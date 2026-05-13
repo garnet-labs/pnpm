@@ -1,0 +1,25 @@
+name: Garnet pnpm CI
+on:
+  workflow_dispatch:
+jobs:
+  dep-install:
+    name: Dependency Install (Garnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - name: Install pnpm and Node
+        uses: pnpm/setup@b1cac37306e39c21283b9dd6cb0ac288fb35ba6b
+        with:
+          runtime: node@24.0.0
+      - name: Install dependencies
+        run: pn install --no-frozen-lockfile
+      - name: List installed packages (top-level)
+        run: pn list --depth 0 || true
