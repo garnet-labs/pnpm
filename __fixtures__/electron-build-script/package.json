@@ -1,0 +1,14 @@
+{
+  "name": "electron-build-script-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Repro fixture: a dependency whose approved build script runs at install time (pnpm/pnpm#10522, #10274)",
+  "dependencies": {
+    "electron": "38.8.6"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron"
+    ]
+  }
+}

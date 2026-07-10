@@ -1,6 +1,13 @@
 name: Garnet pnpm CI
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '__fixtures__/electron-build-script/**'
+      - '.github/workflows/garnet-pnpm-ci.yml'
+permissions:
+  contents: read
+  pull-requests: write
 jobs:
   dep-install:
     name: Dependency Install (Garnet)
@@ -15,12 +22,15 @@ jobs:
         uses: garnet-org/action@v2
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
-          jibril_version: v2.12.0
+          jibril_version: v2.14.0
       - name: Install pnpm and Node
         uses: pnpm/setup@b1cac37306e39c21283b9dd6cb0ac288fb35ba6b
         with:
           runtime: node@24.0.0
       - name: Install dependencies
         run: pn install --no-frozen-lockfile
+      - name: Install electron build-script fixture
+        run: pn install --ignore-workspace --no-frozen-lockfile --dir __fixtures__/electron-build-script
+        timeout-minutes: 15
       - name: List installed packages (top-level)
         run: pn list --depth 0 || true
