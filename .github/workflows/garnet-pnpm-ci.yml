@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: pn install --no-frozen-lockfile
       - name: Install electron build-script fixture
-        run: pn install --ignore-workspace --no-frozen-lockfile --dir __fixtures__/electron-build-script
+        run: pn install --no-frozen-lockfile --dir __fixtures__/electron-build-script
         timeout-minutes: 15
       - name: List installed packages (top-level)
         run: pn list --depth 0 || true
