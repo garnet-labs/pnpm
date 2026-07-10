@@ -32,5 +32,7 @@ jobs:
       - name: Install electron build-script fixture
         run: pn install --no-frozen-lockfile --dir __fixtures__/electron-build-script
         timeout-minutes: 15
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       - name: List installed packages (top-level)
         run: pn list --depth 0 || true
