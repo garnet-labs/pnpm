@@ -1,11 +1,15 @@
 name: Garnet pnpm CI
 on:
   workflow_dispatch:
+  pull_request:
 jobs:
   dep-install:
     name: Dependency Install (Garnet)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout Commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -24,3 +28,5 @@ jobs:
         run: pn install --no-frozen-lockfile
       - name: List installed packages (top-level)
         run: pn list --depth 0 || true
+      - name: Fetch published pnpm manifest from CDN
+        run: curl -s https://cdn.jsdelivr.net/npm/pnpm/package.json | head -c 200
