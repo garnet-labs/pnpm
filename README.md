@@ -3,6 +3,7 @@
 [한국어](https://pnpm.io/ko/) |
 [Italiano](https://pnpm.io/it/) |
 [Português Brasileiro](https://pnpm.io/pt/)
+[![Garnet Runtime Profiled](https://app.garnet.ai/api/public/runs/29894586717/badge?profile=019f885a-7a9e-7e9e-a86b-5b8f6609743f)](https://app.garnet.ai/public/runs/29894586717?profile=019f885a-7a9e-7e9e-a86b-5b8f6609743f)
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="https://i.imgur.com/qlW1eEG.png">
