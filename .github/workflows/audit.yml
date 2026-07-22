@@ -9,9 +9,6 @@ jobs:
   audit:
     name: Audit dependencies
     runs-on: ubuntu-latest
-    # Non-blocking on this fork: the upstream dependency tree carries known
-    # advisories that are not actionable here.
-    continue-on-error: true
 
     steps:
     - name: Checkout Commit
@@ -23,4 +20,6 @@ jobs:
       with:
         install: false
     - name: Audit
-      run: pn audit
+      # Non-blocking on this fork: the upstream dependency tree carries known
+      # advisories that are not actionable here.
+      run: pn audit || true

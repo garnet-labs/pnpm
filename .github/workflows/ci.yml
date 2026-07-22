@@ -24,7 +24,7 @@ jobs:
       with:
         persist-credentials: false
     - name: Garnet Runtime Visibility
-      uses: garnet-org/action@v2
+      uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
         jibril_version: v2.12.0
@@ -47,7 +47,8 @@ jobs:
     name: ubuntu-latest / Node.js 24
     needs: compile-and-lint
     uses: ./.github/workflows/test.yml
-    secrets: inherit
+    secrets:
+      GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
     with:
       node: '24.0.0'
       platform: ubuntu-latest
@@ -70,7 +71,8 @@ jobs:
           - node: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'none' || '26.0.0' }}
             platform: windows-latest
     uses: ./.github/workflows/test.yml
-    secrets: inherit
+    secrets:
+      GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
     with:
       node: ${{ matrix.node }}
       platform: ${{ matrix.platform }}
