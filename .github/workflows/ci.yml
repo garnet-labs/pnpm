@@ -14,12 +14,20 @@ jobs:
 
     name: Compile & Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
     - name: Checkout Commit
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
+    - name: Garnet Runtime Visibility
+      uses: garnet-org/action@v2
+      with:
+        api_token: ${{ secrets.GARNET_API_TOKEN }}
+        jibril_version: v2.12.0
     - name: Install pnpm
       uses: pnpm/setup@b1cac37306e39c21283b9dd6cb0ac288fb35ba6b
     - name: Compile TypeScript
@@ -39,6 +47,7 @@ jobs:
     name: ubuntu-latest / Node.js 24
     needs: compile-and-lint
     uses: ./.github/workflows/test.yml
+    secrets: inherit
     with:
       node: '24.0.0'
       platform: ubuntu-latest
@@ -61,6 +70,7 @@ jobs:
           - node: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'none' || '26.0.0' }}
             platform: windows-latest
     uses: ./.github/workflows/test.yml
+    secrets: inherit
     with:
       node: ${{ matrix.node }}
       platform: ${{ matrix.platform }}

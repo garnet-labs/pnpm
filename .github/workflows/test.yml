@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   test:
@@ -32,6 +33,12 @@ jobs:
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
+    - name: Garnet Runtime Visibility
+      if: runner.os == 'Linux'
+      uses: garnet-org/action@v2
+      with:
+        api_token: ${{ secrets.GARNET_API_TOKEN }}
+        jibril_version: v2.12.0
     - name: Install pnpm and Node
       uses: pnpm/setup@b1cac37306e39c21283b9dd6cb0ac288fb35ba6b
       with:
