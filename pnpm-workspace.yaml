@@ -140,10 +140,10 @@ catalog:
   '@types/zkochan__table': npm:@types/table@6.0.0
   '@typescript-eslint/utils': ^8.57.1
   '@typescript/native-preview': 7.0.0-dev.20260421.2
-  '@yarnpkg/core': 4.5.0
+  '@yarnpkg/core': 4.9.0
   '@yarnpkg/extensions': 2.0.6
   '@yarnpkg/lockfile': ^1.1.0
-  '@yarnpkg/nm': 4.0.7
+  '@yarnpkg/nm': 4.1.0
   '@yarnpkg/parsers': 3.0.3
   '@yarnpkg/pnp': ^4.0.8
   '@zkochan/cmd-shim': ^9.0.3
