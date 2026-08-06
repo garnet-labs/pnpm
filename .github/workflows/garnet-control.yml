@@ -24,6 +24,5 @@ jobs:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Generate network egress
         run: |
-          npm ping
           curl -sS https://registry.npmjs.org/-/ping >/dev/null
           node -e "fetch('https://api.github.com').then(r => console.log('github api', r.status))"
