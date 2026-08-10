@@ -1,0 +1,54 @@
+name: Garnet dep-install
+
+# Installs the workspace with lifecycle scripts enabled under the Garnet
+# sensor. Dependency updates change what runs at install time, and this job is
+# where that shows up: the recorded execution chains and their destinations
+# land on the pull request as a Runtime Review comment, compared against the
+# previous commit of the same pull request.
+on:
+  pull_request:
+    paths:
+      - 'pnpm-workspace.yaml'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/garnet-dep-install.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-dep-install-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dep-install:
+    name: Dependency install (recorded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24.0.0'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Install scripts can spawn children that outlive the install. Give the
+      # sensor a moment to record them before the profile is finalized.
+      - name: Let sensor settle
+        if: always()
+        run: sleep 45
