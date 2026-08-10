@@ -36,13 +36,12 @@ jobs:
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
 
+      # The runner's preinstalled Node.js is enough to run pnpm itself; pnpm
+      # then fetches the workspace's own pinned Node.js runtime during install.
+      # Keeping toolchain setup out of the job leaves the install as the only
+      # network activity the job adds.
       - name: Install pnpm
         uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
-
-      - name: Install Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
-        with:
-          node-version: '24.0.0'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
