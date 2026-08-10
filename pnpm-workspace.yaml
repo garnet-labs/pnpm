@@ -414,7 +414,7 @@ minimumReleaseAgeExclude:
   - cmd-extension
   - comver-to-semver
   - dir-is-case-sensitive
-  - esbuild@0.28.1
+  - esbuild@0.28.2
   - '@esbuild/*'
   - express@4.22.1
   - glob@11.1.0
