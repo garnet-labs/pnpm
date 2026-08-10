@@ -4,7 +4,7 @@ import camelcase from 'camelcase'
 
 import { censorProtectedSettings } from './protectedSettings.js'
 
-// Auth-related Config fields that are internal objects, not user settings.
+// Auth-related Config fields are represented as internal objects, not user settings.
 const NON_SETTING_CONFIG_KEYS = new Set([
   'authConfig', 'configByUri',
 ])
