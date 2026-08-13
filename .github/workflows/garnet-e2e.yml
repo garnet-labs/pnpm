@@ -1,0 +1,66 @@
+name: Garnet e2e (test-branch only)
+
+on:
+  push:
+    branches:
+      - devin/1786751000-garnet-v230-e2e
+  pull_request:
+    paths:
+      - '.github/workflows/garnet-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Simulated fork PR: fork runs receive an empty api_token secret. The
+  # candidate action must skip with a single quiet info line and produce no
+  # warning or notice annotations.
+  empty-token:
+    name: Garnet e2e / empty token skip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: garnet-org/action@544d0847c8ea7a7118a80d809b70c4083101fdcd # v2.3.0 candidate
+        with:
+          api_token: ''
+      - name: Workload placeholder
+        run: curl -sSI https://registry.npmjs.org/ | head -1
+
+  # macOS: the candidate action must skip with a single info line (eBPF is
+  # Linux-only) and never fail the job.
+  macos-skip:
+    name: Garnet e2e / macos skip
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: garnet-org/action@544d0847c8ea7a7118a80d809b70c4083101fdcd # v2.3.0 candidate
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - name: Workload placeholder
+        run: sw_vers
+
+  # Tag-path shape: mirrors update-latest.yml's tag-in-registry job steps
+  # (garnet action + pnpm/setup + a read-only registry query) without any
+  # npm token, so nothing can be published or tagged for real.
+  tag-path-sim:
+    name: Garnet e2e / tag path (read-only)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: garnet-org/action@544d0847c8ea7a7118a80d809b70c4083101fdcd # v2.3.0 candidate
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - name: Install pnpm and Node
+        uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
+        with:
+          version: 11.13.1
+          runtime: node@26.5.0
+          install: false
+          token: ''
+      - name: Read-only registry query
+        run: pn view pnpm dist-tags.latest --registry=https://registry.npmjs.org/
