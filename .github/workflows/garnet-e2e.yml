@@ -29,6 +29,31 @@ jobs:
       - name: Workload placeholder
         run: curl -sSI https://registry.npmjs.org/ | head -1
 
+  # Faithful fork-PR simulation: the action's fork detection reads
+  # GITHUB_EVENT_NAME and the event payload's pull_request.head.repo.full_name,
+  # so pointing those at a synthetic fork payload reproduces the exact
+  # credential-less fork pull_request path (empty api_token, no OIDC).
+  fork-pr-sim:
+    name: Garnet e2e / fork PR simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Write synthetic fork pull_request event payload
+        run: |
+          cat > /tmp/garnet-fork-event.json <<'EOF'
+          {"pull_request": {"head": {"repo": {"full_name": "external-contributor/pnpm"}}}}
+          EOF
+      - uses: garnet-org/action@544d0847c8ea7a7118a80d809b70c4083101fdcd # v2.3.0 candidate
+        env:
+          GITHUB_EVENT_NAME: pull_request
+          GITHUB_EVENT_PATH: /tmp/garnet-fork-event.json
+        with:
+          api_token: ''
+      - name: Workload placeholder
+        run: curl -sSI https://registry.npmjs.org/ | head -1
+
   # macOS: the candidate action must skip with a single info line (eBPF is
   # Linux-only) and never fail the job.
   macos-skip:
