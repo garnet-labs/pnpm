@@ -13,6 +13,24 @@ permissions:
   contents: read
 
 jobs:
+  # Light monitored run that captures the raw Runtime Review step-summary
+  # bytes: the dump action's post step runs after the Garnet post step and
+  # prints every step_summary file to the job log.
+  light-summary:
+    name: Garnet e2e / light run summary capture
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dump-step-summary
+      - uses: garnet-org/action@a999031e6f30574700424a628acf1e49b74c4225 # v2.3.0 candidate
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - name: Workload placeholder
+        run: curl -sSI https://registry.npmjs.org/ | head -1
+
   # Simulated fork PR: fork runs receive an empty api_token secret. The
   # candidate action must skip with a single quiet info line and produce no
   # warning or notice annotations.
