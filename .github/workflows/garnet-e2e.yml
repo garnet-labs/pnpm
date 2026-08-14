@@ -46,6 +46,13 @@ jobs:
         run: |
           jq '.pull_request.head.repo.full_name = "external-contributor/pnpm"' "$GITHUB_EVENT_PATH" > /tmp/garnet-fork-event.json
           cp /tmp/garnet-fork-event.json "$GITHUB_EVENT_PATH"
+      - name: Show payload state the action will read
+        run: |
+          echo "GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME"
+          echo "GITHUB_EVENT_PATH=$GITHUB_EVENT_PATH"
+          jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH"
+          echo "GARNET_ACTION_ENABLE_OIDC_AUTH=${GARNET_ACTION_ENABLE_OIDC_AUTH:-unset}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:-unset}"
       - uses: garnet-org/action@544d0847c8ea7a7118a80d809b70c4083101fdcd # v2.3.0 candidate
         with:
           api_token: ''
