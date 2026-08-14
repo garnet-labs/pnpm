@@ -60,6 +60,8 @@ jobs:
       with:
         persist-credentials: false
     - if: ${{ inputs.garnet }}
+      uses: ./.github/actions/dump-step-summary
+    - if: ${{ inputs.garnet }}
       uses: garnet-org/action@a999031e6f30574700424a628acf1e49b74c4225 # v2.3.0 candidate
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
