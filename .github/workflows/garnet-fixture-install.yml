@@ -44,7 +44,11 @@ jobs:
             dir=$(dirname "$ws")
             # Fixtures that depend on other @pnpm.e2e fixtures need the local
             # e2e registry; only install fixtures resolvable from the public one.
-            if grep -q '"@pnpm\.e2e/' "$dir/package.json"; then
+            if node -e '
+              const m = require(process.argv[1])
+              const deps = { ...m.dependencies, ...m.devDependencies, ...m.optionalDependencies }
+              process.exit(Object.keys(deps).some(d => d.startsWith("@pnpm.e2e/")) ? 0 : 1)
+            ' "$PWD/$dir/package.json"; then
               echo "Skipping $dir (depends on local e2e registry packages)"
               continue
             fi
