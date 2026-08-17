@@ -42,6 +42,12 @@ jobs:
           found=false
           for ws in $(find pnpr/.fixtures -name pnpm-workspace.yaml -not -path '*/node_modules/*' | sort); do
             dir=$(dirname "$ws")
+            # Fixtures that depend on other @pnpm.e2e fixtures need the local
+            # e2e registry; only install fixtures resolvable from the public one.
+            if grep -q '"@pnpm\.e2e/' "$dir/package.json"; then
+              echo "Skipping $dir (depends on local e2e registry packages)"
+              continue
+            fi
             found=true
             echo "::group::pnpm install in $dir"
             (cd "$dir" && pnpm install)
