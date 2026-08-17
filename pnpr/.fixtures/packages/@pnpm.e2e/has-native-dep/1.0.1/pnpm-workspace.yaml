@@ -1,2 +1,2 @@
 allowBuilds:
-  bcrypt: false
+  bcrypt: true
