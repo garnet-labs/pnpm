@@ -13,6 +13,26 @@ permissions:
   contents: read
 
 jobs:
+  # Maintainer's-eye audit: run zizmor exactly as upstream's zizmor.yml does
+  # against the workflows carrying the candidate ref. The candidate bump must
+  # introduce zero new findings; anything zizmor prints here is what the
+  # upstream reviewers would see on the real dependabot bump PR.
+  zizmor-audit:
+    name: Garnet e2e / zizmor audit of bumped workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          # Console output only: this fork branch has no Code scanning SARIF
+          # target, matching upstream's fork-PR behavior.
+          advanced-security: false
+
   # Light monitored run that captures the raw Runtime Review step-summary
   # bytes: the dump action's post step runs after the Garnet post step and
   # prints every step_summary file to the job log.
