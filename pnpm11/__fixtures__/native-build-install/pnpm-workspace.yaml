@@ -1,0 +1,3 @@
+# Own workspace root: this fixture installs from the public registry, so it
+# must not inherit the settings the registry-mock fixtures share.
+packages: []
