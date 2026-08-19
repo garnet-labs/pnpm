@@ -67,11 +67,12 @@ jobs:
       - name: Workload placeholder
         run: curl -sSI https://registry.npmjs.org/ | head -1
 
-  # Faithful fork-PR simulation: GITHUB_* default env vars cannot be
-  # overridden per step, so this runs on a real pull_request event and
-  # rewrites the event payload's pull_request.head.repo.full_name in place,
-  # reproducing the exact credential-less fork pull_request path
-  # (empty api_token, no OIDC).
+  # Faithful fork-PR simulation: the runner restores the event payload file
+  # between steps, so in-place edits to $GITHUB_EVENT_PATH do not survive to
+  # the next step. The rewritten payload (head repo pointing at a fork) lives
+  # in /tmp and GITHUB_EVENT_PATH is overridden on the action step itself,
+  # reproducing the credential-less fork pull_request path (empty api_token,
+  # no OIDC).
   fork-pr-sim:
     name: Garnet e2e / fork PR simulation
     if: github.event_name == 'pull_request'
@@ -83,15 +84,15 @@ jobs:
       - name: Rewrite event payload head repo to a fork
         run: |
           jq '.pull_request.head.repo.full_name = "external-contributor/pnpm"' "$GITHUB_EVENT_PATH" > /tmp/garnet-fork-event.json
-          cp /tmp/garnet-fork-event.json "$GITHUB_EVENT_PATH"
       - name: Show payload state the action will read
         run: |
           echo "GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME"
-          echo "GITHUB_EVENT_PATH=$GITHUB_EVENT_PATH"
-          jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH"
+          jq -r '.pull_request.head.repo.full_name' /tmp/garnet-fork-event.json
           echo "GARNET_ACTION_ENABLE_OIDC_AUTH=${GARNET_ACTION_ENABLE_OIDC_AUTH:-unset}"
           echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:-unset}"
       - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
+        env:
+          GITHUB_EVENT_PATH: /tmp/garnet-fork-event.json
         with:
           api_token: ''
       - name: Workload placeholder
