@@ -62,7 +62,7 @@ jobs:
     - if: ${{ inputs.garnet }}
       uses: ./.github/actions/dump-step-summary
     - if: ${{ inputs.garnet }}
-      uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
+      uses: garnet-org/action@e23e5edde8528bdf4d3ce27fa260421698bcff6d # v2.3.0 candidate (action main, PR 130 merged)
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
     - name: Install pnpm and Node

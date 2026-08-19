@@ -265,7 +265,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
+      - uses: garnet-org/action@e23e5edde8528bdf4d3ce27fa260421698bcff6d # v2.3.0 candidate (action main, PR 130 merged)
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Install pnpm and Node
@@ -419,7 +419,7 @@ jobs:
             echo "::error::Tag v${VERSION} points at ${tag_commit}, but this run would release commit ${GITHUB_SHA}. Rerun the release workflow from the v${VERSION} tag."
             exit 1
           fi
-      - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
+      - uses: garnet-org/action@e23e5edde8528bdf4d3ce27fa260421698bcff6d # v2.3.0 candidate (action main, PR 130 merged)
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Install pnpm and Node
