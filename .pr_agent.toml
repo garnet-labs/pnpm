@@ -59,7 +59,13 @@ comments_location_policy = "both"
 inline_comments_severity_threshold = 3
 issues_user_guidelines = """
 Apply the review framework in REVIEW_GUIDE.md. The repo's priority order — security first, performance second — applies to every reviewer. You are one of two bots: to avoid duplicate comments, you provide the primary depth on security and performance while CodeRabbit provides the primary depth on correctness and convention adherence; always still report any clear correctness bug or documented-convention violation you find. Lead on: (1) security vulnerabilities per REVIEW_GUIDE.md's "Security review rules"; (2) performance regressions in pnpm, pacquet, and pnpr per REVIEW_GUIDE.md's "Performance review rules". Surface only issues tied to changed code, and explain the exploit path, impact, or hot path affected.
+
+Garnet runtime evidence: PRs in this repo may include a committed `.garnet/runtime-evidence.md` — a head-SHA-bound execution profile of the instrumented CI job, recorded at the kernel by Garnet (process chains + outbound network destinations). When this file is present in the PR diff, read it before finalizing the review and reconcile it with the static diff:
+(1) For dependency, lockfile, or CI changes, state explicitly whether the recorded run shows outbound destinations or process chains rooted in install/build/test tooling (pnpm, node, node-gyp, install scripts) outside the repo's expected set (registry.npmjs.org, github.com, codeload.github.com, nodejs.org, GitHub artifact storage). Treat any such destination as a security finding under REVIEW_GUIDE.md's "Security review rules" with inline-severity treatment, naming the destination and the process chain that reached it.
+(2) Do not attribute chains under runner-platform processes (nginx, chronyd, snapd, blacksmithd, dockerd, hosted-compute-*, systemd-network) to the PR — classify them as runner platform behavior.
+(3) Label findings backed by the recording as "verified at runtime" and everything else as static inference. Runtime evidence covers only the recorded jobs; it never clears unrecorded gates or paths CI did not execute, and a clean static diff does not outrank recorded runtime egress.
+(4) If the evidence file's recorded SHA is older than the PR head, check whether later commits touch only review metadata (`.garnet/**`); if so the evidence remains representative, otherwise call it stale.
 """
 compliance_user_guidelines = """
-Enforce the security and performance contracts in REVIEW_GUIDE.md's "Security review rules" and "Performance review rules" sections.
+Enforce the security and performance contracts in REVIEW_GUIDE.md's "Security review rules" and "Performance review rules" sections. When `.garnet/runtime-evidence.md` is present in the PR diff, also enforce the Garnet runtime evidence contract described in issues_user_guidelines.
 """
