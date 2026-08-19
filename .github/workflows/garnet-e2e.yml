@@ -67,13 +67,14 @@ jobs:
       - name: Workload placeholder
         run: curl -sSI https://registry.npmjs.org/ | head -1
 
-  # Faithful fork-PR simulation. The runner pins the GITHUB_EVENT_PATH file
-  # and variable for `uses:` steps (in-place edits and step-level env
-  # overrides never reach the action), so the candidate's main entry is
-  # invoked directly with a rewritten payload whose head repo points at a
-  # fork — the exact credential-less fork pull_request environment (empty
-  # api_token, no OIDC). Asserts the quiet single-info-line skip: no
-  # ::warning/::notice annotations and no ::error.
+  # Faithful fork-PR simulation. The runner owns GITHUB_* variables (step
+  # env cannot override them) and restores the event payload file between
+  # steps, so the rewrite and the candidate's main entry both happen inside
+  # one step: overwrite $GITHUB_EVENT_PATH with a payload whose head repo
+  # points at a fork, then invoke the candidate directly — the exact
+  # credential-less fork pull_request environment (empty api_token, no
+  # OIDC). Asserts the quiet single-info-line skip: no ::warning/::notice
+  # annotations and no ::error.
   fork-pr-sim:
     name: Garnet e2e / fork PR simulation
     if: github.event_name == 'pull_request'
@@ -88,13 +89,8 @@ jobs:
           ref: b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
           path: .garnet-candidate
           persist-credentials: false
-      - name: Rewrite event payload head repo to a fork
-        run: |
-          jq '.pull_request.head.repo.full_name = "external-contributor/pnpm"' "$GITHUB_EVENT_PATH" > /tmp/garnet-fork-event.json
-          jq -r '.pull_request.head.repo.full_name' /tmp/garnet-fork-event.json
-      - name: Run candidate main entry against the fork payload
+      - name: Rewrite payload to a fork head and run the candidate main entry
         env:
-          GITHUB_EVENT_PATH: /tmp/garnet-fork-event.json
           INPUT_API_TOKEN: ''
           INPUT_GITHUB_TOKEN: ''
           INPUT_API_URL: https://api.garnet.ai
@@ -105,6 +101,9 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
         run: |
           set -o pipefail
+          jq '.pull_request.head.repo.full_name = "external-contributor/pnpm"' "$GITHUB_EVENT_PATH" > /tmp/garnet-fork-event.json
+          cp /tmp/garnet-fork-event.json "$GITHUB_EVENT_PATH"
+          jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH"
           node .garnet-candidate/dist/main/index.js 2>&1 | tee /tmp/garnet-fork-sim.out
           grep -q "skips profiling on pull requests from forked repositories" /tmp/garnet-fork-sim.out
           if grep -qE "^::(warning|notice|error)" /tmp/garnet-fork-sim.out; then
