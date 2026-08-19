@@ -45,7 +45,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/dump-step-summary
-      - uses: garnet-org/action@12953af4f3601f27a1fb20751bbdd78d641180f0 # v2.3.0 candidate
+      - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Workload placeholder
@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: garnet-org/action@12953af4f3601f27a1fb20751bbdd78d641180f0 # v2.3.0 candidate
+      - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
         with:
           api_token: ''
       - name: Workload placeholder
@@ -91,7 +91,7 @@ jobs:
           jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH"
           echo "GARNET_ACTION_ENABLE_OIDC_AUTH=${GARNET_ACTION_ENABLE_OIDC_AUTH:-unset}"
           echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:-unset}"
-      - uses: garnet-org/action@12953af4f3601f27a1fb20751bbdd78d641180f0 # v2.3.0 candidate
+      - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
         with:
           api_token: ''
       - name: Workload placeholder
@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: garnet-org/action@12953af4f3601f27a1fb20751bbdd78d641180f0 # v2.3.0 candidate
+      - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Workload placeholder
@@ -120,7 +120,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: garnet-org/action@12953af4f3601f27a1fb20751bbdd78d641180f0 # v2.3.0 candidate
+      - uses: garnet-org/action@b358b772c1fa4571ff0240373c511a9a1d284597 # v2.3.0 candidate (action PR 130 post-rebase)
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Install pnpm and Node
