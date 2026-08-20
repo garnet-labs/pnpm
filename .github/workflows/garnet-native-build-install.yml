@@ -32,7 +32,7 @@ jobs:
           persist-credentials: false
 
       - name: Garnet Runtime Visibility
-        uses: garnet-org/action@12953af4f3601f27a1fb20751bbdd78d641180f0 # v2.3.0-rc
+        uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
 
