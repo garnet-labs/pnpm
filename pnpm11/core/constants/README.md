@@ -1,6 +1,6 @@
 # @pnpm/constants
 
-> pnpm constants
+> Shared constants used across pnpm packages
 
 <!--@shields('npm')-->
 [![npm version](https://img.shields.io/npm/v/@pnpm/constants.svg)](https://npmx.dev/package/@pnpm/constants)

@@ -1,0 +1,150 @@
+name: Garnet e2e (test-branch only)
+
+on:
+  push:
+    branches:
+      - devin/1786751000-garnet-v230-e2e
+  pull_request:
+    paths:
+      - '.github/workflows/garnet-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Maintainer's-eye audit: run zizmor exactly as upstream's zizmor.yml does
+  # against the workflows carrying the candidate ref. The candidate bump must
+  # introduce zero new findings; anything zizmor prints here is what the
+  # upstream reviewers would see on the real dependabot bump PR.
+  zizmor-audit:
+    name: Garnet e2e / zizmor audit of bumped workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          # Console output only: this fork branch has no Code scanning SARIF
+          # target, matching upstream's fork-PR behavior.
+          advanced-security: false
+
+  # Light monitored run that captures the raw Runtime Review step-summary
+  # bytes: the dump action's post step runs after the Garnet post step and
+  # prints every step_summary file to the job log.
+  light-summary:
+    name: Garnet e2e / light run summary capture
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dump-step-summary
+      - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - name: Workload placeholder
+        run: curl -sSI https://registry.npmjs.org/ | head -1
+
+  # Simulated fork PR: fork runs receive an empty api_token secret. The
+  # candidate action must skip with a single quiet info line and produce no
+  # warning or notice annotations.
+  empty-token:
+    name: Garnet e2e / empty token skip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ''
+      - name: Workload placeholder
+        run: curl -sSI https://registry.npmjs.org/ | head -1
+
+  # Faithful fork-PR simulation. The runner owns GITHUB_* variables (step
+  # env cannot override them) and restores the event payload file between
+  # steps, so the rewrite and the candidate's main entry both happen inside
+  # one step: overwrite $GITHUB_EVENT_PATH with a payload whose head repo
+  # points at a fork, then invoke the candidate directly — the exact
+  # credential-less fork pull_request environment (empty api_token, no
+  # OIDC). Asserts the quiet single-info-line skip: no ::warning/::notice
+  # annotations and no ::error.
+  fork-pr-sim:
+    name: Garnet e2e / fork PR simulation
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: garnet-org/action
+          ref: c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+          path: .garnet-candidate
+          persist-credentials: false
+      - name: Rewrite payload to a fork head and run the candidate main entry
+        env:
+          INPUT_API_TOKEN: ''
+          INPUT_GITHUB_TOKEN: ''
+          INPUT_API_URL: https://api.garnet.ai
+          INPUT_JIBRIL_VERSION: ''
+          INPUT_DEBUG: 'false'
+          INPUT_PREVIEW: 'false'
+          ACTIONS_ID_TOKEN_REQUEST_URL: ''
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+        run: |
+          set -o pipefail
+          jq '.pull_request.head.repo.full_name = "external-contributor/pnpm"' "$GITHUB_EVENT_PATH" > /tmp/garnet-fork-event.json
+          cp /tmp/garnet-fork-event.json "$GITHUB_EVENT_PATH"
+          jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH"
+          node .garnet-candidate/dist/main/index.js 2>&1 | tee /tmp/garnet-fork-sim.out
+          grep -q "skips profiling on pull requests from forked repositories" /tmp/garnet-fork-sim.out
+          if grep -qE "^::(warning|notice|error)" /tmp/garnet-fork-sim.out; then
+            echo "fork path emitted an annotation; expected a quiet info-line skip" >&2
+            exit 1
+          fi
+      - name: Workload placeholder
+        run: curl -sSI https://registry.npmjs.org/ | head -1
+
+  # macOS: the candidate action must skip with a single info line (eBPF is
+  # Linux-only) and never fail the job.
+  macos-skip:
+    name: Garnet e2e / macos skip
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - name: Workload placeholder
+        run: sw_vers
+
+  # Tag-path shape: mirrors update-latest.yml's tag-in-registry job steps
+  # (garnet action + pnpm/setup + a read-only registry query) without any
+  # npm token, so nothing can be published or tagged for real.
+  tag-path-sim:
+    name: Garnet e2e / tag path (read-only)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - name: Install pnpm and Node
+        uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
+        with:
+          version: 11.13.1
+          runtime: node@26.5.0
+          install: false
+          token: ''
+      - name: Read-only registry query
+        run: pn view pnpm dist-tags.latest --registry=https://registry.npmjs.org/
