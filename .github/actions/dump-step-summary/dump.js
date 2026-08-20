@@ -16,11 +16,13 @@ if (!own) {
     const bytes = fs.readFileSync(p)
     console.log(`--- ${f}: ${bytes.length} bytes`)
     if (bytes.length === 0) continue
-    console.log(`----- BEGIN ${f} (base64) -----`)
-    console.log(bytes.toString('base64'))
-    console.log(`----- END ${f} (base64) -----`)
-    console.log(`----- BEGIN ${f} (raw) -----`)
-    console.log(bytes.toString('utf8'))
-    console.log(`----- END ${f} (raw) -----`)
+    // Prefix every line so nothing in the dump can start with "::" — the
+    // Actions runner would otherwise interpret such lines as workflow
+    // commands. The prefixed lines also stay subject to secret masking.
+    console.log(`----- BEGIN ${f} -----`)
+    for (const line of bytes.toString('utf8').split('\n')) {
+      console.log(`| ${line}`)
+    }
+    console.log(`----- END ${f} -----`)
   }
 }
