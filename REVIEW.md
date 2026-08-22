@@ -6,6 +6,24 @@ contains a head-bound record, the section is a verbatim mirror of the trusted
 Garnet Runtime Review comment. Treat that record as ground truth of what the
 recorded run observed, then cross-check it against what the diff implies.
 
+## Open with a grounding verdict
+
+Start the review body with one line stating the grounding conclusion for this
+PR:
+
+> **Runtime grounding** (head `<sha7>`): <what the recorded run showed against
+> what this diff should do>
+
+When the record is stale, pending, or absent, the verdict says that instead
+and the review proceeds from the diff alone:
+
+> **Runtime grounding**: record bound to `<old7>`, head is `<sha7>` — stale,
+> not used
+> **Runtime grounding**: no runtime evidence for this head
+
+One or two sentences. State whether the recorded behavior matches what this
+diff should do — the conclusion, not a restatement of the record.
+
 ## Grounding rules
 
 1. Read the `<!-- garnet:commit <sha> -->` marker. Use the mirrored record only
