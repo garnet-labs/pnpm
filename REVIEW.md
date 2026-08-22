@@ -19,6 +19,7 @@ and the review proceeds from the diff alone:
 
 > **Runtime grounding**: record bound to `<old7>`, head is `<sha7>` — stale,
 > not used
+>
 > **Runtime grounding**: no runtime evidence for this head
 
 One or two sentences. State whether the recorded behavior matches what this
