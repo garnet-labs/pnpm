@@ -495,8 +495,8 @@ catalogs:
       specifier: 0.1.2
       version: 0.1.2
     human-id:
-      specifier: ^4.2.0
-      version: 4.2.0
+      specifier: ^4.2.1
+      version: 4.2.1
     husky:
       specifier: ^9.1.7
       version: 9.1.7
@@ -8647,7 +8647,7 @@ importers:
         version: link:../../workspace/spec-parser
       human-id:
         specifier: 'catalog:'
-        version: 4.2.0
+        version: 4.2.1
       semver:
         specifier: 'catalog:'
         version: 7.8.5
@@ -14326,8 +14326,8 @@ packages:
   https-proxy-server-express@0.1.2:
     resolution: {integrity: sha512-wG6/7qwT/DVwI2PW428uoanIjfq5VsfdauROg8HVPSvrXfS8CEoKGkmilanBX8kzUgj145ab3da2Qvci3UbQhw==}
 
-  human-id@4.2.0:
-    resolution: {integrity: sha512-K3GbkIWqyvvlpfhBPlbEvD97TtqBpAYA4kt+cn2lD2x2HuohzZCibcA2nOlnJT6exqvJLggoB5nv2dNf192nEA==}
+  human-id@4.2.1:
+    resolution: {integrity: sha512-zPGsiS+dWoTZtZ4AtpA9Y+BdSFSNWvnouNlWNoUFyAM6xHOHmdCvqO3k8AIbdamCOv4gUFUVNPf6rJFfc4UiJw==}
     hasBin: true
 
   human-signals@2.1.0:
@@ -22139,7 +22139,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  human-id@4.2.0: {}
+  human-id@4.2.1: {}
 
   human-signals@2.1.0: {}
 
