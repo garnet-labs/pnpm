@@ -1,0 +1,8 @@
+# Own workspace root: the dependencies come from the public registry, so this
+# fixture must not inherit the settings the registry-mock fixtures share.
+packages: []
+
+# `chromedriver` downloads a prebuilt binary from its install script. Keep the
+# script blocked so the install only talks to the registry.
+allowBuilds:
+  chromedriver: false

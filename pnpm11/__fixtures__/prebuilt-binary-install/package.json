@@ -1,0 +1,9 @@
+{
+  "name": "prebuilt-binary-install",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "chromedriver": "152.0.1",
+    "is-positive": "1.0.0"
+  }
+}
