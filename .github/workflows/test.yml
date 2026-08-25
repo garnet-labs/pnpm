@@ -115,6 +115,9 @@ jobs:
         [ -z "$ext" ] && chmod +x "$PWD/.pnpr-bin/pnpr" "$PWD/.pnpr-bin/pnpr-prepare"
         echo "PNPR_BIN=$PWD/.pnpr-bin/pnpr$ext" >> "$GITHUB_ENV"
         echo "PNPR_PREPARE_BIN=$PWD/.pnpr-bin/pnpr-prepare$ext" >> "$GITHUB_ENV"
+    # Integration branches run the whole suite; a topic branch runs only the
+    # packages its diff affects, unless it touches `pnpm-workspace.yaml`,
+    # whose catalogs and settings reach every package.
     - name: Determine test scope
       id: test-scope
       shell: bash
