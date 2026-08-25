@@ -1,4 +1,5 @@
 import { parsePropertyPath } from './parse.js'
+import { descendIntoOwnProperty } from './traverse.js'
 import { rejectUnsafeKeys } from './unsafeKeys.js'
 
 type ObjectOrArray = Record<string | number, unknown> | unknown[]
@@ -17,18 +18,9 @@ export function deleteObjectValueByPropertyPath (object: ObjectOrArray, property
   if (path.length === 0) return
   rejectUnsafeKeys(path)
 
-  let obj: ObjectOrArray = object
+  let obj: unknown = object
   for (let i = 0; i < path.length - 1; i++) {
-    const key = path[i]
-    if (
-      typeof obj !== 'object' ||
-      obj === null ||
-      !Object.hasOwn(obj, key) ||
-      (Array.isArray(obj) && typeof key !== 'number')
-    ) {
-      return
-    }
-    obj = (obj as Record<string | number, unknown>)[key] as ObjectOrArray
+    obj = descendIntoOwnProperty(obj, path[i])
   }
 
   if (typeof obj !== 'object' || obj === null) return
