@@ -178,9 +178,15 @@ async function main() {
   if (!process.env.GITHUB_TOKEN || !repo || !prNumber || !headSha) {
     throw new Error("GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER and HEAD_SHA are required")
   }
-  const pr = await github(`/repos/${repo}/pulls/${prNumber}`)
+  const emitMirrored = (value) => {
+    if (process.env.GITHUB_OUTPUT) {
+      appendFileSync(process.env.GITHUB_OUTPUT, `mirrored=${value}\n`)
+    }
+  }
+  let pr = await github(`/repos/${repo}/pulls/${prNumber}`)
   if (pr.head?.sha !== headSha) {
     console.log(`PR head moved (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
+    emitMirrored(false)
     return
   }
   const waitBudgetMs = Number(process.env.EVIDENCE_WAIT_SECONDS ?? "360") * 1000
@@ -190,8 +196,14 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 15000))
     comment = selectEvidenceComment(await listComments())
   }
-  if (process.env.GITHUB_OUTPUT) {
-    appendFileSync(process.env.GITHUB_OUTPUT, `mirrored=${comment ? "true" : "false"}\n`)
+  // The poll can block for minutes; re-read the PR so a head that moved
+  // during the wait aborts instead of writing old-head evidence over a
+  // newer body, and so the patch bases on the freshest description.
+  pr = await github(`/repos/${repo}/pulls/${prNumber}`)
+  if (pr.head?.sha !== headSha) {
+    console.log(`PR head moved during the evidence wait (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
+    emitMirrored(false)
+    return
   }
   const currentBody = pr.body ?? ""
   const bodyWithoutSection = removeSection(currentBody)
@@ -201,8 +213,10 @@ async function main() {
   const nextBody = upsert(currentBody, block)
   if (nextBody === currentBody) {
     console.log("Evidence section already current; nothing to do.")
+    emitMirrored(false)
     return
   }
+  emitMirrored(Boolean(comment).toString())
   await github(`/repos/${repo}/pulls/${prNumber}`, {
     method: "PATCH",
     body: JSON.stringify({ body: nextBody }),
