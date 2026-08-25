@@ -2,7 +2,7 @@
 # fixture must not inherit the settings the registry-mock fixtures share.
 packages: []
 
-# `chromedriver` downloads a prebuilt binary from its install script. Keep the
-# script blocked so the install only talks to the registry.
+# The point of the fixture: `chromedriver` only becomes usable once its
+# install script is allowed to run and download the prebuilt binary.
 allowBuilds:
-  chromedriver: false
+  chromedriver: true
