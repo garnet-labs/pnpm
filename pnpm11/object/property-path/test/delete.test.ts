@@ -47,6 +47,18 @@ test('no-op when an intermediate value is a scalar', () => {
   expect(obj).toEqual({ a: 'scalar' })
 })
 
+test('no-op when an intermediate key is inherited rather than own', () => {
+  const obj: Record<string, unknown> = { scripts: {} }
+  deleteObjectValueByPropertyPathString(obj, 'scripts.toString.name')
+  expect(obj).toEqual({ scripts: {} })
+})
+
+test('no-op when an intermediate array is addressed by a string key', () => {
+  const obj: Record<string, unknown> = { contributors: [{ name: 'Alice' }] }
+  deleteObjectValueByPropertyPathString(obj, 'contributors["0"].name')
+  expect(obj).toEqual({ contributors: [{ name: 'Alice' }] })
+})
+
 test('no-op on an empty property path', () => {
   const obj: Record<string, unknown> = { name: 'foo' }
   deleteObjectValueByPropertyPathString(obj, '')
