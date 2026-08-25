@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 /**
@@ -7,7 +8,13 @@ import { pathToFileURL } from "node:url";
  * delimiters, a head-bound pointer at the GitHub body cap or on delimiter
  * collision, and trusted authors only.
  * Required environment: GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, HEAD_SHA.
- * Optional environment: GITHUB_API_URL.
+ * Optional environment: GITHUB_API_URL, EVIDENCE_WAIT_SECONDS, GITHUB_OUTPUT.
+ *
+ * The Runtime Review comment is posted asynchronously after the instrumented
+ * job uploads its profile, so the head-bound record is polled for up to
+ * EVIDENCE_WAIT_SECONDS (default 360) before the section falls back to the
+ * missing-evidence text. Writes `mirrored=true|false` to GITHUB_OUTPUT so the
+ * workflow can request reviewer re-runs only when a head-bound record landed.
  */
 const RUNTIME_REVIEW_MARKER = "<!-- garnet-runtime-review -->"
 const BEGIN = "<!-- garnet:evidence:begin -->"
@@ -16,13 +23,17 @@ const BEGIN_LINE_RE = /^<!-- garnet:evidence:begin -->[ \t]*\r?$/m
 const END_LINE_RE = /^<!-- garnet:evidence:end -->[ \t]*\r?$/m
 const COMMIT_RE = /<!--\s*garnet:commit\s+([0-9a-f]{40})\s*-->/
 const BODY_LIMIT = 65536
+// Only the Garnet GitHub App identities. github-actions[bot] is deliberately
+// not trusted: any workflow with comment-write permissions posts under it, so
+// trusting it would let arbitrary CI automation forge the evidence markers.
 const TRUSTED_AUTHORS = new Set([
-  "github-actions[bot]",
   "garnet-runtime-review[bot]",
   "garnet-runtime-review-dev[bot]",
 ])
+// Pending placeholders ("still being recorded") are excluded: mirroring one
+// would re-trigger reviewers against a record with no profile in it.
 const GARNET_OWNED_MARKER_RE =
-  /<!--\s*garnet-(?:control-plane|action)(?:-pending)?-pr-comment:v1(?::[a-z0-9.-]+)?\s*-->/
+  /<!--\s*garnet-(?:control-plane|action)-pr-comment:v1(?::[a-z0-9.-]+)?\s*-->/
 
 const api = process.env.GITHUB_API_URL || "https://api.github.com"
 const repo = process.env.GITHUB_REPOSITORY
@@ -171,12 +182,33 @@ async function main() {
   if (!process.env.GITHUB_TOKEN || !repo || !prNumber || !headSha) {
     throw new Error("GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER and HEAD_SHA are required")
   }
-  const pr = await github(`/repos/${repo}/pulls/${prNumber}`)
+  const emitMirrored = (value) => {
+    if (process.env.GITHUB_OUTPUT) {
+      appendFileSync(process.env.GITHUB_OUTPUT, `mirrored=${value}\n`)
+    }
+  }
+  let pr = await github(`/repos/${repo}/pulls/${prNumber}`)
   if (pr.head?.sha !== headSha) {
     console.log(`PR head moved (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
+    emitMirrored(false)
     return
   }
-  const comment = selectEvidenceComment(await listComments())
+  const waitBudgetMs = Number(process.env.EVIDENCE_WAIT_SECONDS ?? "360") * 1000
+  const deadline = Date.now() + waitBudgetMs
+  let comment = selectEvidenceComment(await listComments())
+  while (!comment && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 15000))
+    comment = selectEvidenceComment(await listComments())
+  }
+  // The poll can block for minutes; re-read the PR so a head that moved
+  // during the wait aborts instead of writing old-head evidence over a
+  // newer body, and so the patch bases on the freshest description.
+  pr = await github(`/repos/${repo}/pulls/${prNumber}`)
+  if (pr.head?.sha !== headSha) {
+    console.log(`PR head moved during the evidence wait (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
+    emitMirrored(false)
+    return
+  }
   const currentBody = pr.body ?? ""
   const bodyWithoutSection = removeSection(currentBody)
   const block = comment
@@ -185,8 +217,10 @@ async function main() {
   const nextBody = upsert(currentBody, block)
   if (nextBody === currentBody) {
     console.log("Evidence section already current; nothing to do.")
+    emitMirrored(false)
     return
   }
+  emitMirrored(Boolean(comment).toString())
   await github(`/repos/${repo}/pulls/${prNumber}`, {
     method: "PATCH",
     body: JSON.stringify({ body: nextBody }),
@@ -199,3 +233,4 @@ async function main() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()
+
