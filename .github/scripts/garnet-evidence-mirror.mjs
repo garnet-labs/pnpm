@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 /**
@@ -7,7 +8,13 @@ import { pathToFileURL } from "node:url";
  * delimiters, a head-bound pointer at the GitHub body cap or on delimiter
  * collision, and trusted authors only.
  * Required environment: GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, HEAD_SHA.
- * Optional environment: GITHUB_API_URL.
+ * Optional environment: GITHUB_API_URL, EVIDENCE_WAIT_SECONDS, GITHUB_OUTPUT.
+ *
+ * The Runtime Review comment is posted asynchronously after the instrumented
+ * job uploads its profile, so the head-bound record is polled for up to
+ * EVIDENCE_WAIT_SECONDS (default 360) before the section falls back to the
+ * missing-evidence text. Writes `mirrored=true|false` to GITHUB_OUTPUT so the
+ * workflow can request reviewer re-runs only when a head-bound record landed.
  */
 const RUNTIME_REVIEW_MARKER = "<!-- garnet-runtime-review -->"
 const BEGIN = "<!-- garnet:evidence:begin -->"
@@ -176,7 +183,16 @@ async function main() {
     console.log(`PR head moved (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
     return
   }
-  const comment = selectEvidenceComment(await listComments())
+  const waitBudgetMs = Number(process.env.EVIDENCE_WAIT_SECONDS ?? "360") * 1000
+  const deadline = Date.now() + waitBudgetMs
+  let comment = selectEvidenceComment(await listComments())
+  while (!comment && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 15000))
+    comment = selectEvidenceComment(await listComments())
+  }
+  if (process.env.GITHUB_OUTPUT) {
+    appendFileSync(process.env.GITHUB_OUTPUT, `mirrored=${comment ? "true" : "false"}\n`)
+  }
   const currentBody = pr.body ?? ""
   const bodyWithoutSection = removeSection(currentBody)
   const block = comment

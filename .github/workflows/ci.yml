@@ -243,4 +243,16 @@ jobs:
         with:
           persist-credentials: false
       - name: Mirror head-bound Garnet evidence
+        id: mirror
         run: node .github/scripts/garnet-evidence-mirror.mjs
+      # The AI reviewers review at PR open, minutes before the Runtime Review
+      # record lands, so a fresh head-bound mirror asks them to re-review with
+      # the evidence now in the description (see REVIEW.md).
+      - name: Request evidence-grounded re-review
+        if: steps.mirror.outputs.mirrored == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body='/agentic_review'
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body='@coderabbitai review'
