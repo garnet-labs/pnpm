@@ -28,8 +28,10 @@ const TRUSTED_AUTHORS = new Set([
   "garnet-runtime-review[bot]",
   "garnet-runtime-review-dev[bot]",
 ])
+// Pending placeholders ("still being recorded") are excluded: mirroring one
+// would re-trigger reviewers against a record with no profile in it.
 const GARNET_OWNED_MARKER_RE =
-  /<!--\s*garnet-(?:control-plane|action)(?:-pending)?-pr-comment:v1(?::[a-z0-9.-]+)?\s*-->/
+  /<!--\s*garnet-(?:control-plane|action)-pr-comment:v1(?::[a-z0-9.-]+)?\s*-->/
 
 const api = process.env.GITHUB_API_URL || "https://api.github.com"
 const repo = process.env.GITHUB_REPOSITORY
