@@ -53,6 +53,22 @@ describe('checkDepsStatus - settings change detection', () => {
     jest.clearAllMocks()
   })
 
+  // Lets a test reach the up-to-date verdict: every file the check consults
+  // exists and predates the last validation.
+  function mockUpToDateSingleProject (lastValidatedTimestamp: number): void {
+    const mtimeMs = lastValidatedTimestamp - 10_000
+    const stats = { mtime: new Date(mtimeMs), mtimeMs } as Stats
+    jest.mocked(fsUtils.safeStat).mockImplementation(async () => stats)
+    jest.mocked(fsUtils.safeStatSync).mockReturnValue(stats)
+    jest.mocked(statManifestFileUtils.statManifestFile).mockImplementation(async () => stats)
+    const lockfile = {
+      lockfileVersion: '9.0',
+      importers: { '.': { specifiers: {} } },
+    } as unknown as LockfileObject
+    jest.mocked(lockfileFs.readCurrentLockfile).mockImplementation(async () => lockfile)
+    jest.mocked(lockfileFs.readWantedLockfile).mockImplementation(async () => lockfile)
+  }
+
   it('returns upToDate: false when overrides have changed', async () => {
     const lastValidatedTimestamp = Date.now() - 10_000
     const mockWorkspaceState: WorkspaceState = {
@@ -338,6 +354,7 @@ describe('checkDepsStatus - settings change detection', () => {
     }
 
     jest.mocked(loadWorkspaceState).mockReturnValue(mockWorkspaceState)
+    mockUpToDateSingleProject(lastValidatedTimestamp)
 
     const opts: CheckDepsStatusOptions = {
       rootProjectManifest: {},
@@ -348,7 +365,8 @@ describe('checkDepsStatus - settings change detection', () => {
     }
     const result = await checkDepsStatus(opts)
 
-    expect(result.issue).not.toBe('The value of the enableGlobalVirtualStore setting has changed')
+    expect(result.upToDate).toBe(true)
+    expect(result.issue).toBeUndefined()
   })
 
   it('does not report a change when a state file recorded enableGlobalVirtualStore: false and the setting is now unset', async () => {
@@ -369,6 +387,7 @@ describe('checkDepsStatus - settings change detection', () => {
     }
 
     jest.mocked(loadWorkspaceState).mockReturnValue(mockWorkspaceState)
+    mockUpToDateSingleProject(lastValidatedTimestamp)
 
     const opts: CheckDepsStatusOptions = {
       rootProjectManifest: {},
@@ -379,7 +398,8 @@ describe('checkDepsStatus - settings change detection', () => {
     }
     const result = await checkDepsStatus(opts)
 
-    expect(result.issue).not.toBe('The value of the enableGlobalVirtualStore setting has changed')
+    expect(result.upToDate).toBe(true)
+    expect(result.issue).toBeUndefined()
   })
 })
 
