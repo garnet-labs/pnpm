@@ -23,8 +23,10 @@ const BEGIN_LINE_RE = /^<!-- garnet:evidence:begin -->[ \t]*\r?$/m
 const END_LINE_RE = /^<!-- garnet:evidence:end -->[ \t]*\r?$/m
 const COMMIT_RE = /<!--\s*garnet:commit\s+([0-9a-f]{40})\s*-->/
 const BODY_LIMIT = 65536
+// Only the Garnet GitHub App identities. github-actions[bot] is deliberately
+// not trusted: any workflow with comment-write permissions posts under it, so
+// trusting it would let arbitrary CI automation forge the evidence markers.
 const TRUSTED_AUTHORS = new Set([
-  "github-actions[bot]",
   "garnet-runtime-review[bot]",
   "garnet-runtime-review-dev[bot]",
 ])
@@ -231,3 +233,4 @@ async function main() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()
+
