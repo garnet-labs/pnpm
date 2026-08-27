@@ -1,0 +1,64 @@
+name: Garnet Dependabot Fixture Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "pnpr/.fixtures/**/package.json"
+      - "pnpr/.fixtures/**/pnpm-lock.yaml"
+      - "pnpr/.fixtures/**/package-lock.json"
+      - "pnpr/.fixtures/**/yarn.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-dependabot-fixtures-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-runtime-review:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: Install changed fixture dependencies
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+
+          mapfile -t fixture_dirs < <(
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'pnpr/.fixtures/**' |
+              grep -E '/(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$' |
+              xargs -r -n1 dirname |
+              sort -u
+          )
+
+          if (( ${#fixture_dirs[@]} == 0 )); then
+            echo "No changed fixture dependency manifests found."
+            exit 1
+          fi
+
+          for fixture_dir in "${fixture_dirs[@]}"; do
+            echo "::group::Installing dependencies in ${fixture_dir}"
+            corepack pnpm --dir "$fixture_dir" install \
+              --ignore-workspace \
+              --no-frozen-lockfile \
+              --no-lockfile
+            echo "::endgroup::"
+          done

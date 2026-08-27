@@ -42,7 +42,7 @@ jobs:
         if: github.event_name != 'merge_group'
         with:
           persist-credentials: false
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: github.event_name != 'merge_group'
         id: filter
         with:
@@ -81,9 +81,11 @@ jobs:
       with:
         persist-credentials: false
     - name: Install pnpm
-      uses: pnpm/setup@6523ce966bcf7a1061ce6401e5c6e0b60466bd31
-    - name: Test release publication guard
-      run: .github/scripts/npm-package-publication-state.test.sh
+      uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
+    - name: Test release publication scripts
+      run: |
+        .github/scripts/npm-package-publication-state.test.sh
+        .github/scripts/npm-staged-publication.test.sh
     - name: Compile TypeScript
       run: pn compile-only
     - name: Lint
@@ -142,7 +144,7 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - node: '26.6.0'
+          - node: '26.7.0'
             node_major: '26'
             platform: blacksmith-8vcpu-ubuntu-2404
             platform_label: ubuntu
@@ -215,3 +217,42 @@ jobs:
       - name: Fail if any dependency failed or was cancelled
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1
+
+  # Mirror the head-bound Garnet Runtime Review comment into the PR
+  # description so AI reviewers that read only the description ground in the
+  # same bytes (see REVIEW.md). Skips fork heads: their pull_request token is
+  # read-only regardless of declared permissions; the workflow_run variant
+  # (garnet-evidence-mirror-forks.yml) covers them from the default branch.
+  garnet-evidence-mirror:
+    name: Mirror Garnet evidence for AI reviewers
+    needs: ['test']
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mirror head-bound Garnet evidence
+        id: mirror
+        run: node .github/scripts/garnet-evidence-mirror.mjs
+      # The AI reviewers review at PR open, minutes before the Runtime Review
+      # record lands, so a fresh head-bound mirror asks them to re-review with
+      # the evidence now in the description (see REVIEW.md).
+      - name: Request evidence-grounded re-review
+        if: steps.mirror.outputs.mirrored == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body='/agentic_review'
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body='@coderabbitai review'

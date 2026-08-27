@@ -9,13 +9,15 @@ pub use download::*;
 pub use error::*;
 pub(crate) use extract::{
     allocate_tarball_buffer, apply_append_manifest, apply_placeholder_manifest, decompress_gzip,
-    extract_tarball_entries, normalize_bundled_manifest, tar_entry_payload,
+    extract_tarball_entries, normalize_bundled_manifest, should_stream_extract,
+    stream_extract_gzipped_tarball, tar_entry_payload,
 };
 pub use local_tarball::*;
 pub use prefetch::*;
 pub use zip_archive::*;
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{self, Cursor, Read},
     path::{Component, Path, PathBuf},
@@ -24,11 +26,11 @@ use std::{
 };
 
 use dashmap::{DashMap, DashSet};
-pub use pacquet_network::RetryOpts;
-use pacquet_network::{AuthHeaders, ThrottledClient, UNPRIORITIZED};
-use pacquet_reporter::Reporter;
-use pacquet_store_dir::{StoreDir, StoreIndexWriter, store_index_key};
 use pipe_trait::Pipe;
+pub use pnpm_network::RetryOpts;
+use pnpm_network::{AuthHeaders, ThrottledClient, UNPRIORITIZED};
+use pnpm_reporter::Reporter;
+use pnpm_store_dir::{StoreDir, StoreIndexWriter, store_index_key};
 use rayon::prelude::*;
 use ssri::Integrity;
 use tokio::sync::{Notify, RwLock, Semaphore};
@@ -101,7 +103,7 @@ fn cas_write_pool() -> Option<&'static rayon::ThreadPool> {
 /// Implements the `ignoreFilePattern` / `archiveFilters` behavior.
 /// Pacquet uses a callback rather than a regex so the caller can
 /// hand-code the filter without pulling a regex engine into
-/// `pacquet-tarball`; the canonical Node-runtime filter lives at
+/// `pnpm-tarball`; the canonical Node-runtime filter lives at
 /// the install-dispatch site (Slice D) where it's constructed once
 /// per fetch.
 ///

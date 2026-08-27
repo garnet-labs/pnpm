@@ -1,13 +1,16 @@
 use super::{
-    BTreeMap, BTreeSet, Catalogs, Config, HashSet, HoistedDependencies, Host, IncludedDependencies,
-    InstallError, InstallWithFreshLockfileError, Lockfile, LogEvent, LogLevel, Modules, NodeLinker,
-    PackageManifest, Path, PathBuf, ProjectMutation, ProjectScriptsInputs, RebuildOptions,
-    Reporter, SummaryLog, SystemTime, WorkspaceInstallSelection, build_modules_manifest,
-    build_workspace_state, drain_settled_projects, merge_filtered_modules_metadata,
-    merge_pending_builds, order_project_lifecycle_groups, project_requires_lifecycle_scripts,
+    BTreeMap, BTreeSet, Catalogs, Config, GlobalLog, HashSet, HoistedDependencies, Host,
+    IncludedDependencies, InstallError, InstallWithFreshLockfileError, Lockfile, LogEvent,
+    LogLevel, Modules, NodeLinker, PackageManifest, Path, PathBuf, ProjectMutation,
+    ProjectScriptsInputs, RebuildOptions, Reporter, SummaryLog, SystemTime,
+    WorkspaceInstallSelection, build_modules_manifest, build_workspace_state,
+    drain_settled_projects, merge_filtered_modules_metadata, merge_pending_builds,
+    order_project_lifecycle_groups, project_requires_lifecycle_scripts,
     projects_running_own_scripts, run_projects_lifecycle_scripts, update_workspace_state,
     write_modules_manifest,
 };
+use pnpm_store_dir::VerifiedFileIntegrity;
+use std::time::Duration;
 
 struct ResolveOnlyCompletionInputs<'a> {
     resolve_only: bool,
@@ -122,7 +125,7 @@ fn select_materialized_state<'a>(
         .iter()
         .filter(|(project_dir, _)| {
             let importer_id =
-                pacquet_workspace::importer_id_from_root_dir(inputs.workspace_root, project_dir);
+                pnpm_workspace::importer_id_from_root_dir(inputs.workspace_root, project_dir);
             project_anchor_importer_ids.contains(&importer_id)
         })
         .cloned()
@@ -172,10 +175,10 @@ async fn link_materialized_projects<Reporter: self::Reporter + 'static>(
             .as_deref()
             .and_then(crate::install_frozen_lockfile::parse_major_from_version);
         let engine_name = match runtime_major.or(configured_major) {
-            Some(major) => Some(pacquet_graph_hasher::engine_name(major, None, None)),
+            Some(major) => Some(pnpm_graph_hasher::engine_name(major, None, None)),
             None if config.enable_global_virtual_store => tokio::task::spawn_blocking(|| {
-                pacquet_graph_hasher::detect_node_major()
-                    .map(|major| pacquet_graph_hasher::engine_name(major, None, None))
+                pnpm_graph_hasher::detect_node_major()
+                    .map(|major| pnpm_graph_hasher::engine_name(major, None, None))
             })
             .await
             .ok()
@@ -233,7 +236,7 @@ async fn link_materialized_projects<Reporter: self::Reporter + 'static>(
 }
 
 struct CommitModulesStateInputs<'a> {
-    prior_modules: Option<&'a pacquet_modules_yaml::ModulesLayout>,
+    prior_modules: Option<&'a pnpm_modules_yaml::ModulesLayout>,
     config: &'static Config,
     workspace_root: &'a Path,
     materialized_current_lockfile: Option<&'a Lockfile>,
@@ -254,6 +257,7 @@ struct CommitModulesStateInputs<'a> {
     take_frozen_path: bool,
     lockfile_synthesized_from_current: bool,
     lockfile_was_fast_updated: bool,
+    save_lockfile: bool,
     loaded_wanted_lockfile: Option<&'a Lockfile>,
 }
 
@@ -280,6 +284,7 @@ fn commit_modules_state(inputs: CommitModulesStateInputs<'_>) -> Result<(), Inst
         take_frozen_path,
         lockfile_synthesized_from_current,
         lockfile_was_fast_updated,
+        save_lockfile,
         loaded_wanted_lockfile,
     } = inputs;
     let now = SystemTime::now();
@@ -358,7 +363,7 @@ fn commit_modules_state(inputs: CommitModulesStateInputs<'_>) -> Result<(), Inst
                 project_requires_lifecycle_scripts(project_dir, manifest)
             })
             .map(|(project_dir, _)| {
-                pacquet_workspace::importer_id_from_root_dir(workspace_root, project_dir)
+                pnpm_workspace::importer_id_from_root_dir(workspace_root, project_dir)
             })
             .collect::<Vec<_>>()
     });
@@ -445,6 +450,7 @@ fn commit_modules_state(inputs: CommitModulesStateInputs<'_>) -> Result<(), Inst
     if take_frozen_path
         && (lockfile_synthesized_from_current || lockfile_was_fast_updated)
         && config.lockfile
+        && save_lockfile
         && let Some(updated) = loaded_wanted_lockfile
     {
         updated
@@ -498,7 +504,7 @@ fn run_materialized_project_scripts<Reporter: self::Reporter>(
                 .iter()
                 .filter(|(project_dir, _)| {
                     let importer_id =
-                        pacquet_workspace::importer_id_from_root_dir(workspace_root, project_dir);
+                        pnpm_workspace::importer_id_from_root_dir(workspace_root, project_dir);
                     rebuild.pending_projects.contains(&importer_id)
                 })
                 .cloned()
@@ -542,6 +548,7 @@ struct ReportInstallCompletionInputs<'a> {
     workspace_manifest_dir: &'a Path,
     prefix: String,
     ignored_builds: Vec<String>,
+    verified_file_integrity_baseline: VerifiedFileIntegrity,
 }
 
 fn report_install_completion<Reporter: self::Reporter>(
@@ -553,11 +560,16 @@ fn report_install_completion<Reporter: self::Reporter>(
         workspace_manifest_dir,
         prefix,
         ignored_builds,
+        verified_file_integrity_baseline,
     } = inputs;
     // `pnpm:summary` closes the install and lets the reporter render
     // the accumulated `pnpm:root` events as a "+N -M" block. Must
     // come after `importing_done`.
     Reporter::emit(&LogEvent::Summary(SummaryLog { level: LogLevel::Debug, prefix }));
+
+    report_verified_file_integrity::<Reporter>(
+        VerifiedFileIntegrity::snapshot().since(verified_file_integrity_baseline),
+    );
 
     // A global install is exempt from the scaffold below: its root is a
     // throwaway per-group directory, and the approval prompt that
@@ -576,7 +588,7 @@ fn report_install_completion<Reporter: self::Reporter>(
             .iter()
             .map(|dep_path| crate::allow_build_key_from_ignored_build(dep_path))
             .collect();
-        pacquet_workspace_manifest_writer::scaffold_allow_builds(
+        pnpm_workspace_manifest_writer::scaffold_allow_builds(
             workspace_manifest_dir,
             allow_build_keys.iter().map(String::as_str),
         )
@@ -593,6 +605,48 @@ fn report_install_completion<Reporter: self::Reporter>(
     }
 
     Ok(())
+}
+
+/// Spending this long re-hashing store files is well past what a
+/// healthy store needs, so the install owns up to the time.
+const VERIFIED_FILE_INTEGRITY_SLOW: Duration = Duration::from_secs(1);
+
+/// Re-hashing this many files says something keeps invalidating the
+/// store even when the hashing itself was quick — worth telling the
+/// user about before the store grows and the same churn does cost them
+/// time.
+const VERIFIED_FILE_INTEGRITY_MANY: u64 = 1000;
+
+/// Tell the user when store verification re-hashed files: how much time
+/// it cost, or failing that, that it happened at all on a scale a
+/// healthy store never reaches. The two are separate claims, so they
+/// are separate messages, and the timed one wins when both hold — it
+/// carries the file count anyway.
+///
+/// `verified` covers this install alone, and its `duration` is summed
+/// across the threads that did the hashing — see
+/// [`pnpm_store_dir::VerifiedFileIntegrity`].
+///
+/// The seconds are rounded to tenths in integer arithmetic rather than
+/// by float formatting: pnpm renders the same messages from the same
+/// figures and the two have to agree character for character, but
+/// Rust's `{:.1}` rounds a tie to even where JavaScript's `toFixed`
+/// rounds it up.
+pub(super) fn report_verified_file_integrity<Reporter: self::Reporter>(
+    verified: VerifiedFileIntegrity,
+) {
+    let files = verified.files;
+    let message = if verified.duration > VERIFIED_FILE_INTEGRITY_SLOW {
+        let tenths = (verified.duration.as_millis() + 50) / 100;
+        format!("The integrity of {files} files was checked in {}.{}s.", tenths / 10, tenths % 10)
+    } else if files > VERIFIED_FILE_INTEGRITY_MANY {
+        format!(
+            "The integrity of {files} files was checked, because their timestamps changed since the store recorded them. A backup tool, an antivirus scan, or a copied store can cause this.",
+        )
+    } else {
+        return;
+    };
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Info, message }));
 }
 
 pub(super) struct ApplyMaterializationInputs<'a, 'selection> {
@@ -621,17 +675,18 @@ pub(super) struct ApplyMaterializationInputs<'a, 'selection> {
     pub(super) injected_deps: BTreeMap<String, Vec<String>>,
     pub(super) ignored_builds: Vec<String>,
     pub(super) deferred_builds: Vec<String>,
-    pub(super) modules_manifest: Option<pacquet_modules_yaml::ModulesLayout>,
+    pub(super) modules_manifest: Option<pnpm_modules_yaml::ModulesLayout>,
     pub(super) rebuild: Option<RebuildOptions>,
     pub(super) take_frozen_path: bool,
     pub(super) lockfile_synthesized_from_current: bool,
     pub(super) lockfile_was_fast_updated: bool,
+    pub(super) save_lockfile: bool,
     pub(super) mutation: ProjectMutation,
     pub(super) manifest_dir: &'a Path,
     pub(super) selection: Option<WorkspaceInstallSelection<'selection>>,
-    pub(super) supported_architectures:
-        Option<pacquet_package_is_installable::SupportedArchitectures>,
+    pub(super) supported_architectures: Option<pnpm_package_is_installable::SupportedArchitectures>,
     pub(super) catalogs: Catalogs,
+    pub(super) verified_file_integrity_baseline: VerifiedFileIntegrity,
 }
 
 pub(super) async fn apply_materialization_result<Reporter: self::Reporter + 'static>(
@@ -668,11 +723,13 @@ pub(super) async fn apply_materialization_result<Reporter: self::Reporter + 'sta
         take_frozen_path,
         lockfile_synthesized_from_current,
         lockfile_was_fast_updated,
+        save_lockfile,
         mutation,
         manifest_dir,
         selection,
         supported_architectures,
         catalogs,
+        verified_file_integrity_baseline,
     } = inputs;
     let modules_manifest = modules_manifest.as_ref();
     tracing::info!(target: "pacquet::install", "Complete all");
@@ -741,6 +798,7 @@ pub(super) async fn apply_materialization_result<Reporter: self::Reporter + 'sta
         take_frozen_path,
         lockfile_synthesized_from_current,
         lockfile_was_fast_updated,
+        save_lockfile,
         loaded_wanted_lockfile: lockfile,
     })?;
 
@@ -765,7 +823,7 @@ pub(super) async fn apply_materialization_result<Reporter: self::Reporter + 'sta
     // install.
     update_workspace_state(
         &workspace_root,
-        &build_workspace_state(
+        &build_workspace_state::<Host>(
             &workspace_root,
             config,
             node_linker,
@@ -784,5 +842,6 @@ pub(super) async fn apply_materialization_result<Reporter: self::Reporter + 'sta
         workspace_manifest_dir: &workspace_manifest_dir,
         prefix,
         ignored_builds,
+        verified_file_integrity_baseline,
     })
 }
