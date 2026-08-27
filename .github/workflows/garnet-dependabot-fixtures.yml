@@ -40,8 +40,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          corepack enable
-
           mapfile -t fixture_dirs < <(
             git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'pnpr/.fixtures/**' |
               grep -E '/(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$' |
@@ -56,9 +54,8 @@ jobs:
 
           for fixture_dir in "${fixture_dirs[@]}"; do
             echo "::group::Installing dependencies in ${fixture_dir}"
-            corepack pnpm --dir "$fixture_dir" install \
-              --ignore-workspace \
-              --no-frozen-lockfile \
-              --no-lockfile
+            npm install \
+              --prefix "$fixture_dir" \
+              --no-package-lock
             echo "::endgroup::"
           done
