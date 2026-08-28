@@ -217,3 +217,42 @@ jobs:
       - name: Fail if any dependency failed or was cancelled
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1
+
+  # Mirror the head-bound Garnet Runtime Review comment into the PR
+  # description so AI reviewers that read only the description ground in the
+  # same bytes (see REVIEW.md). Skips fork heads: their pull_request token is
+  # read-only regardless of declared permissions; the workflow_run variant
+  # (garnet-evidence-mirror-forks.yml) covers them from the default branch.
+  garnet-evidence-mirror:
+    name: Mirror Garnet evidence for AI reviewers
+    needs: ['test']
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mirror head-bound Garnet evidence
+        id: mirror
+        run: node .github/scripts/garnet-evidence-mirror.mjs
+      # The AI reviewers review at PR open, minutes before the Runtime Review
+      # record lands, so a fresh head-bound mirror asks them to re-review with
+      # the evidence now in the description (see REVIEW.md).
+      - name: Request evidence-grounded re-review
+        if: steps.mirror.outputs.mirrored == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body='/agentic_review'
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body='@coderabbitai review'
