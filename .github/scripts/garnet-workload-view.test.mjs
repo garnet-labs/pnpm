@@ -9,6 +9,7 @@ import {
   renderDestination,
   renderProfile,
   renderWorkloadBlock,
+  upsert,
 } from "./garnet-workload-view.mjs"
 
 async function fixture(name) {
@@ -18,6 +19,24 @@ async function fixture(name) {
 function tableRowCounts(block) {
   return [...block.matchAll(/<details(?: open)?><summary>.*?<\/summary>([\s\S]*?)<\/details>/g)]
     .map((match) => (match[1].match(/^\| `/gm) || []).length)
+}
+
+function tableSummaryReconciliation(block) {
+  return [...block.matchAll(/<details(?: open)?><summary>(.*?)<\/summary>([\s\S]*?)<\/details>/g)]
+    .map((match) => {
+      const withGone = match[1].match(/(\d+)&nbsp;destinations at head, (\d+)&nbsp;gone/)
+      const headDestinations = withGone
+        ? Number(withGone[1])
+        : Number(match[1].match(/· (\d+)&nbsp;destinations/)?.[1])
+      const goneDestinations = withGone ? Number(withGone[2]) : 0
+      const rows = match[2].match(/^\| `[^`]+` \| (\d+) \|/gm) || []
+      return {
+        headDestinations,
+        goneDestinations,
+        nonZeroRows: rows.filter((row) => !/\| 0 \|/.test(row)).length,
+        zeroRows: rows.filter((row) => /\| 0 \|/.test(row)).length,
+      }
+    })
 }
 
 test("classifies associations using only the specified platform signals", () => {
@@ -75,6 +94,10 @@ test("renders the PR 17 fixture against the PR 30 baseline", async () => {
   assert.doesNotMatch(block, /^Platform /m)
   assert.match(block, /\| destination \| chains \| Δ vs base \| reached by \|/)
   assert.deepEqual(tableRowCounts(block), [10, 29])
+  assert.deepEqual(tableSummaryReconciliation(block), [
+    { headDestinations: 10, goneDestinations: 0, nonZeroRows: 10, zeroRows: 0 },
+    { headDestinations: 23, goneDestinations: 6, nonZeroRows: 23, zeroRows: 6 },
+  ])
   for (const row of baseline.associations) {
     if (classifyAssociation(row) === "workload") {
       assert.ok(block.includes(`| \`${renderDestination(destinationFor(row))}\` |`))
@@ -117,4 +140,9 @@ test("renders all three workload headline cases", async () => {
   assert.match(destinationChange, /^\+ `new\.example\[.\]org` reached by /m)
   assert.match(destinationChange, /^− `pnpm\[.\]io`$/m)
   assert.doesNotMatch(destinationChange, /^~/m)
+})
+
+test("does not take the write path for malformed workload delimiters", () => {
+  const body = "description\n\n<!-- garnet:workload:begin -->\npartial block"
+  assert.equal(upsert(body, "replacement block"), null)
 })

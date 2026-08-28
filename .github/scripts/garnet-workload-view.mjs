@@ -190,20 +190,26 @@ export function renderWorkloadBlock(profile, baselineProfile = null) {
 
   const workloadBaselineRows = baseline?.workload || null
   const platformBaselineRows = baseline?.platform || null
-  const workloadDestinationCount = current.workload.length + (workloadBaselineRows
+  const workloadGoneCount = workloadBaselineRows
     ? workloadBaselineRows.filter((row) => !current.workload.some((currentRow) => currentRow.destination === row.destination)).length
-    : 0)
-  const platformDestinationCount = current.platform.length + (platformBaselineRows
+    : 0
+  const platformGoneCount = platformBaselineRows
     ? platformBaselineRows.filter((row) => !current.platform.some((currentRow) => currentRow.destination === row.destination)).length
-    : 0)
+    : 0
+  const workloadSummary = workloadGoneCount
+    ? `${current.workloadChains}&nbsp;workload chains · ${current.workload.length}&nbsp;destinations at head, ${workloadGoneCount}&nbsp;gone`
+    : `${current.workloadChains}&nbsp;workload chains · ${current.workload.length}&nbsp;destinations`
+  const platformSummary = platformGoneCount
+    ? `runner platform · ${current.platformChains}&nbsp;chains · ${current.platform.length}&nbsp;destinations at head, ${platformGoneCount}&nbsp;gone · no recorded workflow step`
+    : `runner platform · ${current.platformChains}&nbsp;chains · ${current.platform.length}&nbsp;destinations · no recorded workflow step`
   lines.push(
-    `<details open><summary>${current.workloadChains}&nbsp;workload chains · ${workloadDestinationCount}&nbsp;destinations</summary>`,
+    `<details open><summary>${workloadSummary}</summary>`,
     "",
     ...renderTable(current.workload, workloadBaselineRows),
     "",
     "</details>",
     "",
-    `<details><summary>runner platform · ${current.platformChains}&nbsp;chains · ${platformDestinationCount}&nbsp;destinations · no recorded workflow step</summary>`,
+    `<details><summary>${platformSummary}</summary>`,
     "",
     ...renderTable(current.platform, platformBaselineRows),
     "",
@@ -311,13 +317,13 @@ function removeSection(body) {
   return body.slice(0, begin.index) + after.slice(end.index + end[0].length)
 }
 
-function upsert(body, block) {
+export function upsert(body, block) {
   const begin = BEGIN_LINE_RE.exec(body)
   if (begin) {
     const after = body.slice(begin.index)
     const end = END_LINE_RE.exec(after)
     if (!end) return null
-    if (end) return body.slice(0, begin.index) + block + after.slice(end.index + end[0].length)
+    return body.slice(0, begin.index) + block + after.slice(end.index + end[0].length)
   }
   return `${body.trimEnd()}\n\n${block}\n`
 }
@@ -353,16 +359,20 @@ async function main() {
     return
   }
   const bodyWithoutSection = removeSection(pr.body || "")
-  if (bodyWithoutSection === null) {
-    globalThis.console.log("Malformed workload section delimiters found; skipping without writing.")
-    return
-  }
   const block = renderProfile(headProfile, usableBaselineProfile)
   if (bodyWithoutSection.length + block.length > BODY_LIMIT) {
     globalThis.console.log("Workload view exceeds the PR description size budget; skipping.")
     return
   }
   const nextBody = upsert(pr.body || "", block)
+  if (nextBody === null) {
+    globalThis.console.log("Malformed workload section delimiters found; skipping without writing.")
+    return
+  }
+  if (!nextBody.trim()) {
+    globalThis.console.log("Refusing to write an empty PR description; skipping.")
+    return
+  }
   if (nextBody === pr.body) {
     globalThis.console.log("Workload view already current; nothing to do.")
     return
