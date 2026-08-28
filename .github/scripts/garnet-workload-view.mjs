@@ -83,9 +83,12 @@ function deltaFor(current, baseline) {
     )
   })
   return {
+    baselineByDestination,
+    currentByDestination,
     added,
     removed,
     changed,
+    destinationsSame: added.length === 0 && removed.length === 0,
     same: added.length === 0 && removed.length === 0 && changed.length === 0,
   }
 }
@@ -94,35 +97,60 @@ function renderProcesses(processes) {
   return processes.map((process) => `\`${process}\``).join(", ")
 }
 
-function renderRows(rows) {
+function renderRows(rows, baselineRows = null) {
+  const baselineByDestination = baselineRows ? mapByDestination(baselineRows) : null
+  const currentDestinations = new Set(rows.map((row) => row.destination))
+  const rendered = rows.map((row) => {
+    const previous = baselineByDestination?.get(row.destination)
+    const delta = !baselineByDestination
+      ? null
+      : !previous
+        ? "new"
+        : previous.chains === row.chains
+          ? "—"
+          : `${previous.chains} → ${row.chains}`
+    return {
+      ...row,
+      delta,
+    }
+  })
+  if (baselineRows) {
+    for (const row of baselineRows) {
+      if (!currentDestinations.has(row.destination)) {
+        rendered.push({ ...row, chains: 0, delta: "gone" })
+      }
+    }
+  }
+  rendered.sort((left, right) => right.chains - left.chains || left.destination.localeCompare(right.destination))
+  return rendered.map((row) => (
+    `| \`${renderDestination(row.destination)}\` | ${row.chains} | ${row.delta} | ${renderProcesses(row.processes)} |`
+  ))
+}
+
+function renderRowsWithoutDelta(rows) {
   return rows.map((row) => (
     `| \`${renderDestination(row.destination)}\` | ${row.chains} | ${renderProcesses(row.processes)} |`
   ))
 }
 
-function renderDeltaLines(delta, prefix = "") {
+function renderDeltaLines(delta) {
   const lines = []
   for (const row of delta.added) {
-    lines.push(`${prefix}+ \`${renderDestination(row.destination)}\` reached by ${renderProcesses(row.processes)}`)
+    lines.push(`+ \`${renderDestination(row.destination)}\` reached by ${renderProcesses(row.processes)}`)
   }
   for (const row of delta.removed) {
-    lines.push(`${prefix}− \`${renderDestination(row.destination)}\``)
-  }
-  for (const row of delta.changed) {
-    const previous = delta.baselineByDestination.get(row.destination)
-    lines.push(
-      `${prefix}~ \`${renderDestination(row.destination)}\` · ${previous.chains} → ${row.chains} chains · ` +
-      `${renderProcesses(previous.processes)} → ${renderProcesses(row.processes)}`,
-    )
+    lines.push(`− \`${renderDestination(row.destination)}\``)
   }
   return lines
 }
 
-function renderTable(rows) {
+function renderTable(rows, baselineRows = null) {
+  const headers = baselineRows
+    ? ["| destination | chains | Δ vs base | reached by |", "|---|---:|---|---|"]
+    : ["| destination | chains | reached by |", "|---|---:|---|"]
   return [
-    "| destination | chains | reached by |",
-    "|---|---:|---|",
-    ...renderRows(rows),
+    ...headers,
+    ...(baselineRows ? renderRows(rows, baselineRows) : renderRowsWithoutDelta(rows)),
   ]
 }
 
@@ -141,35 +169,43 @@ export function renderWorkloadBlock(profile, baselineProfile = null) {
 
   if (baseline) {
     const workloadDelta = deltaFor(current.workload, baseline.workload)
-    workloadDelta.baselineByDestination = mapByDestination(baseline.workload)
     const base7 = baselineProfile.run.commit_sha.slice(0, 7)
     if (workloadDelta.same) {
       lines.push(`**Workload behaviour unchanged vs \`${base7}\`** — same destinations, same reaching processes.`)
+    } else if (workloadDelta.destinationsSame) {
+      lines.push(
+        `**Workload destinations unchanged vs \`${base7}\`** — connection volume ` +
+        `${baseline.workloadChains} → ${current.workloadChains} chains.`,
+      )
     } else {
       lines.push(`**Workload behaviour vs \`${base7}\`: +${workloadDelta.added.length} −${workloadDelta.removed.length} destinations**`)
       lines.push(...renderDeltaLines(workloadDelta))
     }
     const platformDelta = deltaFor(current.platform, baseline.platform)
     if (!platformDelta.same) {
-      platformDelta.baselineByDestination = mapByDestination(baseline.platform)
-      lines.push(
-        `Platform delta: +${platformDelta.added.length} −${platformDelta.removed.length} destinations`,
-      )
-      lines.push(...renderDeltaLines(platformDelta, "Platform "))
+      lines.push(`runner platform: +${platformDelta.added.length} −${platformDelta.removed.length} destinations · not workload behaviour`)
     }
     lines.push("")
   }
 
+  const workloadBaselineRows = baseline?.workload || null
+  const platformBaselineRows = baseline?.platform || null
+  const workloadDestinationCount = current.workload.length + (workloadBaselineRows
+    ? workloadBaselineRows.filter((row) => !current.workload.some((currentRow) => currentRow.destination === row.destination)).length
+    : 0)
+  const platformDestinationCount = current.platform.length + (platformBaselineRows
+    ? platformBaselineRows.filter((row) => !current.platform.some((currentRow) => currentRow.destination === row.destination)).length
+    : 0)
   lines.push(
-    `<details open><summary>${current.workloadChains}&nbsp;workload chains · ${current.workload.length}&nbsp;destinations</summary>`,
+    `<details open><summary>${current.workloadChains}&nbsp;workload chains · ${workloadDestinationCount}&nbsp;destinations</summary>`,
     "",
-    ...renderTable(current.workload),
+    ...renderTable(current.workload, workloadBaselineRows),
     "",
     "</details>",
     "",
-    `<details><summary>runner platform · ${current.platformChains}&nbsp;chains · ${current.platform.length}&nbsp;destinations · no recorded workflow step</summary>`,
+    `<details><summary>runner platform · ${current.platformChains}&nbsp;chains · ${platformDestinationCount}&nbsp;destinations · no recorded workflow step</summary>`,
     "",
-    ...renderTable(current.platform),
+    ...renderTable(current.platform, platformBaselineRows),
     "",
     "</details>",
     "",
@@ -191,6 +227,13 @@ export function reconcileProfile(profile) {
     workloadDestinations: partition.workload.length,
     platformDestinations: partition.platform.length,
   }
+}
+
+export function renderProfile(headProfile, baselineProfile = null) {
+  return renderWorkloadBlock(
+    headProfile.profiles[0],
+    baselineProfile ? baselineProfile.profiles[0] : null,
+  )
 }
 
 async function github(path, init = {}) {
@@ -273,6 +316,7 @@ function upsert(body, block) {
   if (begin) {
     const after = body.slice(begin.index)
     const end = END_LINE_RE.exec(after)
+    if (!end) return null
     if (end) return body.slice(0, begin.index) + block + after.slice(end.index + end[0].length)
   }
   return `${body.trimEnd()}\n\n${block}\n`
@@ -296,13 +340,24 @@ async function main() {
     ? await fetchProfile(baselineIdentity.run_id, baselineIdentity.profile_id, "baseline")
     : null
   if (baselineIdentity && !baselineProfile) return
+  let usableBaselineProfile = baselineProfile
+  if (baselineProfile && baselineProfile.profiles[0].run.commit_sha !== baselineIdentity.commit) {
+    globalThis.console.log(
+      `Baseline profile commit mismatch (${baselineProfile.profiles[0].run.commit_sha.slice(0, 7)} != ${baselineIdentity.commit.slice(0, 7)}); rendering head-only.`,
+    )
+    usableBaselineProfile = null
+  }
   const pr = await github(`/repos/${repo}/pulls/${prNumber}`)
   if (pr.head?.sha !== headSha) {
     globalThis.console.log(`PR head moved (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); skipping stale profile.`)
     return
   }
   const bodyWithoutSection = removeSection(pr.body || "")
-  const block = renderWorkloadBlock(headProfile.profiles[0], baselineProfile.profiles[0])
+  if (bodyWithoutSection === null) {
+    globalThis.console.log("Malformed workload section delimiters found; skipping without writing.")
+    return
+  }
+  const block = renderProfile(headProfile, usableBaselineProfile)
   if (bodyWithoutSection.length + block.length > BODY_LIMIT) {
     globalThis.console.log("Workload view exceeds the PR description size budget; skipping.")
     return

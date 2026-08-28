@@ -7,6 +7,7 @@ import {
   destinationFor,
   reconcileProfile,
   renderDestination,
+  renderProfile,
   renderWorkloadBlock,
 } from "./garnet-workload-view.mjs"
 
@@ -67,8 +68,53 @@ test("renders the PR 17 fixture against the PR 30 baseline", async () => {
     platformDestinations: 23,
   })
   const block = renderWorkloadBlock(head, baseline)
-  assert.match(block, /\*\*Workload behaviour vs `ba67148`: \+0 −0 destinations\*\*/)
-  assert.match(block, /~ `github\[.\]com` · 14 → 23 chains/)
-  assert.match(block, /Platform delta: \+8 −6 destinations/)
-  assert.deepEqual(tableRowCounts(block), [10, 23])
+  assert.match(block, /\*\*Workload destinations unchanged vs `ba67148`\*\*/)
+  assert.match(block, /connection volume 131 → 187 chains\./)
+  assert.doesNotMatch(block, /^~/m)
+  assert.match(block, /runner platform: \+8 −6 destinations · not workload behaviour/)
+  assert.doesNotMatch(block, /^Platform /m)
+  assert.match(block, /\| destination \| chains \| Δ vs base \| reached by \|/)
+  assert.deepEqual(tableRowCounts(block), [10, 29])
+  for (const row of baseline.associations) {
+    if (classifyAssociation(row) === "workload") {
+      assert.ok(block.includes(`| \`${renderDestination(destinationFor(row))}\` |`))
+    }
+  }
+})
+
+test("renders the head-only path through the main render call", async () => {
+  const profile = await fixture("pr30-1b57225.json")
+  const block = renderProfile(profile, null)
+  assert.doesNotMatch(block, /vs `.*`/)
+  assert.match(block, /131&nbsp;workload chains/)
+})
+
+test("renders all three workload headline cases", async () => {
+  const baseline = await fixture("pr30-1b57225.json")
+  const identical = renderWorkloadBlock(baseline.profiles[0], baseline.profiles[0])
+  assert.match(identical, /\*\*Workload behaviour unchanged vs `ba67148`\*\*/)
+
+  const reduced = JSON.parse(JSON.stringify(baseline))
+  const dropped = reduced.profiles[0].associations.findIndex((association) => (
+    classifyAssociation(association) === "workload" && destinationFor(association) === "registry.npmjs.org"
+  ))
+  reduced.profiles[0].associations.splice(dropped, 1)
+  const volumeOnly = renderWorkloadBlock(reduced.profiles[0], baseline.profiles[0])
+  assert.match(volumeOnly, /\*\*Workload destinations unchanged vs `ba67148`/)
+  assert.match(volumeOnly, /connection volume 131 → 130 chains\./)
+
+  const changed = JSON.parse(JSON.stringify(baseline))
+  changed.profiles[0].associations = changed.profiles[0].associations.filter((association) => (
+    !(classifyAssociation(association) === "workload" && destinationFor(association) === "pnpm.io")
+  ))
+  changed.profiles[0].associations.push({
+    ...changed.profiles[0].associations.find((association) => classifyAssociation(association) === "workload"),
+    remote_address: "203.0.113.10",
+    remote_names: ["new.example.org"],
+  })
+  const destinationChange = renderWorkloadBlock(changed.profiles[0], baseline.profiles[0])
+  assert.match(destinationChange, /\*\*Workload behaviour vs `ba67148`: \+1 −1 destinations\*\*/)
+  assert.match(destinationChange, /^\+ `new\.example\[.\]org` reached by /m)
+  assert.match(destinationChange, /^− `pnpm\[.\]io`$/m)
+  assert.doesNotMatch(destinationChange, /^~/m)
 })
