@@ -97,6 +97,13 @@ export function evaluateGates({
       reasons.push(`job ${job.name} concluded ${job.conclusion}`)
     }
   }
+  const workloadRuns = workloadActivityCounts(cells, profiles)
+  for (const side of ["base", "head"]) {
+    if (cells.some((cell) => cell.side === side && cell.workload_present)
+      && workloadRuns[side] > 0 && workloadRuns[side] < 3) {
+      reasons.push(`workload activity recorded in ${workloadRuns[side]}/3 ${side} runs`)
+    }
+  }
   for (const link of profileLinks) {
     if (!link.url) reasons.push(`profile link missing in ${link.display_name}`)
     else if (link.public === false) reasons.push(`profile not public: ${link.identity}`)
@@ -119,14 +126,23 @@ export function evaluateGates({
   return { status: reasons.length ? "undeterminable" : "determinable", reasons }
 }
 
+export function workloadActivityCounts(cells, profiles) {
+  return ["base", "head"].reduce((counts, side) => {
+    const activeReps = new Set(cells
+      .filter((cell) => cell.side === side && cell.workload_present)
+      .map((cell) => {
+        const profile = profiles.find((item) => profileIdentity(item) === cell.profile_job)
+        return profile && profileSummary(profile).workload.size ? cell.rep : null
+      })
+      .filter((rep) => rep !== null))
+    counts[side] = activeReps.size
+    return counts
+  }, { base: 0, head: 0 })
+}
+
 export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) {
   const baseSha = meta.base
   const headSha = meta.head
-  const headline = status === "undeterminable"
-    ? `**undeterminable** — ${reasons.join("; ")}`
-    : diff.workload.added.length === 0 && diff.workload.removed.length === 0
-      ? "**workload unchanged** — same destinations and execution chains in all 3 runs per side"
-      : `**workload +${diff.workload.added.length} −${diff.workload.removed.length} destinations · +${diff.workload.chains.added.length} −${diff.workload.chains.removed.length} execution chains** (stable across all 3 runs per side)`
   const baseProfiles = profiles.filter((profile) => profileSide(profile) === "base")
   const headProfiles = profiles.filter((profile) => profileSide(profile) === "head")
   const allProfiles = [...baseProfiles, ...headProfiles]
@@ -136,10 +152,8 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
   const imageCell = cells.find((cell) => cell.image_os || cell.image_version) || {}
   const workloadTable = renderPartitionTable("workload", baseProfiles, headProfiles, diff.workload)
   const platformTable = renderPartitionTable("platform", baseProfiles, headProfiles, diff.platform)
-  const rowsAtHead = workloadTable.rows.filter((row) => row.head.reps > 0).length
-  const varianceAtHead = workloadTable.rows.filter((row) => row.delta === "variance").length
-  const platformRowsAtHead = platformTable.rows.filter((row) => row.head.reps > 0).length
-  const platformVariance = platformTable.rows.filter((row) => row.delta === "variance").length
+  const headline = renderHeadline(status, reasons, diff.workload, workloadTable.summary)
+  const workloadRuns = workloadActivityCounts(cells, profiles)
   const links = renderProfileLinks(profiles)
   const machine = {
     contract: "execution-diff/v1",
@@ -155,6 +169,10 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
       variance: diff.workload.variance,
       chains_added: diff.workload.chains.added.length,
       chains_removed: diff.workload.chains.removed.length,
+    },
+    capture: {
+      base_workload_runs: workloadRuns.base,
+      head_workload_runs: workloadRuns.head,
     },
     platform: {
       added: diff.platform.added,
@@ -175,7 +193,7 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
     "",
     `base \`${baseSha.slice(0, 7)}\` → head \`${headSha.slice(0, 7)}\` · \`Garnet Execution Diff\` / \`execution-diff\` · \`${RUNNER_LABEL}\`${imageCell.image_os || imageCell.image_version ? ` (${[imageCell.image_os, imageCell.image_version].filter(Boolean).join(" ")})` : ""} · 3 runs per side · ${headline}`,
     "",
-    `<details open><summary>workload · ${rowsAtHead} destinations at head · ${varianceAtHead} with run-to-run variance</summary>`,
+    `<details open><summary>${renderPartitionSummary("workload", workloadTable.summary)}</summary>`,
     "",
     ...workloadTable.lines,
     ...(diff.workload.chains.added.length || diff.workload.chains.removed.length
@@ -184,7 +202,7 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
     "",
     "</details>",
     "",
-    `<details><summary>runner platform · ${platformRowsAtHead} destinations at head · ${platformVariance} with run-to-run variance · no recorded workflow step, no Runner.Worker descent</summary>`,
+    `<details><summary>${renderPartitionSummary("runner platform", platformTable.summary)} · no recorded workflow step, no Runner.Worker descent</summary>`,
     "",
     ...platformTable.lines,
     ...(diff.platform.chains.added.length || diff.platform.chains.removed.length
@@ -270,6 +288,7 @@ function renderPartitionTable(partition, baseProfiles, headProfiles, diff) {
   const base = stableSets(baseProfiles.map(profileSummary))
   const head = stableSets(headProfiles.map(profileSummary))
   const destinations = new Set([...base[partition].details.keys(), ...head[partition].details.keys()])
+  const chainVariance = new Set((diff.chains?.variance || []).map((chain) => chain.slice(chain.lastIndexOf(" → ") + 3)))
   const rows = [...destinations].map((destination) => {
     const baseDetail = base[partition].details.get(destination) || emptyDetail()
     const headDetail = head[partition].details.get(destination) || emptyDetail()
@@ -277,13 +296,22 @@ function renderPartitionTable(partition, baseProfiles, headProfiles, diff) {
       ? "new"
       : diff.removed.includes(destination)
         ? "gone"
-        : diff.variance.includes(destination) || baseDetail.reps < 3 || headDetail.reps < 3
+        : diff.variance.includes(destination) || chainVariance.has(destination)
           ? "variance"
           : "—"
     return { destination, base: baseDetail, head: headDetail, delta }
   }).sort((left, right) => right.head.chainsMax - left.head.chainsMax || left.destination.localeCompare(right.destination))
+  const summary = {
+    total: rows.length,
+    atHead: rows.filter((row) => row.head.reps > 0).length,
+    baseOnly: rows.filter((row) => row.head.reps === 0 && row.base.reps > 0).length,
+    variance: rows.filter((row) => row.delta === "variance").length,
+    stableChanges: rows.filter((row) => row.delta === "new" || row.delta === "gone").length,
+    unchanged: rows.filter((row) => row.delta === "—").length,
+  }
   return {
     rows,
+    summary,
     lines: rows.length
       ? [
         "| destination | base | head | Δ | reached by |",
@@ -292,6 +320,27 @@ function renderPartitionTable(partition, baseProfiles, headProfiles, diff) {
       ]
       : ["none recorded"],
   }
+}
+
+function renderHeadline(status, reasons, diff, summary) {
+  if (status === "undeterminable") return `**undeterminable** — ${reasons.join("; ")}`
+  const stableDestinationChanges = diff.added.length + diff.removed.length
+  const stableChainChanges = diff.chains.added.length + diff.chains.removed.length
+  if (!stableDestinationChanges && !stableChainChanges) {
+    if (summary.variance) {
+      const noun = summary.variance === 1 ? "destination" : "destinations"
+      const verb = summary.variance === 1 ? "differs" : "differ"
+      return `**workload: no stable change** — ${summary.variance} ${noun} ${verb} between runs`
+    }
+    return "**workload unchanged** — same destinations and execution chains in all 3 runs per side"
+  }
+  const variance = summary.variance ? ` · ${summary.variance} with run-to-run variance` : ""
+  return `**workload +${diff.added.length} ${noun(diff.added.length, "destination")} −${diff.removed.length} ${noun(diff.removed.length, "destination")} · +${diff.chains.added.length} ${noun(diff.chains.added.length, "execution chain")} −${diff.chains.removed.length} ${noun(diff.chains.removed.length, "execution chain")}${variance}** (stable across all 3 runs per side)`
+}
+
+function renderPartitionSummary(partition, summary) {
+  const coverage = summary.baseOnly ? ` (${summary.atHead} at head, ${summary.baseOnly} base only)` : ""
+  return `${partition} · ${plural(summary.total, "destination")}${coverage} · ${summary.variance} with run-to-run variance · ${plural(summary.stableChanges, "stable change")}`
 }
 
 function renderChainChanges(diff) {
@@ -307,6 +356,14 @@ function formatDetail(detail) {
     ? `${detail.chainsMin} chain${detail.chainsMin === 1 ? "" : "s"}`
     : `${detail.chainsMin}–${detail.chainsMax} chains`
   return `${detail.reps}/3 · ${range}`
+}
+
+function plural(count, singular) {
+  return `${count} ${count === 1 ? singular : `${singular}s`}`
+}
+
+function noun(count, singular) {
+  return count === 1 ? singular : `${singular}s`
 }
 
 function emptyDetail() {

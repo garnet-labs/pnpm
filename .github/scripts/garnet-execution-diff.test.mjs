@@ -13,6 +13,7 @@ import {
   stableSets,
   summarizeProfile,
   upsertExecutionDiff,
+  workloadActivityCounts,
 } from "./garnet-execution-diff.mjs"
 
 const actionSha = "c747ff1f597c84579e10173301a31c30bb815181"
@@ -93,7 +94,7 @@ test("a destination added in all head repetitions is new", () => {
   assert.deepEqual(diff.workload.added, ["github.com"])
   assert.equal(diff.workload.chains.added.length, 1)
   const block = receipt(diff, "determinable", [...base.slice(0, 3), ...head.slice(3)])
-  assert.match(block, /\*\*workload \+1 −0 destinations · \+1 −0 execution chains\*\*/)
+  assert.match(block, /\*\*workload \+1 destination −0 destinations · \+1 execution chain −0 execution chains\*\*/)
   assert.match(block, /\| `github\[.\]com` \| 0\/3 \| 3\/3 · 1 chain \| new \|/)
   const foldStart = block.indexOf("<details open>")
   const foldEnd = block.indexOf("</details>", foldStart)
@@ -111,7 +112,7 @@ test("a destination in one repetition is variance, not added", () => {
   assert.deepEqual(diff.workload.added, [])
   assert.deepEqual(diff.workload.variance, ["github.com"])
   const block = receipt(diff, "determinable", [...base.slice(0, 3), ...head.slice(3)])
-  assert.match(block, /\*\*workload unchanged\*\*/)
+  assert.match(block, /\*\*workload: no stable change\*\* — 1 destination differs between runs/)
   assert.match(block, /\| `github\[.\]com` \| 0\/3 \| 1\/3 · 1 chain \| variance \|/)
 })
 
@@ -122,6 +123,7 @@ test("a destination gone from every head repetition is removed", () => {
   assert.deepEqual(diff.workload.removed, ["registry.npmjs.org"])
   const block = receipt(diff, "determinable", [...base.slice(0, 3), ...head.slice(3)])
   assert.match(block, /\| `registry\.npmjs\[.\]org` \| 3\/3 · 1 chain \| 0\/3 \| gone \|/)
+  assert.match(block, /<summary>workload · 1 destination \(0 at head, 1 base only\) · 0 with run-to-run variance · 1 stable change<\/summary>/)
 })
 
 test("platform-only changes do not affect the workload headline", () => {
@@ -278,7 +280,7 @@ test("summary counts are adjacent to rendered rows", () => {
     : item)
   const diff = diffSides(sideSummaries(base.slice(0, 3)), sideSummaries(head.slice(3)))
   const block = receipt(diff, "determinable", [...base.slice(0, 3), ...head.slice(3)])
-  assert.match(block, /workload · 1 destinations at head · 1 with run-to-run variance/)
+  assert.match(block, /workload · 1 destination · 1 with run-to-run variance · 0 stable changes/)
 })
 
 test("machine marker is valid JSON", () => {
@@ -289,6 +291,108 @@ test("machine marker is valid JSON", () => {
   assert.equal(machine.status, "determinable")
   assert.equal(machine.base, "b".repeat(40))
   assert.equal(machine.head, "h".repeat(40))
+  assert.deepEqual(machine.capture, { base_workload_runs: 3, head_workload_runs: 3 })
+})
+
+test("partial workload capture is undeterminable", () => {
+  const profiles = fixtureSet().map((item, index) => index === 4 || index === 5
+    ? { ...item, profiles: [{ ...item.profiles[0], associations: [] }] }
+    : item)
+  const result = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: cells(),
+    jobs: cells().map((cell) => ({ name: `execution-diff (${cell.side}, ${cell.rep})`, conclusion: "success" })),
+    profiles,
+    headSha: "h".repeat(40),
+    runId: "99",
+  })
+  assert.deepEqual(workloadActivityCounts(cells(), profiles), { base: 3, head: 1 })
+  assert.match(result.reasons.join("; "), /workload activity recorded in 1\/3 head runs/)
+  const block = renderReceipt({
+    status: result.status,
+    reasons: result.reasons,
+    meta: { base: "e".repeat(40), head: "h".repeat(40), run_id: "99", action_sha: actionSha },
+    diff: {
+      workload: { added: [], removed: [], variance: [], chains: { added: [], removed: [] } },
+      platform: { added: [], removed: [], variance: [], chains: { added: [], removed: [] } },
+    },
+    profiles,
+    cells: cells(),
+  })
+  assert.doesNotMatch(block, /\| `registry\.npmjs\[.\]org` \| .* \| .* \| variance \|/)
+})
+
+test("complete and absent workload activity do not trigger partial capture", () => {
+  const complete = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: cells(),
+    jobs: cells().map((cell) => ({ name: `execution-diff (${cell.side}, ${cell.rep})`, conclusion: "success" })),
+    profiles: fixtureSet(),
+    headSha: "h".repeat(40),
+    runId: "99",
+  })
+  const absentProfiles = fixtureSet().map((item, index) => index >= 3
+    ? { ...item, profiles: [{ ...item.profiles[0], associations: [] }] }
+    : item)
+  const absentCells = cells().map((cell) => cell.side === "head" ? { ...cell, workload_present: true } : cell)
+  const absent = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: absentCells,
+    jobs: absentCells.map((cell) => ({ name: `execution-diff (${cell.side}, ${cell.rep})`, conclusion: "success" })),
+    profiles: absentProfiles,
+    headSha: "h".repeat(40),
+    runId: "99",
+  })
+  assert.equal(complete.reasons.some((reason) => reason.includes("workload activity recorded")), false)
+  assert.equal(absent.reasons.some((reason) => reason.includes("workload activity recorded")), false)
+})
+
+function assertFoldCounts(block, label) {
+  const start = block.indexOf(`<summary>${label}`)
+  const end = block.indexOf("</details>", start)
+  const section = block.slice(start, end)
+  const summary = section.match(new RegExp(`<summary>${label} · (\\d+) destinations?(?: \\((\\d+) at head, (\\d+) base only\\))? · (\\d+) with run-to-run variance · (\\d+) stable changes?(?: · [^<]+)?</summary>`))
+  assert.ok(summary)
+  const total = Number(summary[1])
+  const atHead = summary[2] === undefined ? total : Number(summary[2])
+  const baseOnly = summary[3] === undefined ? 0 : Number(summary[3])
+  const variance = Number(summary[4])
+  const stableChanges = Number(summary[5])
+  const rows = section.split("\n").filter((line) => line.startsWith("| `"))
+  const rowAtHead = rows.filter((line) => Number(line.split("|")[3].trim().match(/^(\d+)\/3/)?.[1] || 0) > 0).length
+  const rowVariance = rows.filter((line) => line.split("|")[4].trim() === "variance").length
+  const rowStableChanges = rows.filter((line) => ["new", "gone"].includes(line.split("|")[4].trim())).length
+  assert.equal(rows.length, total)
+  assert.equal(atHead + baseOnly, total)
+  assert.equal(rowAtHead, atHead)
+  assert.equal(rowVariance, variance)
+  assert.equal(rowStableChanges, stableChanges)
+  assert.equal(variance + stableChanges + rows.filter((line) => line.split("|")[4].trim() === "—").length, total)
+}
+
+test("fold summaries reconcile with rendered rows", () => {
+  const base = fixtureSet()
+  const head = fixtureSet().map((item, index) => index === 3
+    ? { ...item, profiles: [{ ...item.profiles[0], associations: [] }] }
+    : item)
+  const diff = diffSides(sideSummaries(base.slice(0, 3)), sideSummaries(head.slice(3)))
+  const block = receipt(diff, "determinable", [...base.slice(0, 3), ...head.slice(3)])
+  assertFoldCounts(block, "workload")
+  assertFoldCounts(block, "runner platform")
+})
+
+test("fold summaries reconcile for the real profile fixture", async () => {
+  const fixture = JSON.parse(await readFile(new URL("./__fixtures__/pr30-1b57225.json", import.meta.url)))
+  const profiles = ["base", "head"].flatMap((side) => [1, 2, 3].map((rep) => ({
+    ...fixture,
+    execution_diff: { identity: `execution-diff/${side}/${rep}`, side, rep, url: "https://example.test/profile" },
+  })))
+  const syntheticCells = cells()
+  const summaries = profiles.map((item) => summarizeProfile(item.profiles[0]))
+  const diff = diffSides(stableSets(summaries.slice(0, 3)), stableSets(summaries.slice(3)))
+  const block = receipt(diff, "determinable", profiles)
+  assertFoldCounts(block, "workload")
+  assertFoldCounts(block, "runner platform")
 })
 
 test("upsert replaces, appends, and rejects malformed delimiters", () => {
