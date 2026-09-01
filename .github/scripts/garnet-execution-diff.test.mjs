@@ -4,6 +4,7 @@ import test from "node:test"
 
 import {
   chainIdentity,
+  dedupeProfiles,
   diffSides,
   evaluateGates,
   renderReceipt,
@@ -50,6 +51,7 @@ function cells() {
     expected_sha: "e".repeat(40),
     executed_sha: "e".repeat(40),
     job: `execution-diff-${side}-${rep}`,
+    workload_present: true,
     runner_name: "GitHub Actions 1",
     image_os: "ubuntu24",
     image_version: "20260901.1",
@@ -91,6 +93,11 @@ test("a destination added in all head repetitions is new", () => {
   const block = receipt(diff, "determinable", [...base.slice(0, 3), ...head.slice(3)])
   assert.match(block, /\*\*workload \+1 −0 destinations · \+1 −0 execution chains\*\*/)
   assert.match(block, /\| `github\[.\]com` \| 0\/3 \| 3\/3 · 1 chain \| new \|/)
+  const foldStart = block.indexOf("<details open>")
+  const foldEnd = block.indexOf("</details>", foldStart)
+  const chainDiff = block.indexOf("```diff", foldStart)
+  assert.ok(foldStart < chainDiff && chainDiff < foldEnd)
+  assert.match(block, /^\+ Runner\.Worker › node → github\[.\]com$/m)
 })
 
 test("a destination in one repetition is variance, not added", () => {
@@ -139,9 +146,52 @@ test("all gate failures are collected", () => {
   })
   assert.equal(result.status, "undeterminable")
   assert.match(result.reasons.join("; "), /PR head moved/)
+  assert.match(result.reasons.join("; "), /base moved/)
   assert.match(result.reasons.join("; "), /executed commit mismatch/)
   assert.match(result.reasons.join("; "), /job execution-diff-base-1 concluded failure/)
+  assert.match(result.reasons.join("; "), /jobs found: 1\/6/)
   assert.match(result.reasons.join("; "), /profiles published: 5\/6/)
+})
+
+test("missing workload fixtures make the affected side undeterminable", () => {
+  const missingBase = cells().map((cell) => cell.side === "base" ? { ...cell, workload_present: false } : cell)
+  const result = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: missingBase,
+    jobs: cells().map((cell) => ({ name: cell.job, conclusion: "success" })),
+    profiles: fixtureSet(),
+    headSha: "h".repeat(40),
+    runId: "99",
+  })
+  assert.match(result.reasons.join("; "), /workload fixture absent at base/)
+})
+
+test("missing execution jobs are reported", () => {
+  const result = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: cells(),
+    jobs: cells().slice(0, 5).map((cell) => ({ name: cell.job, conclusion: "success" })),
+    profiles: fixtureSet(),
+    headSha: "h".repeat(40),
+    runId: "99",
+  })
+  assert.match(result.reasons.join("; "), /jobs found: 5\/6/)
+})
+
+test("profile dedupe keeps the latest timestamp for each job", () => {
+  const older = profile("execution-diff/base/1", [assoc({ name: "old.example.com" })])
+  older.profiles[0].timestamp = "2025-01-01T00:00:00.000Z"
+  const newer = profile("execution-diff/base/1", [assoc({ name: "new.example.com" })])
+  newer.profiles[0].timestamp = "2025-01-02T00:00:00.000Z"
+  const result = dedupeProfiles([newer, older])
+  assert.equal(result.length, 1)
+  assert.equal(result[0].profiles[0].associations[0].remote_names[0], "new.example.com")
+})
+
+test("empty platform partitions render none recorded", () => {
+  const diff = diffSides(sideSummaries(fixtureSet().slice(0, 3)), sideSummaries(fixtureSet().slice(3)))
+  const block = receipt(diff)
+  assert.match(block, /<details><summary>runner platform[\s\S]*?\nnone recorded\n\n<\/details>/)
 })
 
 test("lineage loss is undeterminable", () => {

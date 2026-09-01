@@ -20,6 +20,7 @@ const COMMIT_RE = /<!--\s*garnet:commit\s+([0-9a-f]{40})\s*-->/
 const PROFILE_RE = /https:\/\/app\.garnet\.ai\/public\/runs\/(\d+)\?profile=([0-9a-f-]+)/gi
 const PROFILE_JOB_RE = /^execution-diff\/(base|head)\/([123])$/
 const BODY_LIMIT = 65536
+const RUNNER_LABEL = "ubuntu-24.04"
 const env = globalThis.process.env
 const api = env.GITHUB_API_URL || "https://api.github.com"
 
@@ -71,7 +72,10 @@ export function diffSides(base, head) {
 export function evaluateGates({ pr, cells, jobs, profiles, headSha, runId }) {
   const reasons = []
   if (pr.head?.sha !== headSha) reasons.push("PR head moved")
+  if (cells.some((cell) => cell.side === "base" && cell.expected_sha !== pr.base?.sha)) reasons.push("base moved")
   if (cells.length < 6) reasons.push(`cell artifacts: ${cells.length}/6`)
+  const absentWorkloadSides = new Set(cells.filter((cell) => !cell.workload_present).map((cell) => cell.side))
+  for (const side of [...absentWorkloadSides].sort()) reasons.push(`workload fixture absent at ${side}`)
   for (const cell of cells) {
     if (cell.executed_sha !== cell.expected_sha) {
       reasons.push(`executed commit mismatch in ${cell.profile_job}`)
@@ -80,12 +84,13 @@ export function evaluateGates({ pr, cells, jobs, profiles, headSha, runId }) {
   const executionJobs = jobs.filter((job) => (
     /^execution-diff(?: \((?:base|head), [123]\)|-(?:base|head)-[123])$/.test(job.name)
   ))
+  if (executionJobs.length < 6) reasons.push(`jobs found: ${executionJobs.length}/6`)
   for (const job of executionJobs) {
     if (job.conclusion !== "success") {
       reasons.push(`job ${job.name} concluded ${job.conclusion}`)
     }
   }
-  const matchingProfiles = profiles.filter((profile) => {
+  const matchingProfiles = dedupeProfiles(profiles).filter((profile) => {
     const run = profile.profiles?.[0]?.run || profile.run
     return String(run?.run_id) === String(runId) && PROFILE_JOB_RE.test(run?.job || "")
   })
@@ -106,6 +111,17 @@ export function evaluateGates({ pr, cells, jobs, profiles, headSha, runId }) {
   ), 0)
   if (lineageMissing) reasons.push(`lineage not recorded for ${lineageMissing} chains`)
   return { status: reasons.length ? "undeterminable" : "determinable", reasons }
+}
+
+export function dedupeProfiles(profiles) {
+  const unique = new Map()
+  for (const profile of profiles) {
+    const run = profileRun(profile)
+    if (!run?.job) continue
+    const current = unique.get(run.job)
+    if (!current || profileTimestamp(profile) >= profileTimestamp(current)) unique.set(run.job, profile)
+  }
+  return [...unique.values()]
 }
 
 export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) {
@@ -137,7 +153,7 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
     head: headSha,
     run_id: String(meta.run_id),
     repetitions: 3,
-    runner: "ubuntu-24.04",
+    runner: RUNNER_LABEL,
     workload: {
       added: diff.workload.added,
       removed: diff.workload.removed,
@@ -162,20 +178,23 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
     BEGIN,
     "## Execution diff (Garnet)",
     "",
-    `base \`${baseSha.slice(0, 7)}\` → head \`${headSha.slice(0, 7)}\` · \`Garnet Execution Diff\` / \`execution-diff\` · \`ubuntu-24.04\` (${imageCell.image_os || "unknown"} ${imageCell.image_version || "unknown"}) · 3 runs per side · ${headline}`,
+    `base \`${baseSha.slice(0, 7)}\` → head \`${headSha.slice(0, 7)}\` · \`Garnet Execution Diff\` / \`execution-diff\` · \`${RUNNER_LABEL}\`${imageCell.image_os || imageCell.image_version ? ` (${[imageCell.image_os, imageCell.image_version].filter(Boolean).join(" ")})` : ""} · 3 runs per side · ${headline}`,
     "",
     `<details open><summary>workload · ${rowsAtHead} destinations at head · ${varianceAtHead} with run-to-run variance</summary>`,
     "",
     ...workloadTable.lines,
+    ...(diff.workload.chains.added.length || diff.workload.chains.removed.length
+      ? ["", "```diff", ...renderChainChanges(diff.workload), "```"]
+      : []),
     "",
     "</details>",
-    ...(diff.workload.chains.added.length || diff.workload.chains.removed.length
-      ? ["", ...renderChainChanges(diff.workload)]
-      : []),
     "",
     `<details><summary>runner platform · ${platformRowsAtHead} destinations at head · ${platformVariance} with run-to-run variance · no recorded workflow step, no Runner.Worker descent</summary>`,
     "",
     ...platformTable.lines,
+    ...(diff.platform.chains.added.length || diff.platform.chains.removed.length
+      ? ["", "```diff", ...renderChainChanges(diff.platform), "```"]
+      : []),
     "",
     "</details>",
     "",
@@ -270,18 +289,20 @@ function renderPartitionTable(partition, baseProfiles, headProfiles, diff) {
   }).sort((left, right) => right.head.chainsMax - left.head.chainsMax || left.destination.localeCompare(right.destination))
   return {
     rows,
-    lines: [
-      "| destination | base | head | Δ | reached by |",
-      "|---|---|---|---|---|",
-      ...rows.map((row) => `| \`${renderDestination(row.destination)}\` | ${formatDetail(row.base)} | ${formatDetail(row.head)} | ${row.delta} | ${row.head.processes.length || row.base.processes.length ? [...new Set([...row.base.processes, ...row.head.processes])].sort().map((process) => `\`${process}\``).join(", ") : "—"} |`),
-    ],
+    lines: rows.length
+      ? [
+        "| destination | base | head | Δ | reached by |",
+        "|---|---|---|---|---|",
+        ...rows.map((row) => `| \`${renderDestination(row.destination)}\` | ${formatDetail(row.base)} | ${formatDetail(row.head)} | ${row.delta} | ${row.head.processes.length || row.base.processes.length ? [...new Set([...row.base.processes, ...row.head.processes])].sort().map((process) => `\`${process}\``).join(", ") : "—"} |`),
+      ]
+      : ["none recorded"],
   }
 }
 
 function renderChainChanges(diff) {
   return [
-    ...diff.chains.added.map((chain) => `+ ${chain}`),
-    ...diff.chains.removed.map((chain) => `− ${chain}`),
+    ...diff.chains.added.map((chain) => `+ ${renderChain(chain)}`),
+    ...diff.chains.removed.map((chain) => `- ${renderChain(chain)}`),
   ]
 }
 
@@ -313,6 +334,19 @@ function profileSide(profile) {
   return profileRun(profile).job.split("/")[1]
 }
 
+function profileTimestamp(profile) {
+  const timestamp = profile.profiles?.[0]?.timestamp || profile.timestamp
+  const value = Date.parse(timestamp || "")
+  return Number.isNaN(value) ? 0 : value
+}
+
+function renderChain(chain) {
+  const separator = " → "
+  const index = chain.lastIndexOf(separator)
+  if (index < 0) return chain
+  return `${chain.slice(0, index)}${separator}${renderDestination(chain.slice(index + separator.length))}`
+}
+
 function renderProfileLinks(profiles) {
   return ["base", "head"].flatMap((side) => {
     const links = profiles
@@ -340,9 +374,14 @@ async function main() {
     github(`/repos/${env.GITHUB_REPOSITORY}/actions/runs/${env.RUN_ID}/artifacts?per_page=100`),
   ])
   const cells = await readCells(artifactsResponse.artifacts || [])
-  const profiles = await pollProfiles()
+  const profiles = dedupeProfiles(await pollProfiles())
+  const latestPr = await github(`/repos/${env.GITHUB_REPOSITORY}/pulls/${env.PR_NUMBER}`)
+  if (latestPr.head?.sha !== env.HEAD_SHA) {
+    console.log(`PR head moved (${latestPr.head?.sha} != ${env.HEAD_SHA}); skipping stale execution diff.`)
+    return
+  }
   const gate = evaluateGates({
-    pr,
+    pr: latestPr,
     cells,
     jobs: jobsResponse.jobs || [],
     profiles,
@@ -359,7 +398,7 @@ async function main() {
     status: gate.status,
     reasons: gate.reasons,
     meta: {
-      base: cells.find((cell) => cell.side === "base")?.expected_sha || "",
+      base: latestPr.base?.sha || "",
       head: env.HEAD_SHA,
       run_id: env.RUN_ID,
       action_sha: "c747ff1f597c84579e10173301a31c30bb815181",
@@ -368,12 +407,12 @@ async function main() {
     profiles,
     cells,
   })
-  const nextBody = upsertExecutionDiff(pr.body || "", block)
+  const nextBody = upsertExecutionDiff(latestPr.body || "", block)
   if (nextBody === null) {
     console.log("Malformed execution diff delimiters found; skipping without writing.")
     return
   }
-  if ((pr.body || "").replace(BEGIN, "").replace(END, "").length + block.length > BODY_LIMIT) {
+  if ((latestPr.body || "").replace(BEGIN, "").replace(END, "").length + block.length > BODY_LIMIT) {
     console.log("Execution diff exceeds the PR description size budget; skipping.")
     return
   }
@@ -381,7 +420,7 @@ async function main() {
     console.log("Refusing to write an empty PR description; skipping.")
     return
   }
-  if (nextBody === pr.body) {
+  if (nextBody === latestPr.body) {
     console.log("Execution diff already current; nothing to do.")
     return
   }

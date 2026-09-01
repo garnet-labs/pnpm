@@ -30,18 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: garnet-workload-source
-          persist-credentials: false
-          sparse-checkout: .garnet/execution-diff
-          sparse-checkout-cone-mode: true
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
           ref: ${{ matrix.side == 'base' && github.event.pull_request.base.sha || github.event.pull_request.head.sha }}
           persist-credentials: false
           fetch-depth: 1
-          clean: false
 
       - name: Verify executed commit
         shell: bash
@@ -50,9 +41,6 @@ jobs:
           actual=$(git rev-parse HEAD)
           [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
 
-      - name: Restore selected workload fixture
-        run: cp -R garnet-workload-source/.garnet/execution-diff .garnet/
-
       - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
@@ -60,7 +48,16 @@ jobs:
           GARNET_PROFILE_JOB: execution-diff/${{ matrix.side }}/${{ matrix.rep }}
 
       - name: Run selected workload
-        run: npm install --prefix .garnet/execution-diff --no-package-lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .garnet/execution-diff/package.json ]; then
+            npm install --prefix .garnet/execution-diff --no-package-lock
+            echo "WORKLOAD_PRESENT=true" >> "$GITHUB_ENV"
+          else
+            echo "workload fixture absent at $EXPECTED_SHA"
+            echo "WORKLOAD_PRESENT=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Record cell
         shell: bash
@@ -86,6 +83,7 @@ jobs:
               run_id: process.env.GITHUB_RUN_ID,
               run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
               job: process.env.GITHUB_JOB,
+              workload_present: process.env.WORKLOAD_PRESENT === "true",
               runner_name: process.env.RUNNER_NAME,
               runner_os: process.env.RUNNER_OS,
               runner_arch: process.env.RUNNER_ARCH,
