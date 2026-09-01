@@ -322,6 +322,37 @@ test("partial workload capture is undeterminable", () => {
   assert.doesNotMatch(block, /\| `registry\.npmjs\[.\]org` \| .* \| .* \| variance \|/)
 })
 
+test("undeterminable receipts retain observed execution differences", () => {
+  const base = fixtureSet().slice(0, 3)
+  const head = fixtureSet().slice(3).map((item) => ({
+    ...item,
+    profiles: [{ ...item.profiles[0], associations: [...item.profiles[0].associations, assoc({ name: "github.com" })] }],
+  }))
+  const profiles = [...base, ...head]
+  const result = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: cells().map((cell) => cell.side === "base" ? { ...cell, workload_present: false } : cell),
+    jobs: cells().map((cell) => ({ name: `execution-diff (${cell.side}, ${cell.rep})`, conclusion: "success" })),
+    profiles,
+    headSha: "h".repeat(40),
+    runId: "99",
+  })
+  const diff = diffSides(sideSummaries(base), sideSummaries(head))
+  const block = renderReceipt({
+    status: result.status,
+    reasons: result.reasons,
+    meta: { base: "e".repeat(40), head: "h".repeat(40), run_id: "99", action_sha: actionSha },
+    diff,
+    profiles,
+    cells: cells().map((cell) => cell.side === "base" ? { ...cell, workload_present: false } : cell),
+  })
+  assert.match(block, /<summary>workload · 2 destinations · 0 with run-to-run variance · 1 stable change<\/summary>/)
+  assert.match(block, /\| `github\[.\]com` \| 0\/3 \| 3\/3 · 1 chain \| new \|/)
+  const marker = JSON.parse(block.match(/<!-- garnet:execution-diff:summary (.+) -->/)[1])
+  assert.equal(marker.status, "undeterminable")
+  assert.deepEqual(marker.workload.added, ["github.com"])
+})
+
 test("complete and absent workload activity do not trigger partial capture", () => {
   const complete = evaluateGates({
     pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },

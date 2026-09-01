@@ -446,12 +446,10 @@ async function main() {
     runId: env.RUN_ID,
     mergeCommitSha: latestPr.merge_commit_sha,
   })
-  const diff = gate.status === "determinable"
-    ? diffSides(
-      stableSets(cells.filter((cell) => cell.side === "base").map((cell) => profileSummary(profiles.find((profile) => profileIdentity(profile) === cell.profile_job)))),
-      stableSets(cells.filter((cell) => cell.side === "head").map((cell) => profileSummary(profiles.find((profile) => profileIdentity(profile) === cell.profile_job)))),
-    )
-    : emptyDiff()
+  const diff = diffSides(
+    stableSets(profiles.filter((profile) => profileSide(profile) === "base").map(profileSummary)),
+    stableSets(profiles.filter((profile) => profileSide(profile) === "head").map(profileSummary)),
+  )
   const block = renderReceipt({
     status: gate.status,
     reasons: gate.reasons,
