@@ -13,7 +13,7 @@ import {
 } from "./garnet-workload-view.mjs"
 
 async function fixture(name) {
-  return JSON.parse(await readFile(`/home/ubuntu/garnet-profiles/${name}`, "utf8"))
+  return JSON.parse(await readFile(new URL(`./__fixtures__/${name}`, import.meta.url), "utf8"))
 }
 
 function tableRowCounts(block) {
