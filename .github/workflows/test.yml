@@ -20,6 +20,10 @@ on:
         required: false
         type: string
         default: ''
+      cell_id:
+        required: false
+        type: string
+        default: ''
       test_chunk:
         required: false
         type: string
@@ -39,7 +43,7 @@ jobs:
   test:
     name: Node ${{ inputs.node_major }} / chunk ${{ inputs.test_chunk }}/${{ inputs.test_chunk_total }}
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.platform }}-${{ inputs.node }}-${{ inputs.test_chunk }}-${{ inputs.test_chunk_total }}
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.platform }}-${{ inputs.node }}-${{ inputs.test_chunk }}-${{ inputs.test_chunk_total }}-${{ inputs.cell_id }}
       cancel-in-progress: true
 
     runs-on: ${{ inputs.platform }}
