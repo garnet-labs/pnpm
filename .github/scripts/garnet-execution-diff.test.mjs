@@ -4,9 +4,11 @@ import test from "node:test"
 
 import {
   chainIdentity,
-  dedupeProfiles,
   diffSides,
+  executionJob,
   evaluateGates,
+  extractProfileLink,
+  profileLinksFromLogs,
   renderReceipt,
   stableSets,
   summarizeProfile,
@@ -178,14 +180,74 @@ test("missing execution jobs are reported", () => {
   assert.match(result.reasons.join("; "), /jobs found: 5\/6/)
 })
 
-test("profile dedupe keeps the latest timestamp for each job", () => {
-  const older = profile("execution-diff/base/1", [assoc({ name: "old.example.com" })])
-  older.profiles[0].timestamp = "2025-01-01T00:00:00.000Z"
-  const newer = profile("execution-diff/base/1", [assoc({ name: "new.example.com" })])
-  newer.profiles[0].timestamp = "2025-01-02T00:00:00.000Z"
-  const result = dedupeProfiles([newer, older])
-  assert.equal(result.length, 1)
-  assert.equal(result[0].profiles[0].associations[0].remote_names[0], "new.example.com")
+test("matrix job logs identify profiles by side and repetition", () => {
+  const jobs = [
+    { id: 11, name: "execution-diff (base, 2)" },
+    { id: 12, name: "unrelated" },
+  ]
+  const logs = new Map([[
+    11,
+    "Garnet Run Profile report: https://app.garnet.ai/public/runs/99?profile=abc-123&utm_source=github",
+  ]])
+  assert.deepEqual(executionJob(jobs[0].name), {
+    id: undefined,
+    side: "base",
+    rep: 2,
+    identity: "execution-diff/base/2",
+    display_name: jobs[0].name,
+  })
+  assert.deepEqual(extractProfileLink(logs.get(11)), {
+    url: "https://app.garnet.ai/public/runs/99?profile=abc-123",
+    run_id: "99",
+    profile_id: "abc-123",
+  })
+  assert.deepEqual(profileLinksFromLogs(jobs, logs), [{
+    id: 11,
+    side: "base",
+    rep: 2,
+    identity: "execution-diff/base/2",
+    display_name: jobs[0].name,
+    url: "https://app.garnet.ai/public/runs/99?profile=abc-123",
+    run_id: "99",
+    profile_id: "abc-123",
+  }])
+})
+
+test("missing profile links and non-public profiles are gate reasons", () => {
+  const links = [
+    { display_name: "execution-diff (base, 2)", identity: "execution-diff/base/2" },
+    { display_name: "execution-diff (head, 1)", identity: "execution-diff/head/1", url: "https://app.garnet.ai/public/runs/99?profile=missing", public: false },
+  ]
+  const result = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: cells(),
+    jobs: cells().map((cell) => ({ name: `execution-diff (${cell.side}, ${cell.rep})`, conclusion: "success" })),
+    profiles: fixtureSet(),
+    profileLinks: links,
+    headSha: "h".repeat(40),
+    mergeCommitSha: undefined,
+    runId: "99",
+  })
+  assert.match(result.reasons.join("; "), /profile link missing in execution-diff \(base, 2\)/)
+  assert.match(result.reasons.join("; "), /profile not public: execution-diff\/head\/1/)
+})
+
+test("profile commit gate accepts the merge commit", () => {
+  const merge = "m".repeat(40)
+  const profiles = fixtureSet().map((item) => ({
+    ...item,
+    profiles: [{ ...item.profiles[0], run: { ...item.profiles[0].run, commit_sha: merge } }],
+  }))
+  const result = evaluateGates({
+    pr: { head: { sha: "h".repeat(40) }, base: { sha: "e".repeat(40) } },
+    cells: cells(),
+    jobs: cells().map((cell) => ({ name: `execution-diff (${cell.side}, ${cell.rep})`, conclusion: "success" })),
+    profiles,
+    headSha: "h".repeat(40),
+    mergeCommitSha: merge,
+    runId: "99",
+  })
+  assert.equal(result.status, "determinable")
 })
 
 test("empty platform partitions render none recorded", () => {

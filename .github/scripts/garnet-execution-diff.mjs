@@ -9,16 +9,14 @@ import {
   destinationFor,
   renderDestination,
 } from "./garnet-workload-view.mjs"
-import { isTrustedEvidenceComment } from "./garnet-evidence-mirror.mjs"
 
 const execFileAsync = promisify(execFile)
 const BEGIN = "<!-- garnet:execution-diff:begin -->"
 const END = "<!-- garnet:execution-diff:end -->"
 const BEGIN_LINE_RE = /^<!-- garnet:execution-diff:begin -->[ \t]*\r?$/m
 const END_LINE_RE = /^<!-- garnet:execution-diff:end -->[ \t]*\r?$/m
-const COMMIT_RE = /<!--\s*garnet:commit\s+([0-9a-f]{40})\s*-->/
-const PROFILE_RE = /https:\/\/app\.garnet\.ai\/public\/runs\/(\d+)\?profile=([0-9a-f-]+)/gi
-const PROFILE_JOB_RE = /^execution-diff\/(base|head)\/([123])$/
+const PROFILE_RE = /Garnet Run Profile report:\s*(https:\/\/app\.garnet\.ai\/public\/runs\/(\d+)\?profile=([0-9a-f-]+))(?:&[^\s]*)?/i
+const EXECUTION_JOB_RE = /^execution-diff \((base|head), ([123])\)$/
 const BODY_LIMIT = 65536
 const RUNNER_LABEL = "ubuntu-24.04"
 const env = globalThis.process.env
@@ -69,7 +67,16 @@ export function diffSides(base, head) {
   }
 }
 
-export function evaluateGates({ pr, cells, jobs, profiles, headSha, runId }) {
+export function evaluateGates({
+  pr,
+  cells,
+  jobs,
+  profiles,
+  profileLinks = [],
+  headSha,
+  mergeCommitSha,
+  runId,
+}) {
   const reasons = []
   if (pr.head?.sha !== headSha) reasons.push("PR head moved")
   if (cells.some((cell) => cell.side === "base" && cell.expected_sha !== pr.base?.sha)) reasons.push("base moved")
@@ -90,19 +97,18 @@ export function evaluateGates({ pr, cells, jobs, profiles, headSha, runId }) {
       reasons.push(`job ${job.name} concluded ${job.conclusion}`)
     }
   }
-  const matchingProfiles = dedupeProfiles(profiles).filter((profile) => {
-    const run = profile.profiles?.[0]?.run || profile.run
-    return String(run?.run_id) === String(runId) && PROFILE_JOB_RE.test(run?.job || "")
-  })
-  const uniqueProfiles = new Map()
-  for (const profile of matchingProfiles) {
-    const run = profile.profiles?.[0]?.run || profile.run
-    uniqueProfiles.set(run.job, profile)
+  for (const link of profileLinks) {
+    if (!link.url) reasons.push(`profile link missing in ${link.display_name}`)
+    else if (link.public === false) reasons.push(`profile not public: ${link.identity}`)
   }
+  const uniqueProfiles = new Map(profiles
+    .map((profile) => [profileIdentity(profile), profile])
+    .filter(([identity, profile]) => identity && String(profileRun(profile)?.run_id) === String(runId)))
   if (uniqueProfiles.size < 6) reasons.push(`profiles published: ${uniqueProfiles.size}/6`)
-  for (const profile of uniqueProfiles.values()) {
+  for (const [identity, profile] of uniqueProfiles) {
     const run = profile.profiles?.[0]?.run || profile.run
-    if (run.commit_sha !== headSha) reasons.push(`profile commit mismatch in ${run.job}`)
+    const acceptedCommits = new Set([headSha, mergeCommitSha])
+    if (!acceptedCommits.has(run.commit_sha)) reasons.push(`profile commit mismatch in ${identity}`)
   }
   const lineageMissing = [...uniqueProfiles.values()].reduce((count, profile) => (
     count + (profile.profiles || [profile]).reduce((inner, item) => (
@@ -111,17 +117,6 @@ export function evaluateGates({ pr, cells, jobs, profiles, headSha, runId }) {
   ), 0)
   if (lineageMissing) reasons.push(`lineage not recorded for ${lineageMissing} chains`)
   return { status: reasons.length ? "undeterminable" : "determinable", reasons }
-}
-
-export function dedupeProfiles(profiles) {
-  const unique = new Map()
-  for (const profile of profiles) {
-    const run = profileRun(profile)
-    if (!run?.job) continue
-    const current = unique.get(run.job)
-    if (!current || profileTimestamp(profile) >= profileTimestamp(current)) unique.set(run.job, profile)
-  }
-  return [...unique.values()]
 }
 
 export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) {
@@ -170,7 +165,7 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
     },
     profiles: allProfiles.map((profile) => {
       const run = profileRun(profile)
-      return { side: profileSide(profile), rep: Number(run.job.split("/").at(-1)), run_id: String(run.run_id), profile_id: run.profile_id }
+      return { side: profileSide(profile), rep: profileRep(profile), run_id: String(run.run_id), profile_id: run.profile_id }
     }),
     reasons,
   }
@@ -330,14 +325,16 @@ function profileRun(profile) {
   return profile.profiles?.[0]?.run || profile.run
 }
 
-function profileSide(profile) {
-  return profileRun(profile).job.split("/")[1]
+function profileIdentity(profile) {
+  return profile.execution_diff?.identity || profileRun(profile)?.job
 }
 
-function profileTimestamp(profile) {
-  const timestamp = profile.profiles?.[0]?.timestamp || profile.timestamp
-  const value = Date.parse(timestamp || "")
-  return Number.isNaN(value) ? 0 : value
+function profileSide(profile) {
+  return profile.execution_diff?.side || profileIdentity(profile)?.split("/")[1]
+}
+
+function profileRep(profile) {
+  return profile.execution_diff?.rep || Number(profileIdentity(profile)?.split("/").at(-1))
 }
 
 function renderChain(chain) {
@@ -351,10 +348,11 @@ function renderProfileLinks(profiles) {
   return ["base", "head"].flatMap((side) => {
     const links = profiles
       .filter((profile) => profileSide(profile) === side)
-      .sort((left, right) => Number(profileRun(left).job.split("/").at(-1)) - Number(profileRun(right).job.split("/").at(-1)))
+      .sort((left, right) => profileRep(left) - profileRep(right))
       .map((profile) => {
         const run = profileRun(profile)
-        return `[${run.job.split("/").at(-1)}](https://app.garnet.ai/public/runs/${run.run_id}?profile=${run.profile_id})`
+        const url = profile.execution_diff?.url || `https://app.garnet.ai/public/runs/${run.run_id}?profile=${run.profile_id}`
+        return `[${profileRep(profile)}](${url})`
       })
     return links.length ? `${side} ${links.join(" · ")}` : []
   }).join(" · ")
@@ -370,11 +368,12 @@ async function main() {
     return
   }
   const [jobsResponse, artifactsResponse] = await Promise.all([
-    github(`/repos/${env.GITHUB_REPOSITORY}/actions/runs/${env.RUN_ID}/jobs?per_page=100`),
+    github(`/repos/${env.GITHUB_REPOSITORY}/actions/runs/${env.RUN_ID}/jobs?filter=latest&per_page=100`),
     github(`/repos/${env.GITHUB_REPOSITORY}/actions/runs/${env.RUN_ID}/artifacts?per_page=100`),
   ])
   const cells = await readCells(artifactsResponse.artifacts || [])
-  const profiles = dedupeProfiles(await pollProfiles())
+  const profileDiscovery = await pollProfiles(jobsResponse.jobs || [])
+  const profiles = profileDiscovery.profiles
   const latestPr = await github(`/repos/${env.GITHUB_REPOSITORY}/pulls/${env.PR_NUMBER}`)
   if (latestPr.head?.sha !== env.HEAD_SHA) {
     console.log(`PR head moved (${latestPr.head?.sha} != ${env.HEAD_SHA}); skipping stale execution diff.`)
@@ -385,13 +384,15 @@ async function main() {
     cells,
     jobs: jobsResponse.jobs || [],
     profiles,
+    profileLinks: profileDiscovery.links,
     headSha: env.HEAD_SHA,
     runId: env.RUN_ID,
+    mergeCommitSha: latestPr.merge_commit_sha,
   })
   const diff = gate.status === "determinable"
     ? diffSides(
-      stableSets(cells.filter((cell) => cell.side === "base").map((cell) => profileSummary(profiles.find((profile) => profileRun(profile).job === cell.profile_job)))),
-      stableSets(cells.filter((cell) => cell.side === "head").map((cell) => profileSummary(profiles.find((profile) => profileRun(profile).job === cell.profile_job)))),
+      stableSets(cells.filter((cell) => cell.side === "base").map((cell) => profileSummary(profiles.find((profile) => profileIdentity(profile) === cell.profile_job)))),
+      stableSets(cells.filter((cell) => cell.side === "head").map((cell) => profileSummary(profiles.find((profile) => profileIdentity(profile) === cell.profile_job)))),
     )
     : emptyDiff()
   const block = renderReceipt({
@@ -467,37 +468,101 @@ async function readCells(artifacts) {
   return cells
 }
 
-async function pollProfiles() {
+export function executionJob(name, id = undefined) {
+  const match = EXECUTION_JOB_RE.exec(name || "")
+  if (!match) return null
+  const [, side, rep] = match
+  return {
+    id,
+    side,
+    rep: Number(rep),
+    identity: `execution-diff/${side}/${rep}`,
+    display_name: name,
+  }
+}
+
+export function extractProfileLink(log) {
+  const match = PROFILE_RE.exec(log || "")
+  if (!match) return null
+  return { url: match[1], run_id: match[2], profile_id: match[3] }
+}
+
+export function profileLinksFromLogs(jobs, logs) {
+  return jobs
+    .map((job) => executionJob(job.name, job.id))
+    .filter(Boolean)
+    .map((job) => ({ ...job, ...(extractProfileLink(logs.get(job.id)) || {}) }))
+}
+
+async function pollProfiles(jobs) {
   const deadline = Date.now() + 10 * 60 * 1000
+  const executionJobs = jobs
+    .map((job) => executionJob(job.name, job.id))
+    .filter(Boolean)
+  const linksByIdentity = new Map()
+  if (!executionJobs.length) return { profiles: [], links: [] }
   while (true) {
-    const comments = await listComments()
-    const links = new Map()
-    for (const comment of comments) {
-      if (!isTrustedEvidenceComment(comment)) continue
-      if (COMMIT_RE.exec(comment.body)?.[1] !== env.HEAD_SHA) continue
-      for (const match of comment.body.matchAll(PROFILE_RE)) links.set(`${match[1]}:${match[2]}`, match)
+    const logs = new Map()
+    await Promise.all(executionJobs.map(async (job) => {
+      if (!linksByIdentity.has(job.identity)) {
+        try {
+          logs.set(job.id, await jobLogs(job.id))
+        } catch {
+          logs.set(job.id, "")
+        }
+      }
+    }))
+    const lastLinks = profileLinksFromLogs(executionJobs.map((job) => ({ name: job.display_name, id: job.id })), logs)
+    for (const link of lastLinks) {
+      if (link.url) linksByIdentity.set(link.identity, link)
     }
     const profiles = []
-    for (const match of links.values()) {
-      const response = await fetch(`https://app.garnet.ai/api/public/runs/${match[1]}?profile=${match[2]}`)
-      if (!response.ok) continue
+    const publicProfiles = new Set()
+    await Promise.all([...linksByIdentity.values()].map(async (link) => {
+      const response = await fetch(`https://app.garnet.ai/api/public/runs/${link.run_id}?profile=${link.profile_id}`)
+      if (!response.ok) return
+      publicProfiles.add(link.identity)
       const profile = await response.json()
       const run = profileRun(profile)
-      if (String(run?.run_id) === String(env.RUN_ID) && PROFILE_JOB_RE.test(run?.job || "")) profiles.push(profile)
+      if (String(run?.run_id) !== String(env.RUN_ID)) return
+      profile.execution_diff = {
+        identity: link.identity,
+        side: link.side,
+        rep: link.rep,
+        url: link.url,
+      }
+      profiles.push(profile)
+    }))
+    const links = executionJobs.map((job) => linksByIdentity.get(job.identity) || {
+      ...job,
+      url: undefined,
+    })
+    for (const link of links) {
+      if (link.url) link.public = publicProfiles.has(link.identity)
     }
-    if (new Set(profiles.map((profile) => profileRun(profile).job)).size >= 6 || Date.now() >= deadline) return profiles
+    const profilesReady = profiles.length >= executionJobs.length
+      && executionJobs.every((job) => linksByIdentity.has(job.identity) && publicProfiles.has(job.identity))
+    if (profilesReady || Date.now() >= deadline) {
+      return { profiles, links }
+    }
     await new Promise((resolve) => setTimeout(resolve, 30000))
   }
 }
 
-async function listComments() {
-  const comments = []
-  for (let page = 1; page <= 10; page += 1) {
-    const batch = await github(`/repos/${env.GITHUB_REPOSITORY}/issues/${env.PR_NUMBER}/comments?per_page=100&page=${page}`)
-    comments.push(...batch)
-    if (batch.length < 100) break
-  }
-  return comments
+async function jobLogs(jobId) {
+  const response = await fetch(`${api}/repos/${env.GITHUB_REPOSITORY}/actions/jobs/${jobId}/logs`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+    redirect: "manual",
+  })
+  const download = response.status >= 300 && response.status < 400
+    ? await fetch(response.headers.get("location"))
+    : response
+  if (!download.ok) throw new Error(`job ${jobId} logs: ${download.status}`)
+  return download.text()
 }
 
 function emptyDiff() {
