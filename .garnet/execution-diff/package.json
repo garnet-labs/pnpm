@@ -1,0 +1,8 @@
+{
+  "name": "garnet-execution-diff-workload",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "is-odd": "3.0.1"
+  }
+}
