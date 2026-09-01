@@ -16,6 +16,10 @@ on:
         required: false
         type: boolean
         default: false
+      garnet_jibril_version:
+        required: false
+        type: string
+        default: ''
       test_chunk:
         required: false
         type: string
@@ -60,9 +64,12 @@ jobs:
       with:
         persist-credentials: false
     - if: ${{ inputs.garnet }}
-      uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+      uses: ./.github/actions/dump-step-summary
+    - if: ${{ inputs.garnet }}
+      uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
+        jibril_version: ${{ inputs.garnet_jibril_version }}
     - name: Install pnpm and Node
       uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
       with:

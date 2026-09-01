@@ -130,6 +130,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Test-branch only: both ubuntu cells run the Garnet action v2.3.0-rc.1
+        # candidate over the same heavy workload, one per jibril pin, so the
+        # shutdown/profile-flush behaviour of v2.16.0 and v2.17.0-rc.8 is
+        # compared on identical runners within one run.
         include:
           - node: '22.13.0'
             node_major: '22'
@@ -137,6 +141,8 @@ jobs:
             platform_label: ubuntu
             test_chunk: '1'
             test_chunk_total: '1'
+            garnet: true
+            garnet_jibril_version: v2.16.0
           - node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -144,6 +150,7 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
+            garnet_jibril_version: v2.17.0-rc.8
           - node: '26.7.0'
             node_major: '26'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -158,6 +165,7 @@ jobs:
       test_chunk: ${{ matrix.test_chunk }}
       test_chunk_total: ${{ matrix.test_chunk_total }}
       garnet: ${{ matrix.garnet == true }}
+      garnet_jibril_version: ${{ matrix.garnet_jibril_version }}
     secrets:
       GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
 
