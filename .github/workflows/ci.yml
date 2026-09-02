@@ -247,11 +247,15 @@ jobs:
         run: node .github/scripts/garnet-evidence-mirror.mjs
       # The AI reviewers review at PR open, minutes before the Runtime Review
       # record lands, so a fresh head-bound mirror asks them to re-review with
-      # the evidence now in the description (see REVIEW.md).
+      # the evidence now in the description (see REVIEW.md). CodeRabbit and
+      # Qodo ignore commands authored by bot accounts (including
+      # github-actions[bot]), so the request must come from a user identity:
+      # GARNET_REVIEW_TRIGGER_TOKEN is a user PAT with issues write on this
+      # repo. Without it the step still runs, but the apps drop the commands.
       - name: Request evidence-grounded re-review
         if: steps.mirror.outputs.mirrored == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GARNET_REVIEW_TRIGGER_TOKEN || github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body='/agentic_review'

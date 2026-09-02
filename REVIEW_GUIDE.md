@@ -15,6 +15,12 @@ automated reviewers — CodeRabbit ([`.coderabbit.yaml`](./.coderabbit.yaml)) an
 CodeRabbit leads correctness and conventions, Qodo leads security and performance — but every
 reviewer applies the same priority order below. [`AGENTS.md`](./AGENTS.md) points here.
 
+Every reviewer also grounds the review in the PR's runtime evidence per
+[`REVIEW.md`](./REVIEW.md): the description's `Runtime evidence (Garnet)` section mirrors the
+head-bound, kernel-recorded execution profile of the instrumented CI run. Open with the
+one-line `**Runtime grounding** (head \`<sha7>\`): ...` verdict, and treat stale, pending, or
+absent evidence as no runtime evidence.
+
 ## Review priorities
 
 1. **Security first** (§1).
