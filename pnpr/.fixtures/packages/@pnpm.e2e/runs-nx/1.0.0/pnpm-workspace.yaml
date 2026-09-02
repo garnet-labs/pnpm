@@ -1,0 +1,3 @@
+allowBuilds:
+  nx: true
+minimumReleaseAge: 1440
