@@ -266,6 +266,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: garnet-org/action@540530e93eb6d1caed43f82d3145900d17041f20 # v2.3.0 candidate (main)
+        # The Garnet sensor is eBPF-based and only runs on Linux; this job is on
+        # macOS, so record runtime evidence only if the job ever moves to Linux.
+        if: runner.os == 'Linux'
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Install pnpm and Node
@@ -420,6 +423,9 @@ jobs:
             exit 1
           fi
       - uses: garnet-org/action@540530e93eb6d1caed43f82d3145900d17041f20 # v2.3.0 candidate (main)
+        # The Garnet sensor is eBPF-based and only runs on Linux; this job is on
+        # macOS, so record runtime evidence only if the job ever moves to Linux.
+        if: runner.os == 'Linux'
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Install pnpm and Node
