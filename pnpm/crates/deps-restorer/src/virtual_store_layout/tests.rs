@@ -1,4 +1,4 @@
-use super::VirtualStoreLayout;
+use super::{VirtualStoreLayout, global_virtual_store_version_dir};
 use pnpm_config::Config;
 use pnpm_lockfile::{
     DirectoryResolution, LockfileResolution, PackageKey, PackageMetadata, PkgName,
@@ -73,6 +73,7 @@ fn slot_dir_uses_gvs_layout_when_gvs_on() {
                 integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                     .parse()
                     .expect("parse integrity"),
+                revision: None,
             }),
             version: None,
             engines: None,
@@ -127,6 +128,7 @@ fn slot_dir_prefixes_unscoped_with_at_slash_under_gvs() {
                 integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                     .parse()
                     .expect("parse integrity"),
+                revision: None,
             }),
             version: None,
             engines: None,
@@ -158,6 +160,38 @@ fn slot_dir_prefixes_unscoped_with_at_slash_under_gvs() {
 }
 
 #[test]
+fn gvs_version_dir_requires_exact_name_and_version_components() {
+    let root = PathBuf::from("store").join("links");
+    let scoped: PackageKey = "@scope/foo@1.2.3".parse().expect("parse scoped key");
+    let unscoped: PackageKey = "foo@1.2.3".parse().expect("parse unscoped key");
+    assert_eq!(
+        global_virtual_store_version_dir(&root, &scoped, None),
+        Some(root.join("@scope").join("foo").join("1.2.3")),
+    );
+    assert_eq!(
+        global_virtual_store_version_dir(&root, &unscoped, None),
+        Some(root.join("@").join("foo").join("1.2.3")),
+    );
+
+    for key in ["../other@1.2.3", "@scope/../other@1.2.3", r"@scope\evil/foo@1.2.3"] {
+        let key: PackageKey = key.parse().expect("parse unsafe package name");
+        assert_eq!(global_virtual_store_version_dir(&root, &key, None), None);
+    }
+
+    let registry = RegistryResolution {
+        integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .expect("parse integrity"),
+        revision: None,
+    };
+    for version in ["../@/other/1.2.3", r"..\@\other\1.2.3"] {
+        let metadata =
+            package_metadata(LockfileResolution::Registry(registry.clone()), Some(version));
+        assert_eq!(global_virtual_store_version_dir(&root, &unscoped, Some(&metadata)), None);
+    }
+}
+
+#[test]
 fn slot_dir_engine_agnostic_with_empty_allow_build_policy() {
     let config = make_config(
         true,
@@ -173,6 +207,7 @@ fn slot_dir_engine_agnostic_with_empty_allow_build_policy() {
                 integrity: "sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                     .parse()
                     .expect("parse integrity"),
+                revision: None,
             }),
             version: None,
             engines: None,
@@ -230,6 +265,7 @@ fn slot_dir_engine_specific_when_snapshot_is_built() {
                 integrity: "sha512-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
                     .parse()
                     .expect("parse integrity"),
+                revision: None,
             }),
             version: None,
             engines: None,
@@ -350,6 +386,7 @@ fn cross_pinning_siblings_get_distinct_slots() {
             PackageMetadata {
                 resolution: LockfileResolution::Registry(RegistryResolution {
                     integrity: integrity_str.parse().expect("parse integrity"),
+                    revision: None,
                 }),
                 version: None,
                 engines: None,
@@ -425,6 +462,7 @@ fn full_pkg_id_keeps_patch_hash_when_present() {
                 integrity: "sha512-PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"
                     .parse()
                     .expect("parse integrity"),
+                revision: None,
             }),
             version: None,
             engines: None,
@@ -473,6 +511,7 @@ fn gvs_version_segment_anchors_directory_deps() {
         LockfileResolution::Tarball(TarballResolution {
             tarball: "file:vendor/dep.tgz".to_string(),
             integrity: None,
+            revision: None,
             git_hosted: None,
             path: None,
         }),
@@ -502,6 +541,7 @@ fn a_file_snapshot_without_metadata_is_still_scoped() {
         LockfileResolution::Tarball(TarballResolution {
             tarball: "file:packages/b".to_string(),
             integrity: None,
+            revision: None,
             git_hosted: None,
             path: None,
         }),
@@ -612,6 +652,7 @@ fn link_hash_matches_the_shared_typescript_fixture() {
         package_metadata(
             LockfileResolution::Registry(RegistryResolution {
                 integrity: fixture.package.integrity.parse().expect("parse fixture integrity"),
+                revision: None,
             }),
             Some(&fixture.package.version),
         ),
@@ -678,6 +719,7 @@ fn snapshots_with_link_deps_get_a_slot_per_link_target() {
             LockfileResolution::Tarball(TarballResolution {
                 tarball: "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz".to_string(),
                 integrity: None,
+                revision: None,
                 git_hosted: None,
                 path: None,
             }),
@@ -795,6 +837,7 @@ fn link_deps_resolving_to_one_directory_share_a_slot_across_projects() {
             LockfileResolution::Tarball(TarballResolution {
                 tarball: "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz".to_string(),
                 integrity: None,
+                revision: None,
                 git_hosted: None,
                 path: None,
             }),
@@ -836,6 +879,7 @@ fn snapshots_without_link_deps_keep_their_slot() {
             LockfileResolution::Tarball(TarballResolution {
                 tarball: "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz".to_string(),
                 integrity: None,
+                revision: None,
                 git_hosted: None,
                 path: None,
             }),
@@ -1104,6 +1148,7 @@ fn registry_metadata(lead: &str) -> PackageMetadata {
     PackageMetadata {
         resolution: LockfileResolution::Registry(RegistryResolution {
             integrity: integrity.parse().expect("parse integrity"),
+            revision: None,
         }),
         version: None,
         engines: None,

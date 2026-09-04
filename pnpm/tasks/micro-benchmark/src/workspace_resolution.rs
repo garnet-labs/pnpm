@@ -170,6 +170,7 @@ fn graph_resolver(shape: Shape, size: Size) -> GraphResolver {
                     resolution: LockfileResolution::Tarball(TarballResolution {
                         tarball: format!("https://registry.example/{name}-1.0.0.tgz"),
                         integrity: None,
+                        revision: None,
                         git_hosted: None,
                         path: None,
                     }),
@@ -204,6 +205,7 @@ fn graph_resolver(shape: Shape, size: Size) -> GraphResolver {
                 resolution: LockfileResolution::Tarball(TarballResolution {
                     tarball: format!("https://registry.example/{name}-1.0.0.tgz"),
                     integrity: None,
+                    revision: None,
                     git_hosted: None,
                     path: None,
                 }),
@@ -282,6 +284,7 @@ fn workspace_options() -> WorkspaceResolveOptions {
         exclude_links_from_lockfile: false,
         lockfile_dir: PathBuf::from("/workspace"),
         peers_suffix_max_length: 1000,
+        share_workspace_resolutions: true,
         manifest_hook: None,
         overrides_hook: None,
         pick_lowest_direct: false,
@@ -294,6 +297,7 @@ fn workspace_options() -> WorkspaceResolveOptions {
         pnpmfile_hook: None,
         read_package_log: None,
         skipped_optional_log: None,
+        finalized_package: None,
         allowed_deprecated_versions: BTreeMap::new(),
         deprecation_log: None,
         auto_install_peers: true,

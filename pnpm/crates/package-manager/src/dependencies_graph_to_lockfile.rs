@@ -6,14 +6,16 @@
 //! graph rather than building one merged per-depPath snapshot and
 //! fanning it out on write.
 
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use derive_more::{Display, Error};
 use indexmap::IndexMap;
+use miette::Diagnostic;
 use pnpm_catalogs_protocol_parser::parse_catalog_protocol;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_lockfile::{
-    BundledDependencies, CatalogSnapshots, ComVer, ImporterDepVersion, Lockfile,
+    BundledDependencies, CatalogSnapshots, ComVer, ImporterDepVersion, Lockfile, LockfileFormError,
     LockfileFormOptions, LockfileResolution, LockfileSettings, LockfileVersion, PackageKey,
     PackageMetadata, ParseImporterDepVersionError, ParsePkgNameSuffixError, ParsePkgVerPeerError,
     PeerDependencyMeta, PkgName, PkgNameVerPeer, PkgVerPeer, ProjectSnapshot, RegistryOptions,
@@ -153,9 +155,12 @@ pub struct GraphToLockfileOptions<'a> {
 }
 
 /// Error returned while converting a resolver graph into a lockfile.
-#[derive(Debug, Display, Error)]
+#[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum DependenciesGraphToLockfileError {
+    #[diagnostic(transparent)]
+    LockfileForm(#[error(source)] LockfileFormError),
+
     #[display(
         "Failed to serialize importer dependency {alias:?} from dependency path {dep_path:?}: {source}"
     )]
@@ -240,31 +245,45 @@ pub fn dependencies_graph_to_lockfile(
         },
     )?;
 
-    let mut importers: HashMap<String, ProjectSnapshot> =
-        HashMap::with_capacity(importer_inputs.len());
-    for (id, input) in &importer_inputs {
-        let previous_importer = previous_importers.and_then(|imps| imps.get(id));
-        // Effective update scope for this importer, mirroring the resolver's
-        // `update_reuse_scope_for`: a global `None` (bare `update`) applies to
-        // every importer; otherwise the per-importer entry wins, falling back
-        // to the global. This is what lets a `pacquet update <name> --recursive`
-        // target the named dependency in the importer that declares it while
-        // leaving untouched importers on their global scope.
-        let effective_update_reuse_scope = if matches!(update_reuse_scope, UpdateReuseScope::None) {
-            &update_reuse_scope
-        } else {
-            update_reuse_scopes_by_importer.get(id).unwrap_or(&update_reuse_scope)
-        };
-        importers.insert(
-            id.clone(),
-            build_importer(
+    // Each importer's snapshot reads only its own input plus the shared
+    // graph, so a workspace-scale importer list fans out across the
+    // rayon pool; the serial fold below keeps the first error in
+    // importer order, like the loop it replaces.
+    let importer_results: Vec<(
+        &String,
+        Result<ProjectSnapshot, DependenciesGraphToLockfileError>,
+    )> = importer_inputs
+        .iter()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(id, input)| {
+            let previous_importer = previous_importers.and_then(|imps| imps.get(id));
+            // Effective update scope for this importer, mirroring the resolver's
+            // `update_reuse_scope_for`: a global `None` (bare `update`) applies to
+            // every importer; otherwise the per-importer entry wins, falling back
+            // to the global. This is what lets a `pacquet update <name> --recursive`
+            // target the named dependency in the importer that declares it while
+            // leaving untouched importers on their global scope.
+            let effective_update_reuse_scope =
+                if matches!(update_reuse_scope, UpdateReuseScope::None) {
+                    &update_reuse_scope
+                } else {
+                    update_reuse_scopes_by_importer.get(id).unwrap_or(&update_reuse_scope)
+                };
+            let importer = build_importer(
                 input,
                 graph,
                 &ImporterLockfileFlags { exclude_links_from_lockfile, auto_install_peers },
                 previous_importer,
                 effective_update_reuse_scope,
-            )?,
-        );
+            );
+            (id, importer)
+        })
+        .collect();
+    let mut importers: HashMap<String, ProjectSnapshot> =
+        HashMap::with_capacity(importer_inputs.len());
+    for (id, importer) in importer_results {
+        importers.insert(id.clone(), importer?);
     }
 
     let catalog_snapshots = build_catalog_snapshots(&importers, catalogs);
@@ -291,6 +310,12 @@ pub fn dependencies_graph_to_lockfile(
         packages: (!packages.is_empty()).then_some(packages),
         snapshots: (!snapshots.is_empty()).then_some(snapshots),
         time: (!time.is_empty()).then_some(time),
+        // A freshly resolved lockfile, not a rewrite of the previous one,
+        // so it starts with no foreign top-level keys. A host that records
+        // its own block re-asserts it after the install (it is writing its
+        // fresh contents anyway); `Lockfile::extra` is what makes that
+        // read-edit-write round trip lossless.
+        extra: pnpm_lockfile::LockfileExtra::default(),
     })
 }
 
@@ -433,10 +458,13 @@ fn build_importer(
             let targeted_by_update = match update_reuse_scope {
                 UpdateReuseScope::All => false,
                 UpdateReuseScope::None => true,
-                UpdateReuseScope::Except(names) => graph
+                // By name alone: this runs after resolution, where the
+                // version in hand is the one the update just produced, not
+                // the line the selector asked to move.
+                UpdateReuseScope::Except(targets) => graph
                     .get(dep_path)
                     .and_then(node_pkg_name)
-                    .is_some_and(|name| names.contains(&name)),
+                    .is_some_and(|name| targets.covers(&name, None)),
             };
             let targeted_by_spec_change = previous.specifier != specifier;
             if !targeted_by_update && !targeted_by_spec_change {
@@ -464,12 +492,7 @@ fn build_importer(
         .get("dependenciesMeta")
         .filter(|value| value.as_object().is_some_and(|meta| !meta.is_empty()))
         .cloned();
-    let publish_directory = manifest
-        .value()
-        .get("publishConfig")
-        .and_then(|publish_config| publish_config.get("directory"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let (publish_directory, link_directory) = manifest_publish_config(manifest);
 
     Ok(ProjectSnapshot {
         specifiers: (!specifiers.is_empty()).then_some(specifiers),
@@ -478,7 +501,25 @@ fn build_importer(
         optional_dependencies: (!optional_dependencies.is_empty()).then_some(optional_dependencies),
         dependencies_meta,
         publish_directory,
+        link_directory,
     })
+}
+
+pub(crate) fn manifest_publish_config(
+    manifest: &PackageManifest,
+) -> (Option<String>, Option<bool>) {
+    let publish_config = manifest.value().get("publishConfig");
+    let publish_directory = publish_config
+        .and_then(|publish_config| publish_config.get("directory"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let link_directory = publish_directory.as_ref().and_then(|_| {
+        publish_config
+            .and_then(|publish_config| publish_config.get("linkDirectory"))
+            .and_then(Value::as_bool)
+            .filter(|link_directory| !link_directory)
+    });
+    (publish_directory, link_directory)
 }
 
 /// Map each direct-dep alias to the manifest group it appears in.
@@ -685,30 +726,47 @@ fn build_packages_and_snapshots(
     optional_overrides: &HashMap<DepPath, bool>,
     sources: &PackageMetadataSources<'_>,
 ) -> Result<PackagesAndSnapshots, DependenciesGraphToLockfileError> {
-    let mut packages: HashMap<PackageKey, PackageMetadata> = HashMap::new();
-    let mut snapshots: HashMap<PackageKey, SnapshotEntry> = HashMap::new();
-
-    for node in graph.values() {
-        let dep_path = node.dep_path.as_str();
-        let snapshot_key = match dep_path.parse::<PackageKey>() {
-            Ok(snapshot_key) => snapshot_key,
-            // A workspace link is the one node with no row of its own —
-            // it resolves as its own importer and pnpm writes it none
-            // either.
-            Err(_) if dep_path.starts_with("link:") => continue,
-            Err(source) => {
-                return Err(DependenciesGraphToLockfileError::UnkeyedDepPath {
+    // Every node's snapshot and metadata read only that node plus the
+    // shared inputs, so the nodes fan out across the rayon pool; the
+    // serial fold below walks them in the graph's iteration order, so
+    // the first-of-a-key metadata insert and the first error stay the
+    // ones the serial loop would have kept.
+    struct BuiltNode<'graph> {
+        node: &'graph pnpm_resolving_deps_resolver::DependenciesGraphNode,
+        snapshot_key: PackageKey,
+        snapshot: SnapshotEntry,
+    }
+    let built: Vec<Result<Option<BuiltNode<'_>>, DependenciesGraphToLockfileError>> = graph
+        .values()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|node| {
+            let dep_path = node.dep_path.as_str();
+            let snapshot_key = match dep_path.parse::<PackageKey>() {
+                Ok(snapshot_key) => Ok(snapshot_key),
+                // A workspace link is the one node with no row of its own —
+                // it resolves as its own importer and pnpm writes it none
+                // either.
+                Err(_) if dep_path.starts_with("link:") => return Ok(None),
+                Err(source) => Err(DependenciesGraphToLockfileError::UnkeyedDepPath {
                     dep_path: dep_path.to_string(),
                     source: Box::new(source),
-                });
-            }
-        };
-        let metadata_key = snapshot_key.without_peer();
+                }),
+            }?;
+            let snapshot = build_snapshot_entry(node, graph, optional_overrides);
+            Ok(Some(BuiltNode { node, snapshot_key, snapshot }))
+        })
+        .collect();
 
-        let snapshot = build_snapshot_entry(node, graph, optional_overrides);
+    let mut packages: HashMap<PackageKey, PackageMetadata> = HashMap::new();
+    let mut snapshots: HashMap<PackageKey, SnapshotEntry> = HashMap::new();
+    for built_node in built {
+        let Some(BuiltNode { node, snapshot_key, snapshot }) = built_node? else { continue };
+        let metadata_key = snapshot_key.without_peer();
         snapshots.insert(snapshot_key, snapshot);
 
-        packages.entry(metadata_key).or_insert_with_key(|key| {
+        if let std::collections::hash_map::Entry::Vacant(entry) = packages.entry(metadata_key) {
+            let key = entry.key();
             // A registry-qualified key names its registry; that registry —
             // not the scope-routed default — decides whether the tarball
             // URL is canonical and can be dropped from the entry.
@@ -735,7 +793,8 @@ fn build_packages_and_snapshots(
                     server_type: registry_server_type(sources.registry_options_by_url, registry),
                     include_tarball_url,
                 },
-            );
+            )
+            .map_err(DependenciesGraphToLockfileError::LockfileForm)?;
             // `deprecated` is the only registry-mutable field of a
             // published version; an unchanged resolution must not lose
             // a recorded deprecation to a registry serving it
@@ -746,8 +805,8 @@ fn build_packages_and_snapshots(
             {
                 metadata.deprecated.clone_from(&previous.deprecated);
             }
-            metadata
-        });
+            entry.insert(metadata);
+        }
     }
 
     Ok((packages, snapshots))
@@ -765,7 +824,7 @@ fn build_package_metadata(
     node: &DependenciesGraphNode,
     metadata_key: &PackageKey,
     lockfile_form: LockfileFormOptions<'_>,
-) -> PackageMetadata {
+) -> Result<PackageMetadata, LockfileFormError> {
     let manifest = node.resolve_result.manifest.as_deref();
 
     let engines = manifest
@@ -820,7 +879,7 @@ fn build_package_metadata(
         &metadata_key.name.to_string(),
         &resolution_version,
         lockfile_form,
-    );
+    )?;
 
     // Record `version` only for non-registry packages (depPath carries
     // a `:`), and only when the manifest declares one and the resolution
@@ -837,7 +896,7 @@ fn build_package_metadata(
     })
     .flatten();
 
-    PackageMetadata {
+    Ok(PackageMetadata {
         resolution,
         version,
         engines,
@@ -850,7 +909,7 @@ fn build_package_metadata(
         bundled_dependencies,
         peer_dependencies,
         peer_dependencies_meta,
-    }
+    })
 }
 
 /// Read a JSON array field off the resolver's manifest fragment and flatten it

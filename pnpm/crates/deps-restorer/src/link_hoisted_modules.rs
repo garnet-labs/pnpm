@@ -23,10 +23,12 @@ use crate::{
 };
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pnpm_cmd_shim::{Host, LinkBinsError, link_bins};
+use pnpm_cmd_shim::{Host, LinkBinsError, LinkBinsOptions, link_bins};
 use pnpm_config::PackageImportMethod;
 use pnpm_lockfile::PkgIdWithPatchHash;
-use pnpm_reporter::{LogEvent, LogLevel, Reporter, StatsLog, StatsMessage};
+use pnpm_reporter::{
+    LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter, StatsLog, StatsMessage,
+};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
@@ -80,6 +82,11 @@ pub struct LinkHoistedModulesOpts<'a> {
     /// this keeps the deletion site from depending on the
     /// constructor's discipline.
     pub confine_root: &'a Path,
+    /// Options for every bin this pass links — the
+    /// [`crate::shim_link_options`] output for the hoisted linker
+    /// (no `extraNodePaths`; hoisted-tree shims never carry
+    /// `NODE_PATH`, which pnpm gates on the isolated linker).
+    pub link_options: &'a LinkBinsOptions,
 }
 
 /// Failure modes of [`link_hoisted_modules`]. Marked
@@ -246,9 +253,7 @@ fn link_all_pkgs_in_order<Reporter: self::Reporter>(
         .filter_map(|node| node.alias.clone())
         .collect();
     if !dep_names.is_empty() {
-        // pnpm gates `extraNodePaths` on the isolated linker, so
-        // hoisted-tree shims never carry `NODE_PATH`.
-        link_direct_dep_bins(&modules_dir, &dep_names, &[])
+        link_direct_dep_bins(&modules_dir, &dep_names, opts.link_options)
             .map_err(LinkHoistedModulesError::LinkBins)?;
     }
 
@@ -262,7 +267,7 @@ fn link_all_pkgs_in_order<Reporter: self::Reporter>(
         }
         let bundled_modules_dir = child_dir.join("node_modules");
         let bins_dir = bundled_modules_dir.join(".bin");
-        link_bins::<Host>(&bundled_modules_dir, &bins_dir, &[])
+        link_bins::<Host>(&bundled_modules_dir, &bins_dir, opts.link_options)
             .map_err(LinkHoistedModulesError::LinkBins)?;
     }
 
@@ -295,7 +300,23 @@ fn import_node<Reporter: self::Reporter>(
             ..ImportIndexedDirOpts::default()
         },
     )
-    .map_err(LinkHoistedModulesError::ImportIndexedDir)
+    .map_err(LinkHoistedModulesError::ImportIndexedDir)?;
+
+    // `pnpm:progress imported` — see the matching emit in
+    // `create_virtual_dir_by_snapshot::run` for the rationale on the
+    // optimistic `method` value. Under `nodeLinker: hoisted` that emit
+    // never runs (no virtual-store slot is written), so this is the
+    // only source of the reporter's `added` counter.
+    Reporter::emit(&LogEvent::Progress(ProgressLog {
+        level: LogLevel::Debug,
+        message: ProgressMessage::Imported {
+            method: crate::optimistic_wire_method(opts.import_method),
+            requester: opts.requester.to_owned(),
+            to: node.dir.to_string_lossy().into_owned(),
+        },
+    }));
+
+    Ok(())
 }
 
 #[cfg(test)]

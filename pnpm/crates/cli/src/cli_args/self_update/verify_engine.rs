@@ -23,8 +23,7 @@ use pnpm_config::Config;
 use pnpm_graph_hasher::{host_arch, host_libc, host_platform};
 use pnpm_lockfile::{EnvLockfile, PackageKey, SnapshotDepRef, SpecifierAndResolution};
 use pnpm_network::{
-    NetworkSettings, RetryOpts, ThrottledClient, encode_package_name, redact_and_sanitize,
-    send_with_retry,
+    RetryOpts, ThrottledClient, encode_package_name, redact_and_sanitize, send_with_retry,
 };
 use serde::Deserialize;
 use std::{collections::BTreeMap, time::Duration};
@@ -363,7 +362,9 @@ impl SignatureFailure {
 /// validates over the lockfile bytes — from the component's own registry,
 /// or from `fallback_registry` when its own registry cannot provide a
 /// verifiable one. `fallback_registry` is [`CANONICAL_NPM_REGISTRY`] in
-/// production and a mock registry in unit tests.
+/// production and a mock registry in unit tests. The fallback is attempted
+/// once because it is an optional availability check after the primary
+/// registry already failed to provide a verifiable signature.
 async fn find_signature_failure(
     component: &EngineComponent,
     fallback_registry: &str,
@@ -417,7 +418,7 @@ async fn find_signature_failure(
         fallback_registry,
         keys,
         client,
-        retry_opts,
+        RetryOpts { retries: 0, ..retry_opts },
         config,
     )
     .await?;
@@ -702,11 +703,7 @@ fn build_client(config: &Config) -> Result<ThrottledClient, SelfUpdateError> {
         &bootstrap.proxy,
         &bootstrap.tls,
         &bootstrap.tls_by_uri,
-        &NetworkSettings {
-            network_concurrency: config.network_concurrency,
-            fetch_timeout: Duration::from_millis(config.fetch_timeout),
-            user_agent: config.user_agent.clone(),
-        },
+        &config.network_settings(),
     )
     .map_err(|error| SelfUpdateError::EngineIdentityUnverifiable {
         message: format!("could not build the network client to verify the pnpm release: {error}"),

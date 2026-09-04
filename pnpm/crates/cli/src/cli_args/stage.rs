@@ -6,20 +6,22 @@
 //! subcommands — `list`, `view`, `approve`, `reject`, `download` — talk to
 //! the registry's `-/stage` API directly.
 
+mod approve;
 mod summarize_tarball;
 
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use clap::Args;
 use derive_more::{Display, Error};
 use miette::{Context, Diagnostic, IntoDiagnostic};
 use pnpm_config::Config;
+use pnpm_hooks::PnpmfileHooks;
 use pnpm_network::{
     RetryOpts, ThrottledClient, read_limited_body, redact_url_credentials, send_with_retry,
 };
 use pnpm_network_web_auth::{
-    Host as WebAuthHost, OtpChallenge, OtpError, OtpErrorBody, WebAuthFetchOptions,
-    WebAuthRetryOptions, WithOtpError, with_otp_handling,
+    Host as WebAuthHost, OtpChallenge, OtpError, OtpErrorBody, OtpSession, WebAuthFetchOptions,
+    WebAuthRetryOptions, WithOtpError,
 };
 use pnpm_publish::{Host, PublishSummary, resolve_otp_from_env};
 use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
@@ -110,6 +112,21 @@ pub enum StageError {
     #[diagnostic(code(ERR_PNPM_STAGE_TARBALL_MANIFEST_NOT_FOUND))]
     TarballManifestNotFound,
 
+    #[display(
+        "Cannot approve stages {first_stage_id} and {second_stage_id} together because both publish {package_name}@{version}"
+    )]
+    #[diagnostic(code(ERR_PNPM_STAGE_DUPLICATE_PACKAGE))]
+    DuplicateStagePackage {
+        #[error(not(source))]
+        first_stage_id: String,
+        #[error(not(source))]
+        second_stage_id: String,
+        #[error(not(source))]
+        package_name: String,
+        #[error(not(source))]
+        version: String,
+    },
+
     #[display(r#"Invalid package name "{name}"."#)]
     #[diagnostic(code(ERR_PNPM_INVALID_PACKAGE_NAME))]
     InvalidPackageName {
@@ -141,6 +158,10 @@ pub enum StageError {
 pub struct StageRegistryError {
     #[error(not(source))]
     message: String,
+    /// The response status, kept so a caller can tell "no such staged
+    /// version" apart from a failure that applies to every request.
+    #[error(not(source))]
+    pub status: u16,
 }
 
 impl StageRegistryError {
@@ -156,7 +177,7 @@ impl StageRegistryError {
         } else {
             format!("Failed to {action} (status {status_display}): {trimmed}")
         };
-        StageRegistryError { message }
+        StageRegistryError { message, status }
     }
 }
 
@@ -175,12 +196,15 @@ impl StageArgs {
         dir: &Path,
         config: &Config,
         recursive: bool,
+        before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     ) -> miette::Result<Option<String>> {
         match self.params.first().map(String::as_str) {
-            Some("publish") => self.stage_publish::<Reporter>(dir, config, recursive).await,
+            Some("publish") => {
+                self.stage_publish::<Reporter>(dir, config, recursive, before_packing_hooks).await
+            }
             Some("list") => self.stage_list(config).await,
             Some("view") => self.stage_view(config).await,
-            Some("approve") => self.stage_approve::<Reporter>(config).await,
+            Some("approve") => approve::stage_approve::<Reporter>(&self, config).await,
             Some("reject") => self.stage_reject::<Reporter>(config).await,
             Some("download") => self.stage_download(dir, config).await,
             None => Err(StageError::SubcommandRequired.into()),
@@ -198,13 +222,21 @@ impl StageArgs {
         dir: &Path,
         config: &Config,
         recursive: bool,
+        before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     ) -> miette::Result<Option<String>> {
         let StageArgs { params, flags, .. } = self;
         let json = flags.json;
         let dry_run = flags.dry_run;
         let publish = PublishArgs { package: params.get(1).cloned(), flags };
-        let published =
-            publish.publish_packages::<Reporter>(dir, config, recursive, /* stage */ true).await?;
+        let published = publish
+            .publish_packages::<Reporter>(
+                dir,
+                config,
+                recursive,
+                /* stage */ true,
+                before_packing_hooks,
+            )
+            .await?;
         let summaries = published.summaries();
         if json {
             let keyed = key_by_package_name(summaries);
@@ -224,28 +256,7 @@ impl StageArgs {
     async fn stage_list(&self, config: &Config) -> miette::Result<Option<String>> {
         let package_filter = parse_package_filter(self.params.get(1))?;
         let context = self.stage_context(config, package_filter.as_deref())?;
-        let mut items: Vec<Value> = Vec::new();
-        let mut page: usize = 0;
-        loop {
-            let mut url = stage_endpoint_url(&context.registry, "-/stage")?;
-            url.query_pairs_mut()
-                .append_pair("page", &page.to_string())
-                .append_pair("perPage", &PER_PAGE.to_string());
-            if let Some(package) = &package_filter {
-                url.query_pairs_mut().append_pair("package", package);
-            }
-            let response: StageListResponse =
-                stage_json_request(&context, url.as_str(), "list staged packages").await?;
-            let page_len = response.items.len();
-            items.extend(response.items);
-            if items.len() >= response.total || page_len < PER_PAGE {
-                break;
-            }
-            page += 1;
-            if page >= STAGE_LIST_MAX_PAGES {
-                break;
-            }
-        }
+        let items = fetch_stage_items(&context, package_filter.as_deref()).await?;
 
         if self.flags.json {
             return Ok(Some(json_pretty(&Value::Array(items))?));
@@ -272,25 +283,6 @@ impl StageArgs {
             return Ok(Some(json_pretty(&item)?));
         }
         Ok(Some(render_stage_item(&item)))
-    }
-
-    /// `stage approve <stage-id>` — publish the staged version, satisfying an
-    /// OTP / web-auth challenge if the registry raises one.
-    async fn stage_approve<Reporter: self::Reporter>(
-        &self,
-        config: &Config,
-    ) -> miette::Result<Option<String>> {
-        let stage_id = require_stage_id(&self.params, "approve")?;
-        let context = self.stage_context(config, None)?;
-        let url = stage_endpoint_url(&context.registry, &format!("-/stage/{stage_id}/approve"))?;
-        stage_request_with_otp::<Reporter>(
-            &context,
-            reqwest::Method::POST,
-            url.as_str(),
-            &format!("approve staged package {stage_id}"),
-        )
-        .await?;
-        Ok(Some(format!("Staged package {stage_id} approved and published successfully.")))
     }
 
     /// `stage reject <stage-id>` — permanently delete the staged version.
@@ -320,25 +312,7 @@ impl StageArgs {
     async fn stage_download(&self, dir: &Path, config: &Config) -> miette::Result<Option<String>> {
         let stage_id = require_stage_id(&self.params, "download")?;
         let context = self.stage_context(config, None)?;
-        let url = stage_endpoint_url(&context.registry, &format!("-/stage/{stage_id}/tarball"))?;
-        let action = format!("download staged package {stage_id}");
-        let (_guard, response) = stage_send(&context, reqwest::Method::GET, url.as_str(), None)
-            .await
-            .map_err(|source| request_failed(&action, source))?;
-        if !response.status().is_success() {
-            return Err(registry_error_from_response(response, &action).await.into());
-        }
-        let tarball_data = read_limited_body(response, STAGE_TARBALL_BODY_LIMIT)
-            .await
-            .map_err(|source| request_failed(&action, source))?;
-        if tarball_data.truncated {
-            return Err(StageError::RequestFailed {
-                operation: action,
-                reason: format!("registry response exceeded {STAGE_TARBALL_BODY_LIMIT} bytes"),
-            }
-            .into());
-        }
-        let tarball_data = tarball_data.bytes;
+        let tarball_data = fetch_stage_tarball(&context, stage_id).await?;
 
         let mut summary = summarize_tarball(&tarball_data)?;
         let filename = create_tarball_filename(&summary.name, &summary.version, Some(stage_id))?;
@@ -411,6 +385,29 @@ impl StageArgs {
     }
 }
 
+/// Download one staged package without writing it to disk.
+async fn fetch_stage_tarball(context: &StageContext, stage_id: &str) -> miette::Result<Vec<u8>> {
+    let url = stage_endpoint_url(&context.registry, &format!("-/stage/{stage_id}/tarball"))?;
+    let action = format!("download staged package {stage_id}");
+    let (_guard, response) = stage_send(context, reqwest::Method::GET, url.as_str(), None)
+        .await
+        .map_err(|source| request_failed(&action, source))?;
+    if !response.status().is_success() {
+        return Err(registry_error_from_response(response, &action).await.into());
+    }
+    let tarball_data = read_limited_body(response, STAGE_TARBALL_BODY_LIMIT)
+        .await
+        .map_err(|source| request_failed(&action, source))?;
+    if tarball_data.truncated {
+        return Err(StageError::RequestFailed {
+            operation: action,
+            reason: format!("registry response exceeded {STAGE_TARBALL_BODY_LIMIT} bytes"),
+        }
+        .into());
+    }
+    Ok(tarball_data.bytes)
+}
+
 struct StageContext {
     registry: String,
     auth_header: Option<String>,
@@ -420,9 +417,9 @@ struct StageContext {
     web_auth_fetch_options: WebAuthFetchOptions,
 }
 
-/// An HTTP-level failure of a stage mutation, handed to
-/// [`with_otp_handling`]. Only the [`Otp`](Self::Otp) arm is a challenge it
-/// acts on; the rest propagate.
+/// An HTTP-level failure of a stage mutation, handed to the
+/// [`OtpSession`]. Only the [`Otp`](Self::Otp) arm is a challenge it acts on;
+/// the rest propagate.
 #[derive(Debug, Display, Error, Diagnostic)]
 enum StageHttpError {
     #[display("the registry requested a one-time password")]
@@ -458,33 +455,47 @@ async fn stage_request_with_otp<Reporter: self::Reporter>(
     url: &str,
     action: &str,
 ) -> miette::Result<()> {
-    with_otp_handling::<WebAuthHost, Reporter, (), StageHttpError, _, _>(
-        context.web_auth_fetch_options.clone(),
-        // A plain `FnMut` returning an `async move` block (not an
-        // `AsyncFnMut`) so the produced future carries an ordinary `Send`
-        // obligation — see `with_otp_handling`'s `Operation` bound.
-        move |challenge_otp: Option<String>| {
-            // The web-auth-provided OTP (a fresh challenge) takes precedence
-            // over any statically configured one.
-            let effective_otp = challenge_otp.or_else(|| context.otp.clone());
-            let method = method.clone();
-            async move {
-                stage_mutation(context, method, url, action, effective_otp.as_deref()).await
+    let mut session = OtpSession::new(context.web_auth_fetch_options.clone());
+    stage_request_in_session::<Reporter>(context, &mut session, method, url, action).await
+}
+
+/// Send one stage mutation through `session`, so a series of mutations
+/// shares a single one-time password. See [`stage_request_with_otp`] for the
+/// standalone form.
+async fn stage_request_in_session<Reporter: self::Reporter>(
+    context: &StageContext,
+    session: &mut OtpSession,
+    method: reqwest::Method,
+    url: &str,
+    action: &str,
+) -> miette::Result<()> {
+    session
+        .run::<WebAuthHost, Reporter, (), StageHttpError, _, _>(
+            // A plain `FnMut` returning an `async move` block (not an
+            // `AsyncFnMut`) so the produced future carries an ordinary `Send`
+            // obligation — see `with_otp_handling`'s `Operation` bound.
+            move |challenge_otp: Option<String>| {
+                // The web-auth-provided OTP (a fresh challenge) takes precedence
+                // over any statically configured one.
+                let effective_otp = challenge_otp.or_else(|| context.otp.clone());
+                let method = method.clone();
+                async move {
+                    stage_mutation(context, method, url, action, effective_otp.as_deref()).await
+                }
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            // Unwrap the operation's own failure so the user sees the registry
+            // error once, not re-narrated through the OTP wrapper.
+            WithOtpError::Operation(StageHttpError::Registry(registry_error)) => {
+                miette::Report::new(registry_error)
             }
-        },
-    )
-    .await
-    .map_err(|error| match error {
-        // Unwrap the operation's own failure so the user sees the registry
-        // error once, not re-narrated through the OTP wrapper.
-        WithOtpError::Operation(StageHttpError::Registry(registry_error)) => {
-            miette::Report::new(registry_error)
-        }
-        WithOtpError::Operation(StageHttpError::Request(request_error)) => {
-            miette::Report::new(*request_error)
-        }
-        other => miette::Report::new(other),
-    })
+            WithOtpError::Operation(StageHttpError::Request(request_error)) => {
+                miette::Report::new(*request_error)
+            }
+            other => miette::Report::new(other),
+        })
 }
 
 /// Perform a single stage mutation request and classify the response.
@@ -522,6 +533,37 @@ async fn stage_mutation(
         &status_text,
         &body_display_string(&body),
     )))
+}
+
+/// Every staged version the registry reports, optionally narrowed to one
+/// package name.
+async fn fetch_stage_items(
+    context: &StageContext,
+    package_filter: Option<&str>,
+) -> miette::Result<Vec<Value>> {
+    let mut items: Vec<Value> = Vec::new();
+    let mut page: usize = 0;
+    loop {
+        let mut url = stage_endpoint_url(&context.registry, "-/stage")?;
+        url.query_pairs_mut()
+            .append_pair("page", &page.to_string())
+            .append_pair("perPage", &PER_PAGE.to_string());
+        if let Some(package) = package_filter {
+            url.query_pairs_mut().append_pair("package", package);
+        }
+        let response: StageListResponse =
+            stage_json_request(context, url.as_str(), "list staged packages").await?;
+        let page_len = response.items.len();
+        items.extend(response.items);
+        if items.len() >= response.total || page_len < PER_PAGE {
+            break;
+        }
+        page += 1;
+        if page >= STAGE_LIST_MAX_PAGES {
+            break;
+        }
+    }
+    Ok(items)
 }
 
 /// GET a `-/stage` endpoint and parse its JSON body.
@@ -763,6 +805,13 @@ fn render_tarball_summary(summary: &PublishSummary) -> String {
         integrity = summary.integrity,
         entry_count = summary.entry_count,
     )
+}
+
+fn global_info<Reporter: self::Reporter>(message: &str) {
+    Reporter::emit(&LogEvent::Global(GlobalLog {
+        level: LogLevel::Info,
+        message: message.to_owned(),
+    }));
 }
 
 fn global_warn<Reporter: self::Reporter>(message: &str) {

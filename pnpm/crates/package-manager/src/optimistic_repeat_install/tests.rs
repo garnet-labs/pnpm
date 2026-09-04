@@ -3,7 +3,7 @@ use super::{
     check_optimistic_repeat_install_ignoring,
     conflict_markers::MAX_LOCKFILE_CONFLICT_SCAN_BYTES,
     current_pnpmfiles,
-    deps_status::{RunDepsStatus, check_deps_status_before_run},
+    deps_status::{RunDepsStatus, check_deps_status_before_run, install_args_from_state},
     manifest_agreement::{LinkedPackagesContext, linked_packages_are_up_to_date},
     settings::{current_settings, current_settings_with_catalogs},
     timestamps::{FileMtime, lockfile_modified_since, modified_at_or_after},
@@ -14,11 +14,12 @@ use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_modules_yaml::IncludedDependencies;
 use pnpm_package_manifest::PackageManifest;
-use pnpm_testing_utils::fs::backdate_existing_files;
+use pnpm_testing_utils::fs::{backdate_existing_files, set_mtime};
 use pnpm_workspace_state::{
     ProjectEntry, WorkspaceState, WorkspaceStateSettings, load_workspace_state,
     update_workspace_state,
 };
+use ssri::{Algorithm, IntegrityOpts};
 use std::{collections::BTreeMap, fs};
 use tempfile::tempdir;
 
@@ -66,6 +67,26 @@ fn check_with_catalogs(
     })
 }
 
+fn check_with_lockfile(
+    workspace_root: &std::path::Path,
+    config: &Config,
+    node_linker: pnpm_config::NodeLinker,
+    project_manifests: &[(std::path::PathBuf, &PackageManifest)],
+    lockfile: &Lockfile,
+) -> Decision {
+    check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
+        workspace_root,
+        config,
+        node_linker,
+        included: isolated_included(),
+        supported_architectures: None,
+        project_manifests,
+        is_workspace_install: false,
+        lockfile: MaybeLazyLockfile::Loaded(Some(lockfile)),
+        catalogs: &BTreeMap::default(),
+    })
+}
+
 fn check_workspace(
     workspace_root: &std::path::Path,
     config: &Config,
@@ -82,6 +103,73 @@ fn check_workspace(
 fn write_empty_lockfile(workspace_root: &std::path::Path) {
     fs::write(workspace_root.join(Lockfile::FILE_NAME), "lockfileVersion: '9.0'\n")
         .expect("write pnpm-lock.yaml");
+}
+
+fn write_local_tarball_lockfile(
+    workspace_root: &std::path::Path,
+    virtual_store_dir: &std::path::Path,
+    dependency_group: &str,
+    tarball: &[u8],
+) -> Lockfile {
+    let integrity = IntegrityOpts::new().algorithm(Algorithm::Sha512).chain(tarball).result();
+    fs::write(
+        workspace_root.join(Lockfile::FILE_NAME),
+        format!(
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    {dependency_group}:\n      tar:\n        specifier: file:./vendor/tar.tgz\n        version: file:vendor/tar.tgz\npackages:\n  tar@file:vendor/tar.tgz:\n    resolution: {{integrity: {integrity}, tarball: file:vendor/tar.tgz}}\nsnapshots:\n  tar@file:vendor/tar.tgz: {{}}\n",
+        ),
+    )
+    .expect("write local tarball lockfile");
+    let lockfile = Lockfile::load_wanted_from_dir(workspace_root)
+        .expect("load local tarball lockfile")
+        .expect("local tarball lockfile on disk");
+    lockfile
+        .save_current_to_virtual_store_dir(virtual_store_dir)
+        .expect("write current local tarball lockfile");
+    lockfile
+}
+
+fn write_bare_tarball_lockfile(
+    workspace_root: &std::path::Path,
+    virtual_store_dir: &std::path::Path,
+    tarball: &[u8],
+) -> Lockfile {
+    let integrity = IntegrityOpts::new().algorithm(Algorithm::Sha512).chain(tarball).result();
+    fs::write(
+        workspace_root.join(Lockfile::FILE_NAME),
+        format!(
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      tar:\n        specifier: dependency.tgz\n        version: file:dependency.tgz\npackages:\n  tar@file:dependency.tgz:\n    resolution: {{integrity: {integrity}, tarball: file:dependency.tgz}}\nsnapshots:\n  tar@file:dependency.tgz: {{}}\n",
+        ),
+    )
+    .expect("write bare tarball lockfile");
+    let lockfile = Lockfile::load_wanted_from_dir(workspace_root)
+        .expect("load bare tarball lockfile")
+        .expect("bare tarball lockfile on disk");
+    lockfile
+        .save_current_to_virtual_store_dir(virtual_store_dir)
+        .expect("write current bare tarball lockfile");
+    lockfile
+}
+
+fn write_registry_lockfile(
+    workspace_root: &std::path::Path,
+    virtual_store_dir: &std::path::Path,
+    specifier: &str,
+) -> Lockfile {
+    let integrity = IntegrityOpts::new().algorithm(Algorithm::Sha512).chain(b"registry").result();
+    fs::write(
+        workspace_root.join(Lockfile::FILE_NAME),
+        format!(
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      tar:\n        specifier: {specifier}\n        version: 1.0.0\npackages:\n  tar@1.0.0:\n    resolution: {{integrity: {integrity}}}\nsnapshots:\n  tar@1.0.0: {{}}\n",
+        ),
+    )
+    .expect("write registry lockfile");
+    let lockfile = Lockfile::load_wanted_from_dir(workspace_root)
+        .expect("load registry lockfile")
+        .expect("registry lockfile on disk");
+    lockfile
+        .save_current_to_virtual_store_dir(virtual_store_dir)
+        .expect("write current registry lockfile");
+    lockfile
 }
 
 fn write_state(
@@ -109,6 +197,15 @@ fn write_state_with_pnpmfiles(
         settings,
     };
     update_workspace_state(workspace_root, &state).expect("write workspace state");
+}
+
+fn validate_existing_files(workspace_root: &std::path::Path) {
+    let timestamp = backdate_existing_files(workspace_root);
+    let mut state = load_workspace_state(workspace_root)
+        .expect("read workspace state")
+        .expect("workspace state on disk");
+    state.last_validated_timestamp = timestamp;
+    update_workspace_state(workspace_root, &state).expect("refresh workspace state");
 }
 
 #[test]
@@ -194,6 +291,7 @@ fn setup_fresh_install_with_config(
 
     let mut config = Config::new();
     config.modules_dir = workspace_root.join("node_modules");
+    config.virtual_store_dir = config.modules_dir.join(".pnpm");
     configure(&mut config);
     let config = Box::leak(Box::new(config));
     // Pre-create the modules dir so the "missing node_modules" guard
@@ -228,6 +326,30 @@ fn returns_up_to_date_when_state_and_manifests_agree() {
     assert_eq!(decision, Decision::UpToDate);
 }
 
+/// A filtered install refreshes `lastValidatedTimestamp` while leaving
+/// the projects it did not select untouched, so its state cannot prove
+/// the workspace is current: the next install re-validates for real.
+#[test]
+fn returns_skipped_when_the_previous_install_was_filtered() {
+    let (dir, config, manifest) =
+        setup_fresh_install(pnpm_config::NodeLinker::Isolated, "root", "1.0.0", "");
+    let mut state = load_workspace_state(dir.path()).expect("read state").expect("state on disk");
+    state.filtered_install = true;
+    update_workspace_state(dir.path(), &state).expect("write workspace state");
+
+    let decision = check(
+        dir.path(),
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(dir.path().to_path_buf(), &manifest)],
+    );
+
+    assert!(
+        matches!(decision, Decision::Skipped { reason } if reason.contains("previous install was filtered")),
+        "unexpected decision: {decision:?}",
+    );
+}
+
 /// A `file:` dependency must never short-circuit: nothing the fast
 /// path stats covers the dependency's *contents*, so the full install
 /// path has to run and refetch it.
@@ -251,10 +373,10 @@ fn returns_skipped_when_a_project_has_a_file_dependency() {
     );
 }
 
-/// Same bail for a `file:` *tarball* in any dependency group — a
-/// repacked `.tgz` bumps no manifest mtime either.
+/// A missing local tarball must reach the full install path so it can report
+/// the resolver's contextual error.
 #[test]
-fn returns_skipped_when_a_project_has_a_file_tarball_dev_dependency() {
+fn returns_skipped_when_a_project_has_a_missing_file_tarball_dependency() {
     let (dir, config, manifest) = setup_fresh_install(
         pnpm_config::NodeLinker::Isolated,
         "root",
@@ -273,13 +395,193 @@ fn returns_skipped_when_a_project_has_a_file_tarball_dev_dependency() {
     );
 }
 
-/// Bare local path and tarball specs resolve to local file dependencies
-/// too — same bail as `file:`, for the same reason.
+#[test]
+fn returns_up_to_date_when_a_project_has_an_unchanged_file_tarball_dependency() {
+    let (dir, config, manifest) = setup_fresh_install(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        r#""devDependencies":{"tar":"file:./vendor/tar.tgz"}"#,
+    );
+    fs::create_dir_all(dir.path().join("vendor")).expect("create vendor dir");
+    let tarball = b"unchanged";
+    fs::write(dir.path().join("vendor/tar.tgz"), tarball).expect("write tarball");
+    let lockfile = write_local_tarball_lockfile(
+        dir.path(),
+        &config.virtual_store_dir,
+        "devDependencies",
+        tarball,
+    );
+    validate_existing_files(dir.path());
+
+    let decision = check_with_lockfile(
+        dir.path(),
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(dir.path().to_path_buf(), &manifest)],
+        &lockfile,
+    );
+
+    assert_eq!(decision, Decision::UpToDate);
+}
+
+#[test]
+fn returns_skipped_when_a_project_file_tarball_changed_after_validation() {
+    let (dir, config, manifest) = setup_fresh_install(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        r#""dependencies":{"tar":"file:./vendor/tar.tgz"}"#,
+    );
+    fs::create_dir_all(dir.path().join("vendor")).expect("create vendor dir");
+    let tarball = dir.path().join("vendor/tar.tgz");
+    fs::write(&tarball, b"original").expect("write tarball");
+    let lockfile = write_local_tarball_lockfile(
+        dir.path(),
+        &config.virtual_store_dir,
+        "dependencies",
+        b"original",
+    );
+    validate_existing_files(dir.path());
+    fs::write(&tarball, b"repacked").expect("repack tarball");
+
+    let decision = check_with_lockfile(
+        dir.path(),
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(dir.path().to_path_buf(), &manifest)],
+        &lockfile,
+    );
+
+    assert!(
+        matches!(decision, Decision::Skipped { reason } if reason.contains("local file dependency")),
+    );
+}
+
+#[test]
+fn returns_skipped_when_a_project_file_tarball_changes_without_an_mtime_change() {
+    let (dir, config, manifest) = setup_fresh_install(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        r#""dependencies":{"tar":"file:./vendor/tar.tgz"}"#,
+    );
+    fs::create_dir_all(dir.path().join("vendor")).expect("create vendor dir");
+    let tarball = dir.path().join("vendor/tar.tgz");
+    fs::write(&tarball, b"original").expect("write tarball");
+    let modified = fs::metadata(&tarball).expect("stat tarball").modified().expect("tarball mtime");
+    let lockfile = write_local_tarball_lockfile(
+        dir.path(),
+        &config.virtual_store_dir,
+        "dependencies",
+        b"original",
+    );
+    validate_existing_files(dir.path());
+    fs::write(&tarball, b"repacked").expect("repack tarball");
+    set_mtime(&tarball, modified);
+
+    let decision = check_with_lockfile(
+        dir.path(),
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(dir.path().to_path_buf(), &manifest)],
+        &lockfile,
+    );
+
+    assert!(
+        matches!(decision, Decision::Skipped { reason } if reason.contains("local file dependency")),
+    );
+}
+
+#[test]
+fn returns_skipped_when_a_file_tarball_spec_points_to_a_directory() {
+    let (dir, config, manifest) = setup_fresh_install(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        r#""dependencies":{"tar":"file:./vendor/tar.tgz"}"#,
+    );
+    fs::create_dir_all(dir.path().join("vendor/tar.tgz")).expect("create tarball-shaped dir");
+    validate_existing_files(dir.path());
+
+    let decision = check(
+        dir.path(),
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(dir.path().to_path_buf(), &manifest)],
+    );
+
+    assert!(
+        matches!(decision, Decision::Skipped { reason } if reason.contains("local file dependency")),
+    );
+}
+
+#[test]
+fn returns_up_to_date_when_bare_tarball_specs_are_ambiguous() {
+    for spec in ["dependency.tgz", "user/repo.tgz"] {
+        let (dir, config, manifest) = setup_fresh_install(
+            pnpm_config::NodeLinker::Isolated,
+            "root",
+            "1.0.0",
+            &format!(r#""dependencies":{{"tar":"{spec}"}}"#),
+        );
+        let path = dir.path().join(spec);
+        fs::create_dir_all(path.parent().expect("tarball parent")).expect("create parent");
+        fs::write(path, b"local file with an ambiguous specifier").expect("write local file");
+        let lockfile = write_registry_lockfile(dir.path(), &config.virtual_store_dir, spec);
+        validate_existing_files(dir.path());
+
+        let decision = check_with_lockfile(
+            dir.path(),
+            config,
+            pnpm_config::NodeLinker::Isolated,
+            &[(dir.path().to_path_buf(), &manifest)],
+            &lockfile,
+        );
+        assert_eq!(decision, Decision::UpToDate, "specifier {spec:?}");
+    }
+}
+
+#[test]
+fn verifies_a_bare_tarball_when_the_lockfile_records_a_local_resolution() {
+    let (dir, config, manifest) = setup_fresh_install(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        r#""dependencies":{"tar":"dependency.tgz"}"#,
+    );
+    let tarball = dir.path().join("dependency.tgz");
+    fs::write(&tarball, b"original").expect("write bare tarball");
+    let lockfile = write_bare_tarball_lockfile(dir.path(), &config.virtual_store_dir, b"original");
+    validate_existing_files(dir.path());
+
+    let unchanged = check_with_lockfile(
+        dir.path(),
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(dir.path().to_path_buf(), &manifest)],
+        &lockfile,
+    );
+    assert_eq!(unchanged, Decision::UpToDate);
+
+    fs::write(&tarball, b"repacked").expect("repack bare tarball");
+    let changed = check_with_lockfile(
+        dir.path(),
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(dir.path().to_path_buf(), &manifest)],
+        &lockfile,
+    );
+    assert!(
+        matches!(changed, Decision::Skipped { reason } if reason.contains("local file dependency")),
+    );
+}
+
+/// Bare local paths resolve to local directory dependencies and stay on the
+/// full install path.
 #[test]
 fn returns_skipped_when_a_project_has_a_bare_local_path_dependency() {
-    for spec in
-        ["vendor/pkg.tgz", "../sibling-dir", "~/pkgs/foo", "/abs/path/foo", "c:/pkgs/foo", "c:pkgs"]
-    {
+    for spec in ["../sibling-dir", "~/pkgs/foo", "/abs/path/foo", "c:/pkgs/foo", "c:pkgs"] {
         let (dir, config, manifest) = setup_fresh_install(
             pnpm_config::NodeLinker::Isolated,
             "root",
@@ -2349,6 +2651,172 @@ fn workspace_content_check_refreshes_last_validated_timestamp() {
     assert!(after > before, "expected the state timestamp to advance ({before} -> {after})");
 }
 
+/// The instant every mtime-collision test stamps on the files the
+/// freshness check stats and on the recorded `lastValidatedTimestamp`.
+const COLLIDING_MTIME_SECS: u64 = 1_700_000_000;
+/// [`COLLIDING_MTIME_SECS`] in the milliseconds the state records.
+const COLLIDING_MTIME_MS: i64 = 1_700_000_000_000;
+
+/// Reproduce the mtime-tick collision of
+/// [#13907](https://github.com/pnpm/pnpm/issues/13907): every file the
+/// freshness check stats is stamped `subsec_nanos` into the millisecond
+/// the workspace state records as validated, so the manifest reads as
+/// possibly-modified and the content check runs. A `subsec_nanos` of
+/// zero is the whole-second-mtime filesystem's version of the same
+/// collision.
+fn collide_mtimes_with_recorded_state(
+    workspace_root: &std::path::Path,
+    config: &Config,
+    subsec_nanos: u32,
+) {
+    let modified = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::new(COLLIDING_MTIME_SECS, subsec_nanos);
+    for path in [
+        workspace_root.join("package.json"),
+        workspace_root.join(Lockfile::FILE_NAME),
+        config.virtual_store_dir.join(Lockfile::CURRENT_FILE_NAME),
+    ] {
+        set_mtime(&path, modified);
+    }
+    let mut projects = BTreeMap::new();
+    projects.insert(
+        workspace_root.to_string_lossy().into_owned(),
+        ProjectEntry { name: Some("root".into()), version: Some("1.0.0".into()) },
+    );
+    write_state(
+        workspace_root,
+        COLLIDING_MTIME_MS,
+        current_settings(config, pnpm_config::NodeLinker::Isolated, isolated_included(), None),
+        projects,
+    );
+}
+
+/// Rewrite the wanted lockfile so a content check would report the
+/// project outdated while leaving its mtime untouched, so an up-to-date
+/// verdict after this can only have come from the pure-mtime fast path.
+fn poison_lockfile_content(workspace_root: &std::path::Path) {
+    let path = workspace_root.join(Lockfile::FILE_NAME);
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, FOO_LOCKFILE.replace("1.0.0", "1.0.1")).unwrap();
+    set_mtime(&path, modified);
+}
+
+fn recorded_timestamp(workspace_root: &std::path::Path) -> i64 {
+    load_workspace_state(workspace_root)
+        .expect("read the workspace state")
+        .expect("a workspace state to have been written")
+        .last_validated_timestamp
+}
+
+fn assert_content_check_converges_after_collision(subsec_nanos: u32) {
+    let (dir, config) = setup_content_check_project();
+    collide_mtimes_with_recorded_state(dir.path(), config, subsec_nanos);
+    let manifest = PackageManifest::from_path(dir.path().join("package.json")).unwrap();
+    let project_manifests = [(dir.path().to_path_buf(), &manifest)];
+
+    assert_eq!(content_check_decision(&dir, config, true, &project_manifests), Decision::UpToDate);
+    let refreshed = recorded_timestamp(dir.path());
+    assert!(
+        refreshed > COLLIDING_MTIME_MS,
+        "expected the passing content check to advance the baseline past {COLLIDING_MTIME_MS}, got {refreshed}",
+    );
+
+    poison_lockfile_content(dir.path());
+    assert_eq!(content_check_decision(&dir, config, true, &project_manifests), Decision::UpToDate);
+    assert_eq!(recorded_timestamp(dir.path()), refreshed);
+}
+
+#[test]
+fn workspace_content_check_converges_after_a_same_millisecond_mtime_collision() {
+    assert_content_check_converges_after_collision(500_000);
+}
+
+#[test]
+fn workspace_content_check_converges_after_a_whole_second_mtime_collision() {
+    assert_content_check_converges_after_collision(0);
+}
+
+/// The refreshed baseline must not post-date the filesystem clock: an
+/// edit made after the content check passed still has to defeat the
+/// mtime fast path on the next run.
+#[test]
+fn workspace_content_check_does_not_bless_a_manifest_edited_after_it_passed() {
+    let (dir, config) = setup_content_check_project();
+    collide_mtimes_with_recorded_state(dir.path(), config, 500_000);
+    let manifest = PackageManifest::from_path(dir.path().join("package.json")).unwrap();
+    assert_eq!(
+        content_check_decision(&dir, config, true, &[(dir.path().to_path_buf(), &manifest)]),
+        Decision::UpToDate,
+    );
+
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"root","version":"1.0.0","dependencies":{"foo":"^1.0.0","bar":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    let edited = PackageManifest::from_path(dir.path().join("package.json")).unwrap();
+
+    let decision =
+        content_check_decision(&dir, config, true, &[(dir.path().to_path_buf(), &edited)]);
+    assert!(
+        matches!(decision, Decision::Skipped { .. }),
+        "expected the edit to defeat the fast path, got {decision:?}",
+    );
+}
+
+fn workspace_deps_status(
+    dir: &tempfile::TempDir,
+    config: &'static Config,
+    project_manifests: &[(std::path::PathBuf, &PackageManifest)],
+) -> RunDepsStatus {
+    let state = load_workspace_state(dir.path())
+        .expect("read the workspace state")
+        .expect("a workspace state to have been written");
+    let lockfile = Lockfile::load_wanted_from_dir(dir.path()).expect("parse pnpm-lock.yaml");
+    check_deps_status_before_run(
+        &OptimisticRepeatInstallCheck {
+            workspace_root: dir.path(),
+            config,
+            node_linker: pnpm_config::NodeLinker::Isolated,
+            included: isolated_included(),
+            supported_architectures: None,
+            project_manifests,
+            is_workspace_install: true,
+            lockfile: MaybeLazyLockfile::Loaded(lockfile.as_ref()),
+            catalogs: &BTreeMap::default(),
+        },
+        &state,
+    )
+}
+
+fn assert_deps_status_converges_after_collision(subsec_nanos: u32) {
+    let (dir, config) = setup_content_check_project();
+    collide_mtimes_with_recorded_state(dir.path(), config, subsec_nanos);
+    let manifest = PackageManifest::from_path(dir.path().join("package.json")).unwrap();
+    let project_manifests = [(dir.path().to_path_buf(), &manifest)];
+
+    assert_eq!(workspace_deps_status(&dir, config, &project_manifests), RunDepsStatus::UpToDate);
+    let refreshed = recorded_timestamp(dir.path());
+    assert!(
+        refreshed > COLLIDING_MTIME_MS,
+        "expected the passing content check to advance the baseline past {COLLIDING_MTIME_MS}, got {refreshed}",
+    );
+
+    poison_lockfile_content(dir.path());
+    assert_eq!(workspace_deps_status(&dir, config, &project_manifests), RunDepsStatus::UpToDate);
+    assert_eq!(recorded_timestamp(dir.path()), refreshed);
+}
+
+#[test]
+fn run_gate_converges_after_a_same_millisecond_mtime_collision() {
+    assert_deps_status_converges_after_collision(500_000);
+}
+
+#[test]
+fn run_gate_converges_after_a_whole_second_mtime_collision() {
+    assert_deps_status_converges_after_collision(0);
+}
+
 /// Workspace lockfile whose root importer links a sibling: the link
 /// stays valid while the sibling's version satisfies the manifest
 /// range, and a bump outside the range falls through to the full
@@ -2746,4 +3214,26 @@ fn lockfile_check_does_not_self_flag_its_own_baseline() {
     assert!(lockfile_modified_since(coarse, ms));
     // A whole second entirely before the baseline is not flagged.
     assert!(!lockfile_modified_since(coarse, ms + 1_000));
+}
+
+/// The reproduction command spells the dependency-group flags the way
+/// the CLI accepts them
+/// ([pnpm/pnpm#14147](https://github.com/pnpm/pnpm/issues/14147)). The
+/// table mirrors pnpm's `createInstallArgs` test.
+#[test]
+fn install_args_reproduce_the_recorded_dependency_groups() {
+    let args = |dev: Option<bool>, optional: Option<bool>, production: Option<bool>| {
+        let state = WorkspaceState {
+            settings: WorkspaceStateSettings { dev, optional, production, ..Default::default() },
+            ..Default::default()
+        };
+        install_args_from_state(&state)
+    };
+
+    assert_eq!(args(None, Some(true), Some(true)), ["--prod"]);
+    assert_eq!(args(None, Some(false), Some(true)), ["--prod", "--no-optional"]);
+    assert_eq!(args(Some(true), Some(true), None), ["--dev"]);
+    assert_eq!(args(Some(true), Some(false), None), ["--dev", "--no-optional"]);
+    assert_eq!(args(Some(true), Some(true), Some(true)), [] as [&str; 0]);
+    assert_eq!(args(Some(true), Some(false), Some(true)), ["--no-optional"]);
 }

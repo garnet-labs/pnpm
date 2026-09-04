@@ -116,6 +116,60 @@ test('authorization headers are not removed before redirection if the target is 
   }
 })
 
+test('authorization headers are removed before a same-host HTTPS downgrade', async () => {
+  setupMockAgent()
+  try {
+    const securePool = getMockAgent().get('https://registry.pnpm.io')
+    securePool.intercept({
+      path: '/is-positive',
+      method: 'GET',
+      headers: { authorization: 'Bearer 123' },
+    }).reply(302, '', { headers: { location: 'http://registry.pnpm.io/is-positive' } })
+
+    const plainPool = getMockAgent().get('http://registry.pnpm.io')
+    plainPool.intercept({
+      path: '/is-positive',
+      method: 'GET',
+      headers: headers => {
+        expect(headers.authorization).toBeUndefined()
+        return true
+      },
+    }).reply(200, { ok: true }, { headers: { 'content-type': 'application/json' } })
+
+    const fetchFromRegistry = createFetchFromRegistry({})
+    const res = await fetchFromRegistry(
+      'https://registry.pnpm.io/is-positive',
+      { authHeaderValue: 'Bearer 123' }
+    )
+
+    expect(await res.json()).toStrictEqual({ ok: true })
+  } finally {
+    await teardownMockAgent()
+  }
+})
+
+test('manual redirect mode returns the redirect response without following it', async () => {
+  setupMockAgent()
+  try {
+    const mockPool = getMockAgent().get('http://registry.pnpm.io')
+    mockPool.intercept({
+      path: '/-/tarballs/sha512/digest',
+      method: 'GET',
+    }).reply(302, '', { headers: { location: '/redirected' } })
+
+    const fetchFromRegistry = createFetchFromRegistry({})
+    const response = await fetchFromRegistry(
+      'http://registry.pnpm.io/-/tarballs/sha512/digest',
+      { redirect: 'manual' }
+    )
+
+    expect(response.status).toBe(302)
+    expect(response.headers.get('location')).toBe('/redirected')
+  } finally {
+    await teardownMockAgent()
+  }
+})
+
 test('switch to the correct agent for requests on redirect from http: to https:', async () => {
   // This test uses real network - no mock needed
   const fetchFromRegistry = createFetchFromRegistry({})

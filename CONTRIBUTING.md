@@ -26,6 +26,7 @@ The repository holds two implementations of the same package manager: the TypeSc
 
 ### JavaScript and TypeScript CLI
 
+1. Install pnpm using one of the [official installation methods](https://pnpm.io/installation). **Do not use Corepack.** The scripts in this repository invoke pnpm through the `pn` and `pnx` aliases, which the official installation methods create. Corepack only provides the `pnpm` and `pnpx` commands, so with a Corepack-managed pnpm the build fails with errors like `pn: Permission denied` ([pnpm/pnpm#12448](https://github.com/pnpm/pnpm/issues/12448)).
 1. Run `pnpm install` in the root of the repository to install all dependencies.
 1. Run `pnpm add ./pnpm/dev -g` to make pnpm from the repository available in the command line via the `pd` command.
 1. Run `pnpm run compile` to create an initial build of pnpm from the source in the repository.
@@ -230,7 +231,7 @@ Before you submit your Pull Request (PR) consider the following guidelines:
   ```
 
 - Create your patch, following [code style guidelines](#coding-style-guidelines), and **including appropriate test cases**.
-- Run `pnpm changeset` in the root of the repository and describe your changes. The resulting files should be committed as they will be used during release. Write the description for pnpm users and keep it concise — it becomes a release note. Implementation rationale belongs in the commit message, not the changeset.
+- Run `pnpm changeset` in the root of the repository and describe your changes. The resulting files should be committed as they will be used during release. Write the description for pnpm users and keep it concise — it becomes a release note. Implementation rationale belongs in the commit message, not the changeset. The wording rules are in [Changeset style](AGENTS.md#changeset-style).
 - Run the full test suite and ensure that all tests pass.
 - Commit your changes using a descriptive commit message that follows our
   [commit message conventions](#commit-message-guidelines). Adherence to these conventions

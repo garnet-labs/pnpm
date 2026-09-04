@@ -80,6 +80,9 @@
       "path": "../../../pkg-manifest/reader"
     },
     {
+      "path": "../../../pkg-manifest/utils"
+    },
+    {
       "path": "../../../store/path"
     },
     {
@@ -90,6 +93,9 @@
     },
     {
       "path": "../../../testing/registry-mock"
+    },
+    {
+      "path": "../../../text/sanitize"
     },
     {
       "path": "../../../workspace/project-manifest-reader"

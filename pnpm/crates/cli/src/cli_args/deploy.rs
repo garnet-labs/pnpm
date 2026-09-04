@@ -15,15 +15,16 @@ use pnpm_lockfile::{
     DirectoryResolution, ImporterDepVersion, LazyLockfile, Lockfile, LockfileResolution,
     MaybeLazyLockfile, PackageKey, PackageMetadata, PkgName, PkgNameVerPeer, ProjectSnapshot,
     ResolvedDependencyMap, ResolvedDependencySpec, SnapshotDepRef, SnapshotEntry,
-    TarballResolution, VersionPart,
+    TarballResolution, VersionPart, WantedLockfileSelection,
 };
 use pnpm_package_manager::{
-    ImportIndexedDirOpts, Install, ProjectMutation, UpdateSeedPolicy, import_indexed_dir,
+    ImportIndexedDirOpts, Install, ProjectMutation, UpdateSeedPolicy, apply_deploy_manifest_hook,
+    import_indexed_dir,
 };
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
 use pnpm_workspace::{Project, WORKSPACE_MANIFEST_FILENAME, importer_id_from_root_dir};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -87,15 +88,15 @@ enum DeployError {
     UnsafeDeployTarget { deploy_dir: PathBuf, reason: &'static str },
 
     #[display(
-        r#"By default, starting from pnpm v10, we only deploy from workspaces that have "inject-workspace-packages=true" set"#
+        r#"Workspace package '{package}' declares a peer dependency on '{peer}', which resolves to more than one version ({versions}) in the deployed graph. Without "injectWorkspacePackages" there is no snapshot to bind it to."#
     )]
     #[diagnostic(
-        code(ERR_PNPM_DEPLOY_NONINJECTED_WORKSPACE),
+        code(ERR_PNPM_DEPLOY_AMBIGUOUS_PEER),
         help(
-            r#"If you want to deploy without using injected dependencies, run "pnpm deploy" with the "--legacy" flag or set "force-legacy-deploy" to true"#
+            r#"Pin '{peer}' to a single version with an "overrides" entry, set "injectWorkspacePackages" to true, or run "pnpm deploy" with the "--legacy" flag."#
         )
     )]
-    NonInjectedWorkspace,
+    AmbiguousPeer { package: String, peer: String, versions: String },
 
     #[display("The selected project is missing from pnpm-lock.yaml: {project_id}")]
     #[diagnostic(code(ERR_PNPM_CANNOT_DEPLOY))]
@@ -114,6 +115,11 @@ enum DeployError {
 struct ProjectInfo {
     root_dir: PathBuf,
     name: Option<String>,
+    peer_dependencies: Vec<PkgName>,
+    /// Names the project declares as prod or optional dependencies. A peer it
+    /// depends on itself is already bound by that edge, whether or not the
+    /// deploy's group filter kept the edge in the deployed snapshot.
+    declared_dependencies: HashSet<PkgName>,
 }
 
 struct SelectedProject {
@@ -169,10 +175,6 @@ impl DeployArgs {
         }
 
         let force_legacy = self.legacy || config.force_legacy_deploy;
-        if config.shared_workspace_lockfile && !force_legacy && !config.inject_workspace_packages {
-            return Err(DeployError::NonInjectedWorkspace.into());
-        }
-
         let deploy_dir = resolve_target_dir(dir, &self.target_dirs[0]);
         // Deploy's `--force` (declared on the flattened `InstallArgs`)
         // does double duty: besides the install-side force semantics it
@@ -191,7 +193,7 @@ impl DeployArgs {
             !config.deploy_all_files,
         )?;
 
-        if config.shared_workspace_lockfile && !force_legacy {
+        if config.shares_one_lockfile() && !force_legacy {
             match Box::pin(self.deploy_from_shared_lockfile::<ReporterT>(
                 config,
                 workspace_dir,
@@ -203,7 +205,7 @@ impl DeployArgs {
                 SharedDeployOutcome::Deployed => return Ok(()),
                 SharedDeployOutcome::Fallback(warning) => warn::<ReporterT>(&deploy_dir, warning),
             }
-        } else if config.shared_workspace_lockfile && force_legacy {
+        } else if config.shares_one_lockfile() && force_legacy {
             warn::<ReporterT>(
                 &deploy_dir,
                 "Shared workspace lockfile detected but configuration forces legacy deploy implementation.",
@@ -229,10 +231,24 @@ impl DeployArgs {
         selected: &SelectedProject,
         deploy_dir: &Path,
     ) -> miette::Result<SharedDeployOutcome> {
-        if !config.inject_workspace_packages {
-            return Err(DeployError::NonInjectedWorkspace.into());
+        // The shared lockfile, and the importer ids naming the projects in
+        // it, belong to the lockfile dir — which `lockfileDir` can move
+        // away from the workspace this deploy selected its project from.
+        let lockfile_dir = config.lockfile_dir_for(workspace_dir);
+        // Every path this deploy resolves is a lockfile-relative importer
+        // id joined onto that dir, and none of them may escape it. A pin
+        // that does not contain the workspace makes each project's id
+        // climb out (`../packages/app`), so the shared path cannot
+        // describe this layout at all: hand it to the legacy installer,
+        // which resolves the deployed manifest on its own.
+        if !same_path(workspace_dir, lockfile_dir) && !is_ancestor_path(lockfile_dir, workspace_dir)
+        {
+            return Ok(SharedDeployOutcome::Fallback(format!(
+                "The lockfile at {} does not contain the workspace, so its importer paths cannot be deployed. Falling back to installing without it.",
+                lockfile_dir.display(),
+            )));
         }
-        let Some(lockfile) = Lockfile::load_wanted_from_dir(workspace_dir)
+        let Some(lockfile) = Lockfile::load_wanted_from_dir(lockfile_dir)
             .map_err(miette::Report::new)
             .wrap_err("read shared lockfile")?
         else {
@@ -242,14 +258,17 @@ impl DeployArgs {
             ));
         };
 
-        let project_id = importer_id_from_root_dir(workspace_dir, &selected.project.root_dir);
-        let dependency_groups =
-            self.install_args.dependency_options.dependency_groups().collect::<Vec<_>>();
+        let project_id = importer_id_from_root_dir(lockfile_dir, &selected.project.root_dir);
+        let dependency_groups = self
+            .install_args
+            .dependency_options
+            .dependency_groups(config.optional)
+            .collect::<Vec<_>>();
         let deploy_files = create_deploy_files(
             &lockfile,
             selected,
             &project_id,
-            workspace_dir,
+            lockfile_dir,
             deploy_dir,
             config,
             &dependency_groups,
@@ -306,9 +325,12 @@ impl DeployArgs {
             // The deployed project is not one of the source workspace's
             // importers — the deploy hook rewrites the copied manifest —
             // so its resolution must not be seeded from the workspace
-            // lockfile.
+            // lockfile. Plain `pnpm-lock.yaml` whatever the branch settings
+            // say, for the same reason: they describe that workspace
+            // resolution, and pnpm's deploy reads and writes the deployed
+            // lockfile under the plain name too.
             state.lockfile = if state.config.lockfile || frozen_lockfile {
-                LazyLockfile::deferred(deploy_dir.to_path_buf())
+                LazyLockfile::deferred(deploy_dir.to_path_buf(), WantedLockfileSelection::default())
             } else {
                 LazyLockfile::disabled()
             };
@@ -340,8 +362,11 @@ impl DeployArgs {
         );
         let lockfile_path = config.lockfile.then(|| deploy_dir.join(Lockfile::FILE_NAME));
         let prefer_frozen_lockfile = frozen_lockfile.then_some(true).or(Some(false));
-        let dependency_groups =
-            self.install_args.dependency_options.dependency_groups().collect::<Vec<_>>();
+        let dependency_groups = self
+            .install_args
+            .dependency_options
+            .dependency_groups(config.optional)
+            .collect::<Vec<_>>();
 
         let install = Install {
             tarball_mem_cache: Arc::clone(tarball_mem_cache),
@@ -395,6 +420,11 @@ fn create_deploy_install_config(
     let mut deploy_config = base_config.clone();
     deploy_config.modules_dir = deploy_dir.join("node_modules");
     deploy_config.virtual_store_dir = deploy_dir.join("node_modules/.pnpm");
+    // The deploy directory owns the lockfile this install runs against —
+    // the generated one for a shared deploy, its own resolution for the
+    // legacy path. A `lockfileDir` pinning the *source* workspace's
+    // lockfile must not redirect either.
+    deploy_config.lockfile_dir = None;
     deploy_config.global_virtual_store_dir = deploy_config.virtual_store_dir.clone();
     deploy_config.enable_global_virtual_store = false;
     deploy_config.pnpr_server = None;
@@ -428,12 +458,19 @@ fn select_project(
     workspace_dir: &Path,
     dir: &Path,
 ) -> miette::Result<SelectedProject> {
-    let (projects, _patterns) = discover_workspace_projects(workspace_dir)?;
+    let (projects, _patterns) = discover_workspace_projects(workspace_dir, config)?;
     let all_projects = projects
         .iter()
         .map(|project| ProjectInfo {
             root_dir: lexical_normalize(&project.root_dir),
             name: project.manifest.value().get("name").and_then(Value::as_str).map(str::to_string),
+            peer_dependencies: manifest_dependency_names(&project.manifest, &["peerDependencies"]),
+            declared_dependencies: manifest_dependency_names(
+                &project.manifest,
+                &["dependencies", "optionalDependencies"],
+            )
+            .into_iter()
+            .collect(),
         })
         .collect::<Vec<_>>();
 
@@ -690,29 +727,18 @@ fn copy_project<ReporterT: Reporter>(
 fn apply_deploy_hook(manifest_path: &Path) -> miette::Result<()> {
     let mut manifest = PackageManifest::from_path(manifest_path.to_path_buf())
         .wrap_err("read deployed manifest")?;
-    apply_deploy_hook_to_value(manifest.value_mut());
+    apply_deploy_manifest_hook(manifest.value_mut());
     manifest.save().wrap_err("write deployed manifest")
 }
 
-fn apply_deploy_hook_to_value(manifest: &mut Value) {
-    let names = ["dependencies", "devDependencies", "optionalDependencies"]
-        .into_iter()
-        .filter_map(|field| manifest.get(field)?.as_object())
-        .flat_map(|deps| deps.iter())
-        .filter_map(|(name, spec)| {
-            spec.as_str().is_some_and(|spec| spec.starts_with("workspace:")).then_some(name.clone())
-        })
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        return;
-    }
-    let Some(object) = manifest.as_object_mut() else { return };
-    let dependencies_meta =
-        object.entry("dependenciesMeta").or_insert_with(|| Value::Object(Map::new()));
-    let Some(meta_object) = dependencies_meta.as_object_mut() else { return };
-    for name in names {
-        meta_object.insert(name, json!({ "injected": true }));
-    }
+fn manifest_dependency_names(manifest: &PackageManifest, groups: &[&str]) -> Vec<PkgName> {
+    groups
+        .iter()
+        .filter_map(|group| manifest.value().get(group))
+        .filter_map(Value::as_object)
+        .flat_map(|dependencies| dependencies.keys())
+        .filter_map(|name| name.parse().ok())
+        .collect()
 }
 
 fn create_deploy_files(
@@ -741,27 +767,59 @@ fn create_deploy_files(
     target_snapshot.dependencies = Some(HashMap::new());
     target_snapshot.dev_dependencies = Some(HashMap::new());
     target_snapshot.optional_dependencies = Some(HashMap::new());
+    let declared_dependencies = selected
+        .project
+        .manifest
+        .available_dependency_names(None)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let peer_only_dependencies = selected
+        .project
+        .manifest
+        .dependencies([DependencyGroup::Peer])
+        .map(|(name, _)| name.to_string())
+        .filter(|name| !declared_dependencies.contains(name))
+        .collect::<HashSet<_>>();
 
     let selected_root = lexical_normalize(&selected.project.root_dir);
     let selected_bases = ResolveBases { file_base: lockfile_dir, link_base: &selected_root };
+    // An excluded group's direct dependencies are left out of both the
+    // deployed manifest and the deployed importer, because the graph prune
+    // below drops the packages they would point at.
+    let include_prod = dependency_groups.contains(&DependencyGroup::Prod);
     fill_target_dependency_map(
         &mut target_snapshot.dependencies,
-        input_snapshot.dependencies.as_ref(),
+        input_snapshot
+            .dependencies
+            .iter()
+            .flatten()
+            .filter(|(name, _)| include_prod || peer_only_dependencies.contains(&name.to_string())),
         &ctx,
         &selected_bases,
     )?;
+    let include_dev = dependency_groups.contains(&DependencyGroup::Dev);
     fill_target_dependency_map(
         &mut target_snapshot.dev_dependencies,
-        input_snapshot.dev_dependencies.as_ref(),
+        input_snapshot
+            .dev_dependencies
+            .iter()
+            .flatten()
+            .filter(|(name, _)| include_dev || peer_only_dependencies.contains(&name.to_string())),
         &ctx,
         &selected_bases,
     )?;
+    let include_optional = dependency_groups.contains(&DependencyGroup::Optional);
     fill_target_dependency_map(
         &mut target_snapshot.optional_dependencies,
-        input_snapshot.optional_dependencies.as_ref(),
+        input_snapshot.optional_dependencies.iter().flatten().filter(|(name, _)| {
+            include_optional || peer_only_dependencies.contains(&name.to_string())
+        }),
         &ctx,
         &selected_bases,
     )?;
+    drop_empty_dependency_map(&mut target_snapshot.dependencies);
+    drop_empty_dependency_map(&mut target_snapshot.dev_dependencies);
+    drop_empty_dependency_map(&mut target_snapshot.optional_dependencies);
 
     let mut packages = HashMap::new();
     if let Some(input_packages) = lockfile.packages.as_ref() {
@@ -805,6 +863,15 @@ fn create_deploy_files(
             snapshots.insert(output_key, convert_snapshot(snapshot, &ctx, lockfile_dir)?);
         }
     }
+    // Indexed on the same components `same_path` compares, so the importer loop
+    // below costs one lookup per importer rather than a scan of every project.
+    let peer_bearing_projects = selected
+        .all_projects
+        .iter()
+        .filter(|project| !project.peer_dependencies.is_empty())
+        .map(|project| (comparable_path_components(&project.root_dir), project))
+        .collect::<HashMap<_, _>>();
+    let mut linked_workspace_projects = HashMap::new();
     for (importer_path, project_snapshot) in &lockfile.importers {
         if importer_path == project_id {
             continue;
@@ -813,6 +880,10 @@ fn create_deploy_files(
             validate_lockfile_local_path(&lockfile_dir.join(importer_path), lockfile_dir)?;
         let bases = ResolveBases { file_base: lockfile_dir, link_base: &project_root };
         let package_key = create_file_url_key(&project_root, "", &selected.all_projects, None)?;
+        if let Some(project) = peer_bearing_projects.get(&comparable_path_components(&project_root))
+        {
+            linked_workspace_projects.insert(package_key.clone(), (*project).clone());
+        }
         snapshots.insert(
             package_key,
             project_snapshot_to_snapshot_entry(project_snapshot, &ctx, &bases)?,
@@ -835,6 +906,7 @@ fn create_deploy_files(
     deploy_lockfile.packages = (!packages.is_empty()).then_some(packages);
     deploy_lockfile.snapshots = (!snapshots.is_empty()).then_some(snapshots);
     prune_deploy_lockfile_graph(&mut deploy_lockfile, dependency_groups);
+    bind_singleton_peers(&mut deploy_lockfile, &linked_workspace_projects)?;
 
     let mut manifest = selected.project.manifest.value().clone();
     set_manifest_dependencies(&mut manifest, "dependencies", target_snapshot.dependencies.as_ref());
@@ -848,6 +920,7 @@ fn create_deploy_files(
         "optionalDependencies",
         target_snapshot.optional_dependencies.as_ref(),
     );
+    omit_peers_of_excluded_dependencies(&mut manifest, &declared_dependencies, &target_snapshot);
 
     let mut workspace_manifest = Map::new();
     let mut workspace_config =
@@ -892,17 +965,124 @@ fn create_deploy_files(
 
 /// Keep only the dependency graph that the deploy install will materialize.
 ///
-/// The deploy importer and package manifest intentionally retain every direct
-/// dependency group so the generated frozen lockfile still satisfies the
-/// generated manifest. Only the package graph is mode-specific: for example,
-/// `deploy --prod` excludes dev-only and unrelated workspace snapshots from
-/// both the lockfile and the localized virtual store.
+/// The deploy importer already carries just the included dependency groups, so
+/// this walks it in full: `deploy --prod` excludes dev-only and unrelated
+/// workspace snapshots from both the lockfile and the localized virtual store.
+/// A linked workspace package has no package snapshot in the shared lockfile,
+/// so the importer its deployed snapshot is synthesized from carries no peer
+/// bindings. Bind each still-unresolved peer to the deployed graph's own
+/// resolution while that resolution is unambiguous, and refuse when it is not:
+/// picking between candidates is precisely the decision that injecting the
+/// package would have made, and it cannot be recovered afterwards.
+fn bind_singleton_peers(
+    lockfile: &mut Lockfile,
+    linked_workspace_projects: &HashMap<PkgNameVerPeer, ProjectInfo>,
+) -> miette::Result<()> {
+    if linked_workspace_projects.is_empty() {
+        return Ok(());
+    }
+    let Some(snapshots) = lockfile.snapshots.as_ref() else { return Ok(()) };
+
+    // Keyed by the resolved snapshot key rather than the reference that spelled
+    // it, so an npm-aliased edge and a plain one that name the same package
+    // count once.
+    let mut candidates: HashMap<PkgName, HashSet<PkgNameVerPeer>> = HashMap::new();
+    let mut record = |key: PkgNameVerPeer| {
+        candidates.entry(key.name.clone()).or_default().insert(key);
+    };
+    if let Some(importer) = lockfile.importers.get(Lockfile::ROOT_IMPORTER_KEY) {
+        for dependencies in [
+            importer.dependencies.as_ref(),
+            importer.dev_dependencies.as_ref(),
+            importer.optional_dependencies.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (alias, dependency) in dependencies {
+                if let Some(key) = dependency.version.resolved_key(alias) {
+                    record(key);
+                }
+            }
+        }
+    }
+    for snapshot in snapshots.values() {
+        for dependencies in
+            [snapshot.dependencies.as_ref(), snapshot.optional_dependencies.as_ref()]
+                .into_iter()
+                .flatten()
+        {
+            for (alias, dependency) in dependencies {
+                if let Some(key) = dependency.resolve(alias) {
+                    record(key);
+                }
+            }
+        }
+    }
+
+    let mut bindings = Vec::new();
+    for (package_key, project) in linked_workspace_projects {
+        if !snapshots.contains_key(package_key) {
+            continue;
+        }
+        for peer in &project.peer_dependencies {
+            // Either map already binding the peer counts: re-binding one the
+            // package declares as an optional dependency would copy it into the
+            // required map and quietly promote it.
+            // The graph prune clears the optional map before this runs, so a
+            // peer the package depends on optionally is invisible in the
+            // snapshot under `--no-optional`. Binding it there would resurrect
+            // a dependency the flag excluded.
+            if project.declared_dependencies.contains(peer) {
+                continue;
+            }
+            let bound = snapshots.get(package_key).is_some_and(|snapshot| {
+                [snapshot.dependencies.as_ref(), snapshot.optional_dependencies.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|dependencies| dependencies.contains_key(peer))
+            });
+            if bound {
+                continue;
+            }
+            // A peer the deployed graph does not provide at all stays
+            // unresolved, exactly as it is in the workspace this deploy was
+            // taken from.
+            let Some(resolutions) = candidates.get(peer) else { continue };
+            let mut versions =
+                resolutions.iter().map(|key| key.suffix.to_string()).collect::<Vec<_>>();
+            if versions.len() > 1 {
+                versions.sort();
+                return Err(DeployError::AmbiguousPeer {
+                    package: project.name.clone().unwrap_or_else(|| package_key.to_string()),
+                    peer: peer.to_string(),
+                    versions: versions.join(", "),
+                }
+                .into());
+            }
+            if let Some(resolution) = resolutions.iter().next() {
+                bindings.push((
+                    package_key.clone(),
+                    peer.clone(),
+                    SnapshotDepRef::Plain(resolution.suffix.clone()),
+                ));
+            }
+        }
+    }
+
+    let Some(snapshots) = lockfile.snapshots.as_mut() else { return Ok(()) };
+    for (package_key, peer, reference) in bindings {
+        if let Some(snapshot) = snapshots.get_mut(&package_key) {
+            snapshot.dependencies.get_or_insert_default().insert(peer, reference);
+        }
+    }
+    Ok(())
+}
+
 fn prune_deploy_lockfile_graph(lockfile: &mut Lockfile, dependency_groups: &[DependencyGroup]) {
     let Some(snapshots) = lockfile.snapshots.as_ref() else { return };
     let Some(importer) = lockfile.importers.get(Lockfile::ROOT_IMPORTER_KEY) else { return };
 
-    let include_prod = dependency_groups.contains(&DependencyGroup::Prod);
-    let include_dev = dependency_groups.contains(&DependencyGroup::Dev);
     let include_optional = dependency_groups.contains(&DependencyGroup::Optional);
     let mut queue = VecDeque::new();
 
@@ -915,15 +1095,9 @@ fn prune_deploy_lockfile_graph(lockfile: &mut Lockfile, dependency_groups: &[Dep
                 }
             }
         };
-        if include_prod {
-            enqueue_importer_map(importer.dependencies.as_ref());
-        }
-        if include_dev {
-            enqueue_importer_map(importer.dev_dependencies.as_ref());
-        }
-        if include_optional {
-            enqueue_importer_map(importer.optional_dependencies.as_ref());
-        }
+        enqueue_importer_map(importer.dependencies.as_ref());
+        enqueue_importer_map(importer.dev_dependencies.as_ref());
+        enqueue_importer_map(importer.optional_dependencies.as_ref());
     }
 
     let mut reachable = HashSet::new();
@@ -967,17 +1141,22 @@ fn prune_deploy_lockfile_graph(lockfile: &mut Lockfile, dependency_groups: &[Dep
     }
 }
 
-fn fill_target_dependency_map(
+/// A lockfile importer records a dependency group only when it has entries.
+fn drop_empty_dependency_map(dependencies: &mut Option<ResolvedDependencyMap>) {
+    if dependencies.as_ref().is_some_and(HashMap::is_empty) {
+        *dependencies = None;
+    }
+}
+
+fn fill_target_dependency_map<'a>(
     output: &mut Option<ResolvedDependencyMap>,
-    input: Option<&ResolvedDependencyMap>,
+    input: impl Iterator<Item = (&'a PkgName, &'a ResolvedDependencySpec)>,
     ctx: &ConvertCtx,
     bases: &ResolveBases,
 ) -> miette::Result<()> {
     let output = output.get_or_insert_with(HashMap::new);
-    if let Some(input) = input {
-        for (name, spec) in input {
-            output.insert(name.clone(), convert_resolved_dependency_spec(name, spec, ctx, bases)?);
-        }
+    for (name, spec) in input {
+        output.insert(name.clone(), convert_resolved_dependency_spec(name, spec, ctx, bases)?);
     }
     Ok(())
 }
@@ -995,6 +1174,33 @@ fn set_manifest_dependencies(
     if let Some(object) = manifest.as_object_mut() {
         object.insert(field.to_string(), Value::Object(deps));
     }
+}
+
+fn omit_peers_of_excluded_dependencies(
+    manifest: &mut Value,
+    declared_dependencies: &HashSet<String>,
+    target_snapshot: &ProjectSnapshot,
+) {
+    let included_dependencies = dependency_names(target_snapshot);
+    let excluded_dependencies =
+        declared_dependencies.difference(&included_dependencies).cloned().collect::<HashSet<_>>();
+    let Some(manifest) = manifest.as_object_mut() else { return };
+    for field in ["peerDependencies", "peerDependenciesMeta"] {
+        if let Some(Value::Object(dependencies)) = manifest.get_mut(field) {
+            dependencies.retain(|name, _| !excluded_dependencies.contains(name));
+        }
+    }
+}
+
+fn dependency_names(snapshot: &ProjectSnapshot) -> HashSet<String> {
+    snapshot
+        .dependencies
+        .iter()
+        .flatten()
+        .chain(snapshot.dev_dependencies.iter().flatten())
+        .chain(snapshot.optional_dependencies.iter().flatten())
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 fn convert_package_metadata(
@@ -1019,6 +1225,7 @@ fn convert_package_metadata(
             LockfileResolution::Tarball(TarballResolution {
                 tarball: format!("file:{}", relative_path(ctx.deploy_dir, &resolved)),
                 integrity: resolution.integrity.clone(),
+                revision: None,
                 git_hosted: resolution.git_hosted,
                 path: resolution.path.as_ref().map(|_| relative_path(ctx.deploy_dir, &resolved)),
             })

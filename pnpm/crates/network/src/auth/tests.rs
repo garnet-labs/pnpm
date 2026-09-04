@@ -1,6 +1,7 @@
 use super::{
     AuthHeaders, DEFAULT_REGISTRY_SCOPE, UpstreamRouteHook, base64_encode, hide_auth_information,
     nerf_dart, redact_and_sanitize, redact_and_sanitize_multiline, redact_url_credentials,
+    redact_url_for_display,
 };
 use crate::TokenHelperOutput;
 use pretty_assertions::assert_eq;
@@ -231,6 +232,18 @@ fn redact_and_sanitize_strips_credentials_and_control_chars() {
     // A control character inside the userinfo must not break the redaction:
     // controls are stripped first, then credentials are redacted.
     assert_eq!(redact_and_sanitize("https://user:pass\r@host/x"), "https://host/x");
+}
+
+#[test]
+fn redact_url_for_display_strips_secrets_and_control_chars() {
+    assert_eq!(
+        redact_url_for_display("https://user:pass@host/pkg?token=secret#fragment\u{1b}"),
+        "https://host/pkg",
+    );
+    assert_eq!(redact_url_for_display("https://host/pkg#secret"), "https://host/pkg");
+    assert_eq!(redact_url_for_display("https://host/pkg"), "https://host/pkg");
+    assert_eq!(redact_url_for_display("https://user:pa?ss@host/pkg"), "[hidden]");
+    assert_eq!(redact_url_for_display("https://user:pa#ss@host/pkg"), "[hidden]");
 }
 
 #[test]
@@ -533,7 +546,26 @@ fn registry_with_pathname_matches_with_explicit_port() {
 
 #[test]
 fn returns_none_for_unmatched_url_in_empty_map() {
-    assert_eq!(AuthHeaders::default().for_url("http://reg.com"), None);
+    let headers = AuthHeaders::default();
+    assert!(headers.is_empty());
+    assert_eq!(headers.for_url("http://reg.com"), None);
+}
+
+#[test]
+fn secure_lookup_rejects_plain_http_but_allows_loopback() {
+    let headers = build(&[
+        ("//reg.com/", "Bearer remote"),
+        ("//127.0.0.1/", "Bearer local"),
+        ("//[::1]/", "Bearer ipv6-local"),
+    ]);
+    assert!(!headers.is_empty());
+    assert_eq!(headers.for_secure_url("http://reg.com/pkg"), None);
+    let remote = headers.for_secure_url("https://reg.com/pkg");
+    assert_eq!(remote.as_deref(), Some("Bearer remote"));
+    let local = headers.for_secure_url("http://127.0.0.1/pkg");
+    assert_eq!(local.as_deref(), Some("Bearer local"));
+    let ipv6_local = headers.for_secure_url("http://[::1]:4873/pkg");
+    assert_eq!(ipv6_local.as_deref(), Some("Bearer ipv6-local"));
 }
 
 /// Specifically exercises the trailing-slash-append branch in

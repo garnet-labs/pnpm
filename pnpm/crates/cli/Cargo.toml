@@ -34,6 +34,7 @@ pnpm-graph-hasher                      = { workspace = true }
 pnpm-hooks                             = { workspace = true }
 pnpm-injected-deps-syncer              = { workspace = true }
 pnpm-lockfile                          = { workspace = true }
+pnpm-lockfile-import                   = { workspace = true }
 pnpm-lockfile-verification             = { workspace = true }
 pnpm-modules-yaml                      = { workspace = true }
 pnpm-network                           = { workspace = true }
@@ -41,7 +42,10 @@ pnpm-network-web-auth                  = { workspace = true }
 pnpm-config                            = { workspace = true }
 pnpm-config-parse-overrides            = { workspace = true }
 pnpm-default-reporter                  = { workspace = true }
+pnpm-deps-inspection                   = { workspace = true }
+pnpm-deps-inspection-peers             = { workspace = true }
 pnpm-deps-path                         = { workspace = true }
+pnpm-deps-restorer                     = { workspace = true }
 pnpm-pack                              = { workspace = true }
 pnpm-publish                           = { workspace = true }
 pnpm-package-manifest                  = { workspace = true }
@@ -50,12 +54,15 @@ pnpm-patching                          = { workspace = true }
 pnpm-package-is-installable            = { workspace = true }
 pnpm-registry                          = { workspace = true }
 pnpm-reporter                          = { workspace = true }
+pnpm-resolving-default-resolver        = { workspace = true }
 pnpm-resolving-git-resolver            = { workspace = true }
 pnpm-resolving-npm-resolver            = { workspace = true }
 pnpm-resolving-parse-wanted-dependency = { workspace = true }
 pnpm-resolving-resolver-base           = { workspace = true }
+pnpm-semver-include-prerelease         = { workspace = true }
 pnpm-store-dir                         = { workspace = true }
 pnpm-tarball                           = { workspace = true }
+pnpm-text-sanitize                     = { workspace = true }
 pnpm-diagnostics                       = { workspace = true }
 pnpm-directory-fetcher                 = { workspace = true }
 pnpm-versioning                        = { workspace = true }
@@ -64,6 +71,7 @@ pnpm-workspace-manifest-writer         = { workspace = true }
 pnpm-workspace-projects-graph          = { workspace = true }
 pnpm-workspace-projects-filter         = { workspace = true }
 pnpm-workspace-state                   = { workspace = true }
+pnpm-workspace-task-scheduler          = { workspace = true }
 
 chrono               = { workspace = true }
 clap                 = { workspace = true }
@@ -84,6 +92,7 @@ p256                 = { workspace = true }
 pathdiff             = { workspace = true }
 pipe-trait           = { workspace = true }
 rayon                = { workspace = true }
+rustc-hash           = { workspace = true }
 reflink-copy         = { workspace = true }
 regex                = { workspace = true }
 reqwest              = { workspace = true }
@@ -91,11 +100,12 @@ rmp-serde            = { workspace = true }
 same-file            = { workspace = true }
 serde                = { workspace = true }
 serde_json           = { workspace = true }
+shell-words          = { workspace = true }
 ssri                 = { workspace = true }
 tabled               = { workspace = true }
 tar                  = { workspace = true }
 tempfile             = { workspace = true }
-tokio                = { workspace = true }
+tokio                = { workspace = true, features = ["process"] }
 tracing              = { workspace = true }
 url                  = { workspace = true }
 which                = { workspace = true }
@@ -110,9 +120,8 @@ wax                  = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Storage_FileSystem",
+  "Win32_System_Console",
   "Win32_System_SystemInformation",
-  "Win32_UI_Shell",
-  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(unix)'.dependencies]

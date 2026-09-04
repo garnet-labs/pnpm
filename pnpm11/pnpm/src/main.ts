@@ -18,7 +18,7 @@ import { globalWarn, logger } from '@pnpm/logger'
 import { type EngineDependency, isRuntimeAlias, type RuntimeName } from '@pnpm/types'
 import { finishWorkers } from '@pnpm/worker'
 import { safeReadProjectManifestOnly } from '@pnpm/workspace.project-manifest-reader'
-import { filterProjectsFromDir } from '@pnpm/workspace.projects-filter'
+import { filterProjectsFromDir, type WorkspaceFilter } from '@pnpm/workspace.projects-filter'
 import chalk from 'chalk'
 import loudRejection from 'loud-rejection'
 import { isEmpty } from 'ramda'
@@ -28,7 +28,7 @@ import { checkForUpdates } from './checkForUpdates.js'
 import { checkSudo } from './checkSudo.js'
 import { NOT_IMPLEMENTED_COMMAND_SET, overridableByScriptCommands, pnpmCmds, recursiveByDefaultCommands, skipPackageManagerCheckForCommand } from './cmd/index.js'
 import { formatUnknownOptionsError } from './formatError.js'
-import { getConfig, installConfigDepsAndLoadHooks } from './getConfig.js'
+import { getConfig, installConfigDepsAndLoadHooks, isSingleSettingRead } from './getConfig.js'
 import type { ParsedCliArgsWithBuiltIn } from './parseCliArgs.js'
 import { parseCliArgs } from './parseCliArgs.js'
 import { initReporter, type ReporterType } from './reporter/index.js'
@@ -113,8 +113,9 @@ export async function main (inputArgv: string[]): Promise<void> {
       workspaceDir,
       onlyInheritDlxSettingsFromLocal: isDlxOrCreateCommand,
       forSelfUpdate: cmd === 'self-update',
+      printWarnings: !isSingleSettingRead(cmd, cliParams),
     }) as { config: typeof config, context: ConfigContext })
-    if (cmd !== 'setup' && !shouldSkipPmHandling(cmd, cliParams)) {
+    if (cmd !== 'setup' && !shouldSkipPmHandling(cmd, cliParams, cliOptions.location)) {
       if (context.wantedPackageManager != null) {
         const pm = context.wantedPackageManager
         if (pm.onFail !== 'ignore') {
@@ -268,13 +269,19 @@ export async function main (inputArgv: string[]): Promise<void> {
     config.filter = config.filter ?? []
     config.filterProd = config.filterProd ?? []
 
-    const filters = [
+    const filters: WorkspaceFilter[] = [
       ...config.filter.map((filter) => ({ filter, followProdDepsOnly: false })),
       ...config.filterProd.map((filter) => ({ filter, followProdDepsOnly: true })),
     ]
     const relativeWSDirPath = () => path.relative(process.cwd(), wsDir) || '.'
+    // Both of the selectors below are pnpm's own; the user did not write
+    // them. Each has to mean "the project whose directory is the workspace
+    // root", which only glob matching says. Left to follow the pass,
+    // `legacyDirFiltering`'s subtree matching would read them as "every
+    // project below the root" — including the root's descendants instead
+    // of the root, and excluding them instead of it.
     if (config.workspaceRoot) {
-      filters.push({ filter: `{${relativeWSDirPath()}}`, followProdDepsOnly: Boolean(config.filterProd.length) })
+      filters.push({ filter: `{${relativeWSDirPath()}}`, followProdDepsOnly: Boolean(config.filterProd.length), useGlobDirFiltering: true })
     } else if (
       !filters.some(({ filter }) => !filter.startsWith('!')) &&
       workspaceDir &&
@@ -283,7 +290,7 @@ export async function main (inputArgv: string[]): Promise<void> {
       !config.includeWorkspaceRoot &&
       (cmd === 'run' || cmd === 'exec' || cmd === 'add' || cmd === 'test')
     ) {
-      filters.push({ filter: `!{${relativeWSDirPath()}}`, followProdDepsOnly: Boolean(config.filterProd.length) })
+      filters.push({ filter: `!{${relativeWSDirPath()}}`, followProdDepsOnly: Boolean(config.filterProd.length), useGlobDirFiltering: true })
     }
 
     const filterResults = await filterProjectsFromDir(wsDir, filters, {
@@ -420,16 +427,16 @@ function printError (message: string, hint?: string): void {
 }
 
 /**
- * Whether to skip the packageManager/runtime handling block (both auto
- * download and warn/error checks). Returns true when the command itself
- * opts out via `skipPackageManagerCheck: true`, or when the user is asking
- * for help on such a command — `pnpm help <skippable>` and
- * `pnpm <skippable> --help` (which parse-cli-args rewrites to the same
- * cmd='help' form) shouldn't download an older pinned pnpm just to render
- * help for a command that older pnpm may not even have.
+ * Returns whether the command may bypass project package-manager and runtime
+ * handling. Config command aliases bypass it unless `location` is exactly
+ * `project`; an absent or unrecognized location therefore retains config's
+ * global default. Commands marked with `skipPackageManagerCheck`, and help
+ * requests targeting those commands, also bypass it. A missing command does
+ * not.
  */
-function shouldSkipPmHandling (cmd: string | null, cliParams: string[]): boolean {
+function shouldSkipPmHandling (cmd: string | null, cliParams: string[], location: unknown): boolean {
   if (cmd == null) return false
+  if ((cmd === 'config' || cmd === 'c' || cmd === 'get' || cmd === 'set') && location !== 'project') return true
   if (skipPackageManagerCheckForCommand.has(cmd)) return true
   if (cmd === 'help' && cliParams[0] != null && skipPackageManagerCheckForCommand.has(cliParams[0])) return true
   return false
