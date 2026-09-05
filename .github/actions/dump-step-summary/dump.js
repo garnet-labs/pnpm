@@ -5,10 +5,35 @@ const { execSync } = require('child_process')
 // The sensor's own shutdown evidence. This post step runs after the Garnet
 // post step, so the unit has already been stopped and its journal, exit
 // status and log directory describe the completed flush.
+// The sensor writes ~1.8 GB to /var/log/jibril.out on a run this long, so
+// every probe over it is bounded: the ends verbatim, a filtered slice, and a
+// histogram of message shapes over the first and last 200 MB.
+const OUT = '/var/log/jibril.out'
+const strip = "sed -e 's/\\x1b\\[[0-9;]*m//g'"
+const shape = `awk '{ s = \"\"; for (i = 4; i <= 11 && i <= NF; i++) s = s \" \" $i; print substr(s, 2) }'`
+
 const probes = [
   ['journal', 'sudo -n journalctl -u jibril.service --no-pager -o short-precise | tail -200'],
   ['unit', 'sudo -n systemctl show jibril.service -p Result -p ExecMainStatus -p ExecMainCode -p ActiveState -p SubState'],
   ['log dir', 'ls -la /var/log/jibril* 2>&1 || true'],
+  ['unit file', 'sudo -n cat /etc/systemd/system/jibril.service 2>&1 || true'],
+  [
+    'config',
+    `cfg=$(sudo -n cat /etc/systemd/system/jibril.service 2>/dev/null | grep -oE -- '--config[= ][^ ]+' | head -1 | sed -E 's/^--config[= ]//'); ` +
+      'if [ -n "$cfg" ]; then echo "--config points at $cfg"; sudo -n cat "$cfg" 2>&1 | head -c 32K; else echo "no --config in ExecStart"; fi',
+  ],
+  ['out lines', `sudo -n wc -l ${OUT} 2>&1 || true`],
+  ['out head', `sudo -n head -c 64K ${OUT} 2>/dev/null | ${strip}`],
+  ['out tail', `sudo -n tail -c 512K ${OUT} 2>/dev/null | ${strip}`],
+  [
+    'out grep',
+    `sudo -n grep -ai -E 'profil|flush|shutdown|stop|sigterm|panic|fatal|error' ${OUT} 2>/dev/null | tail -300 | ${strip}`,
+  ],
+  [
+    'out shape histogram',
+    `{ sudo -n head -c 200M ${OUT} 2>/dev/null; sudo -n tail -c 200M ${OUT} 2>/dev/null; } | ${strip} | ${shape} | sort | uniq -c | sort -rn | head -40`,
+  ],
+  ['size samples', 'cat /tmp/jibril-size-samples.txt 2>&1 || true'],
 ]
 for (const [label, cmd] of probes) {
   console.log(`----- BEGIN jibril ${label} -----`)
