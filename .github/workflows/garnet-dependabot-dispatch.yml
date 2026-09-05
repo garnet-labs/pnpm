@@ -1,0 +1,57 @@
+name: Garnet Dependabot trusted dispatch
+on:
+  workflow_run:
+    workflows: ["Garnet Dependabot request"]
+    types: [completed]
+permissions: {}
+jobs:
+  dispatch:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Validate originating PR and dispatch trusted recorder
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const {data: run} = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: context.payload.workflow_run.id
+            });
+            if (run.event !== 'pull_request' || run.conclusion !== 'success' ||
+                run.path !== '.github/workflows/garnet-dependabot-request.yml' ||
+                run.head_repository?.full_name !== `${owner}/${repo}`) {
+              throw new Error('Untrusted or ineligible originating run');
+            }
+            const {data: repository} = await github.rest.repos.get({owner, repo});
+            const {data: expectedWorkflow} = await github.rest.actions.getWorkflow({
+              owner, repo, workflow_id: 'garnet-dependabot-request.yml'
+            });
+            if (run.workflow_id !== expectedWorkflow.id) {
+              throw new Error('Originating workflow identity mismatch');
+            }
+            const {data: associated} = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner, repo, commit_sha: run.head_sha, per_page: 100
+            });
+            const candidates = associated.filter(pr =>
+              pr.state === 'open' && pr.user?.login === 'dependabot[bot]' &&
+              pr.head?.sha === run.head_sha &&
+              pr.head?.repo?.id === repository.id &&
+              pr.base?.repo?.id === repository.id
+            );
+            if (candidates.length !== 1) {
+              core.notice('No unique current same-repository Dependabot PR; refusing stale request.');
+              return;
+            }
+            const pr = candidates[0];
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo,
+              workflow_id: 'garnet-dependabot-record.yml',
+              ref: repository.default_branch,
+              inputs: {pr_number: String(pr.number)}
+            });
+            core.notice(`Dispatched trusted recorder for PR #${pr.number} at ${pr.head.sha}.`);

@@ -1,0 +1,252 @@
+name: Garnet Dependabot Record
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Dependabot PR number; resolve its latest exact base/head pair"
+        required: true
+        type: number
+  # Automatic requests arrive through the separate unprivileged PR sentinel
+  # and trusted metadata-only workflow_run dispatcher. Never run this worker
+  # directly from the PR's workflow revision.
+
+permissions: {}
+
+concurrency:
+  group: garnet-dependabot-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.user.login == 'dependabot[bot]' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      snapshot: ${{ steps.resolve.outputs.snapshot }}
+      recorder_sha: ${{ steps.resolve.outputs.recorder_sha }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      manifests: ${{ steps.resolve.outputs.manifests }}
+      images: ${{ steps.images.outputs.images }}
+    steps:
+      # This inline controller MUST remain protected on the default branch.
+      - name: Resolve and validate the latest PR snapshot
+        id: resolve
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          CONTROL_SHA: ${{ github.workflow_sha }}
+          CONTROL_REF: ${{ github.workflow_ref }}
+        with:
+          script: |
+            const assert = (ok, message) => { if (!ok) throw new Error(message); };
+            const sha = value => /^[a-f0-9]{40}$/.test(value || '');
+            const {owner, repo} = context.repo;
+            const {data: repository} = await github.rest.repos.get({owner, repo});
+            assert(owner === 'garnet-labs' && repository.fork === true, 'Only approved garnet-labs forks');
+            assert(repository.full_name === `${owner}/${repo}`, 'Repository identity mismatch');
+            assert(String(repository.id) === process.env.GITHUB_REPOSITORY_ID, 'Repository ID mismatch');
+            const raw = context.eventName === 'workflow_dispatch'
+              ? process.env.INPUT_PR_NUMBER : String(context.payload.pull_request?.number);
+            assert(/^[1-9][0-9]{0,8}$/.test(raw || ''), 'pr_number must be a positive integer');
+            const pull_number = Number(raw);
+            const getPR = async () => (await github.rest.pulls.get({owner, repo, pull_number})).data;
+            const pr = await getPR();
+            assert(pr.state === 'open' || context.eventName === 'workflow_dispatch',
+              'Closed PR replay requires an intentional trusted dispatch');
+            assert(pr.user?.login === 'dependabot[bot]' && pr.user?.type === 'Bot' &&
+              pr.user?.id === 49699333, 'Not the GitHub Dependabot bot');
+            for (const side of ['base', 'head']) {
+              assert(pr[side]?.repo?.id === repository.id &&
+                pr[side]?.repo?.full_name === repository.full_name, 'Cross-repository PR is blocked');
+              assert(sha(pr[side].sha), 'Invalid PR revision');
+            }
+            if (context.eventName === 'pull_request') {
+              assert(pr.head.sha === context.payload.pull_request.head.sha &&
+                pr.base.sha === context.payload.pull_request.base.sha, 'Stale PR event; dispatch a fresh replay');
+            }
+            const {data: branch} = await github.rest.repos.getBranch({
+              owner, repo, branch: repository.default_branch
+            });
+            const recorder_sha = branch.commit.sha;
+            assert(sha(recorder_sha) && sha(process.env.CONTROL_SHA), 'Invalid controller revision');
+            const workflowPath = '.github/workflows/garnet-dependabot-record.yml';
+            assert(process.env.CONTROL_REF.startsWith(`${repository.full_name}/${workflowPath}@`),
+              'Unexpected control workflow path');
+            if (context.eventName === 'workflow_dispatch') {
+              assert(context.ref === `refs/heads/${repository.default_branch}`,
+                'Dispatch only the protected default branch');
+            }
+            const blobAt = async ref => {
+              const {data} = await github.rest.repos.getContent({owner, repo, path: workflowPath, ref});
+              assert(!Array.isArray(data) && data.type === 'file', 'Missing trusted control workflow');
+              return data.sha;
+            };
+            const [runningBlob, trustedBlob] = await Promise.all([
+              blobAt(process.env.CONTROL_SHA), blobAt(recorder_sha)
+            ]);
+            assert(runningBlob === trustedBlob, 'Workflow differs from protected default branch');
+            assert(pr.changed_files > 0 && pr.changed_files <= 3000, 'Changed-file list outside bounded scope');
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number, per_page: 100
+            });
+            assert(files.length === pr.changed_files, 'Incomplete changed-file list');
+            const safePath = p => typeof p === 'string' && p.length <= 512 &&
+              !p.startsWith('/') && !p.includes('\\') && !/[\x00-\x1f\x7f]/.test(p) &&
+              p.split('/').every(x => x && x !== '.' && x !== '..' && x !== '.git');
+            const paths = [...new Set(files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)))].sort();
+            assert(paths.every(safePath), 'Unsafe changed-file path');
+            const again = await getPR();
+            assert(again.base.sha === pr.base.sha && again.head.sha === pr.head.sha &&
+              again.updated_at === pr.updated_at, 'PR changed during resolution; dispatch again');
+            const {data: comparison} = await github.rest.repos.compareCommits({
+              owner, repo, base: pr.base.sha, head: pr.head.sha
+            });
+            const baseline_sha = comparison.merge_base_commit?.sha;
+            assert(sha(baseline_sha), 'Missing immutable merge-base for dependency-only comparison');
+            const manifests = paths.filter(p => /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|pyproject\.toml|uv\.lock|poetry\.lock|requirements[^/]*\.txt|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$/.test(p));
+            const snapshot = {
+              schema: 1, repository: repository.full_name, repository_id: String(repository.id),
+              owner_id: String(repository.owner.id), pr_number: pull_number,
+              pr_state: pr.state, pr_merged: pr.merged === true,
+              author: {login: pr.user.login, id: String(pr.user.id)},
+              base: {sha: pr.base.sha, repository: pr.base.repo.full_name, repository_id: String(pr.base.repo.id)},
+              head: {sha: pr.head.sha, repository: pr.head.repo.full_name, repository_id: String(pr.head.repo.id)},
+              pr_base_tip: pr.base.sha, baseline_sha, comparison_scope: 'merge-base-to-head',
+              control_sha: process.env.CONTROL_SHA, control_ref: process.env.CONTROL_REF,
+              recorder_sha, workflow_path: workflowPath, workflow_blob: trustedBlob,
+              github_sha: context.sha, github_ref: context.ref, event: context.eventName,
+              actor: context.actor, triggering_actor: process.env.GITHUB_TRIGGERING_ACTOR,
+              run_id: String(context.runId), run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+              resolved_at: new Date().toISOString(), pr_updated_at: pr.updated_at,
+              changed_files: paths, manifests
+            };
+            assert(Buffer.byteLength(JSON.stringify(snapshot)) < 48000, 'Snapshot exceeds output limit');
+            core.setOutput('snapshot', JSON.stringify(snapshot));
+            core.setOutput('recorder_sha', recorder_sha);
+            core.setOutput('manifests', JSON.stringify(manifests));
+            core.setOutput('matrix', JSON.stringify({include: [
+              {side: 'base', sha: baseline_sha}, {side: 'head', sha: pr.head.sha}
+            ]}));
+      - name: Checkout approved recorder only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.resolve.outputs.recorder_sha }}
+          path: control
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Resolve one immutable container image per ecosystem for both sides
+        id: images
+        env:
+          RECORDER_SNAPSHOT: ${{ steps.resolve.outputs.snapshot }}
+        run: node control/.github/scripts/garnet-dependabot-record.mjs images
+
+  record:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RECORDER_SNAPSHOT: ${{ needs.resolve.outputs.snapshot }}
+      RECORDER_IMAGES: ${{ needs.resolve.outputs.images }}
+      RECORDER_SIDE: ${{ matrix.side }}
+      RECORDER_SOURCE: ${{ github.workspace }}/source
+      RECORDER_STATE: ${{ runner.temp }}/garnet-recorder-state
+      RECORDER_OUTPUT: ${{ runner.temp }}/garnet-recorder-evidence
+      GARNET_PROFILE_JOB: dependabot-${{ matrix.side }}-attempt-${{ github.run_attempt }}
+      # Suppress the App's implicit comment. A separate trusted publisher can
+      # later publish the verified receipt, not the native profile SHA label.
+      GARNET_ACTION_SKIP_GITHUB_APP_COMMENT: "true"
+    steps:
+      - name: Checkout trusted recorder, never the PR's scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.resolve.outputs.recorder_sha }}
+          path: control
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Initialize diagnostic receipt
+        run: node control/.github/scripts/garnet-dependabot-record.mjs init
+      - name: Checkout exact PR side, not its merge commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          fetch-depth: 1
+      - name: Verify SHA and derive workload without executing source
+        run: node control/.github/scripts/garnet-dependabot-record.mjs prepare
+      - name: Start trusted sensor using OIDC only
+        uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c
+        with:
+          jibril_version: v2.16.0
+          stop_timeout_seconds: "180"
+          debug: "false"
+      - name: Run dependency workload only inside isolated containers
+        timeout-minutes: 30
+        run: node control/.github/scripts/garnet-dependabot-record.mjs run
+      - name: Gracefully stop sensor and export exact-execution receipt
+        if: always()
+        timeout-minutes: 6
+        run: node control/.github/scripts/garnet-dependabot-record.mjs finalize
+      - name: Retain raw profile, receipt, and untrusted workload output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: garnet-record-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.side }}
+          path: ${{ runner.temp }}/garnet-recorder-evidence/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+  verify:
+    if: always() && needs.resolve.result == 'success'
+    needs: [resolve, record]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout trusted verifier on a fresh runner
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.resolve.outputs.recorder_sha }}
+          path: control
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Download only this attempt's two side artifacts as data
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: garnet-record-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: evidence
+          merge-multiple: false
+      - name: Validate complete profiles and exact provenance
+        env:
+          RECORDER_SNAPSHOT: ${{ needs.resolve.outputs.snapshot }}
+          RECORDER_IMAGES: ${{ needs.resolve.outputs.images }}
+          RECORDER_EVIDENCE: ${{ github.workspace }}/evidence
+          RECORDER_SUMMARY: ${{ runner.temp }}/garnet-verified
+          RECORDER_RECORD_RESULT: ${{ needs.record.result }}
+        run: node control/.github/scripts/garnet-dependabot-record.mjs verify
+      - name: Retain trusted verification for a future separate publisher
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: garnet-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/garnet-verified/
+          if-no-files-found: error
+          retention-days: 14
