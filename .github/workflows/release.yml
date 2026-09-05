@@ -265,7 +265,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+      - uses: garnet-org/action@540530e93eb6d1caed43f82d3145900d17041f20 # v2.3.0 candidate (main)
+        # The Garnet sensor is eBPF-based and only runs on Linux; this job is on
+        # macOS, so record runtime evidence only if the job ever moves to Linux.
+        if: runner.os == 'Linux'
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Install pnpm and Node
@@ -419,7 +422,10 @@ jobs:
             echo "::error::Tag v${VERSION} points at ${tag_commit}, but this run would release commit ${GITHUB_SHA}. Rerun the release workflow from the v${VERSION} tag."
             exit 1
           fi
-      - uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+      - uses: garnet-org/action@540530e93eb6d1caed43f82d3145900d17041f20 # v2.3.0 candidate (main)
+        # The Garnet sensor is eBPF-based and only runs on Linux; this job is on
+        # macOS, so record runtime evidence only if the job ever moves to Linux.
+        if: runner.os == 'Linux'
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - name: Install pnpm and Node
