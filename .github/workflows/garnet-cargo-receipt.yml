@@ -1,0 +1,161 @@
+name: Garnet Cargo receipt
+
+# Fork-only. pnpm/pnpm#14547 added opt-in Cargo dependency resolution and
+# materialization to `pnpm install` (`cargo: { enabled: true }` in
+# pnpm-workspace.yaml). The repository does not commit that setting, so no
+# upstream CI job exercises the path: no run records which processes the
+# feature starts, which hosts they reach, or what they write.
+#
+# This workflow builds the binary in an unrecorded job, then runs one
+# cargo-enabled install and the offline compile of the materialized crates
+# under the Garnet step. Only the second job is recorded, and the toolchain
+# is installed before the Garnet step, so the record contains the feature's
+# own execution and nothing else.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/garnet-cargo-receipt.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build the pnpm binary (not recorded)
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free up runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust Toolchain
+        uses: ./.github/actions/rustup
+
+      - name: Build the pnpm binary
+        run: cargo build --locked -p pnpm-cli --bin pnpm
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pnpm-binary
+          path: target/debug/pnpm
+          retention-days: 5
+          if-no-files-found: error
+
+  recorded:
+    name: cargo.enabled install (recorded)
+    needs: build
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      # Everything the record should not contain happens before the Garnet
+      # step: the checkout, the toolchain download, the binary artifact.
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust Toolchain (before recording)
+        uses: ./.github/actions/rustup
+
+      - name: Download the binary (before recording)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pnpm-binary
+          path: ${{ runner.temp }}/bin
+
+      - name: Prepare the fixture (before recording)
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/pnpm"
+          "$RUNNER_TEMP/bin/pnpm" --version
+          F="$RUNNER_TEMP/fixture"
+          mkdir -p "$F/src"
+          cat > "$F/pnpm-workspace.yaml" <<'EOF'
+          cargo:
+            enabled: true
+          EOF
+          cat > "$F/package.json" <<'EOF'
+          {
+            "name": "cargo-receipt-fixture",
+            "private": true,
+            "dependencies": { "is-odd": "3.0.1" }
+          }
+          EOF
+          cat > "$F/Cargo.toml" <<'EOF'
+          [package]
+          name = "cargo-receipt-fixture"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          libc = "0.2"
+          serde = { version = "1", features = ["derive"] }
+          EOF
+          cat > "$F/src/main.rs" <<'EOF'
+          // The serde derive is here to make the proc-macro crates compile;
+          // libc is here because it carries a build script.
+          #[derive(serde::Serialize)]
+          struct Receipt {
+              pid: u32,
+          }
+
+          fn main() {
+              let pid = unsafe { libc::getpid() } as u32;
+              let receipt = Receipt { pid };
+              println!("{}", receipt.pid);
+          }
+          EOF
+          echo "--- fixture"
+          find "$F" -type f | sort
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0-rc.8
+
+      - name: Cargo resolution and materialization (pnpm install)
+        id: install
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/fixture
+        env:
+          PNPM_CONFIG_STORE_DIR: ${{ runner.temp }}/store
+          PNPM_CONFIG_CACHE_DIR: ${{ runner.temp }}/cache
+        run: |
+          set -x
+          "$RUNNER_TEMP/bin/pnpm" install
+
+      - name: Compile the materialized crates (cargo build --locked --offline)
+        id: compile
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/fixture
+        run: |
+          set -x
+          cargo build --locked --offline
+
+      - name: What was written
+        if: always()
+        working-directory: ${{ runner.temp }}/fixture
+        run: |
+          echo "install exit: ${{ steps.install.outcome }}   compile exit: ${{ steps.compile.outcome }}"
+          echo "--- .cargo/config.toml"
+          cat .cargo/config.toml 2>/dev/null || echo "(absent)"
+          echo "--- Cargo.lock (first 40 lines)"
+          head -40 Cargo.lock 2>/dev/null || echo "(absent)"
+          echo "--- .pnpm/crates (two levels)"
+          find .pnpm/crates -maxdepth 3 2>/dev/null | head -40 || echo "(absent)"
+          echo "--- directory source contents"
+          find .pnpm/crates -maxdepth 4 -name '.cargo-checksum.json' 2>/dev/null | head -20 || true
+          echo "--- runner"
+          echo "runner=${RUNNER_NAME} os=$(. /etc/os-release; echo "$PRETTY_NAME") rustc=$(rustc --version)"
