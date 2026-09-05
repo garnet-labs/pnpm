@@ -110,6 +110,13 @@ non-exploitable warning. A misconfigured consumer is not a pnpm bug.
 lockfile package needs a cache/fast path (e.g. a per-lockfile cache keyed on the lockfile hash)
 before it ships as a default.
 
+**Use recorded runtime evidence when it exists.** Some PRs carry a kernel-recorded Execution
+Profile of their own CI run (a Garnet Runtime Review comment, and a `.garnet/runtime-evidence.md`
+file when committed on the branch). Where a finding concerns what a change *executes* — lifecycle
+scripts, `allowBuilds` decisions, new dependencies, network access — check the recorded execution
+chains and destinations instead of reasoning only from the static diff, and cite the Execution
+Profile receipt in the finding.
+
 ---
 
 ## 2. Performance review rules
