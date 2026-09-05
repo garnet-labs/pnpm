@@ -140,9 +140,9 @@ jobs:
         # interleaved so the two arms share the same time window and the same
         # queueing behaviour.
         include:
-          - platform_label: ubuntu rc8-01
-            cell_id: rc8-01
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-01
+            cell_id: rc9-01
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -158,9 +158,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-02
-            cell_id: rc8-02
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-02
+            cell_id: rc9-02
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -176,9 +176,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-03
-            cell_id: rc8-03
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-03
+            cell_id: rc9-03
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -194,9 +194,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-04
-            cell_id: rc8-04
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-04
+            cell_id: rc9-04
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -212,9 +212,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-05
-            cell_id: rc8-05
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-05
+            cell_id: rc9-05
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -230,9 +230,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-06
-            cell_id: rc8-06
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-06
+            cell_id: rc9-06
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -248,9 +248,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-07
-            cell_id: rc8-07
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-07
+            cell_id: rc9-07
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -266,9 +266,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-08
-            cell_id: rc8-08
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-08
+            cell_id: rc9-08
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -284,9 +284,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-09
-            cell_id: rc8-09
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-09
+            cell_id: rc9-09
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -302,9 +302,9 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc8-10
-            cell_id: rc8-10
-            garnet_jibril_version: v2.17.0-rc.8
+          - platform_label: ubuntu rc9-10
+            cell_id: rc9-10
+            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
