@@ -220,7 +220,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      actions: read
+      actions: write
     steps:
       - name: Checkout trusted verifier on a fresh runner
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -243,7 +243,8 @@ jobs:
           RECORDER_SUMMARY: ${{ runner.temp }}/garnet-verified
           RECORDER_RECORD_RESULT: ${{ needs.record.result }}
         run: node control/.github/scripts/garnet-dependabot-record.mjs verify
-      - name: Retain trusted verification for a future separate publisher
+      - name: Retain trusted verification for the separate publisher
+        id: verification_artifact
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -251,3 +252,46 @@ jobs:
           path: ${{ runner.temp }}/garnet-verified/
           if-no-files-found: error
           retention-days: 14
+      - name: Request trusted publication after evidence retention
+        if: always() && steps.verification_artifact.outcome == 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const assert = (ok, message) => { if (!ok) throw new Error(message); };
+            const {owner, repo} = context.repo;
+            const {data: repository} = await github.rest.repos.get({owner, repo});
+            const workerPath = '.github/workflows/garnet-dependabot-record.yml';
+            const publisherPath = '.github/workflows/garnet-dependabot-publish.yml';
+            const ref = `refs/heads/${repository.default_branch}`;
+            assert(owner === 'garnet-labs' && repository.fork &&
+              repository.full_name === `${owner}/${repo}` &&
+              String(repository.id) === process.env.GITHUB_REPOSITORY_ID,
+              'Untrusted publication repository');
+            assert(context.eventName === 'workflow_dispatch' && context.ref === ref &&
+              process.env.GITHUB_WORKFLOW_REF === `${owner}/${repo}/${workerPath}@${ref}` &&
+              /^[a-f0-9]{40}$/.test(context.sha) && process.env.GITHUB_WORKFLOW_SHA === context.sha,
+              'Untrusted publication request context');
+            const {data: run} = await github.rest.actions.getWorkflowRun({owner, repo, run_id: context.runId});
+            const attempt = process.env.GITHUB_RUN_ATTEMPT;
+            assert(/^[1-9]\d{0,5}$/.test(attempt || '') && String(run.run_attempt) === attempt &&
+              run.id === context.runId && run.path === workerPath && run.event === 'workflow_dispatch' &&
+              run.head_sha === context.sha && run.head_branch === repository.default_branch &&
+              run.repository?.id === repository.id && run.head_repository?.id === repository.id,
+              'Publication worker identity mismatch');
+            const {data: worker} = await github.rest.actions.getWorkflow({owner, repo, workflow_id: run.workflow_id});
+            assert(worker.id === run.workflow_id && worker.path === workerPath, 'Wrong worker workflow');
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
+              {owner, repo, run_id: context.runId, per_page: 100});
+            const names = ['base', 'head'].map(side => `garnet-record-${context.runId}-${attempt}-${side}`);
+            names.push(`garnet-verification-${context.runId}-${attempt}`);
+            if (!names.every(name => artifacts.filter(a => a.name === name && !a.expired).length === 1)) {
+              core.notice('No complete retained artifact set; publication request skipped.');
+              return;
+            }
+            const {data: publisher} = await github.rest.actions.getWorkflow({owner, repo,
+              workflow_id: 'garnet-dependabot-publish.yml'});
+            assert(publisher.path === publisherPath && publisher.state === 'active' &&
+              Number.isSafeInteger(publisher.id), 'Publisher workflow missing or inactive');
+            await github.rest.actions.createWorkflowDispatch({owner, repo,
+              workflow_id: publisher.id, ref: repository.default_branch,
+              inputs: {run_id: String(context.runId), run_attempt: attempt, worker_sha: context.sha}});

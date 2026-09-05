@@ -8,8 +8,9 @@ import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {planAdditionalLockfile} from './garnet-additional-lockfiles.mjs';
 
-export const POLICY = 'garnet-dependabot-container-v1';
+export const POLICY = 'garnet-dependabot-container-v2';
 export const ACTION = 'e546567a72e4fede11ec39d6e9f75b539adef22c';
 export const SENSOR = 'v2.16.0';
 export const IMAGE_TAGS = Object.freeze({
@@ -26,6 +27,17 @@ const PRIVATE_NETS = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
   '224.0.0.0/4', '240.0.0.0/4'];
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
 const digest = data => crypto.createHash('sha256').update(data).digest('hex');
+// Always derive these from the trusted control checkout, never artifact or PR
+// paths. A present-but-replaced helper must not satisfy policy-v2 verification.
+export function recorderCodeHashes() {
+  return {
+    recorder_script_sha256: digest(fs.readFileSync(fileURLToPath(import.meta.url))),
+    recorder_helpers_sha256: {
+      '.github/scripts/garnet-additional-lockfiles.mjs':
+        digest(fs.readFileSync(new URL('./garnet-additional-lockfiles.mjs', import.meta.url))),
+    },
+  };
+}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const now = () => new Date().toISOString();
 const quote = s => `'${String(s).replaceAll("'", "'\\''")}'`;
@@ -128,7 +140,14 @@ export function planWorkloads(root, changed) {
     let scope = 'dependency-install-with-lifecycle-hooks';
     let locked = true;
     let note = '';
-    if (kind === 'node') {
+    const additional = planAdditionalLockfile({root, file, kind, read: readSource});
+    if (additional) {
+      dir = additional.directory;
+      commands.push(...additional.commands);
+      scope = additional.scope;
+      locked = additional.locked;
+      note = additional.note;
+    } else if (kind === 'node') {
       const packageRoot = nearest(root, dir, 'package.json');
       assert(packageRoot !== undefined, 'BLOCKED: missing package.json');
       dir = packageRoot;
@@ -146,14 +165,17 @@ export function planWorkloads(root, changed) {
       }
       const pnpmLock = readSource(root, joined(dir, 'pnpm-lock.yaml'), true);
       if (spec?.name === 'yarn' || (!spec && exists(root, dir, 'yarn.lock'))) {
-        throw new Error('BLOCKED: Yarn needs an explicitly reviewed workload policy');
+        throw new Error('BLOCKED: Yarn project could not be resolved by the reviewed lockfile policy');
       }
       if (spec?.name === 'pnpm' || (!standalone && pnpmLock !== null)) {
         assert(pnpmLock !== null, 'BLOCKED: pnpm frozen install requires a lockfile');
         const lockVersion = /(?:^|\n)lockfileVersion:\s*['"]?(\d+)/.exec(pnpmLock)?.[1];
         const version = spec?.version || ({'9': '9.15.9', '6': '8.15.9', '5': '7.33.7'})[lockVersion];
         assert(version, 'BLOCKED: unsupported pnpm lockfile version without packageManager');
-        commands.push(`corepack install --global ${quote(`pnpm@${version}`)}`, 'corepack pnpm install --frozen-lockfile');
+        commands.push(`corepack install --global ${quote(`pnpm@${version}`)}`,
+          'mkdir -p /home/workload/.local/bin',
+          'corepack enable --install-directory /home/workload/.local/bin pnpm',
+          'corepack pnpm install --frozen-lockfile');
         note = spec ? 'packageManager respected' : 'pnpm fallback version selected from lockfile version';
       } else {
         const hasLock = exists(root, dir, 'package-lock.json') || exists(root, dir, 'npm-shrinkwrap.json');
@@ -177,7 +199,7 @@ export function planWorkloads(root, changed) {
         dir = nearest(root, project, 'uv.lock') ?? project;
         readSource(root, joined(dir, 'pyproject.toml'));
         assert(!exists(root, dir, 'poetry.lock') || exists(root, dir, 'uv.lock'),
-          'BLOCKED: Poetry lock needs an explicitly reviewed workload policy');
+          'BLOCKED: Poetry project could not be resolved by the reviewed lockfile policy');
         if (exists(root, dir, 'uv.lock')) {
           commands.push('python -m pip install --user uv==0.8.22',
             'uv lock --check',
@@ -214,6 +236,17 @@ export function planWorkloads(root, changed) {
       commands.push(`gem install bundler --version ${quote(version)} --no-document`,
         `bundle _${version}_ install`);
       note = 'BUNDLE_FROZEN=true, exact lockfile bundler version';
+    }
+    // Ancestor promotion can occur after the additional helper delegates.
+    // Enforce ambiguity guards on the FINAL project, not just the changed path.
+    if (kind === 'node' && exists(root, dir, 'yarn.lock')) {
+      assert(['pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json']
+        .every(name => !exists(root, dir, name)),
+      'BLOCKED: competing Node lockfiles at final selected project require reviewed upstream-workflow manager selection');
+    }
+    if (kind === 'python') {
+      assert(!(exists(root, dir, 'uv.lock') && exists(root, dir, 'poetry.lock')),
+        'BLOCKED: both uv.lock and poetry.lock at final selected project require an explicit ecosystem policy');
     }
     const key = `${kind}:${dir}:${kind === 'python' && scope === 'requirements-install' ? path.posix.basename(file) : ''}`;
     if (plans.has(key)) plans.get(key).changed_manifests.push(file);
@@ -277,6 +310,7 @@ function initialize() {
   fs.mkdirSync(p.state, {recursive: true, mode: 0o700});
   const receipt = {
     schema: 1, policy: POLICY, snapshot: s, side, expected_sha: expectedSHA(s, side),
+    ...recorderCodeHashes(),
     executed_sha: null, control_sha: s.control_sha, recorder_sha: s.recorder_sha,
     run_id: s.run_id, run_attempt: s.run_attempt, profile_job: profileJob(s, side),
     native_profile_sha_is_execution_proof: false, action_sha: ACTION, sensor_version: SENSOR,
@@ -372,7 +406,7 @@ async function prepare() {
   const tree = run('git', ['-C', source, 'ls-tree', '-rz', 'HEAD']);
   assert(!tree.split('\0').some(line => line.startsWith('160000 ')), 'BLOCKED: submodules require explicit policy');
   r.executed_sha = actual;
-  r.recorder_script_sha256 = digest(fs.readFileSync(fileURLToPath(import.meta.url)));
+  Object.assign(r, recorderCodeHashes());
   r.images = validateImages(envJSON('RECORDER_IMAGES'), s);
   // Validate the entire copy before the sensor can expose host credentials.
   state.sourceCopy = path.join(locations().state, 'source');
@@ -634,8 +668,12 @@ async function finalize() {
   assert(r.recording_complete && r.workload_success, 'Recording incomplete or workload failed; artifacts retained');
 }
 
-export function validateReceipt(r, s, side, images) {
+export function validateReceipt(r, s, side, images, codeHashes = recorderCodeHashes()) {
   assert(r?.schema === 1 && r.policy === POLICY, 'Receipt schema/policy mismatch');
+  assert(r.recorder_script_sha256 === codeHashes.recorder_script_sha256, 'Recorder script hash mismatch');
+  assert(r.recorder_helpers_sha256 &&
+    JSON.stringify(r.recorder_helpers_sha256) === JSON.stringify(codeHashes.recorder_helpers_sha256),
+  'Recorder helper hash binding mismatch');
   assert(JSON.stringify(r.snapshot) === JSON.stringify(s), 'Receipt snapshot mismatch');
   assert(r.side === side && r.expected_sha === expectedSHA(s, side) &&
     r.executed_sha === r.expected_sha, 'Receipt executed SHA mismatch');
@@ -681,14 +719,14 @@ async function verify() {
     const names = fs.readdirSync(root).sort();
     assert(JSON.stringify(names) === JSON.stringify(['base', 'head'].map(side => artifactName(s, side)).sort()),
       'Missing, duplicate, or unexpected attempt artifacts');
-    const scriptHash = digest(fs.readFileSync(fileURLToPath(import.meta.url)));
+    const codeHashes = recorderCodeHashes();
+    Object.assign(summary, codeHashes);
     for (const side of ['base', 'head']) {
       const directory = path.join(root, artifactName(s, side));
       assert(!fs.lstatSync(directory).isSymbolicLink(), 'Unsafe artifact directory');
       assert(JSON.stringify(fs.readdirSync(directory).sort()) === JSON.stringify(
         ['jibril.profile.json', 'receipt.json', 'workload.log']), 'Unexpected evidence payload');
-      const r = validateReceipt(JSON.parse(readBounded(path.join(directory, 'receipt.json'), 1024 * 1024)), s, side, images);
-      assert(r.recorder_script_sha256 === scriptHash, 'Recorder script hash mismatch');
+      const r = validateReceipt(JSON.parse(readBounded(path.join(directory, 'receipt.json'), 1024 * 1024)), s, side, images, codeHashes);
       const raw = readBounded(path.join(directory, 'jibril.profile.json'));
       const checked = validateProfile(raw, r);
       assert(r.profile.sha256 === checked.sha256 && r.profile.bytes === checked.bytes &&
@@ -697,6 +735,7 @@ async function verify() {
       assert(log.length <= MAX_LOG && r.workload_log.sha256 === digest(log) &&
         r.workload_log.bytes === log.length, 'Workload log digest mismatch');
       summary.sides.push({side, executed_sha: r.executed_sha, profile_sha256: checked.sha256,
+        recorder_script_sha256: r.recorder_script_sha256, recorder_helpers_sha256: r.recorder_helpers_sha256,
         profile_job: r.profile_job, workloads: r.workloads, evidence: checked.workload_evidence});
     }
     const [base, head] = summary.sides;

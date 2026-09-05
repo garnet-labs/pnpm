@@ -1,0 +1,74 @@
+name: Garnet Dependabot Publish
+run-name: "Garnet receipt ${{ inputs.run_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Completed/finishing trusted recorder run ID"
+        required: true
+        type: string
+      run_attempt:
+        description: "Exact recorder attempt; never follow a later rerun"
+        required: true
+        type: string
+      worker_sha:
+        description: "Recorder controller SHA, not the executed PR SHA"
+        required: true
+        type: string
+
+permissions: {}
+
+# Dispatch inputs are scheduling/lookup targets only, never authorization evidence.
+concurrency:
+  group: garnet-dependabot-publication-${{ github.repository }}-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      issues: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate default-branch identity before checkout
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const {data: repository} = await github.rest.repos.get({owner, repo});
+            const ref = `refs/heads/${repository.default_branch}`;
+            if (owner !== 'garnet-labs' || !repository.fork ||
+                repository.full_name !== `${owner}/${repo}` ||
+                String(repository.id) !== process.env.GITHUB_REPOSITORY_ID ||
+                context.eventName !== 'workflow_dispatch' || context.ref !== ref ||
+                process.env.GITHUB_WORKFLOW_REF !== `${owner}/${repo}/.github/workflows/garnet-dependabot-publish.yml@${ref}` ||
+                !/^[a-f0-9]{40}$/.test(context.sha) ||
+                process.env.GITHUB_WORKFLOW_SHA !== context.sha) {
+              throw new Error('Untrusted publisher checkout context');
+            }
+      - name: Checkout only this publisher's trusted default-branch revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Collect bounded artifacts as data and publish a security-HOLD receipt
+        run: node .github/scripts/garnet-dependabot-collect.mjs
+      - name: Retain publication diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: garnet-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/garnet-dependabot-publication/
+          if-no-files-found: warn
+          retention-days: 14

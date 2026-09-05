@@ -13,6 +13,7 @@ jobs:
       actions: write
       pull-requests: read
       contents: read
+      statuses: write # Metadata-only exact-head pending status; no source execution.
     steps:
       - name: Validate originating PR and dispatch trusted recorder
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
@@ -28,10 +29,20 @@ jobs:
               throw new Error('Untrusted or ineligible originating run');
             }
             const {data: repository} = await github.rest.repos.get({owner, repo});
+            if (owner !== 'garnet-labs' || repository.fork !== true ||
+                repository.full_name !== `${owner}/${repo}` ||
+                String(repository.id) !== process.env.GITHUB_REPOSITORY_ID ||
+                run.repository?.id !== repository.id || run.head_repository?.id !== repository.id ||
+                run.status !== 'completed' ||
+                run.run_attempt !== context.payload.workflow_run.run_attempt ||
+                !/^[a-f0-9]{40}$/.test(run.head_sha)) {
+              throw new Error('Repository, attempt, or run identity mismatch');
+            }
             const {data: expectedWorkflow} = await github.rest.actions.getWorkflow({
               owner, repo, workflow_id: 'garnet-dependabot-request.yml'
             });
-            if (run.workflow_id !== expectedWorkflow.id) {
+            if (run.workflow_id !== expectedWorkflow.id ||
+                expectedWorkflow.path !== '.github/workflows/garnet-dependabot-request.yml') {
               throw new Error('Originating workflow identity mismatch');
             }
             const {data: associated} = await github.rest.repos.listPullRequestsAssociatedWithCommit({
@@ -39,6 +50,7 @@ jobs:
             });
             const candidates = associated.filter(pr =>
               pr.state === 'open' && pr.user?.login === 'dependabot[bot]' &&
+              pr.user?.id === 49699333 && pr.user?.type === 'Bot' &&
               pr.head?.sha === run.head_sha &&
               pr.head?.repo?.id === repository.id &&
               pr.base?.repo?.id === repository.id
@@ -48,10 +60,49 @@ jobs:
               return;
             }
             const pr = candidates[0];
+            const {data: worker} = await github.rest.actions.getWorkflow({
+              owner, repo, workflow_id: 'garnet-dependabot-record.yml'
+            });
+            if (worker.path !== '.github/workflows/garnet-dependabot-record.yml' || worker.state !== 'active') {
+              throw new Error('Trusted recorder workflow identity mismatch');
+            }
+            const {data: current} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
+            const eligible = p => p.state === 'open' && !p.merged &&
+              p.user?.login === 'dependabot[bot]' && p.user?.id === 49699333 && p.user?.type === 'Bot' &&
+              p.head?.sha === run.head_sha && p.head?.repo?.id === repository.id &&
+              p.base?.repo?.id === repository.id;
+            if (!eligible(current)) {
+              core.notice('PR changed before dispatch; refusing stale request.');
+              return;
+            }
+            const statusContext = 'Garnet Dependabot recording';
+            const {data: beforeStatuses} = await github.rest.repos.listCommitStatusesForRef({
+              owner, repo, ref: current.head.sha, per_page: 100
+            });
+            const before = beforeStatuses.find(s => s.context === statusContext);
             await github.rest.actions.createWorkflowDispatch({
               owner, repo,
-              workflow_id: 'garnet-dependabot-record.yml',
+              workflow_id: worker.id,
               ref: repository.default_branch,
               inputs: {pr_number: String(pr.number)}
             });
+            const {data: after} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
+            if (!eligible(after)) {
+              core.notice('Dispatch accepted, but PR head changed; no stale-head pending status written.');
+              return;
+            }
+            const {data: statuses} = await github.rest.repos.listCommitStatusesForRef({
+              owner, repo, ref: after.head.sha, per_page: 100
+            });
+            const latest = statuses.find(s => s.context === statusContext);
+            const target_url = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+            // Avoid downgrading a completion already published while dispatch
+            // was in flight. GitHub does not offer atomic compare-and-set statuses.
+            if (!(latest && latest.id !== before?.id && latest.state !== 'pending') &&
+                !(latest?.state === 'pending' && latest.target_url === target_url)) {
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha: after.head.sha, context: statusContext, state: 'pending',
+                description: 'Recording requested; no security verdict', target_url
+              });
+            }
             core.notice(`Dispatched trusted recorder for PR #${pr.number} at ${pr.head.sha}.`);
