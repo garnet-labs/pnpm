@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  PNPM_VERSION: 12.2.1
+  PNPM_VERSION: 12.3.0
   ITERATIONS: 5
 
 jobs:
