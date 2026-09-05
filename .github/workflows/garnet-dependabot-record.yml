@@ -8,6 +8,14 @@ on:
         description: "Dependabot PR number; resolve its latest exact base/head pair"
         required: true
         type: number
+      finalization_experiment:
+        description: "Parent-approved one-dispatch diagnostic only; not a known fix"
+        required: false
+        default: none
+        type: choice
+        options:
+          - none
+          - diagnostic-stop-420-v1
   # Automatic requests arrive through the separate unprivileged PR sentinel
   # and trusted metadata-only workflow_run dispatcher. Never run this worker
   # directly from the PR's workflow revision.
@@ -35,6 +43,7 @@ jobs:
       matrix: ${{ steps.resolve.outputs.matrix }}
       manifests: ${{ steps.resolve.outputs.manifests }}
       images: ${{ steps.images.outputs.images }}
+      stop_budget: ${{ steps.images.outputs.stop_budget }}
     steps:
       # This inline controller MUST remain protected on the default branch.
       - name: Resolve and validate the latest PR snapshot
@@ -42,6 +51,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_FINALIZATION_EXPERIMENT: ${{ inputs.finalization_experiment }}
           CONTROL_SHA: ${{ github.workflow_sha }}
           CONTROL_REF: ${{ github.workflow_ref }}
         with:
@@ -114,6 +124,7 @@ jobs:
             const manifests = paths.filter(p => /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|pyproject\.toml|uv\.lock|poetry\.lock|requirements[^/]*\.txt|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$/.test(p));
             const snapshot = {
               schema: 1, repository: repository.full_name, repository_id: String(repository.id),
+              finalization_experiment: process.env.INPUT_FINALIZATION_EXPERIMENT || 'none',
               owner_id: String(repository.owner.id), pr_number: pull_number,
               pr_state: pr.state, pr_merged: pr.merged === true,
               author: {login: pr.user.login, id: String(pr.user.id)},
@@ -154,7 +165,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Only exact opt-in pairs get 60m: 30m work + 10m finalization + 8.5m
+    # action post already exceed 45m; 7m setup + 2m upload leave 2.5m reserve.
+    timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).job_minutes }}
     permissions:
       contents: read
       id-token: write
@@ -171,6 +184,7 @@ jobs:
       GARNET_ACTION_SKIP_GITHUB_APP_COMMENT: "true"
     steps:
       - name: Checkout trusted recorder, never the PR's scripts
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 1 || 45 }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ needs.resolve.outputs.recorder_sha }}
@@ -178,8 +192,10 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
       - name: Initialize diagnostic receipt
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 1 || 45 }}
         run: node control/.github/scripts/garnet-dependabot-record.mjs init
       - name: Checkout exact PR side, not its merge commit
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 2 || 45 }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ matrix.sha }}
@@ -189,21 +205,24 @@ jobs:
           lfs: false
           fetch-depth: 1
       - name: Verify SHA and derive workload without executing source
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 1 || 45 }}
         run: node control/.github/scripts/garnet-dependabot-record.mjs prepare
       - name: Start trusted sensor using OIDC only
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 2 || 45 }}
         uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c
         with:
           jibril_version: v2.16.0
-          stop_timeout_seconds: "180"
+          stop_timeout_seconds: ${{ fromJSON(needs.resolve.outputs.stop_budget).sensor_stop_seconds }}
           debug: "false"
       - name: Run dependency workload only inside isolated containers
         timeout-minutes: 30
         run: node control/.github/scripts/garnet-dependabot-record.mjs run
       - name: Gracefully stop sensor and export exact-execution receipt
         if: always()
-        timeout-minutes: 6
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).step_minutes }}
         run: node control/.github/scripts/garnet-dependabot-record.mjs finalize
       - name: Retain raw profile, receipt, and untrusted workload output
+        timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 2 || 45 }}
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

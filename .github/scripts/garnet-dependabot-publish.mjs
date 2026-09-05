@@ -36,6 +36,728 @@ const nonDnsPorts = e => e.ports.map(p => Number(/^(\d+)(?:\s|$)/.exec(p)?.[1]))
 const nonDnsTcp = e => e.protocol === 'TCP' && nonDnsPorts(e).length > 0;
 const distinct = (rows, key) => [...new Map(rows.map(row => [key(row), row])).values()];
 
+// Independent, inline allowlist. Never import/evaluate the fetched recorder or
+// trust artifact-provided manager authority. Source capability alone opts in.
+export function reviewedExceptionsCapability(bytes) {
+  const text = bytes.toString('utf8');
+  if (!text.includes('REVIEWED_EXCEPTIONS_VERSION')) return 0;
+  const declarations = [...text.matchAll(/^\s*export\s+const\s+REVIEWED_EXCEPTIONS_VERSION\s*=\s*([^;\r\n]+);/gm)];
+  check(declarations.length === 1 && ['1', '2'].includes(declarations[0][1].trim()),
+    'unsupported_reviewed_exceptions_capability');
+  return Number(declarations[0][1].trim());
+}
+
+const REVIEWED_YARN = {
+  repository: 'garnet-labs/vscode-extension-test', repository_id: '899092823', pr: 5,
+  base: '393e349d14a10f2db1ce266c42db378ac6391a93', head: 'f43f9f252cab4c3ee9f29a7bcf58f859a35b759b',
+  manifests: ['sema4ai/package-lock.json', 'sema4ai/yarn.lock'],
+};
+const REVIEWED_COPY = {
+  repository: 'garnet-labs/next.js', repository_id: '1206332346', pr: 40,
+  base: '2d069943639fd0fc67a26bbb337d8a726f50924d', head: 'bcae068be948a03cba54813aea6cffb5c03adf63',
+  manifests: ['package.json', 'pnpm-lock.yaml'],
+};
+const YARN_SCOPE = 'reviewed-yarn-locked-install-with-lifecycle-hooks-no-explicit-workspace-build';
+export function reviewedYarnCommands() {
+  return [
+    "garnet_locks_before=$(/usr/bin/sha256sum 'yarn.lock' 'package-lock.json'); readonly garnet_locks_before",
+    'export COREPACK_ENABLE_PROJECT_SPEC=0 COREPACK_DEFAULT_TO_LATEST=0 YARN_IGNORE_PATH=1',
+    "corepack install --global 'yarn@1.22.22'",
+    'mkdir -p /home/workload/.local/bin',
+    'corepack enable --install-directory /home/workload/.local/bin yarn',
+    'corepack yarn install --frozen-lockfile --non-interactive --production=false',
+    "printf '%s\\n' \"$garnet_locks_before\" | /usr/bin/sha256sum --check --status",
+  ];
+}
+const exactManifestSet = (a, b) => strings(a) && equal([...a].sort(), [...b].sort());
+export function expectedReviewedExceptions(s, executed) {
+  const matches = p => s?.repository === p.repository && s.repository_id === p.repository_id &&
+    s.pr_number === p.pr && s.baseline_sha === p.base && s.head?.sha === p.head &&
+    [p.base, p.head].includes(executed) && exactManifestSet(s.manifests, p.manifests);
+  return {
+    manager_selection: matches(REVIEWED_YARN) ? {
+      policy_id: 'vscode-extension-test-pr5-sema4ai-yarn-v1',
+      manager: 'yarn', version: '1.22.22', version_authority: 'trusted-classic-lock-fallback',
+      selected_lockfile: 'sema4ai/yarn.lock',
+      unused_competing_lockfiles: ['sema4ai/package-lock.json'],
+      changed_lockfiles_not_independently_exercised: ['sema4ai/package-lock.json'],
+      authority_blobs: {
+        '.github/workflows/release-robocorp-code-vscode.yml': '41a3063623d70bc9d6c61f7b0aa85c42db85481d',
+        '.github/workflows/pre-release-robocorp-code.yml': 'da08cb83e92c0a6576bdf824f2d2dbe6b20dd07a',
+        'sema4ai/package.json': '448bde4b09f254aee686b3bf63362c619bc60ff6',
+      },
+      authority_commit_pair: [REVIEWED_YARN.base, REVIEWED_YARN.head],
+      source_lock_blobs: executed === REVIEWED_YARN.base ? {
+        'sema4ai/yarn.lock': 'a2e2ba93941e47895ba816f633f3bff22f30c08e',
+        'sema4ai/package-lock.json': '322988a2e68ed3d3a2b5bdd11cceedaca9ded1f2',
+      } : {
+        'sema4ai/yarn.lock': '38877bfff2c010707b9998c37cd3102f56630490',
+        'sema4ai/package-lock.json': '785df566266e81c25259a41390be9ded26889201',
+      },
+    } : null,
+    source_copy_fidelity: matches(REVIEWED_COPY) ? {
+      policy_id: 'nextjs-pr40-exact-fixture-link-preservation-v1',
+      method: 'no-dereference-copy', git_metadata_excluded: true,
+      excluded_tracked_source_paths: [], rewritten_symlink_targets: [],
+      preserved_opaque_symlinks: [{
+        path: 'test/development/app-dir/ssr-in-rsc/node_modules/random-react-library',
+        target: '/Users/sebbie/repos/next.js/test/development/app-dir/ssr-in-rsc/random-react-library/',
+        blob_sha: '07ab05517e672a857a940573789969bfb1de3848', host_target_resolved: false,
+      }],
+      fidelity: 'regular-file bytes and symlink target bytes preserved; existing git-metadata exclusion and executable-mode normalization unchanged',
+    } : null,
+  };
+}
+function exactExceptionField(object, key, expected) {
+  check(expected == null ? !Object.hasOwn(object, key) : equal(object[key], expected),
+    'missing_or_forged_reviewed_exception_metadata');
+}
+function absentExceptionFields(object, fields) {
+  for (const key of fields) exactExceptionField(object, key, null);
+}
+export function validateReviewedReceipt(r, s, version = 0) {
+  check([0, 1, 2].includes(version), 'unsupported_reviewed_exceptions_capability');
+  if (version > 0) check(r.reviewed_exceptions_version === version, 'receipt_exception_capability_mismatch');
+  else exactExceptionField(r, 'reviewed_exceptions_version', null);
+  absentExceptionFields(r, ['manager_selection', 'reviewed_exception_validation']);
+  const expected = version > 0 ? expectedReviewedExceptions(s, r.executed_sha)
+    : {manager_selection: null, source_copy_fidelity: null};
+  exactExceptionField(r, 'source_copy_fidelity', expected.source_copy_fidelity);
+  check(Array.isArray(r.workloads) && r.workloads.length > 0, 'missing_reviewed_workloads');
+  if (expected.manager_selection || expected.source_copy_fidelity)
+    check(r.workloads.length === 1, 'reviewed_workload_scope_mismatch');
+  for (const w of r.workloads) {
+    absentExceptionFields(w, ['reviewed_exceptions_version', 'reviewed_exception_validation']);
+    exactExceptionField(w, 'manager_selection', expected.manager_selection);
+    exactExceptionField(w, 'source_copy_fidelity', expected.source_copy_fidelity);
+    if (!expected.manager_selection) check(w.scope !== YARN_SCOPE, 'unbound_reviewed_yarn_scope');
+    if (expected.manager_selection) check(w.id === 'node:sema4ai:' && w.directory === 'sema4ai' &&
+      w.ecosystem === 'node' && w.locked === true && w.scope === YARN_SCOPE &&
+      equal(w.commands, reviewedYarnCommands()) && exactManifestSet(w.changed_manifests, REVIEWED_YARN.manifests),
+    'reviewed_yarn_scope_or_commands_mismatch');
+    if (expected.source_copy_fidelity) check(w.id === 'node:.:' && w.directory === '.' &&
+      w.ecosystem === 'node' && exactManifestSet(w.changed_manifests, REVIEWED_COPY.manifests),
+    'reviewed_copy_scope_mismatch');
+  }
+  validateGoReceipt(r, s, version);
+  return {version, manager_selection_policy: expected.manager_selection?.policy_id ?? null,
+    source_copy_policy: expected.source_copy_fidelity?.policy_id ?? null};
+}
+export function validateReviewedVerifier(v, row, r, s, version = 0) {
+  const validation = validateReviewedReceipt(r, s, version);
+  if (version > 0) {
+    check(v.reviewed_exceptions_version === version, 'verifier_exception_capability_mismatch');
+    check(equal(row.reviewed_exception_validation, validation), 'verifier_exception_policy_mismatch');
+  } else {
+    exactExceptionField(v, 'reviewed_exceptions_version', null);
+    exactExceptionField(row, 'reviewed_exception_validation', null);
+  }
+  absentExceptionFields(v, ['manager_selection', 'source_copy_fidelity', 'reviewed_exception_validation']);
+  absentExceptionFields(row, ['manager_selection', 'reviewed_exceptions_version']);
+  exactExceptionField(row, 'source_copy_fidelity', r.source_copy_fidelity);
+  validateGoVerifier(v, row, r, s, version);
+}
+
+// Independent source-backed policy data. This publisher imports no policy data,
+// recorder module, PR module, or extra helper at runtime. Commit/blob/inventory
+// constants below were reviewed against the retained immutable source contracts.
+const PYTHON_SCOPE = 'reviewed-uv-locked-selected-dependencies-no-workspace-install';
+const PYTHON_RULES = {
+  'garnet-labs/anthropic-sdk-python': {
+    id: 'anthropic-pr11-uv0102-dev-all-extras-python312-v1',
+    repository_id: '1206647001', pr_number: 11,
+    base: '9a547ef9903f83e8a34556711533802f538fa069',
+    head: '5644d1642f3396d3743265f4b75ea1ddc7cf2590',
+    uv: '0.10.2', groups: ['dev'], extras: ['aiohttp', 'vertex', 'aws', 'bedrock', 'mcp'],
+    excluded_groups: ['pydantic-v1', 'pydantic-v2'],
+    image: {tag: 'python:3.12-bookworm', digest: null, platform: 'linux/amd64'}, glibc_min: null,
+    authority: {
+      'pyproject.toml': '0160d27fd7f3c22df5cc7796f576d6eb63db3fb3',
+      '.python-version': '43077b246094f0b2ea3a54995d76fe1d320945a1',
+      '.github/workflows/ci.yml': 'e4c0a290ad62253f28f62772a9c7953c6e54f92c',
+      'scripts/bootstrap': '4638ec6943c1ea4e94adece7f618d29d6eb3e3b4',
+      'scripts/test': '03fce0b927214edaad9a639cd89592bf31c45b31',
+    },
+    locks: {
+      '9a547ef9903f83e8a34556711533802f538fa069': '124bb8838f55fcb483c8ef3a3929d63d4afccbb7',
+      '5644d1642f3396d3743265f4b75ea1ddc7cf2590': 'ab925c616094d938e0fb738b2a79030148788ae6',
+    },
+    native_install: 'uv sync --all-extras (default dev); test script separately selects pydantic-v1 without mcp',
+    scope_limit: 'Dependency-selection subset only: one source-supported Python 3.12 interpreter, not native 3.9/3.14 test variants, project build, mock server or pytest',
+    caveat: 'Base uv.lock editable anthropic version is 0.88.0 while pyproject version is 0.93.0; retain uv lock --check and report any stale-baseline failure',
+  },
+  'garnet-labs/openshell-deepagent': {
+    id: 'openshell-pr17-python31214-trixie-glibc239-uv0822-v1',
+    repository_id: '1206669469', pr_number: 17,
+    base: '1fae50e4daa9f9381a51cf19aa84645c5c2367d5',
+    head: '0eb44370ff6d22ebc08f57afab977bda97267c92',
+    uv: '0.8.22', groups: [], extras: [], excluded_groups: [],
+    image: {tag: 'python:3.12.14-trixie',
+      digest: 'python@sha256:dabc147823ae8fd8cf9799a80f9e4ddb67eb2238fb9ca5f2ffc774c13a1d59d0',
+      platform: 'linux/amd64'}, glibc_min: '2.39',
+    authority: {'pyproject.toml': '5ce526f0f9fac5410f83f87a56387e58128e3747',
+      'README.md': '86d3211c0038ba4df469fccf44b319d3979a523f'},
+    locks: {
+      '1fae50e4daa9f9381a51cf19aa84645c5c2367d5': '1febe372bf6100f71959847125487d1adf4cab99',
+      '0eb44370ff6d22ebc08f57afab977bda97267c92': 'd3e544c9329caba7c6c5e70b1ccbf7e0fc82781a',
+    },
+    native_install: 'README uv sync; source defines no dependency groups or optional extras',
+    scope_limit: 'External dependency install only; no OpenShell gateway, Docker/k3s sandbox, agent execution, local project build or tests. Fork Garnet CI Python 3.11 conflicts with source >=3.12 and is not used as runtime authority',
+    caveat: 'Wheel ABI compatibility is source/manifest-backed and checked at execution; image and complete workload have not been run in this proposal',
+  },
+};
+function sourceCapability(bytes, marker, versions, reason) {
+  const text = bytes.toString('utf8');
+  if (!text.includes(marker)) return 0;
+  const declarations = [...text.matchAll(new RegExp(
+    `^\\s*export\\s+const\\s+${marker}\\s*=\\s*([^;\\r\\n]+);`, 'gm'))];
+  check(declarations.length === 1 && versions.includes(declarations[0][1].trim()), reason);
+  return Number(declarations[0][1].trim());
+}
+export function reviewedPythonCapability(recorderBytes, helperBytes) {
+  const main = sourceCapability(recorderBytes, 'REVIEWED_PYTHON_POLICIES_VERSION', ['1'],
+    'unsupported_python_policy_capability');
+  const helper = helperBytes === undefined ? 0 :
+    sourceCapability(helperBytes, 'REVIEWED_PYTHON_RUNTIME_VERSION', ['1'],
+      'unsupported_python_helper_capability');
+  check(main === helper, 'python_main_helper_capability_mismatch');
+  return main;
+}
+function pythonRule(s) {
+  const rule = Object.hasOwn(PYTHON_RULES, s?.repository ?? '') ? PYTHON_RULES[s.repository] : null;
+  if (!rule) return null;
+  check(s.repository_id === rule.repository_id && s.pr_number === rule.pr_number &&
+    s.baseline_sha === rule.base && s.base?.sha === rule.base && s.head?.sha === rule.head &&
+    s.comparison_scope === 'merge-base-to-head' &&
+    ['base', 'head'].every(side => s[side].repository === s.repository &&
+      s[side].repository_id === rule.repository_id) &&
+    equal(s.manifests, ['uv.lock']) && equal(s.changed_files, ['uv.lock']),
+  'python_policy_pair_or_scope_mismatch');
+  return rule;
+}
+export function expectedPythonPolicy(s, executed) {
+  const rule = pythonRule(s);
+  if (!rule) return null;
+  check([rule.base, rule.head].includes(executed), 'python_policy_executed_sha_mismatch');
+  return {
+    version: 1, policy_id: rule.id, repository: s.repository, repository_id: rule.repository_id,
+    pr_number: rule.pr_number, baseline_sha: rule.base, head_sha: rule.head, executed_sha: executed,
+    authority_blobs: {...rule.authority, 'uv.lock': rule.locks[executed]},
+    uv_version: rule.uv, python: '3.12', interpreter: '/usr/local/bin/python3',
+    python_downloads: 'never', image: structuredClone(rule.image), glibc_min: rule.glibc_min,
+    default_groups: false, selected_groups: [...rule.groups], selected_extras: [...rule.extras],
+    excluded_groups: [...rule.excluded_groups], local_project_install: false, lock_check: true,
+    frozen_sync: true, lock_and_pyproject_byte_identity: true, native_install: rule.native_install,
+    scope_limit: rule.scope_limit, caveat: rule.caveat,
+  };
+}
+export function reviewedPythonCommands(s) {
+  const rule = pythonRule(s);
+  check(rule, 'unreviewed_python_commands');
+  const guard = rule.glibc_min
+    ? "import os,sys,platform; assert sys.version_info[:3] == (3,12,14); assert platform.machine() == 'x86_64'; libc=os.confstr('CS_GNU_LIBC_VERSION'); assert libc.startswith('glibc '); assert tuple(map(int,libc.split()[1].split('.')[:2])) >= (2,39); print(sys.version.split()[0],libc)"
+    : "import sys; assert sys.version_info[:2] == (3,12); print(sys.version.split()[0])";
+  return [
+    'py_lock_before="$(/usr/bin/sha256sum uv.lock pyproject.toml)"; readonly py_lock_before',
+    `/usr/local/bin/python3 -I -c "${guard}"`,
+    `python -m pip install --user uv==${rule.uv}`,
+    `py_uv_version="$(uv --version)"; case "$py_uv_version" in 'uv ${rule.uv}'|'uv ${rule.uv} ('*) ;; *) exit 78 ;; esac`,
+    'export UV_PYTHON=/usr/local/bin/python3 UV_PYTHON_DOWNLOADS=never',
+    'uv lock --check --python /usr/local/bin/python3',
+    `uv sync --frozen --no-default-groups ${rule.groups.length ? '--group dev --all-extras ' : ''}--no-install-workspace --python /usr/local/bin/python3`,
+    'test "$py_lock_before" = "$(/usr/bin/sha256sum uv.lock pyproject.toml)"',
+  ];
+}
+export function validatePythonReceipt(r, s, version = 0) {
+  check([0, 1].includes(version), 'unsupported_python_policy_capability');
+  absentExceptionFields(r, ['python_runtime_policy', 'reviewed_python_runtime_validation']);
+  const policy = version === 1 ? expectedPythonPolicy(s, r.executed_sha) : null;
+  check(Array.isArray(r.workloads), 'missing_python_policy_workloads');
+  if (!policy) {
+    for (const w of r.workloads) {
+      absentExceptionFields(w, ['python_runtime_policy', 'reviewed_python_runtime_validation']);
+      check(w.scope !== PYTHON_SCOPE, 'unbound_python_policy_scope');
+    }
+    return [];
+  }
+  check(r.policy === POLICY_V2 && r.workloads.length === 1, 'python_policy_workload_count_or_policy');
+  const w = r.workloads[0];
+  check(['base', 'head'].includes(r.side) && r.executed_sha ===
+    (r.side === 'base' ? s.baseline_sha : s.head.sha), 'python_policy_side_mismatch');
+  absentExceptionFields(w, ['reviewed_python_runtime_validation']);
+  check(w.id === 'python:.:' && w.ecosystem === 'python' && w.directory === '.' && w.locked === true &&
+    w.scope === PYTHON_SCOPE && w.note === `${policy.scope_limit}; ${policy.caveat}` &&
+    equal(w.changed_manifests, ['uv.lock']) && equal(w.commands, reviewedPythonCommands(s)) &&
+    equal(w.python_runtime_policy, policy), 'python_policy_workload_or_commands_mismatch');
+  const image = r.images?.python;
+  check(image && equal(Object.keys(r.images), ['python']) &&
+    image.tag === policy.image.tag && image.platform === 'linux/amd64' &&
+    /^(?:python|docker\.io\/library\/python)@sha256:[a-f0-9]{64}$/.test(image.digest) &&
+    equal(image, {tag: policy.image.tag, digest: image.digest, platform: 'linux/amd64'}) &&
+    equal(w.image, image) && (!policy.image.digest || image.digest === policy.image.digest),
+  'python_policy_image_mismatch');
+  return [{workload_id: w.id, ...policy}];
+}
+export function validatePythonVerifier(v, row, r, s, version = 0) {
+  const expected = validatePythonReceipt(r, s, version);
+  absentExceptionFields(v, ['python_runtime_policy', 'reviewed_python_runtime_validation']);
+  absentExceptionFields(row, ['python_runtime_policy']);
+  if (version === 1) check(equal(row.reviewed_python_runtime_validation, expected),
+    'python_verifier_policy_mismatch');
+  else absentExceptionFields(row, ['reviewed_python_runtime_validation']);
+}
+export function validatePythonControllerImages(text, s, sides, version = 0) {
+  if (!version || !pythonRule(s)) return;
+  // Only the trusted initialization and fresh verifier step environment headers
+  // are authoritative here; workload stdout cannot opt into a resolver result.
+  const scopes = [
+    [`record (base, ${s.baseline_sha})`, 'Initialize diagnostic receipt', 'base'],
+    [`record (head, ${s.head.sha})`, 'Initialize diagnostic receipt', 'head'],
+    ['verify', 'Validate complete profiles and exact provenance', 'head'],
+  ];
+  for (const [job, step, side] of scopes) {
+    const matches = text.split(/\r?\n/).flatMap(line => {
+      const pieces = line.split('\t');
+      if (pieces.length !== 3 || pieces[0] !== job || pieces[1] !== step) return [];
+      const match = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z\s{3}RECORDER_IMAGES: (\{.*\})$/.exec(pieces[2]);
+      return match ? [parse(match[1])] : [];
+    });
+    check(matches.length === 1 && equal(matches[0], sides[side]?.receipt?.images),
+      'python_controller_resolved_image_mismatch');
+  }
+}
+// Source-backed, additive contracts. No artifact code or extra runtime helper.
+export function reviewedDirectoryCapability(mainBytes, helperBytes) {
+  const main = sourceCapability(mainBytes, 'REVIEWED_DIRECTORY_POLICIES_VERSION', ['1'],
+    'unsupported_directory_policy_capability');
+  const helper = helperBytes === undefined ? 0 : sourceCapability(helperBytes,
+    'REVIEWED_DIRECTORY_EMPTY_GIT_VERSION', ['1'], 'unsupported_directory_helper_capability');
+  check(main === helper, 'directory_main_helper_capability_mismatch');
+  return main;
+}
+export function reviewedStorageCapability(mainBytes) {
+  return sourceCapability(mainBytes, 'REVIEWED_STORAGE_POLICIES_VERSION', ['1'],
+    'unsupported_storage_policy_capability');
+}
+export function recordingResultCapability(mainBytes) {
+  return sourceCapability(mainBytes, 'RECORDING_RESULT_CONTRACT_VERSION', ['1'],
+    'unsupported_recording_result_capability');
+}
+const COMPARISON_HOLD_REASON = 'Both records validated, but command policy differs; do not claim a scope-equivalent dependency comparison';
+export function validateVerifierResult(v, matched, version = 0, scriptHash, helperHashes) {
+  check(typeof matched === 'boolean' && [0, 1].includes(version), 'invalid_recording_result_contract');
+  if (version === 1) {
+    check(v.recording_verified === true && v.verified === matched &&
+      v.command_policy_diverged === !matched && v.comparison_scope_equivalent === matched &&
+      v.decision === (matched ? 'RECORDING_VERIFIED' : 'HOLD'), 'recording_comparison_flags_mismatch');
+    if (matched) absentExceptionFields(v, ['hold_reason']);
+    else check(v.hold_reason === COMPARISON_HOLD_REASON, 'comparison_hold_reason_mismatch');
+    return;
+  }
+  absentExceptionFields(v, ['recording_verified']);
+  check(v.verified === true, 'independent_verifier_not_verified');
+  // Audited historical producers overloaded verified=true on divergent HOLD.
+  // The added d35 path requires its exact helper too, using trusted source hashes,
+  // not verifier claims. This never awards a matched-comparison status.
+  const historicalProducer = scriptHash === 'ff57d4dae02c6c780bd2fe7ea4f2895d17c93e20921e3df99b43bf1ad01cef80' ||
+    (scriptHash === 'd35e9047f34927865c3df8ec619f4b350a7e152fe7b4dc7e276cfb50d9d09e09' &&
+      helperHashes && equal(helperHashes, {[HELPER]: '520c1ce90b1687367ae9550547301f1684daea0cdf1a5c65adf2d09c0b8fc3ee'}));
+  const historicalHold = historicalProducer &&
+    matched === false && v.decision === 'HOLD' && v.command_policy_diverged === true &&
+    v.comparison_scope_equivalent === false && v.hold_reason === COMPARISON_HOLD_REASON;
+  check(v.decision === 'RECORDING_VERIFIED' || historicalHold, 'independent_verifier_not_verified');
+}
+const DIRECTORY_RULE = {
+  repository: 'garnet-labs/directory-connector', repository_id: '1219214388', pr_number: 23,
+  base: '499a21ff15ab6685f176031f0bb02de969091e7f', head: 'eb785521e836e327788e0731dac773e7a771468f',
+  image: {tag: 'node:25-bookworm', digest: 'node@sha256:0efb427ff710f4943bb3f0641bd3e9ef1ac3cec96c526b67a21b43740becab1f', platform: 'linux/amd64'},
+  authority: {'package.json': '0ba2ca85b2973c2b34bf7a06c1939840b89a7b00',
+    '.nvmrc': 'a682cfb975e0e399490230af930b378b3125f137',
+    '.npmrc': '860dc500f0deaed8939cfec299e5f0303a867a9f',
+    '.github/workflows/test.yml': '5fd2168d2f15bd3f9098f5f43ad5f3b9f52f1e45',
+    'native/package.json': '70103484e61d5cd740c5ebf40d564e0259ca6ca3'},
+  sides: {
+    '499a21ff15ab6685f176031f0bb02de969091e7f': {
+      lock: 'ce3555226da4d2eff6d5a137c73a9a84cc54cfa0',
+      inventory: '7fa010a57e092bbc193a77146aa47439bba8d4246f78f4c931a9e4aa9e42ae4d'},
+    'eb785521e836e327788e0731dac773e7a771468f': {
+      lock: '1ca9203c5507141c4bc68c852a1a592e3f7f7adc',
+      inventory: '7b0461fb0f9569ac9e94d70f6703e6b22b75e6d20cc9bda05003cc1a8ee48d67'},
+  },
+  scope: 'reviewed-npm-ci-with-lifecycle-hooks-and-synthetic-empty-git',
+  note: 'Dependency install with existing lifecycle hooks only. Synthetic empty Git metadata is created inside the credential-free container; original host .git is excluded. This is not full-Git or native-CI fidelity: no commits, origin, native-module build, typechecking, tests, app build or packaging is supplied or claimed.',
+};
+export function expectedDirectoryPolicy(s, executed) {
+  const p = DIRECTORY_RULE;
+  if (s?.repository !== p.repository) return null;
+  check(s.repository_id === p.repository_id && s.pr_number === p.pr_number &&
+    s.baseline_sha === p.base && s.base?.sha === p.base && s.head?.sha === p.head &&
+    [s.base, s.head].every(x => x.repository === p.repository && x.repository_id === p.repository_id) &&
+    equal(s.manifests, ['package-lock.json']) && equal(s.changed_files, ['package-lock.json']),
+  'directory_pair_or_scope_mismatch');
+  check(Object.hasOwn(p.sides, executed), 'directory_executed_sha_mismatch');
+  const side = p.sides[executed];
+  return {version: 1, policy_id: 'directory-connector-pr23-empty-git-node25-npm10-v1',
+    repository: p.repository, repository_id: p.repository_id, pr_number: p.pr_number,
+    baseline_sha: p.base, head_sha: p.head, executed_sha: executed,
+    authority_blobs: {...p.authority, 'package-lock.json': side.lock},
+    source_tree: {scheme: 'git-ls-tree-normalized-v1', executed_sha: executed, tracked_entries: 338,
+      tree_manifest_sha256: side.inventory, gitlinks: [], gitmodules: []},
+    image: structuredClone(p.image), node_version: '25.9.0', npm_version: '10.9.8',
+    node_authority: '.nvmrc v25 and engines.node ~25; verified official image supplies exact 25.9.0',
+    npm_authority: 'engines.npm ~10; 10.9.8 is an existing official compatible release, not a native CI exact pin',
+    synthetic_git_metadata: true, creation_location: 'credential-free-nonroot-workload-container:/work/.git',
+    host_git_metadata_copied: false, source_commits_imported: false, remotes: [], index_entries: [],
+    initial_templates: 'empty', system_and_global_git_config: 'disabled',
+    lifecycle_scripts: 'unchanged-and-enabled', husky: 'unchanged-and-enabled; may set local core.hooksPath normally',
+    source_lock_and_manifest_bytes_unchanged_on_success: true, full_git_fidelity: false,
+    native_ci_fidelity: false, scope_limit: p.note};
+}
+export function reviewedDirectoryCommands() {
+  const guards = [
+    'test -d .git && test ! -L .git',
+    'dc_git_root=$(/usr/bin/git rev-parse --show-toplevel); test "$dc_git_root" = /work',
+    'dc_git_remote=$(/usr/bin/git remote); test -z "$dc_git_remote"',
+    'dc_git_index=$(/usr/bin/git ls-files); test -z "$dc_git_index"',
+    'test -d .git/objects && test ! -L .git/objects; dc_git_objects=$(/usr/bin/find .git/objects ! -type d -print -quit); test -z "$dc_git_objects"',
+    'if /usr/bin/git show-ref --head >/dev/null 2>&1; then exit 78; else test "$?" -eq 1; fi',
+    'if /usr/bin/git config --local --name-only --get-regexp "^(remote[.]|credential[.]|include[.]|includeif[.])" >/dev/null; then exit 78; else test "$?" -eq 1; fi',
+  ];
+  return [
+    'dc_source_before=$(/usr/bin/sha256sum package-lock.json package.json .nvmrc .npmrc); readonly dc_source_before',
+    'test "$(/usr/local/bin/node --version)" = v25.9.0',
+    'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0',
+    'npm install --global --prefix /home/workload/npm npm@10.9.8',
+    'export PATH="/home/workload/npm/bin:$PATH"',
+    'test "$(npm --version)" = 10.9.8',
+    'test ! -e .git && test ! -L .git && test ! -e .gitmodules && test ! -L .gitmodules',
+    'git -c init.templateDir= init', ...guards, 'npm ci --no-audit --no-fund', ...guards,
+    'test ! -e .gitmodules && test ! -L .gitmodules',
+    'test "$dc_source_before" = "$(/usr/bin/sha256sum package-lock.json package.json .nvmrc .npmrc)"',
+  ];
+}
+export function validateDirectoryReceipt(r, s, version = 0) {
+  check([0, 1].includes(version), 'unsupported_directory_policy_capability');
+  absentExceptionFields(r, ['synthetic_git_policy', 'reviewed_directory_git_validation']);
+  const p = version ? expectedDirectoryPolicy(s, r.executed_sha) : null;
+  check(Array.isArray(r.workloads), 'missing_directory_workloads');
+  for (const w of r.workloads) {
+    exactExceptionField(w, 'synthetic_git_policy', p);
+    absentExceptionFields(w, ['reviewed_directory_git_validation']);
+    if (!p) check(w.scope !== DIRECTORY_RULE.scope, 'unbound_directory_scope');
+  }
+  if (!p) return [];
+  check(r.side === 'base' || r.side === 'head', 'directory_side_mismatch');
+  check(r.executed_sha === (r.side === 'base' ? s.baseline_sha : s.head.sha), 'directory_side_mismatch');
+  check(r.workloads.length === 1, 'directory_workload_count');
+  const w = r.workloads[0];
+  check(w.id === 'node:.:' && w.ecosystem === 'node' && w.directory === '.' && w.locked === true &&
+    w.scope === DIRECTORY_RULE.scope && w.note === DIRECTORY_RULE.note &&
+    equal(w.changed_manifests, ['package-lock.json']) && equal(w.commands, reviewedDirectoryCommands()),
+  'directory_exact_workload_mismatch');
+  check(equal(r.images, {node: p.image}) && equal(w.image, p.image), 'directory_exact_image_mismatch');
+  return [{workload_id: w.id, ...p}];
+}
+export function validateDirectoryVerifier(v, row, r, s, version = 0) {
+  absentExceptionFields(v, ['synthetic_git_policy', 'reviewed_directory_git_validation']);
+  absentExceptionFields(row, ['synthetic_git_policy']);
+  const expected = validateDirectoryReceipt(r, s, version);
+  if (version) check(equal(row.reviewed_directory_git_validation, expected), 'directory_verifier_policy_mismatch');
+  else absentExceptionFields(row, ['reviewed_directory_git_validation']);
+}
+const STORAGE_DISKS = {61267: ['ext2/ext3', 'ext4'], 1481003842: ['xfs'], 2435016766: ['btrfs']};
+export function expectedStoragePolicy(s, executed) {
+  if (s?.repository !== 'garnet-labs/gradio-test' || s.pr_number !== 4 ||
+    !Array.isArray(s.manifests) || !s.manifests.includes('test/requirements.txt')) return null;
+  const base = '55041996db69b086ee2a5116ad3db40bced6b056', head = '36f97efa0200792ebc2b1fea5f32f2cd28efc5eb';
+  check(s.repository_id === '899240340' && s.baseline_sha === base && s.pr_base_tip === base &&
+    s.base?.sha === base && s.head?.sha === head &&
+    [s.base, s.head].every(x => x.repository === s.repository && x.repository_id === s.repository_id) &&
+    s.comparison_scope === 'merge-base-to-head' && s.event === 'workflow_dispatch' && s.run_attempt === '1' &&
+    equal(s.manifests, ['test/requirements.txt']) && equal(s.changed_files, s.manifests) &&
+    [base, head].includes(executed), 'storage_pair_or_scope_mismatch');
+  return {version: 1, policy_id: 'gradio-pr4-private-disk-home-v1',
+    repository: s.repository, repository_id: s.repository_id, pr_number: 4,
+    baseline_sha: base, head_sha: head, executed_sha: executed,
+    requirements_blob: executed === base ? 'ff75a5c4be16f7cb948ae5585d38b691820f4834' : '29a22d53b4766c091e56bb0970e6c72b11f82257',
+    home: '/home/workload', tmpdir: '/home/workload/tmp', home_backing: 'fresh-private-runner-temp-disk-directory',
+    initial_home_contents: ['tmp'], uid: 10001, gid: 10001, mode: 448,
+    tmpfs_tmp_bytes: 2147483648, minimum_disk_available_bytes: 17179869184,
+    minimum_disk_available_inodes: 65536, minimum_tmp_available_bytes: 1073741824,
+    permitted_disk_types: ['ext2/ext3', 'ext4', 'xfs', 'btrfs'],
+    preflight: 'trusted-image-python-isolated-mode-no-source-execution-network-none',
+    memory_bytes: 5368709120, cpus: 2, workload_timeout_seconds: 900, job_minutes: 45,
+    dependency_command_unchanged: true, admission_is_peak_usage_guarantee: false};
+}
+function exactKeys(value, keys) {
+  check(value !== null && typeof value === 'object' && !Array.isArray(value) &&
+    equal(Object.keys(value).sort(), [...keys].sort()), 'storage_observation_shape_mismatch');
+}
+function storageNumbers(value, keys) {
+  check(keys.every(key => Number.isSafeInteger(value[key]) && value[key] >= 0), 'invalid_storage_measurement');
+  check(value.block_bytes > 0 && value.available_blocks <= value.free_blocks &&
+    value.free_blocks <= value.blocks && value.free_inodes <= value.inodes, 'inconsistent_storage_capacity');
+  check(['blocks', 'free_blocks', 'available_blocks'].every(k =>
+    Number.isSafeInteger(value[k] * value.block_bytes)), 'unsafe_storage_byte_capacity');
+}
+export function validateStorageObservation(o) {
+  // Thresholds are trusted constants, not an observation/policy-selected argument.
+  exactKeys(o, ['schema', 'created_empty', 'tmp_created_empty', 'host_uid', 'host_gid', 'host_mode',
+    'host_home', 'host_work', 'docker_mounts_checked', 'observed_at', 'initial']);
+  check(o.schema === 1 && o.created_empty === true && o.tmp_created_empty === true &&
+    o.host_uid === 10001 && o.host_gid === 10001 && o.host_mode === 448 &&
+    o.docker_mounts_checked === true && Number.isFinite(date(o.observed_at)), 'storage_creation_or_mount_unverified');
+  const hostKeys = ['type', 'block_bytes', 'blocks', 'free_blocks', 'available_blocks', 'inodes', 'free_inodes'];
+  for (const host of [o.host_home, o.host_work]) {
+    exactKeys(host, hostKeys); storageNumbers(host, hostKeys);
+    check(Object.hasOwn(STORAGE_DISKS, host.type) && host.available_blocks * host.block_bytes >= 17179869184 &&
+      host.free_inodes >= 65536, 'insufficient_or_nondisk_host_storage');
+  }
+  exactKeys(o.initial, ['schema', 'phase', 'paths', 'df']);
+  check(o.initial.schema === 1 && o.initial.phase === 'before-untrusted-workload' &&
+    Array.isArray(o.initial.paths) && equal(o.initial.paths.map(r => r?.path), ['/home/workload', '/tmp', '/work']) &&
+    typeof o.initial.df === 'string' && o.initial.df.length < 4096, 'invalid_storage_probe');
+  const df = o.initial.df.trim().split('\n');
+  check(df.length === 4 && df[0].startsWith('Filesystem'), 'invalid_storage_df');
+  const rowKeys = ['path', 'device', 'block_bytes', 'blocks', 'free_blocks', 'available_blocks',
+    'inodes', 'free_inodes', 'available_inodes'];
+  for (let i = 0; i < 3; i++) {
+    const row = o.initial.paths[i];
+    exactKeys(row, rowKeys); storageNumbers(row, rowKeys.filter(k => k !== 'path'));
+    check(row.available_inodes <= row.free_inodes, 'invalid_storage_available_inodes');
+    const m = /^(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)%\s+(\S+)$/.exec(df[i + 1]);
+    check(m && m[7] === row.path, 'storage_df_path_or_shape_mismatch');
+    const total = Number(m[3]), used = Number(m[4]), available = Number(m[5]), percent = Number(m[6]);
+    check([total, used, available, percent].every(Number.isSafeInteger) &&
+      total === row.blocks * row.block_bytes && used <= total && available <= total &&
+      used + available <= total && percent <= 100, 'storage_df_capacity_mismatch');
+    if (i === 1) check(m[2] === 'tmpfs' && total === 2147483648 && available >= 1073741824 &&
+      row.available_blocks * row.block_bytes >= 1073741824, 'storage_tmp_backing_or_capacity');
+    else {
+      const host = i === 0 ? o.host_home : o.host_work;
+      check(STORAGE_DISKS[host.type].includes(m[2]) && total === host.blocks * host.block_bytes &&
+        available >= 17179869184 && row.available_blocks * row.block_bytes >= 17179869184 &&
+        row.available_inodes >= 65536, 'insufficient_or_unproven_container_disk');
+    }
+  }
+  return o;
+}
+export function validateStorageReceipt(r, s, version = 0) {
+  check([0, 1].includes(version), 'unsupported_storage_policy_capability');
+  absentExceptionFields(r, ['storage_policy', 'storage_observation', 'reviewed_storage_validation']);
+  const p = version ? expectedStoragePolicy(s, r.executed_sha) : null;
+  check(Array.isArray(r.workloads), 'missing_storage_workloads');
+  for (const w of r.workloads) {
+    exactExceptionField(w, 'storage_policy', p);
+    absentExceptionFields(w, ['reviewed_storage_validation']);
+    if (!p) absentExceptionFields(w, ['storage_observation']);
+  }
+  if (!p) return [];
+  check(['base', 'head'].includes(r.side) && r.executed_sha ===
+    (r.side === 'base' ? s.baseline_sha : s.head.sha), 'storage_side_mismatch');
+  check(r.workloads.length === 1, 'storage_workload_count');
+  const w = r.workloads[0];
+  check(w.id === 'python:test:requirements.txt' && w.ecosystem === 'python' && w.directory === 'test' &&
+    w.scope === 'requirements-install' && w.locked === false &&
+    equal(w.changed_manifests, ['test/requirements.txt']) &&
+    equal(w.commands, ["python -m pip install -r 'requirements.txt'"]), 'storage_exact_workload_mismatch');
+  validateStorageObservation(w.storage_observation);
+  check(date(w.storage_observation.observed_at) <= date(w.started_at), 'storage_observation_after_workload');
+  exactKeys(w.image, ['tag', 'digest', 'platform']);
+  check(w.image.tag === 'python:3.10-bookworm' && w.image.platform === 'linux/amd64' &&
+    /^python@sha256:[a-f0-9]{64}$/.test(w.image.digest) && equal(r.images, {python: w.image}),
+  'storage_unchanged_immutable_image_mismatch');
+  return [{workload_id: w.id, policy_id: p.policy_id, executed_sha: r.executed_sha,
+    storage_admission_verified: true, peak_usage_guaranteed: false}];
+}
+export function validateStorageVerifier(v, row, r, s, version = 0) {
+  absentExceptionFields(v, ['storage_policy', 'storage_observation', 'reviewed_storage_validation']);
+  absentExceptionFields(row, ['storage_policy', 'storage_observation']);
+  const expected = validateStorageReceipt(r, s, version);
+  if (version) check(equal(row.reviewed_storage_validation, expected), 'storage_verifier_policy_mismatch');
+  else absentExceptionFields(row, ['reviewed_storage_validation']);
+}
+export function validateAdditionalControllerImages(text, s, sides) {
+  const scopes = [
+    [`record (base, ${s.baseline_sha})`, 'Initialize diagnostic receipt', 'base'],
+    [`record (head, ${s.head.sha})`, 'Initialize diagnostic receipt', 'head'],
+    ['verify', 'Validate complete profiles and exact provenance', 'head'],
+  ];
+  for (const [job, step, side] of scopes) {
+    const matches = text.split(/\r?\n/).flatMap(line => {
+      const pieces = line.split('\t');
+      if (pieces.length !== 3 || pieces[0] !== job || pieces[1] !== step) return [];
+      const m = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z\s{3}RECORDER_IMAGES: (\{.*\})$/.exec(pieces[2]);
+      return m ? [parse(m[1])] : [];
+    });
+    check(matches.length === 1 && equal(matches[0], sides[side]?.receipt?.images),
+      'additional_policy_controller_image_mismatch');
+  }
+}
+const GO_SCOPE = 'reviewed-go-mod-download-with-uninitialized-submodules';
+const GO_RULES = [
+  {
+    policy_id: 'go-ethereum-pr10-go-mod-uninitialized-gitlinks-v1',
+    repository: 'garnet-labs/go-ethereum', repository_id: '1211000635', pr: 10,
+    base: '0b054f5690cfc792e7f6814c7b4e2b58e09ab340', head: '9ceffd5e287699760bfdd2463bb2c75167d32ad7',
+    count: 2365, gitmodules: '241c169c4772ce246ffa45f7fa8a63019ffea0e1',
+    gitlinks: [
+      {path: 'tests/evm-benchmarks', commit_sha: 'd8b88f4046a87d6b902378cef752591f95427b43'},
+      {path: 'tests/testdata', commit_sha: '81862e4848585a438d64f911a19b3825f0f4cd95'},
+    ],
+    sides: {
+      base: {inventory: '44fb03a848e65bdcb9af8b0f8b464f9e40f981e4eabe6ff1e3b381a6c84067b6',
+        mod: '37a2537dd04ca0afc5ed98f02993dd2ad1fbc773', sum: 'c46560324211f839478aaa4f98ef288773a1c8f6'},
+      head: {inventory: '370f661e29b4ef28bfd4179680e9881a6613ea84dff38534ad0bfe09d20b7bbf',
+        mod: '663c14fcc08a3117a692387ae25b064b36192f9f', sum: '24bbf3abeaa8acae2075f0cdc7e6b0f952a3b1d5'},
+    },
+  },
+  {
+    policy_id: 'grype-pr8-go-mod-uninitialized-gitlinks-v1',
+    repository: 'garnet-labs/grype', repository_id: '1211000051', pr: 8,
+    base: 'd3e1ec1f4e5dae225c41f4bd7495371010b3995d', head: '6ea85004173bbd667fc9fabd88529a99d04dc39c',
+    count: 1170, gitmodules: '21e606b75a5911167d8ab45c2eacafcb9ff9fda2',
+    gitlinks: [{path: 'test/quality/vulnerability-match-labels',
+      commit_sha: '2dc3c828717741e26e3e780b24a3263cac450926'}],
+    sides: {
+      base: {inventory: '5234c649f67811a96937a6251706b7c3a32a8308e017450e861e02d0e19043b0',
+        mod: '668d74ba9e7b966c724831dab7365409138c71bc', sum: '4ec2372764755b06b54b133a1cf241005b41ae18'},
+      head: {inventory: 'e205a0cbb9e59a5c87f47ff99e536274e21c42ebbec9d460eb690b73bbc2cff2',
+        mod: '6e15e7c5f12f33a518bb6c2e73796ea2d86474c2', sum: '2e8e1eabccc4534aa5d736d2892b84bedd4a45d9'},
+    },
+  },
+];
+export function expectedGoMaterialization(s, executed) {
+  const p = GO_RULES.find(p => s?.repository === p.repository && s.repository_id === p.repository_id &&
+    s.pr_number === p.pr && s.baseline_sha === p.base && s.head?.sha === p.head &&
+    s.base?.repository === p.repository && s.head.repository === p.repository &&
+    s.base.repository_id === p.repository_id && s.head.repository_id === p.repository_id &&
+    [p.base, p.head].includes(executed) && s.comparison_scope === 'merge-base-to-head' &&
+    exactManifestSet(s.manifests, ['go.mod', 'go.sum']) &&
+    exactManifestSet(s.changed_files, ['go.mod', 'go.sum']));
+  if (!p) return null;
+  const side = p.sides[executed === p.base ? 'base' : 'head'];
+  return {
+    schema: 1, policy_id: p.policy_id, source_revision: executed, scope: GO_SCOPE,
+    git_tree_lookup_sha: executed, tracked_inventory_sha256: side.inventory,
+    tracked_superproject_blob_count: p.count, tracked_superproject_blob_bytes_checked: true,
+    recursive_source_complete: false, submodule_contents_present: false,
+    submodule_fetch_performed: false, git_metadata_excluded: true, host_git_metadata_exposed: false,
+    uninitialized_gitlinks: structuredClone(p.gitlinks), go_work_absent: true, replace_directives_absent: true,
+    go_mod_blob: side.mod, go_sum_blob: side.sum, gitmodules_blob: p.gitmodules,
+    verification_phase: 'before-workload-not-a-post-execution-immutability-claim',
+  };
+}
+const STOP_EXPERIMENT_ID = 'diagnostic-stop-420-v1';
+const STOP_DEFAULTS = {sensor_stop_seconds: 180, stop_command_ms: 240000,
+  settle_ms: 30000, step_minutes: 6, diagnostic_command_ms: 10000,
+  experiment: false, job_minutes: 45};
+// Independent static reconstruction of the five permits in frozen controller
+// ff57d4dae02c6c780bd2fe7ea4f2895d17c93e20921e3df99b43bf1ad01cef80.
+const STOP_PAIRS = [
+  ['garnet-labs/n8n', '1206112160', 34, 'f461114870a31dbdf650abcff9a09ad5a86bdafd',
+    '65fca3909cfa5a986ff618b5984e091fb068a0ec', ['packages/cli/package.json', 'pnpm-lock.yaml']],
+  ['garnet-labs/supabase', '1206332384', 143, 'f28139579a7c017ff90a8414ae1f5929d018d3d2',
+    '0d7c5b981b6ee494709fdf590b6b44e8e0ae5a5a', ['examples/todo-list/nextjs-todo-list/package-lock.json']],
+  ['garnet-labs/OpenHands', '1337697001', 5, 'c41bda23d6b648bf3a30422ab9d71bd7675caea1',
+    'f2689932d9b8a025d0eef961dd9a962c11c5697c', ['package-lock.json']],
+  ['garnet-labs/phantom-connect-sdk', '1206647047', 23, '8eb39b151cedacddf55fc7715b3469b67743f78e',
+    '112a60b79f4c7cb7e736bd34a4a78afe809590a1', ['yarn.lock']],
+  ['garnet-labs/next.js', '1206332346', 40, '2d069943639fd0fc67a26bbb337d8a726f50924d',
+    'bcae068be948a03cba54813aea6cffb5c03adf63', ['package.json', 'pnpm-lock.yaml']],
+];
+export function stopExperimentCapability(bytes) {
+  const text = bytes.toString('utf8');
+  const declarations = [...text.matchAll(/^\s*(?:export\s+)?const\s+STOP_EXPERIMENT\s*=\s*([^;\n]+)\s*;/gm)];
+  if (!declarations.length) {
+    check(!text.includes('STOP_EXPERIMENT'), 'unsupported_stop_experiment_capability');
+    return 0;
+  }
+  check(declarations.length === 1 &&
+    /^(['"])diagnostic-stop-420-v1\1$/.test(declarations[0][1].trim()),
+  'unsupported_stop_experiment_capability');
+  return 1;
+}
+export function expectedFinalizationLimits(s) {
+  const requested = s?.finalization_experiment ?? 'none';
+  if (requested === 'none') return {...STOP_DEFAULTS};
+  check(requested === STOP_EXPERIMENT_ID, 'unknown_finalization_experiment');
+  check(s.event === 'workflow_dispatch' && s.run_attempt === '1' &&
+    STOP_PAIRS.some(([repo, id, pr, base, head, manifests]) =>
+      s.repository === repo && s.repository_id === id && s.pr_number === pr &&
+      s.baseline_sha === base && s.pr_base_tip === base && s.base?.sha === base &&
+      s.head?.sha === head && s.base.repository === repo && s.head.repository === repo &&
+      s.base.repository_id === id && s.head.repository_id === id &&
+      exactManifestSet(s.manifests, manifests)), 'unreviewed_stop_experiment_pair');
+  return {...STOP_DEFAULTS, sensor_stop_seconds: 420, stop_command_ms: 480000,
+    step_minutes: 10, experiment: true, experiment_id: STOP_EXPERIMENT_ID, job_minutes: 60};
+}
+function stopDurationMs(value) {
+  check(typeof value === 'string', 'invalid_systemd_stop_duration');
+  const text = value.trim(), tokens = [...text.matchAll(/(\d+(?:\.\d+)?)(us|ms|min|s|h|d)/g)];
+  check(tokens.length > 0 && tokens.map(t => t[0]).join('') === text.replace(/\s/g, ''),
+    'invalid_systemd_stop_duration');
+  const units = {us: .001, ms: 1, min: 60000, s: 1000, h: 3600000, d: 86400000};
+  return tokens.reduce((sum, t) => sum + Number(t[1]) * units[t[2]], 0);
+}
+export function validateStopReceipt(r, s, version = 0) {
+  check([0, 1].includes(version), 'unsupported_stop_experiment_capability');
+  if (version === 0) {
+    check((s?.finalization_experiment ?? 'none') === 'none' &&
+      !r.sensor?.finalization_limits?.experiment && !r.sensor?.finalization_limits?.experiment_id,
+    'unbound_stop_experiment');
+    return;
+  }
+  const limits = expectedFinalizationLimits(s);
+  if (!limits.experiment) {
+    if (Object.hasOwn(r.sensor ?? {}, 'finalization_limits'))
+      check(equal(r.sensor.finalization_limits, limits), 'unbound_stop_experiment_budget');
+    return;
+  }
+  check(equal(r.sensor?.finalization_limits, limits), 'stop_experiment_budget_mismatch');
+  check(stopDurationMs(r.sensor.stop_details?.TimeoutStopUSec) === 420000,
+    'stop_experiment_effective_timeout_mismatch');
+  check(r.sensor.stop_details.ActiveState === 'inactive' && r.sensor.stop_details.SubState === 'dead' &&
+    r.sensor.stop_details.Result === 'success' && r.sensor.stop_details.ExecMainStatus === '0',
+  'stop_experiment_unclean_lifecycle');
+  check(Number.isFinite(r.sensor.stop_elapsed_ms) && r.sensor.stop_elapsed_ms >= 0 &&
+    r.sensor.stop_elapsed_ms < limits.stop_command_ms &&
+    Number.isFinite(r.sensor.finalization_elapsed_ms) && r.sensor.finalization_elapsed_ms >= 0 &&
+    r.sensor.finalization_elapsed_ms < limits.step_minutes * 60000 &&
+    !r.sensor.finalization_error && !r.finalization_error, 'stop_experiment_timing_or_error');
+}
+export function validateGoReceipt(r, s, version = 0) {
+  check([0, 1, 2].includes(version), 'unsupported_reviewed_exceptions_capability');
+  absentExceptionFields(r, ['go_submodule_validation']);
+  const m = version === 2 ? expectedGoMaterialization(s, r.executed_sha) : null;
+  exactExceptionField(r, 'source_materialization', m);
+  check(Array.isArray(r.workloads), 'missing_go_policy_workloads');
+  for (const w of r.workloads) {
+    absentExceptionFields(w, ['go_submodule_validation']);
+    exactExceptionField(w, 'source_materialization', m);
+    if (!m) check(w.scope !== GO_SCOPE, 'unbound_go_materialization_scope');
+  }
+  if (!m) return null;
+  check(r.reviewed_exceptions_version === 2 && ['base', 'head'].includes(r.side) &&
+    r.executed_sha === (r.side === 'base' ? s.baseline_sha : s.head.sha), 'go_materialization_side_or_capability');
+  check(r.workloads.length === 1, 'go_materialization_workload_count');
+  const w = r.workloads[0];
+  check(w.id === 'go:.:' && w.ecosystem === 'go' && w.directory === '.' && w.locked === true &&
+    w.scope === GO_SCOPE && equal(w.changed_manifests, ['go.mod', 'go.sum']) &&
+    equal(w.commands, ['GOWORK=off go mod download']), 'go_materialization_workload_scope');
+  return {schema: 1, policy_id: m.policy_id, source_revision: m.source_revision,
+    tracked_inventory_sha256: m.tracked_inventory_sha256, recursive_source_complete: false,
+    submodule_contents_present: false, source_materialization_checked: true};
+}
+export function validateGoVerifier(v, row, r, s, version = 0) {
+  const result = validateGoReceipt(r, s, version);
+  absentExceptionFields(v, ['source_materialization', 'go_submodule_validation']);
+  exactExceptionField(row, 'source_materialization', r.source_materialization);
+  exactExceptionField(row, 'go_submodule_validation', result);
+  if (result) check(v.reviewed_exceptions_version === 2 && row.side === r.side,
+    'go_verifier_side_or_capability_mismatch');
+}
+
 function api(endpoint, method = 'GET', body) {
   try {
     return parse(execFileSync('gh', ['api', endpoint,
@@ -145,7 +867,7 @@ export function inspectProfile(raw, r) {
     }
   }
   const expected = {
-    node: /^(node|npm|pnpm|corepack|yarn)$/, python: /^(python(?:\d+(?:\.\d+)*)?|pip(?:\d+(?:\.\d+)*)?|uv|poetry)$/,
+    node: /^(node|npm|pnpm|corepack|yarn|bun)$/, python: /^(python(?:\d+(?:\.\d+)*)?|pip(?:\d+(?:\.\d+)*)?|uv|poetry)$/,
     go: /^go$/, rust: /^(cargo|rustup)$/, ruby: /^(ruby(?:\d+(?:\.\d+)*)?|bundle|bundler|gem)$/,
   };
   const workloads = r.workloads.map(w => {
@@ -192,13 +914,19 @@ export function inspectProfile(raw, r) {
     }, {})};
 }
 
-export function validateSide(r, artifact, s, side, scriptHash, helperHashes) {
+export function validateSide(r, artifact, s, side, scriptHash, helperHashes, reviewedVersion = 0, pythonVersion = 0, stopVersion = 0,
+  directoryVersion = 0, storageVersion = 0) {
   check(r?.schema === 1 && [POLICY, POLICY_V2].includes(r.policy) && equal(r.snapshot, s), 'receipt_schema_or_snapshot_mismatch');
   if (r.policy === POLICY_V2) check(helperHashes && Object.keys(helperHashes).length === 1 &&
     /^[a-f0-9]{64}$/.test(helperHashes[HELPER] || '') && equal(r.recorder_helpers_sha256, helperHashes),
   'recorder_helper_hash_mismatch');
   check(r.side === side && r.expected_sha === (side === 'base' ? s.baseline_sha : s.head.sha) &&
     r.executed_sha === r.expected_sha, 'executed_sha_mismatch');
+  validateReviewedReceipt(r, s, reviewedVersion);
+  validatePythonReceipt(r, s, pythonVersion);
+  validateStopReceipt(r, s, stopVersion);
+  validateDirectoryReceipt(r, s, directoryVersion);
+  validateStorageReceipt(r, s, storageVersion);
   check(r.run_id === s.run_id && r.run_attempt === s.run_attempt && r.control_sha === s.control_sha &&
     r.recorder_sha === s.recorder_sha && r.recorder_script_sha256 === scriptHash,
   'receipt_run_or_recorder_hash_mismatch');
@@ -421,15 +1149,20 @@ export function validateCloudReadback(c, entry, hostedURL) {
 }
 
 export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publishable, artifacts,
-  hostedReports = {}, cloudReadbacks = {}, historical = false}) {
-  const verified = failures.length === 0 && publishable;
+  hostedReports = {}, cloudReadbacks = {}, historical = false, reviewedVersion = 0, pythonVersion = 0,
+  stopVersion = 0, comparisonMatched = true, directoryVersion = 0, storageVersion = 0}) {
+  const recordingVerified = failures.length === 0 && publishable;
+  // Preserve the legacy matched-comparison meaning for existing JSON consumers.
+  // A valid capture with command divergence is a separate, lower-tier fact.
+  const verified = recordingVerified && comparisonMatched;
   const runURL = `https://github.com/${repo}/actions/runs/${run.id}/attempts/${run.run_attempt}`;
-  const decision = verified ? 'Recording verified; security verdict HOLD (requires human interpretation)'
+  const decision = recordingVerified ? 'Recording verified; security verdict HOLD (requires human interpretation)'
     : 'Recording incomplete; security verdict HOLD (requires human interpretation)';
   const lines = [marker(repo, pr.number),
     `<!-- garnet-recording-run:${run.id} attempt:${run.run_attempt} head:${pr.head.sha} -->`,
     historical ? '## Garnet Dependabot historical closed-PR recording' : '## Garnet Dependabot cold-read receipt',
     '', `**${decision}**`, '',
+    ...(!comparisonMatched ? ['**Comparison HOLD:** base/head command policies differ. Both executions may be recorded, but no matched-install or scope-equivalent dependency comparison is claimed.', ''] : []),
     `[Recording run ${run.id}, attempt ${run.run_attempt}](${runURL}) · ${historical ? 'Historical closed-PR' : 'Current PR'} head: ${code(pr.head.sha)}`,
     ...(historical ? ['', '**Historical, closed and unmerged PR. Comment-only recording; not a current active-PR gate. No commit status or reopening.**'] : []),
     '', '| Side / actual workload | Executed SHA | Install / fetch command (in directory) | Image digest | Actual exit | Observed workload processes / destinations / associations |',
@@ -448,6 +1181,70 @@ export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publ
           ? `${counts.processes} / ${counts.destinations} / ${counts.associations}` : 'not verified'} |`);
     }
   }
+  if (reviewedVersion > 0) {
+    const reviewed = expectedReviewedExceptions(s, sides.head?.receipt?.executed_sha);
+    if ((reviewed.manager_selection || reviewed.source_copy_fidelity) && !recordingVerified)
+      lines.push('', '**Reviewed exception not verified:** do not infer manager-selection or source-copy fidelity from this incomplete recording.');
+    else if (reviewed.manager_selection) lines.push('',
+      '**Reviewed install scope:** Yarn graph selected by the two immutable release workflows. The npm package-lock was retained and unchanged, but its graph was **not independently exercised**. Yarn 1.22.22 is a trusted classic-lock fallback, not an upstream version pin. Both lockfiles’ final bytes were checked; this is not a detector of transient modifications. No explicit workspace build or repository-wide tests were run.');
+    else if (reviewed.source_copy_fidelity) lines.push('',
+      '**Reviewed source-copy fidelity:** one exact absolute fixture symlink was preserved as opaque target bytes; no host-target resolution, tracked-source exclusions or symlink-target rewrites. Existing Git-metadata omission and executable-mode normalization were retained.');
+  }
+  if (reviewedVersion === 2) {
+    const go = expectedGoMaterialization(s, s?.head?.sha);
+    if (go && !recordingVerified) lines.push('',
+      '**Reviewed Go materialization not verified:** the reviewed policy permits root GOWORK=off go mod download only, never a complete recursive checkout. No completed source materialization or successful download is asserted for this incomplete recording.');
+    else if (go) {
+      lines.push('', '**Reviewed Go download-only scope:** tracked superproject blobs were checked before the workload. The listed submodules were uninitialized; their contents were absent and were not fetched. **This is not a complete recursive checkout**, build, test or safety approval. Pre-workload checks are not post-execution source immutability. The compatibility field `locked=true` is not a Go `--locked` flag or a guarantee that go.sum cannot change.');
+    }
+    for (const g of go?.uninitialized_gitlinks ?? [])
+      lines.push(`- ${recordingVerified ? 'Uninitialized gitlink' : 'Policy-required uninitialized gitlink (not verified)'}: ${code(g.path)} at ${code(g.commit_sha)}.`);
+  }
+  if (pythonVersion === 1 && Object.hasOwn(PYTHON_RULES, s?.repository ?? '')) {
+    let policy;
+    try { policy = expectedPythonPolicy(s, s?.head?.sha); }
+    catch { /* Invalid snapshot stays an incomplete claim, never a renderer crash. */ }
+    if (!recordingVerified || !policy) lines.push('',
+      '**Reviewed Python policy not verified:** interpreter/image guards, selected dependency scope and intact lock bytes are not asserted for this incomplete recording; any stale-baseline failure remains a failure.');
+    else lines.push('', '**Reviewed Python dependency scope:** ' + escape(policy.scope_limit) + '.',
+      `Policy requirements: Python ${code(policy.python)}, uv ${code(policy.uv_version)}, interpreter ${code(policy.interpreter)}; no interpreter downloads or local workspace installation. Successful recording requires the listed runtime guard, uv version check, uv lock --check, frozen sync and final lock/pyproject byte comparison. These policy fields are requirements, not standalone runtime measurements.`,
+      ...(policy.excluded_groups.length ? ['The pydantic-v1/pydantic-v2 group flags were not selected; this does **not** assert exclusion of all packages named Pydantic from the all-extras graph.'] : []));
+    if (policy) lines.push(
+      ...(!recordingVerified ? [`Policy scope (not a completion claim): ${escape(policy.scope_limit)}.`] : []),
+      `Source-review caveat (retained): ${escape(policy.caveat)}.`);
+  }
+  if (directoryVersion === 1 && s?.repository === DIRECTORY_RULE.repository) {
+    lines.push('', `**Synthetic empty-Git install scope${recordingVerified ? '' : ' — not verified'}:** ` +
+      'the reviewed policy creates fresh Git metadata only inside the credential-free, nonroot workload container; ' +
+      'the root filesystem remains read-only. No host .git, commits, origin, index entries or source Git objects are imported. ' +
+      'Git templates and system/global configuration are disabled; npm lifecycle scripts and Husky are unchanged and enabled. ' +
+      'This is **not full-Git or native-CI fidelity**: no native/Rust build, typecheck, Jest, application build or packaging is claimed.',
+      'The guarded command sequence includes a container-local npm 10.9.8 bootstrap before the unchanged npm ci. ' +
+      '**All observed process/destination counters cover the entire workload, including bootstrap; they are not npm-ci-only attribution.** ' +
+      'The npm version is an official compatible release, not a native-CI exact pin. ' +
+      'Final manifest/lock hash equality is a final-byte check, not proof against transient writes. ' +
+      (!recordingVerified ? 'No successful guarded install or source-byte preservation is asserted for this incomplete recording. ' : '') +
+      'The earlier failed Directory capture remains HOLD; no old exit is repaired.');
+  }
+  if (storageVersion === 1 && s?.repository === 'garnet-labs/gradio-test' && s.pr_number === 4 &&
+    s.manifests?.includes('test/requirements.txt')) {
+    lines.push('', `**Gradio private disk-home admission${recordingVerified ? '' : ' — not verified'}:** ` +
+      'the exact reviewed requirements workload uses a fresh private disk-backed /home/workload and TMPDIR=/home/workload/tmp; ' +
+      '/tmp remains a 2 GiB tmpfs. The root filesystem stays read-only, UID/GID 10001, no credentials mounted, and all existing ' +
+      'isolation/network/resource caps remain. The original pip requirements command is unchanged and explicitly **not locked**.',
+      'Initial admission requires at least 16 GiB available and 65,536 available inodes for home/work, plus at least 1 GiB available in /tmp. ' +
+      'The same-image, network-none, isolated diagnostic preflight is **not dependency execution**. ' +
+      'These are initial measurements, **not a storage reservation, quota, peak-usage guarantee or physical-media proof**; ' +
+      'no 32 GiB reservation is claimed. Later ENOSPC remains HOLD. ' +
+      (!recordingVerified ? 'Storage admission and successful dependency execution are not asserted for this incomplete recording. ' : '') +
+      'The earlier failed Gradio capture remains HOLD.');
+  }
+  if (stopVersion === 1 && (s?.finalization_experiment ?? 'none') !== 'none')
+    lines.push('', `**Diagnostic finalization experiment${recordingVerified ? '' : ' — not verified'}:** ` +
+      'this policy permits only exact reviewed pairs with a 420-second systemd stop budget, 480-second stop subprocess, ' +
+      '10-minute finalizer and 60-minute job. This is a bounded diagnostic experiment, **not a proven fix**. ' +
+      'Clean stop, finite timings and all workload/profile gates remain required; old failed captures are not repaired. ' +
+      'The one-new-dispatch limit is operator-enforced, not a global worker quota.');
   lines.push('', `Baseline: merge-base ${code(s?.baseline_sha)}; PR base tip at resolution: ${code(s?.pr_base_tip)}.`,
     'This is a freshly recorded merge-base-to-head pair, **not a previous profile from this PR**. Only the listed workload ran; repository-wide tests are not asserted.',
     '', '**Observed non-DNS TCP workload destination sets** (domain preferred; numeric port; PIDs and domain-backed IP changes ignored)');
@@ -491,9 +1288,12 @@ export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publ
   const body = `${lines.join('\n')}\n`;
   check(body.length < 60000, 'comment_exceeds_github_limit');
   return {schema: 1, repo, pr: pr.number, run: String(run.id), attempt: run.run_attempt,
-    head: pr.head.sha, historical, publishable, verified, decision, failures, cloud_readback: cloudReadbacks, comment: {body},
+    head: pr.head.sha, historical, publishable, verified, recording_verified: recordingVerified,
+    comparison_matched: comparisonMatched,
+    decision, failures, cloud_readback: cloudReadbacks, comment: {body},
     status: historical ? null : {context: CONTEXT, state: verified ? 'success' : 'error', target_url: runURL,
-      description: verified ? 'Matched install captured; security HOLD; not approval or safety.'
+      description: recordingVerified && !comparisonMatched ? 'Executions captured; comparison HOLD; not approval or safety.'
+        : verified ? 'Matched install captured; security HOLD; not approval or safety.'
         : 'Recording incomplete; security HOLD; not approval or safety.'}};
 }
 
@@ -608,7 +1408,8 @@ export function main(argv = process.argv.slice(2)) {
     snapshot ??= verification[0]?.snapshot;
     check(verification.length > 0, 'missing_verification_json');
   } catch (e) { recordFailure('verification_artifact', e); }
-  let bound = false, scriptHash, scriptPolicy, helperHashes;
+  let bound = false, scriptHash, scriptPolicy, helperHashes, reviewedVersion = 0, pythonVersion = 0,
+    stopVersion = 0, directoryVersion = 0, storageVersion = 0, resultVersion = 0, comparisonMatched = true;
   try {
     check(state.repo === o.repo && SHA.test(state.control_sha), 'invalid_manager_install_anchor');
     check(snapshot && SHA.test(snapshot.recorder_sha) && SHA.test(snapshot.control_sha), 'invalid_snapshot_controller');
@@ -639,12 +1440,36 @@ export function main(argv = process.argv.slice(2)) {
     scriptPolicy = /(?:export\s+)?const POLICY = ['"](garnet-dependabot-container-v[12])['"]/
       .exec(scriptBytes.toString('utf8'))?.[1];
     check([POLICY, POLICY_V2].includes(scriptPolicy), 'unsupported_trusted_recorder_policy');
+    reviewedVersion = reviewedExceptionsCapability(scriptBytes);
+    check(reviewedVersion === 0 || scriptPolicy === POLICY_V2, 'exception_capability_requires_policy_v2');
+    let helperBytes;
     if (scriptPolicy === POLICY_V2) {
       const helper = content(HELPER, snapshot.recorder_sha);
       check(helper.type === 'file' && helper.encoding === 'base64' && typeof helper.content === 'string',
         'missing_recorder_helper_bytes');
-      helperHashes = {[HELPER]: hash(Buffer.from(helper.content, 'base64'))};
+      helperBytes = Buffer.from(helper.content, 'base64');
+      helperHashes = {[HELPER]: hash(helperBytes)};
     }
+    pythonVersion = reviewedPythonCapability(scriptBytes, helperBytes);
+    check(pythonVersion === 0 || (scriptPolicy === POLICY_V2 && reviewedVersion > 0),
+      'python_capability_requires_reviewed_policy_v2');
+    directoryVersion = reviewedDirectoryCapability(scriptBytes, helperBytes);
+    storageVersion = reviewedStorageCapability(scriptBytes);
+    resultVersion = recordingResultCapability(scriptBytes);
+    check((directoryVersion === 0 && storageVersion === 0) ||
+      (scriptPolicy === POLICY_V2 && reviewedVersion === 2), 'additional_policy_requires_reviewed_v2');
+    check(resultVersion === 0 || (scriptPolicy === POLICY_V2 && reviewedVersion === 2),
+      'recording_result_requires_reviewed_v2');
+    if (storageVersion && expectedStoragePolicy(snapshot, snapshot.head.sha))
+      check(run.event === 'workflow_dispatch' && String(run.run_attempt) === '1',
+        'storage_requires_live_manual_attempt_one');
+    stopVersion = stopExperimentCapability(scriptBytes);
+    if (stopVersion === 1) {
+      check(scriptPolicy === POLICY_V2 && reviewedVersion === 2, 'stop_capability_requires_reviewed_v2');
+      if (expectedFinalizationLimits(snapshot).experiment)
+        check(run.event === 'workflow_dispatch' && Number(run.run_attempt) === 1,
+          'stop_experiment_requires_live_manual_attempt_one');
+    } else check((snapshot.finalization_experiment ?? 'none') === 'none', 'unbound_stop_experiment');
     const comparison = api(`${repoPath}/compare/${snapshot.pr_base_tip}...${snapshot.head.sha}`);
     check(comparison.merge_base_commit?.sha === snapshot.baseline_sha, 'merge_base_mismatch');
     const r = sides.head?.receipt;
@@ -658,14 +1483,23 @@ export function main(argv = process.argv.slice(2)) {
     try {
       check(sides[side] && artifacts[side], 'missing_side_evidence');
       check(sides[side].receipt.policy === scriptPolicy, 'receipt_trusted_policy_mismatch');
-      sides[side].observed = validateSide(sides[side].receipt, artifacts[side], snapshot, side, scriptHash, helperHashes);
+      sides[side].observed = validateSide(sides[side].receipt, artifacts[side], snapshot, side,
+        scriptHash, helperHashes, reviewedVersion, pythonVersion, stopVersion, directoryVersion, storageVersion);
     } catch (e) { recordFailure(side, e); }
   }
   try {
     check(verification.length > 0, 'missing_independent_verifier');
+    const base = sides.base.receipt.workloads, head = sides.head.receipt.workloads;
+    check(equal(base.map(w => w.id), head.map(w => w.id)), 'workload_targets_differ');
+    check(base.every((w, i) => w.image.digest === head[i].image.digest &&
+      w.directory === head[i].directory && w.scope === head[i].scope), 'base_head_scope_or_image_mismatch');
+    // Comparison is computed from the independently checked receipts, never
+    // selected by a producer's verified/decision/comparison labels.
+    comparisonMatched = base.every((w, i) => equal(w.commands, head[i].commands));
     for (const v of verification) {
-      check(v.schema === 1 && v.policy === scriptPolicy && v.verified === true &&
-        v.decision === 'RECORDING_VERIFIED' && equal(v.snapshot, snapshot), 'independent_verifier_not_verified');
+      check(v.schema === 1 && v.policy === scriptPolicy && equal(v.snapshot, snapshot),
+        'independent_verifier_not_verified');
+      validateVerifierResult(v, comparisonMatched, resultVersion, scriptHash, helperHashes);
       if (scriptPolicy === POLICY_V2) check(v.recorder_script_sha256 === scriptHash &&
         equal(v.recorder_helpers_sha256, helperHashes), 'verifier_code_hash_mismatch');
       check(Array.isArray(v.sides) && v.sides.length === 2, 'verifier_side_count_mismatch');
@@ -673,6 +1507,10 @@ export function main(argv = process.argv.slice(2)) {
         const matches = v.sides.filter(x => x.side === side), e = sides[side];
         check(matches.length === 1 && e?.observed, 'verifier_missing_observed_side');
         const row = matches[0];
+        validateReviewedVerifier(v, row, e.receipt, snapshot, reviewedVersion);
+        validatePythonVerifier(v, row, e.receipt, snapshot, pythonVersion);
+        validateDirectoryVerifier(v, row, e.receipt, snapshot, directoryVersion);
+        validateStorageVerifier(v, row, e.receipt, snapshot, storageVersion);
         if (scriptPolicy === POLICY_V2) check(row.recorder_script_sha256 === scriptHash &&
           equal(row.recorder_helpers_sha256, helperHashes), 'verifier_side_code_hash_mismatch');
         check(row.executed_sha === e.receipt.executed_sha && row.profile_sha256 === e.observed.sha256 &&
@@ -680,12 +1518,12 @@ export function main(argv = process.argv.slice(2)) {
           equal(row.evidence, e.observed.recorderEvidence), 'verifier_contents_mismatch');
       }
     }
-    const base = sides.base.receipt.workloads, head = sides.head.receipt.workloads;
-    check(equal(base.map(w => w.id), head.map(w => w.id)), 'workload_targets_differ');
-    check(base.every((w, i) => w.image.digest === head[i].image.digest &&
-      w.directory === head[i].directory && w.scope === head[i].scope), 'base_head_scope_or_image_mismatch');
-    // A changed packageManager/policy is interesting, not silently a matched install.
-    check(base.every((w, i) => equal(w.commands, head[i].commands)), 'base_head_commands_differ_requires_review');
+    if (pythonVersion === 1 && Object.hasOwn(PYTHON_RULES, snapshot?.repository ?? ''))
+      validatePythonControllerImages(read(path.join(o.evidence, 'run.log')).toString('utf8'),
+        snapshot, sides, pythonVersion);
+    if ((directoryVersion && expectedDirectoryPolicy(snapshot, snapshot.head.sha)) ||
+      (storageVersion && expectedStoragePolicy(snapshot, snapshot.head.sha)))
+      validateAdditionalControllerImages(read(path.join(o.evidence, 'run.log')).toString('utf8'), snapshot, sides);
   } catch (e) { recordFailure('independent_verification', e); }
   let hostedReports = {};
   try { hostedReports = parseHostedReports(read(path.join(o.evidence, 'run.log')).toString('utf8'), o.run, sides); }
@@ -699,10 +1537,14 @@ export function main(argv = process.argv.slice(2)) {
     } catch { /* Missing/stale/invalid public read-back is not a recording failure. */ }
   }
   const preview = renderPreview({repo: o.repo, pr, run, snapshot, sides, failures, publishable: bound,
-    artifacts, hostedReports, cloudReadbacks, historical: o.historical});
+    artifacts, hostedReports, cloudReadbacks, historical: o.historical, reviewedVersion, pythonVersion,
+    stopVersion, comparisonMatched, directoryVersion, storageVersion});
   preview.provenance = {mode: o.ci ? 'trusted-workflow-dispatch' : 'local-manager',
     default_branch: trust.repository.default_branch, default_tip: trust.defaultTip,
-    recorder_script_sha256: scriptHash, recorder_helpers_sha256: helperHashes};
+    recorder_script_sha256: scriptHash, recorder_helpers_sha256: helperHashes,
+    reviewed_exceptions_version: reviewedVersion || null, reviewed_python_policies_version: pythonVersion || null,
+    stop_experiment_capability: stopVersion || null, reviewed_directory_policies_version: directoryVersion || null,
+    reviewed_storage_policies_version: storageVersion || null, recording_result_contract_version: resultVersion || null};
   save(path.join(o.evidence, 'publisher-preview.md'), preview.comment.body);
   save(path.join(o.evidence, 'publisher-preview.json'), preview);
   if (o.publish) {
