@@ -162,8 +162,8 @@ jobs:
       RECORDER_IMAGES: ${{ needs.resolve.outputs.images }}
       RECORDER_SIDE: ${{ matrix.side }}
       RECORDER_SOURCE: ${{ github.workspace }}/source
-      RECORDER_STATE: ${{ runner.temp }}/garnet-recorder-state
-      RECORDER_OUTPUT: ${{ runner.temp }}/garnet-recorder-evidence
+      RECORDER_STATE: ${{ github.workspace }}/garnet-recorder-state
+      RECORDER_OUTPUT: ${{ github.workspace }}/garnet-recorder-evidence
       GARNET_PROFILE_JOB: dependabot-${{ matrix.side }}-attempt-${{ github.run_attempt }}
       # Suppress the App's implicit comment. A separate trusted publisher can
       # later publish the verified receipt, not the native profile SHA label.
@@ -207,7 +207,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: garnet-record-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.side }}
-          path: ${{ runner.temp }}/garnet-recorder-evidence/
+          path: ${{ env.RECORDER_OUTPUT }}/
           if-no-files-found: error
           retention-days: 14
           compression-level: 6
