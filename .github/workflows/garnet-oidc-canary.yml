@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Pull public canary image
+        run: docker pull node:22-bookworm
       - name: Garnet OIDC registration
         uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c
         env:
@@ -20,6 +22,7 @@ jobs:
           set -euo pipefail
           sudo systemctl is-active --quiet jibril.service
           python3 -c 'import urllib.request; print(urllib.request.urlopen("https://pypi.org/pypi/pip/json", timeout=30).status)'
+          docker run --rm --user 1001:1001 --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 512m node:22-bookworm node -e 'fetch("https://registry.npmjs.org/ajv").then(r=>{console.log(r.status);if(!r.ok)process.exit(1)})'
           sleep 35
       - name: Validate actual profile
         if: always()
