@@ -199,9 +199,12 @@ export function planWorkloads(root, changed) {
     } else if (kind === 'rust') {
       dir = nearest(root, dir, 'Cargo.lock');
       assert(dir !== undefined && exists(root, dir, 'Cargo.toml'), 'BLOCKED: missing Cargo workspace lock or manifest');
-      commands.push('cargo fetch --locked');
+      commands.push('set -- /usr/local/rustup/toolchains/*/bin/cargo',
+        'test "$#" -eq 1 && test -x "$1"',
+        'export PATH="${1%/cargo}:$PATH"',
+        '"$1" fetch --locked');
       scope = 'crate-fetch-only';
-      note = 'Trusted container stable Rust toolchain; no project compilation';
+      note = 'Use the immutable image’s installed cargo directly, without rustup channel updates; no project compilation';
     } else if (kind === 'ruby') {
       dir = nearest(root, dir, 'Gemfile');
       assert(dir !== undefined, 'BLOCKED: missing Gemfile');
@@ -299,18 +302,50 @@ function saveState(state) {
   json(p.receipt, state.receipt);
 }
 
-function copyExactSource(source, destination) {
+export function copyExactSource(source, destination) {
   let entries = 0, total = 0;
   const root = fs.realpathSync(source);
+  const inside = resolved => (resolved === root || resolved.startsWith(`${root}${path.sep}`)) &&
+    !path.relative(root, resolved).split(path.sep).includes('.git');
+  function validateLink(from, target) {
+    assert(!path.isAbsolute(target), 'Absolute source symlink blocked');
+    assert(inside(path.resolve(path.dirname(from), target)), 'Outbound source symlink blocked');
+    // Preserve dangling links, but still inspect existing symlink prefixes.
+    // A lexical-only check can miss "shortcut/../../missing" escapes when
+    // shortcut points to a shallower directory. No file contents are read.
+    let cursor = path.dirname(from), links = 0;
+    const pending = target.split(path.sep);
+    while (pending.length) {
+      const part = pending.shift();
+      if (!part || part === '.') continue;
+      const next = path.resolve(cursor, part);
+      assert(inside(next), 'Outbound source symlink blocked');
+      let stat;
+      try { stat = fs.lstatSync(next); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        cursor = next; continue;
+      }
+      if (stat.isSymbolicLink()) {
+        assert(++links <= 40, 'Cyclic source symlink blocked');
+        const nested = fs.readlinkSync(next);
+        assert(!path.isAbsolute(nested), 'Absolute source symlink blocked');
+        pending.unshift(...nested.split(path.sep));
+      } else cursor = next;
+    }
+    try {
+      assert(inside(fs.realpathSync(from)), 'Outbound source symlink blocked');
+    } catch (error) {
+      // Only an absent target is permissible; ELOOP, EACCES, etc. fail closed.
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
   function visit(from, to) {
     const stat = fs.lstatSync(from);
     assert(++entries <= 400000, 'Source entry limit exceeded');
     if (stat.isSymbolicLink()) {
       const target = fs.readlinkSync(from);
-      assert(!path.isAbsolute(target), 'Absolute source symlink blocked');
-      const resolved = fs.realpathSync(from);
-      assert(resolved.startsWith(`${root}${path.sep}`) &&
-        !path.relative(root, resolved).split(path.sep).includes('.git'), 'Outbound source symlink blocked');
+      validateLink(from, target);
       fs.symlinkSync(target, to);
     } else if (stat.isDirectory()) {
       fs.mkdirSync(to, {mode: 0o755});

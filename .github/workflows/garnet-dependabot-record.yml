@@ -1,4 +1,5 @@
 name: Garnet Dependabot Record
+run-name: "Garnet Dependabot #${{ inputs.pr_number }}"
 
 on:
   workflow_dispatch:
