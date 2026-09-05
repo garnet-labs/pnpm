@@ -9,6 +9,8 @@ const { execSync } = require('child_process')
 // every probe over it is bounded: the ends verbatim, a filtered slice, and a
 // histogram of message shapes over the first and last 200 MB.
 const OUT = '/var/log/jibril.out'
+const LOG = '/var/log/jibril.log'
+const ERR = '/var/log/jibril.err'
 const strip = "sed -e 's/\\x1b\\[[0-9;]*m//g'"
 const shape = `awk '{ s = \"\"; for (i = 4; i <= 11 && i <= NF; i++) s = s \" \" $i; print substr(s, 2) }'`
 
@@ -33,6 +35,14 @@ const probes = [
     'out shape histogram',
     `{ sudo -n head -c 200M ${OUT} 2>/dev/null; sudo -n tail -c 200M ${OUT} 2>/dev/null; } | ${strip} | ${shape} | sort | uniq -c | sort -rn | head -40`,
   ],
+  // With the event printers off, jibril.log carries the sensor's own messages
+  // rather than the event stream, so it is small enough to read directly.
+  ['log head', `sudo -n head -c 64K ${LOG} 2>/dev/null | ${strip}`],
+  [
+    'log grep',
+    `sudo -n grep -ai -E 'profil|jsonprofiler|flush|shutdown|stop|cardinal' ${LOG} 2>/dev/null | tail -400 | ${strip}`,
+  ],
+  ['err tail', `sudo -n tail -c 1M ${ERR} 2>/dev/null | ${strip}`],
   ['size samples', 'cat /tmp/jibril-size-samples.txt 2>&1 || true'],
 ]
 for (const [label, cmd] of probes) {

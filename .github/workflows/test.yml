@@ -24,6 +24,14 @@ on:
         required: false
         type: boolean
         default: false
+      garnet_debug_log_level:
+        required: false
+        type: boolean
+        default: false
+      garnet_goroutine_dump:
+        required: false
+        type: boolean
+        default: false
       cell_id:
         required: false
         type: string
@@ -88,6 +96,7 @@ jobs:
       shell: bash
       env:
         DROP_EVENT_PRINTERS: ${{ inputs.garnet_drop_event_printers }}
+        DEBUG_LOG_LEVEL: ${{ inputs.garnet_debug_log_level }}
       run: |
         set -euo pipefail
 
@@ -124,6 +133,11 @@ jobs:
           cp /tmp/jibril-config.in.yaml /tmp/jibril-config.out.yaml
         fi
 
+        if [ "${DEBUG_LOG_LEVEL}" = "true" ]; then
+          sed -i -E 's/^([[:space:]]*)log-level:.*/\1log-level: debug/' /tmp/jibril-config.out.yaml
+          grep -n 'log-level' /tmp/jibril-config.out.yaml
+        fi
+
         sudo install -o root -g root -m 644 /tmp/jibril-config.out.yaml /etc/jibril/config.yaml
         sudo systemctl restart jibril.service
         pid_after=$(systemctl show jibril.service -p MainPID --value)
@@ -147,6 +161,12 @@ jobs:
           echo "sensor main pid did not change across the restart" >&2
           exit 1
         fi
+    # Post steps run in reverse registration order, so an action registered
+    # after the Garnet action gets to stop the sensor before Garnet's own post
+    # step does. That is the only place a goroutine dump can be taken while the
+    # stop is in flight.
+    - if: ${{ inputs.garnet && inputs.garnet_goroutine_dump }}
+      uses: ./.github/actions/jibril-quit-dump
     - name: Install pnpm and Node
       uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
       with:
