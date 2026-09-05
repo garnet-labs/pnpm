@@ -1,0 +1,39 @@
+name: Garnet Dependabot OIDC canary
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  verify-oidc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Garnet OIDC registration
+        uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c
+        env:
+          GARNET_PROFILE_JOB: dependabot-oidc-canary-${{ github.run_attempt }}
+        with:
+          jibril_version: v2.16.0
+      - name: Harmless trusted workload
+        run: |
+          set -euo pipefail
+          sudo systemctl is-active --quiet jibril.service
+          python3 -c 'import urllib.request; print(urllib.request.urlopen("https://pypi.org/pypi/pip/json", timeout=30).status)'
+          sleep 35
+      - name: Validate actual profile
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo systemctl stop jibril.service
+          sudo test -s /var/log/jibril.profile.json
+          sudo cp /var/log/jibril.profile.json "$RUNNER_TEMP/canary.profile.json"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/canary.profile.json"
+          python3 -c 'import json,os; p=json.load(open(os.environ["RUNNER_TEMP"]+"/canary.profile.json")); assert isinstance(p,dict) and p; print("Nonempty JSON profile present; keys:",list(p))'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: garnet-oidc-canary-profile
+          path: ${{ runner.temp }}/canary.profile.json
+          if-no-files-found: error
+          retention-days: 7
