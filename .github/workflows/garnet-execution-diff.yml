@@ -1,0 +1,101 @@
+name: Garnet Execution Diff
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .garnet/execution-diff/**
+      - .github/workflows/garnet-execution-diff.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-execution-diff-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  execution-diff:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, head]
+        rep: [1, 2, 3]
+    name: execution-diff (${{ matrix.side }}, ${{ matrix.rep }})
+    env:
+      EXPECTED_SHA: ${{ matrix.side == 'base' && github.event.pull_request.base.sha || github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side == 'base' && github.event.pull_request.base.sha || github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify executed commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
+
+      - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+        env:
+          GARNET_PROFILE_JOB: execution-diff/${{ matrix.side }}/${{ matrix.rep }}
+
+      - name: Run selected workload
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .garnet/execution-diff/package.json ]; then
+            npm install --prefix .garnet/execution-diff --no-package-lock
+            echo "WORKLOAD_PRESENT=true" >> "$GITHUB_ENV"
+          else
+            echo "workload fixture absent at $EXPECTED_SHA"
+            echo "WORKLOAD_PRESENT=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Record cell
+        shell: bash
+        env:
+          SIDE: ${{ matrix.side }}
+          REP: ${{ matrix.rep }}
+          PROFILE_JOB: execution-diff/${{ matrix.side }}/${{ matrix.rep }}
+          CELL_PATH: ${{ runner.temp }}/garnet-cell/cell.json
+        run: |
+          set -euo pipefail
+          cell_dir="$RUNNER_TEMP/garnet-cell"
+          mkdir -p "$cell_dir"
+          executed_sha=$(git rev-parse HEAD)
+          export EXECUTED_SHA="$executed_sha"
+          node -e '
+            const fs = require("node:fs")
+            const cell = {
+              side: process.env.SIDE,
+              rep: Number(process.env.REP),
+              profile_job: process.env.PROFILE_JOB,
+              expected_sha: process.env.EXPECTED_SHA,
+              executed_sha: process.env.EXECUTED_SHA,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+              job: process.env.GITHUB_JOB,
+              workload_present: process.env.WORKLOAD_PRESENT === "true",
+              runner_name: process.env.RUNNER_NAME,
+              runner_os: process.env.RUNNER_OS,
+              runner_arch: process.env.RUNNER_ARCH,
+              image_os: process.env.ImageOS || "",
+              image_version: process.env.ImageVersion || "",
+              workload: "npm install --prefix .garnet/execution-diff --no-package-lock",
+            }
+            fs.writeFileSync(process.env.CELL_PATH, JSON.stringify(cell, null, 2) + "\n")
+          '
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: garnet-execution-diff-${{ matrix.side }}-${{ matrix.rep }}
+          path: ${{ runner.temp }}/garnet-cell
+          retention-days: 14
