@@ -130,6 +130,8 @@ The repository's review framework lives in **[REVIEW_GUIDE.md](./REVIEW_GUIDE.md
 
 Security is the first review priority and performance the second. Surface only issues tied to the changed code, and explain the exploit path, impact, or hot path affected. See the guide's Security and Performance review sections for the full checklist.
 
+When reviewing a pull request, also apply **[REVIEW.md](./REVIEW.md)**: the PR description carries a `Runtime evidence (Garnet)` section (between `<!-- garnet:evidence:begin -->` and `<!-- garnet:evidence:end -->`) mirroring the head-SHA-bound, kernel-recorded execution profile of the instrumented CI run. Open the review with the one-line `**Runtime grounding** (head \`<sha7>\`): ...` verdict, use the record only when its `garnet:commit` marker equals the PR head (state stale/absent evidence explicitly otherwise), reconcile the recorded execution chains and outbound destinations with what the diff implies, label runtime-verified findings apart from static inference, and never repeat verdicts or safety judgments from the record itself.
+
 ## Code Reuse and Avoiding Duplication
 
 **Before writing new code, always analyze the existing codebase for similar functionality.** This is a large monorepo with many shared utilities — duplication is a real risk.
