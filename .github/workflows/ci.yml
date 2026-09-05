@@ -129,38 +129,17 @@ jobs:
     needs: [compile-and-lint, build-pnpr-linux]
     strategy:
       fail-fast: false
-      # Twenty heavy cells at once would swamp the runner pool and change the
-      # substrate the comparison runs on; eight keeps the waves comparable.
+      # Three cells fit in one wave, so every cell shares the same window.
       max-parallel: 8
       matrix:
-        # Test-branch only: a profile-loss comparison lane. Every ubuntu cell
-        # runs the identical heavy workload on the identical runner, Node and
-        # chunking under the same Garnet action ref (v2.3.0-rc.1); the only
-        # difference between cells is the jibril pin. Ten replicates per pin,
-        # interleaved so the two arms share the same time window and the same
-        # queueing behaviour.
+        # Test-branch only: the current-head arm of a branch-versus-day
+        # probe. Three cells on the control pin, same workload, runner, Node
+        # and action ref as the earlier lanes; the pin is held fixed so the
+        # only question is whether this tree still loses profiles today.
         include:
-          - platform_label: ubuntu rc9-01
-            cell_id: rc9-01
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
           - platform_label: ubuntu v2160-01
             cell_id: v2160-01
             garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-02
-            cell_id: rc9-02
-            garnet_jibril_version: v2.17.0-rc.9
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -176,143 +155,8 @@ jobs:
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu rc9-03
-            cell_id: rc9-03
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
           - platform_label: ubuntu v2160-03
             cell_id: v2160-03
-            garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-04
-            cell_id: rc9-04
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu v2160-04
-            cell_id: v2160-04
-            garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-05
-            cell_id: rc9-05
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu v2160-05
-            cell_id: v2160-05
-            garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-06
-            cell_id: rc9-06
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu v2160-06
-            cell_id: v2160-06
-            garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-07
-            cell_id: rc9-07
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu v2160-07
-            cell_id: v2160-07
-            garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-08
-            cell_id: rc9-08
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu v2160-08
-            cell_id: v2160-08
-            garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-09
-            cell_id: rc9-09
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu v2160-09
-            cell_id: v2160-09
-            garnet_jibril_version: v2.16.0
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu rc9-10
-            cell_id: rc9-10
-            garnet_jibril_version: v2.17.0-rc.9
-            node: '24.0.0'
-            node_major: '24'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            test_chunk: '1'
-            test_chunk_total: '1'
-            garnet: true
-          - platform_label: ubuntu v2160-10
-            cell_id: v2160-10
             garnet_jibril_version: v2.16.0
             node: '24.0.0'
             node_major: '24'
