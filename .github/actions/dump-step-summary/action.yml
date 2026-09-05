@@ -1,0 +1,6 @@
+name: Dump step summary
+description: Prints the raw GITHUB_STEP_SUMMARY bytes in its post step so summaries written by later actions' post steps are visible in the job log.
+runs:
+  using: node20
+  main: noop.js
+  post: dump.js
