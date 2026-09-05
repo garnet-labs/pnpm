@@ -56,7 +56,8 @@ jobs:
   recorded:
     name: cargo.enabled install (recorded)
     needs: build
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Same runner class as upstream Rust CI's Linux legs.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       # Everything the record should not contain happens before the Garnet
@@ -124,6 +125,15 @@ jobs:
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
           jibril_version: v2.17.0-rc.8
+          debug: true
+
+      - name: Let the sensor settle, then a canary
+        # The canary is a known destination from a known binary. If the canary
+        # appears in the record and the install does not, the sensor was
+        # running and the install genuinely reached nothing.
+        run: |
+          sleep 15
+          curl -sS -o /dev/null -w '%{http_code}\n' https://example.com
 
       - name: Cargo resolution and materialization (pnpm install)
         id: install
@@ -144,11 +154,23 @@ jobs:
           set -x
           cargo build --locked --offline
 
+      - name: Second pass with a cold cache
+        id: second
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/fixture
+        env:
+          PNPM_CONFIG_STORE_DIR: ${{ runner.temp }}/store2
+          PNPM_CONFIG_CACHE_DIR: ${{ runner.temp }}/cache2
+        run: |
+          set -x
+          rm -rf Cargo.lock .cargo .pnpm node_modules pnpm-lock.yaml target
+          "$RUNNER_TEMP/bin/pnpm" install
+
       - name: What was written
         if: always()
         working-directory: ${{ runner.temp }}/fixture
         run: |
-          echo "install exit: ${{ steps.install.outcome }}   compile exit: ${{ steps.compile.outcome }}"
+          echo "install: ${{ steps.install.outcome }}  compile: ${{ steps.compile.outcome }}  second: ${{ steps.second.outcome }}"
           echo "--- .cargo/config.toml"
           cat .cargo/config.toml 2>/dev/null || echo "(absent)"
           echo "--- Cargo.lock (first 40 lines)"
