@@ -57,7 +57,12 @@ fn handler<Reporter: self::Reporter + 'static>(force: bool, dir: &Path) -> miett
     // pnpm's single-executable branch always applies: install the CLI
     // globally and write the alias scripts.
     install_cli_globally::<Reporter>(&exec_path, &pnpm_home_dir, dir)?;
-    create_alias_scripts(&bin_dir).into_diagnostic().wrap_err("create the pnpm alias scripts")?;
+    {
+        let _global_bin_lock = super::global_bin_lock::acquire_global_bin_lock(&bin_dir)?;
+        create_alias_scripts(&bin_dir)
+            .into_diagnostic()
+            .wrap_err("create the pnpm alias scripts")?;
+    }
 
     let report = path_extender::add_dir_to_env_path(
         &pnpm_home_dir,
@@ -153,6 +158,7 @@ fn standalone_manifest(exec_name: &str) -> serde_json::Value {
         "version": PNPM_VERSION,
         "type": "module",
         "bin": { "pnpm": exec_name, "pn": exec_name },
+        "files": [exec_name, "dist/"],
     })
 }
 

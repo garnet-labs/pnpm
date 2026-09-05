@@ -2,7 +2,10 @@ use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::CommandTempCwd;
 use serde_json::json;
-use std::fs;
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 
 #[cfg(unix)]
 fn write_executable(path: &std::path::Path, body: &str) {
@@ -889,6 +892,89 @@ fn run_executes_every_script_matching_a_regexp_selector() {
     }
 }
 
+#[test]
+fn regexp_selected_scripts_run_concurrently_by_default() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("track-concurrency.js"),
+        r"const fs = require('fs')
+const [self, other] = process.argv.slice(2)
+const marker = `active-${self}`
+fs.writeFileSync(marker, '')
+const started = Date.now()
+const check = setInterval(() => {
+  if (fs.existsSync(`active-${other}`)) {
+    fs.writeFileSync('saw-parallel', '')
+    finish()
+  } else if (Date.now() - started > 1000) {
+    finish()
+  }
+}, 10)
+function finish () {
+  clearInterval(check)
+  fs.rmSync(marker, { force: true })
+  console.log(self)
+}
+",
+    )
+    .expect("write concurrency probe");
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "name": "test",
+            "version": "0.0.0",
+            "scripts": {
+                "dev:one": "node track-concurrency.js one two",
+                "dev:two": "node track-concurrency.js two one",
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let output = pacquet
+        .with_args(["--workspace-concurrency=2", "run", "/^dev:/"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(workspace.join("saw-parallel").exists(), "the selected scripts should overlap");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("STDOUT:\n{stdout}\n");
+    assert!(stdout.contains("dev:one: one"));
+    assert!(stdout.contains("dev:two: two"));
+
+    drop(root);
+}
+
+#[test]
+fn regexp_selected_scripts_cancel_siblings_after_failure() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "name": "test",
+            "version": "0.0.0",
+            "scripts": {
+                "dev:slow": r#"node -e "require('fs').writeFileSync('slow-started', ''); setTimeout(() => {}, 5000)""#,
+                "dev:fail": r#"node -e "const fs = require('fs'); const wait = () => fs.existsSync('slow-started') ? process.exit(1) : setTimeout(wait, 10); wait()""#,
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let start = Instant::now();
+    pacquet.with_args(["--workspace-concurrency=2", "run", "/^dev:/"]).assert().failure();
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "a failed script should cancel its in-flight sibling",
+    );
+
+    drop(root);
+}
+
 /// Flags on a selector say nothing about which scripts to pick, so pnpm
 /// rejects them instead of honouring a subset.
 #[cfg(unix)]
@@ -911,4 +997,137 @@ fn run_rejects_regexp_flags_in_a_selector() {
     );
 
     drop(root);
+}
+
+/// With `preferSymlinkedExecutables`, symlinked bins have no shim to
+/// carry a `NODE_PATH` block, so the config exports one pointing at
+/// the virtual store's hidden `node_modules` — pnpm's
+/// `pnpm run with preferSymlinkedExecutables true` test.
+#[test]
+#[cfg_attr(target_os = "windows", ignore = "preferSymlinkedExecutables is inert on Windows")]
+fn run_exports_node_path_when_prefer_symlinked_executables() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let marker_path = workspace.join("node-path.txt");
+    let manifest = json!({
+        "name": "test",
+        "version": "0.0.0",
+        "scripts": {
+            "build": format!(r#"sh -c 'printf %s "$NODE_PATH" > "{}"'"#, marker_path.display()),
+        },
+    })
+    .to_string();
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+    fs::write(workspace.join("pnpm-workspace.yaml"), "preferSymlinkedExecutables: true\n")
+        .expect("write pnpm-workspace.yaml");
+
+    pacquet.with_args(["run", "build"]).assert().success();
+    let node_path = fs::read_to_string(&marker_path).expect("read marker");
+    assert!(
+        node_path.contains("node_modules/.pnpm/node_modules"),
+        "NODE_PATH must point at the virtual store's hidden node_modules: {node_path:?}",
+    );
+
+    drop(root);
+}
+
+/// An explicit `virtualStoreDir` redirects the exported `NODE_PATH` —
+/// pnpm's `pnpm run with preferSymlinkedExecutables and custom
+/// virtualStoreDir` test.
+#[test]
+#[cfg_attr(target_os = "windows", ignore = "preferSymlinkedExecutables is inert on Windows")]
+fn run_exports_node_path_from_a_custom_virtual_store_dir() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let marker_path = workspace.join("node-path.txt");
+    let virtual_store_dir = workspace.join("foo/bar");
+    let manifest = json!({
+        "name": "test",
+        "version": "0.0.0",
+        "scripts": {
+            "build": format!(r#"sh -c 'printf %s "$NODE_PATH" > "{}"'"#, marker_path.display()),
+        },
+    })
+    .to_string();
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "virtualStoreDir: {}\npreferSymlinkedExecutables: true\n",
+            virtual_store_dir.display(),
+        ),
+    )
+    .expect("write pnpm-workspace.yaml");
+
+    pacquet.with_args(["run", "build"]).assert().success();
+    let node_path = fs::read_to_string(&marker_path).expect("read marker");
+    let expected = virtual_store_dir.join("node_modules");
+    assert!(
+        node_path.contains(&expected.display().to_string()),
+        "NODE_PATH must point inside the custom virtual store: {node_path:?}",
+    );
+
+    drop(root);
+}
+
+/// `shellEmulator` runs scripts in pacquet's own shell instead of the
+/// platform's, which is what makes a script written for `sh` portable to
+/// Windows. The tests prove the emulator took over by pointing
+/// `scriptShell` at a path that could never be spawned: the script still
+/// runs, and without the setting the same configuration fails.
+mod shell_emulator {
+    use assert_cmd::prelude::*;
+    use command_extra::CommandExtra;
+    use pnpm_testing_utils::bin::CommandTempCwd;
+    use serde_json::json;
+    use std::{fs, path::Path};
+
+    fn write_project(workspace: &Path, scripts: &serde_json::Value, shell_emulator: bool) {
+        let manifest =
+            json!({ "name": "test", "version": "0.0.0", "scripts": scripts }).to_string();
+        fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+        let unspawnable_shell = workspace.join("no-such-shell");
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            format!(
+                "scriptShell: {}\nshellEmulator: {shell_emulator}\n",
+                unspawnable_shell.display(),
+            ),
+        )
+        .expect("write pnpm-workspace.yaml");
+    }
+
+    #[test]
+    fn runs_the_script_without_the_configured_shell() {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        write_project(&workspace, &json!({ "build": "echo emulated > marker.txt" }), true);
+
+        pacquet.with_args(["run", "build"]).assert().success();
+
+        let marker =
+            fs::read_to_string(workspace.join("marker.txt")).expect("read the script's output");
+        assert_eq!(marker.trim(), "emulated");
+
+        drop(root);
+    }
+
+    #[test]
+    fn without_the_setting_the_same_project_cannot_spawn_its_shell() {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        write_project(&workspace, &json!({ "build": "echo emulated > marker.txt" }), false);
+
+        pacquet.with_args(["run", "build"]).assert().failure();
+        assert!(!workspace.join("marker.txt").exists(), "the script must not have run");
+
+        drop(root);
+    }
+
+    #[test]
+    fn propagates_a_failing_scripts_exit_code() {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        write_project(&workspace, &json!({ "fail": "exit 5" }), true);
+
+        let output = pacquet.with_args(["run", "fail"]).output().expect("spawn pacquet run");
+        assert_eq!(output.status.code(), Some(5), "the script's exit code must propagate");
+
+        drop(root);
+    }
 }

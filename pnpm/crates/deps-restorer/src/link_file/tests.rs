@@ -1,6 +1,7 @@
 use super::{
-    LINK_STATE_CLONE, LINK_STATE_HARDLINK, LinkFileError, auto_link, clone_or_copy_link,
-    is_call_error, is_cross_device, link_file,
+    AUTO_FIRST_TIER, LINK_STATE_CLONE, LINK_STATE_HARDLINK, LinkFileError, auto_link,
+    clone_or_copy_link, downgrade_auto_tier, is_call_error, is_cross_device, link_file,
+    next_auto_tier,
 };
 #[cfg(unix)]
 use super::{LINK_STATE_COPY, import_into_fresh_target};
@@ -138,6 +139,31 @@ fn eexist_does_not_widen_non_exec_mode() {
 
     let dst_mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
     assert_eq!(dst_mode, 0o600, "non-exec EEXIST target must not gain exec bits");
+}
+
+/// A dangling symlink squatting at an executable entry's path must
+/// keep failing the import: the syscall reports EEXIST for the dirent,
+/// the exec-bit re-assertion opens through the symlink and gets
+/// `NotFound`, and no concurrent writer will ever heal it — unlike a
+/// target that truly vanished, whose remover writes an equivalent file.
+#[test]
+#[cfg(unix)]
+fn eexist_recovery_rejects_a_dangling_symlink_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let src = write_source(tmp.path(), "1b59d9-exec", b"#!/usr/bin/env node\n");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+    let dst = tmp.path().join("dst");
+    std::os::unix::fs::symlink(tmp.path().join("missing-target"), &dst).unwrap();
+
+    import_into_fresh_target::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Hardlink,
+        &src,
+        &dst,
+    )
+    .expect_err("a dangling symlink at the target is corruption, not a concurrent writer");
 }
 
 /// Hardlinking in the same directory on the same filesystem works on
@@ -384,6 +410,75 @@ fn auto_respects_cached_copy_state() {
         "state=COPY must not hardlink",
     );
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY, "state must not drift");
+}
+
+/// The platform ladder itself: hardlink before clone on Linux, clone
+/// first everywhere else (`next_auto_tier` carries the why). Pinned so
+/// a refactor of the downgrade machinery can't quietly put Linux back
+/// on the reflink tier.
+#[test]
+fn auto_ladder_order_is_platform_specific() {
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(AUTO_FIRST_TIER, LINK_STATE_HARDLINK);
+        assert_eq!(next_auto_tier(LINK_STATE_HARDLINK), LINK_STATE_CLONE);
+        assert_eq!(next_auto_tier(LINK_STATE_CLONE), super::LINK_STATE_COPY);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(AUTO_FIRST_TIER, LINK_STATE_CLONE);
+        assert_eq!(next_auto_tier(LINK_STATE_CLONE), LINK_STATE_HARDLINK);
+        assert_eq!(next_auto_tier(LINK_STATE_HARDLINK), super::LINK_STATE_COPY);
+    }
+}
+
+/// The downgrade cache only steps forward from the exact tier that
+/// failed: a worker holding a stale view of the ladder must neither
+/// skip it ahead nor drag it back once another worker has advanced it.
+#[test]
+fn stale_downgrades_neither_skip_nor_regress() {
+    let state = AtomicU8::new(AUTO_FIRST_TIER);
+    let second = next_auto_tier(AUTO_FIRST_TIER);
+
+    // The first failure advances the ladder head to its successor.
+    downgrade_auto_tier(&state, AUTO_FIRST_TIER);
+    assert_eq!(state.load(Ordering::Relaxed), second);
+
+    // A racing worker that still saw the head reports the same failure:
+    // its exchange must lose rather than skip the ladder toward copy.
+    downgrade_auto_tier(&state, AUTO_FIRST_TIER);
+    assert_eq!(state.load(Ordering::Relaxed), second);
+
+    // Only the current tier failing moves the ladder again — and a
+    // last stale report from the head still cannot move it back.
+    downgrade_auto_tier(&state, second);
+    assert_eq!(state.load(Ordering::Relaxed), super::LINK_STATE_COPY);
+    downgrade_auto_tier(&state, AUTO_FIRST_TIER);
+    assert_eq!(state.load(Ordering::Relaxed), super::LINK_STATE_COPY);
+}
+
+/// A fresh `Auto` on Linux hardlinks: same-filesystem tempdir, no
+/// prior downgrades, and the observable is the shared inode — the
+/// exact on-disk shape an install's first file gets.
+#[test]
+#[cfg(target_os = "linux")]
+fn auto_fresh_state_hardlinks_on_linux() {
+    use std::os::unix::fs::MetadataExt;
+
+    let state = AtomicU8::new(AUTO_FIRST_TIER);
+    let tmp = tempdir().unwrap();
+    let src = write_source(tmp.path(), "src.txt", b"first-tier");
+    let dst = tmp.path().join("dst.txt");
+
+    auto_link::<SilentReporter>(&AtomicU8::new(0), &state, &src, &dst)
+        .expect("hardlink should succeed on same-FS tempdir");
+
+    assert_eq!(
+        fs::metadata(&src).unwrap().ino(),
+        fs::metadata(&dst).unwrap().ino(),
+        "a fresh Auto on Linux must land on the hardlink tier",
+    );
+    assert_eq!(state.load(Ordering::Relaxed), AUTO_FIRST_TIER, "success must not downgrade");
 }
 
 /// State=HARDLINK means Auto skips the reflink attempt and jumps

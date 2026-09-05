@@ -239,6 +239,20 @@ pub type PackageVersionGuardFuture<'a> = Pin<
     >,
 >;
 
+/// What the resolver does for a package whose every matching version the
+/// guard rejected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GuardExhaustionPolicy {
+    /// Fail the resolve. The guard states a hard requirement, so a request
+    /// that cannot meet it has no acceptable answer.
+    #[default]
+    Fail,
+    /// Resolve to the candidate the picker would have chosen with no guard
+    /// in place. The guard states a preference, and the caller is expected
+    /// to report the packages it could not move off.
+    AcceptRejected,
+}
+
 /// Optional resolver-time policy that can reject a concrete
 /// `name@version` candidate before it is committed to the lockfile.
 ///
@@ -248,10 +262,15 @@ pub type PackageVersionGuardFuture<'a> = Pin<
 /// don't multiply network traffic.
 pub trait PackageVersionGuard: Send + Sync + std::fmt::Debug {
     fn check<'a>(&'a self, name: &'a str, version: &'a str) -> PackageVersionGuardFuture<'a>;
+
+    /// What the resolver does for a request whose every matching version
+    /// [`Self::check`] rejected.
+    fn exhaustion_policy(&self) -> GuardExhaustionPolicy {
+        GuardExhaustionPolicy::Fail
+    }
 }
 
-/// Reload behavior the dispatcher passes per-resolve. A tri-state
-/// (`false | 'compatible' | 'latest'`).
+/// Reload behavior the dispatcher passes per-resolve.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateBehavior {
     /// Keep the lockfile-pinned version. The `false` state.
@@ -261,6 +280,8 @@ pub enum UpdateBehavior {
     Compatible,
     /// Bump to the latest. The `'latest'` state.
     Latest,
+    /// Refresh registry revisions without changing package versions.
+    Patches,
 }
 
 /// Previously-resolved entry from the lockfile, threaded so resolvers

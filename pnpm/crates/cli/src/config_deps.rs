@@ -10,15 +10,16 @@
 use crate::config_overrides::apply_store_dir_override;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use pnpm_catalogs_config::get_catalogs_from_workspace_manifest;
-use pnpm_config::{Config, Host, WorkspaceSettings};
+use pnpm_config::{Config, Host, PNPM_VERSION, WorkspaceSettings};
 use pnpm_env_installer::{
     ConfigDepsInstallOptions, pnpm_engine_packages, resolve_and_install_config_deps,
     resolve_package_manager_integrities,
 };
 use pnpm_graph_hasher::{detect_node_version, host_arch, host_libc, host_platform};
 use pnpm_hooks::{HookContext, LogFn, PnpmfileHooks, finder};
-use pnpm_network::{NetworkSettings, RetryOpts, ThrottledClient};
-use pnpm_reporter::{HookLog, LogEvent, LogLevel, Reporter};
+use pnpm_lockfile::EnvLockfile;
+use pnpm_network::{RetryOpts, ThrottledClient};
+use pnpm_reporter::{HookLog, LogEvent, LogLevel, PnpmLog, Reporter};
 use pnpm_resolving_npm_resolver::{
     InMemoryPackageMetaCache, NpmResolver, shared_packument_fetch_locker,
     shared_picked_manifest_cache,
@@ -63,7 +64,7 @@ pub async fn sync_package_manager_dependencies(
     pnpm_version: &str,
     frozen_lockfile: bool,
     force_resync: bool,
-) -> Result<()> {
+) -> Result<EnvLockfile> {
     sync_engine_dependencies(
         config,
         root_dir,
@@ -78,7 +79,8 @@ pub async fn sync_package_manager_dependencies(
 
 /// Resolve the packages a package manager is installed from into the env
 /// lockfile at `root_dir`, so its bytes are pinned by integrity before any
-/// of them are downloaded or executed.
+/// of them are downloaded or executed. Returns that env lockfile, which the
+/// engine installer reads the closure from.
 pub async fn sync_engine_dependencies(
     config: &Config,
     root_dir: &Path,
@@ -87,7 +89,7 @@ pub async fn sync_engine_dependencies(
     version: &str,
     frozen_lockfile: bool,
     force_resync: bool,
-) -> Result<()> {
+) -> Result<EnvLockfile> {
     let context = EnvInstallerContext::for_package_manager(config)?;
     let options = context.options(root_dir, frozen_lockfile);
     resolve_package_manager_integrities(
@@ -164,14 +166,17 @@ pub async fn resolve_engine_version(
         }
         None => None,
     };
-    let published_by_exclude = config
-        .minimum_release_age_exclude
-        .as_deref()
-        .filter(|patterns| !patterns.is_empty())
-        .map(pnpm_config::version_policy::create_package_version_policy)
-        .transpose()
-        .into_diagnostic()
-        .wrap_err("compile the minimum-release-age-exclude policy")?;
+    // The running version is already on this machine, so hiding it behind the
+    // maturity cutoff protects nothing — it only makes a dist-tag that points
+    // at it fall back to an older release, downgrading the user
+    // (pnpm/pnpm#13883).
+    let mut exclude_patterns = config.minimum_release_age_exclude.clone().unwrap_or_default();
+    exclude_patterns.push(format!("pnpm@{PNPM_VERSION}"));
+    let published_by_exclude =
+        pnpm_config::version_policy::create_package_version_policy(&exclude_patterns)
+            .into_diagnostic()
+            .wrap_err("compile the minimum-release-age-exclude policy")
+            .map(Some)?;
     let trust_policy = match config.trust_policy {
         pnpm_config::TrustPolicy::Off => None,
         pnpm_config::TrustPolicy::NoDowngrade => Some(pnpm_config::TrustPolicy::NoDowngrade),
@@ -263,6 +268,7 @@ async fn resolve_and_install<Reporter: self::Reporter>(
     frozen_lockfile: bool,
 ) -> Result<()> {
     let context = EnvInstallerContext::new(config)?;
+    context.http_client.set_warning_handler(pnpm_reporter::emit_global_warning::<Reporter>);
     let options = context.options(root_dir, frozen_lockfile);
 
     resolve_and_install_config_deps::<Reporter>(config_dependencies, &context.resolver, &options)
@@ -279,6 +285,7 @@ struct EnvInstallerContext {
     store_dir: &'static StoreDir,
     node_version: String,
     verify_store_integrity: bool,
+    strict_store_pkg_content_check: bool,
     offline: bool,
     package_import_method: pnpm_config::PackageImportMethod,
     resolver: NpmResolver<InMemoryPackageMetaCache>,
@@ -323,19 +330,10 @@ impl EnvInstallerContext {
         auth_headers: Arc<pnpm_network::AuthHeaders>,
     ) -> Result<Self> {
         let http_client = Arc::new(
-            ThrottledClient::for_installs(
-                proxy,
-                tls,
-                tls_by_uri,
-                &NetworkSettings {
-                    network_concurrency: config.network_concurrency,
-                    fetch_timeout: Duration::from_millis(config.fetch_timeout),
-                    user_agent: config.user_agent.clone(),
-                },
-            )
-            .into_diagnostic()
-            .wrap_err("create the network client for env-installer dependencies")?
-            .with_max_sockets_per_host(config.max_sockets),
+            ThrottledClient::for_installs(proxy, tls, tls_by_uri, &config.network_settings())
+                .into_diagnostic()
+                .wrap_err("create the network client for env-installer dependencies")?
+                .with_max_sockets_per_host(config.max_sockets),
         );
 
         let registries: HashMap<String, String> = registries.into_iter().collect();
@@ -377,6 +375,7 @@ impl EnvInstallerContext {
             store_dir: Box::leak(Box::new(config.store_dir.clone())),
             node_version: detect_node_version().unwrap_or_else(|| "0.0.0".to_string()),
             verify_store_integrity: config.verify_store_integrity,
+            strict_store_pkg_content_check: config.strict_store_pkg_content_check,
             offline: config.offline,
             package_import_method: config.package_import_method,
             resolver,
@@ -395,6 +394,7 @@ impl EnvInstallerContext {
             auth_headers: &self.auth_headers,
             registries: &self.registries,
             verify_store_integrity: self.verify_store_integrity,
+            strict_store_pkg_content_check: self.strict_store_pkg_content_check,
             offline: self.offline,
             package_import_method: self.package_import_method,
             retry_opts: self.retry_opts,
@@ -408,30 +408,20 @@ impl EnvInstallerContext {
     }
 }
 
-/// Run the `updateConfig` pnpmfile hooks contributed by config-dependency
-/// plugins (and the project's own pnpmfile), applying their result to
-/// `config`. Plugin pnpmfiles run before the project pnpmfile, each
-/// transforming the config object in turn.
-///
-/// Config round-trips through [`WorkspaceSettings`], so any settings key
-/// a hook changes is applied back the same way `pnpm-workspace.yaml` is.
-/// Only the keys a hook actually changed are applied, so values resolved
-/// from `.npmrc` / CLI flags that the hooks leave untouched are not
-/// clobbered. The `catalog:`/`catalogs:` blocks — which pacquet models
-/// outside `WorkspaceSettings` — are seeded into the hook input and, when
-/// a hook changes them, captured into [`Config::catalogs`] for the install
-/// to use.
 /// The pnpmfile paths that contribute hooks for `root_dir`, in
 /// application order: config-dependency plugin pnpmfiles (lexical
 /// order) first, then the workspace-root `.pnpmfile.{cjs,mjs}`. Shared
 /// by the `updateConfig` install hook and the `beforePacking`
 /// pack/publish hook so both apply the same pnpmfile set, matching
 /// pnpm's single loaded hooks object.
-#[must_use]
-pub fn resolve_pnpmfile_paths(config: &Config, root_dir: &Path) -> Vec<PathBuf> {
+pub fn resolve_pnpmfile_paths(
+    config: &Config,
+    root_dir: &Path,
+) -> Result<Vec<PathBuf>, finder::MissingPnpmfileError> {
     if config.ignore_pnpmfile {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    finder::validate_configured_pnpmfiles(pnpm_package_manager::pnpmfile_selection(config))?;
     let config_modules_dir = root_dir.join("node_modules").join(".pnpm-config");
     let mut pnpmfiles: Vec<PathBuf> = match config.config_dependencies.as_ref() {
         Some(deps) => finder::calc_pnpmfile_paths_of_plugin_deps(
@@ -440,10 +430,14 @@ pub fn resolve_pnpmfile_paths(config: &Config, root_dir: &Path) -> Vec<PathBuf> 
         ),
         None => Vec::new(),
     };
-    if let Some(root_pnpmfile) = finder::find_pnpmfile(root_dir) {
-        pnpmfiles.push(root_pnpmfile);
+    for pnpmfile in
+        finder::find_pnpmfiles(root_dir, pnpm_package_manager::pnpmfile_selection(config))
+    {
+        if !pnpmfiles.contains(&pnpmfile) {
+            pnpmfiles.push(pnpmfile);
+        }
     }
-    pnpmfiles
+    Ok(pnpmfiles)
 }
 
 /// Load the pnpmfiles that contribute a `beforePacking` hook for
@@ -451,18 +445,58 @@ pub fn resolve_pnpmfile_paths(config: &Config, root_dir: &Path) -> Vec<PathBuf> 
 /// hook handle per pnpmfile. A recursive pack loads them once and clones
 /// the `Arc`s into each project so a pnpmfile's Node worker is spawned
 /// once, not once per packed project.
-#[must_use]
-pub fn load_before_packing_hooks(config: &Config, root_dir: &Path) -> Vec<Arc<dyn PnpmfileHooks>> {
-    resolve_pnpmfile_paths(config, root_dir).into_iter().map(finder::load_pnpmfile_at).collect()
+pub fn load_before_packing_hooks(
+    config: &Config,
+    root_dir: &Path,
+) -> Result<Vec<Arc<dyn PnpmfileHooks>>, finder::MissingPnpmfileError> {
+    Ok(resolve_pnpmfile_paths(config, root_dir)?
+        .into_iter()
+        .map(finder::load_pnpmfile_at)
+        .collect())
 }
 
+/// Install the project's `configDependencies` and apply the `updateConfig`
+/// pnpmfile hooks to `config`, returning the loaded hook objects. `dir` is
+/// the command's working directory; the config root is derived from it the
+/// same way the install family derives it.
+///
+/// The entry point for commands outside the install family, each of which
+/// resolves its own [`Config`]: pnpm applies `updateConfig` once per
+/// invocation, before the command runs, so a hook's settings — including
+/// `extraEnv` and `extraBinPaths` — reach every command's child processes.
+pub async fn prepare_config<Reporter: self::Reporter>(
+    config: &mut Config,
+    dir: &Path,
+) -> Result<Vec<Arc<dyn PnpmfileHooks>>> {
+    let config_root = config.root_project_manifest_dir(dir).to_path_buf();
+    install_config_deps::<Reporter>(config, &config_root, config.frozen_lockfile.unwrap_or(false))
+        .await?;
+    run_update_config_hooks::<Reporter>(config, &config_root).await
+}
+
+/// Run the `updateConfig` pnpmfile hooks contributed by config-dependency
+/// plugins and the project's own pnpmfile, applying their result to `config`.
+/// The returned handles are the same loaded hook objects that ran
+/// `updateConfig`, so packing can retain the original hook set when the hook
+/// changes a hook-selection setting such as `ignorePnpmfile`.
+///
+/// Config round-trips through [`WorkspaceSettings`], so any settings key a
+/// hook changes is applied back the same way `pnpm-workspace.yaml` is. Only
+/// the keys a hook actually changed are applied, so values resolved from
+/// `.npmrc` or CLI flags that the hooks leave untouched are not clobbered.
+/// The `catalog:`/`catalogs:` blocks — which pacquet models outside
+/// `WorkspaceSettings` — are seeded into the hook input and, when changed,
+/// captured into [`Config::catalogs`] for install and packing commands.
 pub async fn run_update_config_hooks<Reporter: self::Reporter>(
     config: &mut Config,
     root_dir: &Path,
-) -> Result<()> {
-    let pnpmfiles = resolve_pnpmfile_paths(config, root_dir);
+) -> Result<Vec<Arc<dyn PnpmfileHooks>>> {
+    let pnpmfiles = resolve_pnpmfile_paths(config, root_dir)
+        .map_err(|error| miette::miette!(code = "ERR_PNPM_PNPMFILE_NOT_FOUND", "{error}"))?;
+    let hooks: Vec<Arc<dyn PnpmfileHooks>> =
+        pnpmfiles.iter().cloned().map(finder::load_pnpmfile_at).collect();
     if pnpmfiles.is_empty() {
-        return Ok(());
+        return Ok(hooks);
     }
 
     let (base_dir, settings) = match WorkspaceSettings::find_and_load(root_dir).into_diagnostic()? {
@@ -507,16 +541,23 @@ pub async fn run_update_config_hooks<Reporter: self::Reporter>(
 
     let prefix = root_dir.to_string_lossy().into_owned();
     let mut current = input.clone();
-    for pnpmfile in &pnpmfiles {
-        let hooks = finder::load_pnpmfile_at(pnpmfile.clone());
+    let mut has_filter_log = false;
+    for (pnpmfile, hook) in pnpmfiles.iter().zip(&hooks) {
         let ctx = HookContext { log: hook_logger::<Reporter>(pnpmfile, &prefix), dir: None };
-        current = hooks
+        current = hook
             .update_config(current, ctx)
             .await
             .map_err(|err| miette::miette!("{err}"))
-            .wrap_err_with(|| {
-            format!("running updateConfig hook from {}", pnpmfile.display())
-        })?;
+            .wrap_err_with(|| format!("running updateConfig hook from {}", pnpmfile.display()))?;
+        has_filter_log |= hook.has_filter_log().await;
+    }
+    if has_filter_log {
+        Reporter::emit(&LogEvent::Pnpm(PnpmLog {
+            level: LogLevel::Warn,
+            message: "The pnpmfile filterLog hook is deprecated and is not supported by pnpm v12. Remove it from the pnpmfile."
+                .to_string(),
+            prefix: prefix.clone(),
+        }));
     }
 
     // Adopt the hook output's catalogs wholesale into `Config::catalogs`
@@ -541,7 +582,7 @@ pub async fn run_update_config_hooks<Reporter: self::Reporter>(
 
     let delta = config_delta(&input, &current);
     if delta.as_object().is_none_or(serde_json::Map::is_empty) {
-        return Ok(());
+        return Ok(hooks);
     }
     let changed_store_dir = delta.get("storeDir").and_then(Value::as_str).map(str::to_owned);
     let changed_prefer_frozen_lockfile = delta.get("preferFrozenLockfile").cloned();
@@ -602,7 +643,7 @@ pub async fn run_update_config_hooks<Reporter: self::Reporter>(
             global_virtual_store_dir_explicit,
         );
     }
-    Ok(())
+    Ok(hooks)
 }
 
 /// The keys whose value the hooks changed between the serialized input

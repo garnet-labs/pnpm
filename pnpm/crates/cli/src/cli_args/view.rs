@@ -6,7 +6,7 @@
 //! field arguments, only those fields are printed; otherwise a formatted
 //! summary (or, with `--json`, the whole assembled info object) is shown.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use clap::Args;
@@ -14,7 +14,7 @@ use derive_more::{Display, Error};
 use miette::{Context, Diagnostic, IntoDiagnostic};
 use owo_colors::{OwoColorize, Stream, Style};
 use pnpm_config::Config;
-use pnpm_network::{NetworkSettings, RetryOpts, ThrottledClient};
+use pnpm_network::{RetryOpts, ThrottledClient};
 use pnpm_resolving_npm_resolver::{
     FetchFullMetadataOptions, FetchFullMetadataOutcome, PickPackageFromMetaOptions,
     fetch_full_metadata, parse_bare_specifier, pick_package_from_meta, pick_registry_for_package,
@@ -93,7 +93,9 @@ impl ViewArgs {
         };
         let fields = self.params.get(1..).unwrap_or(&[]);
 
-        let info = fetch_package_info(config, self.registry.as_deref(), &package_spec).await?;
+        let (meta, picked) =
+            fetch_package_metadata(config, self.registry.as_deref(), &package_spec, "view").await?;
+        let info = assemble_info(&meta, &picked);
 
         if !fields.is_empty() {
             return Ok(render_fields(&info, fields, self.json));
@@ -148,16 +150,14 @@ fn invalid_manifest(dir: &Path) -> ViewError {
     }
 }
 
-/// Fetch and assemble the registry info object for `package_spec`: parse the
-/// spec (rejecting non-registry protocols), fetch full metadata, pick the
-/// version satisfying the spec, then extend that version's manifest with the
-/// packument-level `versions`, `dist-tags`, and `time` fields the renderers
-/// read.
-async fn fetch_package_info(
+/// Fetch the registry packument for `package_spec` and select the version that
+/// satisfies the spec. The caller decides how much of the result to assemble.
+pub(super) async fn fetch_package_metadata(
     config: &Config,
     registry_override: Option<&str>,
     package_spec: &str,
-) -> miette::Result<Value> {
+    command_name: &str,
+) -> miette::Result<(pnpm_registry::Package, Arc<pnpm_registry::PackageVersion>)> {
     let parsed = parse_wanted_dependency(package_spec);
     let alias = parsed.alias.as_deref();
     let bare = parsed.bare_specifier.as_deref().unwrap_or("latest");
@@ -177,15 +177,10 @@ async fn fetch_package_info(
         &config.proxy,
         &config.tls,
         &config.tls_by_uri,
-        &NetworkSettings {
-            network_concurrency: config.network_concurrency,
-            fetch_timeout: std::time::Duration::from_millis(config.fetch_timeout),
-            user_agent: config.user_agent.clone(),
-        },
+        &config.network_settings(),
     )
     .into_diagnostic()
-    .wrap_err("create the network client for view")?;
-
+    .wrap_err_with(|| format!("create the network client for {command_name}"))?;
     let outcome = fetch_full_metadata(
         &spec.name,
         &FetchFullMetadataOptions {
@@ -219,7 +214,7 @@ async fn fetch_package_info(
         spec: spec.fetch_spec.clone(),
     })?;
 
-    Ok(assemble_info(&meta, &picked))
+    Ok((meta, picked))
 }
 
 /// Build the info object the renderers consume from the picked version's

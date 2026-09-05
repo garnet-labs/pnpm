@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use super::{
     Arc, Catalogs, Config, DependencyGroup, Diagnostic, Display, Error, InstallError,
     InstallWithFreshLockfileError, Lockfile, PackageManifest, Path, PathBuf, PnpmfileChecksumCheck,
@@ -55,8 +57,17 @@ pub async fn wanted_lockfile_satisfies_workspace(
     let Ok(workspace_dir_opt) = configured_or_discovered_workspace_dir(config, manifest_dir) else {
         return false;
     };
-    let workspace_root = workspace_dir_opt.unwrap_or_else(|| manifest_dir.to_path_buf());
-    if !config.ignore_pnpmfile && pnpm_hooks::finder::find_pnpmfile(&workspace_root).is_some() {
+    let workspace_root = workspace_dir_opt.clone().unwrap_or_else(|| manifest_dir.to_path_buf());
+    // The importer ids below name projects relative to the directory the
+    // lockfile sits in, which `lockfileDir` can move away from the
+    // workspace root — deriving them from the workspace instead would
+    // classify every importer the lockfile records as missing.
+    let lockfile_root =
+        super::lockfile_root_for(config, workspace_dir_opt.as_deref(), manifest_dir);
+    if !config.ignore_pnpmfile
+        && !pnpm_hooks::finder::find_pnpmfiles(&workspace_root, crate::pnpmfile_selection(config))
+            .is_empty()
+    {
         return false;
     }
     let Ok(workspace_manifest) = pnpm_workspace::read_workspace_manifest(&workspace_root) else {
@@ -67,12 +78,11 @@ pub async fn wanted_lockfile_satisfies_workspace(
     else {
         return false;
     };
-    let project_manifests =
-        build_project_manifests_list(&workspace_root, manifest, workspace_projects.as_deref());
+    let project_manifests = build_project_manifests_list(manifest, workspace_projects.as_deref());
     let manifest_freshness_inputs: Vec<(String, &PackageManifest)> = project_manifests
         .iter()
         .map(|(project_dir, manifest)| {
-            (pnpm_workspace::importer_id_from_root_dir(&workspace_root, project_dir), *manifest)
+            (pnpm_workspace::importer_id_from_root_dir(&lockfile_root, project_dir), *manifest)
         })
         .collect();
     check_lockfile_freshness(
@@ -182,10 +192,12 @@ pub(super) fn removed_importer_id<'a>(
     lockfile: &'a Lockfile,
     manifest_freshness_inputs: &[(String, &PackageManifest)],
 ) -> Option<&'a str> {
+    let manifest_ids: std::collections::HashSet<&str> =
+        manifest_freshness_inputs.iter().map(|(id, _)| id.as_str()).collect();
     lockfile
         .importers
         .keys()
-        .find(|importer_id| !manifest_freshness_inputs.iter().any(|(id, _)| id == *importer_id))
+        .find(|importer_id| !manifest_ids.contains(importer_id.as_str()))
         .map(String::as_str)
 }
 
@@ -263,21 +275,31 @@ pub(super) async fn check_lockfile_freshness(
     let ignored_optional_matcher = pnpm_config::matcher::create_matcher(
         config.ignored_optional_dependencies.as_deref().unwrap_or_default(),
     );
-    for (importer_id, manifest) in manifest_freshness_inputs {
-        if allow_missing_dependency_free_importers
-            && !lockfile.importers.contains_key(importer_id)
-            && !manifest_has_effective_dependencies(manifest, &ignored_optional_matcher)
-        {
-            continue;
-        }
-        check_importer_satisfies(
-            lockfile,
-            manifest,
-            importer_id,
-            config,
-            &ignored_optional_matcher,
-            parsed_overrides_opt.as_deref(),
-        )?;
+    // Each importer's check reads only shared references, so a
+    // workspace-scale importer list fans out across the rayon pool; the
+    // serial fold keeps the first error in importer order, like the
+    // loop it replaces.
+    let results: Vec<Result<(), FreshnessCheckError>> = manifest_freshness_inputs
+        .par_iter()
+        .map(|(importer_id, manifest)| {
+            if allow_missing_dependency_free_importers
+                && !lockfile.importers.contains_key(importer_id)
+                && !manifest_has_effective_dependencies(manifest, &ignored_optional_matcher)
+            {
+                return Ok(());
+            }
+            check_importer_satisfies(
+                lockfile,
+                manifest,
+                importer_id,
+                config,
+                &ignored_optional_matcher,
+                parsed_overrides_opt.as_deref(),
+            )
+        })
+        .collect();
+    for result in results {
+        result?;
     }
     Ok(())
 }

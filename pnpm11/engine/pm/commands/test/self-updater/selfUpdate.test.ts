@@ -556,6 +556,36 @@ test('global self-update respects minimumReleaseAge: skips immature latest, no-o
   expect(fs.readdirSync(opts.globalPkgDir).sort()).toStrictEqual(globalEntriesBefore)
 })
 
+test('self-update by dist-tag does not downgrade below the active version', async () => {
+  // Reproduces pnpm/pnpm#13883: `next-9` points at the version already
+  // running, but it is younger than minimumReleaseAge, so the maturity
+  // filter moved the tag back to the previous mature release and switched
+  // the user to it.
+  mockPackageManager.version = '9.1.0'
+  const opts = prepare()
+  seedGlobalPnpm(opts, '9.1.0')
+  const globalEntriesBefore = fs.readdirSync(opts.globalPkgDir).sort()
+  const now = Date.now()
+  const metadata = {
+    ...createMetadata('9.1.0', opts.registriesByScope.default, ['9.0.0'], {
+      '9.0.0': new Date(now - 48 * 60 * 60 * 1000).toISOString(),
+      '9.1.0': new Date(now - 8 * 60 * 60 * 1000).toISOString(),
+    }),
+    'dist-tags': { latest: '9.0.0', 'next-9': '9.1.0' },
+  }
+  getMockAgent().get(opts.registriesByScope.default.replace(/\/$/, ''))
+    .intercept({ path: '/pnpm', method: 'GET' })
+    .reply(200, metadata)
+
+  const output = await selfUpdate.handler({
+    ...opts,
+    minimumReleaseAge: 24 * 60,
+  }, ['next-9'])
+
+  expect(output).toBe('The currently active pnpm v9.1.0 is already "next-9" and doesn\'t need an update')
+  expect(fs.readdirSync(opts.globalPkgDir).sort()).toStrictEqual(globalEntriesBefore)
+})
+
 test('self-update respects minimumReleaseAgeExclude for implicit latest resolution', async () => {
   const opts = prepare({
     packageManager: 'pnpm@8.0.0',
@@ -874,7 +904,37 @@ test('should update pnpm entry in devEngines.packageManager array', async () => 
   expect(pkgJson.packageManager).toBeUndefined()
 })
 
-test('should not modify devEngines.packageManager range when resolved version still satisfies it', async () => {
+test.each([
+  ['^8.0.0', '8.5.0', '^8.5.0'],
+  ['~8.0.0', '8.0.5', '~8.0.5'],
+])('should bump devEngines.packageManager range %s when the resolved version still satisfies it', async (currentRange, resolvedVersion, expectedRange) => {
+  const opts = prepare({
+    devEngines: {
+      packageManager: { name: 'pnpm', version: currentRange },
+    },
+  })
+  const pkgJsonPath = path.join(opts.dir, 'package.json')
+  getMockAgent().get(opts.registriesByScope.default.replace(/\/$/, ''))
+    .intercept({ path: '/pnpm', method: 'GET' })
+    .reply(200, createMetadata(resolvedVersion, opts.registriesByScope.default)).persist()
+  mockExeMetadata(opts.registriesByScope.default, resolvedVersion)
+
+  const output = await selfUpdate.handler({
+    ...opts,
+    wantedPackageManager: {
+      name: 'pnpm',
+      version: currentRange,
+    },
+  }, [])
+
+  expect(output).toBe(`The current project has been updated to use pnpm v${resolvedVersion}`)
+  const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'))
+  expect(pkgJson.devEngines.packageManager.version).toBe(expectedRange)
+  const lockfile = fs.readFileSync(path.join(opts.dir, 'pnpm-lock.yaml'), 'utf8')
+  expect(lockfile).toContain(resolvedVersion)
+})
+
+test('should not modify complex devEngines.packageManager range when resolved version still satisfies it', async () => {
   const opts = prepare({
     devEngines: {
       packageManager: { name: 'pnpm', version: '>=8.0.0' },
@@ -1358,11 +1418,9 @@ describe('linkExePlatformBinary', () => {
     expect(result).toBe(fakeBinaryContent)
   })
 
-  test('links the pnpm v12 wrapper from its @pnpm/exe.<target> dependency', () => {
+  test('pnpm 11 version-store linking runs the pnpm v12 wrapper after installing its native binary', async () => {
     const dir = tempDir(false)
 
-    // pnpm v12 (the Rust port) is published as the unscoped `pnpm` wrapper that
-    // depends on `@pnpm/exe.<platform>-<arch>[-musl]` — the `exe.<...>` scheme.
     const nextPkgName = exePlatformPkgDirNameNext(platform, arch, libcFamily)
     const wrapperDir = path.join(dir, 'node_modules', 'pnpm')
     const platformDir = path.join(dir, 'node_modules', '@pnpm', nextPkgName)
@@ -1370,18 +1428,32 @@ describe('linkExePlatformBinary', () => {
     fs.mkdirSync(wrapperDir, { recursive: true })
     fs.mkdirSync(platformDir, { recursive: true })
 
-    fs.writeFileSync(path.join(wrapperDir, executable), 'This is a placeholder.')
+    fs.copyFileSync(
+      path.resolve(import.meta.dirname, '../../../../../..', 'pnpm/npm/pnpm/pnpm'),
+      path.join(wrapperDir, 'pnpm')
+    )
     fs.writeFileSync(path.join(wrapperDir, 'package.json'), JSON.stringify({
+      name: 'pnpm',
+      version: '12.99.0',
       bin: { pnpm: 'pnpm', pn: 'pn', pnpx: 'pnpx', pnx: 'pnx' },
     }))
 
-    const fakeBinaryContent = '#!/bin/sh\necho "fake pnpm v12 binary"'
-    fs.writeFileSync(path.join(platformDir, executable), fakeBinaryContent)
+    const nativeBinary = path.join(platformDir, executable)
+    if (platform === 'win32') {
+      fs.copyFileSync(process.execPath, nativeBinary)
+    } else {
+      fs.writeFileSync(nativeBinary, '#!/bin/sh\necho "fake pnpm v12 binary"\n', { mode: 0o755 })
+    }
+
+    const binDir = path.join(dir, 'bin')
+    await linkBins(path.join(dir, 'node_modules'), binDir, { warn: () => {} })
 
     linkExePlatformBinary(dir, 'pnpm')
+    await linkBins(path.join(dir, 'node_modules'), binDir, { warn: () => {} })
 
-    const result = fs.readFileSync(path.join(wrapperDir, executable), 'utf8')
-    expect(result).toBe(fakeBinaryContent)
+    const result = spawn.sync(path.join(binDir, 'pnpm'), ['--version'], { encoding: 'utf8' })
+    expect(result.status).toBe(0)
+    expect(result.stdout.trim()).toBe(platform === 'win32' ? process.version : 'fake pnpm v12 binary')
   })
 
   test.each([

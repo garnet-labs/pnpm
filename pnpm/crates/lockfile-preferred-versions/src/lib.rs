@@ -5,14 +5,15 @@
 //! entry, and an entry that appears in both buckets has its weight bumped
 //! by the lockfile weight so it outranks single-source matches.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use pnpm_lockfile::{PackageKey, PkgName, SnapshotEntry};
+use pnpm_lockfile::{PackageKey, SnapshotEntry};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_resolving_resolver_base::{
     DIRECT_DEP_SELECTOR_WEIGHT, EXISTING_VERSION_SELECTOR_WEIGHT, PreferredVersions,
     VersionSelectorEntry, VersionSelectorType, VersionSelectorWithWeight,
 };
+use rayon::prelude::*;
 
 mod version_selector_type;
 
@@ -29,40 +30,51 @@ pub fn get_preferred_versions_from_lockfile_and_manifests(
     snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
     manifests: &[&PackageManifest],
 ) -> PreferredVersions {
-    get_preferred_versions_from_lockfile_and_manifests_excluding(
-        snapshots,
-        manifests,
-        &HashSet::new(),
-    )
+    get_preferred_versions_from_lockfile_and_manifests_excluding(snapshots, manifests, &|_| false)
 }
 
-/// Build a [`PreferredVersions`] map while withholding lockfile pins for
-/// `excluded_names`. Manifest-derived preferences remain workspace-wide.
+/// Build a [`PreferredVersions`] map while withholding every lockfile pin
+/// `withheld` accepts. Manifest-derived preferences remain workspace-wide.
 #[must_use]
 pub fn get_preferred_versions_from_lockfile_and_manifests_excluding(
     snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
     manifests: &[&PackageManifest],
-    excluded_names: &HashSet<PkgName>,
+    withheld: &dyn Fn(&PackageKey) -> bool,
 ) -> PreferredVersions {
-    let mut preferred: PreferredVersions = PreferredVersions::new();
-    for manifest in manifests {
-        for (name, spec) in manifest.dependencies([
-            DependencyGroup::Dev,
-            DependencyGroup::Prod,
-            DependencyGroup::Optional,
-        ]) {
-            let Some(selector_type) = get_version_selector_type(spec) else { continue };
-            preferred.entry(name.to_string()).or_default().insert(
-                spec.to_string(),
-                VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
-                    selector_type,
-                    weight: DIRECT_DEP_SELECTOR_WEIGHT,
-                }),
-            );
-        }
-    }
+    // Each manifest's selector classification (semver parses, mostly)
+    // is independent, so a workspace-scale manifest list fans out
+    // across the rayon pool. Every entry is a pure function of its
+    // `(name, spec)` pair — same selector type, same weight — so the
+    // reduce's merge order is immaterial: colliding inserts write the
+    // same value the serial loop would.
+    let mut preferred: PreferredVersions = manifests
+        .par_iter()
+        .map(|manifest| {
+            let mut preferred = PreferredVersions::new();
+            for (name, spec) in manifest.dependencies([
+                DependencyGroup::Dev,
+                DependencyGroup::Prod,
+                DependencyGroup::Optional,
+            ]) {
+                let Some(selector_type) = get_version_selector_type(spec) else { continue };
+                preferred.entry(name.to_string()).or_default().insert(
+                    spec.to_string(),
+                    VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+                        selector_type,
+                        weight: DIRECT_DEP_SELECTOR_WEIGHT,
+                    }),
+                );
+            }
+            preferred
+        })
+        .reduce(PreferredVersions::new, |mut merged, next| {
+            for (name, selectors) in next {
+                merged.entry(name).or_default().extend(selectors);
+            }
+            merged
+        });
     if let Some(snapshots) = snapshots {
-        add_preferred_versions_from_lockfile(snapshots, excluded_names, &mut preferred);
+        add_preferred_versions_from_lockfile(snapshots, withheld, &mut preferred);
     }
     preferred
 }
@@ -72,13 +84,13 @@ pub fn get_preferred_versions_from_lockfile_and_manifests_excluding(
 /// rather than overwriting them.
 fn add_preferred_versions_from_lockfile(
     snapshots: &HashMap<PackageKey, SnapshotEntry>,
-    excluded_names: &HashSet<PkgName>,
+    withheld: &dyn Fn(&PackageKey) -> bool,
     preferred: &mut PreferredVersions,
 ) {
     let mut unique_name_versions: HashMap<String, std::collections::HashSet<String>> =
         HashMap::new();
     for key in snapshots.keys() {
-        if excluded_names.contains(&key.name) {
+        if withheld(key) {
             continue;
         }
         let name = key.name.to_string();

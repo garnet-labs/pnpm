@@ -14,7 +14,7 @@ use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::LogLevel;
 use pnpm_resolving_deps_resolver::{
-    DependencyOverrider, ManifestHook, ResolveImporterError, ResolveImporterOptions,
+    DependencyOverrider, ManifestHook, ResolveImporterError, ResolveImporterOptions, UpdateTargets,
 };
 use pnpm_resolving_resolver_base::{PreferredVersions, ResolveOptions, Resolver};
 use std::{
@@ -59,10 +59,12 @@ pub(super) fn preferred_versions_seeds(
     let mut workspace_seed = match update_seed_policy {
         UpdateSeedPolicy::KeepAll
         | UpdateSeedPolicy::KeepAllResolveAll
+        | UpdateSeedPolicy::FixLockfile
+        | UpdateSeedPolicy::RefreshRevisions
         | UpdateSeedPolicy::ByImporter { .. } => from_lockfile(snapshots, manifests.as_slice()),
         UpdateSeedPolicy::DropAll { .. } => from_lockfile(None, manifests.as_slice()),
-        UpdateSeedPolicy::DropOnly { names, .. } => {
-            from_lockfile_excluding(snapshots, manifests.as_slice(), &excluded_names(names))
+        UpdateSeedPolicy::DropOnly { targets, .. } => {
+            from_lockfile_excluding(snapshots, manifests.as_slice(), &withheld_pin(targets))
         }
     };
 
@@ -86,22 +88,20 @@ pub(super) fn preferred_versions_seeds(
                         Arc::new(seed)
                     }))
                 }
-                ImporterUpdateSeedPolicy::DropOnly(names) => {
-                    let mut cache_key = names.iter().cloned().collect::<Vec<_>>();
-                    cache_key.sort_unstable();
-                    if let Some(seed) = drop_only_seeds.get(&cache_key) {
+                ImporterUpdateSeedPolicy::DropOnly(targets) => {
+                    if let Some(seed) = drop_only_seeds.get(targets) {
                         Arc::clone(seed)
                     } else {
                         let seed = Arc::new({
                             let mut seed = from_lockfile_excluding(
                                 snapshots,
                                 manifests.as_slice(),
-                                &excluded_names(names),
+                                &withheld_pin(targets),
                             );
                             merge_preferred_versions(&mut seed, overrides);
                             seed
                         });
-                        drop_only_seeds.insert(cache_key, Arc::clone(&seed));
+                        drop_only_seeds.insert(targets.clone(), Arc::clone(&seed));
                         seed
                     }
                 }
@@ -123,10 +123,13 @@ fn merge_preferred_versions(seed: &mut PreferredVersions, overrides: Option<&Pre
     }
 }
 
-fn excluded_names(
-    names: &std::collections::HashSet<String>,
-) -> std::collections::HashSet<pnpm_lockfile::PkgName> {
-    names.iter().filter_map(|name| pnpm_lockfile::PkgName::parse(name.as_str()).ok()).collect()
+/// Which lockfile pins `pacquet update` withholds from the seed, so its
+/// targets re-resolve instead of settling back on their recorded version.
+/// A target scoped to a version line withholds only that line's pins: the
+/// other lines are not part of the update and must keep resolving to what
+/// the lockfile recorded.
+fn withheld_pin(targets: &UpdateTargets) -> impl Fn(&pnpm_lockfile::PackageKey) -> bool + '_ {
+    |key| targets.covers(key.name.to_string().as_str(), key.suffix.version_semver())
 }
 
 /// Call the pnpmfile's `preResolution` hook before resolution starts.
@@ -182,6 +185,7 @@ pub(super) struct SharedResolveOptions<'a> {
     pub workspace_packages: Option<Arc<pnpm_resolving_resolver_base::WorkspacePackages>>,
     /// See [`super::InstallWithFreshLockfile::update_checksums`].
     pub update_checksums: bool,
+    pub update_behavior: pnpm_resolving_resolver_base::UpdateBehavior,
 }
 
 impl SharedResolveOptions<'_> {
@@ -208,6 +212,7 @@ impl SharedResolveOptions<'_> {
             inject_workspace_packages: self.config.inject_workspace_packages,
             prefer_workspace_packages: self.config.prefer_workspace_packages,
             update_checksums: self.update_checksums,
+            update: self.update_behavior,
             ..ResolveOptions::default()
         }
     }
@@ -218,6 +223,9 @@ pub(super) struct ReuseSeedInputs<'a> {
     pub catalogs: &'a Catalogs,
     /// The previous run's lockfile, the only reuse candidate.
     pub wanted_lockfile: Option<&'a Lockfile>,
+    /// An `Arc` handle to the same document, when the loader holds one;
+    /// the reuse-verbatim path shares it instead of deep-copying.
+    pub wanted_lockfile_shared: Option<&'a Arc<Lockfile>>,
     pub package_extensions_checksum: Option<&'a str>,
     pub parsed_overrides: Option<&'a [pnpm_config_parse_overrides::VersionOverride]>,
     pub resolved_overrides: Option<&'a IndexMap<String, String>>,
@@ -259,6 +267,7 @@ pub(super) async fn lockfile_reuse_seed(inputs: ReuseSeedInputs<'_>) -> Option<A
         config,
         catalogs,
         wanted_lockfile,
+        wanted_lockfile_shared,
         package_extensions_checksum,
         parsed_overrides,
         resolved_overrides,
@@ -331,7 +340,13 @@ pub(super) async fn lockfile_reuse_seed(inputs: ReuseSeedInputs<'_>) -> Option<A
     };
 
     if override_settings_match {
-        return Some(Arc::new(catalog_rewrite.unwrap_or_else(|| lockfile.clone())));
+        return Some(match catalog_rewrite {
+            Some(rewritten) => Arc::new(rewritten),
+            // `lockfile` is `wanted_lockfile` narrowed by the filter
+            // above, so the loader's handle to it reuses the parsed
+            // document verbatim.
+            None => wanted_lockfile_shared.map_or_else(|| Arc::new(lockfile.clone()), Arc::clone),
+        });
     }
     if !fast_override_eligible {
         return None;
@@ -395,6 +410,9 @@ pub(super) async fn warn_stale_convergence_overrides<Reporter: pnpm_reporter::Re
 pub(super) struct ResolvePassInputs<'a> {
     pub config: &'a Config,
     pub resolver: &'a dyn Resolver,
+    /// See
+    /// [`WorkspaceResolveOptions::share_workspace_resolutions`](pnpm_resolving_deps_resolver::WorkspaceResolveOptions::share_workspace_resolutions).
+    pub share_workspace_resolutions: bool,
     pub importer_manifests: &'a BTreeMap<String, &'a PackageManifest>,
     pub dependency_groups: &'a [DependencyGroup],
     pub catalogs: &'a Catalogs,
@@ -412,6 +430,7 @@ pub(super) struct ResolvePassInputs<'a> {
     /// `afterAllResolved` hook.
     pub pnpmfile_hook: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     pub read_package_log: Option<pnpm_hooks::LogFn>,
+    pub finalized_package: Option<pnpm_resolving_deps_resolver::FinalizedPackageFn>,
     /// See [`crate::resolution_policy::PickPolicy`].
     pub pick_lowest_direct: bool,
     pub time_based: bool,
@@ -446,6 +465,7 @@ pub(super) async fn run_resolve_pass<Reporter: pnpm_reporter::Reporter>(
     let ResolvePassInputs {
         config,
         resolver,
+        share_workspace_resolutions,
         importer_manifests,
         dependency_groups,
         catalogs,
@@ -459,6 +479,7 @@ pub(super) async fn run_resolve_pass<Reporter: pnpm_reporter::Reporter>(
         overrides_hook,
         pnpmfile_hook,
         read_package_log,
+        finalized_package,
         pick_lowest_direct,
         time_based,
         published_by,
@@ -499,11 +520,13 @@ pub(super) async fn run_resolve_pass<Reporter: pnpm_reporter::Reporter>(
         exclude_links_from_lockfile: config.exclude_links_from_lockfile,
         lockfile_dir: lockfile_dir.to_path_buf(),
         peers_suffix_max_length,
+        share_workspace_resolutions,
         manifest_hook: manifest_hook.clone(),
         overrides_hook: overrides_hook.clone(),
         pnpmfile_hook,
         read_package_log,
         skipped_optional_log: Some(super::skipped_optional_log_fn::<Reporter>()),
+        finalized_package,
         pick_lowest_direct,
         time_based,
         wanted_lockfile: resolution_lockfile,

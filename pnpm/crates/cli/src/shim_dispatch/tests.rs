@@ -1,13 +1,12 @@
 #[cfg(windows)]
 use super::validate_candidate;
 use super::{
-    Candidate, find_candidate,
+    Candidate, apply_state_dir_setting, find_candidate,
     identity::{
         MAX_HASHED_BIN_SIZE, local_bin_identity, package_dir_of_target, provider_of_target,
         read_shim_target_from_content, small_file_hash,
     },
-    install_dispatcher_from, is_automatic_runtime, local_bin_path, local_bin_unchanged,
-    manifest_runtime_pin, parse_shim_argv,
+    is_automatic_runtime, local_bin_path, local_bin_unchanged, manifest_runtime_pin,
     runtime_env::managed_runtime_bin,
     trust::{append_trust_decision, read_trust_decision},
     try_dispatch,
@@ -27,29 +26,45 @@ fn non_shim_argv_is_not_intercepted() {
 }
 
 #[test]
-fn parses_the_generated_shim_argv() {
-    let rest = strings(&["node", "/global/bin/node", "/global/node", "--", "--version", "-e", "1"]);
-    let (name, shim, target, args) = parse_shim_argv(&rest).unwrap();
-    assert_eq!(name, "node");
-    assert_eq!(shim, Path::new("/global/bin/node"));
-    assert_eq!(target, Path::new("/global/node"));
-    assert_eq!(args, &strings(&["--version", "-e", "1"])[..]);
+fn malformed_legacy_shim_argv_fails_instead_of_running_the_cli() {
+    assert_eq!(try_dispatch(&strings(&["pnpm", "--shim"])), Some(1));
+    assert_eq!(try_dispatch(&strings(&["pnpm", "--shim", "tool", "/g/bin/tool"])), Some(1));
+    assert_eq!(
+        try_dispatch(&strings(&["pnpm", "--shim", "tool", "/g/bin/tool", "/g/pkg/cli", "x"])),
+        Some(1),
+    );
+    assert_eq!(
+        try_dispatch(&strings(&["pnpm", "--shim", "../tool", "/g/bin/tool", "/g/pkg/cli", "--"])),
+        Some(1),
+    );
+    assert_eq!(
+        try_dispatch(&strings(&["pnpm", "--shim", "tool", "/g/bin/tool", "pkg:not valid", "--"])),
+        Some(1),
+    );
 }
 
 #[test]
-fn rejects_malformed_shim_argv() {
-    assert!(parse_shim_argv(&strings(&[])).is_none());
-    assert!(parse_shim_argv(&strings(&["node"])).is_none());
-    assert!(parse_shim_argv(&strings(&["node", "/t"])).is_none());
-    assert!(parse_shim_argv(&strings(&["node", "/s", "/t", "--version"])).is_none());
-}
+fn configured_state_dir_resolves_relative_to_the_machine_state_root() {
+    let root = tempfile::tempdir().unwrap();
+    let default_state_dir = root.path().join("state/pnpm");
+    let expected_state_dir = dunce::canonicalize(root.path()).unwrap().join("state/custom-state");
+    let mut state_dir = default_state_dir.clone();
+    apply_state_dir_setting(&mut state_dir, Some("custom-state"), &default_state_dir);
+    assert_eq!(state_dir, expected_state_dir);
 
-#[test]
-fn empty_args_after_separator_parse() {
-    let rest = strings(&["tsc", "/s", "/t", "--"]);
-    let (name, _, _, args) = parse_shim_argv(&rest).unwrap();
-    assert_eq!(name, "tsc");
-    assert!(args.is_empty());
+    apply_state_dir_setting(&mut state_dir, Some(""), &default_state_dir);
+    assert_eq!(state_dir, expected_state_dir);
+
+    let absolute_state_dir = root.path().join("absolute-state");
+    apply_state_dir_setting(&mut state_dir, absolute_state_dir.to_str(), &default_state_dir);
+    assert_eq!(state_dir, absolute_state_dir);
+
+    apply_state_dir_setting(&mut state_dir, Some("relative"), Path::new(""));
+    assert!(state_dir.as_os_str().is_empty());
+
+    state_dir = default_state_dir.clone();
+    apply_state_dir_setting(&mut state_dir, Some("../outside"), &default_state_dir);
+    assert!(state_dir.as_os_str().is_empty());
 }
 
 #[test]
@@ -253,33 +268,6 @@ fn package_root_is_the_nearest_manifest_ancestor() {
     fs::write(&nested_target, "").unwrap();
     assert_eq!(package_dir_of_target(&nested_target), Some(package));
     assert_eq!(package_dir_of_target(root.path()), None);
-}
-
-#[test]
-fn versioned_dispatcher_survives_main_executable_replacement() {
-    let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("pnpm");
-    let destination = root.path().join(".pnpm-shim-v1");
-    fs::write(&source, "v12 dispatcher").unwrap();
-    install_dispatcher_from(&source, &destination).unwrap();
-
-    fs::rename(&source, root.path().join("pnpm-v12")).unwrap();
-    fs::write(&source, "pre-v12 executable").unwrap();
-
-    assert_eq!(fs::read_to_string(destination).unwrap(), "v12 dispatcher");
-}
-
-#[test]
-fn dispatcher_install_replaces_a_stale_file() {
-    let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("pnpm");
-    let destination = root.path().join(".pnpm-shim-v1");
-    fs::write(&source, "current dispatcher").unwrap();
-    fs::write(&destination, "stale dispatcher").unwrap();
-
-    install_dispatcher_from(&source, &destination).unwrap();
-
-    assert_eq!(fs::read_to_string(destination).unwrap(), "current dispatcher");
 }
 
 #[cfg(windows)]

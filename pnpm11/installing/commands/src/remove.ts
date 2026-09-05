@@ -67,6 +67,11 @@ export function rcOptionsTypes (): Record<string, unknown> {
     'shared-workspace-lockfile',
     'store-dir',
     'strict-peer-dependencies',
+    'trust-lockfile',
+    'trust-policy',
+    'trust-policy-exclude',
+    'trust-policy-ignore-after',
+    'unsafe-perm',
     'virtual-store-dir',
   ], allTypes)
 }
@@ -256,6 +261,7 @@ export async function handler (
   await updateWorkspaceManifest(opts.workspaceDir ?? opts.dir, {
     catalogPrune: opts.catalogPrune,
     resolvedPackageVersions: resolvedPackageVersionsForPrune(opts, mutationResult.newLockfile),
+    minimumReleaseAgeExcludePrune: opts.minimumReleaseAgeExcludePrune,
     allProjects: updatedProjects,
   })
 }

@@ -155,6 +155,8 @@ pub struct VerifyResult {
     pub passed: bool,
     pub files_map: FilesMap,
     pub side_effects_maps: Option<HashMap<String, FilesMap>>,
+    pub side_effects: Option<HashMap<String, SideEffectsDiff>>,
+    pub remote_side_effects_quarantine: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Fast path used when `verify-store-integrity` is `false`.
@@ -162,7 +164,7 @@ pub struct VerifyResult {
 /// No stat syscalls — the caller trusts the index, and any missing /
 /// corrupt CAFS file surfaces lazily at import time.
 pub fn build_file_maps_from_index(store_dir: &StoreDir, entry: PackageFilesIndex) -> VerifyResult {
-    let PackageFilesIndex { files, side_effects, .. } = entry;
+    let PackageFilesIndex { files, side_effects, remote_side_effects_quarantine, .. } = entry;
     let mut files_map = HashMap::with_capacity(files.len());
     let mut passed = true;
     // Consume `entry.files` so the owned `String` filenames move into
@@ -184,8 +186,14 @@ pub fn build_file_maps_from_index(store_dir: &StoreDir, entry: PackageFilesIndex
         };
         files_map.insert(filename, path);
     }
-    let side_effects_maps = build_side_effects_maps(store_dir, side_effects, &files_map);
-    VerifyResult { passed, files_map, side_effects_maps }
+    let side_effects_maps = build_side_effects_maps(store_dir, side_effects.as_ref(), &files_map);
+    VerifyResult {
+        passed,
+        files_map,
+        side_effects_maps,
+        side_effects,
+        remote_side_effects_quarantine,
+    }
 }
 
 /// Careful path used when `verify-store-integrity` is `true` (the
@@ -204,7 +212,7 @@ pub fn check_pkg_files_integrity(
     // Destructure so the owned `files` HashMap and `algo` String can be
     // consumed below, moving the filenames into `files_map` without a
     // per-file clone on the hot path.
-    let PackageFilesIndex { files, algo, side_effects, .. } = entry;
+    let PackageFilesIndex { files, algo, side_effects, remote_side_effects_quarantine, .. } = entry;
     let mut all_verified = true;
     let mut files_map = HashMap::with_capacity(files.len());
     for (filename, info) in files {
@@ -233,8 +241,14 @@ pub fn check_pkg_files_integrity(
         }
         files_map.insert(filename, path);
     }
-    let side_effects_maps = build_side_effects_maps(store_dir, side_effects, &files_map);
-    VerifyResult { passed: all_verified, files_map, side_effects_maps }
+    let side_effects_maps = build_side_effects_maps(store_dir, side_effects.as_ref(), &files_map);
+    VerifyResult {
+        passed: all_verified,
+        files_map,
+        side_effects_maps,
+        side_effects,
+        remote_side_effects_quarantine,
+    }
 }
 
 /// Materialize the per-cache-key overlaid [`FilesMap`]s from a
@@ -244,13 +258,13 @@ pub fn check_pkg_files_integrity(
 /// as a missing CAS blob.
 fn build_side_effects_maps(
     store_dir: &StoreDir,
-    side_effects: Option<HashMap<String, SideEffectsDiff>>,
+    side_effects: Option<&HashMap<String, SideEffectsDiff>>,
     base_files: &FilesMap,
 ) -> Option<HashMap<String, FilesMap>> {
     let raw = side_effects?;
     let mut out: HashMap<String, FilesMap> = HashMap::with_capacity(raw.len());
     'next_key: for (cache_key, diff) in raw {
-        let SideEffectsDiff { added, deleted } = diff;
+        let SideEffectsDiff { added, deleted, .. } = diff;
         let mut overlay: FilesMap = HashMap::with_capacity(base_files.len());
         if let Some(added) = added {
             for (filename, info) in added {
@@ -259,7 +273,7 @@ fn build_side_effects_maps(
                 // corrupted index row (store integrity is explicitly not
                 // a tamper boundary — see `verify_file`) could otherwise
                 // escape the slot via a `..` or absolute `added` key.
-                if !is_safe_overlay_path(&filename) {
+                if !is_safe_overlay_path(filename) {
                     tracing::debug!(
                         target: "pacquet::store_index",
                         ?filename,
@@ -282,20 +296,20 @@ fn build_side_effects_maps(
                     );
                     continue 'next_key;
                 };
-                overlay.insert(filename, path);
+                overlay.insert(filename.clone(), path);
             }
         }
         // Promote `deleted` to a `HashSet` once per cache key so
         // the `base_files` walk stays linear in `|base|` instead of
         // `O(|base| * |deleted|)`.
         let deleted_set: std::collections::HashSet<String> =
-            deleted.unwrap_or_default().into_iter().collect();
+            deleted.iter().flatten().cloned().collect();
         for (filename, path) in base_files {
             if !deleted_set.contains(filename) && !overlay.contains_key(filename) {
                 overlay.insert(filename.clone(), path.clone());
             }
         }
-        out.insert(cache_key, overlay);
+        out.insert(cache_key.clone(), overlay);
     }
     Some(out)
 }
@@ -331,20 +345,18 @@ fn is_safe_overlay_path(filename: &str) -> bool {
 ///
 /// **Locking discipline.** The fast path (`is_modified == false`, i.e.
 /// the file's mtime is within 100 ms of the recorded `checked_at`)
-/// runs lock-free — it never touches the file's bytes and never
-/// considers a delete, so it cannot race with an in-flight writer.
-/// The slow path (where verification could lead to a
-/// [`remove_stale_cafs_entry`] call) acquires
+/// runs lock-free — it never touches the file's bytes, so it cannot
+/// race with an in-flight writer. The slow path acquires
 /// [`pnpm_fs::cas_write_lock`] for `path` before re-stating the
 /// file. This is the same per-path mutex
 /// [`pnpm_fs::ensure_file`] holds across `O_CREAT|O_EXCL` +
-/// `write_all`, so a concurrent writer's full sequence completes
-/// before the verifier evaluates the file. Without this gate, the
-/// verifier observes the writer's intermediate (partial) state,
-/// `unlink`s the file out from under the writer's open fd, and the
-/// install ends up with `cas_paths` referencing a path whose dirent
-/// has been removed — which surfaces later as ENOENT in
-/// `link_file`.
+/// `write_all`, so a concurrent same-process writer's full sequence
+/// completes before the verifier evaluates the file — without the
+/// gate the verifier would read the writer's intermediate (partial)
+/// state and report a spurious miss. The lock is process-local, which
+/// is exactly why a failed verification must never unlink a file:
+/// another *process* sharing the store may be importing from it — see
+/// [`scrub_directory_at_cafs_path`].
 fn verify_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> bool {
     // Lock-free fast path. `check_file` is read-only and only touches
     // the file's metadata; no risk of clobbering a writer's state.
@@ -392,18 +404,18 @@ fn verify_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> 
         return true;
     }
     if size != info.size {
-        // Wrong size → content definitely changed. Remove so the next
-        // caller fetches a clean copy. See `remove_stale_cafs_entry`
-        // for why this has to cover dirs too.
+        // Wrong size → content definitely changed. Report the miss so
+        // the caller re-fetches; see `scrub_directory_at_cafs_path` for
+        // why nothing but a directory is removed here.
         tracing::debug!(
             target: "pacquet::store_index",
             ?filename,
             ?path,
             expected_size = info.size,
             actual_size = size,
-            "CAFS file size mismatch; scrubbing and re-fetching",
+            "CAFS file size mismatch; re-fetching",
         );
-        remove_stale_cafs_entry(path);
+        scrub_directory_at_cafs_path(path);
         return false;
     }
     let passed = verify_file_integrity(path, &info.digest, algo);
@@ -412,37 +424,71 @@ fn verify_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> 
             target: "pacquet::store_index",
             ?filename,
             ?path,
-            "CAFS file digest mismatch or unknown algo; scrubbing and re-fetching",
+            "CAFS file digest mismatch, read failure, or unknown algo; re-fetching",
         );
-        remove_stale_cafs_entry(path);
+        scrub_directory_at_cafs_path(path);
     }
     passed
 }
 
-/// Remove a CAFS dirent that failed verification, with recursive
-/// (`rimraf`-style) semantics that also handle a directory.
+/// Remove a *directory* squatting at a CAFS blob path so the
+/// re-fetch's `rename` can land. Every other dirent stays: the
+/// re-fetch replaces a mismatched file atomically, and unlinking here
+/// would race installs in other processes importing from this very
+/// path (pnpm/pnpm#14353's error class) — the verifier's lock is
+/// process-local, and [`verify_file_integrity`] reports a transient
+/// read failure the same way as a real mismatch.
 ///
-/// `fs::remove_file` on a directory returns `EISDIR` / `EPERM`, and a
-/// corrupted store that has a directory sitting where a CAFS blob
-/// belongs (stray `mkdir -p`, interrupted write, filesystem hiccup)
-/// would stay there forever if we only tried `remove_file`. Next
-/// install's verification would fail again and again — the store
-/// wouldn't self-heal.
+/// A check-then-delete on the live path could delete whatever a
+/// concurrent process put there in between, so the dirent is renamed
+/// aside first and only then inspected: a directory is removed at its
+/// scrub name, and anything else — including a blob a concurrent
+/// re-fetch landed after the failed verification — is renamed back
+/// where it was. `remove_dir_all` is never pointed at the live path
+/// (it would unlink a terminal symlink there, not just a directory).
 ///
-/// Best-effort for both: try `remove_file`, fall back to
-/// `remove_dir_all` if the dirent is a directory. Errors are logged at
-/// `debug` and dropped — worst case the next install notices the same
-/// stale dirent and retries. We use `symlink_metadata` so we identify
-/// the dirent type without following a symlink.
-fn remove_stale_cafs_entry(path: &Path) {
-    let is_dir = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir());
-    let result = if is_dir { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+/// Best-effort throughout: a failure is logged at `debug` and the next
+/// install retries. A crash between the two renames leaves an inert
+/// `*.pacquet-scrub-*` entry in the shard directory, which nothing
+/// ever resolves.
+fn scrub_directory_at_cafs_path(path: &Path) {
+    // Cheap gate only — the rename + inspect below re-decides
+    // authoritatively, so a dirent swapped after this stat is still
+    // handled correctly. Without the gate every mismatched *file*
+    // would pay the rename round-trip and briefly vanish from its
+    // path.
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir()) {
+        return;
+    }
+    static SCRUB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut scrub_path = path.as_os_str().to_owned();
+    scrub_path.push(format!(
+        ".pacquet-scrub-{}-{}",
+        std::process::id(),
+        SCRUB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    let scrub_path = Path::new(&scrub_path);
+    if fs::rename(path, scrub_path).is_err() {
+        // Nothing left at the path (a concurrent scrubber won), or the
+        // rename is not possible; either way the next install retries.
+        return;
+    }
+    let is_dir = fs::symlink_metadata(scrub_path).is_ok_and(|meta| meta.file_type().is_dir());
+    let result = if is_dir {
+        fs::remove_dir_all(scrub_path)
+    } else {
+        // The dirent changed between the failed verification and the
+        // rename — a concurrent process replaced the squatter. Put the
+        // newcomer back where every reader expects it.
+        fs::rename(scrub_path, path)
+    };
     if let Err(error) = result {
         tracing::debug!(
             target: "pacquet::store_index",
             ?path,
+            ?scrub_path,
             ?error,
-            "failed to scrub stale CAFS entry; next install will retry",
+            "failed to scrub a directory at a CAFS path; next install will retry",
         );
     }
 }
@@ -478,6 +524,42 @@ fn check_file(path: &Path, checked_at: Option<u64>) -> Option<(bool, u64)> {
     let baseline = checked_at.unwrap_or(0);
     let is_modified = mtime_ms.saturating_sub(baseline) > 100;
     Some((is_modified, meta.len()))
+}
+
+/// Whether the materialized package under `dir` still matches the store
+/// row it was expanded from.
+///
+/// This is pnpm's `dint.check`, and answers what `pnpm store status`
+/// asks: has anything edited the package after it was linked out of the
+/// store. Only the files the row records are checked — a file *added*
+/// under `dir` afterwards is not a change to what the store holds — and
+/// a missing, unreadable, or re-hashed file all read as mutated.
+#[must_use]
+pub fn package_dir_matches_index(dir: &Path, index: &PackageFilesIndex) -> bool {
+    index.files.iter().all(|(path, file)| {
+        join_inside(dir, path)
+            .is_some_and(|path| verify_file_integrity(&path, &file.digest, &index.algo))
+    })
+}
+
+/// `dir` joined with a recorded in-package path, or `None` if that path is
+/// anything other than a sequence of plain names.
+///
+/// The recorded paths come from archive entries. Extraction rejects a
+/// leading separator and `..`, but not a Windows drive prefix — and
+/// [`Path::join`] discards its base when the argument has one, which would
+/// point the hash at a file outside the package. Rejecting here keeps that
+/// decision local to the one caller that joins index keys onto a
+/// directory rather than reading them out of the CAS.
+fn join_inside(dir: &Path, relative: &str) -> Option<PathBuf> {
+    let mut joined = dir.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            std::path::Component::Normal(segment) => joined.push(segment),
+            _ => return None,
+        }
+    }
+    Some(joined)
 }
 
 /// Streams the file through the hasher in 64 KiB chunks and compares

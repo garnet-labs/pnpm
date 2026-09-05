@@ -67,14 +67,6 @@ pub struct Package {
     /// [`DerivedPackuments`].
     #[serde(skip_serializing, skip_deserializing)]
     pub derived: DerivedPackuments,
-
-    /// `true` once a release-age upgrade fetch for this document answered
-    /// `304 Not Modified` in this process: the registry holds no fuller
-    /// form than what is already cached, so re-asking within the install
-    /// is pure waste. In-memory only — never written to the mirror, so a
-    /// later install re-validates once and re-stamps.
-    #[serde(skip_serializing, skip_deserializing)]
-    pub release_age_upgrade_checked: bool,
 }
 
 impl Package {
@@ -83,6 +75,37 @@ impl Package {
     #[must_use]
     pub fn published_at(&self, version: &str) -> Option<&str> {
         self.time.as_ref()?.get(version)?.as_str()
+    }
+
+    /// Drop `time` unless it carries a publish timestamp for every
+    /// version this packument lists.
+    ///
+    /// Registries may answer with a partial map: npmmirror adds `time`
+    /// to its abbreviated documents but fills it in only for the
+    /// versions it has synced since it started recording publish times,
+    /// leaving the rest out. A partial map is indistinguishable from a
+    /// complete one at the point of use, so the `minimumReleaseAge`
+    /// filter reads every absent timestamp as "not mature" and silently
+    /// drops the version — resolution then falls back to the lowest
+    /// match.
+    ///
+    /// A map that can't decide maturity is worth nothing to the
+    /// resolver, so it is normalized away where the document is parsed.
+    /// Every packument past that point carries either a complete `time`
+    /// or none at all — the shape the npm registry's own abbreviated
+    /// documents have, and the one the rest of the resolver is written
+    /// against.
+    /// A packument with no versions keeps whatever `time` it has — there
+    /// is nothing for the map to be incomplete about — and a version whose
+    /// entry is an empty string counts as absent.
+    pub fn drop_incomplete_publish_times(&mut self) {
+        let Some(time) = self.time.as_ref() else { return };
+        let complete = self.versions.keys().all(|version| {
+            time.get(version).and_then(serde_json::Value::as_str).is_some_and(|at| !at.is_empty())
+        });
+        if !complete {
+            self.time = None;
+        }
     }
 
     /// Version under `dist-tags.<tag>`, or `None` when the tag is
@@ -211,7 +234,7 @@ impl Package {
 
     #[must_use]
     pub fn pinned_version(&self, version_range: &str) -> Option<Arc<PackageVersion>> {
-        let range: node_semver::Range = version_range.parse().unwrap(); // TODO: this step should have happened in PackageManifest
+        let range: node_semver::Range = version_range.parse().ok()?;
         // Match on the version *strings* so only winning manifests
         // hydrate from their raw fragments.
         let mut satisfying = self
@@ -233,6 +256,20 @@ impl Package {
     #[must_use]
     pub fn latest(&self) -> Option<Arc<PackageVersion>> {
         self.versions.get(self.dist_tags.get("latest")?)
+    }
+
+    /// The version behind `dist-tags.latest` and why its manifest
+    /// failed to decode, when the packument lists that version but
+    /// pnpm can't parse it.
+    ///
+    /// `None` covers every healthy case as well as a genuinely dangling
+    /// tag, so a caller that has already failed to resolve `latest` can
+    /// use this to tell "the registry serves a manifest pnpm can't read"
+    /// apart from "the tag points at nothing".
+    #[must_use]
+    pub fn latest_decode_error(&self) -> Option<(&str, String)> {
+        let version = self.dist_tag("latest")?;
+        Some((version, self.versions.decode_error(version)?))
     }
 }
 
