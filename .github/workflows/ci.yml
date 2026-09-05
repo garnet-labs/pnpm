@@ -129,35 +129,50 @@ jobs:
     needs: [compile-and-lint, build-pnpr-linux]
     strategy:
       fail-fast: false
-      # Three cells fit in one wave, so every cell shares the same window.
+      # Four cells fit in one wave, so every cell shares the same window.
       max-parallel: 8
       matrix:
-        # Test-branch only: the current-head arm of a branch-versus-day
-        # probe. Three cells on the control pin, same workload, runner, Node
-        # and action ref as the earlier lanes; the pin is held fixed so the
-        # only question is whether this tree still loses profiles today.
+        # Test-branch only: does removing the two event printers make the
+        # JSON profile appear? Every cell is the control pin on the same
+        # workload, runner, Node and action ref, and every cell rewrites the
+        # sensor config and restarts the unit so the restart itself is not a
+        # difference between the arms. Arm A rewrites the file unchanged; arm
+        # B drops `stdout` and `varlog` from it.
         include:
-          - platform_label: ubuntu v2160-04
-            cell_id: v2160-04
+          - platform_label: ubuntu keep-printers-07
+            cell_id: keep-printers-07
             garnet_jibril_version: v2.16.0
+            garnet_drop_event_printers: false
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu v2160-05
-            cell_id: v2160-05
+          - platform_label: ubuntu drop-printers-08
+            cell_id: drop-printers-08
             garnet_jibril_version: v2.16.0
+            garnet_drop_event_printers: true
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - platform_label: ubuntu v2160-06
-            cell_id: v2160-06
+          - platform_label: ubuntu keep-printers-09
+            cell_id: keep-printers-09
             garnet_jibril_version: v2.16.0
+            garnet_drop_event_printers: false
+            node: '24.0.0'
+            node_major: '24'
+            platform: blacksmith-8vcpu-ubuntu-2404
+            test_chunk: '1'
+            test_chunk_total: '1'
+            garnet: true
+          - platform_label: ubuntu drop-printers-10
+            cell_id: drop-printers-10
+            garnet_jibril_version: v2.16.0
+            garnet_drop_event_printers: true
             node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
@@ -173,6 +188,7 @@ jobs:
       test_chunk_total: ${{ matrix.test_chunk_total }}
       garnet: ${{ matrix.garnet == true }}
       garnet_jibril_version: ${{ matrix.garnet_jibril_version }}
+      garnet_drop_event_printers: ${{ matrix.garnet_drop_event_printers == true }}
       cell_id: ${{ matrix.cell_id }}
     secrets:
       GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
