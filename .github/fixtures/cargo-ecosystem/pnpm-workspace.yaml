@@ -1,2 +1,5 @@
 packages:
   - .
+
+cargo:
+  enabled: true

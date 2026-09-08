@@ -78,7 +78,7 @@ jobs:
             work="$RUNNER_TEMP/install-$i"
             rm -rf "$work"
             cp -r "$fixture" "$work"
-            (cd "$work" && pnpm add is-number@7.0.0 --ignore-scripts --store-dir "$work/store")
+            (cd "$work" && pnpm add crate:tokio@1 --ignore-scripts --store-dir "$work/store")
           done
           date -u +'%Y-%m-%d %H:%M:%S' > "$RUNNER_TEMP/install_end"
 
