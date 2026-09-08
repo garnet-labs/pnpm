@@ -1,0 +1,6 @@
+name: Dump step summary
+description: "Echoes GITHUB_STEP_SUMMARY into the job log from a post step"
+runs:
+  using: node24
+  main: noop.js
+  post: dump.js
