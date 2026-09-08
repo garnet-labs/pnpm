@@ -1,0 +1,178 @@
+name: Cargo ecosystem record
+
+on:
+  pull_request:
+    paths:
+      - '.github/fixtures/cargo-ecosystem/**'
+      - '.github/workflows/garnet-cargo-ecosystem.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  PNPM_VERSION: 12.4.0
+  ITERATIONS: 3
+
+jobs:
+  record:
+    name: Record Cargo ecosystem (cell ${{ matrix.cell }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: [1, 2, 3]
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@540530e93eb6d1caed43f82d3145900d17041f20
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0-rc.8
+
+      - name: Capture port-53 packets as ground truth
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends tcpdump >/dev/null
+          sudo sh -c "nohup tcpdump -n -i any -U -w '$RUNNER_TEMP/dns.pcap' port 53 >/dev/null 2>&1 & echo \$! > '$RUNNER_TEMP/tcpdump.pid'"
+          sleep 3
+          sudo test -s "$RUNNER_TEMP/dns.pcap" || { echo "::error::tcpdump did not start"; exit 1; }
+
+      - name: Answer DNS from a local forwarder
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends dnsmasq >/dev/null 2>&1 ||
+            { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends dnsmasq >/dev/null; }
+          printf 'no-resolv\nserver=1.1.1.1\nlisten-address=127.0.0.1\nbind-interfaces\nlog-queries\n' |
+            sudo tee /etc/dnsmasq.d/record.conf >/dev/null
+          sudo systemctl restart dnsmasq
+          printf 'nameserver 127.0.0.1\noptions no_tld_query\n' | sudo tee /etc/resolv.conf.new >/dev/null
+          sudo mv /etc/resolv.conf.new /etc/resolv.conf
+          printf '127.0.0.1 %s\n' "$(hostname)" | sudo tee -a /etc/hosts >/dev/null
+          cat /etc/resolv.conf
+          test "$(grep -c '^nameserver ' /etc/resolv.conf)" = 1
+          grep -q '^options no_tld_query$' /etc/resolv.conf
+          getent hosts registry.npmjs.org
+          sudo journalctl -u dnsmasq --no-pager -o cat | grep -qE 'query\[A+\] registry\.npmjs\.org'
+
+      - name: Install pnpm
+        run: |
+          set -euo pipefail
+          npm install -g "pnpm@${PNPM_VERSION}" >/dev/null
+          cd "$RUNNER_TEMP"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+
+      - name: Add the fixture dependency with a cold store
+        run: |
+          set -euo pipefail
+          fixture=.github/fixtures/cargo-ecosystem
+          test "$(cd "$RUNNER_TEMP" && pnpm --version)" = "${PNPM_VERSION}"
+          python3 -c "import json,sys;p=sys.argv[1];m=json.load(open(p));m['packageManager']='pnpm@'+sys.argv[2];json.dump(m,open(p,'w'),indent=2)" "$fixture/package.json" "${PNPM_VERSION}"
+          date -u +'%Y-%m-%d %H:%M:%S' > "$RUNNER_TEMP/install_start"
+          for i in $(seq 1 "$ITERATIONS"); do
+            work="$RUNNER_TEMP/install-$i"
+            rm -rf "$work"
+            cp -r "$fixture" "$work"
+            (cd "$work" && pnpm add is-number@7.0.0 --ignore-scripts --store-dir "$work/store")
+          done
+          date -u +'%Y-%m-%d %H:%M:%S' > "$RUNNER_TEMP/install_end"
+
+      - name: Report Cargo ecosystem and DNS findings
+        if: always()
+        run: |
+          set -euo pipefail
+          if test -s "$RUNNER_TEMP/tcpdump.pid"; then
+            sudo kill "$(cat "$RUNNER_TEMP/tcpdump.pid")" || true
+          fi
+          sleep 2
+          if test -s "$RUNNER_TEMP/dns.pcap"; then
+            sudo chmod a+r "$RUNNER_TEMP/dns.pcap"
+            port_capture_status=present
+          else
+            port_capture_status=absent
+          fi
+          sudo journalctl -u dnsmasq --no-pager -o cat > "$RUNNER_TEMP/forwarder.log" || true
+          if test -s "$RUNNER_TEMP/install_start" && test -s "$RUNNER_TEMP/install_end"; then
+            sudo journalctl -u dnsmasq \
+              --since "$(cat "$RUNNER_TEMP/install_start")" \
+              --until "$(cat "$RUNNER_TEMP/install_end")" \
+              -o cat > "$RUNNER_TEMP/forwarder-installs.log" || true
+          else
+            : > "$RUNNER_TEMP/forwarder-installs.log"
+          fi
+          last_install="$RUNNER_TEMP/install-${ITERATIONS}"
+          cargo_lock="$last_install/Cargo.lock"
+          cargo_config="$last_install/.cargo/config.toml"
+          crate_dir="$last_install/.pnpm/crates/crates-io"
+          if test -f "$cargo_lock"; then
+            cargo_lock_status=present
+            cargo_package_count="$(grep -c '^\[\[package\]\]' "$cargo_lock" || true)"
+          else
+            cargo_lock_status=absent
+            cargo_package_count=0
+          fi
+          if test -f "$cargo_config" &&
+            grep -qF '# >>> pnpm-managed cargo sources >>>' "$cargo_config" &&
+            grep -qF '# <<< pnpm-managed cargo sources <<<' "$cargo_config"; then
+            cargo_source_status=present
+          else
+            cargo_source_status=absent
+          fi
+          if test -d "$crate_dir"; then
+            crate_count="$(find -L "$crate_dir" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          else
+            crate_count=0
+          fi
+          {
+            echo "### Cargo ecosystem record"
+            echo
+            echo '```'
+            echo "pnpm version: ${PNPM_VERSION}"
+            echo "last install directory: ${last_install}"
+            echo
+            echo "port-53 capture: ${port_capture_status}"
+            echo "port-53 destinations:"
+            if test "$port_capture_status" = present; then
+              tcpdump -nr "$RUNNER_TEMP/dns.pcap" 2>/dev/null |
+                { grep -oE '> [0-9.]+\.53:' || true; } |
+                tr -d '>: ' | sort | uniq -c | sort -rn || true
+            else
+              echo "(none)"
+            fi
+            echo
+            echo "names resolved during the recorded installs:"
+            { grep -oE 'query\[[A-Z]+\] [^ ]+' "$RUNNER_TEMP/forwarder-installs.log" || true; } |
+              sed -E 's/^query\[[A-Z]+\] //' | sort | uniq -c | sort -rn
+            echo
+            echo "names resolved during the whole job:"
+            { grep -oE 'query\[[A-Z]+\] [^ ]+' "$RUNNER_TEMP/forwarder.log" || true; } |
+              sed -E 's/^query\[[A-Z]+\] //' | sort | uniq -c | sort -rn
+            echo
+            echo "Cargo.lock: ${cargo_lock_status}"
+            echo "Cargo.lock package entries: ${cargo_package_count}"
+            echo ".cargo/config.toml source-replacement block: ${cargo_source_status}"
+            if test "$cargo_source_status" = present; then
+              sed -n '/# >>> pnpm-managed cargo sources >>>/,/# <<< pnpm-managed cargo sources <<</p' "$cargo_config"
+            else
+              echo "(none)"
+            fi
+            echo "extracted crate directories: ${crate_count}"
+            echo '```'
+          } | tee "$RUNNER_TEMP/report.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the Cargo ecosystem record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-ecosystem-${{ env.PNPM_VERSION }}-cell-${{ matrix.cell }}
+          path: |
+            ${{ runner.temp }}/dns.pcap
+            ${{ runner.temp }}/forwarder.log
+            ${{ runner.temp }}/forwarder-installs.log
+            ${{ runner.temp }}/report.txt
+          if-no-files-found: warn
