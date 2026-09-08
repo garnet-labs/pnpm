@@ -1,0 +1,127 @@
+name: Garnet Jibril Release Gate Job
+
+on:
+  workflow_call:
+    inputs:
+      jibril_version:
+        description: 'jibril-releases tag under test'
+        required: true
+        type: string
+      report_pr:
+        description: 'fork PR number to comment on'
+        required: false
+        type: string
+        default: '36'
+
+permissions: {}
+
+jobs:
+  reproduce:
+    name: Reproduce self-repo reference on Blacksmith
+    # Same runner class as the garnet-enabled leg in ci.yml.
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet runtime monitoring
+        uses: garnet-org/action@540530e93eb6d1caed43f82d3145900d17041f20 # v2.3.0 candidate
+        # The action fails open anyway; never let the gate abort before the
+        # assertion step can record the verdict.
+        continue-on-error: true
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: ${{ inputs.jibril_version }}
+          debug: true
+
+      - name: Workload with egress
+        run: |
+          curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null
+          node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"
+
+      - name: Assert jibril reached the main loop
+        id: assert
+        if: always()
+        env:
+          GATE_TAG: ${{ inputs.jibril_version }}
+        run: |
+          # Poll up to 90s for the runtime status file.
+          found=false
+          for i in $(seq 1 18); do
+            if sudo test -f /var/run/jibril/jibril.status.json; then found=true; break; fi
+            sleep 5
+          done
+          unit_active="$(systemctl is-active jibril || true)"
+          echo "--- jibril.service state: $unit_active ---"
+          echo "--- journalctl (last 80 lines) ---"
+          sudo journalctl -u jibril --no-pager -n 80 || true
+          status=""; steps_status="absent"; workflow_ref="absent"; version=""
+          if [ "$found" = true ]; then
+            sudo cat /var/run/jibril/jibril.status.json | sudo tee /tmp/jibril.status.json >/dev/null
+            sudo chown "$(id -u):$(id -g)" /tmp/jibril.status.json
+            jq . /tmp/jibril.status.json
+            status="$(jq -r '.status // ""' /tmp/jibril.status.json)"
+            steps_status="$(jq -r '.features.github.steps.status // "absent"' /tmp/jibril.status.json)"
+            workflow_ref="$(jq -r '.features.github.workflow_ref // "absent"' /tmp/jibril.status.json)"
+            version="$(jq -r '.version // ""' /tmp/jibril.status.json)"
+          fi
+          if [ "$unit_active" = active ] && [ "$status" = ok ] && [ "$steps_status" = ok ]; then
+            verdict=PASS; reason="sensor active, status ok, github steps resolution ok"
+          elif [ "$found" = false ]; then
+            verdict=FAIL; reason="status file absent — sensor never reached main loop"
+          else
+            verdict=FAIL; reason="unit=$unit_active status=${status:-missing} steps_status=$steps_status"
+          fi
+          {
+            echo "verdict=$verdict"
+            echo "reason=$reason"
+            echo "status=${status:-absent}"
+            echo "version=$version"
+            echo "unit_active=$unit_active"
+            echo "steps_status=$steps_status"
+            echo "workflow_ref=$workflow_ref"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Jibril release gate"
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| requested tag | \`$GATE_TAG\` |"
+            echo "| resolved version | \`${version:-unknown}\` |"
+            echo "| verdict | **$verdict** — $reason |"
+            echo "| runner | \`$RUNNER_NAME\` |"
+            echo "| run | $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Comment gate verdict on the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REPORT_PR: ${{ inputs.report_pr }}
+          GATE_TAG: ${{ inputs.jibril_version }}
+          VERDICT: ${{ steps.assert.outputs.verdict }}
+          REASON: ${{ steps.assert.outputs.reason }}
+          UNIT: ${{ steps.assert.outputs.unit_active }}
+          STEPS_STATUS: ${{ steps.assert.outputs.steps_status }}
+          STATUS_JSON: ${{ steps.assert.outputs.status }}
+          VERSION: ${{ steps.assert.outputs.version }}
+          WORKFLOW_REF: ${{ steps.assert.outputs.workflow_ref }}
+        run: |
+          {
+            echo '<!-- garnet:jibril-release-gate -->'
+            echo "**Jibril release gate · \`$GATE_TAG\` · $VERDICT**"
+            echo "reason: $REASON · unit: \`$UNIT\` · status.json: \`$STATUS_JSON\`/\`$STEPS_STATUS\` · version reported: \`$VERSION\` · workflow_ref: \`$WORKFLOW_REF\`"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID · runner: \`$RUNNER_NAME\` · reusable-workflow form: \`$/\`"
+          } > /tmp/gate-comment.md
+          gh pr comment "$REPORT_PR" --repo "$GH_REPO" --body-file /tmp/gate-comment.md
+
+      - name: Gate conclusion
+        if: steps.assert.outputs.verdict != 'PASS'
+        run: exit 1

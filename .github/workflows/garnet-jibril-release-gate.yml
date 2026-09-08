@@ -1,0 +1,64 @@
+name: Garnet Jibril Release Gate
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      jibril_version:
+        description: 'jibril-releases tag to gate (empty = newest release incl. pre-releases)'
+        required: false
+        default: ''
+      report_pr:
+        description: 'fork PR number to comment on'
+        required: false
+        default: '36'
+
+permissions: {}
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      run_gate: ${{ steps.pick.outputs.run_gate }}
+    steps:
+      - id: pick
+        env:
+          REQUESTED: ${{ inputs.jibril_version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # Newest release by published_at, pre-releases included, drafts excluded.
+          json="$(curl -sSf -H 'Accept: application/vnd.github+json' https://api.github.com/repos/garnet-org/jibril-releases/releases?per_page=20)"
+          newest_tag="$(jq -r '[.[] | select(.draft==false)] | sort_by(.published_at) | last | .tag_name' <<<"$json")"
+          newest_at="$(jq -r '[.[] | select(.draft==false)] | sort_by(.published_at) | last | .published_at' <<<"$json")"
+          tag="${REQUESTED:-$newest_tag}"
+          run_gate=true
+          if [ "$EVENT" = schedule ]; then
+            # Only fire once per new tag: published within the last 65 minutes (cron is every 30).
+            age=$(( $(date +%s) - $(date -d "$newest_at" +%s) ))
+            [ "$age" -le 3900 ] || run_gate=false
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "run_gate=$run_gate" >> "$GITHUB_OUTPUT"
+          {
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| newest release | \`$newest_tag\` |"
+            echo "| published_at | \`$newest_at\` |"
+            echo "| selected tag | \`$tag\` |"
+            echo "| run_gate | \`$run_gate\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    needs: detect
+    if: needs.detect.outputs.run_gate == 'true'
+    name: Garnet Jibril Release Gate / reproduce
+    # The $/ self-repository form IS the reproduction; keep it.
+    uses: $/.github/workflows/garnet-jibril-release-gate-job.yml
+    with:
+      jibril_version: ${{ needs.detect.outputs.tag }}
+      report_pr: ${{ inputs.report_pr || '36' }}
+    secrets: inherit
