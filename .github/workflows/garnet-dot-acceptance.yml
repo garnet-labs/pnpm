@@ -1,0 +1,16 @@
+name: Garnet dot-form acceptance
+
+on:
+  push:
+    branches:
+      - 'devin/**'
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  gate:
+    name: Garnet dot-form acceptance / reproduce
+    # Control case: identical caller job using the ./ local form.
+    uses: ./.github/workflows/garnet-dollar-acceptance-job.yml
