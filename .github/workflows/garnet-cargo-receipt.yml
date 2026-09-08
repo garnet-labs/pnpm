@@ -1,7 +1,7 @@
 name: Garnet Cargo receipt
 
-# Fork-only. pnpm/pnpm#14547 added opt-in Cargo dependency resolution and
-# materialization to `pnpm install` (`cargo: { enabled: true }` in
+# Fork-only. Upstream pull 14547 added opt-in Cargo dependency resolution
+# and materialization to `pnpm install` (`cargo: { enabled: true }` in
 # pnpm-workspace.yaml). The repository does not commit that setting, so no
 # upstream CI job exercises the path: no run records which processes the
 # feature starts, which hosts they reach, or what they write.
@@ -11,6 +11,13 @@ name: Garnet Cargo receipt
 # under the Garnet step. Only the second job is recorded, and the toolchain
 # is installed before the Garnet step, so the record contains the feature's
 # own execution and nothing else.
+#
+# The fixture's crates (libc, serde) run build scripts and proc macros on
+# the recorded runner. They come from crates.io with a locked Cargo.lock,
+# but they are third-party code running in the same job as the Garnet
+# token. The token is written to a root-only file by the action and the
+# job has no other credential (persist-credentials is off, GITHUB_TOKEN is
+# read-only). Nothing in this job can write to the repository.
 
 on:
   pull_request:
@@ -18,10 +25,15 @@ on:
       - '.github/workflows/garnet-cargo-receipt.yml'
   workflow_dispatch: {}
 
+concurrency:
+  group: garnet-cargo-receipt-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# The Garnet step takes the token explicitly, so it does not need
+# id-token: write, and the PR comment comes from the GitHub App, not from
+# the job, so it does not need pull-requests: write.
 permissions:
   contents: read
-  pull-requests: write
-  id-token: write
 
 jobs:
   build:
@@ -40,7 +52,7 @@ jobs:
           df -h /
 
       - name: Install Rust Toolchain
-        uses: ./.github/actions/rustup
+        uses: $/.github/actions/rustup
 
       - name: Build the pnpm binary
         run: cargo build --locked -p pnpm-cli --bin pnpm
@@ -68,7 +80,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust Toolchain (before recording)
-        uses: ./.github/actions/rustup
+        uses: $/.github/actions/rustup
 
       - name: Download the binary (before recording)
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -130,7 +142,11 @@ jobs:
       - name: Let the sensor settle, then a canary
         # The canary is a known destination from a known binary. If the canary
         # appears in the record and the install does not, the sensor was
-        # running and the install genuinely reached nothing.
+        # running and the install genuinely reached nothing. A canary that
+        # cannot reach example.com is itself part of the record and must not
+        # stop the install from running.
+        id: canary
+        continue-on-error: true
         run: |
           sleep 15
           curl -sS -o /dev/null -w '%{http_code}\n' https://example.com
@@ -166,18 +182,54 @@ jobs:
           rm -rf Cargo.lock .cargo .pnpm node_modules pnpm-lock.yaml target
           "$RUNNER_TEMP/bin/pnpm" install
 
+      # Diagnostics only: reads files the install wrote and prints versions.
+      # No network, so it adds nothing to the egress record. It runs before
+      # the action's post step flushes the profile, like every step here.
       - name: What was written
         if: always()
         working-directory: ${{ runner.temp }}/fixture
+        env:
+          CANARY: ${{ steps.canary.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          SECOND: ${{ steps.second.outcome }}
         run: |
-          echo "install: ${{ steps.install.outcome }}  compile: ${{ steps.compile.outcome }}  second: ${{ steps.second.outcome }}"
+          echo "canary: $CANARY  install: $INSTALL  compile: $COMPILE  second: $SECOND"
           echo "--- .cargo/config.toml"
-          cat .cargo/config.toml 2>/dev/null || echo "(absent)"
+          if [ -f .cargo/config.toml ]; then cat .cargo/config.toml; else echo "(absent)"; fi
           echo "--- Cargo.lock (first 40 lines)"
-          head -40 Cargo.lock 2>/dev/null || echo "(absent)"
+          if [ -f Cargo.lock ]; then head -40 Cargo.lock; else echo "(absent)"; fi
           echo "--- .pnpm/crates (two levels)"
-          find .pnpm/crates -maxdepth 3 2>/dev/null | head -40 || echo "(absent)"
-          echo "--- directory source contents"
-          find .pnpm/crates -maxdepth 4 -name '.cargo-checksum.json' 2>/dev/null | head -20 || true
+          if [ -d .pnpm/crates ]; then
+            find .pnpm/crates -maxdepth 3 | head -40
+            echo "--- directory source contents"
+            find .pnpm/crates -maxdepth 4 -name '.cargo-checksum.json' | head -20
+          else
+            echo "(absent)"
+          fi
           echo "--- runner"
           echo "runner=${RUNNER_NAME} os=$(. /etc/os-release; echo "$PRETTY_NAME") rustc=$(rustc --version)"
+
+      # The experiment steps continue on error so the record and the
+      # diagnostics above always land. The job itself must still say whether
+      # the experiment succeeded.
+      - name: Experiment outcome
+        if: always()
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+          SECOND: ${{ steps.second.outcome }}
+        run: |
+          {
+            echo "## cargo.enabled receipt"
+            echo
+            echo "| step | outcome |"
+            echo "|---|---|"
+            echo "| pnpm install (cargo.enabled) | $INSTALL |"
+            echo "| cargo build --locked --offline | $COMPILE |"
+            echo "| second install, cold cache | $SECOND |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$INSTALL" != success ] || [ "$COMPILE" != success ] || [ "$SECOND" != success ]; then
+            echo "::error::experiment did not succeed: install=$INSTALL compile=$COMPILE second=$SECOND"
+            exit 1
+          fi
