@@ -1,0 +1,15 @@
+name: Garnet dollar-form acceptance
+
+on:
+  push:
+    branches:
+      - 'devin/**'
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  gate:
+    name: Garnet dollar-form acceptance / reproduce
+    # The $/ self-repository form IS the reproduction; keep it.
+    uses: $/.github/workflows/garnet-dollar-acceptance-job.yml

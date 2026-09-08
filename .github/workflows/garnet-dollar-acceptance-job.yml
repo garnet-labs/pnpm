@@ -1,0 +1,45 @@
+name: Garnet dollar-form acceptance job
+
+on:
+  workflow_call: {}
+
+permissions: {}
+
+jobs:
+  reproduce:
+    name: Reproduce self-repo $/ reference
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet runtime monitoring
+        uses: garnet-org/action@7a09bf7c85dcb2a85fb3230d9b62609672c617a7
+        env:
+          GARNET_ACTION_ENABLE_OIDC_AUTH: 'true'
+        with:
+          jibril_version: v2.16.0
+          debug: true
+
+      - name: Workload with egress
+        run: |
+          curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null
+          node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"
+          sleep 20
+
+      - name: Record jibril runtime state
+        if: always()
+        run: |
+          unit_active="$(systemctl is-active jibril || true)"
+          echo "--- jibril.service state: $unit_active ---"
+          if sudo test -f /var/run/jibril/jibril.status.json; then
+            sudo cat /var/run/jibril/jibril.status.json
+          else
+            echo "status file absent — sensor never reached main loop"
+          fi
+          exit 0
