@@ -141,7 +141,7 @@ if [ "$in_pr_context" = true ]; then
 fi
 
 # --- 5. public permalink -------------------------------------------------------
-permalink=""; permalink_html=000; permalink_api=000
+permalink=""; permalink_html="untested"; permalink_api="untested"
 if [ -n "$profile_id" ]; then
   permalink="$GARNET_APP_URL/public/runs/$run_id?profile=$profile_id"
   permalink_html="$(curl -sS -o /dev/null -w '%{http_code}' "$permalink" || echo 000)"
@@ -184,6 +184,7 @@ jq -n \
     permalink: {url: $permalink, html: $permalink_html, api: $permalink_api}}' > /tmp/gate-record.json
 
 run_url="https://github.com/$repo/actions/runs/$run_id"
+profile_short="${profile_sha:0:7}"
 {
   echo "<!-- garnet:jibril-release-gate $GATE_TAG -->"
   echo "### Jibril release gate · \`$GATE_TAG\` · **$verdict**"
@@ -204,11 +205,11 @@ run_url="https://github.com/$repo/actions/runs/$run_id"
   echo "| workflow ref seen by sensor | \`${STARTUP_WORKFLOW_REF:-absent}\` |"
   if [ "$in_pr_context" = true ]; then
     echo "| base → head | \`${PR_BASE_SHA:0:7}\` → \`${PR_HEAD_SHA:0:7}\` |"
-    echo "| merge sha at run | \`${merge_sha:0:7}\` · profile recorded \`${profile_sha:0:7}\` (\`$profile_ref\`) |"
+    echo "| merge sha at run | \`${merge_sha:0:7}\` · profile recorded \`${profile_short:-none}\`${profile_ref:+ (\`$profile_ref\`)} |"
     echo "| comparison in comment | ${comparison:-n/a}${previous_sha:+ (previous \`${previous_sha:0:7}\`)} |"
     echo "| synthetic merge | $synthetic_merge |"
   else
-    echo "| commit | \`${merge_sha:0:7}\` · profile recorded \`${profile_sha:0:7}\` (\`$profile_ref\`) · no base/head pair |"
+    echo "| commit | \`${merge_sha:0:7}\` · profile recorded \`${profile_short:-none}\`${profile_ref:+ (\`$profile_ref\`)} · no base/head pair |"
   fi
   if [ "$verdict" = FAIL ]; then
     echo
