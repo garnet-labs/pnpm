@@ -23,6 +23,25 @@ env:
   GARNET_APP_URL: https://app.garnet.ai
 
 jobs:
+  # The same workload on the same runner class without the sensor. The verify
+  # job subtracts its wall time from the reproduce job's to state the overhead
+  # the sensor adds, which pnpm named as a requirement when it adopted Garnet.
+  baseline:
+    name: Same workload without the sensor
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      seconds: ${{ steps.time.outputs.seconds }}
+    steps:
+      - id: time
+        run: |
+          start=$(date +%s)
+          curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null
+          node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
   reproduce:
     name: Reproduce self-repo reference on Blacksmith
     # Same runner class as the garnet-enabled leg in ci.yml.
@@ -40,10 +59,18 @@ jobs:
       workflow_ref: ${{ steps.assert.outputs.workflow_ref }}
       workload: ${{ steps.workload.outcome }}
       runner_name: ${{ steps.assert.outputs.runner_name }}
+      job_start: ${{ steps.clock.outputs.job_start }}
+      action_seconds: ${{ steps.action_clock.outputs.action_seconds }}
+      workload_seconds: ${{ steps.assert.outputs.workload_seconds }}
+      job_end: ${{ steps.assert.outputs.job_end }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Start the clock
+        id: clock
+        run: echo "job_start=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Garnet runtime monitoring
         uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main, v2.3.0 candidate
@@ -54,6 +81,18 @@ jobs:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
           jibril_version: ${{ inputs.jibril_version }}
           debug: true
+
+      # Everything between the two clocks is the action step: download,
+      # verification, install and the wait for the sensor to come up.
+      - name: Stop the action clock
+        id: action_clock
+        if: always()
+        env:
+          JOB_START: ${{ steps.clock.outputs.job_start }}
+        run: |
+          now=$(date +%s)
+          echo "action_seconds=$(( now - JOB_START ))" >> "$GITHUB_OUTPUT"
+          echo "workload_start=$now" > /tmp/gate-clock
 
       # The verify job later checks that this destination is in the uploaded
       # profile, so a registry outage shows up as "workload not recorded",
@@ -71,6 +110,8 @@ jobs:
         env:
           GATE_TAG: ${{ inputs.jibril_version }}
         run: |
+          workload_end=$(date +%s)
+          workload_start=$(cut -d= -f2 /tmp/gate-clock 2>/dev/null || echo "$workload_end")
           # Poll up to 90s for the runtime status file.
           found=false
           for i in $(seq 1 18); do
@@ -107,6 +148,8 @@ jobs:
             echo "steps_status=$steps_status"
             echo "workflow_ref=$workflow_ref"
             echo "runner_name=$RUNNER_NAME"
+            echo "workload_seconds=$(( workload_end - workload_start ))"
+            echo "job_end=$(date +%s)"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### Jibril release gate · startup"
@@ -124,10 +167,10 @@ jobs:
   # is the only place that can observe them.
   verify:
     name: Verify profile, App comment and permalink
-    needs: reproduce
+    needs: [reproduce, baseline]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write # upsert the gate comment on the tracking PR
@@ -135,6 +178,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # pnpm runs zizmor on every PR; the gate applies the same scanner to the
+      # workflow files a test PR touches so its finding count is a gate leg.
+      - name: Install zizmor
+        run: pipx install zizmor==1.30.0
 
       - name: Verify evidence chain
         id: verify
@@ -148,6 +196,11 @@ jobs:
           STARTUP_UNIT: ${{ needs.reproduce.outputs.unit_active }}
           STARTUP_STEPS_STATUS: ${{ needs.reproduce.outputs.steps_status }}
           STARTUP_WORKFLOW_REF: ${{ needs.reproduce.outputs.workflow_ref }}
+          ACTION_SECONDS: ${{ needs.reproduce.outputs.action_seconds }}
+          REPRODUCE_JOB_START: ${{ needs.reproduce.outputs.job_start }}
+          REPRODUCE_JOB_END: ${{ needs.reproduce.outputs.job_end }}
+          REPRODUCE_WORKLOAD_SECONDS: ${{ needs.reproduce.outputs.workload_seconds }}
+          BASELINE_WORKLOAD_SECONDS: ${{ needs.baseline.outputs.seconds }}
           WORKLOAD_OUTCOME: ${{ needs.reproduce.outputs.workload }}
           RUNNER_NAME_USED: ${{ needs.reproduce.outputs.runner_name }}
           EVENT_NAME: ${{ github.event_name }}

@@ -13,13 +13,12 @@ on:
         description: 'fork PR number to comment on'
         required: false
         default: '36'
-  # A pull request that edits the gate runs the full chain in PR context. Only
-  # refs/pull/N/merge runs get a Garnet Runtime Review comment, so this is the
-  # one trigger that can prove the comment leg.
+  # Every pnpm test PR that carries the `garnet-release-testing` label runs the
+  # full chain in its own PR context. Only refs/pull/N/merge runs get a Garnet
+  # Runtime Review comment, so this is the one trigger that can prove the
+  # comment leg. Applying the label to an open PR starts the gate at once.
   pull_request:
-    paths:
-      - '.github/workflows/garnet-jibril-release-gate.yml'
-      - '.github/workflows/garnet-jibril-release-gate-job.yml'
+    types: [opened, reopened, synchronize, labeled]
 
 permissions: {}
 
@@ -32,10 +31,11 @@ concurrency:
 jobs:
   detect:
     name: Pick the Jibril release to gate
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'garnet-release-testing')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      pull-requests: read # read the tracking PR's comments for the per-tag gate marker
+      pull-requests: read # read the tracking PR's body and comments for the tag override and the per-tag gate marker
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
       run_gate: ${{ steps.pick.outputs.run_gate }}
@@ -54,12 +54,18 @@ jobs:
           json="$(curl -sSf -H 'Accept: application/vnd.github+json' https://api.github.com/repos/garnet-org/jibril-releases/releases?per_page=20)"
           newest_tag="$(jq -r '[.[] | select(.draft==false)] | sort_by(.published_at) | last | .tag_name' <<<"$json")"
           newest_at="$(jq -r '[.[] | select(.draft==false)] | sort_by(.published_at) | last | .published_at' <<<"$json")"
-          tag="${REQUESTED:-$newest_tag}"
+          tag="${REQUESTED:-}"
           if [ "$EVENT" = pull_request ]; then
             report_pr="$PR_NUMBER"
+            # A PR pins the tag it tests with one line in its body:
+            #   garnet-gate: jibril_version=v2.17.0-rc.10
+            body_tag="$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq '.body // ""' \
+              | grep -oE '^garnet-gate: jibril_version=[A-Za-z0-9._-]+' | head -n1 | cut -d= -f2 || true)"
+            tag="${tag:-$body_tag}"
           else
             report_pr="${REPORT_PR_INPUT:-36}"
           fi
+          tag="${tag:-$newest_tag}"
           run_gate=true
           if [ "$EVENT" = schedule ]; then
             # Gate each tag once: skip when the tracking PR already carries this
