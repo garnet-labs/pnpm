@@ -12,8 +12,15 @@ on:
         required: false
         type: string
         default: '36'
+    secrets:
+      GARNET_API_TOKEN:
+        required: true
 
 permissions: {}
+
+env:
+  GARNET_API_URL: https://api.garnet.ai
+  GARNET_APP_URL: https://app.garnet.ai
 
 jobs:
   reproduce:
@@ -23,15 +30,23 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: write
-      issues: write
+    outputs:
+      verdict: ${{ steps.assert.outputs.verdict }}
+      reason: ${{ steps.assert.outputs.reason }}
+      status: ${{ steps.assert.outputs.status }}
+      version: ${{ steps.assert.outputs.version }}
+      unit_active: ${{ steps.assert.outputs.unit_active }}
+      steps_status: ${{ steps.assert.outputs.steps_status }}
+      workflow_ref: ${{ steps.assert.outputs.workflow_ref }}
+      workload: ${{ steps.workload.outcome }}
+      runner_name: ${{ steps.assert.outputs.runner_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Garnet runtime monitoring
-        uses: garnet-org/action@540530e93eb6d1caed43f82d3145900d17041f20 # v2.3.0 candidate
+        uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main, v2.3.0 candidate
         # The action fails open anyway; never let the gate abort before the
         # assertion step can record the verdict.
         continue-on-error: true
@@ -40,7 +55,12 @@ jobs:
           jibril_version: ${{ inputs.jibril_version }}
           debug: true
 
+      # The verify job later checks that this destination is in the uploaded
+      # profile, so a registry outage shows up as "workload not recorded",
+      # not as a failed step masking the sensor verdict.
       - name: Workload with egress
+        id: workload
+        continue-on-error: true
         run: |
           curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null
           node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"
@@ -86,42 +106,88 @@ jobs:
             echo "unit_active=$unit_active"
             echo "steps_status=$steps_status"
             echo "workflow_ref=$workflow_ref"
+            echo "runner_name=$RUNNER_NAME"
           } >> "$GITHUB_OUTPUT"
           {
-            echo "### Jibril release gate"
+            echo "### Jibril release gate · startup"
             echo "| field | value |"
             echo "|---|---|"
             echo "| requested tag | \`$GATE_TAG\` |"
             echo "| resolved version | \`${version:-unknown}\` |"
-            echo "| verdict | **$verdict** — $reason |"
+            echo "| startup verdict | **$verdict** — $reason |"
             echo "| runner | \`$RUNNER_NAME\` |"
-            echo "| run | $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID |"
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
-      - name: Comment gate verdict on the PR
+  # Everything the sensor produces lands after the reproduce job's post step:
+  # the profile flush, the control-plane upload, the App comment. A second job
+  # is the only place that can observe them.
+  verify:
+    name: Verify profile, App comment and permalink
+    needs: reproduce
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write # upsert the gate comment on the tracking PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify evidence chain
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
+          GATE_TAG: ${{ inputs.jibril_version }}
+          STARTUP_VERDICT: ${{ needs.reproduce.outputs.verdict }}
+          STARTUP_REASON: ${{ needs.reproduce.outputs.reason }}
+          STARTUP_VERSION: ${{ needs.reproduce.outputs.version }}
+          STARTUP_UNIT: ${{ needs.reproduce.outputs.unit_active }}
+          STARTUP_STEPS_STATUS: ${{ needs.reproduce.outputs.steps_status }}
+          STARTUP_WORKFLOW_REF: ${{ needs.reproduce.outputs.workflow_ref }}
+          WORKLOAD_OUTCOME: ${{ needs.reproduce.outputs.workload }}
+          RUNNER_NAME_USED: ${{ needs.reproduce.outputs.runner_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKLOAD_DESTINATION: registry.npmjs.org
+        run: bash .github/scripts/garnet-release-gate-verify.sh
+
+      - name: Keep the gate record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: garnet-release-gate-${{ inputs.jibril_version }}-${{ github.run_attempt }}
+          path: |
+            /tmp/gate-record.json
+            /tmp/gate-comment.md
+          if-no-files-found: warn
+
+      - name: Upsert gate comment on the tracking PR
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           REPORT_PR: ${{ inputs.report_pr }}
           GATE_TAG: ${{ inputs.jibril_version }}
-          VERDICT: ${{ steps.assert.outputs.verdict }}
-          REASON: ${{ steps.assert.outputs.reason }}
-          UNIT: ${{ steps.assert.outputs.unit_active }}
-          STEPS_STATUS: ${{ steps.assert.outputs.steps_status }}
-          STATUS_JSON: ${{ steps.assert.outputs.status }}
-          VERSION: ${{ steps.assert.outputs.version }}
-          WORKFLOW_REF: ${{ steps.assert.outputs.workflow_ref }}
         run: |
-          {
-            echo '<!-- garnet:jibril-release-gate -->'
-            echo "**Jibril release gate · \`$GATE_TAG\` · $VERDICT**"
-            echo "reason: $REASON · unit: \`$UNIT\` · status.json: \`$STATUS_JSON\`/\`$STEPS_STATUS\` · version reported: \`$VERSION\` · workflow_ref: \`$WORKFLOW_REF\`"
-            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID · runner: \`$RUNNER_NAME\` · reusable-workflow form: \`$/\`"
-          } > /tmp/gate-comment.md
-          gh pr comment "$REPORT_PR" --repo "$GH_REPO" --body-file /tmp/gate-comment.md
+          export MARKER="<!-- garnet:jibril-release-gate $GATE_TAG -->"
+          existing="$(gh api "repos/$GH_REPO/issues/$REPORT_PR/comments" --paginate \
+            | jq -r '.[] | select((.body // "") | contains($ENV.MARKER)) | .id' | head -n1)"
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GH_REPO/issues/comments/$existing" -F body=@/tmp/gate-comment.md >/dev/null
+          else
+            gh pr comment "$REPORT_PR" --repo "$GH_REPO" --body-file /tmp/gate-comment.md
+          fi
 
       - name: Gate conclusion
-        if: steps.assert.outputs.verdict != 'PASS'
-        run: exit 1
+        if: steps.verify.outputs.verdict != 'PASS'
+        env:
+          VERDICT: ${{ steps.verify.outputs.verdict }}
+        run: |
+          echo "::error::gate verdict is '${VERDICT:-none}'; see the gate comment and step summary for the failing legs"
+          exit 1
