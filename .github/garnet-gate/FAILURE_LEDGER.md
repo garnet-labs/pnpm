@@ -2,7 +2,9 @@
 
 Every failure the Garnet integration has had on pnpm, and the gate leg that
 catches it now. The gate is `.github/workflows/garnet-jibril-release-gate.yml`;
-the legs live in `.github/scripts/garnet-release-gate-verify.sh`.
+the legs live in `.github/scripts/garnet-release-gate-verify.sh`, which reads
+the workflow shapes through `.github/scripts/garnet-gate-shape.py` and the
+scanner classes through `.github/garnet-gate/scanner-dispositions.yml`.
 
 Rules that keep this ledger and the gate the same thing:
 
@@ -16,8 +18,8 @@ Rules that keep this ledger and the gate the same thing:
    result. An unlabelled test pull request has not been accepted.
    A demo pull request, one written to be shared or presented as the
    product surface, never carries the label: the gate would post its
-   ten-leg verdict into the conversation the reader is meant to see. Its
-   evidence is the Runtime Review comment and its own replay artifacts.
+   fourteen-leg verdict into the conversation the reader is meant to see.
+   Its evidence is the Runtime Review comment and its own replay artifacts.
    To gate the same commits, open a second pull request from the same
    branch and label that one.
 3. A gate leg is PASS/FAIL when a machine can decide it, and a disclosure line
@@ -41,13 +43,13 @@ Rules that keep this ledger and the gate the same thing:
 | F9 | 2026-09 | Workload step failure aborted the job before the verdict was written | fork PR 43 | reproduce steps `continue-on-error`, verify job `if: always()` |
 | F10 | 2026-09 | Scheduled gate posted a new comment on every run | fork PR 36 | per-tag marker, comment updated in place |
 | F11 | 2026-08-28 | Fork pull requests get no secret and no OIDC token; the sensor is silently skipped | fork PR 18 (Qodo) | L10 discloses; not fixable in this rollout |
-| F12 | 2026-09-08 | Dependabot-actor runs receive an empty `GARNET_API_TOKEN` | upstream pull 13270 | L6 discloses when ci.yml passes the token explicitly |
-| F13 | 2026-08 | Garnet steps on macOS release jobs never record; CodeRabbit and Qodo flagged them | fork PR 33, PR 18; upstream release.yml | L6 counts them as a disclosure |
+| F12 | 2026-09-08 | Dependabot-actor runs receive an empty `GARNET_API_TOKEN` | upstream pull 13270 | L13 runs the credential-less path and L10 discloses that it is a simulation |
+| F13 | 2026-08 | Garnet steps on macOS release jobs never record; CodeRabbit and Qodo flagged them | fork PR 33, PR 18; upstream release.yml | L14 reports every Garnet step in release.yml and update-latest.yml with its runner |
 | F14 | 2026-08 | `id-token: write` added for the sensor; a permission ask pnpm did not agree to | fork pin PRs | L6 fails on `id-token: write`, `secrets: inherit`, or `pull-requests: write` added by the PR |
 | F15 | 2026-07 | Action ref not pinned to a full SHA, or sensor floating on `latest` | pnpm v2.2.0 era | L6 fails on unpinned refs and prints the sensor version source |
-| F16 | 2026-09 | zizmor findings on the workflow files a test PR touched (undocumented permissions, anonymous job, missing concurrency) | fork PR 43 | L8 runs zizmor at pnpm's persona on touched files |
+| F16 | 2026-09 | zizmor findings on the workflow files a test PR touched (undocumented permissions, anonymous job, missing concurrency) | fork PR 43 | L8 runs zizmor at both personas on the gate's own workflows and every workflow file the PR touches |
 | F17 | 2026-09 | Bot review threads (Greptile, Devin, Qodo, CodeRabbit) left open on workflow files | fork PR 41, PR 43 | L8 fails on unresolved bot threads under `.github/` |
-| F18 | 2026-08 | Overhead of the sensor on the instrumented job, which pnpm named as a condition | upstream issue 11626 | L9 baseline job without the sensor, overhead budget |
+| F18 | 2026-08 | Overhead of the sensor on the instrumented job, which pnpm named as a condition | upstream issue 11626 | L9 baseline job without the sensor, with a budget on start, overhead and flush |
 | F19 | 2026-09-08 | One instrumented cell (Node 24 on Blacksmith Ubuntu) read as coverage of all six | upstream ci.yml | L10 prints instrumented and uninstrumented cells |
 | F20 | 2026-09-08 | Verdict read from the GitHub job status; a green job proved nothing | all of the above | the only PASS/FAIL is the verify job's conclusion |
 | F21 | 2026-09-09 | Jibril v2.17.0-rc.10 started on the `$/` shape but reported `github.steps.status=degraded` (`job reproduce not found`): the caller job id differed from the called workflow's job id, and the egress was attributed to `<unknown>` | fork run 34309875655 | caller job id equals the callee job id, as pnpm's `test` calls `test`; L1 requires `steps.status=ok`, L3 requires attribution to the workload step |
@@ -55,3 +57,12 @@ Rules that keep this ledger and the gate the same thing:
 | F23 | 2026-09-09 | With step discovery `ok`, the workload egress still recorded on step `<unknown>`: the workload step carried `id: workload`. GitHub sets `GITHUB_ACTION` to a step's id; Jibril derives `__run_N` from the workflow file, so a `run:` step with an id never matches. pnpm's install and test steps have no id, its `Determine test scope` step does | fork run 34310387514 | the workload step has no `id:` and logs `GITHUB_ACTION`; the workload outcome travels through a file to the assert step |
 | F24 | 2026-09-09 | The control plane answers HTTP 403 for a run it never received, the same code as a token without access; L7 printed the code without saying so | fork run 34310387514 (TS CI run 34310387441 on v2.2.0 → `latest` = v2.16.0) | L7 names 403 as "no profile bound to the run" |
 | F25 | 2026-09-09 | Without an id the workload egress recorded on step `0. Start the clock`, the first `run:` step of the job. The step logged `GITHUB_ACTION=__run`: GitHub numbers only id-less `run:` steps, Jibril's `parseStepsList` numbers every `run:` step, so each id-bearing `run:` step before the workload shifts attribution one step back. pnpm's `test.yml` has `id: test-scope` on `Determine test scope`, so `Validate test chunk inputs` and `Run tests` record one step early; the Aug 5–6 baseline already shows registry fetches under `Validate test chunk inputs` | fork run 34311164193, profile `api/v1/profiles/34311164193` | L3 requires attribution to the workload step by name; the gate keeps two id-bearing `run:` steps ahead of the workload, as pnpm's job has one. Jibril fix: skip id-bearing steps in the `__run_N` counter and match them by id |
+| F26 | 2026-09-09 | The gate keeps passing while pnpm's own CI moves: upstream repins the action, changes the instrumented runner, drops the explicit `api_token`, or reorders the run steps around the workload, and the gate is then proving something about a shape pnpm no longer runs | upstream ci.yml and test.yml at main | L11 upstream drift: the verify job reads pnpm's ci.yml and test.yml at main and fails on a difference the gate does not declare deliberate; the upstream sha is in the record |
+| F27 | 2026-09-09 | Warnings from the action step read as noise on a run that has a token: the fail-open warning of F2 is one line among several, and a reader stops reading them | upstream CI, 654 green runs | L12 warning noise: any annotation from the action step on the trusted-token path fails, and the disclosed fail-open text is named separately from an unexpected one |
+| F28 | 2026-09-09 | The credential-less path is claimed to skip cleanly without being run: Dependabot and fork-head runs get an empty `api_token` and only the action's own behaviour decides whether that is a clean skip or a red job | upstream pull 13270 | L13 credential-less simulation: a job with an empty `api_token` and a read-only token must end green with one info line, no warning and no error. A simulation, not server-side evidence; L10 discloses that |
+| F29 | 2026-09-09 | A Garnet step sits in a release or tag workflow and records nothing: on macOS it cannot, and a step that is inert on a Linux runner is a fault that no green job shows | upstream release.yml (macos-latest), update-latest.yml | L14 release and tag instrumentation: every Garnet step in those workflows is reported with its runner and whether it would produce a profile; inert on a Linux runner fails, macOS is a disclosure |
+| F30 | 2026-09-09 | Sensor overhead measured only on the workload, while the post step flush is what a maintainer waits for at the end of every job | upstream issue 11626 | L9 timing: sensor start, workload overhead, post-step flush, profile-visible and comment-final latency, each against its own budget |
+| F31 | 2026-09-09 | More than one Garnet App comment on a pull request, or a comment bound to a head the pull request has moved past, read as current evidence | fork PR 33, PR 41 | L4 comment correctness: exactly one App comment, updated in place, bound to the current head or merge sha, carrying the recorded step name in quotes and at least one destination |
+| F32 | 2026-09-09 | A leg that cannot fail counted as coverage: `no_bad_egress_domain` has been attention-only in every profile and has never had a deny rule to fail against | fork PRs 32, 33, 41, 43 | L10 prints it as vacuous and says so in the comment |
+| F33 | 2026-09-09 | A scanner finding answered in a review conversation and nowhere else; the next reader re-opens it | fork PR 43 | L8 fails on any zizmor finding, regular or pedantic, with no row in `.github/garnet-gate/scanner-dispositions.yml`, and whitelists the two deliberate actionlint messages by message text |
+| F34 | 2026-09-09 | The evidence mirror in the PR body and the App comment disagree, or one of them is bound to a different sha than the other | fork PR 43 | L4 compares the mirrored block against the comment and requires both to name the same sha |
