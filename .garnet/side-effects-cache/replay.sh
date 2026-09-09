@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # Replay the two-project side-effects-cache scenario with a released pnpm.
 #
-# Two fresh git repositories install the same dependency whose postinstall
-# writes .git/hooks/pre-commit into the consuming project. Both share one
+# Three fresh git repositories install the same dependency whose postinstall
+# writes .git/hooks/pre-commit into the consuming project. All three share one
 # store, so the first install seeds the side-effects cache and the second is
-# answered from it.
+# answered from it. The third opts out of the cache the documented way, and
+# the second is then rebuilt explicitly.
 #
-#   project-a  cold store, sideEffectsCache default   script runs,  hook present
-#   project-b  warm store, sideEffectsCache default   cache hit,    hook missing
+#   project-a          cold store, sideEffectsCache default   script runs,  hook present
+#   project-b          warm store, sideEffectsCache default   cache hit,    hook missing
+#   project-c          warm store, sideEffectsCache: false    script runs,  hook present
+#   project-b rebuild  pnpm rebuild in project-b              script runs,  hook present
 #
 # Usage: replay.sh <work-dir> <results.json>
-# Writes one JSON object per project to <results.json> and prints a table.
-# Exits non-zero if any project's outcome differs from the table above.
+# Writes one JSON object per step to <results.json> and prints a table.
+# Exits non-zero if any step's outcome differs from the table above.
 set -euo pipefail
 
 work_dir=$1
@@ -23,8 +26,8 @@ mkdir -p "$work_dir"
 : > "$results"
 failures=0
 
-replay() {
-  local project=$1 side_effects_cache=$2 expect_script=$3
+prepare() {
+  local project=$1 side_effects_cache=$2
   local dir="$work_dir/$project"
   mkdir -p "$dir"
   cp "$fixture_dir/package.json" "$dir/package.json"
@@ -39,9 +42,13 @@ replay() {
       echo "sideEffectsCache: false"
     fi
   } > "$dir/pnpm-workspace.yaml"
+}
 
-  local log="$work_dir/$project.log"
-  (cd "$dir" && pnpm install --reporter=append-only) > "$log" 2>&1
+replay() {
+  local step=$1 project=$2 command=$3 side_effects_cache=$4 expect_script=$5
+  local dir="$work_dir/$project"
+  local log="$work_dir/$step.log"
+  (cd "$dir" && pnpm "$command" --reporter=append-only) > "$log" 2>&1
   local hook=false postinstall_ran=false
   [ -f "$dir/.git/hooks/pre-commit" ] && hook=true
   grep -q 'simple-git-hooks postinstall' "$log" && postinstall_ran=true
@@ -51,14 +58,19 @@ replay() {
     verdict=unexpected
     failures=$((failures + 1))
   fi
-  printf '%-10s sideEffectsCache=%-7s postinstall_ran=%-5s hook_present=%-5s %s\n' \
-    "$project" "$side_effects_cache" "$postinstall_ran" "$hook" "$verdict"
-  printf '{"project":"%s","side_effects_cache":"%s","postinstall_ran":%s,"hook_present":%s,"expected":%s,"verdict":"%s"}\n' \
-    "$project" "$side_effects_cache" "$postinstall_ran" "$hook" "$expect_script" "$verdict" >> "$results"
+  printf '%-18s pnpm %-8s sideEffectsCache=%-7s postinstall_ran=%-5s hook_present=%-5s %s\n' \
+    "$step" "$command" "$side_effects_cache" "$postinstall_ran" "$hook" "$verdict"
+  printf '{"step":"%s","project":"%s","command":"%s","side_effects_cache":"%s","postinstall_ran":%s,"hook_present":%s,"expected":%s,"verdict":"%s"}\n' \
+    "$step" "$project" "$command" "$side_effects_cache" "$postinstall_ran" "$hook" "$expect_script" "$verdict" >> "$results"
 }
 
 echo "pnpm $(pnpm --version) · node $(node --version)"
-replay project-a default true
-replay project-b default false
+prepare project-a default
+prepare project-b default
+prepare project-c false
+replay project-a         project-a install default true
+replay project-b         project-b install default false
+replay project-c         project-c install false   true
+replay project-b-rebuild project-b rebuild default true
 
 exit "$failures"

@@ -50,7 +50,7 @@ jobs:
           npm install --global "pnpm@${PNPM_VERSION}"
           [ "$(pnpm --version)" = "$PNPM_VERSION" ] || { echo "pnpm $(pnpm --version) installed, expected $PNPM_VERSION"; exit 1; }
 
-      - name: Replay two projects on one store
+      - name: Replay three projects on one store, then rebuild the second
         shell: bash
         env:
           WORK_DIR: ${{ runner.temp }}/side-effects-cache
@@ -62,19 +62,19 @@ jobs:
           {
             echo "## Side-effects cache replay"
             echo
-            echo "commit \`${EXPECTED_SHA:0:7}\` · pnpm ${PNPM_VERSION} · two git repositories, one store · \`simple-git-hooks@2.13.1\` postinstall writes \`.git/hooks/pre-commit\`"
+            echo "commit \`${EXPECTED_SHA:0:7}\` · pnpm ${PNPM_VERSION} · three git repositories, one store, then \`pnpm rebuild\` in the second · \`simple-git-hooks@2.13.1\` postinstall writes \`.git/hooks/pre-commit\`"
             echo
             echo '```'
             cat "$WORK_DIR/table.txt"
             echo '```'
             echo
-            echo "<details><summary>pnpm output per project</summary>"
+            echo "<details><summary>pnpm output per step</summary>"
             echo
-            for project in project-a project-b; do
-              echo "\`$project\`"
+            for step in project-a project-b project-c project-b-rebuild; do
+              echo "\`$step\`"
               echo
               echo '```'
-              cat "$WORK_DIR/$project.log"
+              cat "$WORK_DIR/$step.log"
               echo '```'
               echo
             done
