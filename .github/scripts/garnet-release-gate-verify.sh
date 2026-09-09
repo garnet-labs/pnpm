@@ -495,7 +495,8 @@ if [ "$in_pr_context" = true ]; then
   fi
 fi
 if [ "$shape_fail" = true ]; then
-  leg_fail "L6 posture: $(printf '%s; ' "${shape_notes[@]}")"
+  _posture_state="$(printf '%s; ' "${shape_notes[@]}")"
+  leg_fail "L6 posture: ${_posture_state%; }"
   # Expected only while the single thing wrong is the one pnpm's repin fixes:
   # its own `test.yml` leaving `jibril_version` empty at an action sha whose
   # default resolves to a moving selector. Any other posture finding is new.
@@ -1046,7 +1047,9 @@ done
   fi
   if [ "${#expected_notes[@]}" -gt 0 ]; then
     echo
-    echo "Expected today: $(printf '%s; ' "${expected_notes[@]}" | sed 's/; $//')"
+    echo "Expected today:"
+    echo
+    printf -- '- %s\n' "${expected_notes[@]}"
     echo
     echo "<sub>An expected failure still fails. The marker says a named event retires it, and the run drops the marker by itself once that event is observable.</sub>"
   fi
