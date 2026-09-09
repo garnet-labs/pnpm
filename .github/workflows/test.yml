@@ -63,6 +63,7 @@ jobs:
       uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
+        jibril_version: v2.17.0-rc.10
     - name: Install pnpm and Node
       uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
       with:
