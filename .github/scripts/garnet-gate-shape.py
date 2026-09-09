@@ -36,6 +36,8 @@ WORKLOAD_STEP = "Workload with egress"
 UPSTREAM_WORKLOAD_STEP_PREFIX = "Run tests"
 ACTION = "garnet-org/action@"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+# A sensor release the control plane can serve twice: vN.N.N, optionally -rc.N.
+PINNED_SENSOR = re.compile(r"^v\d+\.\d+(\.\d+)?(-[0-9A-Za-z.]+)?$")
 
 
 def load(path: str) -> dict:
@@ -64,11 +66,26 @@ def action_ref(step: dict) -> str:
 
 
 def permissions_of(job: dict, doc: dict | None = None) -> dict:
-    """Job-level permissions, or the workflow-level ones the job inherits."""
+    """The permissions the job's token actually carries.
+
+    A job-level `permissions:` key overrides the workflow-level one whatever its
+    shape, so the scalar forms have to be expanded rather than skipped: a job
+    that says `permissions: write-all` under a workflow that says
+    `contents: read` gets write on everything.
+    """
     for source in (job, doc or {}):
-        perms = source.get("permissions")
-        if isinstance(perms, dict) and perms:
-            return perms
+        if "permissions" not in source:
+            continue
+        perms = source["permissions"]
+        if isinstance(perms, dict):
+            if perms:
+                return dict(perms)
+            return {}
+        scalar = str(perms).strip()
+        if scalar in ("write-all", "read-all"):
+            grant = "write" if scalar == "write-all" else "read"
+            return {"all": grant, "id-token": grant, "pull-requests": grant, "contents": grant}
+        return {"unrecognised": scalar}
     return {}
 
 
@@ -117,6 +134,23 @@ def attribution(job: dict, workload_name: str) -> dict:
     }
 
 
+def run_step_sequence(job: dict, workload_name: str) -> list[str]:
+    """The run steps before the workload, as `id`/`idless` in file order.
+
+    Jibril numbers every run step and GitHub numbers only the id-less ones, so
+    the attribution of the workload depends on this whole sequence, not on
+    whether some id-bearing step exists somewhere before it. Names are left out:
+    upstream renaming a step does not move the numbering, adding, removing or
+    reordering one does.
+    """
+    sequence = []
+    for name, step_id in run_step_names(job):
+        if name.startswith(workload_name):
+            return sequence
+        sequence.append("id" if step_id else "idless")
+    return sequence
+
+
 def id_bearing_before(job: dict, workload_name: str) -> dict:
     """The run-step shape upstream has around its workload: at least one
     id-bearing run step, then an id-less one, then the workload."""
@@ -129,10 +163,11 @@ def id_bearing_before(job: dict, workload_name: str) -> dict:
                 "idless_before": [n for n, i in before if not i],
                 "immediately_before": before[-1][0] if before else None,
                 "immediately_before_has_id": bool(before[-1][1]) if before else None,
+                "sequence": ["id" if i else "idless" for _, i in before],
             }
         before.append((name, step_id))
     return {"id_bearing_before": [], "idless_before": [], "immediately_before": None,
-            "immediately_before_has_id": None}
+            "immediately_before_has_id": None, "sequence": []}
 
 
 def instrumented_cell(ci: dict) -> dict:
@@ -184,10 +219,19 @@ def release_report(paths: dict[str, str]) -> list[dict]:
             if step is None:
                 continue
             runner = str(job.get("runs-on", "?"))
+            condition = str(step.get("if", job.get("if", ""))).strip()
             if runner.startswith(("macos", "windows")):
                 produces, reason = "no", f"{runner.split('-')[0]} runner: the sensor is Linux-only eBPF"
             elif "ubuntu" in runner or "linux" in runner:
-                produces, reason = "yes", f"{runner} runs the sensor"
+                # A Linux runner can carry the sensor; whether this step reaches
+                # it is a runtime fact the gate has no run of, and a condition
+                # can skip it entirely. Say which of the two this is.
+                if condition:
+                    produces = "conditional"
+                    reason = f"{runner}, guarded by `if: {condition}`: records only when that holds"
+                else:
+                    produces = "expected"
+                    reason = f"{runner} can run the sensor; no run of this workflow is bound to this gate"
             else:
                 produces, reason = "unknown", f"unrecognised runner {runner}"
             report.append(
@@ -197,6 +241,7 @@ def release_report(paths: dict[str, str]) -> list[dict]:
                     "runner": runner,
                     "instrumented": True,
                     "produces_profile": produces,
+                    "condition": condition,
                     "reason": reason,
                     "action_ref": action_ref(step),
                 }
@@ -215,6 +260,9 @@ def posture(job: dict, name: str, doc: dict | None = None, default_version: str 
 
     add("id-token: write absent", perms.get("id-token") != "write",
         f"permissions: {perms or 'inherited'}")
+    add("permissions enumerated, not blanket",
+        "all" not in perms and "unrecognised" not in perms,
+        f"permissions: {perms or 'inherited'}")
     add("no secrets: inherit", "inherit" not in str(job.get("secrets", "")),
         f"secrets: {job.get('secrets', 'none')}")
     add("no pull-requests: write", perms.get("pull-requests") != "write",
@@ -227,16 +275,23 @@ def posture(job: dict, name: str, doc: dict | None = None, default_version: str 
     token = str((step.get("with") or {}).get("api_token", ""))
     add("explicit api_token from secrets", "secrets.GARNET_API_TOKEN" in token,
         f"api_token: {token or 'unset'}")
-    version = str((step.get("with") or {}).get("jibril_version", ""))
+    version = str((step.get("with") or {}).get("jibril_version", "")).strip()
     # An empty input hands the sensor version to the action's own default, which
     # is only acceptable while that default is an explicit pin: a root eBPF
-    # binary must not change under an unchanged action ref.
-    add(
-        "sensor version pinned",
-        bool(version) or default_version not in ("", "latest", "unknown"),
-        f"jibril_version: {version}" if version
-        else f"action default at {ref[:7]} resolves to {default_version or 'unknown'}",
-    )
+    # binary must not change under an unchanged action ref. An explicit input is
+    # only a pin when it names one immutable release; `latest` is not one, and
+    # an expression is resolved by the caller, not here.
+    effective = version or default_version
+    if version.startswith("${{"):
+        detail = f"jibril_version: {version} (resolved by the caller)"
+        pinned = True
+    elif version:
+        detail = f"jibril_version: {version}"
+        pinned = bool(PINNED_SENSOR.match(version))
+    else:
+        detail = f"action default at {ref[:7]} resolves to {effective or 'unknown'}"
+        pinned = bool(PINNED_SENSOR.match(effective or ""))
+    add("sensor version pinned", pinned, detail)
     return findings
 
 
@@ -254,6 +309,11 @@ def main() -> int:
     gate_job = load(GATE_JOB_WORKFLOW)
     gate_caller = load(GATE_CALLER_WORKFLOW)
     local_ci = load(".github/workflows/ci.yml")
+    local_cell = instrumented_cell(local_ci)
+
+    def cell_label(c: dict) -> str:
+        return (f'{c.get("platform_label", c.get("platform", "?"))}'
+                f'/node {c.get("node_major", c.get("node", "?"))}')
 
     reproduce = jobs(gate_job).get(REPRODUCE_JOB) or {}
     upstream_test_job = next(
@@ -275,7 +335,7 @@ def main() -> int:
 
     drift = []
 
-    def compare(field, upstream_value, gate_value, deliberate="", ok=None):
+    def compare(field, upstream_value, gate_value, deliberate="", ok=None, note=""):
         verdict = "match" if (ok if ok is not None else upstream_value == gate_value) else "drift"
         if verdict == "drift" and deliberate:
             verdict = "deliberate"
@@ -285,12 +345,16 @@ def main() -> int:
                 "upstream": upstream_value,
                 "gate": gate_value,
                 "verdict": verdict,
-                "note": deliberate if verdict == "deliberate" else "",
+                "note": deliberate if verdict == "deliberate" else note,
             }
         )
 
     compare("reusable call form", call_form(upstream_call), call_form(gate_call))
     compare("instrumented runner", cell.get("platform", "?"), str(reproduce.get("runs-on", "?")))
+    # Which cell carries the sensor, not just how many do: moving Garnet from
+    # the Node 24 cell to another one on the same runner changes what the gate
+    # speaks for.
+    compare("instrumented cell", cell_label(cell), cell_label(local_cell))
     compare(
         "action ref",
         action_ref(upstream_step) if upstream_step else "none",
@@ -314,15 +378,29 @@ def main() -> int:
         permissions_of(upstream_test_job, upstream_test) or "inherited",
         permissions_of(reproduce, gate_job) or "inherited",
     )
+    # The ordered run-step layout before the workload decides Jibril's __run_N
+    # attribution. The gate runs a shorter job than pnpm's test job on purpose,
+    # so equality is the wrong bar; what has to hold is the part of the layout
+    # the skew is a function of: how many id-bearing run steps precede the
+    # workload, and whether the step immediately before it carries an id.
+    upstream_sequence = run_step_sequence(upstream_test_job, UPSTREAM_WORKLOAD_STEP_PREFIX)
+    gate_sequence = run_step_sequence(reproduce, WORKLOAD_STEP)
+
+    def skew_shape(sequence: list[str]) -> str:
+        if not sequence:
+            return "no run step before the workload"
+        return (
+            f"{sequence.count('id')} id-bearing before the workload, "
+            f"last one {sequence[-1]}"
+        )
+
     compare(
-        "id-bearing run step before the workload",
-        bool(upstream_shape["id_bearing_before"]),
-        bool(gate_shape["id_bearing_before"]),
-    )
-    compare(
-        "id-less run step immediately before the workload",
-        upstream_shape["immediately_before_has_id"] is False,
-        gate_shape["immediately_before_has_id"] is False,
+        "run-step layout before the workload",
+        f"{skew_shape(upstream_sequence)} ({' '.join(upstream_sequence) or 'none'})",
+        f"{skew_shape(gate_sequence)} ({' '.join(gate_sequence) or 'none'})",
+        ok=bool(upstream_sequence) and skew_shape(upstream_sequence) == skew_shape(gate_sequence),
+        note="the gate runs fewer steps than pnpm's test job; the skew is a "
+             "function of the id-bearing count and the last step before the workload",
     )
 
     record = {
@@ -360,6 +438,8 @@ def main() -> int:
             # instruments and the fork does not, or the other way round.
             "local_instrumented": sum(1 for c in all_cells(local_ci) if c["instrumented"]),
             "local_total": len(all_cells(local_ci)),
+            "instrumented_cells": [c["cell"] for c in all_cells(upstream_ci) if c["instrumented"]],
+            "local_instrumented_cells": [c["cell"] for c in all_cells(local_ci) if c["instrumented"]],
         },
     }
     json.dump(record, sys.stdout, indent=2, sort_keys=False, default=str)

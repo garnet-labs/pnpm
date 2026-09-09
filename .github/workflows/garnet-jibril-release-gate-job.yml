@@ -59,7 +59,7 @@ jobs:
       workflow_ref: ${{ steps.assert.outputs.workflow_ref }}
       workload: ${{ steps.assert.outputs.workload }}
       runner_name: ${{ steps.assert.outputs.runner_name }}
-      job_start: ${{ steps.clock.outputs.job_start }}
+      job_start: ${{ steps.action_clock.outputs.job_start }}
       action_seconds: ${{ steps.action_clock.outputs.action_seconds }}
       workload_seconds: ${{ steps.assert.outputs.workload_seconds }}
       job_end: ${{ steps.assert.outputs.job_end }}
@@ -68,9 +68,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # No `id:` here. pnpm's instrumented job has exactly one id-bearing run
+      # step before its test step, and that count is what shifts Jibril's
+      # step numbering; a second one here would reproduce a different skew
+      # from the one pnpm sees (ledger F25).
       - name: Start the clock
-        id: clock
-        run: echo "job_start=$(date +%s)" >> "$GITHUB_OUTPUT"
+        run: date +%s > /tmp/gate-start
 
       - name: Garnet runtime monitoring
         uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main, v2.3.0 candidate
@@ -87,11 +90,13 @@ jobs:
       - name: Stop the action clock
         id: action_clock
         if: always()
-        env:
-          JOB_START: ${{ steps.clock.outputs.job_start }}
         run: |
           now=$(date +%s)
-          echo "action_seconds=$(( now - JOB_START ))" >> "$GITHUB_OUTPUT"
+          job_start="$(cat /tmp/gate-start 2>/dev/null || echo "$now")"
+          {
+            echo "job_start=$job_start"
+            echo "action_seconds=$(( now - job_start ))"
+          } >> "$GITHUB_OUTPUT"
           echo "workload_start=$now" > /tmp/gate-clock
 
       # pnpm's instrumented job runs `Determine test scope` (id: test-scope),
@@ -255,9 +260,18 @@ jobs:
           echo "$ACTIONLINT_SHA256  /tmp/actionlint.tgz" | sha256sum -c -
           tar -xzf /tmp/actionlint.tgz -C /usr/local/bin actionlint
 
-      # The shape analyzer and the scanner classifier read workflow YAML.
+      # The shape analyzer and the scanner classifier read workflow YAML. This
+      # job can write to pull requests, so the fallback install is pinned and
+      # hash-checked rather than resolved at run time.
       - name: Ensure PyYAML
-        run: python3 -c 'import yaml' || pip3 install --quiet --break-system-packages pyyaml
+        run: |
+          python3 -c 'import yaml' && exit 0
+          cat > /tmp/pyyaml.txt <<'EOF'
+          pyyaml==6.0.2 \
+            --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+            --hash=sha256:d584d9ec91ad65861cc08d42e834324ef890a082e591037abe114850ff7bbc3e
+          EOF
+          pip3 install --quiet --break-system-packages --require-hashes --no-deps -r /tmp/pyyaml.txt
 
       # pnpm's own files at main, read fresh: the gate only proves something
       # about pnpm while it still reproduces pnpm's shape.
