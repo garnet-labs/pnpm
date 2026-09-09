@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use crate::_utils::pacquet_in;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
@@ -98,18 +99,11 @@ fn assert_side_effects_materialized(hoisted: bool) {
     drop((root, mock_instance));
 }
 
-/// The cache records what a build writes inside its own package directory
-/// and nothing else. A script that writes into the consuming project, such
-/// as a git hook under `.git/hooks` the way `simple-git-hooks` and `husky`
-/// install theirs, leaves nothing for the cache to restore. The first
-/// project on a store runs the script and gets its hook. A second project
-/// on the same store gets the cached build instead, and no hook. That is
-/// the intended trade, and `sideEffectsCache: false` is the documented way
-/// for such a project to opt out of it.
-///
-/// Pins both halves: the second project does not run the script on a warm
-/// store, and the same project with `sideEffectsCache: false` does.
-/// Regression for <https://github.com/pnpm/pnpm/issues/14717>.
+// The cache records only what a build writes inside its own package
+// directory, so a hook written into the consuming project's `.git/hooks`
+// (`simple-git-hooks`, `husky`) is not restorable. The missing hook on the
+// warm store is the intended trade, not a bug; `sideEffectsCache: false` is
+// the documented opt-out. <https://github.com/pnpm/pnpm/issues/14717>
 #[test]
 fn a_second_project_on_the_store_gets_the_hook_only_without_the_cache() {
     let SecondProject { root, mock_instance, project, hook } =
@@ -132,8 +126,8 @@ fn a_second_project_on_the_store_gets_the_hook_only_without_the_cache() {
     drop((root, mock_instance));
 }
 
-/// `pnpm rebuild` runs the scripts regardless of the cache, so it is the
-/// other documented way for the second project to get its hook.
+// `pnpm rebuild` runs the scripts regardless of the cache, so it is the
+// other documented way for the second project to get its hook.
 #[test]
 fn a_second_project_on_the_store_gets_the_hook_after_an_explicit_rebuild() {
     let SecondProject { root, mock_instance, project, hook } =
@@ -150,9 +144,9 @@ fn a_second_project_on_the_store_gets_the_hook_after_an_explicit_rebuild() {
     drop((root, mock_instance));
 }
 
-/// A second project that just installed `@pnpm.e2e/git-hook-installer`
-/// against a store another project already seeded: the build came from the
-/// side-effects cache, the script did not run, and `hook` does not exist.
+// A second project that just installed `@pnpm.e2e/git-hook-installer`
+// against a store another project already seeded: the build came from the
+// side-effects cache, the script did not run, and `hook` does not exist.
 struct SecondProject {
     root: TempDir,
     mock_instance: TestRegistry,
@@ -206,7 +200,7 @@ impl SecondProject {
         );
         assert!(
             !hook.exists(),
-            "a hook the cache cannot restore must be missing after a cached build"
+            "a hook the cache cannot restore must be missing after a cached build",
         );
 
         SecondProject { root, mock_instance, project, hook }
@@ -221,17 +215,8 @@ fn assert_hook_installed(hook: &Path) {
     );
 }
 
-/// A fresh `pacquet <args>` in `project` that must succeed, returning what
-/// it printed. The registry config lives in the project's `.npmrc` /
-/// `pnpm-workspace.yaml` and the mock registry is a process-global
-/// singleton kept alive by the caller, so this only needs its own command.
 fn pacquet_stdout(project: &Path, args: &[&str]) -> String {
-    let output = Command::cargo_bin("pnpm")
-        .expect("find the pnpm binary")
-        .with_current_dir(project)
-        .with_args(args)
-        .output()
-        .expect("run pacquet");
+    let output = pacquet_in(project).with_args(args).output().expect("run pacquet");
     assert!(output.status.success(), "pacquet must succeed: {output:?}");
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
