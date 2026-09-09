@@ -40,6 +40,8 @@ set -uo pipefail
 : "${WORKLOAD_STEP_NAME:=Workload with egress}"
 : "${REPRODUCE_JOB:=reproduce}"
 : "${POLL_SECONDS:=600}"
+# The App writes the description mirror after it finalizes the comment.
+: "${MIRROR_POLL_SECONDS:=300}"
 : "${INTEGRATION_WORKFLOW_NAME:=TS CI}"
 : "${INTEGRATION_POLL_SECONDS:=1500}"
 : "${OVERHEAD_BUDGET_SECONDS:=120}"
@@ -167,6 +169,20 @@ step_seconds() {
     | ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601))] | first // empty' <<<"$1"
 }
 annotations() { grep -E '##\[(warning|error)\]' <<<"${1:-}" || true; }
+# A job's annotations from the check run, in the log's own notation. The log of a
+# job in a run that is still going is often not archived yet, and the verify job
+# runs inside that run: reading the log alone made L12 report zero annotations
+# for a job that had one and L13 read the credential-less path as silent (F35).
+# The check run carries the same warning and error lines while the run is live.
+job_annotation_lines() { # $1 job id; prints lines, nonzero when unreadable
+  [ -n "$1" ] || return 1
+  gh api --paginate "repos/$repo/check-runs/$1/annotations" \
+    --jq '.[] | select(.annotation_level == "warning" or .annotation_level == "failure")
+      | "##[\(if .annotation_level == "failure" then "error" else "warning" end)]\(.message | gsub("[\r\n]+"; " "))"' 2>/dev/null
+}
+# The lines one source has and the other does not, so a log slice and the check
+# run can be added up without counting the same annotation twice.
+merge_annotation_lines() { printf '%s\n%s\n' "${1:-}" "${2:-}" | sed -E 's/^[0-9T:.Z-]+ //' | sed '/^$/d' | sort -u; }
 
 # --- L1 startup ----------------------------------------------------------------
 startup_verdict="${STARTUP_VERDICT:-FAIL}"
@@ -285,12 +301,21 @@ if [ "$in_pr_context" = true ]; then
     if [ -n "$match" ]; then
       comment_url="$(jq -r '.html_url' <<<"$match")"
       comment_body="$(jq -r '.body' <<<"$match")"
-      if jq -e '.body | contains("<!-- garnet-control-plane-pr-comment:v1")' <<<"$match" >/dev/null; then
+      # The placeholder the App posts first already carries the v1 marker, so
+      # the marker alone is not finality: the record is final once the summary
+      # block reports the chains it recorded. Reading the placeholder as final
+      # is how L4 saw a body with no step name and no destination.
+      summary_json="$(jq -r '.body | capture("<!-- garnet:summary (?<s>.*?) -->").s // ""' <<<"$match")"
+      chains=0
+      [ -z "$summary_json" ] || chains="$(jq -r '.chains // 0' <<<"$summary_json" 2>/dev/null || echo 0)"
+      [ "$chains" != null ] || chains=0
+      if jq -e '.body | contains("<!-- garnet-control-plane-pr-comment:v1")' <<<"$match" >/dev/null \
+         && [ -n "$summary_json" ] && [ "$chains" -gt 0 ] 2>/dev/null; then
         comment_state="final after $(( $(now) - comment_wait_start ))s"
         comment_seconds=$(( $(now) - comment_wait_start ))
-        summary_json="$(jq -r '.body | capture("<!-- garnet:summary (?<s>.*?) -->").s // ""' <<<"$match")"
         break
       fi
+      summary_json=""
       comment_state="pending"
     fi
     sleep 15
@@ -333,9 +358,17 @@ if [ "$in_pr_context" = true ]; then
   if [ -n "$comment_body" ]; then
     recorded_step="$(jq -r 'first(.[]?) // ""' <<<"$workload_steps")"
     [ -n "$recorded_step" ] || recorded_step="$WORKLOAD_STEP_NAME"
+    # The profile carries the step's ordinal (`3. Validate ...`); the comment
+    # quotes the name alone. Both are the same recorded step.
+    recorded_step_name="$(sed -E 's/^[0-9]+\. //' <<<"$recorded_step")"
     has_step=false; has_dest=false
-    grep -qF "\"$recorded_step\"" <<<"$comment_body" && has_step=true
-    grep -qF "$WORKLOAD_DESTINATION" <<<"$comment_body" && has_dest=true
+    # Destinations are defanged in the rendered comment (`npmjs[.]org`), so the
+    # body is compared with the fangs put back rather than with a second
+    # spelling of every destination the gate knows.
+    comment_plain="$(tr -d '[]' <<<"$comment_body")"
+    grep -qF "\"$recorded_step_name\"" <<<"$comment_plain" && has_step=true
+    grep -qF "&quot;$recorded_step_name&quot;" <<<"$comment_plain" && has_step=true
+    grep -qF "$WORKLOAD_DESTINATION" <<<"$comment_plain" && has_dest=true
     if [ "$has_step" = true ] && [ "$has_dest" = true ]; then
       comment_content="names \"$recorded_step\" and $WORKLOAD_DESTINATION"
     elif [ "$has_dest" = true ] && [ "$attribution_skew" = true ]; then
@@ -352,24 +385,34 @@ if [ "$in_pr_context" = true ]; then
 
     # The evidence mirror copies the same comment into the PR description, and
     # a review reads the description. Both have to name the same sha (F34).
-    pr_body="$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null || true)"
-    mirror="$(awk '/<!-- garnet:evidence:begin -->/{on=1} on{print} /<!-- garnet:evidence:end -->/{on=0}' <<<"$pr_body")"
-    comment_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$comment_body" | head -n1)"
-    mirror_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$mirror" | head -n1)"
-    # Same sha is not the same record: the mirror is compared as a payload, so
-    # a stale or hand-trimmed copy under a current marker still fails (F34).
+    # The App writes the description after it finalizes the comment, so the
+    # mirror is waited for rather than read once.
     normalise() { grep -v -e '<!-- garnet:evidence:begin -->' -e '<!-- garnet:evidence:end -->' \
       | sed -e 's/[[:space:]]\+/ /g' -e 's/^ //' -e 's/ $//' | grep -v '^$'; }
-    mirror_body="$(normalise <<<"$mirror")"
+    comment_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$comment_body" | head -n1)"
     comment_normalised="$(normalise <<<"$comment_body")"
+    mirror=""; mirror_marker=""; mirror_body=""
+    mirror_deadline=$((SECONDS + MIRROR_POLL_SECONDS))
+    while :; do
+      pr_body="$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null || true)"
+      mirror="$(awk '/<!-- garnet:evidence:begin -->/{on=1} on{print} /<!-- garnet:evidence:end -->/{on=0}' <<<"$pr_body")"
+      mirror_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$mirror" | head -n1)"
+      mirror_body="$(normalise <<<"$mirror")"
+      { [ -n "$mirror" ] && [ "$mirror_marker" = "$comment_marker" ]; } && break
+      [ "$SECONDS" -lt "$mirror_deadline" ] || break
+      sleep 15
+    done
+    # Same sha is not the same record: the comment's payload has to be present
+    # in the mirror, so a stale or hand-trimmed copy under a current marker
+    # fails. The mirror adds its own heading and fold around that payload (F34).
     if [ -z "$mirror" ]; then
-      mirror_state="absent from the pull request description"
+      mirror_state="absent from the pull request description after ${MIRROR_POLL_SECONDS}s"
       leg_fail "L4 app comment: evidence mirror $mirror_state (F34)"
     elif [ "$mirror_marker" != "$comment_marker" ]; then
       mirror_state="mirror at ${mirror_marker:-no sha}, comment at ${comment_marker:-no sha}"
       leg_fail "L4 app comment: evidence mirror and comment disagree — $mirror_state (F34)"
-    elif [ "$mirror_body" != "$comment_normalised" ]; then
-      mirror_state="same sha, different body: $(wc -l <<<"$mirror_body") mirrored line(s) against $(wc -l <<<"$comment_normalised") in the comment"
+    elif [[ "$mirror_body" != *"$comment_normalised"* ]]; then
+      mirror_state="same sha, different body: $(wc -l <<<"$mirror_body") mirrored line(s) do not carry the comment's $(wc -l <<<"$comment_normalised")"
       leg_fail "L4 app comment: evidence mirror carries the head marker but not the comment's content — $mirror_state (F34)"
       diff <(echo "$comment_normalised") <(echo "$mirror_body") | head -n 20
     else
@@ -740,24 +783,30 @@ if [ -z "$reproduce_job_id" ]; then
   leg_fail "L12 warning noise: $warning_state (F35)"
 else
   reproduce_log="$(job_log "$reproduce_job_id")"
-  if [ -z "$reproduce_log" ]; then
-    warning_state="job log not readable"
-    leg_fail "L12 warning noise: could not read the log of job $reproduce_job_id"
-  else
-    # Main step and post hook both: the OIDC fallback warning is printed while
-    # the action starts, the flush and upload warnings after the job's steps.
+  if reproduce_ann="$(job_annotation_lines "$reproduce_job_id")"; then ann_read=true; else ann_read=false; reproduce_ann=""; fi
+  # Main step and post hook both: the OIDC fallback warning is printed while the
+  # action starts, the flush and upload warnings after the job's steps.
+  action_log=""
+  if [ -n "$reproduce_log" ]; then
     action_log="$(printf '%s\n%s\n' \
       "$(step_log "$reproduce_log" "garnet-org/action@")" \
       "$(post_step_log "$reproduce_log" "$reproduce_steps" "Post $ACTION_STEP_NAME")")"
-    warning_lines="$(annotations "$action_log")"
-    warning_count="$(grep -c '##\[warning\]' <<<"$action_log" || true)"
-    error_count="$(grep -c '##\[error\]' <<<"$action_log" || true)"
-    failopen_count="$(grep -ciE '##\[warning\].*(jibril (service )?failed to start|continuing without)' <<<"$action_log" || true)"
+  fi
+  if [ -z "$reproduce_log" ] && [ "$ann_read" != true ]; then
+    warning_state="neither the log nor the check-run annotations of job $reproduce_job_id could be read"
+    leg_fail "L12 warning noise: $warning_state — a leg that cannot see the annotations cannot pass (F35)"
+  else
+    warning_lines="$(merge_annotation_lines "$(annotations "$action_log")" "$reproduce_ann")"
+    warning_count="$(grep -c '##\[warning\]' <<<"$warning_lines" || true)"
+    error_count="$(grep -c '##\[error\]' <<<"$warning_lines" || true)"
+    failopen_count="$(grep -ciE '##\[warning\].*(jibril (service )?failed to start|continuing without)' <<<"$warning_lines" || true)"
     unexpected=$(( warning_count - failopen_count ))
-    warning_state="$warning_count warning(s), $error_count error(s) from the action step and its post hook; $failopen_count are the disclosed fail-open text (F2)"
+    source_state="action step and post hook from the log"
+    [ -n "$reproduce_log" ] || source_state="check-run annotations only, log not archived yet: job-scoped, not attributed to a step"
+    warning_state="$warning_count warning(s), $error_count error(s) — $source_state; $failopen_count are the disclosed fail-open text (F2)"
     if [ "$warning_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
       leg_fail "L12 warning noise: the action emitted $warning_count warning(s) and $error_count error(s) with api_token supplied, $unexpected of them not the disclosed fail-open text; the OIDC fallback line is garnet-org/action pull request 147, unreleased (F27)"
-      sed -E 's/^[0-9T:.Z-]+ //' <<<"$warning_lines" | head -n 10 | while IFS= read -r line; do
+      head -n 10 <<<"$warning_lines" | while IFS= read -r line; do
         [ -z "$line" ] || echo "::error::L12 offending line: $line"
       done
     fi
@@ -776,18 +825,26 @@ if [ -z "$dependabot_job_id" ]; then
 else
   sim_log="$(job_log "$dependabot_job_id")"
   sim_steps="$(job_steps "$dependabot_job_id")"
-  sim_action_log="$(printf '%s\n%s\n' \
-    "$(step_log "$sim_log" "garnet-org/action@")" \
-    "$(post_step_log "$sim_log" "$sim_steps" "Post $SIM_ACTION_STEP_NAME")")"
+  if sim_ann="$(job_annotation_lines "$dependabot_job_id")"; then sim_ann_read=true; else sim_ann_read=false; sim_ann=""; fi
+  sim_action_log=""
+  if [ -n "$sim_log" ]; then
+    sim_action_log="$(printf '%s\n%s\n' \
+      "$(step_log "$sim_log" "garnet-org/action@")" \
+      "$(post_step_log "$sim_log" "$sim_steps" "Post $SIM_ACTION_STEP_NAME")")"
+  fi
   sim_conclusion="$(step_conclusion "$sim_steps" "$SIM_ACTION_STEP_NAME")"
-  sim_warnings="$(grep -c '##\[warning\]' <<<"$sim_action_log" || true)"
-  sim_errors="$(grep -c '##\[error\]' <<<"$sim_action_log" || true)"
+  sim_evidence="$(merge_annotation_lines "$sim_action_log" "$sim_ann")"
+  sim_warnings="$(grep -c '##\[warning\]' <<<"$sim_evidence" || true)"
+  sim_errors="$(grep -c '##\[error\]' <<<"$sim_evidence" || true)"
   # The action explains the skip in a warning annotation, not an info line. The
   # explanation is what the leg is for, so the annotation counts as one and the
   # form it takes is stated rather than failed on.
-  sim_info="$(grep -ciE "api_token' is required|no api token|without runtime monitoring|skipping" <<<"$sim_action_log" || true)"
+  sim_info="$(grep -ciE "api_token' is required|no api token|without runtime monitoring|skipping" <<<"$sim_evidence" || true)"
   sim_state="outcome ${DEPENDABOT_SIM_OUTCOME:-unknown} · step $sim_conclusion · $sim_info line(s) naming the missing token, carried as $sim_warnings warning annotation(s), $sim_errors error(s)"
-  if [ "${DEPENDABOT_SIM_OUTCOME:-}" != success ] || [ "$sim_errors" -gt 0 ] || [ "$sim_conclusion" != success ]; then
+  if [ -z "$sim_log" ] && [ "$sim_ann_read" != true ]; then
+    sim_state="neither the log nor the check-run annotations of job $dependabot_job_id could be read"
+    leg_fail "L13 credential-less: $sim_state — silence the leg cannot see is not a clean skip (F35)"
+  elif [ "${DEPENDABOT_SIM_OUTCOME:-}" != success ] || [ "$sim_errors" -gt 0 ] || [ "$sim_conclusion" != success ]; then
     leg_fail "L13 credential-less: an empty api_token did not skip cleanly — $sim_state (F28)"
   elif [ "$sim_info" -lt 1 ]; then
     leg_fail "L13 credential-less: the action skipped silently; a credential-less run has to say why (F28)"
