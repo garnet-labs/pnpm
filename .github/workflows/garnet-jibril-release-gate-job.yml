@@ -101,7 +101,9 @@ jobs:
       # No `id:` here, as on pnpm's install and test steps. GitHub sets
       # GITHUB_ACTION to the step id when one is present; Jibril derives
       # `__run_N` from the workflow file and attributes by that value, so a
-      # step with an id records as `<unknown>` (ledger F23).
+      # step with an id records as `<unknown>` (ledger F23). The two
+      # id-bearing run steps above stay: pnpm's job has one before its test
+      # step, and Jibril counts them where GitHub does not (ledger F25).
       - name: Workload with egress
         run: |
           echo "GITHUB_ACTION=$GITHUB_ACTION"

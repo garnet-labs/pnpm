@@ -122,7 +122,9 @@ elif [ -n "$profile_json" ]; then
     if [ "$workload_steps" = "[]" ]; then
       workload_state="destination present, but attributed to runner background, not to a step"
     else
-      workload_state="destination present, but attributed to steps $workload_steps"
+      # Another named step means the sensor's step numbering is off (F25);
+      # <unknown> means GITHUB_ACTION matched no numbered step (F23).
+      workload_state="destination present, but attributed to steps $workload_steps instead of \"$WORKLOAD_STEP_NAME\""
     fi
     leg_fail "L3 workload: $workload_state"
   else
