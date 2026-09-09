@@ -57,7 +57,7 @@ jobs:
       unit_active: ${{ steps.assert.outputs.unit_active }}
       steps_status: ${{ steps.assert.outputs.steps_status }}
       workflow_ref: ${{ steps.assert.outputs.workflow_ref }}
-      workload: ${{ steps.workload.outcome }}
+      workload: ${{ steps.assert.outputs.workload }}
       runner_name: ${{ steps.assert.outputs.runner_name }}
       job_start: ${{ steps.clock.outputs.job_start }}
       action_seconds: ${{ steps.action_clock.outputs.action_seconds }}
@@ -97,12 +97,20 @@ jobs:
       # The verify job later checks that this destination is in the uploaded
       # profile, so a registry outage shows up as "workload not recorded",
       # not as a failed step masking the sensor verdict.
+      #
+      # No `id:` here, as on pnpm's install and test steps. GitHub sets
+      # GITHUB_ACTION to the step id when one is present; Jibril derives
+      # `__run_N` from the workflow file and attributes by that value, so a
+      # step with an id records as `<unknown>` (ledger F23).
       - name: Workload with egress
-        id: workload
-        continue-on-error: true
         run: |
-          curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null
-          node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"
+          echo "GITHUB_ACTION=$GITHUB_ACTION"
+          if curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null \
+            && node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"; then
+            echo success > /tmp/gate-workload
+          else
+            echo failure > /tmp/gate-workload
+          fi
 
       - name: Assert jibril reached the main loop
         id: assert
@@ -148,6 +156,7 @@ jobs:
             echo "steps_status=$steps_status"
             echo "workflow_ref=$workflow_ref"
             echo "runner_name=$RUNNER_NAME"
+            echo "workload=$(cat /tmp/gate-workload 2>/dev/null || echo skipped)"
             echo "workload_seconds=$(( workload_end - workload_start ))"
             echo "job_end=$(date +%s)"
           } >> "$GITHUB_OUTPUT"

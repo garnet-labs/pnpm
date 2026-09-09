@@ -280,7 +280,12 @@ if [ "$in_pr_context" = true ]; then
       integration_profile_id="$(jq -r '.id' "/tmp/profile-$integration_run_id.json")"
       integration_state="profile \`$integration_profile_id\` from $INTEGRATION_WORKFLOW_NAME run $integration_run_id ($integration_conclusion)"
     else
-      integration_state="$INTEGRATION_WORKFLOW_NAME run $integration_run_id finished $integration_conclusion with no profile (control plane HTTP $code): the job was green, the sensor recorded nothing"
+      # The control plane answers 403 for a run it never received (F24).
+      case "$code" in
+        403) why="no profile is bound to that run" ;;
+        *) why="control plane HTTP $code" ;;
+      esac
+      integration_state="$INTEGRATION_WORKFLOW_NAME run $integration_run_id finished $integration_conclusion with no profile ($why): the job was green, the sensor recorded nothing"
       leg_fail "L7 integration run: $integration_state"
     fi
   fi
