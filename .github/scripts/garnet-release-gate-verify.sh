@@ -259,8 +259,14 @@ if [ "$in_pr_context" = true ]; then
   integration_state="untested: no $INTEGRATION_WORKFLOW_NAME run found for head ${PR_HEAD_SHA:0:7}"
   deadline=$((SECONDS + INTEGRATION_POLL_SECONDS))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    run="$(gh api "repos/$repo/actions/runs?head_sha=$PR_HEAD_SHA&event=pull_request&per_page=50" \
-      --jq --arg n "$INTEGRATION_WORKFLOW_NAME" '[.workflow_runs[] | select(.name == $n)] | sort_by(.run_attempt) | last // empty' 2>/dev/null || true)"
+    # A token without actions: read gets an error here, not an empty list. An
+    # error is a gate defect (F22); an empty list is a missing run.
+    if ! runs_json="$(gh api "repos/$repo/actions/runs?head_sha=$PR_HEAD_SHA&event=pull_request&per_page=50" 2>/tmp/runs.err)"; then
+      integration_state="could not list workflow runs for head ${PR_HEAD_SHA:0:7}: $(head -c 200 /tmp/runs.err | tr '\n' ' ')"
+      leg_fail "L7 integration run: $integration_state"
+      break
+    fi
+    run="$(jq -c --arg n "$INTEGRATION_WORKFLOW_NAME" '[.workflow_runs[] | select(.name == $n)] | sort_by(.run_attempt) | last // empty' <<<"$runs_json")"
     [ -n "$run" ] || break
     integration_run_id="$(jq -r '.id' <<<"$run")"
     integration_conclusion="$(jq -r '.conclusion // ""' <<<"$run")"

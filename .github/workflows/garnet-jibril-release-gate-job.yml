@@ -172,6 +172,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
+      actions: read # list the PR head's TS CI run for the integration leg
       contents: read
       pull-requests: write # upsert the gate comment on the tracking PR
     steps:

@@ -89,13 +89,18 @@ jobs:
             echo "| run_gate | \`$run_gate\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  gate:
+  # The job id matches the called workflow's job id, as ci.yml's `test` calls
+  # test.yml's `test`. Jibril resolves GITHUB_JOB against the caller file, so a
+  # caller id that differs from the callee id leaves step discovery degraded
+  # and the egress unattributed (rc.10 gate run 34309875655).
+  reproduce:
     needs: detect
     if: needs.detect.outputs.run_gate == 'true'
     name: Garnet Jibril Release Gate / reproduce
     # Called-workflow jobs cannot exceed these; verify needs pull-requests: write
-    # to upsert the gate comment.
+    # to upsert the gate comment and actions: read to list the PR's TS CI run.
     permissions:
+      actions: read # verify job lists workflow runs for the PR head
       contents: read
       pull-requests: write # verify job upserts the gate comment on the tracking PR
     # The $/ self-repository form IS the reproduction; keep it.
