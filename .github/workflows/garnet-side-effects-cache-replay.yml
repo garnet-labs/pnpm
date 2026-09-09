@@ -79,7 +79,7 @@ jobs:
               echo "\`$step\`"
               echo
               echo '```'
-              cat "$WORK_DIR/$step.log"
+              cat "$WORK_DIR/$step.log" 2>/dev/null || echo "(no log: the replay stopped before this step)"
               echo '```'
               echo
             done

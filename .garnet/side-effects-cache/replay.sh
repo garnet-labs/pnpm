@@ -14,7 +14,9 @@
 #
 # Usage: replay.sh <work-dir> <results.json>
 # Writes one JSON object per step to <results.json> and prints a table.
-# Exits non-zero if any step's outcome differs from the table above.
+# Exits non-zero if any step's outcome differs from the table above. A pnpm
+# command that fails is recorded as an unexpected step and the replay goes on,
+# so the table and every step's log survive the failure.
 set -euo pipefail
 
 work_dir=$1
@@ -48,20 +50,21 @@ replay() {
   local step=$1 project=$2 command=$3 side_effects_cache=$4 expect_script=$5
   local dir="$work_dir/$project"
   local log="$work_dir/$step.log"
-  (cd "$dir" && pnpm "$command" --reporter=append-only) > "$log" 2>&1
+  local exit_code=0
+  (cd "$dir" && pnpm "$command" --reporter=append-only) > "$log" 2>&1 || exit_code=$?
   local hook=false postinstall_ran=false
   [ -f "$dir/.git/hooks/pre-commit" ] && hook=true
   grep -q 'simple-git-hooks postinstall' "$log" && postinstall_ran=true
 
   local verdict=expected
-  if [ "$postinstall_ran" != "$expect_script" ] || [ "$hook" != "$expect_script" ]; then
+  if [ "$exit_code" -ne 0 ] || [ "$postinstall_ran" != "$expect_script" ] || [ "$hook" != "$expect_script" ]; then
     verdict=unexpected
     failures=$((failures + 1))
   fi
-  printf '%-18s pnpm %-8s sideEffectsCache=%-7s postinstall_ran=%-5s hook_present=%-5s %s\n' \
-    "$step" "$command" "$side_effects_cache" "$postinstall_ran" "$hook" "$verdict"
-  printf '{"step":"%s","project":"%s","command":"%s","side_effects_cache":"%s","postinstall_ran":%s,"hook_present":%s,"expected":%s,"verdict":"%s"}\n' \
-    "$step" "$project" "$command" "$side_effects_cache" "$postinstall_ran" "$hook" "$expect_script" "$verdict" >> "$results"
+  printf '%-18s pnpm %-8s sideEffectsCache=%-7s postinstall_ran=%-5s hook_present=%-5s exit=%-3s %s\n' \
+    "$step" "$command" "$side_effects_cache" "$postinstall_ran" "$hook" "$exit_code" "$verdict"
+  printf '{"step":"%s","project":"%s","command":"%s","side_effects_cache":"%s","postinstall_ran":%s,"hook_present":%s,"exit_code":%s,"expected":%s,"verdict":"%s"}\n' \
+    "$step" "$project" "$command" "$side_effects_cache" "$postinstall_ran" "$hook" "$exit_code" "$expect_script" "$verdict" >> "$results"
 }
 
 echo "pnpm $(pnpm --version) · node $(node --version)"
