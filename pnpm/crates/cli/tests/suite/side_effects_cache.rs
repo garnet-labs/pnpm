@@ -116,7 +116,7 @@ fn a_second_project_on_the_store_gets_the_hook_only_without_the_cache() {
     fs::write(&yaml_path, yaml).expect("write the second pnpm-workspace.yaml");
     fs::remove_dir_all(project.join("node_modules")).expect("remove the second node_modules");
 
-    let rebuilt = pacquet_stdout(&project, &["install"]);
+    let rebuilt = pacquet_output(&project, &["install"]);
     assert!(
         rebuilt.contains("git-hook-installer postinstall$"),
         "with the cache off the second project must run the script:\n{rebuilt}",
@@ -134,7 +134,7 @@ fn a_second_project_on_the_store_gets_the_hook_after_an_explicit_rebuild() {
         SecondProject::after_a_cached_install();
 
     eprintln!("Second project: `pnpm rebuild` runs the script the cache answered for...");
-    let rebuilt = pacquet_stdout(&project, &["rebuild"]);
+    let rebuilt = pacquet_output(&project, &["rebuild"]);
     assert!(
         rebuilt.contains("git-hook-installer postinstall$"),
         "rebuild must run the script:\n{rebuilt}",
@@ -193,7 +193,7 @@ impl SecondProject {
         let hook = project.join(".git/hooks/pre-commit");
 
         eprintln!("Second project (warm store): the cache answers for the build...");
-        let cached = pacquet_stdout(&project, &["install"]);
+        let cached = pacquet_output(&project, &["install"]);
         assert!(
             !cached.contains("git-hook-installer postinstall$"),
             "the second project must get the cached build rather than run the script:\n{cached}",
@@ -215,10 +215,12 @@ fn assert_hook_installed(hook: &Path) {
     );
 }
 
-fn pacquet_stdout(project: &Path, args: &[&str]) -> String {
+fn pacquet_output(project: &Path, args: &[&str]) -> String {
     let output = pacquet_in(project).with_args(args).output().expect("run pacquet");
     assert!(output.status.success(), "pacquet must succeed: {output:?}");
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    let mut reported = String::from_utf8_lossy(&output.stdout).into_owned();
+    reported.push_str(&String::from_utf8_lossy(&output.stderr));
+    reported
 }
 
 /// A fresh `pacquet install --frozen-lockfile` against an existing
