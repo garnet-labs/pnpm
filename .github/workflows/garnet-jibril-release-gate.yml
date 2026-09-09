@@ -1,0 +1,113 @@
+name: Garnet Jibril Release Gate
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      jibril_version:
+        description: 'jibril-releases tag to gate (empty = newest release incl. pre-releases)'
+        required: false
+        default: ''
+      report_pr:
+        description: 'fork PR number to comment on'
+        required: false
+        default: '36'
+  # Every pnpm test PR that carries the `garnet-release-testing` label runs the
+  # full chain in its own PR context. Only refs/pull/N/merge runs get a Garnet
+  # Runtime Review comment, so this is the one trigger that can prove the
+  # comment leg. Applying the label to an open PR starts the gate at once.
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+
+permissions: {}
+
+# One gate at a time per ref; a newer push supersedes a running PR gate, and a
+# scheduled gate never overlaps the previous one.
+concurrency:
+  group: garnet-jibril-release-gate-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect:
+    name: Pick the Jibril release to gate
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'garnet-release-testing')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read # read the tracking PR's body and comments for the tag override and the per-tag gate marker
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      run_gate: ${{ steps.pick.outputs.run_gate }}
+      report_pr: ${{ steps.pick.outputs.report_pr }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED: ${{ inputs.jibril_version }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPORT_PR_INPUT: ${{ inputs.report_pr }}
+        run: |
+          # Newest release by published_at, pre-releases included, drafts excluded.
+          json="$(curl -sSf -H 'Accept: application/vnd.github+json' https://api.github.com/repos/garnet-org/jibril-releases/releases?per_page=20)"
+          newest_tag="$(jq -r '[.[] | select(.draft==false)] | sort_by(.published_at) | last | .tag_name' <<<"$json")"
+          newest_at="$(jq -r '[.[] | select(.draft==false)] | sort_by(.published_at) | last | .published_at' <<<"$json")"
+          tag="${REQUESTED:-}"
+          if [ "$EVENT" = pull_request ]; then
+            report_pr="$PR_NUMBER"
+            # A PR pins the tag it tests with one line in its body:
+            #   garnet-gate: jibril_version=v2.17.0-rc.10
+            body_tag="$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq '.body // ""' \
+              | grep -oE '^garnet-gate: jibril_version=[A-Za-z0-9._-]+' | head -n1 | cut -d= -f2 || true)"
+            tag="${tag:-$body_tag}"
+          else
+            report_pr="${REPORT_PR_INPUT:-36}"
+          fi
+          tag="${tag:-$newest_tag}"
+          run_gate=true
+          if [ "$EVENT" = schedule ]; then
+            # Gate each tag once: skip when the tracking PR already carries this
+            # tag's gate comment. The marker is per tag, so reruns of the same
+            # tag update in place and a new tag gets a new comment.
+            export MARKER="<!-- garnet:jibril-release-gate $tag -->"
+            existing="$(gh api "repos/$GH_REPO/issues/$report_pr/comments" --paginate \
+              | jq -r '.[] | select((.body // "") | contains($ENV.MARKER)) | .id' | head -n1)"
+            [ -z "$existing" ] || run_gate=false
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "run_gate=$run_gate" >> "$GITHUB_OUTPUT"
+          echo "report_pr=$report_pr" >> "$GITHUB_OUTPUT"
+          {
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| newest release | \`$newest_tag\` |"
+            echo "| published_at | \`$newest_at\` |"
+            echo "| selected tag | \`$tag\` |"
+            echo "| report PR | \`$report_pr\` |"
+            echo "| run_gate | \`$run_gate\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The job id matches the called workflow's job id, as ci.yml's `test` calls
+  # test.yml's `test`. Jibril resolves GITHUB_JOB against the caller file, so a
+  # caller id that differs from the callee id leaves step discovery degraded
+  # and the egress unattributed (rc.10 gate run 34309875655).
+  reproduce:
+    needs: detect
+    if: needs.detect.outputs.run_gate == 'true'
+    name: Garnet Jibril Release Gate / reproduce
+    # Called-workflow jobs cannot exceed these; verify needs pull-requests: write
+    # to upsert the gate comment and actions: read to list the PR's TS CI run.
+    permissions:
+      actions: read # verify job lists workflow runs for the PR head
+      contents: read
+      pull-requests: write # verify job upserts the gate comment on the tracking PR
+    # The $/ self-repository form IS the reproduction; keep it.
+    uses: $/.github/workflows/garnet-jibril-release-gate-job.yml
+    with:
+      jibril_version: ${{ needs.detect.outputs.tag }}
+      report_pr: ${{ needs.detect.outputs.report_pr }}
+    # Same explicit pass-through shape as ci.yml; nothing else is inherited.
+    secrets:
+      GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}

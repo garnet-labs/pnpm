@@ -1,0 +1,258 @@
+name: Garnet Jibril Release Gate Job
+
+on:
+  workflow_call:
+    inputs:
+      jibril_version:
+        description: 'jibril-releases tag under test'
+        required: true
+        type: string
+      report_pr:
+        description: 'fork PR number to comment on'
+        required: false
+        type: string
+        default: '36'
+    secrets:
+      GARNET_API_TOKEN:
+        required: true
+
+permissions: {}
+
+env:
+  GARNET_API_URL: https://api.garnet.ai
+  GARNET_APP_URL: https://app.garnet.ai
+
+jobs:
+  # The same workload on the same runner class without the sensor. The verify
+  # job subtracts its wall time from the reproduce job's to state the overhead
+  # the sensor adds, which pnpm named as a requirement when it adopted Garnet.
+  baseline:
+    name: Same workload without the sensor
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      seconds: ${{ steps.time.outputs.seconds }}
+    steps:
+      - id: time
+        run: |
+          start=$(date +%s)
+          curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null
+          node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+  reproduce:
+    name: Reproduce self-repo reference on Blacksmith
+    # Same runner class as the garnet-enabled leg in ci.yml.
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.assert.outputs.verdict }}
+      reason: ${{ steps.assert.outputs.reason }}
+      status: ${{ steps.assert.outputs.status }}
+      version: ${{ steps.assert.outputs.version }}
+      unit_active: ${{ steps.assert.outputs.unit_active }}
+      steps_status: ${{ steps.assert.outputs.steps_status }}
+      workflow_ref: ${{ steps.assert.outputs.workflow_ref }}
+      workload: ${{ steps.assert.outputs.workload }}
+      runner_name: ${{ steps.assert.outputs.runner_name }}
+      job_start: ${{ steps.clock.outputs.job_start }}
+      action_seconds: ${{ steps.action_clock.outputs.action_seconds }}
+      workload_seconds: ${{ steps.assert.outputs.workload_seconds }}
+      job_end: ${{ steps.assert.outputs.job_end }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start the clock
+        id: clock
+        run: echo "job_start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Garnet runtime monitoring
+        uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main, v2.3.0 candidate
+        # The action fails open anyway; never let the gate abort before the
+        # assertion step can record the verdict.
+        continue-on-error: true
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: ${{ inputs.jibril_version }}
+          debug: true
+
+      # Everything between the two clocks is the action step: download,
+      # verification, install and the wait for the sensor to come up.
+      - name: Stop the action clock
+        id: action_clock
+        if: always()
+        env:
+          JOB_START: ${{ steps.clock.outputs.job_start }}
+        run: |
+          now=$(date +%s)
+          echo "action_seconds=$(( now - JOB_START ))" >> "$GITHUB_OUTPUT"
+          echo "workload_start=$now" > /tmp/gate-clock
+
+      # The verify job later checks that this destination is in the uploaded
+      # profile, so a registry outage shows up as "workload not recorded",
+      # not as a failed step masking the sensor verdict.
+      #
+      # No `id:` here, as on pnpm's install and test steps. GitHub sets
+      # GITHUB_ACTION to the step id when one is present; Jibril derives
+      # `__run_N` from the workflow file and attributes by that value, so a
+      # step with an id records as `<unknown>` (ledger F23). The two
+      # id-bearing run steps above stay: pnpm's job has one before its test
+      # step, and Jibril counts them where GitHub does not (ledger F25).
+      - name: Workload with egress
+        run: |
+          echo "GITHUB_ACTION=$GITHUB_ACTION"
+          if curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null \
+            && node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"; then
+            echo success > /tmp/gate-workload
+          else
+            echo failure > /tmp/gate-workload
+          fi
+
+      - name: Assert jibril reached the main loop
+        id: assert
+        if: always()
+        env:
+          GATE_TAG: ${{ inputs.jibril_version }}
+        run: |
+          workload_end=$(date +%s)
+          workload_start=$(cut -d= -f2 /tmp/gate-clock 2>/dev/null || echo "$workload_end")
+          # Poll up to 90s for the runtime status file.
+          found=false
+          for i in $(seq 1 18); do
+            if sudo test -f /var/run/jibril/jibril.status.json; then found=true; break; fi
+            sleep 5
+          done
+          unit_active="$(systemctl is-active jibril || true)"
+          echo "--- jibril.service state: $unit_active ---"
+          echo "--- journalctl (last 80 lines) ---"
+          sudo journalctl -u jibril --no-pager -n 80 || true
+          status=""; steps_status="absent"; workflow_ref="absent"; version=""
+          if [ "$found" = true ]; then
+            sudo cat /var/run/jibril/jibril.status.json | sudo tee /tmp/jibril.status.json >/dev/null
+            sudo chown "$(id -u):$(id -g)" /tmp/jibril.status.json
+            jq . /tmp/jibril.status.json
+            status="$(jq -r '.status // ""' /tmp/jibril.status.json)"
+            steps_status="$(jq -r '.features.github.steps.status // "absent"' /tmp/jibril.status.json)"
+            workflow_ref="$(jq -r '.features.github.workflow_ref // "absent"' /tmp/jibril.status.json)"
+            version="$(jq -r '.version // ""' /tmp/jibril.status.json)"
+          fi
+          if [ "$unit_active" = active ] && [ "$status" = ok ] && [ "$steps_status" = ok ]; then
+            verdict=PASS; reason="sensor active, status ok, github steps resolution ok"
+          elif [ "$found" = false ]; then
+            verdict=FAIL; reason="status file absent — sensor never reached main loop"
+          else
+            verdict=FAIL; reason="unit=$unit_active status=${status:-missing} steps_status=$steps_status"
+          fi
+          {
+            echo "verdict=$verdict"
+            echo "reason=$reason"
+            echo "status=${status:-absent}"
+            echo "version=$version"
+            echo "unit_active=$unit_active"
+            echo "steps_status=$steps_status"
+            echo "workflow_ref=$workflow_ref"
+            echo "runner_name=$RUNNER_NAME"
+            echo "workload=$(cat /tmp/gate-workload 2>/dev/null || echo skipped)"
+            echo "workload_seconds=$(( workload_end - workload_start ))"
+            echo "job_end=$(date +%s)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Jibril release gate · startup"
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| requested tag | \`$GATE_TAG\` |"
+            echo "| resolved version | \`${version:-unknown}\` |"
+            echo "| startup verdict | **$verdict** — $reason |"
+            echo "| runner | \`$RUNNER_NAME\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+  # Everything the sensor produces lands after the reproduce job's post step:
+  # the profile flush, the control-plane upload, the App comment. A second job
+  # is the only place that can observe them.
+  verify:
+    name: Verify profile, App comment and permalink
+    needs: [reproduce, baseline]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read # list the PR head's TS CI run for the integration leg
+      contents: read
+      pull-requests: write # upsert the gate comment on the tracking PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # pnpm runs zizmor on every PR; the gate applies the same scanner to the
+      # workflow files a test PR touches so its finding count is a gate leg.
+      - name: Install zizmor
+        run: pipx install zizmor==1.30.0
+
+      - name: Verify evidence chain
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
+          GATE_TAG: ${{ inputs.jibril_version }}
+          STARTUP_VERDICT: ${{ needs.reproduce.outputs.verdict }}
+          STARTUP_REASON: ${{ needs.reproduce.outputs.reason }}
+          STARTUP_VERSION: ${{ needs.reproduce.outputs.version }}
+          STARTUP_UNIT: ${{ needs.reproduce.outputs.unit_active }}
+          STARTUP_STEPS_STATUS: ${{ needs.reproduce.outputs.steps_status }}
+          STARTUP_WORKFLOW_REF: ${{ needs.reproduce.outputs.workflow_ref }}
+          ACTION_SECONDS: ${{ needs.reproduce.outputs.action_seconds }}
+          REPRODUCE_JOB_START: ${{ needs.reproduce.outputs.job_start }}
+          REPRODUCE_JOB_END: ${{ needs.reproduce.outputs.job_end }}
+          REPRODUCE_WORKLOAD_SECONDS: ${{ needs.reproduce.outputs.workload_seconds }}
+          BASELINE_WORKLOAD_SECONDS: ${{ needs.baseline.outputs.seconds }}
+          WORKLOAD_OUTCOME: ${{ needs.reproduce.outputs.workload }}
+          RUNNER_NAME_USED: ${{ needs.reproduce.outputs.runner_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKLOAD_DESTINATION: registry.npmjs.org
+        run: bash .github/scripts/garnet-release-gate-verify.sh
+
+      - name: Keep the gate record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: garnet-release-gate-${{ inputs.jibril_version }}-${{ github.run_attempt }}
+          path: |
+            /tmp/gate-record.json
+            /tmp/gate-comment.md
+          if-no-files-found: warn
+
+      - name: Upsert gate comment on the tracking PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REPORT_PR: ${{ inputs.report_pr }}
+          GATE_TAG: ${{ inputs.jibril_version }}
+        run: |
+          export MARKER="<!-- garnet:jibril-release-gate $GATE_TAG -->"
+          existing="$(gh api "repos/$GH_REPO/issues/$REPORT_PR/comments" --paginate \
+            | jq -r '.[] | select((.body // "") | contains($ENV.MARKER)) | .id' | head -n1)"
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GH_REPO/issues/comments/$existing" -F body=@/tmp/gate-comment.md >/dev/null
+          else
+            gh pr comment "$REPORT_PR" --repo "$GH_REPO" --body-file /tmp/gate-comment.md
+          fi
+
+      - name: Gate conclusion
+        if: steps.verify.outputs.verdict != 'PASS'
+        env:
+          VERDICT: ${{ steps.verify.outputs.verdict }}
+        run: |
+          echo "::error::gate verdict is '${VERDICT:-none}'; see the gate comment and step summary for the failing legs"
+          exit 1
