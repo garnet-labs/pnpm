@@ -1,0 +1,11 @@
+{
+  "name": "garnet-side-effects-cache-workload",
+  "private": true,
+  "version": "0.0.0",
+  "devDependencies": {
+    "simple-git-hooks": "2.13.1"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "echo pre-commit"
+  }
+}
