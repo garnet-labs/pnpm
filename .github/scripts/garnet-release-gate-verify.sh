@@ -256,15 +256,17 @@ elif [ -n "$profile_json" ]; then
     if [ "$workload_steps" = "[]" ]; then
       workload_state="destination present, but attributed to runner background, not to a step"
     else
-      # Another named step means the sensor's step numbering is off (F25);
-      # <unknown> means GITHUB_ACTION matched no numbered step (F23).
-      attribution_skew=true
+      # Only one wrong step name is the parked defect: the one the shape
+      # analysis predicts from parseStepsList's numbering. Any other name, and
+      # `<unknown>` (F23, GITHUB_ACTION matched no numbered step), is an
+      # attribution error nobody has explained and still fails.
       workload_state="destination present · expected \"$WORKLOAD_STEP_NAME\", observed $workload_steps"
       predicted="$(shape_get '.gate.attribution.jibril_records // ""')"
       if [ -n "$predicted" ] && jq -e --arg p "$predicted" 'map(select(contains($p))) | length > 0' <<<"$workload_steps" >/dev/null; then
+        attribution_skew=true
         workload_state="$workload_state — F25 Jibril step-numbering skew, garnet-org/jibril parseStepsList: the egress lands on \"$predicted\", the run step one place earlier in the file"
       else
-        workload_state="$workload_state — F25 Jibril step-numbering skew, garnet-org/jibril parseStepsList is the known cause of an off-by-one attribution"
+        workload_state="$workload_state — not the predicted F25 skew (parseStepsList numbering predicts \"${predicted:-nothing}\" for this job), so it is an unexplained attribution error (F38)"
       fi
     fi
     if [ "$attribution_skew" = true ]; then

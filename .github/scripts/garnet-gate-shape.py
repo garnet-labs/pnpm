@@ -37,7 +37,8 @@ UPSTREAM_WORKLOAD_STEP_PREFIX = "Run tests"
 ACTION = "garnet-org/action@"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 # A sensor release the control plane can serve twice: vN.N.N, optionally -rc.N.
-PINNED_SENSOR = re.compile(r"^v\d+\.\d+(\.\d+)?(-[0-9A-Za-z.]+)?$")
+# A major or minor tag (`v2`, `v2.16`) moves, so it names no fixed binary.
+PINNED_SENSOR = re.compile(r"^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
 
 
 def load(path: str) -> dict:
