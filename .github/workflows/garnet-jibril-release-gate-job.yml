@@ -94,6 +94,18 @@ jobs:
           echo "action_seconds=$(( now - JOB_START ))" >> "$GITHUB_OUTPUT"
           echo "workload_start=$now" > /tmp/gate-clock
 
+      # pnpm's instrumented job runs `Determine test scope` (id: test-scope),
+      # then an id-less validation step, then the test step. This step is the
+      # id-less one in the middle: without it the workload is the first id-less
+      # run step of the job and the skew Jibril produces upstream is not the
+      # skew the gate reproduces (ledger F25).
+      - name: Validate the workload inputs
+        run: |
+          test -s /tmp/gate-clock
+          echo "workload destination: $WORKLOAD_DESTINATION"
+        env:
+          WORKLOAD_DESTINATION: registry.npmjs.org
+
       # The verify job later checks that this destination is in the uploaded
       # profile, so a registry outage shows up as "workload not recorded",
       # not as a failed step masking the sensor verdict.
@@ -101,9 +113,9 @@ jobs:
       # No `id:` here, as on pnpm's install and test steps. GitHub sets
       # GITHUB_ACTION to the step id when one is present; Jibril derives
       # `__run_N` from the workflow file and attributes by that value, so a
-      # step with an id records as `<unknown>` (ledger F23). The two
-      # id-bearing run steps above stay: pnpm's job has one before its test
-      # step, and Jibril counts them where GitHub does not (ledger F25).
+      # step with an id records as `<unknown>` (ledger F23). The id-bearing
+      # run steps above stay: pnpm's job has one before its test step, and
+      # Jibril counts them where GitHub does not (ledger F25).
       - name: Workload with egress
         run: |
           echo "GITHUB_ACTION=$GITHUB_ACTION"
@@ -124,7 +136,7 @@ jobs:
           workload_start=$(cut -d= -f2 /tmp/gate-clock 2>/dev/null || echo "$workload_end")
           # Poll up to 90s for the runtime status file.
           found=false
-          for i in $(seq 1 18); do
+          for _ in $(seq 1 18); do
             if sudo test -f /var/run/jibril/jibril.status.json; then found=true; break; fi
             sleep 5
           done
@@ -173,12 +185,47 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
+  # What a Dependabot-actor or fork-head run gets: no secret reaches the job,
+  # so the action receives an empty api_token. pnpm sees this path on every
+  # Dependabot PR (upstream pull 13270 logged `Input 'api_token' is required`),
+  # and the only acceptable behaviour there is a clean skip. A simulation, not
+  # evidence: it runs with the gate's own event and a read-only token, and no
+  # profile is expected or claimed for it.
+  dependabot_sim:
+    name: Simulation — credential-less run skips cleanly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.sensor.outcome }}
+      conclusion: ${{ steps.record.outputs.conclusion }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet runtime monitoring without credentials
+        id: sensor
+        uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main, v2.3.0 candidate
+        continue-on-error: true
+        with:
+          api_token: ''
+          jibril_version: ${{ inputs.jibril_version }}
+
+      - name: Record the credential-less outcome
+        id: record
+        if: always()
+        env:
+          OUTCOME: ${{ steps.sensor.outcome }}
+        run: echo "conclusion=$OUTCOME" >> "$GITHUB_OUTPUT"
+
   # Everything the sensor produces lands after the reproduce job's post step:
   # the profile flush, the control-plane upload, the App comment. A second job
   # is the only place that can observe them.
   verify:
     name: Verify profile, App comment and permalink
-    needs: [reproduce, baseline]
+    needs: [reproduce, baseline, dependabot_sim]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -195,6 +242,38 @@ jobs:
       # workflow files a test PR touches so its finding count is a gate leg.
       - name: Install zizmor
         run: pipx install zizmor==1.30.0
+
+      # actionlint reads what zizmor does not: expression syntax, runner labels
+      # and shell errors in the gate's own files.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+          ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+        run: |
+          curl -sSfL -o /tmp/actionlint.tgz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "$ACTIONLINT_SHA256  /tmp/actionlint.tgz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tgz -C /usr/local/bin actionlint
+
+      # The shape analyzer and the scanner classifier read workflow YAML.
+      - name: Ensure PyYAML
+        run: python3 -c 'import yaml' || pip3 install --quiet --break-system-packages pyyaml
+
+      # pnpm's own files at main, read fresh: the gate only proves something
+      # about pnpm while it still reproduces pnpm's shape.
+      - name: Fetch upstream pnpm workflows
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: pnpm/pnpm
+        run: |
+          mkdir -p /tmp/upstream
+          sha="$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)"
+          for f in ci.yml test.yml release.yml update-latest.yml; do
+            gh api "repos/$UPSTREAM/contents/.github/workflows/$f?ref=$sha" \
+              --jq .content | base64 -d > "/tmp/upstream/$f"
+          done
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Verify evidence chain
         id: verify
@@ -220,6 +299,9 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           WORKLOAD_DESTINATION: registry.npmjs.org
+          UPSTREAM_DIR: /tmp/upstream
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          DEPENDABOT_SIM_OUTCOME: ${{ needs.dependabot_sim.outputs.outcome }}
         run: bash .github/scripts/garnet-release-gate-verify.sh
 
       - name: Keep the gate record

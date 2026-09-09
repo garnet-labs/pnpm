@@ -76,9 +76,11 @@ jobs:
               | jq -r '.[] | select((.body // "") | contains($ENV.MARKER)) | .id' | head -n1)"
             [ -z "$existing" ] || run_gate=false
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "run_gate=$run_gate" >> "$GITHUB_OUTPUT"
-          echo "report_pr=$report_pr" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$tag"
+            echo "run_gate=$run_gate"
+            echo "report_pr=$report_pr"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "| field | value |"
             echo "|---|---|"

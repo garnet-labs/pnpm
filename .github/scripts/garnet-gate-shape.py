@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Reads the gate's own workflows and pnpm's, upstream and local, and prints one
+JSON record of the shape facts the verifier turns into legs.
+
+The gate only proves something about pnpm while it still runs pnpm's shape, so
+every field a maintainer would read is compared against upstream pnpm/pnpm at
+main: the reusable-workflow call form, the runner of the instrumented cell, the
+action ref, the sensor version, the token input, job permissions, and the order
+of id-bearing run steps before the workload. A difference is either declared
+here as deliberate (the gate exists to run a candidate sensor) or reported as
+drift for the verifier to fail on.
+
+The same parse answers three more questions no other tool in the gate can:
+which step Jibril will attribute the workload egress to (its numbering counts
+every run step, GitHub's counts only the id-less ones), which release and tag
+jobs carry an inert Garnet step, and how many matrix cells upstream instruments.
+
+Usage: garnet-gate-shape.py <upstream-dir> [--upstream-sha SHA]
+       [--action-default-version V] [--upstream-action-default-version V]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+
+import yaml
+
+GATE_JOB_WORKFLOW = ".github/workflows/garnet-jibril-release-gate-job.yml"
+GATE_CALLER_WORKFLOW = ".github/workflows/garnet-jibril-release-gate.yml"
+REPRODUCE_JOB = "reproduce"
+WORKLOAD_STEP = "Workload with egress"
+UPSTREAM_WORKLOAD_STEP_PREFIX = "Run tests"
+ACTION = "garnet-org/action@"
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def load(path: str) -> dict:
+    with open(path, encoding="utf-8") as handle:
+        # `on:` is YAML 1.1 true; the loader keeps it as a key we never read.
+        return yaml.safe_load(handle) or {}
+
+
+def jobs(doc: dict) -> dict:
+    return doc.get("jobs") or {}
+
+
+def steps(job: dict) -> list:
+    return job.get("steps") or []
+
+
+def action_step(job: dict) -> dict | None:
+    for step in steps(job):
+        if str(step.get("uses", "")).startswith(ACTION):
+            return step
+    return None
+
+
+def action_ref(step: dict) -> str:
+    return str(step.get("uses", "")).split("@", 1)[-1].split()[0]
+
+
+def permissions_of(job: dict, doc: dict | None = None) -> dict:
+    """Job-level permissions, or the workflow-level ones the job inherits."""
+    for source in (job, doc or {}):
+        perms = source.get("permissions")
+        if isinstance(perms, dict) and perms:
+            return perms
+    return {}
+
+
+def run_step_names(job: dict) -> list[tuple[str, str | None]]:
+    """(name, id) of every run step, in file order."""
+    return [
+        (str(step.get("name") or step.get("id") or "<unnamed>"), step.get("id"))
+        for step in steps(job)
+        if "run" in step
+    ]
+
+
+def attribution(job: dict, workload_name: str) -> dict:
+    """What GitHub calls the workload step, and what Jibril will call it.
+
+    GitHub sets GITHUB_ACTION to the step id when there is one and numbers only
+    the id-less run steps (__run, __run_2, ...). Jibril's parseStepsList never
+    reads `id:` and numbers every run step, so an id-bearing run step earlier in
+    the job shifts every later id-less step back by one (ledger F25).
+    """
+    runs = run_step_names(job)
+    github_token, jibril_names, anonymous = None, [], 0
+    for index, (name, step_id) in enumerate(runs, start=1):
+        jibril_names.append(f"__run{'' if index == 1 else f'_{index}'}")
+        if step_id:
+            continue
+        anonymous += 1
+        token = "__run" if anonymous == 1 else f"__run_{anonymous}"
+        if name.startswith(workload_name):
+            github_token = token
+    if github_token is None:
+        return {"found": False}
+    jibril_index = jibril_names.index(github_token)
+    recorded_name, recorded_id = runs[jibril_index]
+    return {
+        "found": True,
+        "workload_step": workload_name,
+        "github_action": github_token,
+        "jibril_records": recorded_name,
+        "jibril_records_has_id": bool(recorded_id),
+        "skewed": recorded_name != workload_name,
+        "run_steps": [
+            {"name": name, "id": step_id, "jibril_token": token}
+            for (name, step_id), token in zip(runs, jibril_names)
+        ],
+    }
+
+
+def id_bearing_before(job: dict, workload_name: str) -> dict:
+    """The run-step shape upstream has around its workload: at least one
+    id-bearing run step, then an id-less one, then the workload."""
+    runs = run_step_names(job)
+    before = []
+    for name, step_id in runs:
+        if name.startswith(workload_name):
+            return {
+                "id_bearing_before": [n for n, i in before if i],
+                "idless_before": [n for n, i in before if not i],
+                "immediately_before": before[-1][0] if before else None,
+                "immediately_before_has_id": bool(before[-1][1]) if before else None,
+            }
+        before.append((name, step_id))
+    return {"id_bearing_before": [], "idless_before": [], "immediately_before": None,
+            "immediately_before_has_id": None}
+
+
+def instrumented_cell(ci: dict) -> dict:
+    for job_name, job in jobs(ci).items():
+        matrix = ((job.get("strategy") or {}).get("matrix") or {})
+        for cell in matrix.get("include") or []:
+            if cell.get("garnet") is True:
+                return {"job": job_name, **{k: str(v) for k, v in cell.items()}}
+    return {}
+
+
+def all_cells(ci: dict) -> list[dict]:
+    cells = []
+    for job_name, job in jobs(ci).items():
+        matrix = ((job.get("strategy") or {}).get("matrix") or {})
+        for cell in matrix.get("include") or []:
+            cells.append(
+                {
+                    "job": job_name,
+                    "cell": f'{cell.get("platform_label", cell.get("platform", "?"))}'
+                            f'/node {cell.get("node_major", cell.get("node", "?"))}',
+                    "runner": str(cell.get("platform", "?")),
+                    "instrumented": cell.get("garnet") is True,
+                }
+            )
+    return cells
+
+
+def reusable_call(ci: dict) -> dict:
+    calls = {}
+    for job_name, job in jobs(ci).items():
+        uses = str(job.get("uses", ""))
+        if uses.endswith("test.yml"):
+            calls[job_name] = uses
+    return calls
+
+
+def release_report(paths: dict[str, str]) -> list[dict]:
+    """Every Garnet step in the release and tag workflows, with the runner it
+    would record on. macOS and Windows carry no sensor, so those steps produce
+    nothing; a Linux step that produces nothing is a defect, not a disclosure."""
+    report = []
+    for label, path in paths.items():
+        if not os.path.exists(path):
+            continue
+        doc = load(path)
+        for job_name, job in jobs(doc).items():
+            step = action_step(job)
+            if step is None:
+                continue
+            runner = str(job.get("runs-on", "?"))
+            if runner.startswith(("macos", "windows")):
+                produces, reason = "no", f"{runner.split('-')[0]} runner: the sensor is Linux-only eBPF"
+            elif "ubuntu" in runner or "linux" in runner:
+                produces, reason = "yes", f"{runner} runs the sensor"
+            else:
+                produces, reason = "unknown", f"unrecognised runner {runner}"
+            report.append(
+                {
+                    "workflow": label,
+                    "job": job_name,
+                    "runner": runner,
+                    "instrumented": True,
+                    "produces_profile": produces,
+                    "reason": reason,
+                    "action_ref": action_ref(step),
+                }
+            )
+    return report
+
+
+def posture(job: dict, name: str, doc: dict | None = None, default_version: str = "") -> list[dict]:
+    """The lines a pnpm reviewer and their scanners read on an instrumented job."""
+    findings = []
+    perms = permissions_of(job, doc)
+    step = action_step(job)
+
+    def add(check, ok, detail):
+        findings.append({"job": name, "check": check, "ok": bool(ok), "detail": detail})
+
+    add("id-token: write absent", perms.get("id-token") != "write",
+        f"permissions: {perms or 'inherited'}")
+    add("no secrets: inherit", "inherit" not in str(job.get("secrets", "")),
+        f"secrets: {job.get('secrets', 'none')}")
+    add("no pull-requests: write", perms.get("pull-requests") != "write",
+        f"pull-requests: {perms.get('pull-requests', 'unset')}")
+    if step is None:
+        add("Garnet step present", False, "no garnet-org/action step in this job")
+        return findings
+    ref = action_ref(step)
+    add("action pinned to a full SHA", bool(FULL_SHA.match(ref)), f"garnet-org/action@{ref}")
+    token = str((step.get("with") or {}).get("api_token", ""))
+    add("explicit api_token from secrets", "secrets.GARNET_API_TOKEN" in token,
+        f"api_token: {token or 'unset'}")
+    version = str((step.get("with") or {}).get("jibril_version", ""))
+    # An empty input hands the sensor version to the action's own default, which
+    # is only acceptable while that default is an explicit pin: a root eBPF
+    # binary must not change under an unchanged action ref.
+    add(
+        "sensor version pinned",
+        bool(version) or default_version not in ("", "latest", "unknown"),
+        f"jibril_version: {version}" if version
+        else f"action default at {ref[:7]} resolves to {default_version or 'unknown'}",
+    )
+    return findings
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("upstream_dir")
+    parser.add_argument("--upstream-sha", default="")
+    parser.add_argument("--action-default-version", default="")
+    parser.add_argument("--upstream-action-default-version", default="")
+    args = parser.parse_args()
+
+    up = args.upstream_dir
+    upstream_ci = load(os.path.join(up, "ci.yml"))
+    upstream_test = load(os.path.join(up, "test.yml"))
+    gate_job = load(GATE_JOB_WORKFLOW)
+    gate_caller = load(GATE_CALLER_WORKFLOW)
+    local_ci = load(".github/workflows/ci.yml")
+
+    reproduce = jobs(gate_job).get(REPRODUCE_JOB) or {}
+    upstream_test_job = next(
+        (job for job in jobs(upstream_test).values() if action_step(job)), {}
+    )
+    cell = instrumented_cell(upstream_ci)
+
+    gate_call = str((jobs(gate_caller).get(REPRODUCE_JOB) or {}).get("uses", ""))
+    upstream_calls = reusable_call(upstream_ci)
+    upstream_call = next(iter(upstream_calls.values()), "")
+
+    gate_step = action_step(reproduce) or {}
+    upstream_step = action_step(upstream_test_job) or {}
+    gate_shape = id_bearing_before(reproduce, WORKLOAD_STEP)
+    upstream_shape = id_bearing_before(upstream_test_job, UPSTREAM_WORKLOAD_STEP_PREFIX)
+
+    def call_form(uses: str) -> str:
+        return "$/" if uses.startswith("$/") else "./" if uses.startswith("./") else uses
+
+    drift = []
+
+    def compare(field, upstream_value, gate_value, deliberate="", ok=None):
+        verdict = "match" if (ok if ok is not None else upstream_value == gate_value) else "drift"
+        if verdict == "drift" and deliberate:
+            verdict = "deliberate"
+        drift.append(
+            {
+                "field": field,
+                "upstream": upstream_value,
+                "gate": gate_value,
+                "verdict": verdict,
+                "note": deliberate if verdict == "deliberate" else "",
+            }
+        )
+
+    compare("reusable call form", call_form(upstream_call), call_form(gate_call))
+    compare("instrumented runner", cell.get("platform", "?"), str(reproduce.get("runs-on", "?")))
+    compare(
+        "action ref",
+        action_ref(upstream_step) if upstream_step else "none",
+        action_ref(gate_step) if gate_step else "none",
+        deliberate="the gate runs the candidate action under test",
+    )
+    compare(
+        "sensor version",
+        str((upstream_step.get("with") or {}).get("jibril_version", ""))
+        or f"action default ({args.upstream_action_default_version or 'unknown'})",
+        str((gate_step.get("with") or {}).get("jibril_version", "")) or "action default",
+        deliberate="the gate names the release tag under test",
+    )
+    compare(
+        "api_token input",
+        str((upstream_step.get("with") or {}).get("api_token", "")),
+        str((gate_step.get("with") or {}).get("api_token", "")),
+    )
+    compare(
+        "instrumented job permissions",
+        permissions_of(upstream_test_job, upstream_test) or "inherited",
+        permissions_of(reproduce, gate_job) or "inherited",
+    )
+    compare(
+        "id-bearing run step before the workload",
+        bool(upstream_shape["id_bearing_before"]),
+        bool(gate_shape["id_bearing_before"]),
+    )
+    compare(
+        "id-less run step immediately before the workload",
+        upstream_shape["immediately_before_has_id"] is False,
+        gate_shape["immediately_before_has_id"] is False,
+    )
+
+    record = {
+        "upstream": {
+            "sha": args.upstream_sha,
+            "instrumented_cell": cell,
+            "cells": all_cells(upstream_ci),
+            "reusable_calls": upstream_calls,
+            "attribution": attribution(upstream_test_job, UPSTREAM_WORKLOAD_STEP_PREFIX),
+            "shape": upstream_shape,
+            "action_default_version": args.upstream_action_default_version,
+        },
+        "gate": {
+            "call": gate_call,
+            "runner": str(reproduce.get("runs-on", "?")),
+            "attribution": attribution(reproduce, WORKLOAD_STEP),
+            "shape": gate_shape,
+            "action_default_version": args.action_default_version,
+        },
+        "drift": drift,
+        "drift_count": sum(1 for d in drift if d["verdict"] == "drift"),
+        "posture": posture(reproduce, "gate reproduce", gate_job, args.action_default_version)
+        + posture(upstream_test_job, "upstream test", upstream_test, args.upstream_action_default_version),
+        "release_workflows": release_report(
+            {
+                "release.yml": os.path.join(up, "release.yml"),
+                "update-latest.yml": os.path.join(up, "update-latest.yml"),
+            }
+        ),
+        "coverage": {
+            "cells": all_cells(upstream_ci),
+            "instrumented": sum(1 for c in all_cells(upstream_ci) if c["instrumented"]),
+            "total": len(all_cells(upstream_ci)),
+            # The fork's own matrix: the gate proves nothing about a cell pnpm
+            # instruments and the fork does not, or the other way round.
+            "local_instrumented": sum(1 for c in all_cells(local_ci) if c["instrumented"]),
+            "local_total": len(all_cells(local_ci)),
+        },
+    }
+    json.dump(record, sys.stdout, indent=2, sort_keys=False, default=str)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

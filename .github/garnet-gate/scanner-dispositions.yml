@@ -1,0 +1,54 @@
+# Written dispositions for every scanner finding the gate is allowed to see.
+#
+# The gate fails on an unclassified finding, so a new zizmor finding on a
+# workflow file a test pull request touches has to be fixed or answered here
+# before the gate can pass. Four classes, and nothing else:
+#
+#   fixed                  the finding is gone; the row stays as history
+#   disclosed              accepted and printed in the gate comment
+#   intentional-diagnostic the flagged line is the failure the gate reproduces
+#   garnet-side            the fix belongs in garnet-org/action or the sensor
+#
+# zizmor rows match on ident plus the file path; the optional `route` narrows a
+# row to one location inside that file. actionlint rows match on a substring of
+# the reported message, which is how a deliberate line stays visible in the
+# actionlint output instead of being suppressed with a config file.
+
+zizmor:
+  - ident: undocumented-permissions
+    path: .github/workflows/ci.yml
+    route: jobs.changes.permissions.pull-requests
+    class: disclosed
+    reason: >-
+      pnpm's own file. The permission predates the Garnet rollout and the
+      rollout asks pnpm for no permission change.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/ci.yml
+    route: jobs.garnet-evidence-mirror.permissions.pull-requests
+    class: disclosed
+    reason: >-
+      The evidence mirror writes the PR description on this fork only. It is
+      not part of what the rollout proposes upstream.
+
+  - ident: concurrency-limits
+    path: .github/workflows/ci.yml
+    class: disclosed
+    reason: >-
+      pnpm's own file, unchanged by the rollout. The gate sets concurrency on
+      its own workflow.
+
+actionlint:
+  - message: 'reusable workflow call "$/'
+    class: intentional-diagnostic
+    reason: >-
+      The `$/` self-repository form is the shape Jibril failed on upstream
+      (ledger F1). Reproducing it is the point of the gate; actionlint not
+      knowing the form is the expected output, not a defect to fix.
+
+  - message: 'label "blacksmith-8vcpu-ubuntu-2404" is unknown'
+    class: intentional-diagnostic
+    reason: >-
+      The instrumented cell of pnpm's test matrix runs on this Blacksmith
+      label. A GitHub-hosted label would not reproduce the runner the sensor
+      has to work on.
