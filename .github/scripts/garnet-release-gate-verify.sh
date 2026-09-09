@@ -60,6 +60,12 @@ set -uo pipefail
 : "${REPRODUCE_JOB_NAME:=Reproduce self-repo reference on Blacksmith}"
 : "${DEPENDABOT_SIM_JOB_NAME:=Simulation — credential-less run skips cleanly}"
 : "${JIBRIL_ATTRIBUTION_ISSUE:=https://github.com/garnet-org/jibril/issues/757}"
+# The release the stable channel named when this gate was written. L7 stays dark
+# until the channel moves off it, so the tag is what retires L7's expected mark.
+: "${STABLE_CHANNEL_BEFORE:=v2.16.0}"
+# The channel the action itself downloads from, per `JIBRIL_RELEASES_REPO` in
+# its source; the sensor repository proper is not readable from a fork run.
+: "${JIBRIL_RELEASES_REPO:=garnet-org/jibril-releases}"
 : "${ACTION_STEP_NAME:=Garnet runtime monitoring}"
 : "${SIM_ACTION_STEP_NAME:=Garnet runtime monitoring without credentials}"
 
@@ -85,6 +91,21 @@ disclose() { disclosures+=("$1"); echo "::notice::disclosed: $1"; }
 # in the table rather than as a pass it did not earn.
 disclosed_legs=()
 mark_disclosed() { disclosed_legs+=("$1"); }
+# An expected failure is a FAIL this rollout already knows about and that some
+# named event retires. It is not a pass and it does not soften the verdict: the
+# leg fails, the run fails, and the marker exists so a fourth failing leg is
+# what pages. Each marker is set from a live observation of the state that
+# produces it, so it disappears by itself once the retiring event happens.
+expected_legs=()
+expected_notes=()
+expect_fail() { # $1 leg, $2 the event that retires it
+  expected_legs+=("$1"); expected_notes+=("$1 until $2")
+}
+is_expected() { # $1 leg
+  local leg
+  for leg in ${expected_legs[@]+"${expected_legs[@]}"}; do [ "$leg" = "$1" ] && return 0; done
+  return 1
+}
 now() { date +%s; }
 
 # --- shape of the thing under test ---------------------------------------------
@@ -475,6 +496,15 @@ if [ "$in_pr_context" = true ]; then
 fi
 if [ "$shape_fail" = true ]; then
   leg_fail "L6 posture: $(printf '%s; ' "${shape_notes[@]}")"
+  # Expected only while the single thing wrong is the one pnpm's repin fixes:
+  # its own `test.yml` leaving `jibril_version` empty at an action sha whose
+  # default resolves to a moving selector. Any other posture finding is new.
+  posture_other=0
+  for _note in "${shape_notes[@]}"; do
+    case "$_note" in "upstream test: sensor version pinned"*) ;; *) posture_other=$((posture_other + 1)) ;; esac
+  done
+  [ "$posture_other" -eq 0 ] \
+    && expect_fail L6 "pnpm pins \`jibril_version\` in its own \`test.yml\` (the repin pull request); the marker drops the run after the upstream posture row reads pinned"
 fi
 shape_state="$(printf '%s; ' "${shape_notes[@]}")"
 shape_state="${shape_state%; }"
@@ -485,6 +515,11 @@ shape_state="${shape_state%; }"
 # profile for "pnpm's setup works" to be true.
 integration_state="not applicable (event=${EVENT_NAME:-unknown})"
 integration_run_id=""; integration_profile_id=""; integration_conclusion=""
+# What the sensor's stable channel names right now. `unknown` is not read as
+# "unchanged": a channel the gate cannot see cannot retire anything, and it
+# cannot mark anything expected either.
+stable_channel_tag="$(gh api "repos/$JIBRIL_RELEASES_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)"
+[ -n "$stable_channel_tag" ] || stable_channel_tag=unknown
 if [ "$in_pr_context" = true ]; then
   integration_state="untested: no $INTEGRATION_WORKFLOW_NAME run found for head ${PR_HEAD_SHA:0:7}"
   deadline=$((SECONDS + INTEGRATION_POLL_SECONDS))
@@ -517,6 +552,12 @@ if [ "$in_pr_context" = true ]; then
       esac
       integration_state="$INTEGRATION_WORKFLOW_NAME run $integration_run_id finished $integration_conclusion with no profile ($why): the job was green, the sensor recorded nothing"
       leg_fail "L7 integration run: $integration_state"
+      # pnpm's own job stays dark while the stable channel still names the
+      # release that predates this gate. The retiring event is the channel
+      # moving, read from the sensor's own releases rather than assumed.
+      if [ "$code" = 403 ] && [ "$stable_channel_tag" = "$STABLE_CHANNEL_BEFORE" ]; then
+        expect_fail L7 "the stable channel moves off \`$STABLE_CHANNEL_BEFORE\` (\`Latest\` today is \`$stable_channel_tag\`)"
+      fi
     fi
   fi
 fi
@@ -811,6 +852,12 @@ else
       head -n 10 <<<"$warning_lines" | while IFS= read -r line; do
         [ -z "$line" ] || echo "::error::L12 offending line: $line"
       done
+      # Expected only while every offending line is the one line action 147
+      # removes. A second warning, or any error, is noise nobody has explained.
+      oidc_lines="$(grep -F -c "OIDC token request failed because this workflow is missing 'id-token: write' permission" <<<"$warning_lines" || true)"
+      if [ "$error_count" -eq 0 ] && [ "$oidc_lines" -eq "$warning_count" ]; then
+        expect_fail L12 "garnet-org/action pull request 147 ships and the token path stops printing the OIDC fallback line"
+      fi
     fi
   fi
 fi
@@ -888,6 +935,8 @@ to_json_array() { printf '%s\n' "$@" | jq -R . | jq -s 'map(select(length > 0))'
 
 jq -n \
   --arg verdict "$verdict" --argjson fail_reasons "$(to_json_array "${fail_reasons[@]:-}")" --argjson attention "$(to_json_array "${attention[@]:-}")" \
+  --argjson expected_legs "$(to_json_array "${expected_legs[@]:-}")" --argjson expected_notes "$(to_json_array "${expected_notes[@]:-}")" \
+  --arg stable_channel_tag "${stable_channel_tag:-unknown}" \
   --arg tag "$GATE_TAG" --arg resolved_version "${STARTUP_VERSION:-}" --arg action_sha "$action_ref" --arg upstream_action_sha "$upstream_action_ref" \
   --arg run_id "$run_id" --arg run_attempt "$run_attempt" --arg runner "${RUNNER_NAME_USED:-}" \
   --arg event "${EVENT_NAME:-}" --arg pr "${PR_NUMBER:-}" \
@@ -917,6 +966,7 @@ jq -n \
   --argjson gate_attribution "$(shape_get '.gate.attribution // {}')" --argjson upstream_attribution "$(shape_get '.upstream.attribution // {}')" \
   --arg action_default_version "$action_default_version" \
   '{verdict: $verdict, fail_reasons: $fail_reasons, attention: $attention, disclosures: $disclosures,
+    expected_today: {legs: $expected_legs, retires_when: $expected_notes, stable_channel: $stable_channel_tag},
     jibril: {requested_tag: $tag, resolved_version: $resolved_version},
     action_sha: $action_sha,
     action_default_jibril_version: $action_default_version,
@@ -972,10 +1022,18 @@ leg_row() { # $1 id, $2 title, $3 state text, $4 link
   state="$(leg_state "$1")"
   case "$3" in "not applicable"*|untested*|unknown*) [ "$state" = PASS ] && state="n/a" ;; esac
   [ "$state" = DISCLOSED ] && state="disclosed"
+  [ "$state" = FAIL ] && is_expected "$1" && state="FAIL (expected)"
   printf '| **%s** | %s %s | %s%s |\n' "$state" "$1" "$2" "$(one_line "$3")" "${4:+ [→]($4)}"
 }
 failed_legs=0
 for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed_legs + 1)); done
+# A failing leg nobody expected is the one that pages. The expected set is
+# whatever the run itself observed, not a list held in the workflow file.
+expected_fails=0
+unexpected_fails=0
+for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do
+  if is_expected "${_reason%% *}"; then expected_fails=$((expected_fails + 1)); else unexpected_fails=$((unexpected_fails + 1)); fi
+done
 
 {
   echo "<!-- garnet:jibril-release-gate $GATE_TAG -->"
@@ -984,7 +1042,13 @@ for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed
   if [ "$verdict" = PASS ]; then
     echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\` cleared all 14 legs of the pnpm acceptance bar."
   else
-    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\`: **$failed_legs failing check(s)** below, each named with its ledger row."
+    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\`: **$failed_legs failing check(s)** below, each named with its ledger row — $expected_fails expected today, **$unexpected_fails not**."
+  fi
+  if [ "${#expected_notes[@]}" -gt 0 ]; then
+    echo
+    echo "Expected today: $(printf '%s; ' "${expected_notes[@]}" | sed 's/; $//')"
+    echo
+    echo "<sub>An expected failure still fails. The marker says a named event retires it, and the run drops the marker by itself once that event is observable.</sub>"
   fi
   echo
   echo "| | leg | what it found |"
@@ -1007,7 +1071,9 @@ for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed
     echo
     echo "### Failing legs"
     echo
-    for r in ${fail_reasons[@]+"${fail_reasons[@]}"}; do echo "- $r"; done
+    for r in ${fail_reasons[@]+"${fail_reasons[@]}"}; do
+      if is_expected "${r%% *}"; then echo "- **expected today** — $r"; else echo "- $r"; fi
+    done
     [ -z "$bot_thread_list" ] || echo "$bot_thread_list"
     [ -z "$drift_list" ] || { echo; echo "$drift_list"; }
   fi
@@ -1027,6 +1093,7 @@ for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed
   echo "| action | \`garnet-org/action@${action_ref:0:12}\` · empty \`jibril_version\` there resolves to \`$action_default_version\` |"
   echo "| run | [$run_id]($run_url) attempt $run_attempt · \`${RUNNER_NAME_USED:-}\` · $EVENT_NAME |"
   echo "| pnpm at main | \`${UPSTREAM_SHA:0:7}\` · action \`${upstream_action_ref:0:12}\` → \`$upstream_action_default_version\` |"
+  echo "| sensor stable channel | \`${stable_channel_tag:-unknown}\` · L7 stays dark while it names \`$STABLE_CHANNEL_BEFORE\` |"
   echo "| workflow ref seen by sensor | \`${STARTUP_WORKFLOW_REF:-absent}\` |"
   if [ "$in_pr_context" = true ]; then
     echo "| base → head | \`${PR_BASE_SHA:0:7}\` → \`${PR_HEAD_SHA:0:7}\` |"
