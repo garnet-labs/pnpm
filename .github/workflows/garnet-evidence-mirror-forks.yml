@@ -43,3 +43,20 @@ jobs:
           while IFS= read -r pr_number; do
             PR_NUMBER="${pr_number}" node .github/scripts/garnet-evidence-mirror.mjs
           done <<< "${prs}"
+      # CodeRabbit and Qodo ignore commands authored by bot accounts
+      # (including github-actions[bot]), so the re-review request must come
+      # from a user identity: GARNET_REVIEW_TRIGGER_TOKEN is a user PAT with
+      # issues write on this repo. Without it the apps drop the commands.
+      - name: Request evidence-grounded re-review
+        if: env.TRIGGER_TOKEN != ''
+        env:
+          TRIGGER_TOKEN: ${{ secrets.GARNET_REVIEW_TRIGGER_TOKEN }}
+          GH_TOKEN: ${{ secrets.GARNET_REVIEW_TRIGGER_TOKEN }}
+        run: |
+          set -euo pipefail
+          prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" --jq ".[] | select(.state == \"open\" and .head.sha == \"${HEAD_SHA}\") | .number")
+          [ -z "${prs}" ] && exit 0
+          while IFS= read -r pr_number; do
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" -f body='/agentic_review'
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" -f body='@coderabbitai review'
+          done <<< "${prs}"
