@@ -10,9 +10,16 @@ Rules that keep this ledger and the gate the same thing:
    verifier in the same pull request. A row without a leg is a gap; a leg
    without a row is unexplained.
 2. Every pull request on this fork that tests Garnet product or release work
-   for pnpm carries the label `garnet-release-testing`. The gate runs on the
+   for pnpm (pin bumps, Jibril release candidates, gate work, acceptance
+   runs) carries the label `garnet-release-testing`. The gate runs on the
    label, reports on the pull request, and its verdict is the acceptance
    result. An unlabelled test pull request has not been accepted.
+   A demo pull request, one written to be shared or presented as the
+   product surface, never carries the label: the gate would post its
+   ten-leg verdict into the conversation the reader is meant to see. Its
+   evidence is the Runtime Review comment and its own replay artifacts.
+   To gate the same commits, open a second pull request from the same
+   branch and label that one.
 3. A gate leg is PASS/FAIL when a machine can decide it, and a disclosure line
    when only a reader can. Disclosures are printed under "Disclosed, not
    failing" and never hidden.

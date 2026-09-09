@@ -349,6 +349,15 @@ try {
     Written by an agent (Claude Code, claude-opus-4-7).
     ```
 
+## Garnet pull requests on this fork
+
+This fork runs Garnet's runtime sensor on its CI. Two kinds of pull request carry Garnet work, and the label decides which bots speak on them:
+
+-   **Test pull requests** (sensor pin bumps, Jibril release candidates, gate work, acceptance runs) carry the label `garnet-release-testing`. The label starts `.github/workflows/garnet-jibril-release-gate.yml`, which posts a ten-leg verdict comment on the pull request. Rules and the failure ledger: [`.github/garnet-gate/FAILURE_LEDGER.md`](./.github/garnet-gate/FAILURE_LEDGER.md).
+-   **Demo pull requests** (anything written to be shared, presented, or offered upstream) never carry that label. The reader should see the change, the Runtime Review comment, and the pull request's own evidence, not a gate verdict. To gate the same commits, open a second pull request from the same branch and label that one.
+
+Before adding `garnet-release-testing` to a pull request, ask which kind it is. Removing the label does not remove a verdict comment the gate already posted; delete that comment by hand.
+
 ## Resolving Conflicts in GitHub PRs
 
 Use `shell/resolve-pr-conflicts.sh` to resolve PR conflicts:
