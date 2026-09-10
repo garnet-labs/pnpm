@@ -40,6 +40,8 @@ set -uo pipefail
 : "${WORKLOAD_STEP_NAME:=Workload with egress}"
 : "${REPRODUCE_JOB:=reproduce}"
 : "${POLL_SECONDS:=600}"
+# The App writes the description mirror after it finalizes the comment.
+: "${MIRROR_POLL_SECONDS:=300}"
 : "${INTEGRATION_WORKFLOW_NAME:=TS CI}"
 : "${INTEGRATION_POLL_SECONDS:=1500}"
 : "${OVERHEAD_BUDGET_SECONDS:=120}"
@@ -52,9 +54,20 @@ set -uo pipefail
 : "${UPSTREAM_REPO:=pnpm/pnpm}"
 : "${SHAPE_SCRIPT:=.github/scripts/garnet-gate-shape.py}"
 : "${DEPENDABOT_SIM_OUTCOME:=}"
-: "${REPRODUCE_JOB_NAME:=reproduce}"
-: "${DEPENDABOT_SIM_JOB_NAME:=credential-less run skips cleanly}"
+# Display names as GitHub reports them for a reusable workflow's jobs, which is
+# "<caller job> / <job name>": every job of the callee shares the caller prefix,
+# so these are matched on the trailing name, exactly.
+: "${REPRODUCE_JOB_NAME:=Reproduce self-repo reference on Blacksmith}"
+: "${DEPENDABOT_SIM_JOB_NAME:=Simulation — credential-less run skips cleanly}"
+: "${JIBRIL_ATTRIBUTION_ISSUE:=https://github.com/garnet-org/jibril/issues/757}"
+# The release the stable channel named when this gate was written. L7 stays dark
+# until the channel moves off it, so the tag is what retires L7's expected mark.
+: "${STABLE_CHANNEL_BEFORE:=v2.16.0}"
+# The channel the action itself downloads from, per `JIBRIL_RELEASES_REPO` in
+# its source; the sensor repository proper is not readable from a fork run.
+: "${JIBRIL_RELEASES_REPO:=garnet-org/jibril-releases}"
 : "${ACTION_STEP_NAME:=Garnet runtime monitoring}"
+: "${SIM_ACTION_STEP_NAME:=Garnet runtime monitoring without credentials}"
 
 run_id="$GITHUB_RUN_ID"
 run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
@@ -74,6 +87,25 @@ leg_attention() { attention+=("$1"); echo "::warning::$1"; }
 # annotation: L12 counts annotations, and the gate must not add noise to what
 # it measures.
 disclose() { disclosures+=("$1"); echo "::notice::disclosed: $1"; }
+# A leg whose finding is real, reported, and parked upstream reads as disclosed
+# in the table rather than as a pass it did not earn.
+disclosed_legs=()
+mark_disclosed() { disclosed_legs+=("$1"); }
+# An expected failure is a FAIL this rollout already knows about and that some
+# named event retires. It is not a pass and it does not soften the verdict: the
+# leg fails, the run fails, and the marker exists so a fourth failing leg is
+# what pages. Each marker is set from a live observation of the state that
+# produces it, so it disappears by itself once the retiring event happens.
+expected_legs=()
+expected_notes=()
+expect_fail() { # $1 leg, $2 the event that retires it
+  expected_legs+=("$1"); expected_notes+=("$1 until $2")
+}
+is_expected() { # $1 leg
+  local leg
+  for leg in ${expected_legs[@]+"${expected_legs[@]}"}; do [ "$leg" = "$1" ] && return 0; done
+  return 1
+}
 now() { date +%s; }
 
 # --- shape of the thing under test ---------------------------------------------
@@ -116,18 +148,62 @@ shape_get() { jq -r "$1" <<<"$shape" 2>/dev/null || echo ""; }
 # --- job timeline --------------------------------------------------------------
 # Step times and log annotations for this run's own jobs; L9 and L12 read them.
 jobs_json="$(gh api "repos/$repo/actions/runs/$run_id/attempts/$run_attempt/jobs?per_page=100" 2>/dev/null || echo '{"jobs":[]}')"
-job_id_by_name() { jq -r --arg n "$1" '[.jobs[]? | select(.name | contains($n))] | last | .id // empty' <<<"$jobs_json"; }
+# Exactly one job whose display name ends with this name. A prefix match takes
+# every job of the reusable workflow, and reading the wrong job's log is how a
+# leg reports what another job did (F35).
+job_id_by_name() {
+  jq -r --arg n "$1" '
+    [.jobs[]? | select((.name | endswith($n)) or .name == $n)]
+    | if length == 1 then .[0].id else empty end' <<<"$jobs_json"
+}
+job_ids_matching() { jq -r --arg n "$1" '[.jobs[]? | select(.name | endswith($n))] | length' <<<"$jobs_json"; }
 reproduce_job_id="$(job_id_by_name "$REPRODUCE_JOB_NAME")"
 dependabot_job_id="$(job_id_by_name "$DEPENDABOT_SIM_JOB_NAME")"
 job_log() { # $1 job id -> the job's log on stdout, empty when it cannot be read
   [ -n "$1" ] || return 0
   gh api "repos/$repo/actions/jobs/$1/logs" 2>/dev/null || true
 }
-# One step's slice of a job log: from the step's own group header to the next.
+job_steps() { # $1 job id -> that job's step timeline
+  [ -n "$1" ] || { echo '{"steps":[]}'; return; }
+  gh api "repos/$repo/actions/jobs/$1" 2>/dev/null || echo '{"steps":[]}'
+}
+# A run step's slice of a job log: its own group header to the next one.
 step_log() { awk -v start="$2" '
   index($0, "##[group]Run ") && index($0, start) { on = 1; next }
   on && index($0, "##[group]Run ") && !index($0, start) { on = 0 }
   on { print }' <<<"$1"; }
+# The action's post hook is a step of its own and writes no group header at all,
+# so its lines are cut by the step's start and end time from the job timeline.
+# Everything the action says after the job's own steps are done is said there.
+post_step_log() { # $1 log, $2 steps json, $3 post step name
+  local from to
+  from="$(jq -r --arg n "$3" '[.steps[]? | select(.name == $n) | .started_at // empty] | first // empty' <<<"$2")"
+  to="$(jq -r --arg n "$3" '[.steps[]? | select(.name == $n) | .completed_at // empty] | first // empty' <<<"$2")"
+  [ -n "$from" ] && [ -n "$to" ] || return 0
+  awk -v from="$from" -v to="$to" '
+    { stamp = substr($0, 1, 19) "Z" }
+    stamp >= from && stamp <= to { print }' <<<"$1"
+}
+step_conclusion() { jq -r --arg n "$2" '[.steps[]? | select(.name == $n) | .conclusion] | first // ""' <<<"$1"; }
+step_seconds() {
+  jq -r --arg n "$2" '[.steps[]? | select(.name == $n) | select(.started_at != null and .completed_at != null)
+    | ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601))] | first // empty' <<<"$1"
+}
+annotations() { grep -E '##\[(warning|error)\]' <<<"${1:-}" || true; }
+# A job's annotations from the check run, in the log's own notation. The log of a
+# job in a run that is still going is often not archived yet, and the verify job
+# runs inside that run: reading the log alone made L12 report zero annotations
+# for a job that had one and L13 read the credential-less path as silent (F35).
+# The check run carries the same warning and error lines while the run is live.
+job_annotation_lines() { # $1 job id; prints lines, nonzero when unreadable
+  [ -n "$1" ] || return 1
+  gh api --paginate "repos/$repo/check-runs/$1/annotations" \
+    --jq '.[] | select(.annotation_level == "warning" or .annotation_level == "failure")
+      | "##[\(if .annotation_level == "failure" then "error" else "warning" end)]\(.message | gsub("[\r\n]+"; " "))"' 2>/dev/null
+}
+# The lines one source has and the other does not, so a log slice and the check
+# run can be added up without counting the same annotation twice.
+merge_annotation_lines() { printf '%s\n%s\n' "${1:-}" "${2:-}" | sed -E 's/^[0-9T:.Z-]+ //' | sed '/^$/d' | sort -u; }
 
 # --- L1 startup ----------------------------------------------------------------
 startup_verdict="${STARTUP_VERDICT:-FAIL}"
@@ -187,7 +263,11 @@ fi
 # --- L3 workload recorded ------------------------------------------------------
 # A workload step that itself failed (registry outage) leaves this leg untested
 # rather than failing a gate whose sensor did its job.
+# The step-numbering skew itself is parked upstream (jibril#757), so the leg
+# computes and prints observed vs expected attribution and discloses the skew
+# instead of failing on it. Everything else about the leg still decides.
 workload_state="untested"
+attribution_skew=false
 if [ "${WORKLOAD_OUTCOME:-}" != success ]; then
   workload_state="untested: workload step outcome=${WORKLOAD_OUTCOME:-unknown}"
 elif [ -n "$profile_json" ]; then
@@ -197,17 +277,26 @@ elif [ -n "$profile_json" ]; then
     if [ "$workload_steps" = "[]" ]; then
       workload_state="destination present, but attributed to runner background, not to a step"
     else
-      # Another named step means the sensor's step numbering is off (F25);
-      # <unknown> means GITHUB_ACTION matched no numbered step (F23).
-      workload_state="destination present, but attributed to steps $workload_steps instead of \"$WORKLOAD_STEP_NAME\""
+      # Only one wrong step name is the parked defect: the one the shape
+      # analysis predicts from parseStepsList's numbering. Any other name, and
+      # `<unknown>` (F23, GITHUB_ACTION matched no numbered step), is an
+      # attribution error nobody has explained and still fails.
+      workload_state="destination present · expected \"$WORKLOAD_STEP_NAME\", observed $workload_steps"
       predicted="$(shape_get '.gate.attribution.jibril_records // ""')"
       if [ -n "$predicted" ] && jq -e --arg p "$predicted" 'map(select(contains($p))) | length > 0' <<<"$workload_steps" >/dev/null; then
+        attribution_skew=true
         workload_state="$workload_state — F25 Jibril step-numbering skew, garnet-org/jibril parseStepsList: the egress lands on \"$predicted\", the run step one place earlier in the file"
       else
-        workload_state="$workload_state — F25 Jibril step-numbering skew, garnet-org/jibril parseStepsList is the known cause of an off-by-one attribution"
+        workload_state="$workload_state — not the predicted F25 skew (parseStepsList numbering predicts \"${predicted:-nothing}\" for this job), so it is an unexplained attribution error (F38)"
       fi
     fi
-    leg_fail "L3 workload: $workload_state"
+    if [ "$attribution_skew" = true ]; then
+      workload_state="$workload_state; parked upstream at $JIBRIL_ATTRIBUTION_ISSUE, disclosed here"
+      mark_disclosed L3
+      disclose "L3 workload: $workload_state — the fix is upstream in Jibril (overwrite the step context at process exec from eBPF using GITHUB_ACTION); this leg reports the attribution and does not decide the verdict while $JIBRIL_ATTRIBUTION_ISSUE is open (F25)"
+    else
+      leg_fail "L3 workload: $workload_state"
+    fi
   else
     workload_state="not recorded: $WORKLOAD_DESTINATION absent from profile egress"
     leg_fail "L3 workload: $workload_state"
@@ -235,12 +324,21 @@ if [ "$in_pr_context" = true ]; then
     if [ -n "$match" ]; then
       comment_url="$(jq -r '.html_url' <<<"$match")"
       comment_body="$(jq -r '.body' <<<"$match")"
-      if jq -e '.body | contains("<!-- garnet-control-plane-pr-comment:v1")' <<<"$match" >/dev/null; then
+      # The placeholder the App posts first already carries the v1 marker, so
+      # the marker alone is not finality: the record is final once the summary
+      # block reports the chains it recorded. Reading the placeholder as final
+      # is how L4 saw a body with no step name and no destination.
+      summary_json="$(jq -r '.body | capture("<!-- garnet:summary (?<s>.*?) -->").s // ""' <<<"$match")"
+      chains=0
+      [ -z "$summary_json" ] || chains="$(jq -r '.chains // 0' <<<"$summary_json" 2>/dev/null || echo 0)"
+      [ "$chains" != null ] || chains=0
+      if jq -e '.body | contains("<!-- garnet-control-plane-pr-comment:v1")' <<<"$match" >/dev/null \
+         && [ -n "$summary_json" ] && [ "$chains" -gt 0 ] 2>/dev/null; then
         comment_state="final after $(( $(now) - comment_wait_start ))s"
         comment_seconds=$(( $(now) - comment_wait_start ))
-        summary_json="$(jq -r '.body | capture("<!-- garnet:summary (?<s>.*?) -->").s // ""' <<<"$match")"
         break
       fi
+      summary_json=""
       comment_state="pending"
     fi
     sleep 15
@@ -283,30 +381,65 @@ if [ "$in_pr_context" = true ]; then
   if [ -n "$comment_body" ]; then
     recorded_step="$(jq -r 'first(.[]?) // ""' <<<"$workload_steps")"
     [ -n "$recorded_step" ] || recorded_step="$WORKLOAD_STEP_NAME"
+    # The profile carries the step's ordinal (`3. Validate ...`); the comment
+    # quotes the name alone. Both are the same recorded step.
+    recorded_step_name="$(sed -E 's/^[0-9]+\. //' <<<"$recorded_step")"
     has_step=false; has_dest=false
-    grep -qF "\"$recorded_step\"" <<<"$comment_body" && has_step=true
-    grep -qF "$WORKLOAD_DESTINATION" <<<"$comment_body" && has_dest=true
+    # Destinations are defanged in the rendered comment (`npmjs[.]org`), so the
+    # body is compared with the fangs put back rather than with a second
+    # spelling of every destination the gate knows.
+    comment_plain="$(tr -d '[]' <<<"$comment_body")"
+    grep -qF "\"$recorded_step_name\"" <<<"$comment_plain" && has_step=true
+    grep -qF "&quot;$recorded_step_name&quot;" <<<"$comment_plain" && has_step=true
+    grep -qF "$WORKLOAD_DESTINATION" <<<"$comment_plain" && has_dest=true
     if [ "$has_step" = true ] && [ "$has_dest" = true ]; then
       comment_content="names \"$recorded_step\" and $WORKLOAD_DESTINATION"
+    elif [ "$has_dest" = true ] && [ "$attribution_skew" = true ]; then
+      # The only name the comment could quote is the skewed one, so a missing
+      # quoted step name here is the same upstream defect as L3, not a second
+      # one: the destination is named, the step it is hung on is not (F25).
+      comment_content="names $WORKLOAD_DESTINATION; no step name in quotes, downstream of the F25 skew"
+      mark_disclosed L4
+      disclose "L4 app comment: body $comment_content — same disclosure as L3, parked at $JIBRIL_ATTRIBUTION_ISSUE (F25)"
     else
       comment_content="missing $( [ "$has_step" = true ] || printf 'the recorded step name in quotes; ' )$( [ "$has_dest" = true ] || printf 'a destination' )"
-      leg_fail "L4 app comment: body $comment_content (F31)"
+      leg_fail "L4 app comment: body $comment_content — the destination is what binds the record to the workload, and the comment does not carry it (F31)"
     fi
 
     # The evidence mirror copies the same comment into the PR description, and
     # a review reads the description. Both have to name the same sha (F34).
-    pr_body="$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null || true)"
-    mirror="$(awk '/<!-- garnet:evidence:begin -->/{on=1} on{print} /<!-- garnet:evidence:end -->/{on=0}' <<<"$pr_body")"
+    # The App writes the description after it finalizes the comment, so the
+    # mirror is waited for rather than read once.
+    normalise() { grep -v -e '<!-- garnet:evidence:begin -->' -e '<!-- garnet:evidence:end -->' \
+      | sed -e 's/[[:space:]]\+/ /g' -e 's/^ //' -e 's/ $//' | grep -v '^$'; }
     comment_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$comment_body" | head -n1)"
-    mirror_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$mirror" | head -n1)"
+    comment_normalised="$(normalise <<<"$comment_body")"
+    mirror=""; mirror_marker=""; mirror_body=""
+    mirror_deadline=$((SECONDS + MIRROR_POLL_SECONDS))
+    while :; do
+      pr_body="$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null || true)"
+      mirror="$(awk '/<!-- garnet:evidence:begin -->/{on=1} on{print} /<!-- garnet:evidence:end -->/{on=0}' <<<"$pr_body")"
+      mirror_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$mirror" | head -n1)"
+      mirror_body="$(normalise <<<"$mirror")"
+      { [ -n "$mirror" ] && [ "$mirror_marker" = "$comment_marker" ]; } && break
+      [ "$SECONDS" -lt "$mirror_deadline" ] || break
+      sleep 15
+    done
+    # Same sha is not the same record: the comment's payload has to be present
+    # in the mirror, so a stale or hand-trimmed copy under a current marker
+    # fails. The mirror adds its own heading and fold around that payload (F34).
     if [ -z "$mirror" ]; then
-      mirror_state="absent from the pull request description"
+      mirror_state="absent from the pull request description after ${MIRROR_POLL_SECONDS}s"
       leg_fail "L4 app comment: evidence mirror $mirror_state (F34)"
     elif [ "$mirror_marker" != "$comment_marker" ]; then
       mirror_state="mirror at ${mirror_marker:-no sha}, comment at ${comment_marker:-no sha}"
       leg_fail "L4 app comment: evidence mirror and comment disagree — $mirror_state (F34)"
+    elif [[ "$mirror_body" != *"$comment_normalised"* ]]; then
+      mirror_state="same sha, different body: $(wc -l <<<"$mirror_body") mirrored line(s) do not carry the comment's $(wc -l <<<"$comment_normalised")"
+      leg_fail "L4 app comment: evidence mirror carries the head marker but not the comment's content — $mirror_state (F34)"
+      diff <(echo "$comment_normalised") <(echo "$mirror_body") | head -n 20
     else
-      mirror_state="mirrored in the description, both bound to ${PR_HEAD_SHA:0:7}"
+      mirror_state="mirrored in the description in full, both bound to ${PR_HEAD_SHA:0:7}"
     fi
   fi
 fi
@@ -362,7 +495,17 @@ if [ "$in_pr_context" = true ]; then
   fi
 fi
 if [ "$shape_fail" = true ]; then
-  leg_fail "L6 posture: $(printf '%s; ' "${shape_notes[@]}")"
+  _posture_state="$(printf '%s; ' "${shape_notes[@]}")"
+  leg_fail "L6 posture: ${_posture_state%; }"
+  # Expected only while the single thing wrong is the one pnpm's repin fixes:
+  # its own `test.yml` leaving `jibril_version` empty at an action sha whose
+  # default resolves to a moving selector. Any other posture finding is new.
+  posture_other=0
+  for _note in "${shape_notes[@]}"; do
+    case "$_note" in "upstream test: sensor version pinned"*) ;; *) posture_other=$((posture_other + 1)) ;; esac
+  done
+  [ "$posture_other" -eq 0 ] \
+    && expect_fail L6 "pnpm pins \`jibril_version\` in its own \`test.yml\` (the repin pull request); the marker drops the run after the upstream posture row reads pinned"
 fi
 shape_state="$(printf '%s; ' "${shape_notes[@]}")"
 shape_state="${shape_state%; }"
@@ -373,6 +516,11 @@ shape_state="${shape_state%; }"
 # profile for "pnpm's setup works" to be true.
 integration_state="not applicable (event=${EVENT_NAME:-unknown})"
 integration_run_id=""; integration_profile_id=""; integration_conclusion=""
+# What the sensor's stable channel names right now. `unknown` is not read as
+# "unchanged": a channel the gate cannot see cannot retire anything, and it
+# cannot mark anything expected either.
+stable_channel_tag="$(gh api "repos/$JIBRIL_RELEASES_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)"
+[ -n "$stable_channel_tag" ] || stable_channel_tag=unknown
 if [ "$in_pr_context" = true ]; then
   integration_state="untested: no $INTEGRATION_WORKFLOW_NAME run found for head ${PR_HEAD_SHA:0:7}"
   deadline=$((SECONDS + INTEGRATION_POLL_SECONDS))
@@ -405,6 +553,12 @@ if [ "$in_pr_context" = true ]; then
       esac
       integration_state="$INTEGRATION_WORKFLOW_NAME run $integration_run_id finished $integration_conclusion with no profile ($why): the job was green, the sensor recorded nothing"
       leg_fail "L7 integration run: $integration_state"
+      # pnpm's own job stays dark while the stable channel still names the
+      # release that predates this gate. The retiring event is the channel
+      # moving, read from the sensor's own releases rather than assumed.
+      if [ "$code" = 403 ] && [ "$stable_channel_tag" = "$STABLE_CHANNEL_BEFORE" ]; then
+        expect_fail L7 "the stable channel moves off \`$STABLE_CHANNEL_BEFORE\` (\`Latest\` today is \`$stable_channel_tag\`)"
+      fi
     fi
   fi
 fi
@@ -431,9 +585,18 @@ if [ "$in_pr_context" = true ]; then
 fi
 if command -v zizmor >/dev/null 2>&1; then
   count_findings() { jq 'if type == "array" then map(select(.ignored | not)) | length else 0 end' "$1" 2>/dev/null || echo 0; }
-  zizmor --format json-v1 --no-exit-codes --offline "${scan_files[@]}" > /tmp/zizmor.json 2>/tmp/zizmor.err || true
+  # A scanner that failed to run reports nothing, which reads exactly like a
+  # clean scan. Both invocations have to produce a JSON array or the leg fails.
+  scan_ok=true
+  zizmor --format json-v1 --no-exit-codes --offline "${scan_files[@]}" > /tmp/zizmor.json 2>/tmp/zizmor.err \
+    || { scan_ok=false; leg_fail "L8 reviewers: zizmor exited nonzero — $(head -c 200 /tmp/zizmor.err | tr '\n' ' ') (F33)"; }
+  zizmor --format json-v1 --no-exit-codes --offline --persona pedantic "${scan_files[@]}" > /tmp/zizmor-pedantic.json 2>/tmp/zizmor-pedantic.err \
+    || { scan_ok=false; leg_fail "L8 reviewers: zizmor --persona pedantic exited nonzero — $(head -c 200 /tmp/zizmor-pedantic.err | tr '\n' ' ') (F33)"; }
+  for report in /tmp/zizmor.json /tmp/zizmor-pedantic.json; do
+    jq -e 'type == "array"' "$report" >/dev/null 2>&1 \
+      || { scan_ok=false; leg_fail "L8 reviewers: $report is not a zizmor JSON array, so no finding in it was classified (F33)"; }
+  done
   zizmor_findings="$(count_findings /tmp/zizmor.json)"
-  zizmor --format json-v1 --no-exit-codes --offline --persona pedantic "${scan_files[@]}" > /tmp/zizmor-pedantic.json 2>/dev/null || true
   zizmor_pedantic="$(count_findings /tmp/zizmor-pedantic.json)"
   # Every finding, regular or pedantic, needs a written class in the
   # dispositions file. An answer left in a review conversation is not one (F33).
@@ -441,14 +604,21 @@ if command -v zizmor >/dev/null 2>&1; then
   python3 - "$DISPOSITIONS_PATH" /tmp/zizmor.json /tmp/zizmor-pedantic.json \
     > /tmp/zizmor-classified.txt 2>/tmp/zizmor-classify.err <<'PY' || classified=$?
 import json, sys, yaml
+
+# A class the verifier does not know is not a disposition; "fixed" claims the
+# finding is gone, so a finding still reported under it is unanswered (F33).
+DECIDING = {"disclosed", "intentional-diagnostic", "garnet-side"}
+
 dispositions_path, *reports = sys.argv[1:]
 rows = (yaml.safe_load(open(dispositions_path)) or {}).get("zizmor") or []
+for row in rows:
+    if not isinstance(row, dict) or not row.get("ident") or not row.get("path"):
+        sys.exit(f"malformed disposition row: {row!r}")
+    if row.get("class") not in DECIDING | {"fixed"}:
+        sys.exit(f"unknown disposition class {row.get('class')!r} for {row.get('ident')!r}")
 seen = set()
 for report in reports:
-    try:
-        findings = json.load(open(report))
-    except (OSError, ValueError):
-        continue
+    findings = json.load(open(report))
     for finding in findings if isinstance(findings, list) else []:
         if finding.get("ignored"):
             continue
@@ -472,6 +642,8 @@ for report in reports:
             None,
         )
         state = match.get("class") if match else "unclassified"
+        if state not in DECIDING:
+            state = "unclassified"
         print(f"{state}\t{key[0]} at {path}{' ' + route if route else ''}")
 PY
   if [ "$classified" -eq 0 ]; then
@@ -480,9 +652,10 @@ PY
   else
     zizmor_unclassified=0
     zizmor_unclassified_list="  - dispositions not read: $(head -c 200 /tmp/zizmor-classify.err | tr '\n' ' ')"
-    leg_fail "L8 reviewers: could not read $DISPOSITIONS_PATH"
+    leg_fail "L8 reviewers: $DISPOSITIONS_PATH did not classify the findings — $(head -c 200 /tmp/zizmor-classify.err | tr '\n' ' ') (F33)"
   fi
   zizmor_state="$zizmor_findings regular, $zizmor_pedantic pedantic finding(s) over ${#scan_files[@]} workflow file(s); $zizmor_unclassified without a written class"
+  [ "$scan_ok" = true ] || zizmor_state="$zizmor_state · the scan itself did not complete, so those counts prove nothing"
   if [ "${zizmor_unclassified:-0}" -gt 0 ]; then
     leg_fail "L8 reviewers: $zizmor_unclassified zizmor finding(s) with no row in $DISPOSITIONS_PATH (F33)"
     echo "$zizmor_unclassified_list"
@@ -496,13 +669,17 @@ fi
 # text; disabling actionlint or configuring the label away would hide them.
 if command -v actionlint >/dev/null 2>&1; then
   actionlint -no-color "${scan_files[@]}" > /tmp/actionlint.txt 2>&1 || true
-  python3 - "$DISPOSITIONS_PATH" /tmp/actionlint.txt > /tmp/actionlint-unexpected.txt 2>/dev/null <<'PY' || true
+  actionlint_read=0
+  python3 - "$DISPOSITIONS_PATH" /tmp/actionlint.txt > /tmp/actionlint-unexpected.txt 2>/tmp/actionlint-classify.err <<'PY' || actionlint_read=$?
 import re, sys, yaml
 dispositions_path, report = sys.argv[1:]
-allowed = [
-    row.get("message", "")
-    for row in (yaml.safe_load(open(dispositions_path)) or {}).get("actionlint") or []
-]
+rows = (yaml.safe_load(open(dispositions_path)) or {}).get("actionlint") or []
+for row in rows:
+    if not isinstance(row, dict) or not row.get("message"):
+        sys.exit(f"malformed actionlint disposition row: {row!r}")
+    if row.get("class") not in {"intentional-diagnostic", "disclosed"}:
+        sys.exit(f"unknown actionlint disposition class {row.get('class')!r}")
+allowed = [row["message"] for row in rows]
 for line in open(report):
     if not re.match(r"^\S+\.ya?ml:\d+:\d+:", line):
         continue
@@ -510,6 +687,9 @@ for line in open(report):
         continue
     print(line.rstrip())
 PY
+  if [ "$actionlint_read" -ne 0 ]; then
+    leg_fail "L8 reviewers: the actionlint dispositions did not parse — $(head -c 200 /tmp/actionlint-classify.err | tr '\n' ' ') (F33)"
+  fi
   actionlint_unexpected="$(wc -l < /tmp/actionlint-unexpected.txt | tr -d ' ')"
   actionlint_state="$actionlint_unexpected unexpected message(s); the \`\$/\` form and the Blacksmith label are answered in the dispositions file"
   if [ "$actionlint_unexpected" -gt 0 ]; then
@@ -559,19 +739,19 @@ else
 fi
 # The flush is the part a maintainer waits for after their own job is done: the
 # action's post step, read from the job timeline rather than from the sensor.
-if [ -n "$reproduce_job_id" ]; then
-  flush_seconds="$(gh api "repos/$repo/actions/jobs/$reproduce_job_id" 2>/dev/null \
-    | jq -r --arg n "Post $ACTION_STEP_NAME" '
-      [.steps[]? | select(.name == $n) | select(.started_at != null and .completed_at != null)
-       | ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601))] | first // empty')"
-fi
+reproduce_steps='{"steps":[]}'
+[ -z "$reproduce_job_id" ] || reproduce_steps="$(job_steps "$reproduce_job_id")"
+flush_seconds="$(step_seconds "$reproduce_steps" "Post $ACTION_STEP_NAME")"
 if [ -n "$flush_seconds" ]; then
   flush_seconds="${flush_seconds%.*}"
   timing_state="$timing_state · post-step flush ${flush_seconds}s (budget ${FLUSH_BUDGET_SECONDS}s)"
   [ "$flush_seconds" -le "$FLUSH_BUDGET_SECONDS" ] \
     || leg_fail "L9 timing: post-step flush ${flush_seconds}s exceeds ${FLUSH_BUDGET_SECONDS}s on the light cell (F30)"
 else
+  # The flush is the whole reason a post step exists; if it cannot be read, the
+  # budget was not checked and the leg has no business passing (F30).
   timing_state="$timing_state · post-step flush not measured"
+  leg_fail "L9 timing: post-step flush not measured on the light cell — no \"Post $ACTION_STEP_NAME\" step in the reproduce job timeline (F30)"
 fi
 [ -z "$profile_seconds" ] || timing_state="$timing_state · profile visible ${profile_seconds}s after the job"
 [ -z "$comment_seconds" ] || timing_state="$timing_state · comment final ${comment_seconds}s after the profile"
@@ -641,27 +821,46 @@ fi
 # On a run that has a token, an annotation from the action step is a defect: the
 # only warning pnpm has ever been shown there is the fail-open one of F2, and a
 # reader who learns to skip warnings skips that one too (F27).
-warning_count=0; error_count=0; failopen_count=0; warning_state="untested"
-if [ -n "$reproduce_job_id" ]; then
-  reproduce_log="$(job_log "$reproduce_job_id")"
-  if [ -n "$reproduce_log" ]; then
-    action_log="$(step_log "$reproduce_log" "garnet-org/action@")"
-    warning_count="$(grep -c '##\[warning\]' <<<"$action_log" || true)"
-    error_count="$(grep -c '##\[error\]' <<<"$action_log" || true)"
-    failopen_count="$(grep -ciE '##\[warning\].*(jibril (service )?failed to start|continuing without)' <<<"$action_log" || true)"
-    unexpected=$(( warning_count - failopen_count ))
-    warning_state="$warning_count warning(s), $error_count error(s) from the action step; $failopen_count are the disclosed fail-open text (F2)"
-    if [ "$warning_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
-      leg_fail "L12 warning noise: the action step emitted $warning_count warning(s) and $error_count error(s) on the trusted-token path, $unexpected of them not the disclosed fail-open text (F27)"
-      grep -E '##\[(warning|error)\]' <<<"$action_log" | head -n 10
-    fi
-  else
-    warning_state="job log not readable"
-    leg_fail "L12 warning noise: could not read the reproduce job log"
-  fi
+warning_count=0; error_count=0; failopen_count=0; warning_state="untested"; warning_lines=""
+if [ -z "$reproduce_job_id" ]; then
+  warning_state="reproduce job not resolved ($(job_ids_matching "$REPRODUCE_JOB_NAME") job(s) named \"$REPRODUCE_JOB_NAME\" in the run)"
+  leg_fail "L12 warning noise: $warning_state (F35)"
 else
-  warning_state="reproduce job not found in the run"
-  leg_fail "L12 warning noise: reproduce job not found in run $run_id"
+  reproduce_log="$(job_log "$reproduce_job_id")"
+  if reproduce_ann="$(job_annotation_lines "$reproduce_job_id")"; then ann_read=true; else ann_read=false; reproduce_ann=""; fi
+  # Main step and post hook both: the OIDC fallback warning is printed while the
+  # action starts, the flush and upload warnings after the job's steps.
+  action_log=""
+  if [ -n "$reproduce_log" ]; then
+    action_log="$(printf '%s\n%s\n' \
+      "$(step_log "$reproduce_log" "garnet-org/action@")" \
+      "$(post_step_log "$reproduce_log" "$reproduce_steps" "Post $ACTION_STEP_NAME")")"
+  fi
+  if [ -z "$reproduce_log" ] && [ "$ann_read" != true ]; then
+    warning_state="neither the log nor the check-run annotations of job $reproduce_job_id could be read"
+    leg_fail "L12 warning noise: $warning_state — a leg that cannot see the annotations cannot pass (F35)"
+  else
+    warning_lines="$(merge_annotation_lines "$(annotations "$action_log")" "$reproduce_ann")"
+    warning_count="$(grep -c '##\[warning\]' <<<"$warning_lines" || true)"
+    error_count="$(grep -c '##\[error\]' <<<"$warning_lines" || true)"
+    failopen_count="$(grep -ciE '##\[warning\].*(jibril (service )?failed to start|continuing without)' <<<"$warning_lines" || true)"
+    unexpected=$(( warning_count - failopen_count ))
+    source_state="action step and post hook from the log"
+    [ -n "$reproduce_log" ] || source_state="check-run annotations only, log not archived yet: job-scoped, not attributed to a step"
+    warning_state="$warning_count warning(s), $error_count error(s) — $source_state; $failopen_count are the disclosed fail-open text (F2)"
+    if [ "$warning_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
+      leg_fail "L12 warning noise: the action emitted $warning_count warning(s) and $error_count error(s) with api_token supplied, $unexpected of them not the disclosed fail-open text; the OIDC fallback line is garnet-org/action pull request 147, unreleased (F27)"
+      head -n 10 <<<"$warning_lines" | while IFS= read -r line; do
+        [ -z "$line" ] || echo "::error::L12 offending line: $line"
+      done
+      # Expected only while every offending line is the one line action 147
+      # removes. A second warning, or any error, is noise nobody has explained.
+      oidc_lines="$(grep -F -c "OIDC token request failed because this workflow is missing 'id-token: write' permission" <<<"$warning_lines" || true)"
+      if [ "$error_count" -eq 0 ] && [ "$oidc_lines" -eq "$warning_count" ]; then
+        expect_fail L12 "garnet-org/action pull request 147 ships and the token path stops printing the OIDC fallback line"
+      fi
+    fi
+  fi
 fi
 
 # --- L13 credential-less run ---------------------------------------------------
@@ -670,21 +869,39 @@ fi
 # job (F28). It produces no profile and none is claimed.
 sim_state="untested"
 sim_warnings=0; sim_errors=0; sim_info=0
-if [ -n "$dependabot_job_id" ]; then
+if [ -z "$dependabot_job_id" ]; then
+  sim_state="simulation job not resolved ($(job_ids_matching "$DEPENDABOT_SIM_JOB_NAME") job(s) named \"$DEPENDABOT_SIM_JOB_NAME\" in the run)"
+  leg_fail "L13 credential-less: $sim_state (F35)"
+else
   sim_log="$(job_log "$dependabot_job_id")"
-  sim_action_log="$(step_log "$sim_log" "garnet-org/action@")"
-  sim_warnings="$(grep -c '##\[warning\]' <<<"$sim_action_log" || true)"
-  sim_errors="$(grep -c '##\[error\]' <<<"$sim_action_log" || true)"
-  sim_info="$(grep -ciE "api_token' is required|no api token|skipping" <<<"$sim_action_log" || true)"
-  sim_state="outcome ${DEPENDABOT_SIM_OUTCOME:-unknown} · $sim_warnings warning(s), $sim_errors error(s), $sim_info info line(s) naming the missing token"
-  if [ "${DEPENDABOT_SIM_OUTCOME:-}" != success ] || [ "$sim_warnings" -gt 0 ] || [ "$sim_errors" -gt 0 ]; then
+  sim_steps="$(job_steps "$dependabot_job_id")"
+  if sim_ann="$(job_annotation_lines "$dependabot_job_id")"; then sim_ann_read=true; else sim_ann_read=false; sim_ann=""; fi
+  sim_action_log=""
+  if [ -n "$sim_log" ]; then
+    sim_action_log="$(printf '%s\n%s\n' \
+      "$(step_log "$sim_log" "garnet-org/action@")" \
+      "$(post_step_log "$sim_log" "$sim_steps" "Post $SIM_ACTION_STEP_NAME")")"
+  fi
+  sim_conclusion="$(step_conclusion "$sim_steps" "$SIM_ACTION_STEP_NAME")"
+  sim_evidence="$(merge_annotation_lines "$sim_action_log" "$sim_ann")"
+  sim_warnings="$(grep -c '##\[warning\]' <<<"$sim_evidence" || true)"
+  sim_errors="$(grep -c '##\[error\]' <<<"$sim_evidence" || true)"
+  # The action explains the skip in a warning annotation, not an info line. The
+  # explanation is what the leg is for, so the annotation counts as one and the
+  # form it takes is stated rather than failed on.
+  sim_info="$(grep -ciE "api_token' is required|no api token|without runtime monitoring|skipping" <<<"$sim_evidence" || true)"
+  sim_state="outcome ${DEPENDABOT_SIM_OUTCOME:-unknown} · step $sim_conclusion · $sim_info line(s) naming the missing token, carried as $sim_warnings warning annotation(s), $sim_errors error(s)"
+  if [ -z "$sim_log" ] && [ "$sim_ann_read" != true ]; then
+    sim_state="neither the log nor the check-run annotations of job $dependabot_job_id could be read"
+    leg_fail "L13 credential-less: $sim_state — silence the leg cannot see is not a clean skip (F35)"
+  elif [ "${DEPENDABOT_SIM_OUTCOME:-}" != success ] || [ "$sim_errors" -gt 0 ] || [ "$sim_conclusion" != success ]; then
     leg_fail "L13 credential-less: an empty api_token did not skip cleanly — $sim_state (F28)"
   elif [ "$sim_info" -lt 1 ]; then
     leg_fail "L13 credential-less: the action skipped silently; a credential-less run has to say why (F28)"
+  elif [ "$sim_warnings" -gt 0 ]; then
+    disclose "L13 credential-less: the explanation arrives as a ##[warning] annotation, not an info line — intended on this path, and unlike L12 it is not noise on a token run (F28)"
+    mark_disclosed L13
   fi
-else
-  sim_state="simulation job not found in the run"
-  leg_fail "L13 credential-less: simulation job not found in run $run_id"
 fi
 disclose "L13 is a simulation on this repository's own event with a read-only token, not a Dependabot run: it shows what the action does without a token, and no server-side evidence exists for Dependabot or fork pull requests (F11, F12)"
 
@@ -719,6 +936,8 @@ to_json_array() { printf '%s\n' "$@" | jq -R . | jq -s 'map(select(length > 0))'
 
 jq -n \
   --arg verdict "$verdict" --argjson fail_reasons "$(to_json_array "${fail_reasons[@]:-}")" --argjson attention "$(to_json_array "${attention[@]:-}")" \
+  --argjson expected_legs "$(to_json_array "${expected_legs[@]:-}")" --argjson expected_notes "$(to_json_array "${expected_notes[@]:-}")" \
+  --arg stable_channel_tag "${stable_channel_tag:-unknown}" \
   --arg tag "$GATE_TAG" --arg resolved_version "${STARTUP_VERSION:-}" --arg action_sha "$action_ref" --arg upstream_action_sha "$upstream_action_ref" \
   --arg run_id "$run_id" --arg run_attempt "$run_attempt" --arg runner "${RUNNER_NAME_USED:-}" \
   --arg event "${EVENT_NAME:-}" --arg pr "${PR_NUMBER:-}" \
@@ -748,6 +967,7 @@ jq -n \
   --argjson gate_attribution "$(shape_get '.gate.attribution // {}')" --argjson upstream_attribution "$(shape_get '.upstream.attribution // {}')" \
   --arg action_default_version "$action_default_version" \
   '{verdict: $verdict, fail_reasons: $fail_reasons, attention: $attention, disclosures: $disclosures,
+    expected_today: {legs: $expected_legs, retires_when: $expected_notes, stable_channel: $stable_channel_tag},
     jibril: {requested_tag: $tag, resolved_version: $resolved_version},
     action_sha: $action_sha,
     action_default_jibril_version: $action_default_version,
@@ -792,16 +1012,29 @@ leg_state() { # $1 leg id -> FAIL when any failure names it
   for reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do
     case "$reason" in "$1 "*|"$1:"*) printf FAIL; return ;; esac
   done
+  local leg
+  for leg in ${disclosed_legs[@]+"${disclosed_legs[@]}"}; do
+    [ "$leg" = "$1" ] && { printf DISCLOSED; return; }
+  done
   printf PASS
 }
 leg_row() { # $1 id, $2 title, $3 state text, $4 link
   local state
   state="$(leg_state "$1")"
   case "$3" in "not applicable"*|untested*|unknown*) [ "$state" = PASS ] && state="n/a" ;; esac
+  [ "$state" = DISCLOSED ] && state="disclosed"
+  [ "$state" = FAIL ] && is_expected "$1" && state="FAIL (expected)"
   printf '| **%s** | %s %s | %s%s |\n' "$state" "$1" "$2" "$(one_line "$3")" "${4:+ [→]($4)}"
 }
 failed_legs=0
 for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed_legs + 1)); done
+# A failing leg nobody expected is the one that pages. The expected set is
+# whatever the run itself observed, not a list held in the workflow file.
+expected_fails=0
+unexpected_fails=0
+for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do
+  if is_expected "${_reason%% *}"; then expected_fails=$((expected_fails + 1)); else unexpected_fails=$((unexpected_fails + 1)); fi
+done
 
 {
   echo "<!-- garnet:jibril-release-gate $GATE_TAG -->"
@@ -810,7 +1043,15 @@ for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed
   if [ "$verdict" = PASS ]; then
     echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\` cleared all 14 legs of the pnpm acceptance bar."
   else
-    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\`: **$failed_legs failing check(s)** below, each named with its ledger row."
+    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\`: **$failed_legs failing check(s)** below, each named with its ledger row — $expected_fails expected today, **$unexpected_fails not**."
+  fi
+  if [ "${#expected_notes[@]}" -gt 0 ]; then
+    echo
+    echo "Expected today:"
+    echo
+    printf -- '- %s\n' "${expected_notes[@]}"
+    echo
+    echo "<sub>An expected failure still fails. The marker says a named event retires it, and the run drops the marker by itself once that event is observable.</sub>"
   fi
   echo
   echo "| | leg | what it found |"
@@ -833,7 +1074,9 @@ for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed
     echo
     echo "### Failing legs"
     echo
-    for r in ${fail_reasons[@]+"${fail_reasons[@]}"}; do echo "- $r"; done
+    for r in ${fail_reasons[@]+"${fail_reasons[@]}"}; do
+      if is_expected "${r%% *}"; then echo "- **expected today** — $r"; else echo "- $r"; fi
+    done
     [ -z "$bot_thread_list" ] || echo "$bot_thread_list"
     [ -z "$drift_list" ] || { echo; echo "$drift_list"; }
   fi
@@ -853,6 +1096,7 @@ for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed
   echo "| action | \`garnet-org/action@${action_ref:0:12}\` · empty \`jibril_version\` there resolves to \`$action_default_version\` |"
   echo "| run | [$run_id]($run_url) attempt $run_attempt · \`${RUNNER_NAME_USED:-}\` · $EVENT_NAME |"
   echo "| pnpm at main | \`${UPSTREAM_SHA:0:7}\` · action \`${upstream_action_ref:0:12}\` → \`$upstream_action_default_version\` |"
+  echo "| sensor stable channel | \`${stable_channel_tag:-unknown}\` · L7 stays dark while it names \`$STABLE_CHANNEL_BEFORE\` |"
   echo "| workflow ref seen by sensor | \`${STARTUP_WORKFLOW_REF:-absent}\` |"
   if [ "$in_pr_context" = true ]; then
     echo "| base → head | \`${PR_BASE_SHA:0:7}\` → \`${PR_HEAD_SHA:0:7}\` |"
