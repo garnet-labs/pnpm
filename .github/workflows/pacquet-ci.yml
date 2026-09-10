@@ -149,7 +149,7 @@ jobs:
         continue-on-error: true
 
       - name: Install just
-        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: just
 
@@ -157,9 +157,14 @@ jobs:
         run: just install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,sccache@0.17.0
+
+      - name: Install Python for ecosystem tests
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0  v6
+        with:
+          python-version: '3.13'
 
       - name: Test pacquet
         shell: bash
@@ -376,7 +381,7 @@ jobs:
 
       - name: Install cargo-deny
         if: github.event_name == 'merge_group' || steps.filter.outputs.src == 'true'
-        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: cargo-deny
 
@@ -482,13 +487,10 @@ jobs:
       - name: Install cargo-dylint and dylint-link
         uses: $/.github/actions/binstall
         with:
-          # Pin to 6.0.0 until trailofbits/dylint cuts a 6.0.2. The
-          # 6.0.1 binstall artifacts (published 2026-05-26 17:51 UTC)
-          # fail at driver bootstrap with `failed to read
-          # /home/runner/work/dylint/dylint/driver/Cargo.toml`, the
-          # path baked in by dylint's own CI checkout. Downstream
-          # runners don't have that workspace so the step aborts.
-          packages: cargo-dylint@6.0.0 dylint-link@6.0.0
+          # Keep in step with the `dylint_linting` version the pinned
+          # perfectionist revision builds against: cargo-dylint refuses
+          # a library built by a newer one.
+          packages: cargo-dylint@6.0.4 dylint-link@6.0.4
 
       - name: Run dylint
         # `-D warnings` must come in via `RUSTFLAGS`, not as a trailing
