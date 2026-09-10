@@ -39,6 +39,11 @@ jobs:
       cancel-in-progress: true
 
     runs-on: ${{ inputs.platform }}
+    # Fork-only A/B diagnostic for the existing Garnet-recorded Node 24 cell.
+    # The comparison commit flips only this value. This is workspace config,
+    # not a supported command-scoped override; pnpm has no such override yet.
+    env:
+      DIAGNOSTIC_CARGO_ENABLED: 'false'
 
     steps:
     # A near-full "affected packages" sweep can exhaust the hosted runner's
@@ -59,6 +64,33 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
+    # Keep identical toolchain preparation on both sides of the diagnostic and
+    # finish it before Garnet starts. The receipt therefore describes install
+    # work, not rustup downloads or cache traffic.
+    - name: Prepare Rust outside the recorded window
+      if: ${{ inputs.garnet }}
+      uses: $/.github/actions/rustup
+      with:
+        restore-cache: false
+    - name: Set diagnostic Cargo workspace mode
+      if: ${{ inputs.garnet }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$DIAGNOSTIC_CARGO_ENABLED" in
+          true|false) ;;
+          *) echo "::error::invalid diagnostic Cargo mode: $DIAGNOSTIC_CARGO_ENABLED"; exit 1 ;;
+        esac
+        if grep -qE '^[[:space:]]*cargo:' pnpm-workspace.yaml; then
+          echo "::error::pnpm-workspace.yaml already has a cargo setting"
+          exit 1
+        fi
+        cat >> pnpm-workspace.yaml <<EOF
+
+        cargo:
+          enabled: $DIAGNOSTIC_CARGO_ENABLED
+        EOF
+        tail -n 4 pnpm-workspace.yaml
     - if: ${{ inputs.garnet }}
       uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
       with:
@@ -66,7 +98,26 @@ jobs:
     - name: Install pnpm and Node
       uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
       with:
+        # cargo.enabled first shipped after the repository's 12.3.4 pin.
+        # Pin both A/B recordings to the released version used by upstream
+        # pnpm/pnpm#14689; other matrix cells retain the repository default.
+        version: ${{ inputs.garnet && '12.4.1' || '' }}
         runtime: node@${{ inputs.node }}
+    - name: Verify diagnostic Cargo workspace result
+      if: ${{ inputs.garnet }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        marker='# >>> pnpm-managed cargo sources >>>'
+        if [ "$DIAGNOSTIC_CARGO_ENABLED" = true ]; then
+          grep -Fq "$marker" .cargo/config.toml
+          test -d .pnpm/crates
+          echo "cargo.enabled=true materialized $(find .pnpm/crates -mindepth 1 -maxdepth 1 | wc -l) source directories"
+        else
+          ! grep -Fq "$marker" .cargo/config.toml
+          test ! -d .pnpm/crates
+          echo "cargo.enabled=false left the managed Cargo source and .pnpm/crates absent"
+        fi
     - name: Verify Node version
       shell: bash
       env:
