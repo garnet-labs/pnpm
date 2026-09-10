@@ -14,15 +14,16 @@ permissions:
 
 jobs:
   recorded:
-    name: JS install with cargo.enabled true
+    name: JS install with cargo.enabled false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      DIAGNOSTIC_CARGO_ENABLED: 'true'
+      DIAGNOSTIC_CARGO_ENABLED: 'false'
     steps:
       - name: Checkout commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Prepare Rust before recording
@@ -34,6 +35,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "executed_sha=$(git rev-parse HEAD)"
           node <<'NODE'
           const fs = require('node:fs')
           const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'))
