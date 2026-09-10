@@ -77,6 +77,16 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
+        # pnpm/setup rejects a version input that differs from package.json,
+        # so pin this one cell by updating both declarations before the action
+        # reads them. Other matrix cells retain the repository's default.
+        node <<'NODE'
+        const fs = require('node:fs')
+        const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+        manifest.packageManager = 'pnpm@12.4.1'
+        manifest.devEngines.packageManager.version = '12.4.1'
+        fs.writeFileSync('package.json', `${JSON.stringify(manifest, null, 2)}\n`)
+        NODE
         case "$DIAGNOSTIC_CARGO_ENABLED" in
           true|false) ;;
           *) echo "::error::invalid diagnostic Cargo mode: $DIAGNOSTIC_CARGO_ENABLED"; exit 1 ;;
@@ -98,10 +108,6 @@ jobs:
     - name: Install pnpm and Node
       uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
       with:
-        # cargo.enabled first shipped after the repository's 12.3.4 pin.
-        # Pin both A/B recordings to the released version used by upstream
-        # pnpm/pnpm#14689; other matrix cells retain the repository default.
-        version: ${{ inputs.garnet && '12.4.1' || '' }}
         runtime: node@${{ inputs.node }}
     - name: Verify diagnostic Cargo workspace result
       if: ${{ inputs.garnet }}
