@@ -43,7 +43,7 @@ jobs:
     # The comparison commit flips only this value. This is workspace config,
     # not a supported command-scoped override; pnpm has no such override yet.
     env:
-      DIAGNOSTIC_CARGO_ENABLED: 'false'
+      DIAGNOSTIC_CARGO_ENABLED: 'true'
 
     steps:
     # A near-full "affected packages" sweep can exhaust the hosted runner's
