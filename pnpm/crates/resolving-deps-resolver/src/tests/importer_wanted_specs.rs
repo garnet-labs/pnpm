@@ -102,3 +102,32 @@ fn regular_dep_range_wins_over_dev_range_of_same_alias() {
     .unwrap();
     assert_eq!(wanted, vec![("foo".to_string(), "1.0.0".to_string(), false, false)]);
 }
+
+#[test]
+fn rejects_invalid_peer_dependency_specification() {
+    let (_tmp, manifest) = manifest_with(serde_json::json!({
+        "name": "proj",
+        "peerDependencies": {
+            "@pnpm.e2e/foo": "@pnpm.e2e/foo@1.0.0"
+        }
+    }));
+    let err = importer_direct_wanted_specs(
+        &manifest,
+        ALL_GROUPS,
+        false,
+        &pnpm_catalogs_types::Catalogs::new(),
+    )
+    .unwrap_err();
+    match err {
+        crate::resolve_dependency_tree::ResolveDependencyTreeError::InvalidPeerDependencySpecification {
+            dep_name,
+            project_id,
+            version,
+        } => {
+            assert_eq!(dep_name, "@pnpm.e2e/foo");
+            assert_eq!(project_id, "proj");
+            assert_eq!(version, "@pnpm.e2e/foo@1.0.0");
+        }
+        other => panic!("expected InvalidPeerDependencySpecification, got {other:?}"),
+    }
+}

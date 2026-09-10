@@ -2,7 +2,7 @@ import {
   buildRunProfile,
   isRealRecordedStep,
   summarizeProfile,
-} from "../renderer/review.mjs"
+} from "./review.mjs"
 
 function asRecord(profile) {
   if (profile === null || typeof profile !== "object") return null

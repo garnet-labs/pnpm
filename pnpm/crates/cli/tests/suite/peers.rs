@@ -892,3 +892,42 @@ fn a_filtered_install_only_reports_the_projects_it_installed() {
 
     drop((root, mock_instance));
 }
+
+#[test]
+fn invalid_peer_dependency_specification_fails_install() {
+    let CommandTempCwd { workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "proj",
+            "version": "1.0.0",
+            "peerDependencies": {
+                "@pnpm.e2e/foo": "@pnpm.e2e/foo@1.0.0"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let output = Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .without_ambient_pnpm_config()
+        .arg("install")
+        .output()
+        .expect("run pnpm install");
+
+    assert!(
+        !output.status.success(),
+        "install should fail on invalid peer specification: {output:?}",
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("ERR_PNPM_INVALID_PEER_DEPENDENCY_SPECIFICATION"),
+        "stderr should contain ERR_PNPM_INVALID_PEER_DEPENDENCY_SPECIFICATION:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("The peerDependencies field named '@pnpm.e2e/foo' of package 'proj' has an invalid value: '@pnpm.e2e/foo@1.0.0'"),
+        "stderr should contain detailed error message:\n{stderr}",
+    );
+}
