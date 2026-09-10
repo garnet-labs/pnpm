@@ -14,11 +14,11 @@ permissions:
 
 jobs:
   recorded:
-    name: JS install with cargo.enabled true
+    name: JS install with cargo.enabled false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      DIAGNOSTIC_CARGO_ENABLED: 'true'
+      DIAGNOSTIC_CARGO_ENABLED: 'false'
     steps:
       - name: Checkout commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,9 +50,10 @@ jobs:
           EOF
 
       - name: Start Garnet recording
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764 # action main
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0
           debug: true
 
       - name: Install JS dependencies
