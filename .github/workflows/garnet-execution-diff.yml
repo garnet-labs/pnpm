@@ -41,7 +41,7 @@ jobs:
           actual=$(git rev-parse HEAD)
           [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
 
-      - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+      - uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764 # main, v2.3.0 candidate
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
         env:

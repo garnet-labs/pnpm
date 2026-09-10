@@ -209,9 +209,9 @@ jobs:
         run: node control/.github/scripts/garnet-dependabot-record.mjs prepare
       - name: Start trusted sensor using OIDC only
         timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 2 || 45 }}
-        uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c
+        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764
         with:
-          jibril_version: v2.16.0
+          jibril_version: v2.17.0
           stop_timeout_seconds: ${{ fromJSON(needs.resolve.outputs.stop_budget).sensor_stop_seconds }}
           debug: "false"
       - name: Run dependency workload only inside isolated containers

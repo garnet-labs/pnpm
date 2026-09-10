@@ -12,11 +12,11 @@ jobs:
       - name: Pull public canary image
         run: docker pull node:22-bookworm
       - name: Garnet OIDC registration
-        uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c
+        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764
         env:
           GARNET_PROFILE_JOB: dependabot-oidc-canary-${{ github.run_attempt }}
         with:
-          jibril_version: v2.16.0
+          jibril_version: v2.17.0
       - name: Harmless trusted workload
         run: |
           set -euo pipefail
