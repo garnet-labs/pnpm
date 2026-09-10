@@ -14,11 +14,11 @@ permissions:
 
 jobs:
   recorded:
-    name: JS install with cargo.enabled false
+    name: JS install with cargo.enabled true
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      DIAGNOSTIC_CARGO_ENABLED: 'false'
+      DIAGNOSTIC_CARGO_ENABLED: 'true'
     steps:
       - name: Checkout commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
