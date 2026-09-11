@@ -1,0 +1,45 @@
+# Leg tiers for the Garnet release gate.
+#
+# core     — must pass for the pnpm upgrade/acceptance bar: capture → comment
+#            → permalink, rendered-comment correctness (cold read), the
+#            security/trust posture we actually ask pnpm for, and compliance
+#            with the current rollout model. A core miss fails the verdict.
+# optional — a disclosed limitation, a follow-on already filed, or a leg that
+#            cannot be exercised until pnpm itself changes something. Reported
+#            loudly on every run; never blocks the verdict.
+#
+# How to keep the gate aligned with ongoing engineering work:
+#   - Change a leg's tier HERE, not in garnet-release-gate-verify.sh. The
+#     script routes every leg through this file; a tier edit is a one-line
+#     diff that reviewers can cold-read.
+#   - `promotion` names the engineering fix/decision that moves an optional
+#     leg back to core. When that work lands, flip the tier in the same PR
+#     that proves it.
+#   - `why` cites the ledger row (F-refs in FAILURE_LEDGER.md) or the decision
+#     so the reason survives the people who wrote it.
+#   - A new failure mode still gets a ledger row + a leg in the same change;
+#     choose its tier at creation.
+#
+# L6 is split inside the script: the gate job's own posture and the PR-diff
+# permission checks are core; rows read from pnpm's own files at main report
+# under the optional "upstream posture" heading (they only change when pnpm
+# repins).
+legs:
+  L1:   { tier: core,     why: "sensor start is the product" }
+  L2:   { tier: core,     why: "profile upload is the product" }
+  L3:   { tier: optional, why: "F25 jibril parseStepsList step-numbering skew — disclosed",
+          promotion: "fix lands in garnet-org/jibril and the recorded step names the run step" }
+  L4:   { tier: core,     why: "capture → finalized comment bound to the PR head; the render is what the reviewer sees" }
+  L5:   { tier: core,     why: "the public permalink is the shareable proof" }
+  L6:   { tier: core,     why: "no permission asks, full-SHA pins, explicit api_token; upstream-file rows report optional" }
+  L7:   { tier: optional, why: "pnpm's own TS CI on its current pin — platform reliability evidence, not something the candidate controls (e.g. intermittent jibril.service fail-open since Sep-2)",
+          promotion: "when upstream repins to the candidate, the leg measures the product we ship" }
+  L8:   { tier: core,     why: "scanner/reviewer flag pass — trust bar for the ask" }
+  L9:   { tier: core,     why: "regression bound on sensor start + overhead + flush latency" }
+  L10:  { tier: core,     why: "only fails if the fork instruments fewer cells than the declared model; coverage gaps themselves are disclosed, not failing" }
+  L11:  { tier: core,     why: "if the gate stops mirroring pnpm's shape, every other verdict is void" }
+  L12:  { tier: core,     why: "no warnings on the token path — clean DX a maintainer sees" }
+  L13:  { tier: optional, why: "F28 credential-less/fork coverage is an accepted limitation we communicate, not a blocker",
+          promotion: "when the action names the missing-token reason or fork coverage ships" }
+  L14:  { tier: optional, why: "macOS/release-workflow coverage limitations are disclosed; unclassifiable-runner steps stay watched",
+          promotion: "when non-Linux capture exists or the release workflows are in scope" }
