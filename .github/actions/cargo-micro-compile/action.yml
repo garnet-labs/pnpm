@@ -1,0 +1,9 @@
+name: Compile micro-benchmark
+description: Build the pinned micro-benchmark binary
+runs:
+  using: composite
+  steps:
+    - name: Compile
+      shell: bash
+      working-directory: ${{ env.SOURCE_DIRECTORY }}
+      run: cargo build --release --bin=micro-benchmark
