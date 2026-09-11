@@ -1,0 +1,7 @@
+{
+  "name": "dns-egress-pnpm",
+  "private": true,
+  "dependencies": {
+    "pnpm": "12.2.1"
+  }
+}
