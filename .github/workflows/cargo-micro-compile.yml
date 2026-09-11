@@ -1,0 +1,102 @@
+name: Cargo micro-benchmark compile
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/cargo-micro-compile.yml
+      - .github/actions/cargo-micro-compile/**
+      - .ci/cargo-sources.toml
+
+permissions: {}
+
+concurrency:
+  group: cargo-micro-compile-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  compile:
+    name: Garnet / Cargo micro-benchmark compile
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      SOURCE_REVISION: cfd4a73149bfcf654431be474bff40e94b04ffd4
+    steps:
+      - name: Set build locations
+        shell: bash
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cargo-target" >> "$GITHUB_ENV"
+          echo "SOURCE_DIRECTORY=$RUNNER_TEMP/pnpm-source" >> "$GITHUB_ENV"
+      - name: Checkout build configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Checkout pinned source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: cfd4a73149bfcf654431be474bff40e94b04ffd4
+          path: workload
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b
+        with:
+          working-directory: workload
+          install: false
+          cache: false
+      - name: Prepare isolated build
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C workload rev-parse HEAD)" = "$SOURCE_REVISION"
+          mv workload "$SOURCE_DIRECTORY"
+          cp .ci/cargo-sources.toml "$SOURCE_DIRECTORY/.cargo/config.toml"
+          cd "$SOURCE_DIRECTORY"
+          rustup toolchain install 1.97.0 --profile minimal
+          test "$(pnpm --version)" = 12.4.1
+          test ! -e "$CARGO_HOME/registry"
+          test ! -e "$CARGO_HOME/git"
+          test ! -e "$CARGO_TARGET_DIR"
+          test ! -e .pnpm/crates
+          mkdir -p "$RUNNER_TEMP/build-receipt"
+          sha256sum Cargo.lock pnpm-lock.yaml rust-toolchain.toml > "$RUNNER_TEMP/build-receipt/inputs.sha256"
+          printf 'source=%s\nconfiguration=%s\n' "$SOURCE_REVISION" "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" | tee "$RUNNER_TEMP/build-receipt/revisions.txt"
+      - name: Record runtime
+        uses: garnet-org/action@ec09d3e69da42f45395d2796b951bcb109a84734
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0
+      - name: Check capture started
+        shell: bash
+        run: |
+          set -euo pipefail
+          systemctl is-active --quiet jibril.service
+          systemctl show jibril.service -p MainPID -p ActiveEnterTimestamp -p NRestarts > "$RUNNER_TEMP/build-receipt/sensor-before.txt"
+      - name: Build micro-benchmark
+        uses: ./.github/actions/cargo-micro-compile
+      - name: Verify build and capture
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIRECTORY"
+          sha256sum --check "$RUNNER_TEMP/build-receipt/inputs.sha256"
+          test -x "$CARGO_TARGET_DIR/release/micro-benchmark"
+          systemctl is-active --quiet jibril.service
+          systemctl show jibril.service -p MainPID -p ActiveEnterTimestamp -p NRestarts > "$RUNNER_TEMP/build-receipt/sensor-after.txt"
+          diff "$RUNNER_TEMP/build-receipt/sensor-before.txt" "$RUNNER_TEMP/build-receipt/sensor-after.txt"
+          printf 'compile=success\n' > "$RUNNER_TEMP/build-receipt/result.txt"
+      - name: Retain build receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cargo-build-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/build-receipt/
+          if-no-files-found: error
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
