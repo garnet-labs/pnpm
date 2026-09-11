@@ -26,6 +26,12 @@
 #   L13 credential-less   an empty api_token skips cleanly (simulation)
 #   L14 release and tag   Garnet steps in release.yml and update-latest.yml
 #
+# Each leg has a tier in .github/garnet-gate/leg-tiers.yml: core legs gate the
+# pnpm upgrade verdict; optional legs are disclosed limitations, follow-ons,
+# or legs only pnpm's own repin can exercise — reported every run, never
+# blocking. Change a tier there, not here; the file carries each leg's reason
+# and promotion condition so the bar stays aligned with engineering decisions.
+#
 # Reads the reproduce and baseline job outputs from env, then asks the control
 # plane and GitHub for what the sensor actually produced. Every leg is recorded
 # with the exact identifiers a reader needs to re-check it.
@@ -65,16 +71,29 @@ in_pr_context=false
 [ "${EVENT_NAME:-}" = pull_request ] && [ -n "${PR_NUMBER:-}" ] && in_pr_context=true
 
 fail_reasons=()
+optional_reasons=()
 attention=()
 disclosures=()
 note() { echo "::notice::$*"; }
 leg_fail() { fail_reasons+=("$1"); echo "::error::$1"; }
+leg_optional() { optional_reasons+=("$1"); echo "::notice::optional leg unmet: $1"; }
 leg_attention() { attention+=("$1"); echo "::warning::$1"; }
 # A disclosure is a line only a reader can decide. It is never a warning
 # annotation: L12 counts annotations, and the gate must not add noise to what
 # it measures.
 disclose() { disclosures+=("$1"); echo "::notice::disclosed: $1"; }
 now() { date +%s; }
+
+# Leg tiers live in .github/garnet-gate/leg-tiers.yml. core legs gate the
+# verdict; optional legs are disclosed limitations, follow-ons, or legs that
+# only pnpm's own upgrade can exercise — reported on every run, never blocking.
+: "${TIERS_PATH:=.github/garnet-gate/leg-tiers.yml}"
+leg_tier() { # $1 leg id -> core | optional (default core when unconfigured)
+  sed -nE "s/^  $1: *\\{ *tier: *(core|optional).*/\\1/p" "$TIERS_PATH" 2>/dev/null | head -n1
+}
+leg_check() { # $1 leg id, $2 failure text — routes to fail or optional by tier
+  if [ "$(leg_tier "$1")" = optional ]; then leg_optional "$1 $2"; else leg_fail "$1 $2"; fi
+}
 
 # --- shape of the thing under test ---------------------------------------------
 # One parse of pnpm's files at main and of the gate's own reproduce job, shared
@@ -131,7 +150,7 @@ step_log() { awk -v start="$2" '
 
 # --- L1 startup ----------------------------------------------------------------
 startup_verdict="${STARTUP_VERDICT:-FAIL}"
-[ "$startup_verdict" = PASS ] || leg_fail "L1 startup: ${STARTUP_REASON:-no verdict from reproduce job}"
+[ "$startup_verdict" = PASS ] || leg_check L1 "startup: ${STARTUP_REASON:-no verdict from reproduce job}"
 
 # --- L2 profile uploaded -------------------------------------------------------
 # The gate runs exactly one instrumented job per run, so the run-level lookup
@@ -178,10 +197,10 @@ if [ -n "$profile_json" ]; then
     profile_state="uploaded after ${profile_seconds}s"
   else
     profile_state="uploaded, but job=$profile_job attempt=$profile_attempt (expected $REPRODUCE_JOB/$run_attempt)"
-    leg_fail "L2 profile: $profile_state"
+    leg_check L2 "profile: $profile_state"
   fi
 else
-  leg_fail "L2 profile: $profile_state after ${POLL_SECONDS}s (run $run_id)"
+  leg_check L2 "profile: $profile_state after ${POLL_SECONDS}s (run $run_id)"
 fi
 
 # --- L3 workload recorded ------------------------------------------------------
@@ -207,10 +226,10 @@ elif [ -n "$profile_json" ]; then
         workload_state="$workload_state — F25 Jibril step-numbering skew, garnet-org/jibril parseStepsList is the known cause of an off-by-one attribution"
       fi
     fi
-    leg_fail "L3 workload: $workload_state"
+    leg_check L3 "workload: $workload_state"
   else
     workload_state="not recorded: $WORKLOAD_DESTINATION absent from profile egress"
-    leg_fail "L3 workload: $workload_state"
+    leg_check L3 "workload: $workload_state"
   fi
 fi
 
@@ -253,7 +272,7 @@ if [ "$in_pr_context" = true ]; then
     elif [ -n "$current_merge_sha" ] && [ "$profile_sha" != "$current_merge_sha" ] && [ "$profile_sha" != "$PR_HEAD_SHA" ]; then
       cause="merge commit regenerated: sensor recorded ${profile_sha:0:7}, GitHub now reports ${current_merge_sha:0:7} for the same head; the control plane skips the profile as stale"
     fi
-    leg_fail "L4 app comment: $comment_state after ${POLL_SECONDS}s for head ${PR_HEAD_SHA:0:7} · $cause"
+    leg_check L4 "app comment: $comment_state after ${POLL_SECONDS}s for head ${PR_HEAD_SHA:0:7} · $cause"
   fi
   if [ -n "$summary_json" ]; then
     previous_sha="$(jq -r '.previous // ""' <<<"$summary_json")"
@@ -273,7 +292,7 @@ if [ "$in_pr_context" = true ]; then
   # second App comment leaves the reader two records of the same head (F31).
   app_comments="$(jq '[.[] | select(.user.login == "garnet-runtime-review[bot]" or .user.login == "garnet-runtime-review-dev[bot]")] | length' <<<"${comments:-[]}" 2>/dev/null || echo 0)"
   if [ "$app_comments" -gt 1 ]; then
-    leg_fail "L4 app comment: $app_comments Garnet App comments on the pull request; the App updates one comment in place (F31)"
+    leg_check L4 "app comment: $app_comments Garnet App comments on the pull request; the App updates one comment in place (F31)"
   fi
 
   # What the comment has to carry to be evidence: the step the sensor recorded,
@@ -284,13 +303,16 @@ if [ "$in_pr_context" = true ]; then
     recorded_step="$(jq -r 'first(.[]?) // ""' <<<"$workload_steps")"
     [ -n "$recorded_step" ] || recorded_step="$WORKLOAD_STEP_NAME"
     has_step=false; has_dest=false
+    # The App quotes the step name; in the raw body that arrives as either a
+    # literal " or an HTML-escaped &quot; — both render correctly for a reader.
     grep -qF "\"$recorded_step\"" <<<"$comment_body" && has_step=true
+    grep -qF "&quot;$recorded_step&quot;" <<<"$comment_body" && has_step=true
     grep -qF "$WORKLOAD_DESTINATION" <<<"$comment_body" && has_dest=true
     if [ "$has_step" = true ] && [ "$has_dest" = true ]; then
       comment_content="names \"$recorded_step\" and $WORKLOAD_DESTINATION"
     else
       comment_content="missing $( [ "$has_step" = true ] || printf 'the recorded step name in quotes; ' )$( [ "$has_dest" = true ] || printf 'a destination' )"
-      leg_fail "L4 app comment: body $comment_content (F31)"
+      leg_check L4 "app comment: body $comment_content (F31)"
     fi
 
     # The evidence mirror copies the same comment into the PR description, and
@@ -301,10 +323,10 @@ if [ "$in_pr_context" = true ]; then
     mirror_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$mirror" | head -n1)"
     if [ -z "$mirror" ]; then
       mirror_state="absent from the pull request description"
-      leg_fail "L4 app comment: evidence mirror $mirror_state (F34)"
+      leg_check L4 "app comment: evidence mirror $mirror_state (F34)"
     elif [ "$mirror_marker" != "$comment_marker" ]; then
       mirror_state="mirror at ${mirror_marker:-no sha}, comment at ${comment_marker:-no sha}"
-      leg_fail "L4 app comment: evidence mirror and comment disagree — $mirror_state (F34)"
+      leg_check L4 "app comment: evidence mirror and comment disagree — $mirror_state (F34)"
     else
       mirror_state="mirrored in the description, both bound to ${PR_HEAD_SHA:0:7}"
     fi
@@ -318,7 +340,7 @@ if [ -n "$profile_id" ]; then
   permalink_html="$(curl -sS -o /dev/null -w '%{http_code}' "$permalink" || echo 000)"
   permalink_api="$(curl -sS -o /dev/null -w '%{http_code}' "$GARNET_APP_URL/api/public/runs/$run_id?profile=$profile_id" || echo 000)"
   if [ "$permalink_html" != 200 ] || [ "$permalink_api" != 200 ]; then
-    leg_fail "L5 permalink: html=$permalink_html api=$permalink_api"
+    leg_check L5 "permalink: html=$permalink_html api=$permalink_api"
   fi
 fi
 
@@ -328,15 +350,20 @@ fi
 # rollout did not ask for, a full SHA pin, an explicit token, and a sensor
 # version that cannot move under an unchanged action ref (F14, F15).
 shape_notes=()
+upstream_notes=()
 shape_fail=false
 posture_json="$(shape_get '.posture // []')"
 [ -n "$posture_json" ] || posture_json='[]'
 while IFS=$'\t' read -r pjob pcheck pdetail; do
   [ -n "$pjob" ] || continue
-  shape_fail=true
-  shape_notes+=("$pjob: $pcheck — $pdetail")
+  case "$pjob" in
+    # pnpm's own files at main are the consumer's current posture, not the
+    # candidate's: they only change when pnpm repins, so they report optional.
+    upstream*) upstream_notes+=("$pjob: $pcheck — $pdetail") ;;
+    *) shape_fail=true; shape_notes+=("$pjob: $pcheck — $pdetail") ;;
+  esac
 done < <(jq -r '.[] | select(.ok | not) | [.job, .check, .detail] | @tsv' <<<"$posture_json")
-if [ "$shape_fail" = false ]; then
+if [ "$shape_fail" = false ] && [ "${#upstream_notes[@]}" -eq 0 ]; then
   shape_notes+=("gate and upstream: no id-token, no secrets: inherit, no pull-requests: write, action pinned to a full sha, explicit api_token, sensor version pinned")
 fi
 if [ -n "$shape_error" ]; then
@@ -362,9 +389,12 @@ if [ "$in_pr_context" = true ]; then
   fi
 fi
 if [ "$shape_fail" = true ]; then
-  leg_fail "L6 posture: $(printf '%s; ' "${shape_notes[@]}")"
+  leg_check L6 "posture: $(printf '%s; ' "${shape_notes[@]}")"
 fi
-shape_state="$(printf '%s; ' "${shape_notes[@]}")"
+if [ "${#upstream_notes[@]}" -gt 0 ]; then
+  leg_optional "L6 posture (upstream): $(printf '%s; ' "${upstream_notes[@]}")"
+fi
+shape_state="$(printf '%s; ' "${shape_notes[@]}")${upstream_notes:+${shape_notes:+; }$(printf '%s; ' "${upstream_notes[@]}")}"
 shape_state="${shape_state%; }"
 
 # --- L7 integration run --------------------------------------------------------
@@ -381,7 +411,7 @@ if [ "$in_pr_context" = true ]; then
     # error is a gate defect (F22); an empty list is a missing run.
     if ! runs_json="$(gh api "repos/$repo/actions/runs?head_sha=$PR_HEAD_SHA&event=pull_request&per_page=50" 2>/tmp/runs.err)"; then
       integration_state="could not list workflow runs for head ${PR_HEAD_SHA:0:7}: $(head -c 200 /tmp/runs.err | tr '\n' ' ')"
-      leg_fail "L7 integration run: $integration_state"
+      leg_check L7 "integration run: $integration_state"
       break
     fi
     run="$(jq -c --arg n "$INTEGRATION_WORKFLOW_NAME" '[.workflow_runs[] | select(.name == $n)] | sort_by(.run_attempt) | last // empty' <<<"$runs_json")"
@@ -404,7 +434,7 @@ if [ "$in_pr_context" = true ]; then
         *) why="control plane HTTP $code" ;;
       esac
       integration_state="$INTEGRATION_WORKFLOW_NAME run $integration_run_id finished $integration_conclusion with no profile ($why): the job was green, the sensor recorded nothing"
-      leg_fail "L7 integration run: $integration_state"
+      leg_check L7 "integration run: $integration_state"
     fi
   fi
 fi
@@ -480,16 +510,16 @@ PY
   else
     zizmor_unclassified=0
     zizmor_unclassified_list="  - dispositions not read: $(head -c 200 /tmp/zizmor-classify.err | tr '\n' ' ')"
-    leg_fail "L8 reviewers: could not read $DISPOSITIONS_PATH"
+    leg_check L8 "reviewers: could not read $DISPOSITIONS_PATH"
   fi
   zizmor_state="$zizmor_findings regular, $zizmor_pedantic pedantic finding(s) over ${#scan_files[@]} workflow file(s); $zizmor_unclassified without a written class"
   if [ "${zizmor_unclassified:-0}" -gt 0 ]; then
-    leg_fail "L8 reviewers: $zizmor_unclassified zizmor finding(s) with no row in $DISPOSITIONS_PATH (F33)"
+    leg_check L8 "reviewers: $zizmor_unclassified zizmor finding(s) with no row in $DISPOSITIONS_PATH (F33)"
     echo "$zizmor_unclassified_list"
   fi
 else
   zizmor_state="zizmor not installed"
-  leg_fail "L8 reviewers: zizmor not installed, the scanner bar was not applied"
+  leg_check L8 "reviewers: zizmor not installed, the scanner bar was not applied"
 fi
 # actionlint reads what zizmor does not. Two of its messages are the gate's
 # deliberate reproductions and are answered in the dispositions file by message
@@ -513,12 +543,12 @@ PY
   actionlint_unexpected="$(wc -l < /tmp/actionlint-unexpected.txt | tr -d ' ')"
   actionlint_state="$actionlint_unexpected unexpected message(s); the \`\$/\` form and the Blacksmith label are answered in the dispositions file"
   if [ "$actionlint_unexpected" -gt 0 ]; then
-    leg_fail "L8 reviewers: actionlint reports $actionlint_unexpected message(s) with no disposition"
+    leg_check L8 "reviewers: actionlint reports $actionlint_unexpected message(s) with no disposition"
     cat /tmp/actionlint-unexpected.txt
   fi
 else
   actionlint_state="actionlint not installed"
-  leg_fail "L8 reviewers: actionlint not installed, the scanner bar was not applied"
+  leg_check L8 "reviewers: actionlint not installed, the scanner bar was not applied"
 fi
 if [ "$in_pr_context" = true ]; then
   # shellcheck disable=SC2016 # $owner and friends are GraphQL variables
@@ -535,7 +565,7 @@ if [ "$in_pr_context" = true ]; then
   bot_threads="$(jq 'length' <<<"$threads")"
   bot_thread_list="$(jq -r '.[] | "  - \(.author) on \(.path): \(.url)"' <<<"$threads")"
   if [ "$bot_threads" -gt 0 ]; then
-    leg_fail "L8 reviewers: $bot_threads unresolved bot review thread(s) on .github/ paths"
+    leg_check L8 "reviewers: $bot_threads unresolved bot review thread(s) on .github/ paths"
     echo "$bot_thread_list"
   fi
 fi
@@ -552,8 +582,8 @@ flush_seconds=""
 if [ -n "$action_seconds" ] && [ -n "${REPRODUCE_WORKLOAD_SECONDS:-}" ] && [ -n "${BASELINE_WORKLOAD_SECONDS:-}" ]; then
   overhead_seconds=$(( REPRODUCE_WORKLOAD_SECONDS - BASELINE_WORKLOAD_SECONDS ))
   timing_state="sensor start ${action_seconds}s (budget ${START_BUDGET_SECONDS}s) · workload ${REPRODUCE_WORKLOAD_SECONDS}s with sensor vs ${BASELINE_WORKLOAD_SECONDS}s without, overhead ${overhead_seconds}s (budget ${OVERHEAD_BUDGET_SECONDS}s)"
-  [ "$action_seconds" -le "$START_BUDGET_SECONDS" ] || leg_fail "L9 timing: sensor start ${action_seconds}s exceeds ${START_BUDGET_SECONDS}s"
-  [ "$overhead_seconds" -le "$OVERHEAD_BUDGET_SECONDS" ] || leg_fail "L9 timing: workload overhead ${overhead_seconds}s exceeds ${OVERHEAD_BUDGET_SECONDS}s"
+  [ "$action_seconds" -le "$START_BUDGET_SECONDS" ] || leg_check L9 "timing: sensor start ${action_seconds}s exceeds ${START_BUDGET_SECONDS}s"
+  [ "$overhead_seconds" -le "$OVERHEAD_BUDGET_SECONDS" ] || leg_check L9 "timing: workload overhead ${overhead_seconds}s exceeds ${OVERHEAD_BUDGET_SECONDS}s"
 else
   timing_state="untested: missing job clocks (action=${action_seconds:-?} workload=${REPRODUCE_WORKLOAD_SECONDS:-?} baseline=${BASELINE_WORKLOAD_SECONDS:-?})"
 fi
@@ -569,7 +599,7 @@ if [ -n "$flush_seconds" ]; then
   flush_seconds="${flush_seconds%.*}"
   timing_state="$timing_state · post-step flush ${flush_seconds}s (budget ${FLUSH_BUDGET_SECONDS}s)"
   [ "$flush_seconds" -le "$FLUSH_BUDGET_SECONDS" ] \
-    || leg_fail "L9 timing: post-step flush ${flush_seconds}s exceeds ${FLUSH_BUDGET_SECONDS}s on the light cell (F30)"
+    || leg_check L9 "timing: post-step flush ${flush_seconds}s exceeds ${FLUSH_BUDGET_SECONDS}s on the light cell (F30)"
 else
   timing_state="$timing_state · post-step flush not measured"
 fi
@@ -610,7 +640,7 @@ coverage_state="$coverage_state · Linux x86_64 only; macOS, Windows, fork PRs a
 upstream_instrumented="$(shape_get '[.upstream.cells[]? | select(.instrumented)] | length')"
 local_instrumented="$(shape_get '.coverage.local_instrumented // empty')"
 if [ -n "$upstream_instrumented" ] && [ -n "$local_instrumented" ] && [ "$upstream_instrumented" != "$local_instrumented" ]; then
-  leg_fail "L10 coverage: this fork instruments $local_instrumented cell(s), pnpm at main instruments $upstream_instrumented (F26)"
+  leg_check L10 "coverage: this fork instruments $local_instrumented cell(s), pnpm at main instruments $upstream_instrumented (F26)"
 fi
 disclose "the sensor is Linux x86_64 eBPF: macOS and Windows cells record nothing, and no change to this rollout makes them record"
 disclose "fork pull requests and Dependabot-actor runs get no secret, so they produce no server-side evidence; L13 is a simulation of that path, not evidence for it"
@@ -625,14 +655,14 @@ drift_count=0
 drift_list=""
 if [ -n "$shape_error" ]; then
   drift_state="upstream not read: $shape_error"
-  leg_fail "L11 upstream drift: $drift_state"
+  leg_check L11 "upstream drift: $drift_state"
 else
   drift_count="$(shape_get '.drift_count // 0')"
   drift_list="$(jq -r '.drift[]? | select(.verdict == "drift") | "  - \(.field): pnpm has \(.upstream|tostring), the gate has \(.gate|tostring)"' <<<"$shape")"
   deliberate_count="$(shape_get '[.drift[]? | select(.verdict == "deliberate")] | length')"
   drift_state="pnpm/pnpm at \`${UPSTREAM_SHA:0:7}\` · $drift_count difference(s), $deliberate_count declared deliberate"
   if [ "$drift_count" -gt 0 ]; then
-    leg_fail "L11 upstream drift: the gate no longer mirrors pnpm at ${UPSTREAM_SHA:0:7} — $drift_count field(s) differ (F26)"
+    leg_check L11 "upstream drift: the gate no longer mirrors pnpm at ${UPSTREAM_SHA:0:7} — $drift_count field(s) differ (F26)"
     echo "$drift_list"
   fi
 fi
@@ -652,16 +682,16 @@ if [ -n "$reproduce_job_id" ]; then
     unexpected=$(( warning_count - failopen_count ))
     warning_state="$warning_count warning(s), $error_count error(s) from the action step; $failopen_count are the disclosed fail-open text (F2)"
     if [ "$warning_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
-      leg_fail "L12 warning noise: the action step emitted $warning_count warning(s) and $error_count error(s) on the trusted-token path, $unexpected of them not the disclosed fail-open text (F27)"
+      leg_check L12 "warning noise: the action step emitted $warning_count warning(s) and $error_count error(s) on the trusted-token path, $unexpected of them not the disclosed fail-open text (F27)"
       grep -E '##\[(warning|error)\]' <<<"$action_log" | head -n 10
     fi
   else
     warning_state="job log not readable"
-    leg_fail "L12 warning noise: could not read the reproduce job log"
+    leg_check L12 "warning noise: could not read the reproduce job log"
   fi
 else
   warning_state="reproduce job not found in the run"
-  leg_fail "L12 warning noise: reproduce job not found in run $run_id"
+  leg_check L12 "warning noise: reproduce job not found in run $run_id"
 fi
 
 # --- L13 credential-less run ---------------------------------------------------
@@ -678,13 +708,13 @@ if [ -n "$dependabot_job_id" ]; then
   sim_info="$(grep -ciE "api_token' is required|no api token|skipping" <<<"$sim_action_log" || true)"
   sim_state="outcome ${DEPENDABOT_SIM_OUTCOME:-unknown} · $sim_warnings warning(s), $sim_errors error(s), $sim_info info line(s) naming the missing token"
   if [ "${DEPENDABOT_SIM_OUTCOME:-}" != success ] || [ "$sim_warnings" -gt 0 ] || [ "$sim_errors" -gt 0 ]; then
-    leg_fail "L13 credential-less: an empty api_token did not skip cleanly — $sim_state (F28)"
+    leg_check L13 "credential-less: an empty api_token did not skip cleanly — $sim_state (F28)"
   elif [ "$sim_info" -lt 1 ]; then
-    leg_fail "L13 credential-less: the action skipped silently; a credential-less run has to say why (F28)"
+    leg_check L13 "credential-less: the action skipped silently; a credential-less run has to say why (F28)"
   fi
 else
   sim_state="simulation job not found in the run"
-  leg_fail "L13 credential-less: simulation job not found in run $run_id"
+  leg_check L13 "credential-less: simulation job not found in run $run_id"
 fi
 disclose "L13 is a simulation on this repository's own event with a read-only token, not a Dependabot run: it shows what the action does without a token, and no server-side evidence exists for Dependabot or fork pull requests (F11, F12)"
 
@@ -704,7 +734,7 @@ else
     disclose "$line"
   done < <(jq -r '.release_workflows[]? | select(.produces_profile == "no") | "\(.workflow) runs a Garnet step in `\(.job)` on `\(.runner)` and records nothing: \(.reason) (F13)"' <<<"$shape")
   if [ "${release_inert:-0}" -gt 0 ]; then
-    leg_fail "L14 release and tag: $release_inert Garnet step(s) on a runner the gate cannot classify (F29)"
+    leg_check L14 "release and tag: $release_inert Garnet step(s) on a runner the gate cannot classify (F29)"
   fi
 fi
 
@@ -718,7 +748,7 @@ fi
 to_json_array() { printf '%s\n' "$@" | jq -R . | jq -s 'map(select(length > 0))'; }
 
 jq -n \
-  --arg verdict "$verdict" --argjson fail_reasons "$(to_json_array "${fail_reasons[@]:-}")" --argjson attention "$(to_json_array "${attention[@]:-}")" \
+  --arg verdict "$verdict" --argjson fail_reasons "$(to_json_array "${fail_reasons[@]:-}")" --argjson optional_reasons "$(to_json_array "${optional_reasons[@]:-}")" --argjson attention "$(to_json_array "${attention[@]:-}")" \
   --arg tag "$GATE_TAG" --arg resolved_version "${STARTUP_VERSION:-}" --arg action_sha "$action_ref" --arg upstream_action_sha "$upstream_action_ref" \
   --arg run_id "$run_id" --arg run_attempt "$run_attempt" --arg runner "${RUNNER_NAME_USED:-}" \
   --arg event "${EVENT_NAME:-}" --arg pr "${PR_NUMBER:-}" \
@@ -747,7 +777,7 @@ jq -n \
   --arg actionlint_state "$actionlint_state" --argjson zizmor_unclassified "${zizmor_unclassified:-0}" \
   --argjson gate_attribution "$(shape_get '.gate.attribution // {}')" --argjson upstream_attribution "$(shape_get '.upstream.attribution // {}')" \
   --arg action_default_version "$action_default_version" \
-  '{verdict: $verdict, fail_reasons: $fail_reasons, attention: $attention, disclosures: $disclosures,
+  '{verdict: $verdict, fail_reasons: $fail_reasons, optional_reasons: $optional_reasons, attention: $attention, disclosures: $disclosures,
     jibril: {requested_tag: $tag, resolved_version: $resolved_version},
     action_sha: $action_sha,
     action_default_jibril_version: $action_default_version,
@@ -787,31 +817,42 @@ one_line() { # $1 text -> one line, at most 96 characters
   text="$(tr '\n' ' ' <<<"$1" | tr -s ' ' | sed 's/^ //; s/ $//; s/|/\\|/g')"
   if [ "${#text}" -gt 96 ]; then printf '%s…' "${text:0:95}"; else printf '%s' "$text"; fi
 }
-leg_state() { # $1 leg id -> FAIL when any failure names it
+leg_state() { # $1 leg id -> FAIL on a core miss, OPT on an unmet optional leg
   local reason
   for reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do
     case "$reason" in "$1 "*|"$1:"*) printf FAIL; return ;; esac
   done
+  for reason in ${optional_reasons[@]+"${optional_reasons[@]}"}; do
+    case "$reason" in "$1 "*|"$1:"*) printf OPT; return ;; esac
+  done
   printf PASS
 }
 leg_row() { # $1 id, $2 title, $3 state text, $4 link
-  local state
+  local state tier
   state="$(leg_state "$1")"
   case "$3" in "not applicable"*|untested*|unknown*) [ "$state" = PASS ] && state="n/a" ;; esac
-  printf '| **%s** | %s %s | %s%s |\n' "$state" "$1" "$2" "$(one_line "$3")" "${4:+ [→]($4)}"
+  tier=""
+  [ "$(leg_tier "$1")" = optional ] && tier=" · _optional_"
+  printf '| **%s** | %s %s%s | %s%s |\n' "$state" "$1" "$2" "$tier" "$(one_line "$3")" "${4:+ [→]($4)}"
 }
 failed_legs=0
+optional_missed=0
 for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed_legs + 1)); done
+for _reason in ${optional_reasons[@]+"${optional_reasons[@]}"}; do optional_missed=$((optional_missed + 1)); done
 
 {
   echo "<!-- garnet:jibril-release-gate $GATE_TAG -->"
   echo "## Jibril release gate: **$verdict**"
   echo
   if [ "$verdict" = PASS ]; then
-    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\` cleared all 14 legs of the pnpm acceptance bar."
+    opt_note=""
+    [ "$optional_missed" -gt 0 ] && opt_note=" · $optional_missed optional leg(s) unmet (accepted limitations and follow-ons, below)"
+    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\` cleared every core leg of the pnpm acceptance bar$opt_note."
   else
-    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\`: **$failed_legs failing check(s)** below, each named with its ledger row."
+    echo "\`$GATE_TAG\` on \`garnet-org/action@${action_ref:0:7}\`: **$failed_legs failing core check(s)** below, each named with its ledger row${optional_missed:+ · $optional_missed optional leg(s) unmet}."
   fi
+  echo
+  echo "Core legs gate the pnpm upgrade verdict (capture → comment → permalink, rendered-comment correctness, security/trust posture, rollout-model compliance). \`OPT\` legs are disclosed limitations and follow-ons, or legs only pnpm's own repin can exercise — visible on every run, never blocking. Tiers live in [.github/garnet-gate/leg-tiers.yml](https://github.com/$repo/blob/$merge_sha/.github/garnet-gate/leg-tiers.yml)."
   echo
   echo "| | leg | what it found |"
   echo "|---|---|---|"
@@ -836,6 +877,12 @@ for _reason in ${fail_reasons[@]+"${fail_reasons[@]}"}; do failed_legs=$((failed
     for r in ${fail_reasons[@]+"${fail_reasons[@]}"}; do echo "- $r"; done
     [ -z "$bot_thread_list" ] || echo "$bot_thread_list"
     [ -z "$drift_list" ] || { echo; echo "$drift_list"; }
+  fi
+  if [ "${#optional_reasons[@]}" -gt 0 ]; then
+    echo
+    echo "### Optional legs unmet (never block the verdict)"
+    echo
+    for r in ${optional_reasons[@]+"${optional_reasons[@]}"}; do echo "- $r"; done
   fi
   if [ "${#attention[@]}" -gt 0 ] || [ "${#disclosures[@]}" -gt 0 ]; then
     echo
