@@ -1,9 +1,6 @@
 name: Garnet drain acceptance
 
 on:
-  push:
-    branches:
-      - 'devin/**'
   workflow_dispatch: {}
 
 permissions:

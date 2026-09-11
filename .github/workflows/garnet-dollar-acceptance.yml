@@ -1,18 +1,17 @@
 name: Garnet dollar-form acceptance
 
 on:
-  push:
-    branches:
-      - 'devin/**'
   pull_request: {}
   workflow_dispatch: {}
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  gate:
+  reproduce:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: Garnet dollar-form acceptance / reproduce
     # The $/ self-repository form IS the reproduction; keep it.
     uses: $/.github/workflows/garnet-dollar-acceptance-job.yml
+    secrets:
+      GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
