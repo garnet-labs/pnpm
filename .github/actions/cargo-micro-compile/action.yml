@@ -3,6 +3,10 @@ description: Build the pinned micro-benchmark binary
 runs:
   using: composite
   steps:
+    - name: Install crates
+      shell: bash
+      working-directory: ${{ env.SOURCE_DIRECTORY }}
+      run: pnpm install --frozen-lockfile --filter pacquet
     - name: Compile
       shell: bash
       working-directory: ${{ env.SOURCE_DIRECTORY }}
