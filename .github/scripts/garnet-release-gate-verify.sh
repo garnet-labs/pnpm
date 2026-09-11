@@ -305,11 +305,17 @@ if [ "$in_pr_context" = true ]; then
     recorded_step="$(jq -r 'first(.[]?) // ""' <<<"$workload_steps")"
     [ -n "$recorded_step" ] || recorded_step="$WORKLOAD_STEP_NAME"
     has_step=false; has_dest=false
-    # The App quotes the step name; in the raw body that arrives as either a
-    # literal " or an HTML-escaped &quot; — both render correctly for a reader.
-    grep -qF "\"$recorded_step\"" <<<"$comment_body" && has_step=true
-    grep -qF "&quot;$recorded_step&quot;" <<<"$comment_body" && has_step=true
-    grep -qF "$WORKLOAD_DESTINATION" <<<"$comment_body" && has_dest=true
+    # The App renders destinations defanged (`npmjs[.]org`) and quotes the step
+    # name; jibril may number the recorded name (`2. Stop the action clock`)
+    # while the comment renders the step's own name (F25 skew). Normalize the
+    # body and try the de-numbered name so the check reads what a reader sees.
+    body_norm="$(sed 's/\[\.\]/./g' <<<"$comment_body")"
+    step_plain="$(sed -E 's/^[0-9]+\. //' <<<"$recorded_step")"
+    grep -qF "\"$recorded_step\"" <<<"$body_norm" && has_step=true
+    grep -qF "&quot;$recorded_step&quot;" <<<"$body_norm" && has_step=true
+    grep -qF "\"$step_plain\"" <<<"$body_norm" && has_step=true
+    grep -qF "&quot;$step_plain&quot;" <<<"$body_norm" && has_step=true
+    grep -qF "$WORKLOAD_DESTINATION" <<<"$body_norm" && has_dest=true
     if [ "$has_step" = true ] && [ "$has_dest" = true ]; then
       comment_content="names \"$recorded_step\" and $WORKLOAD_DESTINATION"
     else
@@ -401,7 +407,8 @@ fi
 if [ "${#upstream_notes[@]}" -gt 0 ]; then
   leg_optional "L6 posture (upstream): $(printf '%s; ' "${upstream_notes[@]}")"
 fi
-shape_state="$(printf '%s; ' "${shape_notes[@]}")${upstream_notes:+${shape_notes:+; }$(printf '%s; ' "${upstream_notes[@]}")}"
+shape_state=""
+for _n in ${shape_notes[@]+"${shape_notes[@]}"} ${upstream_notes[@]+"${upstream_notes[@]}"}; do shape_state+="$_n; "; done
 shape_state="${shape_state%; }"
 
 # --- L7 integration run --------------------------------------------------------
