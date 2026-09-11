@@ -1,0 +1,7 @@
+{
+  "dependency": "peer-spec-validation",
+  "packageDir": ".",
+  "from": "silent-success",
+  "to": "fail-closed",
+  "label": "constructed"
+}
