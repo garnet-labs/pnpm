@@ -1,0 +1,7 @@
+{
+  "dependency": "cargo.enabled",
+  "packageDir": ".",
+  "from": "false",
+  "to": "true",
+  "label": "real"
+}

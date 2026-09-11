@@ -1,0 +1,161 @@
+# Garnet dependency replay: records the dependency install on the baseline
+# commit and on the update commit under the Garnet sensor, then posts one
+# comparison comment on the PR. Installed on the replay branch by
+# dependency-replay/replay.mjs together with .github/garnet-replay/.
+name: garnet-dependency-replay
+
+on:
+  pull_request:
+
+concurrency:
+  group: garnet-dependency-replay-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  record:
+    name: record ${{ matrix.side }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        side: [baseline, update]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+
+      - name: Select ${{ matrix.side }} commit
+        id: side
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.side }}" = "baseline" ]; then
+            git checkout --quiet HEAD~1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Rust before recording
+        uses: $/.github/actions/rustup
+        with:
+          restore-cache: false
+
+      - name: Prepare pnpm and Node before recording
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          runtime: node@26.8.2
+          install: false
+
+      - uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main 2026-09-04, OIDC default, unreleased
+        id: garnet
+        # Distinct names avoid the control-plane agent dedupe index collision between matrix legs.
+        env:
+          GARNET_PROFILE_JOB: record-${{ matrix.side }}
+        # Fallback when OIDC is unavailable (fork pull requests):
+        # with:
+        #   api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: Install dependencies (${{ matrix.side }})
+        env:
+          REPLAY_SHA: ${{ steps.side.outputs.sha }}
+        run: bash .github/garnet-replay/install.sh
+
+      # Short-lived install flows need the sensor's flush cadence before stop.
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
+
+      - name: Export execution record
+        if: always()
+        env:
+          PROFILE_JSON_PATH: /var/log/jibril.profile.json
+        run: |
+          set -uo pipefail
+          sudo systemctl stop jibril.service || true
+          for i in $(seq 1 10); do
+            if sudo test -f /var/log/jibril.profile.json; then break; fi
+            sleep 1
+          done
+          mkdir -p "$RUNNER_TEMP/profile"
+          if sudo test -f /var/log/jibril.profile.json; then
+            sudo cp /var/log/jibril.profile.json "$RUNNER_TEMP/profile/jibril.profile.json"
+            sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/profile/jibril.profile.json"
+            wc -c "$RUNNER_TEMP/profile/jibril.profile.json"
+          else
+            echo "No execution record: the sensor did not write a Run Profile (see the Garnet step log; OIDC needs id-token: write and is unavailable on fork pull requests). The comment/JSON path still runs with GITHUB_TOKEN but has nothing to compare." >> "$GITHUB_STEP_SUMMARY"
+            echo "No execution record found at /var/log/jibril.profile.json" >&2
+          fi
+          if test -f "$RUNNER_TEMP/cargo-replay/native.json"; then
+            cp "$RUNNER_TEMP/cargo-replay/native.json" "$RUNNER_TEMP/profile/native.json"
+            cp "$RUNNER_TEMP/cargo-replay/install.stdout" "$RUNNER_TEMP/profile/install.stdout"
+            cp "$RUNNER_TEMP/cargo-replay/install.stderr" "$RUNNER_TEMP/profile/install.stderr"
+          fi
+          echo "${{ steps.side.outputs.sha }}" > "$RUNNER_TEMP/profile/sha"
+          echo "${{ github.run_id }}" > "$RUNNER_TEMP/profile/run_id"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: garnet-profile-${{ matrix.side }}
+          path: ${{ runner.temp }}/profile
+          if-no-files-found: warn
+
+  compare:
+    name: compare
+    needs: record
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: garnet-profile-*
+          path: profiles
+
+      - name: Render comparison and post PR comment
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASELINE_PROFILE_JSON_PATH: profiles/garnet-profile-baseline/jibril.profile.json
+          UPDATE_PROFILE_JSON_PATH: profiles/garnet-profile-update/jibril.profile.json
+          REPLAY_JSON_PATH: .github/garnet-replay/replay.json
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FAIL_ON_ERROR: "false"
+          EXECUTION_DIFF_JSON_PATH: ${{ runner.temp }}/execution-diff.json
+        run: |
+          set -uo pipefail
+          export BASELINE_SHA="$(cat profiles/garnet-profile-baseline/sha 2>/dev/null || git rev-parse HEAD~1)"
+          export HEAD_SHA="$(cat profiles/garnet-profile-update/sha 2>/dev/null || echo "$HEAD_SHA")"
+          node .github/garnet-replay/compare.mjs
+
+      - name: Post native Cargo-filter oracle
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASELINE_NATIVE_JSON_PATH: profiles/garnet-profile-baseline/native.json
+          UPDATE_NATIVE_JSON_PATH: profiles/garnet-profile-update/native.json
+        run: node .github/garnet-replay/native-comment.mjs
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: garnet-execution-diff
+          path: ${{ runner.temp }}/execution-diff.json
+          if-no-files-found: warn
