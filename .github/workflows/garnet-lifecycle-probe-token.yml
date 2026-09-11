@@ -1,0 +1,55 @@
+name: Garnet lifecycle probe (token)
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - .github/workflows/garnet-lifecycle-probe-token.yml
+
+permissions: {}
+
+concurrency:
+  group: garnet-lifecycle-probe-token-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Garnet / lifecycle probe (token)
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Record run identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "checked_out=$(git rev-parse HEAD)"
+          echo "pr_head=${PR_HEAD}"
+          echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+
+      - name: Record runtime
+        uses: garnet-org/action@ec09d3e69da42f45395d2796b951bcb109a84734
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0
+
+      - name: Workload
+        shell: bash
+        run: |
+          set -euo pipefail
+          systemctl is-active --quiet jibril.service
+          node -e 'fetch("https://registry.npmjs.org/pnpm/latest").then(r => { console.log(r.status); if (!r.ok) process.exit(1) })'
+          sleep 150
+
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
