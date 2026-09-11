@@ -1,0 +1,68 @@
+name: Resolver install
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dns-install.yml'
+      - '.github/dns-install/**'
+
+permissions: {}
+
+concurrency:
+  group: dns-install-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: Install with the configured resolver
+    if: >-
+      github.repository == 'garnet-labs/pnpm' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Prepare the released binary and frozen fixture
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          printf 'Reviewed commit: %s\n' "$EXPECTED_SHA"
+          mkdir -p "$RUNNER_TEMP/dns-bootstrap" "$RUNNER_TEMP/dns-install"
+          cp .github/dns-install/package*.json "$RUNNER_TEMP/dns-bootstrap/"
+          npm ci --prefix "$RUNNER_TEMP/dns-bootstrap" --no-audit --no-fund
+          cp pnpm/crates/testing-utils/src/fixtures/big/{package.json,pnpm-lock.yaml} "$RUNNER_TEMP/dns-install/"
+          cd "$RUNNER_TEMP/dns-install"
+          sha256sum package.json pnpm-lock.yaml | tee "$RUNNER_TEMP/dns-fixture.sha256"
+          expected=$(node -p "require('$RUNNER_TEMP/dns-bootstrap/package.json').dependencies.pnpm")
+          test "$("$RUNNER_TEMP/dns-bootstrap/node_modules/.bin/pnpm" --version)" = "$expected"
+          printf 'pnpm %s\n' "$expected"
+
+      - name: Configure one nameserver
+        run: |
+          printf 'nameserver 1.1.1.1\noptions no_tld_query\n' > "$RUNNER_TEMP/resolv.conf"
+          sudo cp --remove-destination "$RUNNER_TEMP/resolv.conf" /etc/resolv.conf
+          cat /etc/resolv.conf
+          getent ahostsv4 registry.npmjs.org
+
+      - name: Record runtime behavior
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0
+
+      - name: Install the frozen fixture
+        working-directory: ${{ runner.temp }}/dns-install
+        run: |
+          "$RUNNER_TEMP/dns-bootstrap/node_modules/.bin/pnpm" install \
+            --frozen-lockfile --ignore-scripts --store-dir "$RUNNER_TEMP/dns-store"
+          test -f node_modules/react/package.json
+          sha256sum --check "$RUNNER_TEMP/dns-fixture.sha256"
