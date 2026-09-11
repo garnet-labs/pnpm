@@ -50,10 +50,9 @@ jobs:
           EOF
 
       - name: Start Garnet recording
-        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764 # action main
+        uses: garnet-org/action@ec09d3e69da42f45395d2796b951bcb109a84734 # release candidate, 2026-09-11
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
-          jibril_version: v2.17.0
           debug: true
 
       - name: Install JS dependencies
@@ -98,3 +97,44 @@ jobs:
           if [ "$INSTALL_OUTCOME" != success ] || [ "$ASSERTION_OUTCOME" != success ]; then
             echo "::error::experiment failed: install=$INSTALL_OUTCOME assertion=$ASSERTION_OUTCOME"
           fi
+
+  stopped_without_profile:
+    name: Verify stopped signal after an intentional sensor crash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GARNET_POST_PROFILE_WAIT_SECONDS: '5'
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Start Garnet recording
+        uses: garnet-org/action@ec09d3e69da42f45395d2796b951bcb109a84734 # release candidate, 2026-09-11
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: Exercise the missing-profile stop path
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error https://registry.npmjs.org/-/ping > /dev/null
+          test "$(systemctl show jibril.service --property=Restart --value)" = no
+          sudo systemctl kill --signal=SIGKILL jibril.service
+          for attempt in 1 2 3 4 5; do
+            state=$(systemctl is-active jibril.service || true)
+            if [ "$state" = failed ] || [ "$state" = inactive ]; then break; fi
+            sleep 1
+          done
+          case "$state" in
+            failed|inactive) ;;
+            *) echo "::error::sensor did not stop: $state"; exit 1 ;;
+          esac
+          sudo test ! -s /var/log/jibril.profile.json
+          {
+            echo '## Intentional missing-profile regression'
+            echo 'The sensor was deliberately terminated before its final profile flush.'
+            echo 'Acceptance requires the post step to report the stop and the App to resolve pending state.'
+          } >> "$GITHUB_STEP_SUMMARY"
