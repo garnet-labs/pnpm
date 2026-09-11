@@ -48,6 +48,7 @@ jobs:
           set -euo pipefail
           systemctl is-active --quiet jibril.service
           node -e 'fetch("https://registry.npmjs.org/pnpm/latest").then(r => { console.log(r.status); if (!r.ok) process.exit(1) })'
+          curl -fsS -o /dev/null -w '%{http_code}\n' https://api.github.com/repos/pnpm/pnpm/releases/latest
           sleep 150
 
       - name: Let sensor settle
