@@ -1,0 +1,37 @@
+name: Garnet drain acceptance
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  drain:
+    name: Four-minute job under the sensor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/dump-step-summary
+
+      - name: Garnet runtime monitoring
+        uses: garnet-org/action@7a09bf7c85dcb2a85fb3230d9b62609672c617a7
+        env:
+          GARNET_ACTION_ENABLE_OIDC_AUTH: 'true'
+        with:
+          jibril_version: v2.16.0
+
+      - name: Light install plus long dwell
+        run: |
+          corepack enable pnpm
+          mkdir -p "$RUNNER_TEMP/keyv-lite" && cd "$RUNNER_TEMP/keyv-lite"
+          pnpm init >/dev/null 2>&1 || true
+          pnpm add is-odd
+          sleep 240

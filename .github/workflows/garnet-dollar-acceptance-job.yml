@@ -1,0 +1,71 @@
+name: Garnet dollar-form acceptance job
+
+on:
+  workflow_call:
+    secrets:
+      GARNET_API_TOKEN:
+        required: false
+
+permissions: {}
+
+jobs:
+  reproduce:
+    name: Reproduce self-repo $/ reference
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/dump-step-summary
+
+      - name: Record acceptance identity
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          printf 'head=%s\nbase=%s\nmerge=%s\ncheckout=%s\nrun=%s\njob=%s\nattempt=%s\n' \
+            "$HEAD_SHA" "$BASE_SHA" "$GITHUB_SHA" "$(git rev-parse HEAD)" \
+            "$GITHUB_RUN_ID" "$GITHUB_JOB" "$GITHUB_RUN_ATTEMPT"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Garnet runtime monitoring
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: Set up Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.0.0'
+
+      - name: Install the frozen pnpm fixture
+        run: |
+          mkdir -p "$RUNNER_TEMP/pnpm-current-pin"
+          cp pnpm/crates/testing-utils/src/fixtures/big/{package.json,pnpm-lock.yaml} "$RUNNER_TEMP/pnpm-current-pin/"
+          cd "$RUNNER_TEMP/pnpm-current-pin"
+          sha256sum package.json pnpm-lock.yaml > "$RUNNER_TEMP/pnpm-fixture.sha256"
+          npx --yes pnpm@12.3.0 install --frozen-lockfile --ignore-scripts --store-dir "$RUNNER_TEMP/pnpm-current-pin-store"
+          test -f node_modules/react/package.json
+          sha256sum --check "$RUNNER_TEMP/pnpm-fixture.sha256"
+
+      - name: Workload with egress
+        run: |
+          curl -sSf https://registry.npmjs.org/pnpm/latest -o /dev/null
+          node -e "fetch('https://registry.npmjs.org/-/ping').then(r=>console.log(r.status))"
+          sleep 20
+
+      - name: Record jibril runtime state
+        if: always()
+        run: |
+          unit_active="$(systemctl is-active jibril || true)"
+          echo "--- jibril.service state: $unit_active ---"
+          if sudo test -f /var/run/jibril/jibril.status.json; then
+            sudo cat /var/run/jibril/jibril.status.json
+          else
+            echo "status file absent — sensor never reached main loop"
+          fi
+          exit 0
