@@ -1,0 +1,68 @@
+name: Garnet fixture install
+
+# Registry fixtures declare real dependencies, and updating one changes what
+# runs at install time. This job installs every fixture that carries its own
+# pnpm-workspace.yaml, with the Garnet sensor recording the execution chains
+# and outbound connections the install produces.
+on:
+  pull_request:
+    paths:
+      - 'pnpr/.fixtures/**'
+      - '.github/workflows/garnet-fixture-install.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-fixture-install-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fixture-install:
+    name: Fixture install (recorded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@12953af4f3601f27a1fb20751bbdd78d641180f0 # v2.3.0-rc
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: Install pnpm
+        uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
+
+      - name: Install fixtures
+        run: |
+          found=false
+          for ws in $(find pnpr/.fixtures -name pnpm-workspace.yaml -not -path '*/node_modules/*' | sort); do
+            dir=$(dirname "$ws")
+            # Fixtures that depend on other @pnpm.e2e fixtures need the local
+            # e2e registry; only install fixtures resolvable from the public one.
+            if node -e '
+              const m = require(process.argv[1])
+              const deps = { ...m.dependencies, ...m.devDependencies, ...m.optionalDependencies }
+              process.exit(Object.keys(deps).some(d => d.startsWith("@pnpm.e2e/")) ? 0 : 1)
+            ' "$PWD/$dir/package.json"; then
+              echo "Skipping $dir (depends on local e2e registry packages)"
+              continue
+            fi
+            found=true
+            echo "::group::pnpm install in $dir"
+            (cd "$dir" && pnpm install)
+            echo "::endgroup::"
+          done
+          if [ "$found" = false ]; then
+            echo "No fixtures with their own pnpm-workspace.yaml; nothing to install."
+          fi
+
+      # Install scripts can spawn children that outlive the install. Give the
+      # sensor a moment to record them before the profile is finalized.
+      - name: Let sensor settle
+        if: always()
+        run: sleep 45
