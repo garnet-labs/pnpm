@@ -1,0 +1,8 @@
+{
+  "name": "dns-egress-fixture",
+  "private": true,
+  "dependencies": {
+    "is-odd": "3.0.1",
+    "left-pad": "1.3.0"
+  }
+}

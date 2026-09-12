@@ -1,0 +1,165 @@
+name: Garnet DNS egress
+
+# Fork-only. Records which nameserver a released pnpm 12 binary actually
+# queries when /etc/resolv.conf names exactly one nameserver (1.1.1.1) and
+# carries `options no_tld_query`. One job per released binary, same commit, same
+# runner class as upstream Rust CI. Nothing here asserts an outcome; the
+# Garnet step records the processes and the destinations they reached.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/garnet-dns-egress.yml'
+      - '.github/garnet/dns-egress/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  pnpm-12-2-1:
+    name: pnpm 12.2.1 (recorded)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    env:
+      PNPM_VERSION: '12.2.1'
+      # A third released version. Its only purpose is to make the installed
+      # binary perform its own registry fetch (packageManager pin download).
+      PIN_VERSION: '12.2.0'
+      CONFIGURED_NS: '1.1.1.1'
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0-rc.8
+
+      - name: Point resolv.conf at one configured nameserver
+        # Blacksmith runners resolve through 8.8.8.8 by default, which is the
+        # same address a hickory fallback would use, so the configured
+        # nameserver is set to 1.1.1.1 explicitly. Anything that still talks
+        # to 8.8.8.8 / 8.8.4.4 after this step is not using resolv.conf.
+        run: |
+          echo "--- /etc/resolv.conf before"
+          cat /etc/resolv.conf || true
+          printf 'nameserver %s\noptions no_tld_query\n' "$CONFIGURED_NS" > "$RUNNER_TEMP/resolv.conf"
+          sudo rm -f /etc/resolv.conf
+          sudo cp "$RUNNER_TEMP/resolv.conf" /etc/resolv.conf
+          echo "--- /etc/resolv.conf after"
+          cat /etc/resolv.conf
+          echo "--- glibc resolves through it"
+          getent hosts registry.npmjs.org | head -2
+
+      - name: Install pnpm
+        # Outside the checkout: the repository root pins packageManager, which
+        # would otherwise redirect every pnpm invocation below.
+        working-directory: ${{ runner.temp }}
+        run: |
+          npm install -g "pnpm@${PNPM_VERSION}"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+
+      - name: Path A - install a two-dependency fixture
+        continue-on-error: true
+        run: |
+          cp -r .github/garnet/dns-egress "$RUNNER_TEMP/fixture-install"
+          cd "$RUNNER_TEMP/fixture-install"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+          pnpm install --store-dir "$RUNNER_TEMP/store"
+
+      - name: Path B - packageManager pin fetch by the installed binary
+        # The installed pnpm resolves the registry itself to download the
+        # pinned version. This is the binary's own network path.
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixture-pin"
+          cd "$RUNNER_TEMP/fixture-pin"
+          printf '{"name":"dns-egress-pin","private":true,"packageManager":"pnpm@%s"}\n' "$PIN_VERSION" > package.json
+          echo "installed: ${PNPM_VERSION}  pinned: ${PIN_VERSION}"
+          echo "pnpm --version inside the pinned directory prints:"
+          pnpm --version
+
+      - name: Record what ran
+        run: |
+          echo "runner=${RUNNER_NAME} os=$(. /etc/os-release; echo "$PRETTY_NAME")"
+          echo "resolv.conf:"; cat /etc/resolv.conf
+          echo "installed pnpm: $(cd "$RUNNER_TEMP" && pnpm --version)"
+
+  pnpm-12-3-0:
+    needs: pnpm-12-2-1
+    name: pnpm 12.3.0 (recorded)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    env:
+      PNPM_VERSION: '12.3.0'
+      # A third released version. Its only purpose is to make the installed
+      # binary perform its own registry fetch (packageManager pin download).
+      PIN_VERSION: '12.2.0'
+      CONFIGURED_NS: '1.1.1.1'
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0-rc.8
+
+      - name: Point resolv.conf at one configured nameserver
+        # Blacksmith runners resolve through 8.8.8.8 by default, which is the
+        # same address a hickory fallback would use, so the configured
+        # nameserver is set to 1.1.1.1 explicitly. Anything that still talks
+        # to 8.8.8.8 / 8.8.4.4 after this step is not using resolv.conf.
+        run: |
+          echo "--- /etc/resolv.conf before"
+          cat /etc/resolv.conf || true
+          printf 'nameserver %s\noptions no_tld_query\n' "$CONFIGURED_NS" > "$RUNNER_TEMP/resolv.conf"
+          sudo rm -f /etc/resolv.conf
+          sudo cp "$RUNNER_TEMP/resolv.conf" /etc/resolv.conf
+          echo "--- /etc/resolv.conf after"
+          cat /etc/resolv.conf
+          echo "--- glibc resolves through it"
+          getent hosts registry.npmjs.org | head -2
+
+      - name: Install pnpm
+        # Outside the checkout: the repository root pins packageManager, which
+        # would otherwise redirect every pnpm invocation below.
+        working-directory: ${{ runner.temp }}
+        run: |
+          npm install -g "pnpm@${PNPM_VERSION}"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+
+      - name: Path A - install a two-dependency fixture
+        continue-on-error: true
+        run: |
+          cp -r .github/garnet/dns-egress "$RUNNER_TEMP/fixture-install"
+          cd "$RUNNER_TEMP/fixture-install"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+          pnpm install --store-dir "$RUNNER_TEMP/store"
+
+      - name: Path B - packageManager pin fetch by the installed binary
+        # The installed pnpm resolves the registry itself to download the
+        # pinned version. This is the binary's own network path.
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixture-pin"
+          cd "$RUNNER_TEMP/fixture-pin"
+          printf '{"name":"dns-egress-pin","private":true,"packageManager":"pnpm@%s"}\n' "$PIN_VERSION" > package.json
+          echo "installed: ${PNPM_VERSION}  pinned: ${PIN_VERSION}"
+          echo "pnpm --version inside the pinned directory prints:"
+          pnpm --version
+
+      - name: Record what ran
+        run: |
+          echo "runner=${RUNNER_NAME} os=$(. /etc/os-release; echo "$PRETTY_NAME")"
+          echo "resolv.conf:"; cat /etc/resolv.conf
+          echo "installed pnpm: $(cd "$RUNNER_TEMP" && pnpm --version)"
