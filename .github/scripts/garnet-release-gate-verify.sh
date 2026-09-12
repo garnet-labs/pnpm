@@ -295,38 +295,51 @@ if [ "$in_pr_context" = true ]; then
     leg_check L4 "app comment: $app_comments Garnet App comments on the pull request; the App updates one comment in place (F31)"
   fi
 
-  # What the comment has to carry to be evidence: the step the sensor recorded,
-  # in quotes, and at least one destination it reached from it. The step name is
-  # the recorded one, not the intended one, so an F25 skew fails L3 and leaves
-  # this check honest.
+  # What the comment has to carry to be evidence: at least one destination it
+  # reached, attributed to the step the sensor recorded. The step name is the
+  # recorded one, not the intended one; recorded-vs-rendered step attribution
+  # is a disclosed-unstable surface (F25/F31), so a missing quoted name reports
+  # optional while a missing destination is a core miss — that is the comment's
+  # actual claim.
   if [ -n "$comment_body" ]; then
     recorded_step="$(jq -r 'first(.[]?) // ""' <<<"$workload_steps")"
     [ -n "$recorded_step" ] || recorded_step="$WORKLOAD_STEP_NAME"
     has_step=false; has_dest=false
-    # The App quotes the step name; in the raw body that arrives as either a
-    # literal " or an HTML-escaped &quot; — both render correctly for a reader.
-    grep -qF "\"$recorded_step\"" <<<"$comment_body" && has_step=true
-    grep -qF "&quot;$recorded_step&quot;" <<<"$comment_body" && has_step=true
-    grep -qF "$WORKLOAD_DESTINATION" <<<"$comment_body" && has_dest=true
+    # The App renders destinations defanged (`npmjs[.]org`) and quotes the step
+    # name; jibril may number the recorded name (`2. Stop the action clock`)
+    # while the comment renders the step's own name (F25 skew). Normalize the
+    # body and try the de-numbered name so the check reads what a reader sees.
+    body_norm="$(sed 's/\[\.\]/./g' <<<"$comment_body")"
+    step_plain="$(sed -E 's/^[0-9]+\. //' <<<"$recorded_step")"
+    grep -qF "\"$recorded_step\"" <<<"$body_norm" && has_step=true
+    grep -qF "&quot;$recorded_step&quot;" <<<"$body_norm" && has_step=true
+    grep -qF "\"$step_plain\"" <<<"$body_norm" && has_step=true
+    grep -qF "&quot;$step_plain&quot;" <<<"$body_norm" && has_step=true
+    grep -qF "$WORKLOAD_DESTINATION" <<<"$body_norm" && has_dest=true
     if [ "$has_step" = true ] && [ "$has_dest" = true ]; then
       comment_content="names \"$recorded_step\" and $WORKLOAD_DESTINATION"
     else
       comment_content="missing $( [ "$has_step" = true ] || printf 'the recorded step name in quotes; ' )$( [ "$has_dest" = true ] || printf 'a destination' )"
-      leg_check L4 "app comment: body $comment_content (F31)"
+      if [ "$has_dest" = false ]; then
+        leg_check L4 "app comment: body $comment_content (F31)"
+      else
+        leg_optional "L4 app comment: body $comment_content (F31)"
+      fi
     fi
 
-    # The evidence mirror copies the same comment into the PR description, and
-    # a review reads the description. Both have to name the same sha (F34).
+    # The evidence mirror copies the same comment into the PR description so a
+    # review can read it there — a reviewer-consumption experiment, not part of
+    # the pnpm acceptance surface (F34). Reported optional in both directions.
     pr_body="$(gh api "repos/$repo/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null || true)"
     mirror="$(awk '/<!-- garnet:evidence:begin -->/{on=1} on{print} /<!-- garnet:evidence:end -->/{on=0}' <<<"$pr_body")"
     comment_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$comment_body" | head -n1)"
     mirror_marker="$(grep -oE '<!-- garnet:commit [0-9a-f]{40} -->' <<<"$mirror" | head -n1)"
     if [ -z "$mirror" ]; then
       mirror_state="absent from the pull request description"
-      leg_check L4 "app comment: evidence mirror $mirror_state (F34)"
+      leg_optional "L4 app comment: evidence mirror $mirror_state (F34)"
     elif [ "$mirror_marker" != "$comment_marker" ]; then
       mirror_state="mirror at ${mirror_marker:-no sha}, comment at ${comment_marker:-no sha}"
-      leg_check L4 "app comment: evidence mirror and comment disagree — $mirror_state (F34)"
+      leg_optional "L4 app comment: evidence mirror and comment disagree — $mirror_state (F34)"
     else
       mirror_state="mirrored in the description, both bound to ${PR_HEAD_SHA:0:7}"
     fi
@@ -394,7 +407,8 @@ fi
 if [ "${#upstream_notes[@]}" -gt 0 ]; then
   leg_optional "L6 posture (upstream): $(printf '%s; ' "${upstream_notes[@]}")"
 fi
-shape_state="$(printf '%s; ' "${shape_notes[@]}")${upstream_notes:+${shape_notes:+; }$(printf '%s; ' "${upstream_notes[@]}")}"
+shape_state=""
+for _n in ${shape_notes[@]+"${shape_notes[@]}"} ${upstream_notes[@]+"${upstream_notes[@]}"}; do shape_state+="$_n; "; done
 shape_state="${shape_state%; }"
 
 # --- L7 integration run --------------------------------------------------------

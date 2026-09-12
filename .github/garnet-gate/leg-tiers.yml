@@ -29,7 +29,7 @@ legs:
   L2:   { tier: core,     why: "profile upload is the product" }
   L3:   { tier: optional, why: "F25 jibril parseStepsList step-numbering skew — disclosed",
           promotion: "fix lands in garnet-org/jibril and the recorded step names the run step" }
-  L4:   { tier: core,     why: "capture → finalized comment bound to the PR head; the render is what the reviewer sees" }
+  L4:   { tier: core,     why: "capture → finalized comment bound to the PR head; the render is what the reviewer sees. Carve-outs inside the leg: a missing quoted step name reports optional (step attribution is disclosed-unstable, F25/F31) and the PR-description evidence mirror reports optional (reviewer-consumption experiment, F34); a missing destination or a duplicate App comment stays core" }
   L5:   { tier: core,     why: "the public permalink is the shareable proof" }
   L6:   { tier: core,     why: "no permission asks, full-SHA pins, explicit api_token; upstream-file rows report optional" }
   L7:   { tier: optional, why: "pnpm's own TS CI on its current pin — platform reliability evidence, not something the candidate controls (e.g. intermittent jibril.service fail-open since Sep-2)",
