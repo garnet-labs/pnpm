@@ -1,0 +1,55 @@
+name: Native build install
+
+# Installs the `native-build-install` fixture from the public registry on a
+# real runner. The fixture exists to exercise installs that fetch from the
+# registry and, once a package's build is allowed, run its build script; this
+# job is where a change to either shows up. The install runs under the Garnet
+# sensor, so the execution chains and the destinations they reach are recorded
+# and compared against the previous commit of the same pull request.
+on:
+  pull_request:
+    paths:
+      - 'pnpm11/__fixtures__/native-build-install/**'
+      - '.github/workflows/garnet-native-build-install.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-build-install-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-build-install:
+    name: Fixture install (recorded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      # The runner's preinstalled Node.js is enough to run pnpm itself, which
+      # keeps toolchain setup out of the job and leaves the fixture install as
+      # the only network activity it adds.
+      - name: Install pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 12.0.0-rc.6
+
+      - name: Install fixture
+        working-directory: pnpm11/__fixtures__/native-build-install
+        run: pnpm install --no-frozen-lockfile
+
+      # Build scripts can spawn children that outlive the install. Give the
+      # sensor a moment to record them before the profile is finalized.
+      - name: Let sensor settle
+        if: always()
+        run: sleep 45
