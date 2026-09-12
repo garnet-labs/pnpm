@@ -1,0 +1,98 @@
+name: Garnet Side-Effects Cache Replay
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .garnet/side-effects-cache/**
+      - .github/workflows/garnet-side-effects-cache-replay.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-side-effects-cache-replay-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    name: side-effects-cache replay
+    env:
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+      PNPM_VERSION: 12.3.4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify executed commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
+
+      - uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+        env:
+          GARNET_PROFILE_JOB: side-effects-cache-replay
+
+      - name: Install pnpm
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          install: false
+
+      - name: Verify pnpm version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(pnpm --version)" = "$PNPM_VERSION" ] || { echo "pnpm $(pnpm --version) installed, expected $PNPM_VERSION"; exit 1; }
+
+      - name: Replay three projects on one store, then rebuild the second
+        shell: bash
+        env:
+          WORK_DIR: ${{ runner.temp }}/side-effects-cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR"
+          status=0
+          .garnet/side-effects-cache/replay.sh "$WORK_DIR" "$WORK_DIR/results.json" | tee "$WORK_DIR/table.txt" || status=$?
+          {
+            echo "## Side-effects cache replay"
+            echo
+            echo "commit \`${EXPECTED_SHA:0:7}\` · pnpm ${PNPM_VERSION} · three git repositories, one store, then \`pnpm rebuild\` in the second · \`simple-git-hooks@2.13.1\` postinstall writes \`.git/hooks/pre-commit\`"
+            echo
+            echo '```'
+            cat "$WORK_DIR/table.txt"
+            echo '```'
+            echo
+            echo "<details><summary>pnpm output per step</summary>"
+            echo
+            for step in project-a project-b project-c project-b-rebuild; do
+              echo "\`$step\`"
+              echo
+              echo '```'
+              cat "$WORK_DIR/$step.log" 2>/dev/null || echo "(no log: the replay stopped before this step)"
+              echo '```'
+              echo
+            done
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: side-effects-cache-replay-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/side-effects-cache/results.json
+            ${{ runner.temp }}/side-effects-cache/table.txt
+            ${{ runner.temp }}/side-effects-cache/project-*.log
+          if-no-files-found: error
