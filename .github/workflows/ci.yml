@@ -129,28 +129,51 @@ jobs:
     needs: [compile-and-lint, build-pnpr-linux]
     strategy:
       fail-fast: false
+      # Three cells fit in one wave, so every cell shares the same window.
+      max-parallel: 8
       matrix:
+        # Test-branch only: lane 5 showed the profile stays empty with the
+        # event printers off, so this lane reads the sensor's own debug log
+        # instead. Every cell is the control pin with the printers dropped
+        # (which keeps `jibril.log` small enough to read) at `log-level:
+        # debug`. Cell 13 additionally takes a goroutine dump partway through
+        # its stop, which kills the sensor.
         include:
-          - node: '22.13.0'
-            node_major: '22'
-            platform: blacksmith-8vcpu-ubuntu-2404
-            platform_label: ubuntu
-            test_chunk: '1'
-            test_chunk_total: '1'
-          - node: '24.0.0'
+          - platform_label: ubuntu debug-11
+            cell_id: debug-11
+            garnet_jibril_version: v2.16.0
+            garnet_drop_event_printers: true
+            garnet_debug_log_level: true
+            node: '24.0.0'
             node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
-            platform_label: ubuntu
             test_chunk: '1'
             test_chunk_total: '1'
             garnet: true
-          - node: '26.8.1'
-            node_major: '26'
+          - platform_label: ubuntu debug-12
+            cell_id: debug-12
+            garnet_jibril_version: v2.16.0
+            garnet_drop_event_printers: true
+            garnet_debug_log_level: true
+            node: '24.0.0'
+            node_major: '24'
             platform: blacksmith-8vcpu-ubuntu-2404
-            platform_label: ubuntu
             test_chunk: '1'
             test_chunk_total: '1'
-    uses: $/.github/workflows/test.yml
+            garnet: true
+          - platform_label: ubuntu debug-quit-13
+            cell_id: debug-quit-13
+            garnet_jibril_version: v2.16.0
+            garnet_drop_event_printers: true
+            garnet_debug_log_level: true
+            garnet_goroutine_dump: true
+            node: '24.0.0'
+            node_major: '24'
+            platform: blacksmith-8vcpu-ubuntu-2404
+            test_chunk: '1'
+            test_chunk_total: '1'
+            garnet: true
+    uses: ./.github/workflows/test.yml
     with:
       node: ${{ matrix.node }}
       node_major: ${{ matrix.node_major }}
@@ -158,6 +181,11 @@ jobs:
       test_chunk: ${{ matrix.test_chunk }}
       test_chunk_total: ${{ matrix.test_chunk_total }}
       garnet: ${{ matrix.garnet == true }}
+      garnet_jibril_version: ${{ matrix.garnet_jibril_version }}
+      garnet_drop_event_printers: ${{ matrix.garnet_drop_event_printers == true }}
+      garnet_debug_log_level: ${{ matrix.garnet_debug_log_level == true }}
+      garnet_goroutine_dump: ${{ matrix.garnet_goroutine_dump == true }}
+      cell_id: ${{ matrix.cell_id }}
     secrets:
       GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
 
