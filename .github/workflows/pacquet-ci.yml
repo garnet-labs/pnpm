@@ -101,6 +101,9 @@ jobs:
           - os: blacksmith-12vcpu-macos-latest
             os_label: macos
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
     # Backstop for hangs outside nextest's per-test terminate-after
     # (stuck cargo build, stuck tool download): warm-cache runs finish
     # in ~5 minutes, cold-cache rebuilds of the full workspace need the
@@ -117,6 +120,8 @@ jobs:
       # the linker dies with ENOSPC / SIGBUS mid-build. Drop the
       # preinstalled toolchains this job never uses (~25 GB) before
       # compiling anything.
+      - uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main 2026-09-04
+        if: runner.os == 'Linux'
       - name: Free up runner disk space
         if: runner.os == 'Linux'
         run: |
