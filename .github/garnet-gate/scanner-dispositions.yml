@@ -319,6 +319,18 @@ actionlint:
       pnpm's own file. The finding predates the Garnet rollout and the rollout
       changes only the action SHA on this file.
 
+  - message: '.github/workflows/test.yml:180:7: shellcheck reported issue in this script: SC2153'
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - message: '.github/workflows/test.yml:228:7: shellcheck reported issue in this script: SC2153'
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
   - message: 'label "blacksmith-8vcpu-windows-2025" is unknown'
     class: disclosed
     reason: >-
