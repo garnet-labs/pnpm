@@ -38,6 +38,266 @@ zizmor:
       pnpm's own file, unchanged by the rollout. The gate sets concurrency on
       its own workflow.
 
+  - ident: adhoc-packages
+    path: .github/workflows/garnet-dependabot-fixtures.yml
+    route: jobs.dependency-runtime-review.steps.2
+    class: disclosed
+    reason: >-
+      The fixture workflow intentionally installs dependencies from changed
+      fixture manifests to exercise Dependabot dependency-resolution behavior;
+      the package versions are supplied by the fixtures and cannot be
+      pre-pinned in the workflow.
+
+  - ident: adhoc-packages
+    path: .github/workflows/garnet-execution-diff.yml
+    route: jobs.execution-diff.steps.3
+    class: disclosed
+    reason: >-
+      pinned version, install is the gate's own scanner / renderer
+
+  - ident: excessive-permissions
+    path: .github/workflows/garnet-oidc-canary.yml
+    route: permissions.id-token
+    class: fixed
+    reason: >-
+      The OIDC permission is scoped to the canary job.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/garnet-oidc-canary.yml
+    route: permissions.id-token
+    class: fixed
+    reason: >-
+      The OIDC permission now documents its purpose at the job level.
+
+  - ident: anonymous-definition
+    path: .github/workflows/garnet-oidc-canary.yml
+    route: jobs.verify-oidc
+    class: fixed
+    reason: >-
+      The canary job now has a display name.
+
+  - ident: concurrency-limits
+    path: .github/workflows/garnet-oidc-canary.yml
+    route: 'on'
+    class: fixed
+    reason: >-
+      The canary workflow now has an explicit concurrency group.
+
+  - ident: artipacked
+    path: .github/workflows/garnet-dependabot-fixtures.yml
+    route: jobs.dependency-runtime-review.steps.0
+    class: fixed
+    reason: >-
+      Checkout no longer persists credentials.
+
+  - ident: unpinned-uses
+    path: .github/workflows/garnet-dependabot-fixtures.yml
+    route: jobs.dependency-runtime-review.steps.0
+    class: fixed
+    reason: >-
+      Checkout is pinned to the full v4.2.2 commit SHA.
+
+  - ident: anonymous-definition
+    path: .github/workflows/garnet-dependabot-fixtures.yml
+    route: jobs.dependency-runtime-review
+    class: fixed
+    reason: >-
+      The fixture review job now has a display name.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/garnet-dependabot-record.yml
+    route: jobs.resolve.permissions.pull-requests
+    class: fixed
+    reason: >-
+      The pull request read permission now documents its purpose.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/garnet-dependabot-record.yml
+    route: jobs.record.permissions.id-token
+    class: fixed
+    reason: >-
+      The OIDC permission now documents its purpose.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/garnet-dependabot-record.yml
+    route: jobs.verify.permissions.actions
+    class: fixed
+    reason: >-
+      The actions permission now documents its purpose.
+
+  - ident: anonymous-definition
+    path: .github/workflows/garnet-dependabot-record.yml
+    route: jobs.resolve
+    class: fixed
+    reason: >-
+      The snapshot resolution job now has a display name.
+
+  - ident: anonymous-definition
+    path: .github/workflows/garnet-dependabot-record.yml
+    route: jobs.record
+    class: fixed
+    reason: >-
+      The recording job now has a display name.
+
+  - ident: anonymous-definition
+    path: .github/workflows/garnet-dependabot-record.yml
+    route: jobs.verify
+    class: fixed
+    reason: >-
+      The verification job now has a display name.
+
+  - ident: excessive-permissions
+    path: .github/workflows/release.yml
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: template-injection
+    path: .github/workflows/release.yml
+    route: jobs.validate-release-ref.steps.0
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: template-injection
+    path: .github/workflows/release.yml
+    route: jobs.build-rust.steps.4
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: template-injection
+    path: .github/workflows/release.yml
+    route: jobs.build-rust.steps.5
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: template-injection
+    path: .github/workflows/release.yml
+    route: jobs.build-rust-napi.steps.3
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: template-injection
+    path: .github/workflows/release.yml
+    route: jobs.build-pnpr.steps.3
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: template-injection
+    path: .github/workflows/release.yml
+    route: jobs.build-pnpr.steps.6
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: template-injection
+    path: .github/workflows/release.yml
+    route: jobs.build-pnpr.steps.7
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/release.yml
+    route: jobs.build-rust.permissions.attestations
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/release.yml
+    route: jobs.build-rust-napi.permissions.attestations
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/release.yml
+    route: jobs.publish-rust.permissions.id-token
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/release.yml
+    route: jobs.build-pnpr.permissions.attestations
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/release.yml
+    route: jobs.publish-pnpr.permissions.id-token
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: undocumented-permissions
+    path: .github/workflows/release.yml
+    route: jobs.docker-pnpr.permissions.packages
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: anonymous-definition
+    path: .github/workflows/release.yml
+    route: jobs.validate-release-ref
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: anonymous-definition
+    path: .github/workflows/update-latest.yml
+    route: jobs.publish-to-winget
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: anonymous-definition
+    path: .github/workflows/update-latest.yml
+    route: jobs.post-to-reddit
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: anonymous-definition
+    path: .github/workflows/update-latest.yml
+    route: jobs.post-to-mastodon
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - ident: concurrency-limits
+    path: .github/workflows/update-latest.yml
+    route: 'on'
+    class: disclosed
+    reason: >-
+      pnpm's own manual-dispatch file. Independent version/tag dispatches must
+      be allowed to run concurrently, so a shared workflow/ref concurrency
+      group would serialize or cancel distinct updates.
+
 actionlint:
   - message: 'reusable workflow call "$/'
     class: intentional-diagnostic
@@ -52,3 +312,33 @@ actionlint:
       The instrumented cell of pnpm's test matrix runs on this Blacksmith
       label. A GitHub-hosted label would not reproduce the runner the sensor
       has to work on.
+
+  - message: 'label "blacksmith-4vcpu-ubuntu-2404" is unknown'
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - message: 'label "blacksmith-8vcpu-windows-2025" is unknown'
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - message: 'label "blacksmith-12vcpu-macos-latest" is unknown'
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - message: 'specifying action "$/.github/actions/rust-release-target" in invalid format'
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
+
+  - message: 'label "blacksmith-4vcpu-ubuntu-2404" is unknown'
+    class: disclosed
+    reason: >-
+      pnpm's own file. The finding predates the Garnet rollout and the rollout
+      changes only the action SHA on this file.
