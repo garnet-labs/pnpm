@@ -4,7 +4,8 @@
 # workflow file a test pull request touches has to be fixed or answered here
 # before the gate can pass. Four classes, and nothing else:
 #
-#   fixed                  the finding is gone; the row stays as history
+#   fixed                  the finding is gone; the row stays as history, and
+#                         the gate fails if it reappears
 #   disclosed              accepted and printed in the gate comment
 #   intentional-diagnostic the flagged line is the failure the gate reproduces
 #   garnet-side            the fix belongs in garnet-org/action or the sensor
