@@ -211,7 +211,7 @@ jobs:
         run: node control/.github/scripts/garnet-dependabot-record.mjs prepare
       - name: Start trusted sensor using OIDC only
         timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 2 || 45 }}
-        uses: garnet-org/action@2609a287b43720d73e26304558b2ead0fafd369b # v2.3.0 candidate (main 2609a28)
+        uses: garnet-org/action@f9ed14ab54564073ec11bba8d62d6980e172d2a0 # v2.3.0 candidate (main f9ed14a)
         with:
           jibril_version: v2.17.0
           stop_timeout_seconds: ${{ fromJSON(needs.resolve.outputs.stop_budget).sensor_stop_seconds }}

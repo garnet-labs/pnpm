@@ -73,7 +73,7 @@ jobs:
         run: echo "job_start=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Garnet runtime monitoring
-        uses: garnet-org/action@2609a287b43720d73e26304558b2ead0fafd369b # v2.3.0 candidate (main 2609a28)
+        uses: garnet-org/action@f9ed14ab54564073ec11bba8d62d6980e172d2a0 # v2.3.0 candidate (main f9ed14a)
         # The action fails open anyway; never let the gate abort before the
         # assertion step can record the verdict.
         continue-on-error: true
@@ -207,7 +207,7 @@ jobs:
 
       - name: Garnet runtime monitoring without credentials
         id: sensor
-        uses: garnet-org/action@2609a287b43720d73e26304558b2ead0fafd369b # v2.3.0 candidate (main 2609a28)
+        uses: garnet-org/action@f9ed14ab54564073ec11bba8d62d6980e172d2a0 # v2.3.0 candidate (main f9ed14a)
         continue-on-error: true
         with:
           api_token: ''
