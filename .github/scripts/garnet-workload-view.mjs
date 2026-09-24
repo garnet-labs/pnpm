@@ -39,9 +39,10 @@ export function groupAssociations(associations) {
   const groups = new Map()
   for (const association of associations) {
     const destination = destinationFor(association)
-    const group = groups.get(destination) || { chains: 0, processes: new Set() }
+    const group = groups.get(destination) || { chains: 0, processes: new Set(), stepUnknown: false }
     group.chains += 1
     if (association.process) group.processes.add(association.process)
+    if (association.github_step === "<unknown>" || !association.github_step) group.stepUnknown = true
     groups.set(destination, group)
   }
   return [...groups.entries()]
@@ -49,6 +50,7 @@ export function groupAssociations(associations) {
       destination,
       chains: group.chains,
       processes: [...group.processes].sort(),
+      stepUnknown: group.stepUnknown,
     }))
     .sort((left, right) => right.chains - left.chains || left.destination.localeCompare(right.destination))
 }
@@ -123,13 +125,13 @@ function renderRows(rows, baselineRows = null) {
   }
   rendered.sort((left, right) => right.chains - left.chains || left.destination.localeCompare(right.destination))
   return rendered.map((row) => (
-    `| \`${renderDestination(row.destination)}\` | ${row.chains} | ${row.delta} | ${renderProcesses(row.processes)} |`
+    `| \`${renderDestination(row.destination)}\`${row.stepUnknown ? " (step unknown)" : ""} | ${row.chains} | ${row.delta} | ${renderProcesses(row.processes)} |`
   ))
 }
 
 function renderRowsWithoutDelta(rows) {
   return rows.map((row) => (
-    `| \`${renderDestination(row.destination)}\` | ${row.chains} | ${renderProcesses(row.processes)} |`
+    `| \`${renderDestination(row.destination)}\`${row.stepUnknown ? " (step unknown)" : ""} | ${row.chains} | ${renderProcesses(row.processes)} |`
   ))
 }
 
@@ -170,15 +172,16 @@ export function renderWorkloadBlock(profile, baselineProfile = null) {
   if (baseline) {
     const workloadDelta = deltaFor(current.workload, baseline.workload)
     const base7 = baselineProfile.run.commit_sha.slice(0, 7)
+    const basis = `(run ${baselineProfile.run.run_id}, fixed reference — not the previous push the Garnet App comment compares against)`
     if (workloadDelta.same) {
-      lines.push(`**Workload behaviour unchanged vs \`${base7}\`** — same destinations, same reaching processes.`)
+      lines.push(`**Workload behaviour unchanged vs pinned baseline \`${base7}\`** ${basis} — same destinations, same reaching processes.`)
     } else if (workloadDelta.destinationsSame) {
       lines.push(
-        `**Workload destinations unchanged vs \`${base7}\`** — connection volume ` +
+        `**Workload destinations unchanged vs pinned baseline \`${base7}\`** ${basis} — connection volume ` +
         `${baseline.workloadChains} → ${current.workloadChains} chains.`,
       )
     } else {
-      lines.push(`**Workload behaviour vs \`${base7}\`: +${workloadDelta.added.length} −${workloadDelta.removed.length} destinations**`)
+      lines.push(`**Workload behaviour vs pinned baseline \`${base7}\`** ${basis}: +${workloadDelta.added.length} −${workloadDelta.removed.length} destinations`)
       lines.push(...renderDeltaLines(workloadDelta))
     }
     const platformDelta = deltaFor(current.platform, baseline.platform)

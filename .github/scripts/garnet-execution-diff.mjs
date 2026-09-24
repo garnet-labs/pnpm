@@ -216,7 +216,7 @@ export function renderReceipt({ status, reasons, meta, diff, profiles, cells }) 
     "",
     "Same workload, same runner label; rows marked new or gone appear in all 3 runs of one side and none of the other.",
     "",
-    `<sub>recorded at the kernel by Garnet · \`garnet-org/action@${meta.action_sha.slice(0, 7)}\` (v2.3.0-rc.1)</sub>`,
+    `<sub>recorded at the kernel by Garnet · \`garnet-org/action@${meta.action_sha.slice(0, 7)}\` (unreleased candidate)</sub>`,
     `<!-- garnet:execution-diff:summary ${JSON.stringify(machine)} -->`,
     END,
   ].join("\n")
@@ -457,7 +457,7 @@ async function main() {
       base: latestPr.base?.sha || "",
       head: env.HEAD_SHA,
       run_id: env.RUN_ID,
-      action_sha: "c747ff1f597c84579e10173301a31c30bb815181",
+      action_sha: env.GARNET_ACTION_SHA || "c747ff1f597c84579e10173301a31c30bb815181",
     },
     diff,
     profiles,

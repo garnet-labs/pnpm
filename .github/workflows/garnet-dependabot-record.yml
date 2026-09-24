@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   resolve:
+    name: Resolve Dependabot snapshot
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.user.login == 'dependabot[bot]' &&
@@ -36,7 +37,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: read # read pull request metadata for snapshot resolution
     outputs:
       snapshot: ${{ steps.resolve.outputs.snapshot }}
       recorder_sha: ${{ steps.resolve.outputs.recorder_sha }}
@@ -160,6 +161,7 @@ jobs:
         run: node control/.github/scripts/garnet-dependabot-record.mjs images
 
   record:
+    name: Record Dependabot execution
     needs: resolve
     strategy:
       fail-fast: false
@@ -170,7 +172,7 @@ jobs:
     timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).job_minutes }}
     permissions:
       contents: read
-      id-token: write
+      id-token: write # exchange the GitHub OIDC token for Garnet access
     env:
       RECORDER_SNAPSHOT: ${{ needs.resolve.outputs.snapshot }}
       RECORDER_IMAGES: ${{ needs.resolve.outputs.images }}
@@ -233,13 +235,14 @@ jobs:
           compression-level: 6
 
   verify:
+    name: Verify Dependabot evidence
     if: always() && needs.resolve.result == 'success'
     needs: [resolve, record]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
-      actions: write
+      actions: write # dispatch the trusted evidence publication workflow
     steps:
       - name: Checkout trusted verifier on a fresh runner
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

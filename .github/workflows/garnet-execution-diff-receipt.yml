@@ -21,6 +21,8 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       RUN_ID: ${{ github.event.workflow_run.id }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      # Must match the garnet-org/action `uses:` pin in garnet-execution-diff.yml.
+      GARNET_ACTION_SHA: 9696f3cae14437203c56dac7d78d9449b9ba3764
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

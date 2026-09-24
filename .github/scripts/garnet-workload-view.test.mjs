@@ -87,7 +87,7 @@ test("renders the PR 17 fixture against the PR 30 baseline", async () => {
     platformDestinations: 23,
   })
   const block = renderWorkloadBlock(head, baseline)
-  assert.match(block, /\*\*Workload destinations unchanged vs `ba67148`\*\*/)
+  assert.match(block, /\*\*Workload destinations unchanged vs pinned baseline `ba67148`\*\*/)
   assert.match(block, /connection volume 131 → 187 chains\./)
   assert.doesNotMatch(block, /^~/m)
   assert.match(block, /runner platform: \+8 −6 destinations · not workload behaviour/)
@@ -115,7 +115,7 @@ test("renders the head-only path through the main render call", async () => {
 test("renders all three workload headline cases", async () => {
   const baseline = await fixture("pr30-1b57225.json")
   const identical = renderWorkloadBlock(baseline.profiles[0], baseline.profiles[0])
-  assert.match(identical, /\*\*Workload behaviour unchanged vs `ba67148`\*\*/)
+  assert.match(identical, /\*\*Workload behaviour unchanged vs pinned baseline `ba67148`\*\* \(run \d+, fixed reference — not the previous push the Garnet App comment compares against\)/)
 
   const reduced = JSON.parse(JSON.stringify(baseline))
   const dropped = reduced.profiles[0].associations.findIndex((association) => (
@@ -123,7 +123,7 @@ test("renders all three workload headline cases", async () => {
   ))
   reduced.profiles[0].associations.splice(dropped, 1)
   const volumeOnly = renderWorkloadBlock(reduced.profiles[0], baseline.profiles[0])
-  assert.match(volumeOnly, /\*\*Workload destinations unchanged vs `ba67148`/)
+  assert.match(volumeOnly, /\*\*Workload destinations unchanged vs pinned baseline `ba67148`\*\* \(run \d+, fixed reference/)
   assert.match(volumeOnly, /connection volume 131 → 130 chains\./)
 
   const changed = JSON.parse(JSON.stringify(baseline))
@@ -136,7 +136,7 @@ test("renders all three workload headline cases", async () => {
     remote_names: ["new.example.org"],
   })
   const destinationChange = renderWorkloadBlock(changed.profiles[0], baseline.profiles[0])
-  assert.match(destinationChange, /\*\*Workload behaviour vs `ba67148`: \+1 −1 destinations\*\*/)
+  assert.match(destinationChange, /\*\*Workload behaviour vs pinned baseline `ba67148`\*\* \(run \d+, fixed reference[^)]*\): \+1 −1 destinations/)
   assert.match(destinationChange, /^\+ `new\.example\[.\]org` reached by /m)
   assert.match(destinationChange, /^− `pnpm\[.\]io`$/m)
   assert.doesNotMatch(destinationChange, /^~/m)
