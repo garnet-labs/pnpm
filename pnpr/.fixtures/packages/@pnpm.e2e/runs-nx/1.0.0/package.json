@@ -1,0 +1,7 @@
+{
+  "name": "@pnpm.e2e/runs-nx",
+  "version": "1.0.0",
+  "dependencies": {
+    "nx": "23.2.0"
+  }
+}
