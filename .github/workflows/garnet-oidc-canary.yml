@@ -2,17 +2,25 @@ name: Garnet Dependabot OIDC canary
 on:
   workflow_dispatch:
 permissions:
-  contents: read
-  id-token: write
+  {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   verify-oidc:
+    name: Verify Garnet OIDC authentication
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read # read the workflow repository metadata
+      id-token: write # mint an OIDC token for Garnet authentication
     steps:
       - name: Pull public canary image
         run: docker pull node:22-bookworm
       - name: Garnet OIDC registration
-        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764
+        uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
         env:
           GARNET_PROFILE_JOB: dependabot-oidc-canary-${{ github.run_attempt }}
         with:

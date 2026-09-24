@@ -15,8 +15,9 @@
 #                         pins, a sensor version that cannot move on its own
 #   L7 integration run    pnpm's own instrumented TS CI job for this head
 #                         produced a profile
-#   L8 reviewers          every scanner finding classified in writing, no
-#                         unresolved bot threads on .github/ paths
+#   L8 reviewers          every scanner finding classified in writing, no fixed
+#                         finding may reappear, and no unresolved bot threads
+#                         on .github/ paths
 #   L9 timing             sensor start, workload overhead, post-step flush,
 #                         profile-visible and comment-final latency
 #   L10 coverage          which CI cells are instrumented, and what the gate
@@ -459,7 +460,8 @@ fi
 # .github/ paths. A finding either gets fixed or a written disposition and a
 # resolved thread; an open one fails the gate.
 zizmor_state="not applicable"
-zizmor_findings=0; zizmor_pedantic=0; zizmor_unclassified=0; zizmor_unclassified_list=""
+zizmor_findings=0; zizmor_pedantic=0; zizmor_unclassified=0; zizmor_regressed=0
+zizmor_unclassified_list=""; zizmor_regressed_list=""
 actionlint_state="untested"; actionlint_unexpected=0
 bot_threads=0; bot_thread_list=""
 # The gate's own workflows are always scanned: they are the production-shaped
@@ -515,21 +517,32 @@ for report in reports:
             ),
             None,
         )
-        state = match.get("class") if match else "unclassified"
+        state = (
+            "regressed"
+            if match and match.get("class") == "fixed"
+            else match.get("class") if match else "unclassified"
+        )
         print(f"{state}\t{key[0]} at {path}{' ' + route if route else ''}")
 PY
   if [ "$classified" -eq 0 ]; then
     zizmor_unclassified_list="$(sed -n 's/^unclassified\t/  - /p' /tmp/zizmor-classified.txt)"
     zizmor_unclassified="$(grep -c '^unclassified	' /tmp/zizmor-classified.txt || true)"
+    zizmor_regressed_list="$(sed -n 's/^regressed\t/  - /p' /tmp/zizmor-classified.txt)"
+    zizmor_regressed="$(grep -c '^regressed	' /tmp/zizmor-classified.txt || true)"
   else
     zizmor_unclassified=0
+    zizmor_regressed=0
     zizmor_unclassified_list="  - dispositions not read: $(head -c 200 /tmp/zizmor-classify.err | tr '\n' ' ')"
     leg_check L8 "reviewers: could not read $DISPOSITIONS_PATH"
   fi
-  zizmor_state="$zizmor_findings regular, $zizmor_pedantic pedantic finding(s) over ${#scan_files[@]} workflow file(s); $zizmor_unclassified without a written class"
+  zizmor_state="$zizmor_findings regular, $zizmor_pedantic pedantic finding(s) over ${#scan_files[@]} workflow file(s); $zizmor_unclassified without a written class; $zizmor_regressed regressed"
   if [ "${zizmor_unclassified:-0}" -gt 0 ]; then
     leg_check L8 "reviewers: $zizmor_unclassified zizmor finding(s) with no row in $DISPOSITIONS_PATH (F33)"
     echo "$zizmor_unclassified_list"
+  fi
+  if [ "${zizmor_regressed:-0}" -gt 0 ]; then
+    leg_check L8 "reviewers: $zizmor_regressed zizmor finding(s) marked fixed have reappeared"
+    echo "$zizmor_regressed_list"
   fi
 else
   zizmor_state="zizmor not installed"
@@ -788,7 +801,7 @@ jq -n \
   --arg sim_state "$sim_state" --arg sim_outcome "${DEPENDABOT_SIM_OUTCOME:-}" \
   --arg release_state "$release_state" --argjson release_workflows "$(shape_get '.release_workflows // []')" \
   --arg comment_content "$comment_content" --arg mirror_state "$mirror_state" --argjson app_comments "${app_comments:-0}" \
-  --arg actionlint_state "$actionlint_state" --argjson zizmor_unclassified "${zizmor_unclassified:-0}" \
+  --arg actionlint_state "$actionlint_state" --argjson zizmor_unclassified "${zizmor_unclassified:-0}" --argjson zizmor_regressed "${zizmor_regressed:-0}" \
   --argjson gate_attribution "$(shape_get '.gate.attribution // {}')" --argjson upstream_attribution "$(shape_get '.upstream.attribution // {}')" \
   --arg action_default_version "$action_default_version" \
   '{verdict: $verdict, fail_reasons: $fail_reasons, optional_reasons: $optional_reasons, attention: $attention, disclosures: $disclosures,
@@ -808,7 +821,8 @@ jq -n \
       L6_posture: {state: $shape_state, failed: $shape_fail, inert_garnet_steps: $macos_garnet},
       L7_integration_run: {state: $integration_state, run_id: $integration_run_id, profile_id: $integration_profile_id},
       L8_reviewers: {zizmor: $zizmor_state, zizmor_findings: $zizmor_findings, zizmor_pedantic: $zizmor_pedantic,
-                     zizmor_unclassified: $zizmor_unclassified, actionlint: $actionlint_state, unresolved_bot_threads: $bot_threads},
+                     zizmor_unclassified: $zizmor_unclassified, zizmor_regressed: $zizmor_regressed,
+                     actionlint: $actionlint_state, unresolved_bot_threads: $bot_threads},
       L9_timing: {state: $timing_state, sensor_start_seconds: $action_seconds, start_budget_seconds: $start_budget,
                   overhead_seconds: $overhead_seconds, overhead_budget_seconds: $overhead_budget,
                   flush_seconds: $flush_seconds, flush_budget_seconds: $flush_budget,
