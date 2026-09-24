@@ -1,0 +1,100 @@
+name: Garnet Cargo opt-out replay
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/garnet-cargo-optout-replay.yml'
+
+concurrency:
+  group: garnet-cargo-optout-replay-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  recorded:
+    name: JS install with cargo.enabled true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DIAGNOSTIC_CARGO_ENABLED: 'true'
+    steps:
+      - name: Checkout commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Prepare Rust before recording
+        uses: $/.github/actions/rustup
+        with:
+          restore-cache: false
+
+      - name: Configure the diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "executed_sha=$(git rev-parse HEAD)"
+          node <<'NODE'
+          const fs = require('node:fs')
+          const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          manifest.packageManager = 'pnpm@12.4.1'
+          manifest.devEngines.packageManager.version = '12.4.1'
+          fs.writeFileSync('package.json', `${JSON.stringify(manifest, null, 2)}\n`)
+          NODE
+          cat >> pnpm-workspace.yaml <<EOF
+
+          cargo:
+            enabled: $DIAGNOSTIC_CARGO_ENABLED
+          EOF
+
+      - name: Start Garnet recording
+        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764 # action main
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0
+          debug: true
+
+      - name: Install JS dependencies
+        id: install
+        continue-on-error: true
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          runtime: node@24.0.0
+
+      - name: Assert Cargo result
+        id: assertion
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker='# >>> pnpm-managed cargo sources >>>'
+          if [ "$DIAGNOSTIC_CARGO_ENABLED" = true ]; then
+            grep -Fq "$marker" .cargo/config.toml
+            test -d .pnpm/crates
+            echo "cargo.enabled=true materialized Cargo sources"
+          else
+            ! grep -Fq "$marker" .cargo/config.toml
+            test ! -d .pnpm/crates
+            echo "cargo.enabled=false left Cargo sources absent"
+          fi
+
+      - name: Report experiment outcome
+        if: always()
+        env:
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          ASSERTION_OUTCOME: ${{ steps.assertion.outcome }}
+        run: |
+          {
+            echo "## Cargo opt-out replay"
+            echo
+            echo "| check | outcome |"
+            echo "|---|---|"
+            echo "| JS dependency install | $INSTALL_OUTCOME |"
+            echo "| Cargo materialization assertion | $ASSERTION_OUTCOME |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$INSTALL_OUTCOME" != success ] || [ "$ASSERTION_OUTCOME" != success ]; then
+            echo "::error::experiment failed: install=$INSTALL_OUTCOME assertion=$ASSERTION_OUTCOME"
+          fi
