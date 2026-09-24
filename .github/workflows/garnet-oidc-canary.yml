@@ -20,7 +20,7 @@ jobs:
       - name: Pull public canary image
         run: docker pull node:22-bookworm
       - name: Garnet OIDC registration
-        uses: garnet-org/action@f9ed14ab54564073ec11bba8d62d6980e172d2a0 # v2.3.0 candidate (main f9ed14a)
+        uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
         env:
           GARNET_PROFILE_JOB: dependabot-oidc-canary-${{ github.run_attempt }}
         with:

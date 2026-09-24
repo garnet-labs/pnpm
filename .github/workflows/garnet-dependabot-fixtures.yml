@@ -18,20 +18,18 @@ concurrency:
 
 jobs:
   dependency-runtime-review:
-    name: Review changed dependency fixtures
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Garnet Runtime Visibility
-        uses: garnet-org/action@f9ed14ab54564073ec11bba8d62d6980e172d2a0 # v2.3.0 candidate (main f9ed14a)
+        uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
 
