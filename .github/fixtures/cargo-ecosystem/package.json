@@ -1,0 +1,8 @@
+{
+  "name": "cargo-ecosystem-fixture",
+  "private": true,
+  "packageManager": "pnpm@12.4.0",
+  "dependencies": {
+    "is-number": "7.0.0"
+  }
+}
