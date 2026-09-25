@@ -1,0 +1,9 @@
+{
+  "name": "@pnpm.e2e/git-hook-installer",
+  "version": "1.0.0",
+  "description": "A package whose postinstall writes a pre-commit hook into the consuming project's .git/hooks",
+  "scripts": {
+    "postinstall": "node install-hook.js"
+  },
+  "license": "MIT"
+}
