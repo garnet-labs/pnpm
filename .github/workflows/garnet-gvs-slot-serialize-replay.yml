@@ -56,6 +56,7 @@ jobs:
           cat > "$FIXTURE_ROOT/package/postinstall.cjs" <<'JS'
           const fs = require('node:fs')
           const http = require('node:http')
+          const https = require('node:https')
           const path = require('node:path')
 
           const eventsPath = path.join(__dirname, 'lifecycle.ndjson')
@@ -77,18 +78,27 @@ jobs:
             request.on('error', reject)
           })
 
+          const notifyProfile = () => new Promise((resolve, reject) => {
+            const request = https.get('https://registry.npmjs.org/-/ping', response => {
+              response.resume()
+              response.on('end', resolve)
+            })
+            request.setTimeout(2000, () => request.destroy(new Error('profile request timeout')))
+            request.on('error', reject)
+          })
+
           const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
 
           async function main () {
             appendEvent('start')
-            await notifyObserver('start')
+            await Promise.all([notifyObserver('start'), notifyProfile()])
             await sleep(4000)
             fs.writeFileSync(
               path.join(__dirname, 'rewritten-by-postinstall.txt'),
               `pid=${process.pid} time=${Date.now()}\n`
             )
             appendEvent('end')
-            await notifyObserver('end')
+            await Promise.all([notifyObserver('end'), notifyProfile()])
           }
 
           main().catch(error => {
