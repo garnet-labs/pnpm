@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      FIXTURE_ROOT: ${{ runner.temp }}/garnet-gvs-slot-replay
+      FIXTURE_ROOT: /tmp/garnet-gvs-slot-replay
       DIAGNOSTIC_COMPARISON: sequential-versus-concurrent
     steps:
       - name: Checkout pull request head
