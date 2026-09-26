@@ -1,0 +1,284 @@
+name: Garnet global virtual store slot replay
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/garnet-gvs-slot-serialize-replay.yml'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: garnet-gvs-slot-serialize-replay-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  recorded-ab:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FIXTURE_ROOT: /tmp/garnet-gvs-slot-replay
+      DIAGNOSTIC_COMPARISON: sequential-versus-concurrent
+      GVS_PROBE_URL: http://127.0.0.1:43129
+    steps:
+      - name: Checkout pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up pnpm
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b
+        with:
+          runtime: node@24.0.0
+
+      - name: Prepare shared-slot fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$FIXTURE_ROOT"
+          mkdir -p "$FIXTURE_ROOT/package"
+
+          cat > "$FIXTURE_ROOT/package/package.json" <<'JSON'
+          {
+            "name": "gvs-slot-probe",
+            "version": "1.0.0",
+            "scripts": {
+              "postinstall": "node postinstall.cjs"
+            }
+          }
+          JSON
+
+          cat > "$FIXTURE_ROOT/package/postinstall.cjs" <<'JS'
+          const fs = require('node:fs')
+          const http = require('node:http')
+          const https = require('node:https')
+          const path = require('node:path')
+
+          const eventsPath = path.join(__dirname, 'lifecycle.ndjson')
+          const appendEvent = event => {
+            fs.appendFileSync(eventsPath, `${JSON.stringify({
+              event,
+              pid: process.pid,
+              time: Date.now(),
+            })}\n`)
+          }
+
+          const notifyObserver = event => new Promise((resolve, reject) => {
+            const url = new URL(`/${event}?pid=${process.pid}`, process.env.GVS_PROBE_URL)
+            const request = http.get(url, response => {
+              response.resume()
+              response.on('end', resolve)
+            })
+            request.setTimeout(2000, () => request.destroy(new Error('observer timeout')))
+            request.on('error', reject)
+          })
+
+          const notifyProfile = () => new Promise((resolve, reject) => {
+            const request = https.get('https://registry.npmjs.org/-/ping', response => {
+              response.resume()
+              response.on('end', resolve)
+            })
+            request.setTimeout(2000, () => request.destroy(new Error('profile request timeout')))
+            request.on('error', reject)
+          })
+
+          const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
+
+          async function main () {
+            appendEvent('start')
+            await Promise.all([notifyObserver('start'), notifyProfile()])
+            await sleep(4000)
+            fs.writeFileSync(
+              path.join(__dirname, 'rewritten-by-postinstall.txt'),
+              `pid=${process.pid} time=${Date.now()}\n`
+            )
+            appendEvent('end')
+            await Promise.all([notifyObserver('end'), notifyProfile()])
+          }
+
+          main().catch(error => {
+            console.error(error)
+            process.exitCode = 1
+          })
+          JS
+
+          cat > "$FIXTURE_ROOT/observer.cjs" <<'JS'
+          const fs = require('node:fs')
+          const http = require('node:http')
+
+          const logPath = process.argv[2]
+          const server = http.createServer((request, response) => {
+            fs.appendFileSync(logPath, `${JSON.stringify({
+              path: request.url,
+              time: Date.now(),
+            })}\n`)
+            response.end('ok')
+          })
+
+          server.listen(43129, '127.0.0.1')
+          JS
+
+          tar -czf "$FIXTURE_ROOT/gvs-slot-probe-1.0.0.tgz" -C "$FIXTURE_ROOT" package
+
+          for mode in sequential concurrent; do
+            for index in 1 2 3 4; do
+              project="$FIXTURE_ROOT/$mode/project-$index"
+              mkdir -p "$project"
+              cat > "$project/package.json" <<'JSON'
+          {
+            "name": "gvs-slot-consumer",
+            "version": "1.0.0",
+            "private": true,
+            "packageManager": "pnpm@12.3.4",
+            "dependencies": {
+              "gvs-slot-probe": "file:../../gvs-slot-probe-1.0.0.tgz"
+            }
+          }
+          JSON
+              cat > "$project/pnpm-workspace.yaml" <<YAML
+          enableGlobalVirtualStore: true
+          storeDir: "$FIXTURE_ROOT/stores/$mode"
+          allowBuilds:
+            "gvs-slot-probe@file:../../gvs-slot-probe-1.0.0.tgz": true
+          YAML
+            done
+          done
+
+      - name: Start Garnet recording
+        uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          debug: true
+        env:
+          GARNET_PROFILE_JOB: gvs-slot-serialize-replay
+
+      - name: Run sequential baseline and concurrent treatment
+        id: installs
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p "$FIXTURE_ROOT/logs" "$FIXTURE_ROOT/outcomes"
+          node "$FIXTURE_ROOT/observer.cjs" "$FIXTURE_ROOT/observer.ndjson" \
+            > "$FIXTURE_ROOT/logs/observer.log" 2>&1 &
+          observer_pid=$!
+          trap 'kill "$observer_pid" 2>/dev/null; wait "$observer_pid" 2>/dev/null' EXIT
+
+          observer_ready=false
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --silent "$GVS_PROBE_URL/ready" > /dev/null; then
+              observer_ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$observer_ready" != true ]; then
+            echo "::error::lifecycle observer did not start"
+            cat "$FIXTURE_ROOT/logs/observer.log"
+            exit 1
+          fi
+
+          install_one() {
+            local mode=$1
+            local index=$2
+            local project="$FIXTURE_ROOT/$mode/project-$index"
+            (
+              cd "$project"
+              pnpm install --reporter=append-only
+            ) > "$FIXTURE_ROOT/logs/$mode-$index.log" 2>&1
+            local code=$?
+            echo "$code" > "$FIXTURE_ROOT/outcomes/$mode-$index"
+            return "$code"
+          }
+
+          result=0
+          for index in 1 2 3 4; do
+            install_one sequential "$index" || result=1
+          done
+
+          gate="$FIXTURE_ROOT/concurrent.start"
+          pids=()
+          for index in 1 2 3 4; do
+            (
+              while [ ! -e "$gate" ]; do sleep 0.05; done
+              install_one concurrent "$index"
+            ) &
+            pids+=("$!")
+          done
+          touch "$gate"
+
+          for pid in "${pids[@]}"; do
+            wait "$pid" || result=1
+          done
+
+          for mode in sequential concurrent; do
+            for index in 1 2 3 4; do
+              echo "::group::$mode install $index"
+              cat "$FIXTURE_ROOT/logs/$mode-$index.log"
+              echo "::endgroup::"
+            done
+
+            marker_files=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson | wc -l)
+            starts=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + |
+              awk '/"event":"start"/ { count++ } END { print count + 0 }')
+            ends=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + |
+              awk '/"event":"end"/ { count++ } END { print count + 0 }')
+            if [ "$marker_files" -ne 1 ] || [ "$starts" -lt 1 ] || [ "$ends" -lt 1 ]; then
+              echo "::error::$mode did not complete a lifecycle in exactly one shared slot: files=$marker_files starts=$starts ends=$ends"
+              result=1
+            fi
+          done
+
+          exit "$result"
+
+      - name: Report diagnostic outcomes
+        if: always()
+        shell: bash
+        env:
+          INSTALL_STEP_OUTCOME: ${{ steps.installs.outcome }}
+        run: |
+          {
+            echo "## Global virtual store slot replay"
+            echo
+            echo "Held constant: pnpm version, package tarball, lifecycle script, project count, and global virtual store configuration."
+            echo
+            echo "| side | scheduling | install exit codes | marker files | starts | ends |"
+            echo "|---|---|---|---:|---:|---:|"
+            for mode in sequential concurrent; do
+              codes=$(cat "$FIXTURE_ROOT"/outcomes/"$mode"-* 2>/dev/null | paste -sd ',' - || true)
+              markers=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson 2>/dev/null | wc -l)
+              starts=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + 2>/dev/null |
+                awk '/"event":"start"/ { count++ } END { print count + 0 }')
+              ends=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + 2>/dev/null |
+                awk '/"event":"end"/ { count++ } END { print count + 0 }')
+              echo "| $mode | $mode | ${codes:-missing} | $markers | $starts | $ends |"
+            done
+            echo
+            echo "Recorded install step outcome: $INSTALL_STEP_OUTCOME"
+            echo
+            for mode in sequential concurrent; do
+              echo "<details><summary>$mode lifecycle markers</summary>"
+              echo
+              echo '```json'
+              find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -print -exec cat {} \; 2>/dev/null || true
+              echo '```'
+              echo "</details>"
+              echo
+            done
+            echo "<details><summary>loopback observer events</summary>"
+            echo
+            echo '```json'
+            cat "$FIXTURE_ROOT/observer.ndjson" 2>/dev/null || true
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Allow recording to settle
+        if: always()
+        run: sleep 25
