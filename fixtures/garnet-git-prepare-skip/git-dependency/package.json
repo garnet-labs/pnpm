@@ -1,0 +1,16 @@
+{
+  "name": "garnet-git-prepare-root",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@12.3.4",
+  "files": [
+    "index.js",
+    "prepared.txt"
+  ],
+  "scripts": {
+    "prepare": "node record-prepare.cjs"
+  },
+  "dependencies": {
+    "garnet-unapproved-build": "file:./unapproved-build"
+  }
+}
