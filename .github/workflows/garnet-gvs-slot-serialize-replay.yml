@@ -22,6 +22,7 @@ jobs:
     env:
       FIXTURE_ROOT: /tmp/garnet-gvs-slot-replay
       DIAGNOSTIC_COMPARISON: sequential-versus-concurrent
+      GVS_PROBE_URL: http://127.0.0.1:43129
     steps:
       - name: Checkout pull request head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -54,6 +55,7 @@ jobs:
 
           cat > "$FIXTURE_ROOT/package/postinstall.cjs" <<'JS'
           const fs = require('node:fs')
+          const http = require('node:http')
           const path = require('node:path')
 
           const eventsPath = path.join(__dirname, 'lifecycle.ndjson')
@@ -65,14 +67,50 @@ jobs:
             })}\n`)
           }
 
-          appendEvent('start')
-          setTimeout(() => {
+          const notifyObserver = event => new Promise((resolve, reject) => {
+            const url = new URL(`/${event}?pid=${process.pid}`, process.env.GVS_PROBE_URL)
+            const request = http.get(url, response => {
+              response.resume()
+              response.on('end', resolve)
+            })
+            request.setTimeout(2000, () => request.destroy(new Error('observer timeout')))
+            request.on('error', reject)
+          })
+
+          const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
+
+          async function main () {
+            appendEvent('start')
+            await notifyObserver('start')
+            await sleep(4000)
             fs.writeFileSync(
               path.join(__dirname, 'rewritten-by-postinstall.txt'),
               `pid=${process.pid} time=${Date.now()}\n`
             )
             appendEvent('end')
-          }, 4000)
+            await notifyObserver('end')
+          }
+
+          main().catch(error => {
+            console.error(error)
+            process.exitCode = 1
+          })
+          JS
+
+          cat > "$FIXTURE_ROOT/observer.cjs" <<'JS'
+          const fs = require('node:fs')
+          const http = require('node:http')
+
+          const logPath = process.argv[2]
+          const server = http.createServer((request, response) => {
+            fs.appendFileSync(logPath, `${JSON.stringify({
+              path: request.url,
+              time: Date.now(),
+            })}\n`)
+            response.end('ok')
+          })
+
+          server.listen(43129, '127.0.0.1')
           JS
 
           tar -czf "$FIXTURE_ROOT/gvs-slot-probe-1.0.0.tgz" -C "$FIXTURE_ROOT" package
@@ -117,6 +155,24 @@ jobs:
           set +e
           set -uo pipefail
           mkdir -p "$FIXTURE_ROOT/logs" "$FIXTURE_ROOT/outcomes"
+          node "$FIXTURE_ROOT/observer.cjs" "$FIXTURE_ROOT/observer.ndjson" \
+            > "$FIXTURE_ROOT/logs/observer.log" 2>&1 &
+          observer_pid=$!
+          trap 'kill "$observer_pid" 2>/dev/null; wait "$observer_pid" 2>/dev/null' EXIT
+
+          observer_ready=false
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --silent "$GVS_PROBE_URL/ready" > /dev/null; then
+              observer_ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$observer_ready" != true ]; then
+            echo "::error::lifecycle observer did not start"
+            cat "$FIXTURE_ROOT/logs/observer.log"
+            exit 1
+          fi
 
           install_one() {
             local mode=$1
@@ -205,6 +261,12 @@ jobs:
               echo "</details>"
               echo
             done
+            echo "<details><summary>loopback observer events</summary>"
+            echo
+            echo '```json'
+            cat "$FIXTURE_ROOT/observer.ndjson" 2>/dev/null || true
+            echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Allow recording to settle
