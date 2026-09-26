@@ -7,7 +7,7 @@ on:
       - 'fixtures/garnet-gvs-bins-path/**'
 
 concurrency:
-  group: garnet-gvs-bins-path-${{ github.event.pull_request.number }}-${{ matrix.bin_path_mode }}
+  group: garnet-gvs-bins-path-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
