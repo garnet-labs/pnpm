@@ -1,0 +1,10 @@
+packages:
+  - app
+  - tools/*
+
+virtualStoreType: global
+storeDir: .garnet-store
+scriptsPrependNodePath: true
+
+allowBuilds:
+  garnet-gvs-build-probe@file:garnet-gvs-build-probe-1.0.0.tgz: true

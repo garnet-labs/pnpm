@@ -1,0 +1,10 @@
+{
+  "name": "garnet-gvs-build-probe",
+  "version": "1.0.0",
+  "scripts": {
+    "postinstall": "sh postinstall.sh"
+  },
+  "files": [
+    "postinstall.sh"
+  ]
+}
