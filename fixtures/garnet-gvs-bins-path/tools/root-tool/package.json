@@ -1,0 +1,10 @@
+{
+  "name": "garnet-root-tool",
+  "version": "1.0.0",
+  "bin": {
+    "garnet-root-tool": "garnet-root-tool"
+  },
+  "files": [
+    "garnet-root-tool"
+  ]
+}
