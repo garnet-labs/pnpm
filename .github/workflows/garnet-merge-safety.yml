@@ -1,0 +1,59 @@
+# Merge check: runs `replay decide` over the head-bound Garnet record and
+# reports merge | hold | undeterminable. Hold and undeterminable fail closed.
+# Runs from the default branch when the Garnet App writes or edits its
+# Runtime Review comment on a pull request, or on manual dispatch with a pull
+# request number. It checks out only the pinned replay tooling and never
+# checks out or executes pull request code. Mark this job required in branch
+# protection to make the decision a merge condition.
+name: Garnet merge check
+
+on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: number
+
+permissions: {}
+
+jobs:
+  merge-safety:
+    name: garnet/merge-safety
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '<!-- garnet-runtime-review -->') &&
+       contains(fromJSON('["garnet-runtime-review[bot]","garnet-ai[bot]"]'), github.event.comment.user.login))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: garnet-labs/garnet-replay
+          ref: 6f82d328d1019ea78d05643ca6a831b7fa3d5eeb
+          persist-credentials: false
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 20
+      - name: Merge decision from the head-bound record
+        shell: bash
+        run: |
+          set -uo pipefail
+          node bin/replay.mjs decide "https://github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}" | tee "${RUNNER_TEMP}/decision.txt"
+          status=${PIPESTATUS[0]}
+          cat "${RUNNER_TEMP}/decision.txt" >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${status}" -eq 0 ]; then
+            echo "::notice::pull request ${PR_NUMBER}: decision merge"
+          else
+            echo "::error::pull request ${PR_NUMBER}: decision hold or undeterminable (exit ${status}); the reasons are in the step summary"
+          fi
+          exit "${status}"
