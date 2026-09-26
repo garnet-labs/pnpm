@@ -86,6 +86,7 @@ jobs:
             "name": "gvs-slot-consumer",
             "version": "1.0.0",
             "private": true,
+            "packageManager": "pnpm@12.3.4",
             "dependencies": {
               "gvs-slot-probe": "file:../../gvs-slot-probe-1.0.0.tgz"
             }
@@ -95,7 +96,7 @@ jobs:
           enableGlobalVirtualStore: true
           storeDir: "$FIXTURE_ROOT/stores/$mode"
           allowBuilds:
-            gvs-slot-probe: true
+            "gvs-slot-probe@file:../../gvs-slot-probe-1.0.0.tgz": true
           YAML
             done
           done
@@ -113,6 +114,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           mkdir -p "$FIXTURE_ROOT/logs" "$FIXTURE_ROOT/outcomes"
 
@@ -149,6 +151,24 @@ jobs:
             wait "$pid" || result=1
           done
 
+          for mode in sequential concurrent; do
+            for index in 1 2 3 4; do
+              echo "::group::$mode install $index"
+              cat "$FIXTURE_ROOT/logs/$mode-$index.log"
+              echo "::endgroup::"
+            done
+
+            marker_files=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson | wc -l)
+            starts=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + |
+              awk '/"event":"start"/ { count++ } END { print count + 0 }')
+            ends=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + |
+              awk '/"event":"end"/ { count++ } END { print count + 0 }')
+            if [ "$marker_files" -ne 1 ] || [ "$starts" -lt 1 ] || [ "$ends" -lt 1 ]; then
+              echo "::error::$mode did not complete a lifecycle in exactly one shared slot: files=$marker_files starts=$starts ends=$ends"
+              result=1
+            fi
+          done
+
           exit "$result"
 
       - name: Report diagnostic outcomes
@@ -162,12 +182,16 @@ jobs:
             echo
             echo "Held constant: pnpm version, package tarball, lifecycle script, project count, and global virtual store configuration."
             echo
-            echo "| side | scheduling | install exit codes | lifecycle marker files |"
-            echo "|---|---|---|---|"
+            echo "| side | scheduling | install exit codes | marker files | starts | ends |"
+            echo "|---|---|---|---:|---:|---:|"
             for mode in sequential concurrent; do
               codes=$(cat "$FIXTURE_ROOT"/outcomes/"$mode"-* 2>/dev/null | paste -sd ',' - || true)
               markers=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson 2>/dev/null | wc -l)
-              echo "| $mode | $mode | ${codes:-missing} | $markers |"
+              starts=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + 2>/dev/null |
+                awk '/"event":"start"/ { count++ } END { print count + 0 }')
+              ends=$(find "$FIXTURE_ROOT/stores/$mode" -type f -name lifecycle.ndjson -exec cat {} + 2>/dev/null |
+                awk '/"event":"end"/ { count++ } END { print count + 0 }')
+              echo "| $mode | $mode | ${codes:-missing} | $markers | $starts | $ends |"
             done
             echo
             echo "Recorded install step outcome: $INSTALL_STEP_OUTCOME"
