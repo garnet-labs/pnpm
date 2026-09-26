@@ -1,0 +1,7 @@
+{
+  "name": "garnet-unapproved-build",
+  "version": "1.0.0",
+  "scripts": {
+    "install": "node record-install.cjs"
+  }
+}
