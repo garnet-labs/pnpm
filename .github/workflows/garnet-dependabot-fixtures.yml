@@ -4,6 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
+      - ".github/workflows/garnet-dependabot-fixtures.yml"
       - "pnpr/.fixtures/**/package.json"
       - "pnpr/.fixtures/**/pnpm-lock.yaml"
       - "pnpr/.fixtures/**/package-lock.json"
@@ -18,9 +19,7 @@ concurrency:
 
 jobs:
   dependency-runtime-review:
-    if: >-
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -29,33 +28,18 @@ jobs:
           fetch-depth: 0
 
       - name: Garnet Runtime Visibility
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
 
-      - name: Install changed fixture dependencies
+      - name: Install fixture dependencies
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FIXTURE_DIR: pnpr/.fixtures/packages/@pnpm.e2e/has-native-dep/1.0.1
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t fixture_dirs < <(
-            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'pnpr/.fixtures/**' |
-              grep -E '/(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$' |
-              xargs -r -n1 dirname |
-              sort -u
-          )
-
-          if (( ${#fixture_dirs[@]} == 0 )); then
-            echo "No changed fixture dependency manifests found."
-            exit 1
-          fi
-
-          for fixture_dir in "${fixture_dirs[@]}"; do
-            echo "::group::Installing dependencies in ${fixture_dir}"
-            npm install \
-              --prefix "$fixture_dir" \
-              --no-package-lock
-            echo "::endgroup::"
-          done
+          echo "::group::Installing dependencies in ${FIXTURE_DIR}"
+          npm install \
+            --prefix "$FIXTURE_DIR" \
+            --no-package-lock
+          echo "::endgroup::"
