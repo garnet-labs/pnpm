@@ -16,6 +16,26 @@ on:
         required: false
         type: boolean
         default: false
+      garnet_jibril_version:
+        required: false
+        type: string
+        default: ''
+      garnet_drop_event_printers:
+        required: false
+        type: boolean
+        default: false
+      garnet_debug_log_level:
+        required: false
+        type: boolean
+        default: false
+      garnet_goroutine_dump:
+        required: false
+        type: boolean
+        default: false
+      cell_id:
+        required: false
+        type: string
+        default: ''
       test_chunk:
         required: false
         type: string
@@ -35,7 +55,7 @@ jobs:
   test:
     name: Node ${{ inputs.node_major }} / chunk ${{ inputs.test_chunk }}/${{ inputs.test_chunk_total }}
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.platform }}-${{ inputs.node }}-${{ inputs.test_chunk }}-${{ inputs.test_chunk_total }}
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.platform }}-${{ inputs.node }}-${{ inputs.test_chunk }}-${{ inputs.test_chunk_total }}-${{ inputs.cell_id }}
       cancel-in-progress: true
 
     runs-on: ${{ inputs.platform }}
@@ -60,9 +80,93 @@ jobs:
       with:
         persist-credentials: false
     - if: ${{ inputs.garnet }}
-      uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+      uses: ./.github/actions/dump-step-summary
+    - if: ${{ inputs.garnet }}
+      uses: garnet-org/action@c747ff1f597c84579e10173301a31c30bb815181 # v2.3.0-rc.1
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
+        jibril_version: ${{ inputs.garnet_jibril_version }}
+    # The sensor writes /etc/jibril/config.yaml itself during install, in the
+    # same step that starts the unit, so a config variant can only be applied
+    # by rewriting the file and restarting. Both arms take the restart, and
+    # only the file content differs, so the restart is not a variable: the
+    # first seconds of the job are uncovered either way.
+    - name: Rewrite sensor config and restart
+      if: ${{ inputs.garnet }}
+      shell: bash
+      env:
+        DROP_EVENT_PRINTERS: ${{ inputs.garnet_drop_event_printers }}
+        DEBUG_LOG_LEVEL: ${{ inputs.garnet_debug_log_level }}
+      run: |
+        set -euo pipefail
+
+        pid_before=$(systemctl show jibril.service -p MainPID --value)
+        sudo cat /etc/jibril/config.yaml > /tmp/jibril-config.in.yaml
+
+        if [ "${DROP_EVENT_PRINTERS}" = "true" ]; then
+          python3 - /tmp/jibril-config.in.yaml /tmp/jibril-config.out.yaml <<'PY'
+        import sys
+
+        drop = ("stdout", "varlog")
+        src, dst = sys.argv[1], sys.argv[2]
+        out, skipping = [], False
+
+        for line in open(src).read().splitlines():
+            stripped = line.strip()
+            if skipping:
+                # A mapping entry ends at the next line indented no deeper
+                # than the key itself.
+                if stripped != "" and len(line) - len(line.lstrip()) <= 2:
+                    skipping = False
+                else:
+                    continue
+            if stripped.split("#")[0].strip() in ["- " + name for name in drop]:
+                continue
+            if stripped.split("#")[0].strip() in [name + ":" for name in drop]:
+                skipping = True
+                continue
+            out.append(line)
+
+        open(dst, "w").write("\n".join(out) + "\n")
+        PY
+        else
+          cp /tmp/jibril-config.in.yaml /tmp/jibril-config.out.yaml
+        fi
+
+        if [ "${DEBUG_LOG_LEVEL}" = "true" ]; then
+          sed -i -E 's/^([[:space:]]*)log-level:.*/\1log-level: debug/' /tmp/jibril-config.out.yaml
+          grep -n 'log-level' /tmp/jibril-config.out.yaml
+        fi
+
+        sudo install -o root -g root -m 644 /tmp/jibril-config.out.yaml /etc/jibril/config.yaml
+        sudo systemctl restart jibril.service
+        pid_after=$(systemctl show jibril.service -p MainPID --value)
+
+        echo "----- BEGIN jibril restart -----"
+        echo "drop_event_printers=${DROP_EVENT_PRINTERS}"
+        echo "main pid before=${pid_before} after=${pid_after}"
+        echo "is-active: $(systemctl is-active jibril.service)"
+        sudo systemctl show jibril.service -p Result -p ActiveState -p SubState -p ExecMainStartTimestamp
+        echo "config diff (installed vs as written by the sensor):"
+        diff -u /tmp/jibril-config.in.yaml /tmp/jibril-config.out.yaml || true
+        echo "config now in place:"
+        sudo cat /etc/jibril/config.yaml
+        echo "----- END jibril restart -----"
+
+        if [ "$(systemctl is-active jibril.service)" != "active" ]; then
+          echo "sensor is not active after restart" >&2
+          exit 1
+        fi
+        if [ "${pid_after}" = "${pid_before}" ]; then
+          echo "sensor main pid did not change across the restart" >&2
+          exit 1
+        fi
+    # Post steps run in reverse registration order, so an action registered
+    # after the Garnet action gets to stop the sensor before Garnet's own post
+    # step does. That is the only place a goroutine dump can be taken while the
+    # stop is in flight.
+    - if: ${{ inputs.garnet && inputs.garnet_goroutine_dump }}
+      uses: ./.github/actions/jibril-quit-dump
     - name: Install pnpm and Node
       uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
       with:

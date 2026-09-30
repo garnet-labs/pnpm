@@ -1,0 +1,6 @@
+name: Jibril goroutine dump
+description: Stops the sensor from its own post step and sends SIGQUIT partway through, so the Go runtime dumps every goroutine stack into /var/log/jibril.err.
+runs:
+  using: node20
+  main: noop.js
+  post: quit.js
