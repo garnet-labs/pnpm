@@ -24,7 +24,12 @@ reportAndExit(offenders)
 // `#` comment lines are dropped — git strips both, so a mention in either is
 // never committed and must not be flagged.
 function scannableText (raw) {
-  return stripCommentLines(stripScissorsSection(raw))
+  return maskEmailAddresses(stripCommentLines(stripScissorsSection(raw)))
+}
+
+// An address in angle brackets (`Name <user@host>`, as in git trailers) is an email, not a mention.
+function maskEmailAddresses (text) {
+  return text.replace(/<[^\s<>@]+@[^\s<>]+>/g, (address) => ' '.repeat(address.length))
 }
 
 function stripScissorsSection (raw) {
