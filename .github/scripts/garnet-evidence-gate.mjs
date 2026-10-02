@@ -16,7 +16,9 @@ import { pathToFileURL } from "node:url";
  * Required environment: GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, HEAD_SHA.
  * Optional: GARNET_RECORD_WORKFLOWS (JSON array of recorder workflow names; while
  * any of them is still running on the head the check stays in progress).
- * Optional environment: GITHUB_API_URL, GITHUB_SERVER_URL, GITHUB_RUN_ID.
+ * Optional environment: GITHUB_API_URL, GITHUB_SERVER_URL, GITHUB_RUN_ID,
+ * GARNET_GATE_MODE (check-run, the default, or comment: no checks:write, the
+ * reading goes to a workflow annotation and one per-head pull request comment).
  */
 const RUNTIME_REVIEW_MARKER = "<!-- garnet-runtime-review -->"
 const PENDING_MARKER = "garnet-control-plane-pending-pr-comment"
@@ -183,6 +185,55 @@ export function parseRecorderNames(raw) {
   return parsed
 }
 
+const TITLES = { success: "Head-bound Runtime Review record", pending: "Record still being written", failure: "No head-bound Runtime Review record" }
+
+/**
+ * @param {string|undefined} raw GARNET_GATE_MODE
+ * @returns {"check-run"|"comment"}
+ */
+export function parseGateMode(raw) {
+  if (typeof raw !== "string" || raw.trim() === "") return "check-run"
+  const mode = raw.trim()
+  if (mode !== "check-run" && mode !== "comment") throw new Error("GARNET_GATE_MODE must be check-run or comment")
+  return mode
+}
+
+/**
+ * The per-head gate comment marker. A new head gets a new comment.
+ * @param {string} head 40-hex head sha
+ * @returns {string}
+ */
+export function gateCommentMarker(head) {
+  return `<!-- garnet:evidence-gate ${head} -->`
+}
+
+/**
+ * The pull request comment body publishing one reading in comment mode.
+ * @param {{state: "success"|"pending"|"failure", summary: string}} reading
+ * @param {string} head
+ * @param {string|null} detailsUrl workflow run link, when known
+ * @returns {string}
+ */
+export function gateCommentBody(reading, head, detailsUrl) {
+  return [
+    gateCommentMarker(head),
+    `**${EVIDENCE_CHECK}: ${reading.state}** — ${TITLES[reading.state]}`,
+    reading.summary,
+    ...(detailsUrl !== null ? [`[workflow run](${detailsUrl})`] : []),
+  ].join("\n")
+}
+
+/**
+ * The gate comment already posted for this head, if any.
+ * @param {{id?: number, body?: string}[]} comments
+ * @param {string} head
+ * @returns {{id?: number, body?: string}|null}
+ */
+export function existingGateComment(comments, head) {
+  const marker = gateCommentMarker(head)
+  return (Array.isArray(comments) ? comments : []).find((comment) => typeof comment?.body === "string" && comment.body.includes(marker)) ?? null
+}
+
 /**
  * The check-run body to publish for one reading.
  * @param {{state: "success"|"pending"|"failure", summary: string}} reading
@@ -191,13 +242,12 @@ export function parseRecorderNames(raw) {
  * @returns {Record<string, unknown>}
  */
 export function checkRunPayload(reading, head, detailsUrl) {
-  const titles = { success: "Head-bound Runtime Review record", pending: "Record still being written", failure: "No head-bound Runtime Review record" }
   return {
     name: EVIDENCE_CHECK,
     head_sha: head,
     ...(detailsUrl !== null ? { details_url: detailsUrl } : {}),
     ...(reading.state === "pending" ? { status: "in_progress" } : { status: "completed", conclusion: reading.state }),
-    output: { title: titles[reading.state], summary: reading.summary },
+    output: { title: TITLES[reading.state], summary: reading.summary },
   }
 }
 
@@ -229,18 +279,36 @@ async function main() {
     console.log(`PR head moved (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not publishing a check for a stale head.`)
     return
   }
+  const mode = parseGateMode(process.env.GARNET_GATE_MODE)
   const recorders = parseRecorderNames(process.env.GARNET_RECORD_WORKFLOWS)
   const runsPage = recorders.length === 0 ? null : await github(`/repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`)
-  const reading = withRecorderCompleteness(evidenceStateFor(await listComments(), headSha), unsettledRecorders(runsPage?.workflow_runs, recorders), headSha)
+  const comments = await listComments()
+  const reading = withRecorderCompleteness(evidenceStateFor(comments, headSha), unsettledRecorders(runsPage?.workflow_runs, recorders), headSha)
   const server = process.env.GITHUB_SERVER_URL || "https://github.com"
   const detailsUrl = process.env.GITHUB_RUN_ID ? `${server}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}` : null
-  const payload = checkRunPayload(reading, headSha, detailsUrl)
-  const existing = await github(`/repos/${repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(EVIDENCE_CHECK)}&per_page=100`)
-  if (alreadyPublished(existing?.check_runs, payload)) {
-    console.log(`${EVIDENCE_CHECK} on ${headSha.slice(0, 7)} already reads ${reading.state}; nothing to do.`)
+  if (mode === "comment") {
+    if (reading.state === "success") console.log(`::notice title=${EVIDENCE_CHECK}::${reading.summary}`)
+    if (reading.state === "pending") console.log(`::warning title=${EVIDENCE_CHECK}::${reading.summary}`)
+    const body = gateCommentBody(reading, headSha, detailsUrl)
+    const posted = existingGateComment(comments, headSha)
+    if (posted !== null && posted.body === body) {
+      console.log(`${EVIDENCE_CHECK} comment on ${headSha.slice(0, 7)} already reads ${reading.state}; nothing to do.`)
+    } else if (posted !== null) {
+      await github(`/repos/${repo}/issues/comments/${posted.id}`, { method: "PATCH", body: JSON.stringify({ body }) })
+      console.log(`updated the ${EVIDENCE_CHECK} comment on head ${headSha.slice(0, 7)} for PR #${prNumber}: ${reading.state}`)
+    } else {
+      await github(`/repos/${repo}/issues/${prNumber}/comments`, { method: "POST", body: JSON.stringify({ body }) })
+      console.log(`posted the ${EVIDENCE_CHECK} comment on head ${headSha.slice(0, 7)} for PR #${prNumber}: ${reading.state}`)
+    }
   } else {
-    await github(`/repos/${repo}/check-runs`, { method: "POST", body: JSON.stringify(payload) })
-    console.log(`published ${EVIDENCE_CHECK} = ${reading.state} on head ${headSha.slice(0, 7)} for PR #${prNumber}`)
+    const payload = checkRunPayload(reading, headSha, detailsUrl)
+    const existing = await github(`/repos/${repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(EVIDENCE_CHECK)}&per_page=100`)
+    if (alreadyPublished(existing?.check_runs, payload)) {
+      console.log(`${EVIDENCE_CHECK} on ${headSha.slice(0, 7)} already reads ${reading.state}; nothing to do.`)
+    } else {
+      await github(`/repos/${repo}/check-runs`, { method: "POST", body: JSON.stringify(payload) })
+      console.log(`published ${EVIDENCE_CHECK} = ${reading.state} on head ${headSha.slice(0, 7)} for PR #${prNumber}`)
+    }
   }
   if (reading.state === "failure") {
     console.log(`::error::pull request ${prNumber}: ${reading.summary}`)

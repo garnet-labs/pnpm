@@ -48,6 +48,8 @@ jobs:
       EVENT_PR_NUMBER: ${{ github.event.issue.number }}
       GARNET_REVIEWERS: "coderabbit,greptile,qodo,devin"
       GARNET_RECORD_WORKFLOWS: '["TS CI"]'
+      # comment: no checks:write; verdict goes to an annotation and one per-head PR comment instead of the check run.
+      GARNET_GATE_MODE: check-run
       DEVIN_API_TOKEN: ${{ secrets.DEVIN_API_TOKEN }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -96,12 +98,16 @@ jobs:
           for pr_number in ${PRS}; do
             PR_NUMBER="${pr_number}" node .github/scripts/garnet-evidence-gate.mjs || echo "no head-bound record yet for #${pr_number}; reviews are not requested"
           done
+      # CodeRabbit and Qodo ignore review commands authored by bot accounts, so
+      # the request comment is posted with the user PAT in
+      # GARNET_REVIEW_TRIGGER_TOKEN when that secret is set; only this step sees it.
       - name: Request reviews once the record is bound (once per head)
         if: steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
         shell: bash
         env:
           HEAD_SHA: ${{ steps.head.outputs.sha }}
           PRS: ${{ steps.head.outputs.prs }}
+          GARNET_REVIEW_TRIGGER_TOKEN: ${{ secrets.GARNET_REVIEW_TRIGGER_TOKEN }}
         run: |
           set -euo pipefail
           for pr_number in ${PRS}; do
