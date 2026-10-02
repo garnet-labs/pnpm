@@ -40,6 +40,8 @@ jobs:
       EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       EVENT_PR_NUMBER: ${{ github.event.issue.number }}
       GARNET_RECORD_WORKFLOWS: '["TS CI"]'
+      # comment: no checks:write (needs pull-requests: write); verdict goes to an annotation and one per-head PR comment instead of the check run.
+      GARNET_GATE_MODE: check-run
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

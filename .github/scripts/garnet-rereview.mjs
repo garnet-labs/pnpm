@@ -1,5 +1,13 @@
 import { pathToFileURL } from "node:url";
 
+import {
+  evidenceStateFor,
+  parseGateMode,
+  parseRecorderNames,
+  unsettledRecorders,
+  withRecorderCompleteness,
+} from "./garnet-evidence-gate.mjs"
+
 /**
  * Requests reviews again once a finalized Garnet Runtime Review record is bound
  * to the pull request head. Reviewers run on PR open, before the recorder has
@@ -13,7 +21,9 @@ import { pathToFileURL } from "node:url";
  * the pull request.
  * Required environment: GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, HEAD_SHA,
  * GARNET_REVIEWERS (comma-separated).
- * Optional environment: GITHUB_API_URL, DEVIN_API_TOKEN, DEVIN_API_URL.
+ * Optional environment: GITHUB_API_URL, GARNET_GATE_MODE, GARNET_RECORD_WORKFLOWS,
+ * GARNET_REVIEW_TRIGGER_TOKEN (a user token; CodeRabbit and Qodo ignore review
+ * commands authored by bot accounts), DEVIN_API_TOKEN, DEVIN_API_URL.
  */
 const RUNTIME_REVIEW_MARKER = "<!-- garnet-runtime-review -->"
 const PENDING_MARKER = "garnet-control-plane-pending-pr-comment"
@@ -45,12 +55,12 @@ const repo = process.env.GITHUB_REPOSITORY
 const prNumber = process.env.PR_NUMBER
 const headSha = process.env.HEAD_SHA
 
-async function github(path, init = {}) {
+async function github(path, init = {}, token = process.env.GITHUB_TOKEN) {
   const res = await fetch(`${api}${path}`, {
     ...init,
     headers: {
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       "X-GitHub-Api-Version": "2022-11-28",
       ...(init.headers || {}),
@@ -141,6 +151,43 @@ async function awaitEvidenceCheck(head) {
 }
 
 /**
+ * The token the request comment is posted with: the configured user token when
+ * present, the workflow token otherwise. Values are never logged.
+ * @param {Record<string, string|undefined>} env
+ * @returns {{token: string|undefined, identity: "user"|"workflow"}}
+ */
+export function commentToken(env) {
+  const user = env?.GARNET_REVIEW_TRIGGER_TOKEN
+  if (typeof user === "string" && user !== "") return { token: user, identity: "user" }
+  return { token: env?.GITHUB_TOKEN, identity: "workflow" }
+}
+
+/**
+ * The `garnet/evidence` reading the gate publishes for this head, computed from
+ * the pull request comments instead of the check-runs API.
+ * @param {{user?: {login?: string}, body?: string}[]} comments
+ * @param {{name?: string, status?: string}[]} runs workflow runs for the head
+ * @param {string[]} recorders recorder workflow names
+ * @param {string} head
+ * @returns {"success"|"pending"|"failure"}
+ */
+export function fallbackEvidenceState(comments, runs, recorders, head) {
+  return withRecorderCompleteness(evidenceStateFor(comments, head), unsettledRecorders(runs, recorders), head).state
+}
+
+async function awaitEvidenceComment(head, recorders) {
+  let state = "pending"
+  for (let attempt = 0; attempt < CHECK_ATTEMPTS; attempt += 1) {
+    const comments = await listComments()
+    const runsPage = recorders.length === 0 ? null : await github(`/repos/${repo}/actions/runs?head_sha=${head}&per_page=100`)
+    state = fallbackEvidenceState(comments, runsPage?.workflow_runs, recorders, head)
+    if (state === "success" || state === "failure") return state
+    await new Promise((resolve) => setTimeout(resolve, CHECK_WAIT_MS))
+  }
+  return state
+}
+
+/**
  * @param {{user?: {login?: string}, body?: string}[]} comments
  * @param {string} head
  * @returns {boolean}
@@ -219,9 +266,14 @@ async function main() {
     console.log(`No finalized record bound to head ${headSha.slice(0, 7)}; reviews are not requested without evidence.`)
     return
   }
-  const check = await awaitEvidenceCheck(headSha)
+  const gateMode = parseGateMode(process.env.GARNET_GATE_MODE)
+  const check = gateMode === "comment"
+    ? await awaitEvidenceComment(headSha, parseRecorderNames(process.env.GARNET_RECORD_WORKFLOWS))
+    : await awaitEvidenceCheck(headSha)
   if (check !== "success") {
-    console.log(`${EVIDENCE_CHECK} is ${check} for head ${headSha.slice(0, 7)}; reviews are requested only after it passes.`)
+    console.log(gateMode === "comment"
+      ? `${EVIDENCE_CHECK} (comment mode) is ${check} for head ${headSha.slice(0, 7)}; reviews are requested only after it passes.`
+      : `${EVIDENCE_CHECK} is ${check} for head ${headSha.slice(0, 7)}; reviews are requested only after it passes.`)
     return
   }
   const current = await github(`/repos/${repo}/pulls/${prNumber}`)
@@ -237,8 +289,12 @@ async function main() {
   if (reviewers.includes("copilot") && await requestCopilot(pr.html_url)) requested.push("copilot")
   if (reviewers.includes("devin") && await requestDevin(pr.html_url)) requested.push("devin")
   const body = renderRequestComment(reviewers, headSha, requested)
-  await github(`/repos/${repo}/issues/${prNumber}/comments`, { method: "POST", body: JSON.stringify({ body }) })
   const mentioned = reviewers.filter((name) => name in MENTIONS)
+  const commentAuth = commentToken(process.env)
+  if (commentAuth.identity === "workflow" && mentioned.length > 0) {
+    console.log("GARNET_REVIEW_TRIGGER_TOKEN is not set; the request comment is posted by the workflow token, and CodeRabbit and Qodo ignore commands from bot accounts.")
+  }
+  await github(`/repos/${repo}/issues/${prNumber}/comments`, { method: "POST", body: JSON.stringify({ body }) }, commentAuth.token)
   console.log(`posted one re-review request for head ${headSha.slice(0, 7)}: mentioned ${mentioned.join(", ") || "none"}; API requested ${requested.join(", ") || "none"}`)
 }
 
