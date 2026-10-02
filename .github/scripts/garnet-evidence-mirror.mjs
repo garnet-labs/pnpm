@@ -1,20 +1,15 @@
-import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 /**
  * Mirrors trusted Garnet Runtime Review bytes into a PR description.
  *
- * Contract: verbatim bytes, exact garnet:commit head binding, line-anchored
- * delimiters, a head-bound pointer at the GitHub body cap or on delimiter
- * collision, and trusted authors only.
+ * Contract: the comment's bytes as they were at mirror time, exact
+ * garnet:commit head binding, line-anchored delimiters, a head-bound pointer at
+ * the GitHub body cap or on delimiter collision, and trusted authors only. The
+ * App appends jobs to one comment as they finish, so the block names the
+ * recorded time and job count it copied and is re-run on every edit.
  * Required environment: GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, HEAD_SHA.
- * Optional environment: GITHUB_API_URL, EVIDENCE_WAIT_SECONDS, GITHUB_OUTPUT.
- *
- * The Runtime Review comment is posted asynchronously after the instrumented
- * job uploads its profile, so the head-bound record is polled for up to
- * EVIDENCE_WAIT_SECONDS (default 360) before the section falls back to the
- * missing-evidence text. Writes `mirrored=true|false` to GITHUB_OUTPUT so the
- * workflow can request reviewer re-runs only when a head-bound record landed.
+ * Optional environment: GITHUB_API_URL.
  */
 const RUNTIME_REVIEW_MARKER = "<!-- garnet-runtime-review -->"
 const BEGIN = "<!-- garnet:evidence:begin -->"
@@ -22,16 +17,13 @@ const END = "<!-- garnet:evidence:end -->"
 const BEGIN_LINE_RE = /^<!-- garnet:evidence:begin -->[ \t]*\r?$/m
 const END_LINE_RE = /^<!-- garnet:evidence:end -->[ \t]*\r?$/m
 const COMMIT_RE = /<!--\s*garnet:commit\s+([0-9a-f]{40})\s*-->/
+const SUMMARY_RE = /<!-- garnet:summary (\{.*?\}) -->/
 const BODY_LIMIT = 65536
-// Only the Garnet GitHub App identities. github-actions[bot] is deliberately
-// not trusted: any workflow with comment-write permissions posts under it, so
-// trusting it would let arbitrary CI automation forge the evidence markers.
 const TRUSTED_AUTHORS = new Set([
   "garnet-runtime-review[bot]",
   "garnet-runtime-review-dev[bot]",
+  "garnet-ai[bot]",
 ])
-// Pending placeholders ("still being recorded") are excluded: mirroring one
-// would re-trigger reviewers against a record with no profile in it.
 const GARNET_OWNED_MARKER_RE =
   /<!--\s*garnet-(?:control-plane|action)-pr-comment:v1(?::[a-z0-9.-]+)?\s*-->/
 
@@ -91,15 +83,45 @@ function section(inner) {
   return [BEGIN, "## Runtime evidence (Garnet)", "", inner, END].join("\n")
 }
 
-function preambleFor(head) {
+/**
+ * What the comment's machine register says was copied: recorded time and job
+ * count, when the register parses.
+ * @param {string} body
+ * @returns {{recorded: string|null, jobs: number|null}}
+ */
+export function recordStamp(body) {
+  const match = SUMMARY_RE.exec(String(body ?? ""))
+  if (match === null) return { recorded: null, jobs: null }
+  try {
+    const parsed = JSON.parse(match[1])
+    return {
+      recorded: typeof parsed?.recorded === "string" ? parsed.recorded : null,
+      jobs: typeof parsed?.jobs === "number" ? parsed.jobs : null,
+    }
+  } catch {
+    return { recorded: null, jobs: null }
+  }
+}
+
+function stampText(stamp) {
+  const parts = []
+  if (stamp.jobs !== null) parts.push(`${stamp.jobs} job${stamp.jobs === 1 ? "" : "s"}`)
+  if (stamp.recorded !== null) parts.push(`recorded ${stamp.recorded}`)
+  return parts.length === 0 ? "" : ` (${parts.join(", ")})`
+}
+
+function preambleFor(head, stamp = { recorded: null, jobs: null }) {
   const sha7 = head.slice(0, 7)
   const preamble = [
-    `Kernel-recorded execution record for head \`${head}\`, mirrored verbatim from`,
-    "the sticky Garnet Runtime Review comment on this PR so reviewers that read only",
-    "the description ground in the same bytes. Facts only. Judgment stays with the",
-    "reviewer. Cite grounded findings as:",
+    [
+      `Kernel-recorded execution record for head \`${sha7}\`${stampText(stamp)}, copied from`,
+      "the sticky Garnet Runtime Review comment on this PR so reviewers that read only",
+      "the description ground in the same bytes. The comment is the source: it gains",
+      "jobs as they finish and this block follows it. Facts only. Judgment stays with",
+      "the reviewer. Cite grounded findings as:",
+    ].join(" "),
     "",
-    `> Runtime evidence (Garnet, head \`${sha7}\`): \`<execution chain>\` → \`<destination>\` (\`<workflow>/<job>\`) — <Execution Profile URL>`,
+    `> Runtime evidence (Garnet, head \`${sha7}\`): \`<execution chain>\` → \`<destination>\` (\`<workflow>/<job>\`) — \`<Execution Profile URL>\``,
     "",
   ].join("\n")
   return preamble
@@ -109,7 +131,7 @@ function pointerSection(comment, head, preamble, reason) {
   const sha7 = head.slice(0, 7)
   return section(
     `<!-- garnet:commit ${head} -->\n${preamble}\nThe record for head \`${sha7}\` is not mirrored here because ${reason}` +
-      ` Read it verbatim in [the sticky Garnet Runtime Review comment](${comment.html_url}).`,
+      ` Read it in [the sticky Garnet Runtime Review comment](${comment.html_url}).`,
   )
 }
 
@@ -120,9 +142,10 @@ function pointerSection(comment, head, preamble, reason) {
  * @returns {string}
  */
 export function renderEvidenceSection(comment, head, remainingBudget) {
-  const preamble = preambleFor(head)
+  const stamp = recordStamp(comment.body)
+  const preamble = preambleFor(head, stamp)
   const mirrored = [
-    "<details><summary>Execution record (verbatim mirror)</summary>",
+    `<details><summary>Execution record, copied from the comment${stampText(stamp)}</summary>`,
     "",
     comment.body,
     "",
@@ -182,33 +205,12 @@ async function main() {
   if (!process.env.GITHUB_TOKEN || !repo || !prNumber || !headSha) {
     throw new Error("GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER and HEAD_SHA are required")
   }
-  const emitMirrored = (value) => {
-    if (process.env.GITHUB_OUTPUT) {
-      appendFileSync(process.env.GITHUB_OUTPUT, `mirrored=${value}\n`)
-    }
-  }
-  let pr = await github(`/repos/${repo}/pulls/${prNumber}`)
+  const pr = await github(`/repos/${repo}/pulls/${prNumber}`)
   if (pr.head?.sha !== headSha) {
     console.log(`PR head moved (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
-    emitMirrored(false)
     return
   }
-  const waitBudgetMs = Number(process.env.EVIDENCE_WAIT_SECONDS ?? "360") * 1000
-  const deadline = Date.now() + waitBudgetMs
-  let comment = selectEvidenceComment(await listComments())
-  while (!comment && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 15000))
-    comment = selectEvidenceComment(await listComments())
-  }
-  // The poll can block for minutes; re-read the PR so a head that moved
-  // during the wait aborts instead of writing old-head evidence over a
-  // newer body, and so the patch bases on the freshest description.
-  pr = await github(`/repos/${repo}/pulls/${prNumber}`)
-  if (pr.head?.sha !== headSha) {
-    console.log(`PR head moved during the evidence wait (${pr.head?.sha?.slice(0, 7)} != ${headSha.slice(0, 7)}); not mirroring a stale record.`)
-    emitMirrored(false)
-    return
-  }
+  const comment = selectEvidenceComment(await listComments())
   const currentBody = pr.body ?? ""
   const bodyWithoutSection = removeSection(currentBody)
   const block = comment
@@ -217,10 +219,8 @@ async function main() {
   const nextBody = upsert(currentBody, block)
   if (nextBody === currentBody) {
     console.log("Evidence section already current; nothing to do.")
-    emitMirrored(false)
     return
   }
-  emitMirrored(Boolean(comment).toString())
   await github(`/repos/${repo}/pulls/${prNumber}`, {
     method: "PATCH",
     body: JSON.stringify({ body: nextBody }),
@@ -233,4 +233,3 @@ async function main() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()
-

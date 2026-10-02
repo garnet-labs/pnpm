@@ -1,0 +1,11 @@
+{
+  "triggerOnUpdates": true,
+  "instructions": "Apply REVIEW.md. The pull request description carries a Runtime evidence (Garnet) section between <!-- garnet:evidence:begin --> and <!-- garnet:evidence:end -->, bound to a head by <!-- garnet:commit <sha> -->. Use it only when that SHA equals the pull request head. Prefix each runtime-grounded statement exactly with 'Runtime evidence (Garnet, head <sha7>): ' and name the execution chain, destination and workflow/job. When the section is absent or its SHA differs from the head, write 'Runtime evidence (Garnet, head <sha7>): undeterminable - no record bound to this head'. Never repeat verdicts or safety judgments from the record; judge the diff yourself.",
+  "rules": [
+    {
+      "id": "garnet-runtime-evidence",
+      "rule": "Runtime-grounded statements are prefixed exactly with 'Runtime evidence (Garnet, head <sha7>): ' and use only the head-bound Garnet section; missing or stale evidence is undeterminable, never clean.",
+      "severity": "high"
+    }
+  ]
+}
