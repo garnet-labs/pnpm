@@ -1,0 +1,109 @@
+# Mirrors the head-bound Garnet Runtime Review comment into the pull request
+# description so reviewers and agents that read only the description see the
+# same bytes, publishes the `garnet/evidence` check on the head from the same
+# reading, then requests the configured reviewers once per head so they review
+# with the record present. Runs from the default branch with the
+# repository token after a recording workflow completes and again each time the
+# Garnet App posts or edits its comment (the App adds jobs to one comment as
+# they finish, so the description follows the record). It never checks out or
+# executes pull request code.
+name: Garnet evidence mirror
+
+on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
+  workflow_run:
+    workflows: ["TS CI"]
+    types: [completed]
+  issue_comment:
+    types: [created, edited]
+
+permissions: {}
+
+# One run at a time: several recorders and several comment edits fire for one
+# head, and the per-head lock is a comment, not an atomic write. Nothing is
+# cancelled once it started.
+concurrency:
+  group: garnet-evidence-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror head-bound record into the description
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null
+          && contains(fromJSON('["garnet-runtime-review[bot]","garnet-runtime-review-dev[bot]","garnet-ai[bot]"]'), github.event.comment.user.login)
+          && contains(github.event.comment.body, '<!-- garnet-runtime-review -->'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      EVENT_PR_NUMBER: ${{ github.event.issue.number }}
+      GARNET_REVIEWERS: "coderabbit,greptile,qodo,devin"
+      GARNET_RECORD_WORKFLOWS: '["TS CI"]'
+      DEVIN_API_TOKEN: ${{ secrets.DEVIN_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
+      - name: Wait for the Runtime Review comment to settle
+        if: github.event_name == 'workflow_run'
+        run: sleep 45
+      - name: Resolve the open pull requests at this head
+        id: head
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${EVENT_PR_NUMBER}" ]; then
+            head=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${EVENT_PR_NUMBER}" --jq 'select(.state == "open") | .head.sha')
+            prs="${EVENT_PR_NUMBER}"
+          else
+            head="${EVENT_HEAD_SHA}"
+            prs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head}/pulls" --jq ".[] | select(.state == \"open\" and .head.sha == \"${head}\") | .number" | tr '\n' ' ')
+          fi
+          echo "sha=${head}" >> "${GITHUB_OUTPUT}"
+          echo "prs=${prs}" >> "${GITHUB_OUTPUT}"
+      - name: Mirror into every open pull request at this head
+        if: steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          PRS: ${{ steps.head.outputs.prs }}
+        run: |
+          set -euo pipefail
+          for pr_number in ${PRS}; do
+            PR_NUMBER="${pr_number}" node .github/scripts/garnet-evidence-mirror.mjs
+          done
+      - name: Publish garnet/evidence on the head before asking for reviews
+        if: steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          PRS: ${{ steps.head.outputs.prs }}
+        run: |
+          set -uo pipefail
+          for pr_number in ${PRS}; do
+            PR_NUMBER="${pr_number}" node .github/scripts/garnet-evidence-gate.mjs || echo "no head-bound record yet for #${pr_number}; reviews are not requested"
+          done
+      - name: Request reviews once the record is bound (once per head)
+        if: steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          PRS: ${{ steps.head.outputs.prs }}
+        run: |
+          set -euo pipefail
+          for pr_number in ${PRS}; do
+            PR_NUMBER="${pr_number}" node .github/scripts/garnet-rereview.mjs
+          done
