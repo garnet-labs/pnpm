@@ -360,7 +360,7 @@ test('skipping optional dependency if it cannot be fetched', async () => {
 })
 
 // https://github.com/pnpm/pnpm/issues/16514
-test('an optional dependency that fails the integrity check is skipped and reported', async () => {
+test('an optional dependency that fails the integrity check is skipped, unlinked, and reported', async () => {
   const prefix = tempDir()
   fs.writeFileSync(path.join(prefix, 'package.json'), JSON.stringify({
     name: 'project',
@@ -385,14 +385,16 @@ importers:
 packages:
 
   is-negative@2.1.0:
-    resolution: {integrity: sha512-+iCKT4ZcvjRnjkHnQjZ8/qfciLLGD8BFKS0GNR5VjDU6jEiwh899R0GSMkaYcuTNd7fEKXb3Qib0webe6HczNw==}
+    resolution: {integrity: ${getIntegrity('is-negative', '2.1.0')}}
 
   is-positive@1.0.0:
     resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
 
 snapshots:
 
-  is-negative@2.1.0: {}
+  is-negative@2.1.0:
+    optionalDependencies:
+      is-positive: 1.0.0
 
   is-positive@1.0.0:
     optional: true
@@ -412,6 +414,7 @@ snapshots:
   project.has('is-negative')
   expect(fs.existsSync(path.join(prefix, 'node_modules/is-positive'))).toBe(false)
   expect(fs.lstatSync(path.join(prefix, 'node_modules/is-positive'), { throwIfNoEntry: false })).toBeUndefined()
+  expect(fs.lstatSync(path.join(prefix, 'node_modules/.pnpm/is-negative@2.1.0/node_modules/is-positive'), { throwIfNoEntry: false })).toBeUndefined()
 
   expect(reporter).toHaveBeenCalledWith(expect.objectContaining({
     name: 'pnpm:skipped-optional-dependency',

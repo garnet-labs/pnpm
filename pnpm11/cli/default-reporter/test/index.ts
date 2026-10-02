@@ -1117,7 +1117,9 @@ test('prints a warning about an optional dependency that could not be fetched', 
   const output$ = toOutput$({
     context: {
       argv: ['install'],
-      config: { dir: prefix } as ReporterPnpmConfig,
+      // The install runs from a workspace project, while the skip is
+      // reported with the lockfile directory as its prefix.
+      config: { dir: path.join(prefix, 'packages/foo') } as ReporterPnpmConfig,
     },
     streamParser: createStreamParser(),
   })
@@ -1186,6 +1188,36 @@ test('logLevel=warn', async () => {
   const output = await firstValueFrom(output$.pipe(skip(1), take(1)))
   expect(output).toBe(`${formatWarn('Some issue')}
 ${formatError('ERR_PNPM_SOME_CODE', 'some error')}`)
+})
+
+// https://github.com/pnpm/pnpm/issues/16514
+test('prints the warning about an optional dependency that could not be fetched with logLevel=warn', async () => {
+  const prefix = process.cwd()
+  const output$ = toOutput$({
+    context: {
+      argv: ['install'],
+      config: { dir: prefix } as ReporterPnpmConfig,
+    },
+    reportingOptions: {
+      logLevel: 'warn',
+    },
+    streamParser: createStreamParser(),
+  })
+
+  skippedOptionalDependencyLogger.debug({
+    package: {
+      id: 'foo@1.0.0',
+      name: 'foo',
+      version: '1.0.0',
+    },
+    prefix,
+    reason: 'fetch_failure',
+  })
+
+  expect.assertions(1)
+
+  const output = await firstValueFrom(output$)
+  expect(output).toBe(formatWarn('foo@1.0.0 is an optional dependency that could not be fetched. Excluding it from installation.'))
 })
 
 test('logLevel=error', async () => {
