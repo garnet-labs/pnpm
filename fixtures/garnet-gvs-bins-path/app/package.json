@@ -1,0 +1,8 @@
+{
+  "name": "garnet-gvs-bins-app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "garnet-gvs-build-probe": "file:../garnet-gvs-build-probe-1.0.0.tgz"
+  }
+}
