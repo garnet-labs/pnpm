@@ -1,0 +1,8 @@
+# Own workspace root: this fixture installs from the public registry, so it
+# must not inherit the settings the registry-mock fixtures share.
+packages: []
+
+# The point of the fixture: the dependency's build script has to run for the
+# native binding to be installed.
+allowBuilds:
+  bcrypt: true
