@@ -145,3 +145,5 @@ function fail (message) {
   console.error(message)
   process.exit(1)
 }
+
+// Recorded by the fork-only Garnet Bootstrap Routing workflow.
