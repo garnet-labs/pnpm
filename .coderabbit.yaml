@@ -1,5 +1,9 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 reviews:
+  # Fork isolation: review PRs into the experiment base branch, not only main.
+  auto_review:
+    base_branches:
+      - "^garnet/bootstrap-routing-base$"
   # Skip generated, vendored, and snapshot files so reviews focus on hand-written code.
   path_filters:
     - "!pnpm-lock.yaml"
