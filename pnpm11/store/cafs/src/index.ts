@@ -8,10 +8,11 @@ import type {
   PackageFiles,
   SideEffects,
   SideEffectsDiff,
+  SideEffectsFilesMap,
 } from '@pnpm/store.cafs-types'
 
 import { addFilesFromDir } from './addFilesFromDir.js'
-import { addFilesFromTarball } from './addFilesFromTarball.js'
+import { addFilesFromTarball, addFilesFromTarballBounded, addFilesFromTarballFile } from './addFilesFromTarball.js'
 import {
   buildFileMapsFromIndex,
   checkPkgFilesIntegrity,
@@ -30,26 +31,34 @@ import {
   modeIsExecutable,
 } from './getFilePathInCafs.js'
 import { normalizeBundledManifest } from './normalizeBundledManifest.js'
+import { parseJsonBufferSync } from './parseJson.js'
+import { createSideEffectsFilesMapBuilder, isSymlinkMode, normalizeSymlinkTarget, type SideEffectsFilesMapBuilder, SYMLINK_MODE } from './symlinks.js'
 import { writeBufferToCafs } from './writeBufferToCafs.js'
 
 export const HASH_ALGORITHM = 'sha512'
 
 export { type BundledManifest } from '@pnpm/types'
-export { normalizeBundledManifest }
+export { normalizeBundledManifest, parseJsonBufferSync }
 
 export {
   buildFileMapsFromIndex,
   checkPkgFilesIntegrity,
   contentPathFromHex,
+  createSideEffectsFilesMapBuilder,
   type FilesIndex,
   type FileType,
   getFilePathByModeInCafs,
   type Integrity,
+  isSymlinkMode,
+  normalizeSymlinkTarget,
   type PackageFileInfo,
   type PackageFiles,
   type PackageFilesIndex,
   type SideEffects,
   type SideEffectsDiff,
+  type SideEffectsFilesMap,
+  type SideEffectsFilesMapBuilder,
+  SYMLINK_MODE,
   takeVerifiedFileIntegrity,
   type VerifiedFileIntegrity,
   verifyFileIntegrity,
@@ -65,8 +74,10 @@ export interface CreateCafsOpts {
 }
 
 export interface CafsFunctions {
-  addFilesFromDir: (dirname: string, opts?: { files?: string[], readManifest?: boolean, includeNodeModules?: boolean }) => AddToStoreResult
+  addFilesFromDir: (dirname: string, opts?: { files?: string[], readManifest?: boolean, includeNodeModules?: boolean, recordSymlinks?: boolean }) => AddToStoreResult
   addFilesFromTarball: (tarballBuffer: Buffer, readManifest?: boolean, ignore?: (filename: string) => boolean) => AddToStoreResult
+  addFilesFromTarballBounded: (tarballBuffer: Buffer, readManifest?: boolean, ignore?: (filename: string) => boolean) => Promise<AddToStoreResult>
+  addFilesFromTarballFile: (tarballFile: string, readManifest?: boolean, ignore?: (filename: string) => boolean) => Promise<AddToStoreResult>
   addFile: (buffer: Buffer, mode: number) => FileWriteResult
   getFilePathByModeInCafs: (digest: string, mode: number) => string
 }
@@ -78,18 +89,22 @@ export function createCafs (storeDir: string, { ignoreFile, cafsLocker }: Create
     addFilesFromDir: addFilesFromDir.bind(null, addBuffer),
     addFilesFromTarball: (tarballBuffer, readManifest, callIgnore) =>
       addFilesFromTarball(addBuffer, tarballBuffer, readManifest, combineIgnore(ignoreFile, callIgnore)),
+    addFilesFromTarballBounded: async (tarballBuffer, readManifest, callIgnore) =>
+      addFilesFromTarballBounded(addBuffer, tarballBuffer, { readManifest, ignore: combineIgnore(ignoreFile, callIgnore), storeDir }),
+    addFilesFromTarballFile: async (tarballFile, readManifest, callIgnore) =>
+      addFilesFromTarballFile(addBuffer, tarballFile, { readManifest, ignore: combineIgnore(ignoreFile, callIgnore), storeDir }),
     addFile: addBuffer,
     getFilePathByModeInCafs: getFilePathByModeInCafs.bind(null, storeDir),
   }
 }
 
 function combineIgnore (
-  a?: (filename: string) => boolean,
-  b?: (filename: string) => boolean
+  storeIgnore?: (filename: string) => boolean,
+  callIgnore?: (filename: string) => boolean
 ): ((filename: string) => boolean) | undefined {
-  if (!a) return b
-  if (!b) return a
-  return (filename) => a(filename) || b(filename)
+  if (!storeIgnore) return callIgnore
+  if (!callIgnore) return storeIgnore
+  return (filename) => storeIgnore(filename) || callIgnore(filename)
 }
 
 type WriteBufferToCafs = (buffer: Buffer, fileDest: string, mode: number | undefined, integrity: Integrity) => { checkedAt: number, filePath: string }

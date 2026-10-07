@@ -14,6 +14,12 @@ pub(crate) enum AuditError {
     #[diagnostic(code(ERR_PNPM_AUDIT_NO_LOCKFILE))]
     NoLockfile,
 
+    #[display(
+        r#"pnpm-lock.yaml has no entry for these selected workspace projects: {importer_ids}. Run "pnpm install" to update it."#
+    )]
+    #[diagnostic(code(ERR_PNPM_AUDIT_MISSING_IMPORTERS))]
+    MissingImporters { importer_ids: String },
+
     #[display("No installed packages found to audit")]
     #[diagnostic(code(ERR_PNPM_AUDIT_NO_PACKAGES))]
     NoPackages,
@@ -124,6 +130,13 @@ impl AuditVulnerabilityCounts {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields mirror the npm audit advisory JSON format."
+    )
+)]
 pub(crate) struct AuditAdvisory {
     pub(crate) findings: Vec<AuditFinding>,
     pub(crate) id: u64,

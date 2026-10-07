@@ -13,6 +13,10 @@ const LATEST_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Create a `package.json` file.
 #[derive(Debug, Args)]
 pub struct InitArgs {
+    /// Create a package.json file with the bare minimum of required fields.
+    #[clap(long = "bare")]
+    pub bare: bool,
+
     /// Set the module system for the package. Defaults to "module".
     #[clap(long = "init-type", value_name = "commonjs|module")]
     pub init_type: Option<InitTypeArg>,
@@ -54,7 +58,9 @@ impl InitArgs {
     /// pinned.
     pub(crate) fn pins_pnpm(&self, config: &Config, init_dir: &Path) -> bool {
         self.effective_init_package_manager(config)
-            && config.workspace_dir.as_deref().is_none_or(|root| root == init_dir)
+            && config.workspace_dir
+                .as_deref()
+                .is_none_or(|root| root == init_dir)
     }
 }
 

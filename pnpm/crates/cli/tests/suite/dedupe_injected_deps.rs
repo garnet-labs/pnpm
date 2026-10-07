@@ -22,8 +22,13 @@ use std::{fs, process::Command};
 /// transitive deps are empty (vacuous subset).
 #[test]
 fn injected_leaf_workspace_dep_is_deduped_to_link() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     fs::write(
@@ -61,7 +66,10 @@ fn injected_leaf_workspace_dep_is_deduped_to_link() {
     )
     .expect("write packages/b/package.json");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let dep = workspace.join("packages/a/node_modules/b");
     assert!(
@@ -95,8 +103,13 @@ fn injected_leaf_workspace_dep_is_deduped_to_link() {
 /// mode), so the same resolve path backs both `install` and `remove`.
 #[test]
 fn injected_workspace_dep_with_children_stays_link_after_remove() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     fs::write(
@@ -144,7 +157,10 @@ fn injected_workspace_dep_with_children_stays_link_after_remove() {
     )
     .expect("write packages/b/package.json");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let lockfile_path = workspace.join("pnpm-lock.yaml");
     let lockfile = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
@@ -197,8 +213,13 @@ fn injected_workspace_dep_with_children_stays_link_after_remove() {
 /// subset of `b`'s own direct deps.
 #[test]
 fn injected_peer_suffixed_workspace_dep_stays_file_after_remove() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     fs::write(
@@ -248,7 +269,10 @@ fn injected_peer_suffixed_workspace_dep_stays_file_after_remove() {
     )
     .expect("write packages/b/package.json");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let lockfile_path = workspace.join("pnpm-lock.yaml");
     let lockfile = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
@@ -290,8 +314,13 @@ fn injected_peer_suffixed_workspace_dep_stays_file_after_remove() {
 /// entry is stale. Regression test for pnpm/pnpm#13754.
 #[test]
 fn newly_injected_workspace_dep_with_dedupe_off_replaces_recorded_link() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     fs::write(
@@ -329,7 +358,10 @@ fn newly_injected_workspace_dep_with_dedupe_off_replaces_recorded_link() {
     )
     .expect("write packages/b/package.json");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let lockfile_path = workspace.join("pnpm-lock.yaml");
     let lockfile = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
@@ -350,7 +382,10 @@ fn newly_injected_workspace_dep_with_dedupe_off_replaces_recorded_link() {
     )
     .expect("rewrite packages/a/package.json");
 
-    pacquet_in(&workspace).with_arg("install").assert().success();
+    pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
 
     let lockfile = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
     assert!(
@@ -390,8 +425,13 @@ fn newly_injected_workspace_dep_with_dedupe_off_replaces_recorded_link() {
 /// [`ImporterDepVersion::File`]: pnpm_lockfile::ImporterDepVersion::File
 #[test]
 fn injected_workspace_dep_with_dedupe_off_writes_file_arm() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     fs::write(
@@ -429,7 +469,10 @@ fn injected_workspace_dep_with_dedupe_off_writes_file_arm() {
     )
     .expect("write packages/b/package.json");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let lockfile_path = workspace.join("pnpm-lock.yaml");
     let lockfile = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
@@ -467,8 +510,13 @@ fn injected_workspace_dep_with_dedupe_off_writes_file_arm() {
 /// pnpm/pnpm#12038.
 #[test]
 fn injected_workspace_dep_with_dedupe_off_materialises_under_gvs() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     fs::write(
@@ -502,7 +550,10 @@ fn injected_workspace_dep_with_dedupe_off_materialises_under_gvs() {
     )
     .expect("write packages/b/package.json");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let dep = workspace.join("packages/a/node_modules/b");
     assert!(
@@ -515,7 +566,7 @@ fn injected_workspace_dep_with_dedupe_off_materialises_under_gvs() {
     );
 
     // The slot path must not embed the raw `file:` version — that is
-    // the `ERROR_INVALID_NAME` shape on Windows the fix removes.
+    // the `ERROR_INVALID_NAME` shape on Windows.
     #[cfg(unix)]
     {
         let target = fs::read_link(&dep).expect("read packages/a/node_modules/b symlink");
@@ -524,6 +575,92 @@ fn injected_workspace_dep_with_dedupe_off_materialises_under_gvs() {
             "GVS slot path must not contain a `file:` segment with a colon; got {target:?}",
         );
     }
+
+    drop((root, mock_instance));
+}
+
+/// `app` injects `mid`, whose peer `leaf` depends on
+/// `@pnpm.e2e/has-optional-peer`. `app` also provides that package's
+/// optional peer `@pnpm.e2e/peer-c`, so the injected `mid` resolves
+/// `leaf` with the peer while `mid`'s own `leaf` does not. Peer-dependent
+/// dedupe merges those two `leaf` variants, and `mid` must then dedupe to
+/// `link:../mid`, as pnpm 11 records it. See pnpm/pnpm#16354.
+#[test]
+fn injected_workspace_dep_is_deduped_after_its_peer_variants_merge() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "name": "ws-root", "version": "0.0.0", "private": true }).to_string(),
+    )
+    .expect("write root package.json");
+
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut workspace_yaml =
+        fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
+    if !workspace_yaml.ends_with('\n') {
+        workspace_yaml.push('\n');
+    }
+    workspace_yaml.push_str("packages:\n  - 'packages/*'\ninjectWorkspacePackages: true\n");
+    fs::write(&workspace_yaml_path, workspace_yaml).expect("write pnpm-workspace.yaml");
+
+    let projects = [
+        (
+            "app",
+            serde_json::json!({
+                "name": "app",
+                "version": "1.0.0",
+                "dependencies": {
+                    "mid": "workspace:*",
+                    "leaf": "workspace:*",
+                    "@pnpm.e2e/peer-c": "1.0.0",
+                },
+            }),
+        ),
+        (
+            "mid",
+            serde_json::json!({
+                "name": "mid",
+                "version": "1.0.0",
+                "devDependencies": { "leaf": "workspace:^" },
+                "peerDependencies": { "leaf": "^1" },
+            }),
+        ),
+        (
+            "leaf",
+            serde_json::json!({
+                "name": "leaf",
+                "version": "1.0.0",
+                "dependencies": { "@pnpm.e2e/has-optional-peer": "1.0.0" },
+            }),
+        ),
+    ];
+    for (dir, manifest) in projects {
+        let project_dir = workspace.join("packages").join(dir);
+        fs::create_dir_all(&project_dir).expect("create the project dir");
+        fs::write(project_dir.join("package.json"), manifest.to_string())
+            .expect("write the project manifest");
+    }
+
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile =
+        fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read pnpm-lock.yaml");
+    assert!(lockfile.contains("link:../mid"), "app should record mid as link:../mid:\n{lockfile}");
+    assert!(
+        !lockfile.contains("file:packages/"),
+        "no injected workspace snapshot should remain:\n{lockfile}",
+    );
 
     drop((root, mock_instance));
 }

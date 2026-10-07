@@ -1,6 +1,67 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::Path,
+    sync::{Arc, Barrier},
+    thread,
+};
 
-use super::{ConfigOverlay, cache_key, overlay_default_registry, pin_unkeyed_header};
+use super::{
+    ConfigOverlay, build_config, cache_key, config_cache, intern_config, overlay_default_registry,
+    pin_unkeyed_header,
+};
+
+#[test]
+fn a_global_store_overlay_keeps_project_state_local() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("pnpm-workspace.yaml"), "virtualStoreDir: custom-store\n")
+        .unwrap();
+    let shared_store = root.path().join("shared-store");
+    let overlay = ConfigOverlay {
+        enable_global_virtual_store: Some(true),
+        global_virtual_store_dir: Some(shared_store.clone()),
+        ..ConfigOverlay::default()
+    };
+
+    let config = build_config(root.path(), &overlay).unwrap();
+
+    assert_eq!(config.install_state_dir, root.path().join("node_modules/.pnpm"));
+    assert_eq!(config.virtual_store_dir(), shared_store);
+}
+
+#[test]
+fn concurrent_publication_retains_one_interned_config() {
+    const CALLER_COUNT: usize = 32;
+    let temp_dir = tempfile::tempdir().expect("create temporary config directory");
+    let overlay = ConfigOverlay::default();
+    let key = cache_key(temp_dir.path(), &overlay);
+    assert!(!config_cache().contains_key(&key));
+
+    let configs = (0..CALLER_COUNT)
+        .map(|_| build_config(temp_dir.path(), &overlay).expect("build config"))
+        .collect::<Vec<_>>();
+    let publish = Arc::new(Barrier::new(CALLER_COUNT));
+
+    let mut handles = Vec::with_capacity(CALLER_COUNT);
+    for config in configs {
+        let publish = Arc::clone(&publish);
+        handles.push(thread::spawn(move || {
+            publish.wait();
+            std::ptr::from_ref(intern_config(key, config)).addr()
+        }));
+    }
+
+    let config_addresses = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("config thread should not panic"))
+        .collect::<HashSet<_>>();
+
+    assert_eq!(config_addresses.len(), 1);
+    let cached_address = config_cache()
+        .get(&key)
+        .map(|config| std::ptr::from_ref(*config).addr())
+        .expect("config should be retained in cache");
+    assert_eq!(config_addresses.iter().next().copied(), Some(cached_address));
+}
 
 /// Two independently constructed overlays with identical map contents must
 /// produce the same cache key. If the map fields were `HashMap` (random

@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import util from 'node:util'
+
+import { isError } from '@pnpm/error'
 
 export type EditDir = string & { __brand: 'patch-edit-dir' }
 
@@ -51,12 +52,12 @@ function modifyStateFile (modulesDir: string, modifyState: (state: State) => voi
   fs.writeFileSync(filePath, JSON.stringify(state, undefined, 2))
 }
 
-function readStateFile (modulesDir: string): State | undefined {
+export function readStateFile (modulesDir: string): State | undefined {
   let fileContent: string
   try {
     fileContent = fs.readFileSync(getStateFilePath(modulesDir), 'utf-8')
   } catch (err) {
-    if (util.types.isNativeError(err) && 'code' in err && err.code === 'ENOENT') {
+    if (isError(err) && 'code' in err && err.code === 'ENOENT') {
       return undefined
     }
     throw err

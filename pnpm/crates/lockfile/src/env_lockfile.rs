@@ -15,23 +15,23 @@
 use crate::{
     LoadLockfileError, Lockfile, PackageKey, PackageMetadata, SaveLockfileError, SnapshotEntry,
     extract_main_document,
+    git_merge_file::{ParsedWantedFile, parse_wanted_file},
+    merge_env_lockfile_changes,
     save_lockfile::ensure_lockfile_is_not_symlink,
     serialize_yaml,
-    yaml_documents::{YAML_DOCUMENT_SEPARATOR, YAML_DOCUMENT_START, read_first_yaml_document},
+    yaml_documents::{
+        YAML_DOCUMENT_SEPARATOR, YAML_DOCUMENT_START, normalize_lockfile_content,
+        read_first_yaml_document,
+    },
 };
 use pnpm_fs::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
-    io::{self, ErrorKind, Read as _},
+    io::{self, ErrorKind},
     path::Path,
 };
-
-#[cfg(unix)]
-use crate::save_lockfile::symlinked_lockfile_error;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
 
 /// The resolved `{ specifier, version }` pair recorded for each config
 /// (or package-manager) dependency under an importer.
@@ -88,7 +88,6 @@ impl EnvLockfile {
         let mut importers = HashMap::new();
         importers.insert(Self::ROOT_IMPORTER_KEY.to_string(), EnvImporterSnapshot::default());
         EnvLockfile {
-            // Seeds the `lockfileVersion` "9.0" string.
             lockfile_version: "9.0".to_string(),
             importers,
             packages: HashMap::new(),
@@ -112,29 +111,58 @@ impl EnvLockfile {
     ///
     /// Only the leading document is read: the dependency graph that
     /// follows it never reaches memory.
+    ///
+    /// Two branches that each added a config dependency conflict inside
+    /// this document, where the main lockfile's own recovery never looks,
+    /// so the same merge runs here.
     pub fn read(root_dir: &Path) -> Result<Option<Self>, LoadLockfileError> {
         let path = root_dir.join(Lockfile::FILE_NAME);
         let Some(env_doc) = read_env_document(&path).map_err(LoadLockfileError::ReadFile)? else {
             return Ok(None);
         };
-        let mut env: EnvLockfile = serde_saphyr::from_str(&env_doc)
-            .map_err(|source| LoadLockfileError::parse_yaml(&path, &source))?;
+        Ok(Self::parse_conflicted_document(&env_doc, &path)?.value)
+    }
+
+    /// [`Self::read`]'s parse of one env document, with the number of
+    /// files its Git conflict markers had to be merged out of — 1 or 0,
+    /// since it is handed a single document.
+    pub(crate) fn parse_conflicted_document(
+        env_doc: &str,
+        path: &Path,
+    ) -> Result<ParsedWantedFile<Self>, LoadLockfileError> {
+        parse_wanted_file(env_doc, path, Self::parse_document, merge_env_lockfile_changes)
+    }
+
+    fn parse_document(env_doc: &str, path: &Path) -> Result<Option<Self>, LoadLockfileError> {
+        let mut env: EnvLockfile = serde_saphyr::from_str(env_doc)
+            .map_err(|source| LoadLockfileError::parse_yaml(path, &source))?;
         env.root_importer_mut();
         Ok(Some(env))
     }
 
     /// Write this env document as the first YAML document of
     /// `<root_dir>/pnpm-lock.yaml`, preserving any existing main
-    /// document. Emits `---\n${envYaml}\n---\n${mainDoc}`.
+    /// document. Emits `---\n${envYaml}\n---\n${mainDoc}`. An unchanged
+    /// document is not rewritten.
     pub fn write(&self, root_dir: &Path) -> Result<(), SaveLockfileError> {
         let path = root_dir.join(Lockfile::FILE_NAME);
-        ensure_lockfile_is_not_symlink(&path).map_err(SaveLockfileError::WriteFile)?;
         let env_yaml = serialize_yaml::to_string(self).map_err(SaveLockfileError::SerializeYaml)?;
-        let main_doc = read_lockfile_to_string_no_follow(&path)
-            .map_err(SaveLockfileError::WriteFile)?
-            .map_or_else(String::new, |existing| extract_main_document(&existing).to_string());
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => Some(raw),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(SaveLockfileError::WriteFile(error)),
+        };
+        let existing = raw.as_deref().map(normalize_lockfile_content);
+        let main_doc = existing
+            .as_deref()
+            .map(extract_main_document)
+            .unwrap_or_default();
         let combined =
             format!("{YAML_DOCUMENT_START}{env_yaml}{YAML_DOCUMENT_SEPARATOR}{main_doc}");
+        if existing.as_deref() == Some(combined.as_str()) {
+            return Ok(());
+        }
+        ensure_lockfile_is_not_symlink(&path).map_err(SaveLockfileError::WriteFile)?;
         write_atomic(&path, combined.as_bytes()).map_err(SaveLockfileError::WriteFile)
     }
 }
@@ -147,41 +175,6 @@ fn read_env_document(path: &Path) -> io::Result<Option<String>> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-fn read_lockfile_to_string_no_follow(path: &Path) -> io::Result<Option<String>> {
-    let mut file = match open_lockfile_no_follow(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let mut content = String::new();
-    #[expect(
-        clippy::verbose_file_reads,
-        reason = "Reading from the caller's file handle avoids reopening the lockfile by path."
-    )]
-    file.read_to_string(&mut content)?;
-    Ok(Some(content))
-}
-
-#[cfg(unix)]
-fn open_lockfile_no_follow(path: &Path) -> io::Result<File> {
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| normalize_no_follow_error(path, error))
-}
-
-#[cfg(not(unix))]
-fn open_lockfile_no_follow(path: &Path) -> io::Result<File> {
-    ensure_lockfile_is_not_symlink(path)?;
-    File::open(path)
-}
-
-#[cfg(unix)]
-fn normalize_no_follow_error(path: &Path, error: io::Error) -> io::Error {
-    if error.raw_os_error() == Some(libc::ELOOP) { symlinked_lockfile_error(path) } else { error }
 }
 
 #[cfg(test)]

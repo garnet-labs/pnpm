@@ -277,7 +277,7 @@ test('createDeployFiles preserves peer-only dependencies auto-installed into an 
 
 // A package may legitimately be named after an Object.prototype member, and a
 // plain property read would find that member and report a binding that does not
-// exist, leaving the peer unbound where pacquet's map lookup binds it.
+// exist.
 test('createDeployFiles binds a peer whose name collides with an Object prototype member', () => {
   const lockfileDir = path.resolve('workspace')
   const libDir = path.join(lockfileDir, 'lib')
@@ -327,4 +327,152 @@ test('createDeployFiles binds a peer whose name collides with an Object prototyp
   const [, libSnapshot] = Object.entries(deployLockfile.packages!).find(([key]) => key.startsWith('lib@file:'))!
   expect(Object.hasOwn(libSnapshot.dependencies ?? {}, 'constructor')).toBeTruthy()
   expect(libSnapshot.dependencies!.constructor).toBe('1.0.0')
+})
+
+
+test.each(['dependencies', 'devDependencies', 'optionalDependencies'] as const)('createDeployFiles normalizes registry specifiers in %s and preserves snapshot references', (field) => {
+  const lockfileDir = path.resolve('workspace')
+  const references = {
+    plain: '1.0.0',
+    peer: '1.0.0(react-dom@19.0.0(react@19.0.0))(react@19.0.0)',
+    patched: '1.0.0(patch_hash=abc)(react@19.0.0)',
+    alias: '@scope/pkg@1.0.0(react@19.0.0)',
+    tarball: 'https://example.com/pkg.tgz',
+    opaque: 'https://example.com/pkg.tgz(peer@1.0.0)',
+    registry: 'private:1.0.0(react@19.0.0)',
+    runtime: 'runtime:24.0.0',
+  }
+  const specifiers = {
+    plain: '1.0.0',
+    peer: '1.0.0',
+    patched: '1.0.0',
+    alias: 'npm:@scope/pkg@1.0.0',
+    tarball: 'https://example.com/pkg.tgz',
+    opaque: 'https://example.com/pkg.tgz(peer@1.0.0)',
+    registry: 'private:1.0.0(react@19.0.0)',
+    runtime: 'runtime:24.0.0',
+  }
+  const lockfile: LockfileObject = {
+    lockfileVersion: '9.0',
+    importers: { ['.' as ProjectId]: { specifiers: {}, [field]: references } },
+    packages: {
+      ['peer@' + references.peer as DepPath]: { resolution: { integrity: 'sha512-test' } },
+    },
+  }
+  const result = createDeployFiles({
+    allProjects: [],
+    deployDir: path.join(lockfileDir, 'out'),
+    include: { dependencies: true, devDependencies: true, optionalDependencies: true },
+    lockfile,
+    lockfileDir,
+    selectedProjectManifest: { name: 'app', [field]: references },
+    projectId: '.' as ProjectId,
+    rootProjectManifestDir: lockfileDir,
+  })
+  expect(result.manifest[field]).toStrictEqual(specifiers)
+  expect(result.lockfile.importers['.' as ProjectId].specifiers).toStrictEqual(specifiers)
+  expect(result.lockfile.importers['.' as ProjectId][field]).toStrictEqual(references)
+  expect(result.lockfile.packages).toEqual(lockfile.packages)
+})
+
+test('createDeployFiles counts an optional peer the workspace root lists only when resolvePeersFromWorkspaceRoot is on', () => {
+  const lockfileDir = path.resolve('workspace')
+  const deployDir = path.join(lockfileDir, 'out')
+  const projectId = 'app' as ProjectId
+  const abcDepPath = 'abc@1.0.0(peer-c@1.0.0)' as DepPath
+  const lockfile: LockfileObject = {
+    lockfileVersion: '9.0',
+    importers: {
+      ['.' as ProjectId]: {
+        specifiers: { 'peer-c': '1.0.0' },
+        devDependencies: { 'peer-c': '1.0.0' },
+      },
+      [projectId]: {
+        specifiers: { abc: '1.0.0' },
+        dependencies: { abc: '1.0.0(peer-c@1.0.0)' },
+      },
+    },
+    packages: {
+      [abcDepPath]: {
+        resolution: { integrity: 'sha512-abc' },
+        peerDependencies: { 'peer-c': '^1.0.0' },
+        peerDependenciesMeta: { 'peer-c': { optional: true } },
+        dependencies: { 'peer-c': '1.0.0' },
+      },
+      ['peer-c@1.0.0' as DepPath]: { resolution: { integrity: 'sha512-peer-c' } },
+    },
+  }
+  const deployLockfile = (resolvePeersFromWorkspaceRoot: boolean) => createDeployFiles({
+    allProjects: [
+      {
+        rootDir: lockfileDir as ProjectRootDir,
+        rootDirRealPath: lockfileDir as ProjectRootDirRealPath,
+        manifest: { name: 'root', version: '1.0.0' },
+      },
+      {
+        rootDir: path.join(lockfileDir, 'app') as ProjectRootDir,
+        rootDirRealPath: path.join(lockfileDir, 'app') as ProjectRootDirRealPath,
+        manifest: { name: 'app', version: '1.0.0' },
+      },
+    ],
+    deployDir,
+    include: { dependencies: true, devDependencies: false, optionalDependencies: true },
+    lockfile,
+    lockfileDir,
+    resolvePeersFromWorkspaceRoot,
+    selectedProjectManifest: { name: 'app', version: '1.0.0', dependencies: { abc: '1.0.0' } },
+    projectId,
+    rootProjectManifestDir: lockfileDir,
+  }).lockfile
+
+  const withRootPeers = deployLockfile(true)
+  expect(withRootPeers.packages?.['peer-c@1.0.0' as DepPath]).toBeUndefined()
+  expect(withRootPeers.packages?.[abcDepPath].dependencies).toBeUndefined()
+  expect(lockfile.packages?.[abcDepPath].dependencies).toStrictEqual({ 'peer-c': '1.0.0' })
+
+  const withoutRootPeers = deployLockfile(false)
+  expect(withoutRootPeers.packages?.['peer-c@1.0.0' as DepPath]).toBeDefined()
+  expect(withoutRootPeers.packages?.[abcDepPath].dependencies).toStrictEqual({ 'peer-c': '1.0.0' })
+})
+
+test('createDeployFiles keeps a link into the declaring package', () => {
+  const lockfileDir = path.resolve('workspace')
+  const projectId = '.' as ProjectId
+  const parentDepPath = 'parent@1.0.0' as DepPath
+  const lockfile: LockfileObject = {
+    lockfileVersion: '9.0',
+    importers: {
+      [projectId]: {
+        specifiers: { parent: '1.0.0' },
+        dependencies: { parent: '1.0.0' },
+      },
+    },
+    packages: {
+      [parentDepPath]: {
+        resolution: { integrity: 'sha512-test' },
+        dependencies: { child: 'link:<root>/child' },
+      },
+    },
+  }
+
+  const { lockfile: deployLockfile } = createDeployFiles({
+    allProjects: [{
+      rootDir: lockfileDir as ProjectRootDir,
+      rootDirRealPath: lockfileDir as ProjectRootDirRealPath,
+      manifest: { name: 'app', version: '1.0.0' },
+    }],
+    deployDir: path.join(lockfileDir, 'out'),
+    include: {
+      dependencies: true,
+      devDependencies: true,
+      optionalDependencies: true,
+    },
+    lockfile,
+    lockfileDir,
+    selectedProjectManifest: { name: 'app', version: '1.0.0' },
+    projectId,
+    rootProjectManifestDir: lockfileDir,
+  })
+
+  expect(deployLockfile.packages?.[parentDepPath]?.dependencies).toStrictEqual({ child: 'link:<root>/child' })
 })

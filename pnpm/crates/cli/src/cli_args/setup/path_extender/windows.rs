@@ -7,7 +7,8 @@
 //! so non-ASCII values survive the round-trip.
 
 use super::{AddDirToEnvPathOpts, AddingPosition, PathExtenderError};
-use std::{path::Path, process::Command};
+use crate::process::Command;
+use std::path::Path;
 
 /// The change made to one environment variable, used to render the
 /// before/after report.
@@ -26,8 +27,8 @@ pub(super) fn add_dir_to_windows_env_path(
 ) -> Result<Vec<EnvVariableChange>, PathExtenderError> {
     // `chcp` makes `reg` use UTF-8 for output. Otherwise non-ASCII
     // characters in environment variables become garbled.
-    let chcp_output = run_capture_chcp(&[])
-        .map_err(|err| PathExtenderError::Chcp { message: err.to_string() })?;
+    let chcp_output =
+        run_capture_chcp(&[]).map_err(|err| PathExtenderError::Chcp { message: err.to_string() })?;
     let cp_bak = first_number(&chcp_output)
         .ok_or_else(|| PathExtenderError::Chcp { message: chcp_output.clone() })?;
     run_capture_chcp(&["65001"])?;
@@ -79,30 +80,54 @@ fn update_env_variable(
     expandable_string: bool,
     overwrite: bool,
 ) -> Result<EnvVariableChange, PathExtenderError> {
-    let current_value = get_env_value_from_registry(registry_output, name);
-    match &current_value {
-        Some(current) if !overwrite => {
-            if current != value {
-                return Err(PathExtenderError::BadEnvFound {
-                    env_name: name.to_string(),
-                    wanted_value: value.to_string(),
-                });
-            }
-            Ok(EnvVariableChange {
-                variable: name.to_string(),
-                old_value: current_value,
-                new_value: value.to_string(),
-            })
+    update_env_variable_with(
+        registry_output,
+        name,
+        value,
+        expandable_string,
+        overwrite,
+        set_env_var_in_registry,
+    )
+}
+
+fn update_env_variable_with<Setter>(
+    registry_output: &str,
+    name: &str,
+    value: &str,
+    expandable_string: bool,
+    overwrite: bool,
+    mut setter: Setter,
+) -> Result<EnvVariableChange, PathExtenderError>
+where
+    Setter: FnMut(&str, &str, bool) -> Result<(), PathExtenderError>,
+{
+    let current = get_env_value_with_type_from_registry(registry_output, name);
+    let current_value = current.as_ref().map(|entry| entry.data.clone());
+
+    if let Some(current) = &current
+        && !overwrite
+    {
+        if current.data != value {
+            return Err(PathExtenderError::BadEnvFound {
+                env_name: name.to_string(),
+                current_value: current.data.clone(),
+            });
         }
-        _ => {
-            set_env_var_in_registry(name, value, expandable_string)?;
-            Ok(EnvVariableChange {
+        if current.value_type.eq_ignore_ascii_case(registry_value_type(expandable_string)) {
+            return Ok(EnvVariableChange {
                 variable: name.to_string(),
                 old_value: current_value,
                 new_value: value.to_string(),
-            })
+            });
         }
     }
+
+    setter(name, value, expandable_string)?;
+    Ok(EnvVariableChange {
+        variable: name.to_string(),
+        old_value: current_value,
+        new_value: value.to_string(),
+    })
 }
 
 fn add_to_path(
@@ -116,7 +141,10 @@ fn add_to_path(
         Some(data) if !data.trim().is_empty() => data,
         _ => return Err(PathExtenderError::NoPath),
     };
-    if path_data.split(';').any(|entry| entry == added_dir) {
+    if path_data
+        .split(';')
+        .any(|entry| entry == added_dir)
+    {
         return Ok(EnvVariableChange {
             variable: variable.to_string(),
             old_value: Some(path_data.clone()),
@@ -177,32 +205,57 @@ where
     }
 }
 
+#[derive(Debug)]
+struct RegistryEnvValue {
+    value_type: String,
+    data: String,
+}
+
+fn get_env_value_from_registry(registry_output: &str, env_var_name: &str) -> Option<String> {
+    get_env_value_with_type_from_registry(registry_output, env_var_name).map(|entry| entry.data)
+}
+
+fn get_env_value_with_type_from_registry(
+    registry_output: &str,
+    env_var_name: &str,
+) -> Option<RegistryEnvValue> {
+    registry_output
+        .lines()
+        .find_map(|line| env_value_with_type_from_registry_line(line, env_var_name))
+}
+
 /// Parse a `reg query` line of the form `    <name>    <type>    <data>`
 /// (four-space separators), matching `name` case-insensitively.
-fn get_env_value_from_registry(registry_output: &str, env_var_name: &str) -> Option<String> {
-    for line in registry_output.lines() {
-        let Some(rest) = line.strip_prefix("    ") else {
-            continue;
-        };
-        if rest.len() < env_var_name.len()
-            || !rest[..env_var_name.len()].eq_ignore_ascii_case(env_var_name)
-        {
-            continue;
-        }
-        let Some(after_name) = rest[env_var_name.len()..].strip_prefix("    ") else {
-            continue;
-        };
-        let Some(type_end) = after_name.find("    ") else {
-            continue;
-        };
-        let value_type = &after_name[..type_end];
-        if value_type.is_empty() || !value_type.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-        {
-            continue;
-        }
-        return Some(after_name[type_end + 4..].to_string());
+fn env_value_with_type_from_registry_line(
+    line: &str,
+    env_var_name: &str,
+) -> Option<RegistryEnvValue> {
+    let rest = line.strip_prefix("    ")?;
+    // The length of the name we want is not necessarily a char boundary of
+    // this line: an unrelated name can hold a multi-byte character that ends
+    // past it. Slicing there panics, so take the candidate as a whole.
+    let name = rest.get(..env_var_name.len())?;
+    if !name.eq_ignore_ascii_case(env_var_name) {
+        return None;
     }
-    None
+    let after_name = rest[name.len()..].strip_prefix("    ")?;
+    let type_end = after_name.find("    ")?;
+    let value_type = &after_name[..type_end];
+    if value_type.is_empty()
+        || !value_type
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(RegistryEnvValue {
+        value_type: value_type.to_string(),
+        data: after_name[type_end + 4..].to_string(),
+    })
+}
+
+fn registry_value_type(expandable_string: bool) -> &'static str {
+    if expandable_string { "REG_EXPAND_SZ" } else { "REG_SZ" }
 }
 
 fn set_env_var_in_registry(
@@ -210,7 +263,7 @@ fn set_env_var_in_registry(
     env_var_value: &str,
     expandable_string: bool,
 ) -> Result<(), PathExtenderError> {
-    let reg_type = if expandable_string { "REG_EXPAND_SZ" } else { "REG_SZ" };
+    let reg_type = registry_value_type(expandable_string);
     let output = Command::new("reg")
         .args(["add", REG_KEY, "/v", env_var_name, "/t", reg_type, "/d", env_var_value, "/f"])
         .output()?;

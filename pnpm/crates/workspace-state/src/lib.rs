@@ -1,3 +1,6 @@
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
+
 //! Read and write pnpm's `node_modules/.pnpm-workspace-state-v1.json`.
 //!
 //! The file records what an install actually used (project list,
@@ -18,7 +21,6 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tempfile::NamedTempFile;
 
 /// Basename of the workspace-state file, written inside `node_modules/`.
 pub const WORKSPACE_STATE_FILENAME: &str = ".pnpm-workspace-state-v1.json";
@@ -37,6 +39,14 @@ pub struct ProjectEntry {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Whether a hoisted install left the project with its own modules
+    /// directory. The hoisted linker creates one only for dependencies it
+    /// nests under the project, so a project with dependencies may have
+    /// none; this records which ones must still have it. Never set under
+    /// the isolated linker, which needs a modules directory for every
+    /// project with dependencies.
+    #[serde(default, rename = "hasModulesDir", skip_serializing_if = "std::ops::Not::not")]
+    pub has_modules_dir: bool,
 }
 
 /// A single `configDependencies` value — either a `VersionWithIntegrity`
@@ -87,6 +97,13 @@ pub struct WorkspaceState {
 /// resolved value differs from pnpm's, pnpm correctly reinstalls.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields mirror settings recorded in pnpm-workspace-state-v1.json."
+    )
+)]
 pub struct WorkspaceStateSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_builds: Option<BTreeMap<String, serde_json::Value>>,
@@ -102,6 +119,8 @@ pub struct WorkspaceStateSettings {
     pub dedupe_peer_dependents: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_peers: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_dedupe: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<bool>,
     /// `None` and `Some(false)` both mean "global virtual store off" —
@@ -123,6 +142,9 @@ pub struct WorkspaceStateSettings {
     pub inject_workspace_packages: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_workspace_packages: Option<serde_json::Value>,
+    /// `lockfile.includeResolutionSettings`, recorded only while it is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockfile_include_resolution_settings: Option<bool>,
     /// Minutes a published version must age before it may be installed.
     /// pnpm resolves this to a concrete `24 * 60` default, so it must be
     /// recorded for pnpm's all-key freshness check to stay on the fast
@@ -143,6 +165,8 @@ pub struct WorkspaceStateSettings {
     pub minimum_release_age_strict: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_linker: Option<NodeLinker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_linker_excluded: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +225,7 @@ pub enum NodeLinker {
     Hoisted,
     Isolated,
     Pnp,
+    Loaded,
 }
 
 /// Error returned by [`update_workspace_state`].
@@ -225,7 +250,10 @@ pub enum UpdateWorkspaceStateError {
 /// Writes to a temporary file in the same directory, then atomically
 /// renames it into place, so a concurrent reader — pnpm or pacquet —
 /// never observes a half-written file
-/// ([#12020](https://github.com/pnpm/pnpm/issues/12020)).
+/// ([#12020](https://github.com/pnpm/pnpm/issues/12020)). Two pnpm
+/// processes installing one workspace at once both write it, so the
+/// rename retries the transient lock errors Windows raises for the other
+/// writer's handle.
 ///
 /// The serialized bytes are `JSON.stringify(state, undefined, 2) + '\n'`:
 /// `serde_json`'s pretty printer uses the same 2-space indent and `": "`
@@ -235,26 +263,29 @@ pub fn update_workspace_state(
     workspace_dir: &Path,
     state: &WorkspaceState,
 ) -> Result<(), UpdateWorkspaceStateError> {
-    let file_path = get_file_path(workspace_dir);
+    update_workspace_state_in_modules(&workspace_dir.join("node_modules"), state)
+}
+
+/// Atomically write workspace state inside the selected installation directory.
+pub fn update_workspace_state_in_modules(
+    modules_dir: &Path,
+    state: &WorkspaceState,
+) -> Result<(), UpdateWorkspaceStateError> {
+    let file_path = modules_dir.join(WORKSPACE_STATE_FILENAME);
     let parent = file_path.parent().expect("workspace-state path always has a parent");
-    fs::create_dir_all(parent).map_err(|source| UpdateWorkspaceStateError::CreateDir {
-        path: parent.to_path_buf(),
-        source,
-    })?;
+    pnpm_fs::create_dir_all_with_retry(parent)
+        .map_err(|source| UpdateWorkspaceStateError::CreateDir {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     let mut serialized =
         serde_json::to_string_pretty(state).map_err(UpdateWorkspaceStateError::SerializeJson)?;
     serialized.push('\n');
-    let mut temp = NamedTempFile::new_in(parent).map_err(|source| {
-        UpdateWorkspaceStateError::WriteFile { path: file_path.clone(), source }
-    })?;
-    temp.write_all(serialized.as_bytes()).map_err(|source| {
-        UpdateWorkspaceStateError::WriteFile { path: file_path.clone(), source }
-    })?;
-    temp.persist(&file_path).map_err(|error| UpdateWorkspaceStateError::WriteFile {
-        path: file_path,
-        source: error.error,
-    })?;
-    Ok(())
+    let write = |source| UpdateWorkspaceStateError::WriteFile { path: file_path.clone(), source };
+    let mut temp = pnpm_fs::private_named_tempfile_in(parent).map_err(write)?;
+    temp.write_all(serialized.as_bytes()).map_err(write)?;
+    let temp = temp.into_temp_path();
+    pnpm_fs::rename_with_retry(&temp, &file_path).map_err(write)
 }
 
 /// Read the workspace state file at `<workspace_dir>/node_modules/.pnpm-workspace-state-v1.json`.
@@ -263,7 +294,14 @@ pub fn update_workspace_state(
 pub fn load_workspace_state(
     workspace_dir: &Path,
 ) -> Result<Option<WorkspaceState>, LoadWorkspaceStateError> {
-    let file_path = get_file_path(workspace_dir);
+    load_workspace_state_in_modules(&workspace_dir.join("node_modules"))
+}
+
+/// Read workspace state inside the selected installation directory.
+pub fn load_workspace_state_in_modules(
+    modules_dir: &Path,
+) -> Result<Option<WorkspaceState>, LoadWorkspaceStateError> {
+    let file_path = modules_dir.join(WORKSPACE_STATE_FILENAME);
     let text = match fs::read_to_string(&file_path) {
         Ok(text) => text,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -304,7 +342,8 @@ pub fn now_millis() -> i64 {
 /// dependency-injection seam produce the value the state file records.
 #[must_use]
 pub fn millis_since_epoch(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_millis() as i64)
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64)
 }
 
 #[cfg(test)]

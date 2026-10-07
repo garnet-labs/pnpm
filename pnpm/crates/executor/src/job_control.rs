@@ -4,7 +4,9 @@
 //! reaches only the direct child. A Job Object with `KILL_ON_JOB_CLOSE` lets
 //! the OS terminate the whole process tree after an error, panic, or
 //! interrupt. Successful commands disarm the job so a process deliberately
-//! detached by a script can outlive pacquet. On Unix the kernel's
+//! detached by a script can outlive pacquet. A descendant created with
+//! `CREATE_BREAKAWAY_FROM_JOB` leaves the job, so it outlives pacquet even
+//! after a failure. On Unix the kernel's
 //! process-group and signal model already provides cleanup, so setup is a
 //! no-op.
 //!
@@ -20,7 +22,7 @@
 //! [`arm_process_tree_cleanup`] returns a guard to bind for the lifetime of
 //! the process.
 
-use std::process::Child;
+use crate::process::Child;
 
 #[cfg(windows)]
 use std::sync::Mutex;
@@ -54,12 +56,14 @@ impl JobGuard {
     /// Disable process-tree cleanup after a successful command.
     #[cfg(windows)]
     pub fn disarm(self) {
-        use core::mem::{size_of, zeroed};
-        use core::ptr;
+        use std::{
+            mem::{size_of, zeroed},
+            ptr,
+        };
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
 
         // Stop assigning children first so no spawn can reach the handle
@@ -70,9 +74,11 @@ impl JobGuard {
         // [`arm_process_tree_cleanup`]. The information pointer refers to a
         // stack local that outlives the call. Clear the kill limit before
         // closing the handle; if clearing fails, leave the armed handle for
-        // the operating system to close at exit.
+        // the operating system to close at exit. Breakaway stays allowed for
+        // the detached processes that remain in the job.
         unsafe {
-            let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             let set = SetInformationJobObject(
                 self.job,
                 JobObjectExtendedLimitInformation,
@@ -95,13 +101,15 @@ impl JobGuard {
 #[cfg(windows)]
 #[must_use]
 pub fn arm_process_tree_cleanup() -> Option<JobGuard> {
-    use core::mem::{size_of, zeroed};
-    use core::ptr;
+    use std::{
+        mem::{size_of, zeroed},
+        ptr,
+    };
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -115,7 +123,10 @@ pub fn arm_process_tree_cleanup() -> Option<JobGuard> {
             return None;
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Not `SILENT_BREAKAWAY_OK`: that would release every descendant and
+        // leave nothing for `KILL_ON_JOB_CLOSE` to clean up.
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         let set = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
@@ -153,8 +164,10 @@ pub fn arm_process_tree_cleanup() -> Option<JobGuard> {
 /// in it instead.
 #[cfg(windows)]
 fn enclosing_job_releases_children() -> bool {
-    use core::mem::{size_of, zeroed};
-    use core::ptr;
+    use std::{
+        mem::{size_of, zeroed},
+        ptr,
+    };
     use windows_sys::Win32::System::JobObjects::{
         IsProcessInJob, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, QueryInformationJobObject,

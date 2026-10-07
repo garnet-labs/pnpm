@@ -439,6 +439,56 @@ test('createVersionsOverrider() overrides dependencies with file with relative p
   })
 })
 
+test('createVersionsOverrider() overrides dependencies with bare relative tarball path for workspace package', () => {
+  const rootDir = process.cwd()
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier: './tarballs/qar-1.0.0.tgz',
+    },
+  ], rootDir)
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, path.join(rootDir, 'packages', 'pkg'))).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '../../tarballs/qar-1.0.0.tgz',
+    },
+  })
+})
+
+test('createVersionsOverrider() does not rewrite remote tarball URLs', () => {
+  const rootDir = process.cwd()
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier: 'https://example.com/qar-1.0.0.tgz',
+    },
+  ], rootDir)
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, path.join(rootDir, 'packages', 'pkg'))).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: 'https://example.com/qar-1.0.0.tgz',
+    },
+  })
+})
+
 test('createVersionsOverrider() overrides dependencies with file specified with absolute path', () => {
   const absolutePath = path.join(import.meta.dirname, 'qar')
   const overrider = createVersionsOverrider([
@@ -618,6 +668,54 @@ test('createVersionsOverrider() overrides peerDependencies of another dependency
     peerDependencies: {
       react: '18.1.0',
     },
+  })
+})
+
+test.each(['unwanted-peer', 'my-app>unwanted-peer'])('createVersionsOverrider() removes optional peer metadata with %s', (selector) => {
+  const overrider = createVersionsOverrider(parseOverrides({ [selector]: '-' }, {}), process.cwd())
+  const manifest = {
+    name: 'my-app',
+    version: '1.0.0',
+    peerDependencies: { 'unwanted-peer': '^1.0.0', kept: '^2.0.0' },
+    peerDependenciesMeta: Object.freeze({
+      'unwanted-peer': { optional: true },
+      kept: { optional: true },
+    }),
+  }
+
+  expect(overrider(manifest)).toStrictEqual({
+    name: 'my-app',
+    version: '1.0.0',
+    dependencies: {},
+    peerDependencies: { kept: '^2.0.0' },
+    peerDependenciesMeta: { kept: { optional: true } },
+  })
+  expect(manifest.peerDependencies).toStrictEqual({ 'unwanted-peer': '^1.0.0', kept: '^2.0.0' })
+  expect(manifest.peerDependenciesMeta).toStrictEqual({
+    'unwanted-peer': { optional: true },
+    kept: { optional: true },
+  })
+})
+
+test.each(['unwanted-peer', 'my-app>unwanted-peer'])('createVersionsOverrider() removes an optional peer declared only in peerDependenciesMeta with %s', (selector) => {
+  const overrider = createVersionsOverrider(parseOverrides({ [selector]: '-' }, {}), process.cwd())
+  const manifest = {
+    name: 'my-app',
+    version: '1.0.0',
+    peerDependenciesMeta: Object.freeze({
+      'unwanted-peer': { optional: true },
+      kept: { optional: true },
+    }),
+  }
+
+  expect(overrider(manifest)).toStrictEqual({
+    name: 'my-app',
+    version: '1.0.0',
+    peerDependenciesMeta: { kept: { optional: true } },
+  })
+  expect(manifest.peerDependenciesMeta).toStrictEqual({
+    'unwanted-peer': { optional: true },
+    kept: { optional: true },
   })
 })
 
@@ -879,7 +977,7 @@ test('createVersionsOverrider() explicit overrides win over a convergence overri
   })
 })
 
-test('createVersionsOverrider() collects declared ranges of convergence-governed packages', () => {
+test('createVersionsOverrider() collects declared ranges of convergence-governed packages', async () => {
   const convergeDeclaredRanges = new Map<string, Set<string>>()
   const overrider = createVersionsOverrider([
     {
@@ -888,13 +986,13 @@ test('createVersionsOverrider() collects declared ranges of convergence-governed
       converge: true,
     },
   ], process.cwd(), { convergeDeclaredRanges })
-  overrider({
+  await overrider({
     dependencies: {
       foo: '^4.0.5',
       bar: '^1.0.0',
     },
   })
-  overrider({
+  await overrider({
     dependencies: {
       foo: '^3.0.0',
     },
@@ -1018,5 +1116,225 @@ describe('createOverriddenDependencyMatcher()', () => {
 
   test('is undefined when no override could claim anything', () => {
     expect(createOverriddenDependencyMatcher([], process.cwd())).toBeUndefined()
+  })
+})
+
+test('createVersionsOverrider() re-anchors a bare path override on the package it rewrites', () => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier: '../qar',
+    },
+  ], process.cwd())
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, path.resolve('pkg'))).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '../../qar',
+    },
+  })
+})
+
+// The shape pnpm/pnpm#11131 reports: a tarball reached by a path prefix lands
+// on the local resolver like any other path, so it moves with the file that
+// declared it.
+test('createVersionsOverrider() re-anchors a bare path naming a tarball', () => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier: './tarballs/qar.tgz',
+    },
+  ], process.cwd())
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, path.resolve('packages/app'))).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '../../tarballs/qar.tgz',
+    },
+  })
+})
+
+test('createVersionsOverrider() keeps a re-anchored bare path unambiguously local', () => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier: './libs/qar',
+    },
+  ], process.cwd())
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, process.cwd())).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: './libs/qar',
+    },
+  })
+})
+
+test('createVersionsOverrider() renders an override naming the package it rewrites as "."', () => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier: './packages/app',
+    },
+  ], process.cwd())
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, path.resolve('packages/app'))).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '.',
+    },
+  })
+})
+
+// The resolver forward-slashes a specifier before it reads the `~` prefix, so
+// the backslash spelling names the home directory too and must not be measured
+// from the workspace.
+test.each([
+  ['a forward slash', 'file:~/qar'],
+  ['a backslash', 'file:~\\qar'],
+])('createVersionsOverrider() leaves a home-relative override written with %s alone', (_label, newBareSpecifier) => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier,
+    },
+  ], process.cwd())
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, path.resolve('packages/app'))).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: newBareSpecifier,
+    },
+  })
+})
+
+// A UNC share's leading `//` is what makes it a share rather than a path on
+// the current drive, so the run of separators survives rendering. The
+// backslash spelling is claimed on Windows alone, but the collapsing this
+// guards against is not platform-specific.
+test('createVersionsOverrider() keeps a bare UNC override on its share', () => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier: '//server/share/qar',
+    },
+  ], 'C:/workspace')
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, undefined)).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '//server/share/qar',
+    },
+  })
+})
+
+// A transitive manifest reaches the hook with no directory, which is why the
+// target renders absolute here. A tarball's protocol is unconditional, so
+// naming it cannot change how the package materializes. A directory's turns on
+// whether the dependency is injected, which this renderer cannot see, and an
+// explicit `link:` would outrank that and reference an injected package in
+// place instead of copying it.
+test.each([
+  ['a tarball', './tarballs/qar.tgz', 'file:C:/workspace/tarballs/qar.tgz'],
+  ['a directory', './local-dep', 'C:/workspace/local-dep'],
+])('createVersionsOverrider() renders a drive-anchored bare path naming %s', (_label, newBareSpecifier, expected) => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier,
+    },
+  ], 'C:/workspace')
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, undefined)).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: expected,
+    },
+  })
+})
+
+test.each([
+  ['a hosted-git shorthand', 'user/repo'],
+  ['a tarball-shaped dist-tag', 'repo.tgz'],
+  ['a registry range', '^1.2.3'],
+  ['an npm alias', 'npm:other@^1'],
+  ['a single-letter named registry', 'c:pkg@1'],
+])('createVersionsOverrider() leaves %s alone', (_label, newBareSpecifier) => {
+  const overrider = createVersionsOverrider([
+    {
+      targetPkg: {
+        name: 'qar',
+      },
+      newBareSpecifier,
+    },
+  ], process.cwd())
+  expect(overrider({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: '3.0.0',
+    },
+  }, path.resolve('pkg'))).toStrictEqual({
+    name: 'foo',
+    version: '1.2.0',
+    dependencies: {
+      qar: newBareSpecifier,
+    },
   })
 })

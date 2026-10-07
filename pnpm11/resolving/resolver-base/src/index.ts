@@ -248,10 +248,7 @@ export interface ResolutionVerifier {
  * the user, persists them (e.g. into `minimumReleaseAgeExclude`), or
  * aborts. Code is the verifier-defined error code
  * (`MINIMUM_RELEASE_AGE_VIOLATION`, `TRUST_DOWNGRADE`, etc.) — the
- * install command filters by code to decide downstream UX. Lifted here
- * (rather than in deps-installer) so both deps-resolver and
- * deps-installer can share one shape; future resolver packages plug in
- * without needing the deps-installer dependency.
+ * install command filters by code to decide downstream UX.
  */
 export interface ResolutionPolicyViolation {
   name: string
@@ -313,15 +310,36 @@ function libcMatches (variantLibc: string | undefined, requestedLibc: string | n
   return variantLibc === requestedLibc
 }
 
-function pickSupported<T extends string | null | undefined> (requirements: string[] | undefined, hostValue: T): string | T {
+function pickSupported<HostValue extends string | null | undefined> (requirements: string[] | undefined, hostValue: HostValue): string | HostValue {
   if (!requirements?.length) return hostValue
   if (requirements.some((requirement) => requirement === 'current' || requirement === hostValue)) return hostValue
   return requirements[0]
 }
 
+/**
+ * A version of the same package the registry does not report as deprecated.
+ *
+ * Only the resolver can work this out, since only it holds the packument.
+ */
+export interface NonDeprecatedAlternative {
+  version: string
+  /**
+   * Whether reaching it means widening the declared range. Only ever true
+   * for a dependency that declared a range: a tag says nothing about which
+   * versions are acceptable, so there is no range to be outside of.
+   */
+  outsideDeclaredRange: boolean
+}
+
 export interface ResolveResult {
   id: PkgResolutionId
   latest?: string
+  /**
+   * Set only when the resolved version is deprecated, so that the
+   * deprecation warning can name a version to move to. Absent when the
+   * resolution was reused from the lockfile, which holds no packument.
+   */
+  nonDeprecatedAlternative?: NonDeprecatedAlternative
   publishedAt?: string
   manifest?: DependencyManifest
   resolution: Resolution
@@ -392,6 +410,8 @@ export interface ResolveOptions {
   defaultTag?: string
   pickLowestVersion?: boolean
   publishedBy?: Date
+  /** Release-age cutoff to try when the time-based cutoff has no match. */
+  fallbackPublishedBy?: Date
   publishedByExclude?: PackageVersionPolicy
   projectDir: string
   lockfileDir: string

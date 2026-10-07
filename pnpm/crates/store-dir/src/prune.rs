@@ -19,7 +19,10 @@
 //! on the hot install path); parallelism can be added later if
 //! profiling shows it's worth the complexity.
 
-use crate::{GetRegisteredProjectsError, StoreDir, get_registered_projects};
+use crate::{
+    GetRegisteredProjectsError, StoreDir, StoreLockError, get_registered_projects,
+    prune_cas::PruneCasError,
+};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_fs::read_symlink_dir;
@@ -33,6 +36,12 @@ use std::{
 /// Error type of [`StoreDir::prune`].
 #[derive(Debug, Display, Error, Diagnostic)]
 pub enum PruneError {
+    #[display("Failed to read CAS loader references: {_0}")]
+    #[diagnostic(code(ERR_PNPM_STORE_LOADER_REFERENCES))]
+    LoaderReferences(#[error(source)] io::Error),
+    #[diagnostic(transparent)]
+    StoreLock(#[error(source)] StoreLockError),
+
     /// Surface from the read-side of the project registry — stale
     /// entries that can't be unlinked, inaccessible registry dirs,
     /// or projects whose `stat` returned a permission error.
@@ -59,22 +68,57 @@ pub enum PruneError {
         #[error(source)]
         error: io::Error,
     },
+
+    #[display("Failed to read project directory during mark phase {path:?}: {error}")]
+    #[diagnostic(code(ERR_PNPM_STORE_DIR_PRUNE_READ_MARK_DIR))]
+    ReadMarkDir {
+        path: PathBuf,
+        #[error(source)]
+        error: io::Error,
+    },
+
+    #[diagnostic(transparent)]
+    PruneCas(#[error(source)] PruneCasError),
 }
 
 impl StoreDir {
-    /// Remove unreferenced packages from the global virtual store at
-    /// `<store_dir>/links`.
+    /// Remove unreferenced packages from the global virtual store and
+    /// content-addressable files that have no hard links outside the store.
     ///
     /// Pacquet doesn't yet thread the install-time reporter into
     /// store-dir, so the informational messages go to stderr via
     /// `eprintln!` until [#344] lands the proper reporter wiring.
     ///
-    /// Returns `Ok(())` on success; surfaces I/O errors from the mark
-    /// or sweep walks as [`PruneError`]. Stale registry entries are
-    /// healed transparently by [`crate::get_registered_projects`].
-    ///
     /// [#344]: https://github.com/pnpm/pacquet/issues/344
     pub fn prune(&self) -> Result<(), PruneError> {
+        let _store_lock = self.lock_for_prune().map_err(PruneError::StoreLock)?;
+        let references = crate::loader_references::loader_references(self)
+            .map_err(PruneError::LoaderReferences)?;
+        self.prune_global_virtual_store(&references.package_roots)?;
+        let stats = crate::prune_cas::prune_cas_with_references(self, &references.files)
+            .map_err(PruneError::PruneCas)?;
+        eprintln!(
+            "Removed {} file{} ({} bytes)",
+            stats.files,
+            if stats.files == 1 { "" } else { "s" },
+            stats.bytes,
+        );
+        eprintln!(
+            "Removed {} package{}",
+            stats.packages,
+            if stats.packages == 1 { "" } else { "s" },
+        );
+        if stats.undecodable_packages > 0 {
+            eprintln!(
+                "Kept {} package index entr{} that could not be read",
+                stats.undecodable_packages,
+                if stats.undecodable_packages == 1 { "y" } else { "ies" },
+            );
+        }
+        Ok(())
+    }
+
+    fn prune_global_virtual_store(&self, loader_roots: &[PathBuf]) -> Result<(), PruneError> {
         let links_dir = self.links();
         if !path_exists(&links_dir) {
             return Ok(());
@@ -90,25 +134,14 @@ impl StoreDir {
             projects.len(),
         );
 
-        // Canonicalize the links root once and pass it down. The
-        // mark walk compares every target's canonical form against
-        // this root, and canonicalising inside the per-entry loop
-        // would burn one extra syscall per visited symlink — wasteful
-        // on large trees where the answer is invariant.
-        let canonical_links = dunce::canonicalize(&links_dir).unwrap_or_else(|_| links_dir.clone());
-        let mut reachable: HashSet<PathBuf> = HashSet::new();
-        let mut visited: HashSet<PathBuf> = HashSet::new();
-        for project_dir in &projects {
-            for modules_dir in find_all_node_modules_dirs(project_dir) {
-                walk_symlinks_to_store(
-                    &modules_dir,
-                    &canonical_links,
-                    &mut reachable,
-                    &mut visited,
-                );
-            }
+        let reachable = mark_reachable_slots(&links_dir, &projects, loader_roots)?;
+        // Projects without the global virtual store register too, so no link
+        // from any registered project leaves the slots' users as unknown as
+        // an empty registry does.
+        if reachable.is_empty() {
+            eprintln!("No registered project uses the global virtual store");
+            return Ok(());
         }
-
         let removed = remove_unreachable_packages(&links_dir, &reachable)?;
         if removed > 0 {
             eprintln!(
@@ -123,50 +156,105 @@ impl StoreDir {
     }
 }
 
+/// Every `<store_dir>/links` slot the registered projects link into.
+fn mark_reachable_slots(
+    links_dir: &Path,
+    projects: &[PathBuf],
+    loader_roots: &[PathBuf],
+) -> Result<HashSet<PathBuf>, PruneError> {
+    // Canonicalize the links root once and pass it down. The
+    // mark walk compares every target's canonical form against
+    // this root, and canonicalising inside the per-entry loop
+    // would burn one extra syscall per visited symlink — wasteful
+    // on large trees where the answer is invariant.
+    let canonical_links =
+        dunce::canonicalize(links_dir).unwrap_or_else(|_| links_dir.to_path_buf());
+    let mut reachable: HashSet<PathBuf> = HashSet::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    mark_loader_roots(loader_roots, &canonical_links, &mut reachable, &mut visited)?;
+    for project_dir in projects {
+        for modules_dir in find_all_node_modules_dirs(
+            project_dir,
+            canonical_links.parent().expect("links directory has a store root"),
+        )? {
+            walk_symlinks_to_store(&modules_dir, &canonical_links, &mut reachable, &mut visited)?;
+        }
+    }
+    Ok(reachable)
+}
+
+fn mark_loader_roots(
+    loader_roots: &[PathBuf],
+    canonical_links: &Path,
+    reachable: &mut HashSet<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<(), PruneError> {
+    for root in loader_roots {
+        if let Some(slot) = store_slot_from_target(root, canonical_links) {
+            let directory = canonical_links.join(&slot).join("node_modules");
+            reachable.insert(slot);
+            walk_symlinks_to_store(&directory, canonical_links, reachable, visited)?;
+        }
+    }
+    Ok(())
+}
+
 /// Find every `node_modules/` directory under `project_dir`,
 /// including those inside workspace packages. Descends into every
 /// non-hidden subdir until it sees `node_modules`, at which point it
 /// records the path and stops descending — the
 /// hoisted deps inside `node_modules/.pnpm` and friends are picked up
 /// by [`walk_symlinks_to_store`]'s transitive recursion instead.
-fn find_all_node_modules_dirs(project_dir: &Path) -> Vec<PathBuf> {
+fn find_all_node_modules_dirs(
+    project_dir: &Path,
+    excluded_store: &Path,
+) -> Result<Vec<PathBuf>, PruneError> {
     let mut out = Vec::new();
-    scan(project_dir, &mut out);
-    return out;
+    let project = dunce::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    scan_node_modules_dirs(&project, &mut out, excluded_store)?;
+    Ok(out)
+}
 
-    fn scan(dir: &Path, out: &mut Vec<PathBuf>) {
-        // Swallow every `read_dir` error, as pnpm does. A permission
-        // failure inside a workspace package would make `prune`
-        // over-aggressive (its node_modules wouldn't be marked), but
-        // tightening this would diverge from pnpm's behaviour — and
-        // `pacquet store prune` shares a store directory with `pnpm
-        // store prune`, so the two must agree on what counts as
-        // reachable.
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        let mut subdirs = Vec::new();
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let entry_path = entry.path();
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str == "node_modules" {
-                out.push(entry_path);
-                // Don't descend into node_modules
-            } else if !name_str.starts_with('.') {
-                subdirs.push(entry_path);
-            }
-        }
-        for sub in subdirs {
-            scan(&sub, out);
+fn scan_node_modules_dirs(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    excluded_store: &Path,
+) -> Result<(), PruneError> {
+    for subdir in project_subdirectories(dir, excluded_store)? {
+        let name = subdir
+            .file_name()
+            .expect("directory entry has a name")
+            .to_string_lossy();
+        if name == "node_modules" {
+            out.push(subdir);
+        } else if !name.starts_with('.') {
+            scan_node_modules_dirs(&subdir, out, excluded_store)?;
         }
     }
+    Ok(())
+}
+
+fn project_subdirectories(dir: &Path, excluded_store: &Path) -> Result<Vec<PathBuf>, PruneError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(PruneError::ReadMarkDir { path: dir.to_path_buf(), error }),
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| PruneError::ReadMarkDir { path: dir.to_path_buf(), error })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| PruneError::ReadMarkDir { path: entry.path(), error })?;
+        let entry_path = entry.path();
+        if file_type.is_dir() && entry_path != excluded_store {
+            subdirs.push(entry_path);
+        }
+    }
+    Ok(subdirs)
 }
 
 /// Recursively follow every symlink under `dir`. When a symlink
@@ -174,10 +262,7 @@ fn find_all_node_modules_dirs(project_dir: &Path) -> Vec<PathBuf> {
 /// `<scope>/<name>/<version>/<hash>` segment in `reachable` and
 /// recurse into the slot's `node_modules/` for transitive deps.
 ///
-/// `canonical_links` must already be the canonicalised links root
-/// — [`StoreDir::prune`] does this once and threads it through, so
-/// the per-entry loop doesn't pay a `canonicalize` syscall for an
-/// invariant value.
+/// `canonical_links` must already be the canonicalised links root.
 ///
 /// `visited` is the cycle guard, keyed by the canonical (real) path
 /// of `dir`. Storing the canonical `PathBuf` directly is enough — the
@@ -188,79 +273,97 @@ fn walk_symlinks_to_store(
     canonical_links: &Path,
     reachable: &mut HashSet<PathBuf>,
     visited: &mut HashSet<PathBuf>,
-) {
+) -> Result<(), PruneError> {
     let canonical_dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     if !visited.insert(canonical_dir) {
-        return;
+        return Ok(());
     }
 
-    // Swallow every `read_dir` error, as pnpm does. Same caveat as in
-    // [`find_all_node_modules_dirs`]: tightening this would diverge
-    // from pnpm and risk a `pacquet store prune` deciding more slots
-    // are unreachable than a parallel `pnpm store prune` would.
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(PruneError::ReadMarkDir { path: dir.to_path_buf(), error });
+        }
     };
-    for entry in entries.flatten() {
-        let entry_path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        if file_type.is_symlink() {
-            // `read_symlink_dir` handles Windows junctions (which
-            // `pnpm_fs::symlink_dir` creates for every
-            // `node_modules/<pkg>` entry); plain `fs::read_link`
-            // would EINVAL on them and the mark walk would miss
-            // every direct dep on Windows. See
-            // [`rust-lang/rust#28528`](https://github.com/rust-lang/rust/issues/28528).
-            let Ok(target) = read_symlink_dir(&entry_path) else {
-                continue;
-            };
-            let absolute_target = if target.is_absolute() {
-                target
-            } else {
-                entry_path.parent().map(|p| p.join(&target)).unwrap_or(target)
-            };
-            // Canonicalise the target so a symlink-bearing path
-            // prefix doesn't fool the `starts_with` check against
-            // the (already-canonical) links root.
-            let canonical_target =
-                dunce::canonicalize(&absolute_target).unwrap_or_else(|_| absolute_target.clone());
-            if !canonical_target.starts_with(canonical_links) {
-                continue;
-            }
-            // Slot path is the segment after `canonical_links` up to
-            // (but excluding) the first `node_modules` component.
-            // Layout:
-            //   <links>/<scope>/<name>/<version>/<hash>/node_modules/<pkg>
-            // We want `<scope>/<name>/<version>/<hash>`.
-            let Ok(rel) = canonical_target.strip_prefix(canonical_links) else {
-                continue;
-            };
-            let parts: Vec<_> = rel.components().collect();
-            let nm_idx = parts
-                .iter()
-                .position(|comp| comp.as_os_str() == std::ffi::OsStr::new("node_modules"));
-            if let Some(idx) = nm_idx {
-                let slot: PathBuf = parts[..idx].iter().collect();
-                reachable.insert(slot.clone());
-                let inner_modules = canonical_links.join(&slot).join("node_modules");
-                walk_symlinks_to_store(&inner_modules, canonical_links, reachable, visited);
-            }
-        } else if file_type.is_dir() {
-            // Skip `.pnpm` — that's the project-local virtual store.
-            // The slots we want are reached *through* `.pnpm`'s
-            // symlinks, not by descending into it directly. (When
-            // GVS is on, `.pnpm` may also be absent, in which case
-            // the skip is a no-op.)
-            let name = entry.file_name();
-            if name.to_string_lossy() == ".pnpm" {
-                continue;
-            }
-            walk_symlinks_to_store(&entry_path, canonical_links, reachable, visited);
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| PruneError::ReadMarkDir { path: dir.to_path_buf(), error })?;
+        if let Some(next_dir) = next_walk_dir(&entry, canonical_links, reachable) {
+            walk_symlinks_to_store(&next_dir, canonical_links, reachable, visited)?;
         }
     }
+    Ok(())
+}
+
+/// The directory to descend into for one entry: the store slot a symlink
+/// resolves to (recorded as reachable on the way), or a plain subdirectory.
+///
+/// `.pnpm` is the project-local virtual store, so it is skipped: the slots
+/// we want are reached *through* its symlinks, not by descending into it
+/// directly. (When GVS is on, `.pnpm` may also be absent, in which case the
+/// skip is a no-op.)
+fn next_walk_dir(
+    entry: &fs::DirEntry,
+    canonical_links: &Path,
+    reachable: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    let file_type = entry.file_type().ok()?;
+    let entry_path = entry.path();
+    if file_type.is_symlink() {
+        let slot = linked_store_slot(&entry_path, canonical_links)?;
+        let inner_modules = canonical_links.join(&slot).join("node_modules");
+        reachable.insert(slot);
+        return Some(inner_modules);
+    }
+    if file_type.is_dir()
+        && entry.file_name().to_string_lossy() != ".pnpm"
+        && canonical_links.parent() != Some(entry_path.as_path())
+    {
+        return Some(entry_path);
+    }
+    None
+}
+
+/// The `<scope>/<name>/<version>/<hash>` slot a `node_modules` symlink
+/// points at, or `None` when it leads somewhere else.
+fn linked_store_slot(entry_path: &Path, canonical_links: &Path) -> Option<PathBuf> {
+    let target = read_symlink_dir(entry_path).ok()?;
+    let absolute_target = if target.is_absolute() {
+        target
+    } else {
+        entry_path
+            .parent()
+            .map(|parent| parent.join(&target))
+            .unwrap_or(target)
+    };
+    store_slot_from_target(&absolute_target, canonical_links)
+}
+
+fn store_slot_from_target(absolute_target: &Path, canonical_links: &Path) -> Option<PathBuf> {
+    // Canonicalise the target so a symlink-bearing path prefix doesn't fool
+    // the `starts_with` check against the (already-canonical) links root.
+    let canonical_target =
+        dunce::canonicalize(absolute_target).unwrap_or_else(|_| absolute_target.to_path_buf());
+
+    // Slot path is the segment after `canonical_links` up to (but excluding)
+    // the first `node_modules` component. Layout:
+    //   <links>/<scope>/<name>/<version>/<hash>/node_modules/<pkg>
+    // We want `<scope>/<name>/<version>/<hash>`.
+    let rel = canonical_target.strip_prefix(canonical_links).ok()?;
+    let parts: Vec<_> = rel.components().collect();
+    if parts
+        .iter()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let node_modules = parts
+        .iter()
+        .position(|component| component.as_os_str() == std::ffi::OsStr::new("node_modules"))?;
+    (node_modules > 0).then(|| parts[..node_modules].iter().collect())
 }
 
 /// Sweep phase: walk `<links_dir>/<scope>/<name>/<version>/<hash>`
@@ -273,8 +376,7 @@ fn remove_unreachable_packages(
     reachable: &HashSet<PathBuf>,
 ) -> Result<usize, PruneError> {
     let mut count = 0usize;
-    let scopes = list_subdirs(links_dir)?;
-    for scope in &scopes {
+    for scope in &list_subdirs(links_dir)? {
         let scope_path = links_dir.join(scope);
         let pkg_names = list_subdirs(&scope_path)?;
         let mut emptied_pkgs = 0;
@@ -284,14 +386,8 @@ fn remove_unreachable_packages(
             let (removed_here, all_versions_emptied) =
                 remove_unreachable_versions(&pkg_dir, &pkg_rel, reachable)?;
             count += removed_here;
-            if all_versions_emptied {
-                // Every version under this pkg was emptied — try to
-                // drop the now-empty `<name>/` parent. Race-safe
-                // remove: a concurrent install that just materialised
-                // a fresh version dir here keeps its work.
-                if remove_empty_dir(&pkg_dir)? {
-                    emptied_pkgs += 1;
-                }
+            if all_versions_emptied && remove_empty_dir(&pkg_dir)? {
+                emptied_pkgs += 1;
             }
         }
         if emptied_pkgs == pkg_names.len() && !pkg_names.is_empty() {
@@ -311,29 +407,33 @@ fn remove_unreachable_versions(
     let mut emptied_versions = 0;
     for version in &versions {
         let version_dir = pkg_dir.join(version);
-        let hashes = list_subdirs(&version_dir)?;
-        let mut removed_hashes = 0;
-        for hash in &hashes {
-            let slot_rel = pkg_rel.join(version).join(hash);
-            if !reachable.contains(&slot_rel) {
-                let slot_dir = version_dir.join(hash);
-                // The slot subtree is unreferenced — recursive
-                // remove of its files is correct.
-                remove_slot_dir(&slot_dir)?;
-                removed_hashes += 1;
-                count += 1;
-            }
-        }
-        if removed_hashes == hashes.len() && !hashes.is_empty() {
-            // Try to drop the `<version>/` parent only if it's
-            // genuinely empty after the slot removals. A concurrent
-            // install that just landed a new hash dir here survives.
-            if remove_empty_dir(&version_dir)? {
-                emptied_versions += 1;
-            }
+        let (removed_here, all_hashes_removed) =
+            remove_unreachable_slots(&version_dir, &pkg_rel.join(version), reachable)?;
+        count += removed_here;
+        if all_hashes_removed && remove_empty_dir(&version_dir)? {
+            emptied_versions += 1;
         }
     }
     Ok((count, emptied_versions == versions.len() && !versions.is_empty()))
+}
+
+/// Remove every unreachable `<hash>` slot of one version, reporting how many
+/// went and whether that emptied the version directory.
+fn remove_unreachable_slots(
+    version_dir: &Path,
+    version_rel: &Path,
+    reachable: &HashSet<PathBuf>,
+) -> Result<(usize, bool), PruneError> {
+    let hashes = list_subdirs(version_dir)?;
+    let mut removed = 0usize;
+    for hash in &hashes {
+        if reachable.contains(&version_rel.join(hash)) {
+            continue;
+        }
+        remove_slot_dir(&version_dir.join(hash))?;
+        removed += 1;
+    }
+    Ok((removed, removed == hashes.len() && !hashes.is_empty()))
 }
 
 /// Returns the names of every directory entry under `dir`, swallowing
@@ -385,10 +485,7 @@ fn remove_slot_dir(path: &Path) -> Result<(), PruneError> {
 /// just-written tree wiped by that recursive remove. Using
 /// `fs::remove_dir` keeps pacquet race-safe (the new slot stays;
 /// only the parent that's truly empty is removed) while producing
-/// the same on-disk result in the non-race case. Slot directories
-/// themselves still go through [`remove_slot_dir`] — those are
-/// known-unreferenced by the time prune reaches them, so recursive
-/// removal is correct.
+/// the same on-disk result in the non-race case.
 fn remove_empty_dir(path: &Path) -> Result<bool, PruneError> {
     match fs::remove_dir(path) {
         Ok(()) => Ok(true),

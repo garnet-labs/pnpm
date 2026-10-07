@@ -81,6 +81,9 @@ impl EnvVar for GlEnv {
             "CI_PIPELINE_ID" => "999",
             "CI_CONFIG_PATH" => ".gitlab-ci.yml",
             "CI_JOB_URL" => "https://gitlab.com/pnpm/pnpm/-/jobs/555",
+            "CI_PROJECT_ID" => "123",
+            "CI_PROJECT_NAMESPACE_ID" => "456",
+            "CI_PIPELINE_SOURCE" => "push",
             _ => return None,
         };
         Some(value.to_owned())
@@ -106,6 +109,29 @@ fn gitlab_statement_shapes_the_slsa_v02_predicate() {
     );
     assert_eq!(predicate["materials"][0]["uri"], "git+https://gitlab.com/pnpm/pnpm");
     assert_eq!(predicate["materials"][0]["digest"]["sha1"], "abc123");
+}
+
+#[test]
+fn gitlab_statement_lists_the_set_ci_variables_as_invocation_parameters() {
+    let subject = json!([{ "name": "pkg:npm/pkg@1.0.0", "digest": { "sha512": "deadbeef" } }]);
+    let statement = gitlab_statement::<GlEnv>(&subject);
+
+    assert_eq!(
+        statement["predicate"]["invocation"]["parameters"],
+        json!({
+            "CI_COMMIT_SHA": "abc123",
+            "CI_CONFIG_PATH": ".gitlab-ci.yml",
+            "CI_JOB_ID": "555",
+            "CI_JOB_NAME": "publish",
+            "CI_JOB_URL": "https://gitlab.com/pnpm/pnpm/-/jobs/555",
+            "CI_PIPELINE_ID": "999",
+            "CI_PIPELINE_SOURCE": "push",
+            "CI_PROJECT_ID": "123",
+            "CI_PROJECT_NAMESPACE_ID": "456",
+            "CI_PROJECT_URL": "https://gitlab.com/pnpm/pnpm",
+            "CI_RUNNER_ID": "77",
+        }),
+    );
 }
 
 /// A GitHub-Actions provider that reuses [`GhEnv`]'s variable bodies.
@@ -203,8 +229,9 @@ async fn fetch_sigstore_token_uses_github_request_token() {
         })
     });
 
-    let token =
-        fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default()).await.unwrap();
+    let token = fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default())
+        .await
+        .unwrap();
     assert_eq!(token, "gh-sigstore-token");
 }
 
@@ -231,8 +258,9 @@ async fn fetch_sigstore_token_reads_gitlab_env_token() {
         }
     }
 
-    let token =
-        fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default()).await.unwrap();
+    let token = fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default())
+        .await
+        .unwrap();
     assert_eq!(token, "gl-sigstore-token");
 }
 
@@ -258,8 +286,9 @@ async fn fetch_sigstore_token_errors_when_gitlab_token_missing() {
         }
     }
 
-    let err =
-        fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default()).await.unwrap_err();
+    let err = fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default())
+        .await
+        .unwrap_err();
     assert!(matches!(err, ProvenanceGenError::GitLabMissingToken));
 }
 
@@ -410,8 +439,7 @@ const INSTANT_RETRIES: pnpm_network::RetryOpts = pnpm_network::RetryOpts {
 
 #[tokio::test]
 async fn with_sign_deadline_times_out_a_hung_attempt() {
-    let err = with_sign_deadline(Duration::ZERO, std::future::pending())
-        .await
+    let err = with_sign_deadline(Duration::ZERO, std::future::pending()).await
         .expect_err("a hung exchange hits the deadline");
     assert!(matches!(err, ProvenanceGenError::Sign { .. }), "got {err:?}");
 }
@@ -479,7 +507,8 @@ async fn fetch_sigstore_token_rejects_unsupported_provider() {
         }
     }
 
-    let err =
-        fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default()).await.unwrap_err();
+    let err = fetch_sigstore_token::<Sys, SilentReporter>(&OidcHttpOptions::default())
+        .await
+        .unwrap_err();
     assert!(matches!(err, ProvenanceGenError::UnsupportedProvider));
 }

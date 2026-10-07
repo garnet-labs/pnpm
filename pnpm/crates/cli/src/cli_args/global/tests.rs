@@ -1,11 +1,22 @@
 use super::{
-    FsGlobalRemoval, GlobalInstallCleanup, GlobalRemovalTransaction, activation::FsRename,
-    check_virtual_shim_conflicts, commit_global_removal, infer_local_package_alias,
-    is_windows_drive_path, replacement_aliases, resolve_local_param,
-    should_replace_existing_package, split_comma_separated, update_selectors,
+    FsGlobalRemoval, GlobalPackageBinSnapshot, activation::FsRename, check_virtual_shim_conflicts,
+    global_group_config, infer_local_package_alias, replacement_aliases,
+    should_replace_existing_package, snapshot_global_package, update_selectors,
+};
+use crate::{
+    cli_args::{
+        global::{
+            cleanup::{FsRemoveDirAll, discard_install_dir_on_error_with_fs},
+            remove::{GlobalInstallCleanup, GlobalRemovalTransaction, commit_global_removal},
+            selectors::{is_windows_drive_path, resolve_local_param, split_comma_separated},
+        },
+        shim::record_virtual_shim_state,
+    },
+    shim_dispatch::{ShimTarget, install_native_shim, remove_native_shim},
 };
 use miette::IntoDiagnostic;
 use pnpm_cmd_shim::{Host as CmdShimHost, PackageBinSource, remove_bin as remove_cmd_shim};
+use pnpm_config::Config;
 use pnpm_fs::{force_symlink_dir, remove_symlink_dir};
 use pnpm_global::GlobalPackageInfo;
 use serde_json::json;
@@ -16,11 +27,6 @@ use std::{
     sync::Arc,
 };
 use tempfile::TempDir;
-
-use crate::{
-    cli_args::shim::record_virtual_shim_state,
-    shim_dispatch::{ShimTarget, install_native_shim, remove_native_shim},
-};
 
 struct BinRemovalFailure;
 struct HashRemovalFailure;
@@ -164,8 +170,11 @@ fn later_hash_cleanup_failure_restores_earlier_groups() {
     let first_group =
         fixture.seed_group(GlobalGroupSpec { alias: "first", hash: "first-hash", bin: "first" });
     let groups = vec![first_group.clone(), fixture.group.clone()];
-    let affected_bin_names =
-        fixture.affected_bin_names.iter().cloned().chain(["first".to_string()]).collect();
+    let affected_bin_names = fixture.affected_bin_names
+        .iter()
+        .cloned()
+        .chain(["first".to_string()])
+        .collect();
     let bins_to_keep = HashSet::new();
     let cleanup = fixture.cleanup(&bins_to_keep);
     let transaction = GlobalRemovalTransaction {
@@ -183,8 +192,8 @@ fn later_hash_cleanup_failure_restores_earlier_groups() {
         fs::read(fixture.global_bin_dir.join("first")).expect("read first bin"),
         b"old first\n",
     );
-    assert!(pnpm_global::get_hash_link(&fixture.global_pkg_dir, &first_group.hash).exists());
-    assert!(first_group.install_dir.exists());
+    assert!(pnpm_global::get_hash_link(&fixture.global_pkg_dir, &first_group.info.hash).exists());
+    assert!(first_group.info.install_dir.exists());
 }
 
 #[test]
@@ -195,7 +204,7 @@ fn detects_windows_drive_paths() {
 }
 
 #[test]
-fn latest_update_drops_the_spec_only_of_plain_version_dependencies() {
+fn latest_update_uses_the_latest_tag_only_for_plain_version_dependencies() {
     let dependencies = vec![
         ("private-linked-pkg".to_string(), "link:/home/user/private-linked-pkg".to_string()),
         ("local-tarball-pkg".to_string(), "file:/home/user/local-tarball-pkg.tgz".to_string()),
@@ -215,13 +224,16 @@ fn latest_update_drops_the_spec_only_of_plain_version_dependencies() {
             "remote-tarball-pkg@https://example.com/pkg.tgz",
             "aliased-pkg@npm:other-pkg@^2.0.0",
             "named-registry-pkg@gh:^3.0.0",
-            "foo",
-            "bar",
+            "foo@latest",
+            "bar@latest",
         ],
     );
     assert_eq!(
         update_selectors(&dependencies, false, &HashMap::new()),
-        dependencies.iter().map(|(alias, spec)| format!("{alias}@{spec}")).collect::<Vec<String>>(),
+        dependencies
+            .iter()
+            .map(|(alias, spec)| format!("{alias}@{spec}"))
+            .collect::<Vec<String>>(),
     );
 }
 
@@ -235,7 +247,10 @@ fn a_pinned_dependency_is_held_at_its_installed_version() {
     ];
     let pins = HashMap::from([("prerelease".to_string(), "2.0.0".to_string())]);
 
-    assert_eq!(update_selectors(&dependencies, true, &pins), vec!["prerelease@2.0.0", "stable"]);
+    assert_eq!(
+        update_selectors(&dependencies, true, &pins),
+        vec!["prerelease@2.0.0", "stable@latest"],
+    );
 }
 
 #[test]
@@ -343,11 +358,83 @@ fn exact_aliases_still_replace_mixed_groups() {
     ));
 }
 
+#[test]
+fn ownership_snapshot_preserves_manifest_diagnostic_codes() {
+    struct FailingFreshInstallCleanup;
+
+    impl FsRemoveDirAll for FailingFreshInstallCleanup {
+        fn remove_dir_all(_: &Path) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    let root = tempfile::tempdir().expect("create ownership fixture");
+    let info = GlobalPackageInfo {
+        hash: "hash".to_string(),
+        install_dir: root.path().to_path_buf(),
+        dependencies: vec![("dependency".to_string(), "1.0.0".to_string())],
+    };
+    let manifest_path = root.path().join("node_modules/dependency/package.json");
+
+    let empty =
+        snapshot_global_package(info.clone()).expect("a group without node_modules owns no bins");
+    assert!(empty.bin_names.is_empty());
+
+    // A dependency directory without its manifest still fails closed.
+    std::fs::create_dir_all(root.path().join("node_modules/dependency"))
+        .expect("create dependency directory");
+
+    let missing = snapshot_global_package(info.clone())
+        .err()
+        .expect("a missing ownership manifest must fail");
+    let missing: &(dyn miette::Diagnostic + Send + Sync) = missing.as_ref();
+    assert_eq!(
+        miette::Diagnostic::code(missing).map(|code| code.to_string()),
+        Some("ERR_PNPM_PACKAGE_MANIFEST_IO_ERROR".to_string()),
+    );
+
+    let missing = snapshot_global_package(info.clone())
+        .err()
+        .expect("a missing ownership manifest must fail");
+    let cleanup_error = discard_install_dir_on_error_with_fs::<FailingFreshInstallCleanup, (), _>(
+        root.path(),
+        Err(missing),
+    )
+    .expect_err("a fresh install that cannot be discarded must fail");
+    let cleanup_diagnostic: &(dyn miette::Diagnostic + Send + Sync) = cleanup_error.as_ref();
+    let install_diagnostic = miette::Diagnostic::diagnostic_source(cleanup_diagnostic)
+        .expect("cleanup failure retains the install diagnostic");
+    assert_eq!(
+        miette::Diagnostic::code(install_diagnostic).map(|code| code.to_string()),
+        Some("ERR_PNPM_PACKAGE_MANIFEST_IO_ERROR".to_string()),
+    );
+    let cleanup_reports = miette::Diagnostic::related(cleanup_diagnostic)
+        .expect("cleanup failure reports the remaining artifact")
+        .collect::<Vec<_>>();
+    assert_eq!(cleanup_reports.len(), 1);
+    assert!(
+        cleanup_reports[0]
+            .to_string()
+            .contains(&root.path().display().to_string()),
+    );
+
+    std::fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
+        .expect("create dependency directory");
+    std::fs::write(manifest_path, "{").expect("write malformed ownership manifest");
+    let malformed =
+        snapshot_global_package(info).err().expect("a malformed ownership manifest must fail");
+    let malformed: &(dyn miette::Diagnostic + Send + Sync) = malformed.as_ref();
+    assert_eq!(
+        miette::Diagnostic::code(malformed).map(|code| code.to_string()),
+        Some("ERR_PNPM_PACKAGE_MANIFEST_SERIALIZATION_ERROR".to_string()),
+    );
+}
+
 struct GlobalRemovalFixture {
     _root: TempDir,
     global_pkg_dir: PathBuf,
     global_bin_dir: PathBuf,
-    group: GlobalPackageInfo,
+    group: GlobalPackageBinSnapshot,
     affected_bin_names: HashSet<String>,
 }
 
@@ -399,7 +486,7 @@ impl GlobalRemovalFixture {
             _root: root,
             global_pkg_dir,
             global_bin_dir,
-            group,
+            group: snapshot_global_package(group).expect("snapshot fixture group ownership"),
             affected_bin_names: HashSet::from(["owner".to_string(), "other".to_string()]),
         }
     }
@@ -425,7 +512,7 @@ impl GlobalRemovalFixture {
         }
     }
 
-    fn seed_group(&self, spec: GlobalGroupSpec<'_>) -> GlobalPackageInfo {
+    fn seed_group(&self, spec: GlobalGroupSpec<'_>) -> GlobalPackageBinSnapshot {
         let install_dir = self.global_pkg_dir.join(format!("install-{}", spec.alias));
         let package_dir = install_dir.join("node_modules").join(spec.alias);
         fs::create_dir_all(&package_dir).expect("create installed package directory");
@@ -452,7 +539,7 @@ impl GlobalRemovalFixture {
             &pnpm_global::get_hash_link(&self.global_pkg_dir, &group.hash),
         )
         .expect("seed global hash link");
-        group
+        snapshot_global_package(group).expect("snapshot seeded group ownership")
     }
 
     fn assert_package_commands_restored(&self) {
@@ -464,12 +551,17 @@ impl GlobalRemovalFixture {
             fs::read(self.global_bin_dir.join("other")).expect("read other bin"),
             b"old other\n",
         );
-        assert!(pnpm_global::get_hash_link(&self.global_pkg_dir, &self.group.hash).exists());
-        assert!(self.group.install_dir.exists());
+        assert!(pnpm_global::get_hash_link(&self.global_pkg_dir, &self.group.info.hash).exists());
+        assert!(self.group.info.install_dir.exists());
         let backup_count = fs::read_dir(&self.global_bin_dir)
             .expect("read global bin directory")
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".pnpm-bin-backup-"))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pnpm-bin-backup-")
+            })
             .count();
         assert_eq!(backup_count, 0);
     }
@@ -492,4 +584,21 @@ fn create_local_package(root: &Path, directory_name: &str, manifest: &str) -> Pa
     std::fs::write(package_dir.join("package.json"), manifest)
         .expect("write local package manifest");
     package_dir
+}
+
+#[test]
+fn a_group_config_carries_the_persisted_minimum_release_age_excludes() {
+    let dir = TempDir::new().expect("temp dir");
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "minimumReleaseAgeExclude:\n  - foo@2.0.0\n")
+        .expect("write the group manifest");
+    let mut base = Config::new();
+    base.minimum_release_age_exclude = Some(vec!["bar@1.0.0".to_string()]);
+
+    let config =
+        global_group_config(&base, dir.path(), dir.path(), None).expect("build the group config");
+
+    assert_eq!(
+        config.minimum_release_age_exclude,
+        Some(vec!["bar@1.0.0".to_string(), "foo@2.0.0".to_string()]),
+    );
 }

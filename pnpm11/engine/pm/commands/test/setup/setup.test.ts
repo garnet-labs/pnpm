@@ -71,6 +71,21 @@ test('setup makes no changes', async () => {
   expect(output).toBe('No changes to the environment were made. Everything is already up to date.')
 })
 
+test('setup names the shell config file when it makes no changes', async () => {
+  jest.mocked(addDirToEnvPath).mockReturnValue(Promise.resolve<PathExtenderReport>({
+    configFile: {
+      changeType: 'skipped',
+      path: '~/.bashrc',
+    },
+    oldSettings: 'export PNPM_HOME=dir',
+    newSettings: 'export PNPM_HOME=dir',
+  }))
+  const output = await setup.handler({ pnpmHomeDir: '' })
+  expect(output).toBe(`Configuration already up to date in ~/.bashrc
+
+No changes to the environment were made. Everything is already up to date.`)
+})
+
 test('setup makes changes on POSIX', async () => {
   jest.mocked(addDirToEnvPath).mockReturnValue(Promise.resolve<PathExtenderReport>({
     configFile: {
@@ -83,7 +98,7 @@ test('setup makes changes on POSIX', async () => {
   const output = await setup.handler({ pnpmHomeDir: '' })
   expect(output).toBe(`Created ~/.bashrc
 
-Next configuration changes were made:
+The following configuration changes were made:
 export PNPM_HOME=dir2
 
 To start using pnpm, run:
@@ -97,7 +112,7 @@ test('setup makes changes on Windows', async () => {
     newSettings: 'export PNPM_HOME=dir2',
   }))
   const output = await setup.handler({ pnpmHomeDir: '' })
-  expect(output).toBe(`Next configuration changes were made:
+  expect(output).toBe(`The following configuration changes were made:
 export PNPM_HOME=dir2
 
 Setup complete. Open a new terminal to start using pnpm.`)
@@ -386,3 +401,139 @@ test('setup ignores legacy shim cleanup failures', async () => {
     actualFs.rmSync(tmpDir, { recursive: true, force: true })
   }
 })
+
+// The aliases setup writes are `sh` scripts, so this runs where `sh` does. On
+// Windows the .cmd wrappers take over.
+const posixTest = process.platform === 'win32' ? test.skip : test
+
+posixTest('the alias scripts run the pnpm beside them, not one earlier on PATH', async () => {
+  jest.mocked(addDirToEnvPath).mockReturnValue(Promise.resolve<PathExtenderReport>({
+    oldSettings: 'PNPM_HOME=dir',
+    newSettings: 'PNPM_HOME=dir',
+  }))
+  jest.mocked(detectIfCurrentPkgIsExecutable).mockReturnValue(true)
+  const tmpDir = actualFs.mkdtempSync(path.join(os.tmpdir(), 'pnpm-setup-test-'))
+  // The backslash is deliberate: it is an ordinary character in a Unix directory
+  // name, and the walk must leave it alone rather than read it as a separator.
+  const pnpmHomeDir = path.join(tmpDir, 'home\\dir')
+  const execPath = path.join(tmpDir, 'pnpm')
+  const originalExecPath = process.execPath
+  Object.defineProperty(process, 'execPath', { value: execPath, configurable: true })
+  try {
+    await setup.handler({ pnpmHomeDir })
+
+    const binDir = path.join(pnpmHomeDir, 'bin')
+    writeStub(path.join(binDir, 'pnpm'), 'sibling')
+    // Earlier on PATH, so it wins any lookup by name.
+    const decoyDir = path.join(tmpDir, 'decoy')
+    writeStub(path.join(decoyDir, 'pnpm'), 'decoy')
+
+    for (const [name, injected] of [['pn', ''], ['pnpx', 'dlx '], ['pnx', 'dlx ']]) {
+      // MSYS and Cygwin can hand the script a native Windows path, which has no
+      // slash for ${self%/*} to strip. There is no POSIX shell on Windows to run
+      // this against, so pin the text, as the shim header's tests do. The gate is
+      // what keeps a Unix path holding a backslash off that branch, and pnpmHomeDir
+      // above holds one, so the spawn below is the executable half.
+      const script = actualFs.readFileSync(path.join(binDir, name), 'utf8')
+      expect(script).toContain('  [A-Za-z]:\\\\*|\\\\\\\\*)')
+
+      const result = actualChildProcess.spawnSync(path.join(binDir, name), ['add', 'foo'], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${decoyDir}:/usr/bin:/bin` },
+      })
+      expect({ name, stdout: result.stdout }).toEqual({ name, stdout: `sibling: ${injected}add foo\n` })
+    }
+  } finally {
+    Object.defineProperty(process, 'execPath', { value: originalExecPath, configurable: true })
+    actualFs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+/** An executable stand-in for pnpm at `file` that echoes `label` and its arguments. */
+function writeStub (file: string, label: string): void {
+  actualFs.mkdirSync(path.dirname(file), { recursive: true })
+  actualFs.writeFileSync(file, `#!/bin/sh\necho "${label}: $*"\n`)
+  actualFs.chmodSync(file, 0o755)
+}
+
+// The Windows counterpart of the test above. The stand-in sibling is named for the
+// pnpm.cmd shim `pnpm add -g` links next to the aliases.
+const winTest = process.platform === 'win32' ? test : test.skip
+// What the stand-in shim exits with, so the wrappers are shown to hand the shim's
+// status back rather than reporting their own success.
+const SHIM_EXIT_CODE = 3
+// cmd.exe needs System32 for its own startup. It follows the decoy on the PATH
+// handed to the child, and the decoy coming first is what this test turns on.
+const SYSTEM32 = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32')
+
+winTest('the .cmd wrappers call the pnpm shim beside them, not one earlier on PATH', async () => {
+  jest.mocked(addDirToEnvPath).mockReturnValue(Promise.resolve<PathExtenderReport>({
+    oldSettings: 'PNPM_HOME=dir',
+    newSettings: 'PNPM_HOME=dir',
+  }))
+  jest.mocked(detectIfCurrentPkgIsExecutable).mockReturnValue(true)
+  const tmpDir = actualFs.mkdtempSync(path.join(os.tmpdir(), 'pnpm-setup-test-'))
+  const pnpmHomeDir = path.join(tmpDir, 'home')
+  const execPath = path.join(tmpDir, 'pnpm.exe')
+  const originalExecPath = process.execPath
+  Object.defineProperty(process, 'execPath', { value: execPath, configurable: true })
+  try {
+    await setup.handler({ pnpmHomeDir })
+
+    const binDir = path.join(pnpmHomeDir, 'bin')
+    writeShimStub(path.join(binDir, 'pnpm.cmd'), 'sibling')
+    // Earlier on PATH, so it wins any lookup by name.
+    const decoyDir = path.join(tmpDir, 'decoy')
+    writeShimStub(path.join(decoyDir, 'pnpm.cmd'), 'decoy')
+
+    for (const [name, injected] of [['pn', ''], ['pnpx', 'dlx '], ['pnx', 'dlx ']]) {
+      const result = actualChildProcess.spawnSync('cmd', ['/c', path.join(binDir, `${name}.cmd`), 'add', 'foo'], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${decoyDir};${SYSTEM32}` },
+      })
+      // Otherwise a failure to spawn surfaces as `stdout` being undefined.
+      if (result.error != null) throw result.error
+      expect({ name, stdout: result.stdout.trimEnd(), status: result.status })
+        .toEqual({ name, stdout: `sibling: ${injected}add foo`, status: SHIM_EXIT_CODE })
+    }
+  } finally {
+    Object.defineProperty(process, 'execPath', { value: originalExecPath, configurable: true })
+    actualFs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+// PowerShell prefers pn.ps1 over pn.cmd, so an unsigned leftover from an earlier
+// setup would keep failing under the default execution policy.
+winTest('setup removes the .ps1 alias wrappers an earlier setup left', async () => {
+  jest.mocked(addDirToEnvPath).mockReturnValue(Promise.resolve<PathExtenderReport>({
+    oldSettings: 'PNPM_HOME=dir',
+    newSettings: 'PNPM_HOME=dir',
+  }))
+  jest.mocked(detectIfCurrentPkgIsExecutable).mockReturnValue(true)
+  const tmpDir = actualFs.mkdtempSync(path.join(os.tmpdir(), 'pnpm-setup-test-'))
+  const pnpmHomeDir = path.join(tmpDir, 'home')
+  const binDir = path.join(pnpmHomeDir, 'bin')
+  actualFs.mkdirSync(binDir, { recursive: true })
+  for (const name of ['pn', 'pnpx', 'pnx']) {
+    actualFs.writeFileSync(path.join(binDir, `${name}.ps1`), 'stale wrapper\n')
+  }
+  const originalExecPath = process.execPath
+  Object.defineProperty(process, 'execPath', { value: path.join(tmpDir, 'pnpm.exe'), configurable: true })
+  try {
+    await setup.handler({ pnpmHomeDir })
+
+    for (const name of ['pn', 'pnpx', 'pnx']) {
+      expect({ name, ps1: actualFs.existsSync(path.join(binDir, `${name}.ps1`)) }).toEqual({ name, ps1: false })
+      expect({ name, cmd: actualFs.existsSync(path.join(binDir, `${name}.cmd`)) }).toEqual({ name, cmd: true })
+    }
+  } finally {
+    Object.defineProperty(process, 'execPath', { value: originalExecPath, configurable: true })
+    actualFs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+/** A stand-in for pnpm's generated `.cmd` shim at `file`, echoing `label` and its arguments. */
+function writeShimStub (file: string, label: string): void {
+  actualFs.mkdirSync(path.dirname(file), { recursive: true })
+  actualFs.writeFileSync(file, `@echo off\r\necho ${label}: %*\r\nexit /b ${SHIM_EXIT_CODE}\r\n`)
+}

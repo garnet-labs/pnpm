@@ -1,6 +1,8 @@
+import fs from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import path from 'node:path'
+import { promisify } from 'node:util'
 
 import { afterAll, expect, test } from '@jest/globals'
 import { resolveAndInstallConfigDeps } from '@pnpm/installing.env-installer'
@@ -10,6 +12,8 @@ import { prepareEmpty } from '@pnpm/prepare'
 import { getIntegrity, REGISTRY_MOCK_PORT } from '@pnpm/testing.registry-mock'
 import { createTempStore } from '@pnpm/testing.temp-store'
 import { loadJsonFileSync } from 'load-json-file'
+
+import { bravoDepMatureUpTo101MinimumReleaseAge } from './utils/minimumReleaseAge.js'
 
 const registry = `http://localhost:${REGISTRY_MOCK_PORT}/`
 
@@ -227,29 +231,9 @@ test('takes the tarball of an old-format config dep from the packument', async (
 // registry. Packuments are proxied from pnpr with their `dist.tarball` pointed
 // at a `/tarballs/` prefix, and the derivable URL is answered with a 404.
 async function withNonDerivableTarballRegistry (run: (registryUrl: string) => Promise<void>): Promise<void> {
-  const upstreamBase = `http://localhost:${REGISTRY_MOCK_PORT}`
-  let proxyBase = ''
+  const bases = { upstream: `http://localhost:${REGISTRY_MOCK_PORT}`, proxy: '' }
   const server = http.createServer((req, res) => {
-    void (async () => {
-      const tarballPath = req.url!.startsWith('/tarballs/') ? req.url!.slice('/tarballs'.length) : undefined
-      if (tarballPath == null && req.url!.endsWith('.tgz')) {
-        res.writeHead(404)
-        res.end('Not Found')
-        return
-      }
-      const upstream = await fetch(`${upstreamBase}${tarballPath ?? req.url!}`, {
-        headers: { accept: req.headers.accept ?? '*/*' },
-      })
-      const contentType = upstream.headers.get('content-type') ?? ''
-      if (contentType.includes('json')) {
-        const body = (await upstream.text()).split(upstreamBase).join(`${proxyBase}/tarballs`)
-        res.writeHead(upstream.status, { 'content-type': 'application/json' })
-        res.end(body)
-      } else {
-        res.writeHead(upstream.status, { 'content-type': contentType })
-        res.end(Buffer.from(await upstream.arrayBuffer()))
-      }
-    })().catch((err: unknown) => {
+    proxyToUpstream(req, res, bases).catch((err: unknown) => {
       res.writeHead(500)
       res.end(String(err))
     })
@@ -257,21 +241,50 @@ async function withNonDerivableTarballRegistry (run: (registryUrl: string) => Pr
   await new Promise<void>((resolve) => {
     server.listen(0, resolve)
   })
-  proxyBase = `http://localhost:${(server.address() as AddressInfo).port}`
+  bases.proxy = `http://localhost:${(server.address() as AddressInfo).port}`
   try {
-    await run(`${proxyBase}/`)
+    await run(`${bases.proxy}/`)
   } finally {
     server.closeAllConnections()
-    await new Promise<void>((resolve, reject) => {
-      server.close((err) => {
-        if (err == null) {
-          resolve()
-        } else {
-          reject(err)
-        }
-      })
-    })
+    await closeServer(server)
   }
+}
+
+async function proxyToUpstream (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  bases: { upstream: string, proxy: string }
+): Promise<void> {
+  const tarballPath = req.url!.startsWith('/tarballs/') ? req.url!.slice('/tarballs'.length) : undefined
+  if (tarballPath == null && req.url!.endsWith('.tgz')) {
+    res.writeHead(404)
+    res.end('Not Found')
+    return
+  }
+  const upstream = await fetch(`${bases.upstream}${tarballPath ?? req.url!}`, {
+    headers: { accept: req.headers.accept ?? '*/*' },
+  })
+  const contentType = upstream.headers.get('content-type') ?? ''
+  if (contentType.includes('json')) {
+    const body = (await upstream.text()).split(bases.upstream).join(`${bases.proxy}/tarballs`)
+    res.writeHead(upstream.status, { 'content-type': 'application/json' })
+    res.end(body)
+  } else {
+    res.writeHead(upstream.status, { 'content-type': contentType })
+    res.end(Buffer.from(await upstream.arrayBuffer()))
+  }
+}
+
+async function closeServer (server: http.Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((err) => {
+      if (err == null) {
+        resolve()
+      } else {
+        reject(err)
+      }
+    })
+  })
 }
 
 test('keeps optional subdeps of a pinned config dep out of the lockfile', async () => {
@@ -351,7 +364,7 @@ test('emits installing-config-deps events only when work is needed', async () =>
   const firstRunEvents = takeConfigDepEvents()
 
   expect(firstRunEvents.map(e => e.status)).toEqual(['started', 'done'])
-  expect(firstRunEvents.find(e => e.status === 'done')?.deps).toEqual([
+  expect(firstRunEvents.find(event => event.status === 'done')?.deps).toEqual([
     { name: '@pnpm.e2e/foo', version: '100.0.0' },
   ])
 
@@ -386,4 +399,167 @@ test('succeeds with frozenLockfile when env lockfile is up-to-date', async () =>
   const manifest = loadJsonFileSync<{ name: string, version: string }>('node_modules/.pnpm-config/@pnpm.e2e/foo/package.json')
   expect(manifest.name).toBe('@pnpm.e2e/foo')
   expect(manifest.version).toBe('100.0.0')
+})
+
+test.each([undefined, '2.0.0'])('rejects a config lockfile redirect before fetching its tarball (metadata version %s)', async (metadataVersion) => {
+  prepareEmpty()
+  let tarballRequests = 0
+  const server = http.createServer((request, response) => {
+    if (request.url === '/unapproved.tgz') {
+      tarballRequests++
+      response.end('unapproved archive')
+      return
+    }
+    response.setHeader('content-type', 'application/json')
+    response.end(JSON.stringify({
+      name: 'my-config',
+      versions: {
+        '2.0.0': {
+          name: 'my-config', version: '2.0.0',
+          dist: { integrity: 'sha512-ZGVm', tarball: `${registryUrl}unapproved.tgz` },
+        },
+        '1.0.0': {
+          name: 'my-config', version: '1.0.0',
+          dist: { integrity: 'sha512-YWJj', tarball: `${registryUrl}my-config/-/my-config-1.0.0.tgz` },
+        },
+      },
+    }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const registryUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`
+  try {
+    const lockfile = createEnvLockfile()
+    lockfile.importers['.'].configDependencies['my-config'] = { specifier: '1.0.0', version: '1.0.0' }
+    lockfile.packages['my-config@1.0.0'] = {
+      version: metadataVersion,
+      resolution: { integrity: 'sha512-ZGVm', tarball: `${registryUrl}unapproved.tgz` },
+    }
+    lockfile.snapshots['my-config@1.0.0'] = {}
+    await writeEnvLockfile(process.cwd(), lockfile)
+    await expect(resolveAndInstallConfigDeps({ 'my-config': '1.0.0' }, createOpts(registryUrl)))
+      .rejects.toMatchObject({ code: 'ERR_PNPM_BAD_CONFIG_DEP' })
+    expect(tarballRequests).toBe(0)
+  } finally {
+    await promisify(server.close.bind(server))()
+  }
+})
+
+test.each(['1.0.0+sha512-YWJj', { integrity: '1.0.0+sha512-YWJj', tarball: 'https://approved.example/config.tgz' }])(
+  'rejects a config lockfile that replaces the configured integrity pin (%j)', async (specifier) => {
+    prepareEmpty()
+    const lockfile = createEnvLockfile()
+    lockfile.importers['.'].configDependencies['my-config'] = { specifier: '1.0.0', version: '1.0.0' }
+    lockfile.packages['my-config@1.0.0'] = {
+      resolution: { integrity: 'sha512-ZGVm', tarball: 'https://unapproved.example/config.tgz' },
+    }
+    lockfile.snapshots['my-config@1.0.0'] = {}
+    await writeEnvLockfile(process.cwd(), lockfile)
+    await expect(resolveAndInstallConfigDeps({ 'my-config': specifier }, createOpts()))
+      .rejects.toMatchObject({ code: 'ERR_PNPM_BAD_CONFIG_DEP' })
+  }
+)
+
+test('rejects replacing the version of an integrity-pinned configuration dependency', async () => {
+  prepareEmpty()
+  const lockfile = createEnvLockfile()
+  lockfile.importers['.'].configDependencies['my-config'] = { specifier: '1.0.0', version: '2.0.0' }
+  lockfile.packages['my-config@2.0.0'] = { resolution: { integrity: 'sha512-ZGVm' } }
+  lockfile.snapshots['my-config@2.0.0'] = {}
+  await writeEnvLockfile(process.cwd(), lockfile)
+  await expect(resolveAndInstallConfigDeps({ 'my-config': '1.0.0+sha512-YWJj' }, createOpts()))
+    .rejects.toMatchObject({ code: 'ERR_PNPM_BAD_CONFIG_DEP', message: expect.stringContaining('configured integrity') })
+})
+
+test('rejects a git-hosted config lockfile entry before fetching it', async () => {
+  prepareEmpty()
+  const opts = createOpts()
+  const fetchedIds: string[] = []
+  const fetchPackage = opts.store.fetchPackage
+  opts.store.fetchPackage = async (options) => {
+    fetchedIds.push(options.pkg.id)
+    return fetchPackage(options)
+  }
+  const lockfile = createEnvLockfile()
+  lockfile.importers['.'].configDependencies['my-config'] = { specifier: '1.0.0', version: '1.0.0' }
+  lockfile.packages['my-config@1.0.0'] = {
+    resolution: { integrity: 'sha512-ZGVm', tarball: `https://codeload.github.com/evil/config/tar.gz/${'a'.repeat(40)}` },
+  }
+  lockfile.snapshots['my-config@1.0.0'] = {}
+  await writeEnvLockfile(process.cwd(), lockfile)
+  await expect(resolveAndInstallConfigDeps({ 'my-config': '1.0.0' }, opts))
+    .rejects.toMatchObject({ code: 'ERR_PNPM_BAD_CONFIG_DEP', message: expect.stringContaining('must resolve from an npm registry') })
+  expect(fetchedIds).toStrictEqual([])
+})
+
+test('verifies config dependencies against the registry only when they need to be installed', async () => {
+  prepareEmpty()
+  const opts = createOpts()
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/foo': '100.0.0' }, opts)
+
+  const unreachableRegistry = 'http://127.0.0.1:1/'
+  const offlineOpts = {
+    ...opts,
+    registriesByScope: { default: unreachableRegistry },
+    minimumReleaseAge: 1440,
+    retry: { retries: 0 },
+    frozenLockfile: true,
+  }
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/foo': '100.0.0' }, offlineOpts)
+
+  const lockfile = (await readEnvLockfile(process.cwd()))!
+  lockfile.packages['@pnpm.e2e/foo@100.0.0'] = {
+    resolution: { integrity: 'sha512-ZGVm', tarball: `${unreachableRegistry}foo.tgz` },
+  }
+  await writeEnvLockfile(process.cwd(), lockfile)
+  await expect(resolveAndInstallConfigDeps({ '@pnpm.e2e/foo': '100.0.0' }, offlineOpts)).rejects.toThrow()
+})
+
+test('resolves a config dependency to a version older than minimumReleaseAge', async () => {
+  prepareEmpty()
+  const opts = { ...createOpts(), minimumReleaseAge: bravoDepMatureUpTo101MinimumReleaseAge() }
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/bravo-dep': '^1.0.0' }, opts)
+  expect(loadJsonFileSync<{ version: string }>('node_modules/.pnpm-config/@pnpm.e2e/bravo-dep/package.json').version).toBe('1.0.1')
+
+  fs.rmSync('node_modules', { recursive: true })
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/bravo-dep': '^1.0.0' }, { ...opts, frozenLockfile: true })
+  expect(loadJsonFileSync<{ version: string }>('node_modules/.pnpm-config/@pnpm.e2e/bravo-dep/package.json').version).toBe('1.0.1')
+})
+
+test('rejects a config dependency newer than minimumReleaseAge', async () => {
+  prepareEmpty()
+  const opts = { ...createOpts(), minimumReleaseAge: bravoDepMatureUpTo101MinimumReleaseAge() }
+  await expect(resolveAndInstallConfigDeps({ '@pnpm.e2e/bravo-dep': '1.1.0' }, opts))
+    .rejects.toMatchObject({ code: 'ERR_PNPM_BAD_CONFIG_DEP', message: expect.stringContaining('minimumReleaseAge') })
+  expect(await readEnvLockfile(process.cwd())).toBeNull()
+})
+
+test('minimumReleaseAgeExclude admits a config dependency newer than minimumReleaseAge', async () => {
+  prepareEmpty()
+  const opts = {
+    ...createOpts(),
+    minimumReleaseAge: bravoDepMatureUpTo101MinimumReleaseAge(),
+    minimumReleaseAgeExclude: ['@pnpm.e2e/bravo-dep'],
+  }
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/bravo-dep': '1.1.0' }, opts)
+  fs.rmSync('node_modules', { recursive: true })
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/bravo-dep': '1.1.0' }, { ...opts, frozenLockfile: true })
+  expect(loadJsonFileSync<{ version: string }>('node_modules/.pnpm-config/@pnpm.e2e/bravo-dep/package.json').version).toBe('1.1.0')
+})
+
+test('rejects a config dependency whose optional dependency is newer than minimumReleaseAge', async () => {
+  prepareEmpty()
+  const opts = {
+    ...createOpts(),
+    minimumReleaseAge: 100 * 365 * 24 * 60,
+    minimumReleaseAgeExclude: ['@pnpm.e2e/optional-platform-selector'],
+  }
+  await expect(resolveAndInstallConfigDeps({ '@pnpm.e2e/optional-platform-selector': '2.0.0' }, opts))
+    .rejects.toMatchObject({ code: 'ERR_PNPM_BAD_CONFIG_DEP', message: expect.stringContaining('minimumReleaseAge') })
+})
+
+test('resolves a version+integrity pin newer than minimumReleaseAge', async () => {
+  prepareEmpty()
+  const opts = { ...createOpts(), minimumReleaseAge: 100 * 365 * 24 * 60 }
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/foo': `100.0.0+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}` }, opts)
+  expect(loadJsonFileSync<{ version: string }>('node_modules/.pnpm-config/@pnpm.e2e/foo/package.json').version).toBe('100.0.0')
 })

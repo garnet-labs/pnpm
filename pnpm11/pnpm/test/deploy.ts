@@ -8,7 +8,7 @@ import { loadJsonFileSync } from 'load-json-file'
 import { readYamlFileSync } from 'read-yaml-file'
 import { writeYamlFileSync } from 'write-yaml-file'
 
-import { execPnpm } from './utils/index.js'
+import { execPnpm, execPnpmSync } from './utils/index.js'
 
 // Covers https://github.com/pnpm/pnpm/issues/9550
 // This test is currently disabled because of https://github.com/pnpm/pnpm/issues/9596
@@ -90,6 +90,91 @@ test.skip('legacy deploy creates only necessary directories when the root manife
   expect(loadJsonFileSync('services/foo/pnpm.out/package.json')).toStrictEqual(loadJsonFileSync('services/foo/package.json'))
 })
 
+// Covers https://github.com/pnpm/pnpm/issues/6437
+test('legacy deploy leaves out the dependencies of the workspace root project', async () => {
+  preparePackages([
+    {
+      location: '.',
+      package: {
+        name: 'root',
+        version: '0.0.0',
+        private: true,
+        dependencies: { '@pnpm.e2e/bar': '100.0.0' },
+      },
+    },
+    {
+      location: 'packages/app',
+      package: {
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { '@pnpm.e2e/foo': '100.0.0' },
+      },
+    },
+  ])
+
+  writeYamlFileSync('pnpm-workspace.yaml', {
+    packages: ['packages/*'],
+    forceLegacyDeploy: true,
+  })
+
+  await execPnpm(['install'])
+  await execPnpm(['--filter=app', 'deploy', '--prod', 'deploy-dir'])
+
+  expect(fs.existsSync('deploy-dir/node_modules/@pnpm.e2e/foo')).toBe(true)
+  expect(fs.existsSync('deploy-dir/node_modules/@pnpm.e2e/bar')).toBe(false)
+  expect(fs.readdirSync('deploy-dir/node_modules/.pnpm').filter(entry => entry.startsWith('@pnpm.e2e+bar@'))).toStrictEqual([])
+  expect(fs.existsSync('node_modules/@pnpm.e2e/bar')).toBe(true)
+})
+
+test('running a script in a deployed project does not trigger an install outside CI', async () => {
+  preparePackages([
+    { location: '.', package: { name: 'root', version: '0.0.0', private: true } },
+    {
+      location: 'packages/app',
+      package: {
+        name: 'app',
+        version: '1.0.0',
+        scripts: { start: 'node --eval ""' },
+      },
+    },
+  ])
+
+  writeYamlFileSync('pnpm-workspace.yaml', {
+    autoInstallPeers: false,
+    dedupePeers: true,
+    excludeLinksFromLockfile: true,
+    ignoredOptionalDependencies: ['never-matches'],
+    packages: ['packages/*'],
+    peersSuffixMaxLength: 42,
+  })
+
+  await execPnpm(['install'])
+
+  const workspaceDir = process.cwd()
+  const deployDir = path.join(tempDir(false), 'deploy')
+  await execPnpm(['--filter=app', 'deploy', deployDir])
+
+  expect(readYamlFileSync(path.join(deployDir, 'pnpm-workspace.yaml'))).toStrictEqual({
+    autoInstallPeers: false,
+    dedupePeers: true,
+    excludeLinksFromLockfile: true,
+    ignoredOptionalDependencies: ['never-matches'],
+    injectWorkspacePackages: false,
+    packages: ['.'],
+    peersSuffixMaxLength: 42,
+    virtualStoreType: 'project',
+  })
+
+  process.chdir(deployDir)
+  try {
+    await execPnpm(['--config.verify-deps-before-run=error', 'run', 'start'], {
+      env: { CI: 'false' },
+    })
+  } finally {
+    process.chdir(workspaceDir)
+  }
+})
+
 test('deploy with a shared lockfile honors --no-optional in the graph and virtual store', async () => {
   preparePackages([
     { location: '.', package: { name: 'root', version: '0.0.0', private: true } },
@@ -129,6 +214,19 @@ test('deploy with a shared lockfile honors --no-optional in the graph and virtua
   })
 
   await execPnpm(['install'])
+
+  const deployDirWithOptional = path.resolve('deploy-with-optional')
+  await execPnpm(['--filter=app', 'deploy', '--prod', deployDirWithOptional])
+
+  expect(fs.existsSync(path.join(deployDirWithOptional, 'node_modules/lib'))).toBe(true)
+  expect(fs.existsSync(path.join(deployDirWithOptional, 'node_modules/optional-only'))).toBe(true)
+  const libReal = fs.realpathSync(path.join(deployDirWithOptional, 'node_modules/lib'))
+  expect(fs.existsSync(path.join(path.dirname(libReal), '@pnpm.e2e/qar'))).toBe(true)
+  const optReal = fs.realpathSync(path.join(deployDirWithOptional, 'node_modules/optional-only'))
+  expect(fs.existsSync(path.join(path.dirname(optReal), '@pnpm.e2e/foo'))).toBe(true)
+  const virtualStoreWithOptional = fs.readdirSync(path.join(deployDirWithOptional, 'node_modules/.pnpm'))
+  expect(virtualStoreWithOptional.some(entry => entry.includes('@pnpm.e2e+qar@'))).toBe(true)
+  expect(virtualStoreWithOptional.some(entry => entry.includes('@pnpm.e2e+foo@'))).toBe(true)
 
   const deployDir = path.resolve('deploy-without-optional')
   await execPnpm(['--filter=app', 'deploy', '--prod', '--no-optional', deployDir])
@@ -266,3 +364,117 @@ test('deploy with a shared lockfile succeeds when pacquet is declared in configD
 
   expect(fs.existsSync(path.join(deployDir, 'node_modules/is-positive/package.json'))).toBe(true)
 }, PUBLIC_REGISTRY_TIMEOUT)
+
+test('deployed peer dependencies can install with a fresh lockfile', async () => {
+  const dependencies = {
+    '@pnpm.e2e/abc': '1.0.0',
+    alias: 'npm:@pnpm.e2e/abc@1.0.0',
+    '@pnpm.e2e/peer-a': '1.0.0',
+    '@pnpm.e2e/peer-b': '1.0.0',
+    '@pnpm.e2e/peer-c': '1.0.0',
+  }
+  preparePackages([
+    { location: '.', package: { name: 'root', private: true } },
+    { location: 'app', package: { name: 'app', version: '1.0.0', dependencies } },
+  ])
+  writeYamlFileSync('pnpm-workspace.yaml', { packages: ['app'], injectWorkspacePackages: true })
+  await execPnpm(['install'])
+
+  const workspaceDir = process.cwd()
+  const deployDir = path.join(tempDir(false), 'deploy')
+  await execPnpm(['--filter=app', 'deploy', deployDir])
+  const manifestPath = path.join(deployDir, 'package.json')
+  const manifest = loadJsonFileSync<{ dependencies: typeof dependencies }>(manifestPath)
+  expect(manifest.dependencies).toStrictEqual(dependencies)
+  const lockfilePath = path.join(deployDir, 'pnpm-lock.yaml')
+  const deployedLockfile = readYamlFileSync<LockfileFile>(lockfilePath)
+  expect(deployedLockfile.importers!['.'].dependencies!['@pnpm.e2e/abc'].version).toContain('(')
+
+  fs.rmSync(lockfilePath)
+  fs.rmSync(path.join(deployDir, 'node_modules'), { recursive: true })
+  process.chdir(deployDir)
+  try {
+    await execPnpm(['install', '--no-frozen-lockfile'])
+  } finally {
+    process.chdir(workspaceDir)
+  }
+  expect(loadJsonFileSync(manifestPath)).toStrictEqual(manifest)
+  const freshLockfile = readYamlFileSync<LockfileFile>(lockfilePath)
+  expect(freshLockfile.importers!['.'].dependencies!['@pnpm.e2e/abc'].version).toContain('(')
+  for (const name of ['@pnpm.e2e/abc', 'alias']) {
+    expect(loadJsonFileSync(path.join(deployDir, 'node_modules', name, 'package.json'))).toMatchObject({
+      name: '@pnpm.e2e/abc', version: '1.0.0',
+    })
+  }
+})
+
+test('deploy does not run prepare scripts of the deployed project', async () => {
+  preparePackages([
+    { location: '.', package: { name: 'root', version: '0.0.0', private: true } },
+    {
+      location: 'packages/app',
+      package: {
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { '@pnpm.e2e/foo': '100.0.0' },
+        scripts: {
+          preinstall: 'node -e "require(\'fs\').appendFileSync(\'ran-stages.txt\', \'preinstall\\n\')"',
+          install: 'node -e "require(\'fs\').appendFileSync(\'ran-stages.txt\', \'install\\n\')"',
+          postinstall: 'node -e "require(\'fs\').appendFileSync(\'ran-stages.txt\', \'postinstall\\n\')"',
+          prepublish: 'node -e "process.exit(1)"',
+          preprepare: 'node -e "process.exit(1)"',
+          prepare: 'node -e "process.exit(1)"',
+          postprepare: 'node -e "process.exit(1)"',
+        },
+      },
+    },
+  ])
+
+  writeYamlFileSync('pnpm-workspace.yaml', {
+    packages: ['packages/*'],
+  })
+
+  await execPnpm(['install', '--ignore-scripts'])
+  await execPnpm(['--filter=app', 'deploy', '--prod', 'deploy-prod'])
+  expect(fs.readFileSync('deploy-prod/ran-stages.txt', 'utf8')).toBe('preinstall\ninstall\npostinstall\n')
+
+  await execPnpm(['--filter=app', 'deploy', 'deploy-dev'])
+  expect(fs.readFileSync('deploy-dev/ran-stages.txt', 'utf8')).toBe('preinstall\ninstall\npostinstall\n')
+
+  await execPnpm(['--filter=app', 'deploy', '--legacy', 'deploy-legacy'])
+  expect(fs.readFileSync('packages/app/ran-stages.txt', 'utf8')).toBe('preinstall\ninstall\npostinstall\n')
+})
+
+test('deploy respects --package-import-method from CLI', async () => {
+  preparePackages([
+    { location: '.', package: { name: 'root', version: '0.0.0', private: true } },
+    {
+      location: 'packages/app',
+      package: {
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { '@pnpm.e2e/foo': '100.0.0' },
+      },
+    },
+  ])
+
+  writeYamlFileSync('pnpm-workspace.yaml', {
+    packages: ['packages/*'],
+  })
+
+  await execPnpm(['install'])
+
+  const copyResult = execPnpmSync(['--filter=app', 'deploy', '--prod', '--package-import-method=copy', 'deploy-copy'])
+  expect(copyResult.stdout.toString()).toContain('Packages are copied from the content-addressable store to the virtual store.')
+  const copyDepFile = path.resolve('deploy-copy/node_modules/@pnpm.e2e/foo/package.json')
+  expect(fs.statSync(copyDepFile).nlink).toBe(1)
+
+  const hardlinkResult = execPnpmSync(['--filter=app', 'deploy', '--prod', '--package-import-method=hardlink', 'deploy-hardlink'])
+  expect(hardlinkResult.stdout.toString()).toContain('Packages are hard linked from the content-addressable store to the virtual store.')
+  const hardlinkProjectFile = path.resolve('deploy-hardlink/package.json')
+  expect(fs.statSync(hardlinkProjectFile).nlink).toBe(1)
+  const hardlinkDepFile = path.resolve('deploy-hardlink/node_modules/@pnpm.e2e/foo/package.json')
+  expect(fs.statSync(hardlinkDepFile).nlink).toBeGreaterThanOrEqual(2)
+})
+
+

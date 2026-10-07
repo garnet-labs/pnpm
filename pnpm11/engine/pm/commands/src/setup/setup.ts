@@ -62,8 +62,6 @@ function getExecPath (): string {
 
 /**
  * Install the CLI as a global package using `pnpm add -g file:<dir>`.
- * This places pnpm in the standard global directory alongside other
- * globally installed packages.
  */
 function installCliGlobally (execPath: string, pnpmHomeDir: string): void {
   const execDir = path.dirname(execPath)
@@ -147,19 +145,113 @@ function createAliasScripts (targetDir: string): void {
 
   fs.mkdirSync(targetDir, { recursive: true })
 
-  createShellScript(targetDir, 'pn', 'pnpm')
-  createShellScript(targetDir, 'pnpx', 'pnpm dlx')
-  createShellScript(targetDir, 'pnx', 'pnpm dlx')
+  createShellScript(targetDir, 'pn', '')
+  createShellScript(targetDir, 'pnpx', ' dlx')
+  createShellScript(targetDir, 'pnx', ' dlx')
 }
 
-function createShellScript (targetDir: string, name: string, command: string): void {
+// Sets $self to the regular file this alias script lives in, walking the shim
+// or symlink chain it was launched through.
+const RESOLVE_SELF_SCRIPT = `# A helper the default path lacks, as in a Nix build sandbox, comes from PATH
+# instead, with node_modules and relative entries dropped from it.
+caller_path_set=\${PATH+set}
+caller_path=\${PATH-}
+helper_path=
+rest=$caller_path:
+while [ -n "$rest" ]; do
+  dir=\${rest%%:*}
+  rest=\${rest#*:}
+  case "$dir" in
+    */node_modules/*|*/node_modules) ;;
+    /*) helper_path=\${helper_path:+$helper_path:}$dir ;;
+  esac
+done
+# An empty PATH searches the current directory.
+PATH=\${helper_path:-/}
+# A helper comes from PATH only when the default path lacks it and PATH has it.
+# The bash 3.2 that macOS ships as sh answers \`command -p -v\` from PATH.
+run_helper() {
+  if command -p -v "$1" >/dev/null 2>&1 || ! command -v "$1" >/dev/null 2>&1; then command -p "$@"; else command "$@"; fi
+}
+self=$0
+# MSYS and Cygwin can launch this with a native Windows path, which has no slash
+# for \`\${self%/*}\` to strip. Only a drive letter or a UNC prefix marks one; a
+# backslash anywhere else is an ordinary character in a Unix file name, so the
+# path is left alone. The separators are swapped in the shell rather than through
+# \`echo\`, which mangles a \`\\t\` or \`\\b\` in a path under dash.
+case $self in
+  [A-Za-z]:\\\\*|\\\\\\\\*)
+    while :; do
+      case $self in
+        *\\\\*) self=\${self%%\\\\*}/\${self#*\\\\} ;;
+        *) break ;;
+      esac
+    done
+    ;;
+esac
+# \`\${self%/*}\` needs a slash to strip. A bare name came from a PATH lookup and
+# stands for a file in the current directory.
+case $self in
+  */*) ;;
+  *) self=./$self ;;
+esac
+hops=0
+while [ -L "$self" ] && [ "$hops" -lt 40 ]; do
+  hops=$((hops + 1))
+  link=$(run_helper readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=\${self%/*}/$link ;;
+  esac
+done
+if [ -n "$caller_path_set" ]; then PATH=$caller_path; else unset PATH; fi
+`
+
+/**
+ * Write one alias, `subcommand` being the shell text it appends to the pnpm call
+ * (`' dlx'` for `pnpx` and `pnx`).
+ *
+ * The sibling each form reaches is the bin `pnpm add -g` linked for the CLI this command
+ * just installed: a pnpm shim and, on Windows, its pnpm.cmd twin. The bin linker
+ * writes a bare pnpm.exe only for the `node` bin name, so each form has exactly
+ * one sibling to name.
+ *
+ * On Windows this also writes the `.cmd` form and removes a `.ps1` form of the same
+ * name, so PowerShell runs the `.cmd`.
+ */
+function createShellScript (targetDir: string, name: string, subcommand: string): void {
   // windows can also use shell script via mingw or cygwin so no filter
-  const shellScript = `#!/bin/sh\nexec ${command} "$@"\n`
+  const shellScript = `#!/bin/sh
+# $0 is whatever shim or symlink \`${name}\` was launched through, so walk to the
+# file itself before looking beside it. The hop cap matches the kernel's ELOOP
+# limit, so a cycle cannot hang the script. Directories come from \`\${self%/*}\`
+# and \`readlink\` runs through \`command -p\`, so the caller's PATH decides nothing here.
+#
+${RESOLVE_SELF_SCRIPT}# The walk has to end at a regular file. Running out of hops leaves $self a
+# symlink; a chain that changed under us can leave it dangling or a directory, and
+# a failed readlink leaves a trailing slash. Each case would take \`pnpm\` from the
+# wrong directory — the substitution this script exists to prevent.
+if [ -L "$self" ] || [ ! -f "$self" ]; then
+  echo "${name}: could not resolve $0 to a regular file within 40 symlink hops." >&2
+  exit 1
+fi
+
+exec "\${self%/*}/pnpm"${subcommand} "$@"
+`
   fs.writeFileSync(path.join(targetDir, name), shellScript, { mode: 0o755 })
 
   if (process.platform === 'win32') {
-    fs.writeFileSync(path.join(targetDir, `${name}.cmd`), `@echo off\n${command} %*\n`)
-    fs.writeFileSync(path.join(targetDir, `${name}.ps1`), `${command} @args\n`)
+    // The sibling is invoked directly, the way the generated .cmd shims invoke
+    // theirs. Through `call` the forwarded arguments would take a second round of
+    // %-expansion, and the exit code is the shim's either way, since this is the
+    // last command this script runs. `%~dp0` already ends in a backslash.
+    fs.writeFileSync(path.join(targetDir, `${name}.cmd`), `@echo off\r\n"%~dp0pnpm.cmd"${subcommand} %*\r\n`)
+    // No .ps1 form, and one an earlier setup left is removed, because PowerShell
+    // prefers it over the .cmd. It could only call pnpm.cmd too, since the bin
+    // linker omits pnpm.ps1 (makePowerShellShim), so it would add nothing but an
+    // execution-policy error where unsigned scripts are blocked, and it would drop
+    // a bare `--` from the arguments.
+    fs.rmSync(path.join(targetDir, `${name}.ps1`), { force: true })
   }
 }
 
@@ -217,14 +309,15 @@ export async function handler (
 }
 
 function renderSetupOutput (report: PathExtenderReport): string {
-  if (report.oldSettings === report.newSettings) {
-    return 'No changes to the environment were made. Everything is already up to date.'
-  }
   const output = []
   if (report.configFile) {
     output.push(reportConfigChange(report.configFile))
   }
-  output.push(`Next configuration changes were made:
+  if (report.oldSettings === report.newSettings) {
+    output.push('No changes to the environment were made. Everything is already up to date.')
+    return output.join('\n\n')
+  }
+  output.push(`The following configuration changes were made:
 ${report.newSettings}`)
   if (report.configFile == null) {
     output.push('Setup complete. Open a new terminal to start using pnpm.')

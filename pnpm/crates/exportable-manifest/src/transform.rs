@@ -1,9 +1,6 @@
 //! Final normalization pass applied to a publish manifest. The four
 //! steps run in order: required-field validation, `bin` normalization,
 //! `peerDependenciesMeta` defaulting, then `repository` normalization.
-//!
-//! The pass is a straight sequence of in-place mutations on the
-//! manifest object — no closure composition.
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
@@ -57,7 +54,10 @@ fn transform_bin(manifest: &mut Map<String, Value>) -> Result<(), TransformError
     };
     let bin = bin.clone();
     // `transformRequiredFields` already guaranteed a string `name`.
-    let pkg_name = manifest.get("name").and_then(Value::as_str).unwrap_or_default();
+    let pkg_name = manifest
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let command_name = normalize_bin_name(pkg_name)?;
     let mut bin_object = Map::new();
     bin_object.insert(command_name, Value::String(bin));
@@ -96,7 +96,10 @@ fn transform_peer_dependencies_meta(manifest: &mut Map<String, Value>) {
                 continue;
             }
         };
-        let optional = entry.get("optional").and_then(Value::as_bool).unwrap_or(false);
+        let optional = entry
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         entry.insert("optional".to_string(), Value::Bool(optional));
         out.insert(key.clone(), Value::Object(entry));
     }

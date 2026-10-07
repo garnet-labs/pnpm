@@ -18,6 +18,36 @@ interface VersionSelector {
   normalized: string
 }
 
+export interface NpmAliasTarget {
+  /** The real package the alias points at. */
+  name: string
+  /** The selector declared for it, or undefined when the alias names none. */
+  versionSelector?: string
+}
+
+/**
+ * Split an `npm:` specifier into the package it names and the version selector
+ * declared for it. `npm:<name>@<selector>` points at `<name>`;
+ * `npm:<selector>` paired with a package alias points at the alias itself,
+ * mirroring the named-registry shape (e.g. `gh:^1.0.0`). That fallback is
+ * restricted to semver ranges and versions so unscoped package names like
+ * `npm:is-positive` keep their npm package-aliasing meaning. Returns null when
+ * the specifier is not an npm alias.
+ */
+export function parseNpmAliasTarget (bareSpecifier: string, alias: string | undefined): NpmAliasTarget | null {
+  if (!bareSpecifier.startsWith('npm:')) return null
+  const body = bareSpecifier.slice('npm:'.length)
+  if (alias && semver.validRange(body) != null) {
+    return { name: alias, versionSelector: body }
+  }
+  const versionDelimiter = body.lastIndexOf('@')
+  if (versionDelimiter < 1) return { name: body }
+  return {
+    name: body.slice(0, versionDelimiter),
+    versionSelector: body.slice(versionDelimiter + 1),
+  }
+}
+
 export function parseBareSpecifier (
   bareSpecifier: string,
   alias: string | undefined,
@@ -25,26 +55,12 @@ export function parseBareSpecifier (
   registry: string
 ): RegistryPackageSpec | null {
   let name = alias
-  if (bareSpecifier.startsWith('npm:')) {
-    bareSpecifier = bareSpecifier.slice(4)
-    // `npm:<version_selector>` — fall back to the outer dependency alias as
-    // the package name, mirroring the named-registry shape (e.g. `gh:^1.0.0`).
-    // Restricted to semver ranges/versions so unscoped package names like
-    // `npm:is-positive` keep their npm package-aliasing meaning.
-    if (alias && semver.validRange(bareSpecifier) != null) {
-      name = alias
-    } else {
-      const index = bareSpecifier.lastIndexOf('@')
-      if (index < 1) {
-        name = bareSpecifier
-        bareSpecifier = defaultTag
-      } else {
-        name = bareSpecifier.slice(0, index)
-        bareSpecifier = bareSpecifier.slice(index + 1)
-      }
-    }
+  const npmAliasTarget = parseNpmAliasTarget(bareSpecifier, alias)
+  if (npmAliasTarget != null) {
+    name = npmAliasTarget.name
+    bareSpecifier = npmAliasTarget.versionSelector ?? defaultTag
   }
-  if (name) {
+  if (name && !firstMemberHasColon(bareSpecifier)) {
     const selector = getVersionSelectorType(bareSpecifier)
     if (selector != null) {
       return {
@@ -65,6 +81,21 @@ export function parseBareSpecifier (
     }
   }
   return null
+}
+
+/**
+ * Whether the first member of a version selector contains a colon, as a
+ * protocol-prefixed selector like `runtime:^22.0.0 || ^24.0.0` does. No npm
+ * version, range, or dist-tag contains one.
+ *
+ * Loose semver parsing drops a union member it cannot parse, so it reads that
+ * example as the npm range `^24.0.0`. A colon in a later member does not
+ * count, because merged peer ranges are joined with `||` and
+ * `^1.0.0 || workspace:^2.0.0` still resolves `^1.0.0` from the registry.
+ */
+function firstMemberHasColon (selector: string): boolean {
+  const colon = selector.indexOf(':')
+  return colon !== -1 && !/[\s|]/.test(selector.slice(0, colon))
 }
 
 export interface JsrRegistryPackageSpec extends RegistryPackageSpec {
@@ -115,42 +146,9 @@ export function parseNamedRegistrySpecifierToRegistryPackageSpec (
   const registryName = rawSpecifier.substring(0, colon)
   if (!knownRegistryNames.has(registryName)) return null
 
-  const body = rawSpecifier.substring(colon + 1)
-  let pkgName: string
-  let versionSelector: string | undefined
-
-  if (semver.validRange(body) != null) {
-    // `<alias>:<version_selector>` — fall back to the dependency alias as
-    // the package name. Unresolvable without one.
-    if (!packageAlias) return null
-    pkgName = packageAlias
-    versionSelector = body
-  } else if (body[0] === '@') {
-    // `<alias>:@<owner>/<name>[@<version_selector>]` — scoped package.
-    const index = body.lastIndexOf('@')
-    if (index === 0) {
-      pkgName = body
-    } else {
-      pkgName = body.substring(0, index)
-      versionSelector = body.substring(index + '@'.length)
-    }
-  } else if (packageAlias?.startsWith('@')) {
-    // `<alias>:<tag>` paired with a scoped alias — body is a version
-    // selector (tag/dist-tag). Mirrors GitHub Packages, where the package
-    // is always scoped and a bare body is a tag.
-    pkgName = packageAlias
-    versionSelector = body
-  } else {
-    // `<alias>:<name>[@<version_selector>]` — unscoped package in body.
-    const index = body.lastIndexOf('@')
-    if (index < 1) {
-      pkgName = body
-    } else {
-      pkgName = body.substring(0, index)
-      versionSelector = body.substring(index + '@'.length)
-    }
-    if (!pkgName) return null
-  }
+  const target = splitNamedRegistryBody(rawSpecifier.substring(colon + 1), packageAlias)
+  if (target == null) return null
+  const { pkgName, versionSelector } = target
 
   // The name is used in registry URLs and metadata cache file paths, so
   // anything that is not a valid npm package name must never make it through.
@@ -168,6 +166,43 @@ export function parseNamedRegistrySpecifierToRegistryPackageSpec (
     ...parseRevisionSelector(selector, versionSelector ?? defaultTag),
     name: pkgName,
     registryName,
+  }
+}
+
+interface PackageNameAndSelector {
+  pkgName: string
+  versionSelector?: string
+}
+
+function splitNamedRegistryBody (body: string, packageAlias: string | undefined): PackageNameAndSelector | null {
+  if (semver.validRange(body) != null) {
+    // `<alias>:<version_selector>` — fall back to the dependency alias as
+    // the package name. Unresolvable without one.
+    if (!packageAlias) return null
+    return { pkgName: packageAlias, versionSelector: body }
+  }
+  if (body[0] === '@') {
+    // `<alias>:@<owner>/<name>[@<version_selector>]` — scoped package.
+    return splitPackageNameAndSelector(body)
+  }
+  if (packageAlias?.startsWith('@')) {
+    // `<alias>:<tag>` paired with a scoped alias — body is a version
+    // selector (tag/dist-tag). Mirrors GitHub Packages, where the package
+    // is always scoped and a bare body is a tag.
+    return { pkgName: packageAlias, versionSelector: body }
+  }
+  // `<alias>:<name>[@<version_selector>]` — unscoped package in body.
+  const target = splitPackageNameAndSelector(body)
+  return target.pkgName ? target : null
+}
+
+/** Splits on the last `@` that is not the leading `@` of a scope. */
+function splitPackageNameAndSelector (body: string): PackageNameAndSelector {
+  const index = body.lastIndexOf('@')
+  if (index < 1) return { pkgName: body }
+  return {
+    pkgName: body.substring(0, index),
+    versionSelector: body.substring(index + '@'.length),
   }
 }
 

@@ -13,18 +13,16 @@
 //!
 //! pnpm injects every side effect the flow touches as a bag of closures on a
 //! `context` object. This port threads them through the project's capability
-//! seam instead: the interactive OTP / web-auth effects reuse
-//! [`pnpm_network_web_auth`]'s capability traits (composed on the single
-//! `Sys` type parameter), the credential prompts read through the crate-local
-//! [`PromptInput`] / [`PromptPassword`] capabilities — the raw `dialoguer`
-//! terminal reads, wrapped by `prompt_line` — and `config.yaml` I/O reuses
-//! logout's [`FsReadToString`] / [`FsWrite`]. User-facing messages flow through
-//! the `Reporter` seam on the `pnpm:global` channel, matching pnpm's
-//! `globalInfo`. The two registry requests (the web-login `POST` and the
-//! classic `PUT`) go over the shared [`ThrottledClient`] — a real fixture
+//! seam instead, composed on the single `Sys` type parameter. The registry
+//! requests go over the shared [`ThrottledClient`] — a real fixture
 //! (`mockito`) in tests — so only the effects a fixture can't stage portably
 //! sit behind the `Sys` seam. See the "Dependency injection for tests" section
 //! of `pnpm/CODE_STYLE_GUIDE.md`.
+
+pub use classic_login::ClassicLoginOpError;
+pub use error::LoginError;
+pub use host::Host;
+pub use prompt::{PromptInput, PromptPassword};
 
 use std::{io, path::Path};
 
@@ -49,11 +47,6 @@ mod host;
 mod prompt;
 mod web_login;
 
-pub use classic_login::ClassicLoginOpError;
-pub use error::LoginError;
-pub use host::Host;
-pub use prompt::{PromptInput, PromptPassword};
-
 use classic_login::classic_login;
 use web_login::{WebLoginFlowError, web_login};
 
@@ -75,13 +68,11 @@ pub struct LoginOptions<'a> {
     pub fetch_timeout: u64,
 }
 
-/// The full capability set [`login`] requires from its host: the eight
-/// OTP / web-auth effects, the two credential prompts ([`PromptInput`] /
-/// [`PromptPassword`]), and `config.yaml` read / write ([`FsReadToString`] /
-/// [`FsWrite`]). The blanket impl covers every type that implements all of
-/// them, so the production [`Host`] and the test fakes satisfy it
-/// automatically. Bundling the bound lets a caller that re-dispatches into
-/// [`login`] — the CLI adapter — name one trait instead of restating the list.
+/// The full capability set [`login`] requires from its host. The blanket impl
+/// covers every type that implements all of them, so the production [`Host`]
+/// and the test fakes satisfy it automatically. Bundling the bound lets a
+/// caller that re-dispatches into [`login`] — the CLI adapter — name one trait
+/// instead of restating the list.
 pub trait LoginHost:
     Clock
     + Sleep

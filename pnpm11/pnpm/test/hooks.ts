@@ -4,7 +4,7 @@ import path from 'node:path'
 import { expect, test } from '@jest/globals'
 import { createHash } from '@pnpm/crypto.hash'
 import { prepare, preparePackages } from '@pnpm/prepare'
-import { getIntegrity } from '@pnpm/testing.registry-mock'
+import { getIntegrity, REGISTRY_MOCK_PORT } from '@pnpm/testing.registry-mock'
 import type { PackageManifest } from '@pnpm/types'
 import { loadJsonFileSync } from 'load-json-file'
 import { writeYamlFileSync } from 'write-yaml-file'
@@ -276,6 +276,23 @@ module.exports = {
   expect(nodeModulesFiles).toContain('is-number')
 })
 
+test('an updateConfig hook that drops the default route installs from the configured registry', async () => {
+  prepare()
+  fs.writeFileSync('.pnpmfile.cjs', `
+module.exports = {
+  hooks: {
+    updateConfig: (config) => ({
+      ...config,
+      registriesByScope: { '@acme': 'https://acme.invalid/' },
+    }),
+  },
+}`, 'utf8')
+
+  await execPnpm(['add', 'is-positive@1.0.0'])
+
+  expect(fs.readdirSync('node_modules')).toContain('is-positive')
+})
+
 test('loading an ESM pnpmfile', async () => {
   prepare()
 
@@ -292,6 +309,35 @@ export const hooks = {
 
   const nodeModulesFiles = fs.readdirSync('node_modules')
   expect(nodeModulesFiles).toContain('kind-of')
+  expect(nodeModulesFiles).toContain('is-number')
+})
+
+test('the command line outranks the updateConfig hook', async () => {
+  prepare()
+
+  fs.writeFileSync('.pnpmfile.mjs', `
+export const hooks = {
+  updateConfig: (config) => ({
+    ...config,
+    nodeLinker: 'isolated',
+    registriesByScope: {
+      ...config.registriesByScope,
+      default: 'http://localhost:1/',
+    },
+  }),
+}`, 'utf8')
+  writeYamlFileSync('pnpm-workspace.yaml', { pnpmfile: ['.pnpmfile.mjs'] })
+
+  await execPnpm([
+    'add',
+    'is-odd@1.0.0',
+    `--registry=http://localhost:${REGISTRY_MOCK_PORT}/`,
+    '--node-linker=hoisted',
+    '--fetch-retries=0',
+  ])
+
+  const nodeModulesFiles = fs.readdirSync('node_modules')
+  expect(nodeModulesFiles).toContain('is-odd')
   expect(nodeModulesFiles).toContain('is-number')
 })
 
@@ -337,4 +383,19 @@ test('automatically loading pnpmfile from a config dependency that has a name th
   const nodeModulesFiles = fs.readdirSync('node_modules')
   expect(nodeModulesFiles).toContain('kind-of')
   expect(nodeModulesFiles).toContain('is-number')
+})
+
+test('the project pnpmfile runs after the pnpmfile of a config dependency plugin', async () => {
+  prepare()
+  fs.writeFileSync('.pnpmfile.cjs', `
+    module.exports = { hooks: { updateConfig: (config) => ({ ...config, nodeLinker: 'isolated' }) } }
+  `, 'utf8')
+
+  await execPnpm(['add', '--config', '@pnpm/plugin-pnpmfile'])
+  await execPnpm(['add', 'is-odd@1.0.0'])
+
+  const nodeModulesFiles = fs.readdirSync('node_modules')
+  expect(nodeModulesFiles).toContain('is-odd')
+  expect(nodeModulesFiles).toContain('.pnpm')
+  expect(nodeModulesFiles).not.toContain('kind-of')
 })

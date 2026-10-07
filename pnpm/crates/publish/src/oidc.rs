@@ -7,6 +7,10 @@
 //! instead of a live registry. CI-provider detection is a plain `EnvVar` read
 //! ([`is_github_actions`], [`is_gitlab`]).
 
+pub use auth_token::{AuthTokenError, fetch_auth_token};
+pub use id_token::{GetIdTokenError, IdTokenError, get_id_token};
+pub use provenance::{DetermineProvenanceError, ProvenanceError, determine_provenance};
+
 mod auth_token;
 mod id_token;
 mod provenance;
@@ -19,10 +23,6 @@ use crate::{
     capabilities::{Clock, EnvVar, OidcFetch, OidcFetchError, OidcMethod, OidcRequest},
     global_log::global_info,
 };
-
-pub use auth_token::{AuthTokenError, fetch_auth_token};
-pub use id_token::{GetIdTokenError, IdTokenError, get_id_token};
-pub use provenance::{DetermineProvenanceError, ProvenanceError, determine_provenance};
 
 /// Read an environment variable, treating an empty value as unset.
 pub(crate) fn truthy_env<Sys: EnvVar>(name: &str) -> Option<String> {
@@ -106,14 +106,8 @@ where
         .ok_or(GitHubRequestTokenError::MissingValue)
 }
 
-/// Percent-encode the scope separator so the
-/// package name is a single URL path segment (`@scope/name` → `@scope%2fname`).
-pub(crate) fn escaped_package_name(name: &str) -> String {
-    name.replace('/', "%2f")
-}
-
 /// The fetch-retry / timeout knobs the OIDC requests forward, sourced from the
-/// publish options, shared by all three OIDC steps.
+/// publish options.
 #[derive(Debug, Default, Clone)]
 pub struct OidcHttpOptions {
     pub fetch_retries: Option<u32>,

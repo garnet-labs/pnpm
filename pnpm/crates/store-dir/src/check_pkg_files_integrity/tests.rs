@@ -1,6 +1,6 @@
 use super::{
     VerifiedFileIntegrity, VerifiedFilesCache, build_file_maps_from_index,
-    check_pkg_files_integrity, package_dir_matches_index,
+    check_pkg_files_integrity, defer_pkg_files_integrity, package_dir_matches_index,
 };
 use crate::{CafsFileInfo, PackageFilesIndex, SideEffectsDiff, StoreDir};
 use pretty_assertions::assert_eq;
@@ -31,7 +31,10 @@ fn sha512_hex(bytes: &[u8]) -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn index_with(algo: &str, info: Vec<(&str, CafsFileInfo)>) -> PackageFilesIndex {
@@ -40,7 +43,10 @@ fn index_with(algo: &str, info: Vec<(&str, CafsFileInfo)>) -> PackageFilesIndex 
         requires_build: None,
         requires_prepare: None,
         algo: algo.to_string(),
-        files: info.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        files: info
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
         side_effects: None,
         remote_side_effects_quarantine: None,
     }
@@ -62,6 +68,33 @@ fn fast_path_skips_filesystem_checks() {
     let path = result.files_map.get("index.js").expect("path inserted");
     eprintln!("path={path:?} exists={}", path.exists());
     assert!(!path.exists(), "no file was planted — fast path didn't care");
+}
+
+#[test]
+fn deferred_check_builds_the_maps_first_and_stats_only_when_run() {
+    let _guard = TALLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = tempdir().unwrap();
+    let store_dir = StoreDir::new(tmp.path());
+    let content = b"deferred";
+    let digest = sha512_hex(content);
+    // No `checked_at`, so a run of the check has to hash the file.
+    let entry =
+        index_with("sha512", vec![("index.js", info(&digest, content.len() as u64, 0o644, None))]);
+    let (result, pending) = defer_pkg_files_integrity(&store_dir, entry);
+    dbg!(&result);
+    assert!(result.passed, "a well-formed row passes before its files are checked");
+    let path = result.files_map.get("index.js").expect("path inserted");
+    let cache = VerifiedFilesCache::new();
+    assert!(!pending.verify(&store_dir, &cache), "the file was never planted");
+    assert!(cache.is_empty(), "a failed file is not cached as verified");
+
+    plant_cafs_file(&store_dir, &digest, 0o644, content);
+    let (_, pending) = defer_pkg_files_integrity(
+        &store_dir,
+        index_with("sha512", vec![("index.js", info(&digest, content.len() as u64, 0o644, None))]),
+    );
+    assert!(pending.verify(&store_dir, &cache), "the planted file verifies");
+    assert!(cache.contains(path), "a verified file is cached for later rows");
 }
 
 /// We can't easily set `mtime` from the standard library, but
@@ -439,6 +472,67 @@ fn no_side_effects_yields_none() {
     assert!(result.side_effects_maps.is_none());
 }
 
+/// An empty row is a build whose whole effect landed outside the package
+/// directory. See `side_effects_overlay` for why it must not count as a cache hit.
+///
+/// Regression for <https://github.com/pnpm/pnpm/issues/14717>.
+#[test]
+fn side_effects_overlay_with_nothing_to_restore_drops_cache_key_entry() {
+    let tmp = tempdir().unwrap();
+    let store_dir = StoreDir::new(tmp.path());
+    let base_digest = sha512_hex(b"base");
+    let entry = PackageFilesIndex {
+        manifest: None,
+        requires_build: None,
+        requires_prepare: None,
+        algo: "sha512".into(),
+        files: HashMap::from([("a.js".to_string(), info(&base_digest, 4, 0o644, None))]),
+        side_effects: Some(HashMap::from([(
+            "k1".to_string(),
+            SideEffectsDiff { added: None, deleted: None, remote_origin: None },
+        )])),
+        remote_side_effects_quarantine: None,
+    };
+    let result = build_file_maps_from_index(&store_dir, entry);
+    let maps = result.side_effects_maps.expect("a configured cache stays `Some`");
+    assert!(!maps.contains_key("k1"), "an empty row is not a build to restore: {maps:?}");
+}
+
+/// The empty-row drop keys off having nothing to restore, not off `added`
+/// alone: a build that only removes files is still reproducible from its row.
+#[test]
+fn side_effects_overlay_with_only_deletions_keeps_cache_key_entry() {
+    let tmp = tempdir().unwrap();
+    let store_dir = StoreDir::new(tmp.path());
+    let base_digest = sha512_hex(b"base");
+    let entry = PackageFilesIndex {
+        manifest: None,
+        requires_build: None,
+        requires_prepare: None,
+        algo: "sha512".into(),
+        files: HashMap::from([
+            ("a.js".to_string(), info(&base_digest, 4, 0o644, None)),
+            ("gone.js".to_string(), info(&base_digest, 4, 0o644, None)),
+        ]),
+        side_effects: Some(HashMap::from([(
+            "k1".to_string(),
+            SideEffectsDiff {
+                added: None,
+                deleted: Some(vec!["gone.js".to_string()]),
+                remote_origin: None,
+            },
+        )])),
+        remote_side_effects_quarantine: None,
+    };
+    let result = build_file_maps_from_index(&store_dir, entry);
+    let overlay = result.side_effects_maps
+        .unwrap()
+        .remove("k1")
+        .expect("entry survives");
+    assert!(overlay.files.contains_key("a.js"), "base survives: {overlay:?}");
+    assert!(!overlay.files.contains_key("gone.js"), "deleted drops: {overlay:?}");
+}
+
 #[test]
 fn side_effects_overlay_adds_and_drops_correctly() {
     let tmp = tempdir().unwrap();
@@ -471,10 +565,10 @@ fn side_effects_overlay_adds_and_drops_correctly() {
     let result = build_file_maps_from_index(&store_dir, entry);
     let maps = result.side_effects_maps.expect("populated");
     let overlay = maps.get("darwin;arm64;node20;deps=fake").expect("entry exists");
-    assert!(overlay.contains_key("a.js"), "base survives: {overlay:?}");
-    assert!(overlay.contains_key("c.js"), "added overlays: {overlay:?}");
-    assert!(!overlay.contains_key("b.js"), "deleted drops: {overlay:?}");
-    assert_eq!(overlay.len(), 2);
+    assert!(overlay.files.contains_key("a.js"), "base survives: {overlay:?}");
+    assert!(overlay.files.contains_key("c.js"), "added overlays: {overlay:?}");
+    assert!(!overlay.files.contains_key("b.js"), "deleted drops: {overlay:?}");
+    assert_eq!(overlay.files.len(), 2);
 }
 
 #[test]
@@ -500,8 +594,11 @@ fn side_effects_overlay_added_shadows_base_on_collision() {
         remote_side_effects_quarantine: None,
     };
     let result = build_file_maps_from_index(&store_dir, entry);
-    let overlay = result.side_effects_maps.unwrap().remove("k1").unwrap();
-    let path = overlay.get("collide.js").expect("collide.js present");
+    let overlay = result.side_effects_maps
+        .unwrap()
+        .remove("k1")
+        .unwrap();
+    let path = overlay.files.get("collide.js").expect("collide.js present");
     // CAFS layout splits the digest as `<2-char prefix>/<rest>`, so the
     // path won't contain the digest as a single contiguous substring.
     // Verify by checking that the overlay digest's tail (post-prefix
@@ -652,10 +749,10 @@ fn side_effects_overlay_keys_are_independent() {
     let maps = result.side_effects_maps.unwrap();
     let k1 = maps.get("k1").unwrap();
     let k2 = maps.get("k2").unwrap();
-    assert!(k1.contains_key("a.js") && !k1.contains_key("b.js"), "k1: {k1:?}");
-    assert!(k2.contains_key("b.js") && !k2.contains_key("a.js"), "k2: {k2:?}");
-    assert!(k1.contains_key("base.js"));
-    assert!(k2.contains_key("base.js"));
+    assert!(k1.files.contains_key("a.js") && !k1.files.contains_key("b.js"), "k1: {k1:?}");
+    assert!(k2.files.contains_key("b.js") && !k2.files.contains_key("a.js"), "k2: {k2:?}");
+    assert!(k1.files.contains_key("base.js"));
+    assert!(k2.files.contains_key("base.js"));
 }
 
 /// A one-file index whose single entry is recorded under `path`.
@@ -714,4 +811,129 @@ fn a_recorded_path_that_is_not_a_plain_relative_path_never_matches() {
             "{escape} must not be joined onto the package directory",
         );
     }
+}
+
+#[test]
+fn built_package_with_postinstall_modifications_is_not_reported_as_modified() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("index.js"), b"modified by postinstall\n").unwrap();
+    fs::write(package.join("generated.js"), b"created by postinstall\n").unwrap();
+
+    let mut index = index_with_one_file("index.js", b"original content\n");
+    index.requires_build = Some(true);
+    assert!(package_dir_matches_index(&package, &index));
+}
+
+#[test]
+fn built_package_with_manifest_script_is_not_reported_as_modified() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("index.js"), b"modified by postinstall\n").unwrap();
+
+    let mut index = index_with_one_file("index.js", b"original content\n");
+    index.manifest = Some(serde_json::json!({
+        "scripts": {
+            "postinstall": "node build.js"
+        }
+    }));
+    assert!(package_dir_matches_index(&package, &index));
+}
+
+#[test]
+fn missing_directory_fails_even_for_built_package() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("nonexistent");
+
+    let mut index = index_with_one_file("index.js", b"original content\n");
+    index.requires_build = Some(true);
+    assert!(!package_dir_matches_index(&package, &index));
+}
+
+#[test]
+fn side_effects_diff_overlay_matches() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("index.js"), b"module.exports = 1\n").unwrap();
+    fs::write(package.join("addon.node"), b"binary\n").unwrap();
+
+    let mut index = index_with_one_file("index.js", b"module.exports = 1\n");
+    let addon_digest = sha512_hex(b"binary\n");
+    let mut added = HashMap::new();
+    added.insert("addon.node".to_string(), info(&addon_digest, 7, 0o755, None));
+    let mut side_effects = HashMap::new();
+    side_effects.insert(
+        "linux-x64".to_string(),
+        SideEffectsDiff { added: Some(added), deleted: None, remote_origin: None },
+    );
+    index.side_effects = Some(side_effects);
+
+    assert!(package_dir_matches_index(&package, &index));
+
+    // If an index file is modified, and the package does not declare build scripts:
+    fs::write(package.join("index.js"), b"corrupted\n").unwrap();
+    assert!(!package_dir_matches_index(&package, &index));
+}
+
+#[test]
+fn hardlinked_built_package_with_modifications_is_reported_as_modified() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+
+    let cas_file = dir.path().join("cas_file");
+    fs::write(&cas_file, b"corrupted\n").unwrap();
+    fs::hard_link(&cas_file, package.join("index.js")).unwrap();
+
+    let mut index = index_with_one_file("index.js", b"original content\n");
+    index.requires_build = Some(true);
+    assert!(!package_dir_matches_index(&package, &index));
+}
+
+#[test]
+fn unrelated_package_with_added_binding_gyp_is_reported_as_modified() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("index.js"), b"corrupted\n").unwrap();
+    fs::write(package.join("binding.gyp"), b"{}\n").unwrap();
+
+    let index = index_with_one_file("index.js", b"original content\n");
+    assert!(!package_dir_matches_index(&package, &index));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_file_in_built_package_is_reported_as_modified() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+
+    let external_blob = dir.path().join("external_blob");
+    fs::write(&external_blob, b"corrupted\n").unwrap();
+    std::os::unix::fs::symlink(&external_blob, package.join("index.js")).unwrap();
+
+    let mut index = index_with_one_file("index.js", b"original content\n");
+    index.requires_build = Some(true);
+    assert!(!package_dir_matches_index(&package, &index));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_parent_dir_in_built_package_is_reported_as_modified() {
+    let dir = tempdir().unwrap();
+    let package = dir.path().join("pkg");
+    fs::create_dir_all(&package).unwrap();
+
+    let external_dir = dir.path().join("external_dir");
+    fs::create_dir_all(&external_dir).unwrap();
+    fs::write(external_dir.join("index.js"), b"corrupted\n").unwrap();
+    std::os::unix::fs::symlink(&external_dir, package.join("nested")).unwrap();
+
+    let mut index = index_with_one_file("nested/index.js", b"original content\n");
+    index.requires_build = Some(true);
+    assert!(!package_dir_matches_index(&package, &index));
 }

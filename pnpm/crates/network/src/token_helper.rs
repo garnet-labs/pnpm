@@ -8,9 +8,10 @@
 //! invocation that makes no matching request. The mapping from the
 //! command's stdout to a header mirrors pnpm's `executeTokenHelper`.
 
+use crate::process::{Child, Command, Stdio};
+
 use std::{
     io::{self, Read},
-    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -92,13 +93,14 @@ pub fn execute_token_helper(
     let Some(program) = command.first() else {
         return Err(TokenHelperError::EmptyToken { program: String::new() });
     };
-    let output = run(command).map_err(|source| {
-        if source.kind() == io::ErrorKind::TimedOut {
-            TokenHelperError::Timeout { program: program.clone() }
-        } else {
-            TokenHelperError::Spawn { program: program.clone(), source }
-        }
-    })?;
+    let output = run(command)
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::TimedOut {
+                TokenHelperError::Timeout { program: program.clone() }
+            } else {
+                TokenHelperError::Spawn { program: program.clone(), source }
+            }
+        })?;
     if !output.success {
         return Err(TokenHelperError::ErrorStatus { program: program.clone() });
     }
@@ -168,8 +170,6 @@ fn run_token_helper_command_with_timeout(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    // The child is reaped; disarm so the guard can't signal a pid the OS
-    // may already have recycled.
     guard.disarm();
 
     Ok(TokenHelperOutput {
@@ -216,7 +216,10 @@ fn build_command(program: &str, args: &[String]) -> Command {
     let lowercased = program.to_ascii_lowercase();
     if lowercased.ends_with(".bat") || lowercased.ends_with(".cmd") {
         let mut command = Command::new("cmd");
-        command.arg("/C").arg(program).args(args);
+        command
+            .arg("/C")
+            .arg(program)
+            .args(args);
         return command;
     }
     let mut command = Command::new(program);

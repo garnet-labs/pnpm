@@ -87,6 +87,18 @@ fn parity_settings_read_from_the_environment() {
     assert_eq!(settings.use_beta_cli, Some(true));
 }
 
+#[test]
+fn progress_reads_from_the_environment() {
+    struct EnvProgress;
+    impl EnvVar for EnvProgress {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_PROGRESS").then(|| "false".to_owned())
+        }
+    }
+    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvProgress>();
+    assert_eq!(settings.progress, Some(false));
+}
+
 /// An exported-but-empty `PNPM_CONFIG_STORE_DIR=` shouldn't clobber
 /// the configured store path.
 #[test]
@@ -99,6 +111,35 @@ fn empty_env_var_is_treated_as_unset() {
     }
     let settings = WorkspaceSettings::from_pnpm_config_env::<EnvEmpty>();
     assert_eq!(settings.store_dir, None);
+}
+
+#[test]
+fn empty_node_options_env_vars_override_lower_layers() {
+    struct UppercaseEmptyNodeOptions;
+    impl EnvVar for UppercaseEmptyNodeOptions {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_NODE_OPTIONS").then(String::new)
+        }
+    }
+    struct LowercaseEmptyNodeOptions;
+    impl EnvVar for LowercaseEmptyNodeOptions {
+        fn var(name: &str) -> Option<String> {
+            (name == "pnpm_config_node_options").then(String::new)
+        }
+    }
+
+    for settings in [
+        WorkspaceSettings::from_pnpm_config_env::<UppercaseEmptyNodeOptions>(),
+        WorkspaceSettings::from_pnpm_config_env::<LowercaseEmptyNodeOptions>(),
+    ] {
+        assert_eq!(settings.node_options.as_ref().map(Option::as_deref), Some(Some("")));
+        let mut config =
+            Config { node_options: Some("--trace-warnings".to_string()), ..Config::default() };
+
+        settings.apply_to(&mut config, Path::new("/workspace"));
+
+        assert_eq!(config.node_options.as_deref(), Some(""));
+    }
 }
 
 /// `savePrefix` is the exception to [`empty_env_var_is_treated_as_unset`]:
@@ -315,4 +356,36 @@ sideEffectsCache:
     assert!(!config.side_effects_cache_read());
     assert!(!config.side_effects_cache_write());
     assert_eq!(config.remote_side_effects_cache.expect("shared cache config").org, "acme");
+}
+
+#[test]
+fn tag_version_prefix_reads_from_the_environment() {
+    struct EnvPrefix;
+    impl EnvVar for EnvPrefix {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_TAG_VERSION_PREFIX").then(|| "release-".to_owned())
+        }
+    }
+    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvPrefix>();
+    assert_eq!(settings.tag_version_prefix.as_deref(), Some("release-"));
+
+    struct EnvEmptyPrefix;
+    impl EnvVar for EnvEmptyPrefix {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_TAG_VERSION_PREFIX").then(String::new)
+        }
+    }
+    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvEmptyPrefix>();
+    assert_eq!(settings.tag_version_prefix.as_deref(), Some(""));
+}
+
+#[test]
+fn publish_wait_timeout_reads_from_environment() {
+    struct Env;
+    impl EnvVar for Env {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_PUBLISH_WAIT_TIMEOUT").then(|| "600000".to_owned())
+        }
+    }
+    assert_eq!(WorkspaceSettings::from_pnpm_config_env::<Env>().publish_wait_timeout, Some(600000));
 }

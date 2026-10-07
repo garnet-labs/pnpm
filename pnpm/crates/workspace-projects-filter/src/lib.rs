@@ -11,21 +11,28 @@
 //!   filter, handling the `--filter-prod` production-only graph.
 //!
 //! A `[<since>]` changed-packages selector selects the projects whose
-//! files changed since the given git ref (`git diff --name-only`),
-//! honoring `testPattern` / `changedFilesIgnorePattern`.
+//! files changed since the merge base of `HEAD` and the given git ref
+//! (`git diff --name-only`), including uncommitted changes,
+//! honoring `testPattern` / `changedFilesIgnorePattern`. Without a merge
+//! base (a shallow clone, unrelated histories, or an invalid ref), it
+//! diffs against the ref itself.
 
-mod filter;
-mod get_changed_projects;
-pub use get_changed_projects::{ChangedProjects, GetChangedProjectsOptions, get_changed_projects};
-mod glob;
-mod parse_project_selector;
-mod path_util;
+#[cfg(target_family = "wasm")]
+pub(crate) use pnpm_process as process;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::process;
 
 pub use filter::{
     FilterError, FilterProjectsOptions, FilterWorkspaceProjectsOptions, FilteredProjects,
     WorkspaceFilter, filter_projects, filter_projects_by_selector_objects,
     filter_workspace_projects,
 };
+pub use get_changed_projects::{ChangedProjects, GetChangedProjectsOptions, get_changed_projects};
 pub use parse_project_selector::{ProjectSelector, parse_project_selector};
-
 pub use pnpm_workspace_projects_graph::{BaseProject, ProjectGraph, ProjectGraphNode};
+
+mod filter;
+mod get_changed_projects;
+mod glob;
+mod parse_project_selector;
+mod path_util;

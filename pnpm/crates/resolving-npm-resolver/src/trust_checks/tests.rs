@@ -49,8 +49,10 @@ fn version_json(name: &str, version: &str, evidence: Evidence) -> serde_json::Va
 }
 
 fn make_package(name: &str, versions: &[(&str, &str, Evidence)]) -> Package {
-    let versions_json: serde_json::Map<String, serde_json::Value> =
-        versions.iter().map(|(v, _, ev)| ((*v).to_string(), version_json(name, v, *ev))).collect();
+    let versions_json: serde_json::Map<String, serde_json::Value> = versions
+        .iter()
+        .map(|(v, _, ev)| ((*v).to_string(), version_json(name, v, *ev)))
+        .collect();
     let time_json: serde_json::Map<String, serde_json::Value> = versions
         .iter()
         .map(|(v, t, _)| ((*v).to_string(), serde_json::Value::String((*t).to_string())))
@@ -370,7 +372,7 @@ fn undecodable_prior_version_fails_closed() {
             "1.1.0": "2025-02-01T00:00:00.000Z",
         },
         "versions": {
-            "1.0.0": { "corrupt": "fragment" },
+            "1.0.0": { "dist": "not-an-object" },
             "1.1.0": version_json("acme", "1.1.0", Evidence::None),
         },
     });
@@ -378,6 +380,28 @@ fn undecodable_prior_version_fails_closed() {
     let err = fail_if_trust_downgraded(&meta, "1.1.0", &TrustCheckOptions::default())
         .expect_err("undecodable prior manifest must fail the trust check");
     assert!(matches!(err, TrustViolation::TrustCheckFailed { .. }), "got {err:?}");
+}
+
+#[test]
+fn compact_history_detects_trust_evidence_without_a_full_manifest() {
+    let body = serde_json::json!({
+        "name": "acme",
+        "dist-tags": {},
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-02-01T00:00:00.000Z",
+        },
+        "versions": {
+            "1.0.0": { "_npmUser": { "approver": { "name": "a", "email": "a@example.com" } } },
+            "1.1.0": version_json("acme", "1.1.0", Evidence::None),
+        },
+    });
+    let meta: Package = serde_json::from_value(body).expect("deserialize fixture Package");
+
+    assert!(meta.versions.get("1.0.0").is_none());
+    let error = fail_if_trust_downgraded(&meta, "1.1.0", &TrustCheckOptions::default())
+        .expect_err("the earlier staged publish must remain the trust baseline");
+    assert!(matches!(error, TrustViolation::TrustDowngrade { .. }), "got {error:?}");
 }
 
 mod ignore_missing_time_field {
@@ -434,7 +458,10 @@ mod ignore_missing_time_field {
                 ("2.0.0", "2025-02-01T00:00:00.000Z", Evidence::None),
             ],
         );
-        meta.time.as_mut().expect("fixture builds a time map").remove("2.0.0");
+        meta.time
+            .as_mut()
+            .expect("fixture builds a time map")
+            .remove("2.0.0");
         let opts = TrustCheckOptions { ignore_missing_time_field: true, ..Default::default() };
         let err = fail_if_trust_downgraded(&meta, "2.0.0", &opts)
             .expect_err("a per-version hole is not a registry that omits the field");
@@ -485,7 +512,7 @@ mod get_trust_evidence {
         assert!(matches!(
             get_trust_evidence(&parse(version)),
             Some(TrustEvidence::TrustedPublisher)
-        ));
+        ),);
     }
 
     #[test]
@@ -519,5 +546,55 @@ mod get_trust_evidence {
         let mut version = version_json("acme", "1.0.0", Evidence::None);
         version["_npmUser"] = serde_json::json!({ "name": "alice", "email": "alice@example.com" });
         assert!(get_trust_evidence(&parse(version)).is_none());
+    }
+}
+
+mod get_trust_evidence_compact {
+    use pnpm_registry::VersionTrustMetadata;
+
+    use crate::trust_checks::{TrustEvidence, get_trust_evidence_compact};
+
+    fn classify(version: serde_json::Value) -> Option<TrustEvidence> {
+        let metadata: VersionTrustMetadata =
+            serde_json::from_value(version).expect("deserialize trust metadata");
+        get_trust_evidence_compact(&metadata)
+    }
+
+    #[test]
+    fn provenance_is_lowest_rank() {
+        assert_eq!(
+            classify(serde_json::json!({
+                "dist": {"attestations": {"provenance": true}}
+            })),
+            Some(TrustEvidence::Provenance),
+        );
+    }
+
+    #[test]
+    fn trusted_publisher_requires_provenance() {
+        assert_eq!(
+            classify(serde_json::json!({
+                "_npmUser": {"trustedPublisher": true}
+            })),
+            None,
+        );
+        assert_eq!(
+            classify(serde_json::json!({
+                "_npmUser": {"trustedPublisher": true},
+                "dist": {"attestations": {"provenance": true}}
+            })),
+            Some(TrustEvidence::TrustedPublisher),
+        );
+    }
+
+    #[test]
+    fn approver_is_highest_rank() {
+        assert_eq!(
+            classify(serde_json::json!({
+                "_npmUser": {"approver": true},
+                "dist": {"attestations": {"provenance": true}}
+            })),
+            Some(TrustEvidence::StagedPublish),
+        );
     }
 }

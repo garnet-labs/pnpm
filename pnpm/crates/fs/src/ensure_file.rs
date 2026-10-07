@@ -1,8 +1,14 @@
+pub use overwrite::overwrite_file_in_place;
+
+mod creation;
+mod overwrite;
+use creation::FileCreation;
+
 use crate::rename_with_retry;
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     hash::{BuildHasher, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -32,18 +38,9 @@ const ENFILE: i32 = 23;
 /// (many concurrent rayon workers each holding fds during CAS
 /// extraction + verification) makes fd pressure likely under load.
 ///
-/// Backoff doubles starting at 2 ms and caps at 200 ms; the budget
-/// is 32 sleep-and-retry rounds followed by a final attempt (33
-/// total calls) for roughly 5–6 s of total wait before we surface
-/// the error. Real fd-pressure resolves in tens of ms once other
-/// workers finish their writes and close fds, so we hit the cap
-/// rarely.
-///
 /// On Windows the error codes don't map (Win32 returns its own
 /// numeric space) and the runtime fd limits work differently, so
-/// the helper is a thin pass-through there — the trailing `op()`
-/// after the `cfg(unix)` block is the one and only attempt on that
-/// platform.
+/// the helper is a thin pass-through there.
 pub(crate) fn retry_on_fd_pressure<Func, Value>(mut op: Func) -> io::Result<Value>
 where
     Func: FnMut() -> io::Result<Value>,
@@ -108,8 +105,12 @@ pub enum EnsureFileError {
 /// syscall cost when they have — `fs::create_dir_all` does a `stat` on
 /// every call even when the directory already exists, which adds up to
 /// one wasted `stat` per file on a cold install.
+///
+/// On Unix, directories created by this call receive the group-write and
+/// setgid bits of the nearest ancestor that already existed. Directories
+/// that were already present are not modified.
 pub fn ensure_parent_dir(dir: &Path) -> Result<(), EnsureFileError> {
-    fs::create_dir_all(dir)
+    crate::file_mode::create_dir_all_inheriting_mode(dir)
         .map_err(|error| EnsureFileError::CreateDir { parent_dir: dir.to_path_buf(), error })
 }
 
@@ -120,25 +121,6 @@ pub fn ensure_parent_dir(dir: &Path) -> Result<(), EnsureFileError> {
 /// guarantee that should call [`ensure_parent_dir`] first — splitting
 /// the two lets the CAFS writer share one `create_dir_all` per shard
 /// instead of paying it per file.
-///
-/// Sequence:
-///
-/// 1. Try `O_CREAT | O_EXCL` open (`OpenOptions::create_new(true)`).
-///    On success we own the file and write `content` directly.
-/// 2. On `ErrorKind::AlreadyExists` (warm cache or concurrent writer
-///    race) re-read the file and byte-compare with `content`. CAS
-///    paths are hash-derived, so matching bytes == matching digest;
-///    since we already have the expected bytes in hand, comparing
-///    against them verifies integrity without a separate hash step.
-/// 3. If bytes match → `Ok(())`. The file is a live CAS entry; leaving
-///    it alone is correct.
-/// 4. If bytes mismatch, a prior install crashed mid-write and left a
-///    torn blob. Recover by writing a fresh temp file next to the
-///    target and `rename`ing it over. Rename is atomic on Unix
-///    (`rename(2)`) and replaces-in-place on Windows
-///    (`SetFileInformationByHandle`/`MoveFileEx`), so an observer
-///    never sees a partial file.
-/// 5. Any other open error propagates as `CreateFile`.
 ///
 /// Design choices:
 ///
@@ -163,31 +145,75 @@ pub fn ensure_parent_dir(dir: &Path) -> Result<(), EnsureFileError> {
 pub fn ensure_file(
     file_path: &Path,
     content: &[u8],
-    #[cfg_attr(windows, allow(unused))] mode: Option<u32>,
+    #[cfg_attr(windows, allow(unused, reason = "POSIX mode bits are only applied on Unix"))]
+    mode: Option<u32>,
+) -> Result<(), EnsureFileError> {
+    ensure(file_path, content, mode, Repair::Rename)
+}
+
+/// [`ensure_file`] with the repair strategy CAS blobs need: when the
+/// existing file's bytes mismatch, overwrite it in place first, keeping
+/// the inode so the hard links to it from other projects'
+/// `node_modules` are healed by the same write (pnpm/pnpm#3445). The
+/// temp+`rename` repair [`ensure_file`] uses would swap the inode and
+/// leave those copies corrupt. Falls back to the rename when the
+/// in-place overwrite is refused or fails verification.
+///
+/// In-place overwrite is not atomic — a concurrent reader can observe
+/// torn content for the duration of the write — so this variant is for
+/// content-addressed blobs only: their consumers validate integrity and
+/// re-trigger this repair on a torn read. Files whose readers take the
+/// bytes as-is (`.pnp.cjs`, the package map) must keep [`ensure_file`]'s
+/// atomic rename.
+pub fn ensure_cas_file(
+    file_path: &Path,
+    content: &[u8],
+    #[cfg_attr(windows, allow(unused, reason = "POSIX mode bits are only applied on Unix"))]
+    mode: Option<u32>,
+) -> Result<(), EnsureFileError> {
+    ensure(file_path, content, mode, Repair::InPlace)
+}
+
+/// How [`ensure`] repairs an existing file whose bytes mismatch.
+#[derive(Clone, Copy)]
+enum Repair {
+    /// Temp file + `rename` over the target. Atomic, but swaps the
+    /// inode, disconnecting hard-linked copies.
+    Rename,
+    /// Truncate and rewrite under the same inode, healing hard-linked
+    /// copies; falls back to the rename when refused.
+    InPlace,
+}
+
+fn ensure(
+    file_path: &Path,
+    content: &[u8],
+    mode: Option<u32>,
+    repair: Repair,
 ) -> Result<(), EnsureFileError> {
     // See the "Process-local per-path mutex" bullet above and
     // [`cas_write_lock`] for the rationale.
     let lock = cas_write_lock(file_path);
     let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Some(mode) = mode {
-            options.mode(mode);
+    let creation = FileCreation::new(file_path.parent().unwrap_or_else(|| Path::new(".")), mode);
+    match creation.open(file_path) {
+        Ok(mut file) => {
+            #[cfg(unix)]
+            creation
+                .grant(&file)
+                .map_err(|error| EnsureFileError::WriteFile {
+                    file_path: file_path.to_path_buf(),
+                    error,
+                })?;
+            file.write_all(content)
+                .map_err(|error| EnsureFileError::WriteFile {
+                    file_path: file_path.to_path_buf(),
+                    error,
+                })
         }
-    }
-
-    match retry_on_fd_pressure(|| options.open(file_path)) {
-        Ok(mut file) => file.write_all(content).map_err(|error| EnsureFileError::WriteFile {
-            file_path: file_path.to_path_buf(),
-            error,
-        }),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            verify_or_rewrite(file_path, content, mode)
+            verify_or_rewrite(file_path, content, mode, repair)
         }
         Err(error) => {
             Err(EnsureFileError::CreateFile { file_path: file_path.to_path_buf(), error })
@@ -196,11 +222,6 @@ pub fn ensure_file(
 }
 
 /// Borrow the process-local write mutex for `file_path`.
-///
-/// The hot path costs one path hash + one uncontended mutex acquire
-/// per CAFS file written (~170k on the alotta-files fixture), with no
-/// allocations: the path is hashed into one of `NUM_CAS_LOCK_STRIPES`
-/// statically-allocated mutexes.
 ///
 /// **Coordination contract.** Callers handing in the same `&Path`
 /// always receive the same `Mutex<()>`. The hasher is initialised
@@ -270,6 +291,7 @@ fn verify_or_rewrite(
     file_path: &Path,
     content: &[u8],
     mode: Option<u32>,
+    repair: Repair,
 ) -> Result<(), EnsureFileError> {
     match fs::symlink_metadata(file_path) {
         Ok(meta) if !meta.file_type().is_file() => {
@@ -280,10 +302,12 @@ fn verify_or_rewrite(
         // Cheap size-mismatch reject before we read a single byte —
         // a CAS file whose length doesn't match the buffer we were
         // about to write cannot possibly have matching contents.
-        Ok(meta) if meta.len() != content.len() as u64 => write_atomic(file_path, content, mode),
+        Ok(meta) if meta.len() != content.len() as u64 => {
+            repair_file(file_path, content, mode, repair)
+        }
         Ok(_) => match file_equals_bytes(file_path, content) {
             Ok(true) => Ok(()),
-            Ok(false) => write_atomic(file_path, content, mode),
+            Ok(false) => repair_file(file_path, content, mode, repair),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 write_atomic(file_path, content, mode)
             }
@@ -296,6 +320,21 @@ fn verify_or_rewrite(
         }
         Err(error) => Err(EnsureFileError::ReadFile { file_path: file_path.to_path_buf(), error }),
     }
+}
+
+/// Repair a corrupt regular file at `file_path` per the caller's
+/// strategy.
+fn repair_file(
+    file_path: &Path,
+    content: &[u8],
+    mode: Option<u32>,
+    repair: Repair,
+) -> Result<(), EnsureFileError> {
+    let mut source = content;
+    let repaired = matches!(repair, Repair::InPlace)
+        && overwrite_file_in_place(file_path, &mut source)
+        && file_equals_bytes(file_path, content).unwrap_or(false);
+    if repaired { Ok(()) } else { write_atomic(file_path, content, mode) }
 }
 
 /// Stream `file_path` and byte-compare against `content` without
@@ -349,15 +388,6 @@ fn file_equals_bytes(file_path: &Path, content: &[u8]) -> io::Result<bool> {
 /// `rename` it over the target. The rename is the only atomic step; an
 /// observer sees either the old contents or the new ones, never a
 /// half-written blob.
-///
-/// The temp file itself is opened with `O_CREAT|O_EXCL`
-/// (`create_new(true)`) rather than `create+truncate` so we never
-/// follow a symlink or truncate a file an attacker (or a crashed
-/// prior install) pre-seeded at our predicted temp path. If we hit
-/// `AlreadyExists` anyway — collisions are vanishingly rare given the
-/// pid + per-process atomic counter temp scheme, but cross-container
-/// shared-store setups can re-use pids — we advance the counter and
-/// try again, up to `MAX_TEMP_ATTEMPTS` times.
 ///
 /// Open errors are classified as `CreateFile`; write errors as
 /// `WriteFile`. On any failure the partially-created temp file is
@@ -416,10 +446,7 @@ fn write_atomic(
 pub fn create_exclusive_temp_file(
     dir: &Path,
     base: &str,
-    // `mode` feeds `OpenOptionsExt::mode` inside the `cfg(unix)` block
-    // below; Windows has no POSIX mode bits to set at open time, so the
-    // parameter is genuinely unused there.
-    #[cfg_attr(windows, allow(unused))] mode: Option<u32>,
+    mode: Option<u32>,
 ) -> Result<(PathBuf, File), EnsureFileError> {
     /// Retries after `AlreadyExists` on the temp path. Sixteen fresh
     /// counter values is plenty — under benign conditions we never
@@ -429,22 +456,20 @@ pub fn create_exclusive_temp_file(
 
     let mut last_already_exists: Option<io::Error> = None;
 
+    let creation = FileCreation::new(dir, mode);
+
     for _ in 0..MAX_TEMP_ATTEMPTS {
         let tmp_path = temp_path_in(dir, base);
-
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Some(mode) = mode {
-                options.mode(mode);
+        match creation.open(&tmp_path) {
+            Ok(file) => {
+                #[cfg(unix)]
+                if let Err(error) = creation.grant(&file) {
+                    drop(file);
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(EnsureFileError::CreateFile { file_path: tmp_path, error });
+                }
+                return Ok((tmp_path, file));
             }
-        }
-
-        match retry_on_fd_pressure(|| options.open(&tmp_path)) {
-            Ok(file) => return Ok((tmp_path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 // Stale temp file or adversarial / concurrent pre-seed.
                 // Retry with a fresh counter; don't touch whatever is
@@ -472,14 +497,13 @@ pub fn create_exclusive_temp_file(
     })
 }
 
-/// Build a unique temp path inside `dir`, of the form
-/// `{base}{pid}{counter}` per [`create_exclusive_temp_file`]'s
-/// uniqueness contract.
+/// Build a unique temp path inside `dir`, per
+/// [`create_exclusive_temp_file`]'s uniqueness contract.
 fn temp_path_in(dir: &Path, base: &str) -> PathBuf {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
+    let pid = crate::process_id();
 
     dir.join(format!("{base}{pid}{counter}"))
 }

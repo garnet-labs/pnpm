@@ -15,15 +15,33 @@ import {
   execPnpxSync,
 } from './utils/index.js'
 
-const f = fixtures(import.meta.dirname)
-const hasOutdatedDepsFixture = f.find('has-outdated-deps')
+const testFixtures = fixtures(import.meta.dirname)
+const hasOutdatedDepsFixture = testFixtures.find('has-outdated-deps')
 
 test('commands that were previously passed through to npm now fail', () => {
+  prepareEmpty()
   const result = execPnpmSync(['xmas'])
 
   expect(result.status).not.toBe(0)
   const output = result.stdout.toString() + result.stderr.toString()
   expect(output).toContain('ERR_PNPM_NOT_IMPLEMENTED')
+})
+
+test('pnpm runs when the temporary directory does not exist', () => {
+  prepare({})
+  const missingTmpDir = path.resolve('missing-tmp/tmp')
+
+  const result = execPnpmSync(['install'], {
+    env: {
+      NODE_DISABLE_COMPILE_CACHE: '1',
+      TEMP: missingTmpDir,
+      TMP: missingTmpDir,
+      TMPDIR: missingTmpDir,
+    },
+  })
+
+  expect(result.stderr.toString()).not.toContain('ENOENT')
+  expect(result.status).toBe(0)
 })
 
 test('set-script writes the script to package.json', async () => {
@@ -44,8 +62,8 @@ test('installs in the folder where the package.json file is', async () => {
 
   await execPnpm(['install', 'rimraf@2.5.1'])
 
-  const m = project.requireModule('rimraf')
-  expect(typeof m).toBe('function')
+  const rimraf = project.requireModule('rimraf')
+  expect(typeof rimraf).toBe('function')
   project.isExecutable('.bin/rimraf')
 })
 

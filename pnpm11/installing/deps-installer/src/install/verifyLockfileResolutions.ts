@@ -4,6 +4,7 @@ import { PnpmError } from '@pnpm/error'
 import { isValidDependencyAlias } from '@pnpm/installing.deps-resolver'
 import type { LockfileObject } from '@pnpm/lockfile.fs'
 import { isGitHostedTarballUrl, nameVerFromPkgSnapshot } from '@pnpm/lockfile.utils'
+import { MINIMUM_RELEASE_AGE_VIOLATION_CODE, TRUST_DOWNGRADE_VIOLATION_CODE } from '@pnpm/resolving.npm-resolver'
 import type {
   Resolution,
   ResolutionPolicyViolation,
@@ -35,6 +36,13 @@ const DEFAULT_CONCURRENCY = 64
 
 export const RESOLUTION_SHAPE_MISMATCH_VIOLATION_CODE = 'RESOLUTION_SHAPE_MISMATCH'
 
+// Violations from policies the user can relax. Relaxing a policy cannot clear
+// any other violation.
+const POLICY_VIOLATION_CODES = new Set([
+  MINIMUM_RELEASE_AGE_VIOLATION_CODE,
+  TRUST_DOWNGRADE_VIOLATION_CODE,
+])
+
 // Same code the sink-level guards (`safeJoinModulesDir`) throw.
 export const INVALID_DEPENDENCY_ALIAS_CODE = 'INVALID_DEPENDENCY_NAME'
 
@@ -46,6 +54,11 @@ const RESOLUTION_SHAPE_CACHE_IDENTITY: VerifierCacheIdentity = {
 const DEPENDENCY_ALIAS_CACHE_IDENTITY: VerifierCacheIdentity = {
   policy: { dependencyAliasCheck: true },
   canTrustPastCheck: (cached) => cached.dependencyAliasCheck === true,
+}
+
+const VARIATION_RESOLUTION_CACHE_IDENTITY: VerifierCacheIdentity = {
+  policy: { variationResolutionCheck: true },
+  canTrustPastCheck: (cached) => cached.variationResolutionCheck === true,
 }
 
 /**
@@ -60,7 +73,7 @@ const DEPENDENCY_ALIAS_CACHE_IDENTITY: VerifierCacheIdentity = {
  * resolution it just produced).
  */
 export function withOfflineCheckCacheIdentities (verifiers: readonly VerifierCacheIdentity[]): VerifierCacheIdentity[] {
-  return [...verifiers, RESOLUTION_SHAPE_CACHE_IDENTITY, DEPENDENCY_ALIAS_CACHE_IDENTITY]
+  return [...verifiers, RESOLUTION_SHAPE_CACHE_IDENTITY, DEPENDENCY_ALIAS_CACHE_IDENTITY, VARIATION_RESOLUTION_CACHE_IDENTITY]
 }
 
 export interface VerifyLockfileResolutionsOptions {
@@ -76,6 +89,15 @@ export interface VerifyLockfileResolutionsOptions {
   cacheDir?: string
   /** Absolute path of the lockfile being verified. Used by the cache's stat shortcut. */
   lockfilePath?: string
+  /**
+   * Entries the install re-resolves instead of reusing, such as the
+   * targets of `pnpm update <pkg>`. The resolver applies the policies to
+   * whatever it picks for them, so the verifiers skip their locked
+   * versions, which may no longer be served by the registry. The offline
+   * shape and alias checks still cover them. A run that skips an entry
+   * does not record the lockfile as verified.
+   */
+  isReplaced?: (name: string, version: string) => boolean
 }
 
 /**
@@ -88,22 +110,12 @@ export interface VerifyLockfileResolutionsOptions {
  * Fresh local resolution is covered by the resolver's own per-version
  * filter.
  *
- * Each verifier handles its own protocol short-circuit inside `verify`
- * (returning `{ ok: true }` for resolutions outside its scope), so the
- * fan-out is policy-neutral and dispatch-free at this layer.
- *
  * Designed for fail-closed semantics at the verifier level: a verifier
  * that can't confirm a resolution is expected to return `{ ok: false }`
  * rather than passing silently — otherwise a registry hiccup or an
  * unpublished version would re-open the bypass.
  *
  * No-op when `verifiers` is empty.
- *
- * When `options.cacheDir` and `options.lockfilePath` are both
- * provided, an unchanged lockfile that has already been verified
- * under the same (or stricter) policy short-circuits the registry
- * round-trip entirely — see {@link tryLockfileVerificationCache} for
- * the lookup logic.
  */
 export async function verifyLockfileResolutions (
   lockfile: LockfileObject,
@@ -112,52 +124,8 @@ export async function verifyLockfileResolutions (
 ): Promise<void> {
   if (!lockfile.packages) return
 
-  // Caching kicks in only when the caller surfaced both a writable
-  // cache directory and the lockfile's absolute path — that's the
-  // production wiring; unit tests that skip them get the gate without
-  // memoization and still exercise the same code path.
-  const cache = options?.cacheDir && options?.lockfilePath
-    ? { cacheDir: options.cacheDir, lockfilePath: options.lockfilePath }
-    : undefined
-
-  const cacheVerifiers = withOfflineCheckCacheIdentities(verifiers)
-
-  // Cache lookup runs before any registry I/O — the fast path is a
-  // single stat() of the lockfile when the previous install already
-  // verified it under a policy that's at least as strict as today's.
-  // The content key is hashed lazily from the in-memory lockfile (not
-  // the file bytes) so we never read the file a second time. On a
-  // miss the precomputed stat+hash flow to recordVerification.
-  type Precomputed = ReturnType<typeof tryLockfileVerificationCache>['precomputed']
-  let cachePrecomputed: Precomputed | undefined
-  // hashObject streams and is key-order-stable, unlike JSON.stringify.
-  let cachedHash: string | undefined
-  const hashLockfile = (): string => {
-    if (cachedHash == null) cachedHash = hashObject(lockfile)
-    return cachedHash
-  }
-  if (cache) {
-    const result = tryLockfileVerificationCache(cache.cacheDir, {
-      lockfilePath: cache.lockfilePath,
-      verifiers: cacheVerifiers,
-      hashLockfile,
-    })
-    if (result.hit) {
-      // A silent short-circuit looks like the policy gate never ran
-      // (pnpm/pnpm#12324), so surface the reused verdict — but only
-      // when policy verifiers are active; the shape-only run that
-      // every install performs stays quiet.
-      if (verifiers.length > 0) {
-        lockfileVerificationLogger.debug({
-          status: 'cached',
-          verifiedAt: result.verifiedAt,
-          lockfilePath: options?.lockfilePath,
-        })
-      }
-      return
-    }
-    cachePrecomputed = result.precomputed
-  }
+  const cacheContext = createVerificationCacheContext(lockfile, verifiers, options)
+  if (isVerifiedByCache(cacheContext, verifiers, options?.lockfilePath)) return
 
   // Emit started/done around the actual verification pass — the
   // round-trip can be slow on a cold registry cache, and the cached
@@ -175,16 +143,112 @@ export async function verifyLockfileResolutions (
     throw buildVerificationError(shapeViolations)
   }
   if (verifiers.length === 0) return
+  if (dropReplacedCandidates(candidates, options?.isReplaced)) {
+    cacheContext.cache = undefined
+  }
   if (candidates.size === 0) {
-    if (cache) {
-      recordVerification(cache.cacheDir, {
-        lockfilePath: cache.lockfilePath,
-        verifiers: cacheVerifiers,
-        hashLockfile,
-      }, cachePrecomputed)
-    }
+    recordVerifiedLockfile(cacheContext)
     return
   }
+  await verifyCandidates(candidates, verifiers, { cacheContext, options })
+}
+
+type CachePrecomputed = ReturnType<typeof tryLockfileVerificationCache>['precomputed']
+
+interface VerificationCacheContext {
+  cache?: { cacheDir: string, lockfilePath: string }
+  cacheVerifiers: VerifierCacheIdentity[]
+  hashLockfile: () => string
+  // On a miss the stat+hash the lookup computed flow to recordVerification.
+  precomputed?: CachePrecomputed
+}
+
+function createVerificationCacheContext (
+  lockfile: LockfileObject,
+  verifiers: ResolutionVerifier[],
+  options: VerifyLockfileResolutionsOptions | undefined
+): VerificationCacheContext {
+  // hashObject streams and is key-order-stable, unlike JSON.stringify.
+  let cachedHash: string | undefined
+  return {
+    cache: options?.cacheDir && options?.lockfilePath
+      ? { cacheDir: options.cacheDir, lockfilePath: options.lockfilePath }
+      : undefined,
+    cacheVerifiers: withOfflineCheckCacheIdentities(verifiers),
+    hashLockfile: () => {
+      if (cachedHash == null) cachedHash = hashObject(lockfile)
+      return cachedHash
+    },
+  }
+}
+
+/**
+ * Cache lookup runs before any registry I/O — the fast path is a
+ * single stat() of the lockfile when the previous install already
+ * verified it under a policy that's at least as strict as today's.
+ * The content key is hashed lazily from the in-memory lockfile (not
+ * the file bytes) so we never read the file a second time.
+ */
+function isVerifiedByCache (
+  cacheContext: VerificationCacheContext,
+  verifiers: ResolutionVerifier[],
+  lockfilePath: string | undefined
+): boolean {
+  if (!cacheContext.cache) return false
+  const result = tryLockfileVerificationCache(cacheContext.cache.cacheDir, {
+    lockfilePath: cacheContext.cache.lockfilePath,
+    verifiers: cacheContext.cacheVerifiers,
+    hashLockfile: cacheContext.hashLockfile,
+  })
+  if (!result.hit) {
+    cacheContext.precomputed = result.precomputed
+    return false
+  }
+  // A silent short-circuit looks like the policy gate never ran
+  // (pnpm/pnpm#12324), so surface the reused verdict — but only
+  // when policy verifiers are active; the shape-only run that
+  // every install performs stays quiet.
+  if (verifiers.length > 0) {
+    lockfileVerificationLogger.debug({
+      status: 'cached',
+      verifiedAt: result.verifiedAt,
+      lockfilePath,
+    })
+  }
+  return true
+}
+
+/** Persist the success so the next install can stat-only the lockfile. */
+function recordVerifiedLockfile (cacheContext: VerificationCacheContext): void {
+  if (!cacheContext.cache) return
+  recordVerification(cacheContext.cache.cacheDir, {
+    lockfilePath: cacheContext.cache.lockfilePath,
+    verifiers: cacheContext.cacheVerifiers,
+    hashLockfile: cacheContext.hashLockfile,
+  }, cacheContext.precomputed)
+}
+
+/** Remove the candidates the install re-resolves; whether any was removed. */
+function dropReplacedCandidates (
+  candidates: Map<string, Candidate>,
+  isReplaced: VerifyLockfileResolutionsOptions['isReplaced']
+): boolean {
+  if (isReplaced == null) return false
+  let dropped = false
+  for (const [key, { name, version }] of candidates) {
+    if (isReplaced(name, version)) {
+      candidates.delete(key)
+      dropped = true
+    }
+  }
+  return dropped
+}
+
+async function verifyCandidates (
+  candidates: Map<string, Candidate>,
+  verifiers: ResolutionVerifier[],
+  { cacheContext, options }: { cacheContext: VerificationCacheContext, options: VerifyLockfileResolutionsOptions | undefined }
+): Promise<void> {
   const startedAt = Date.now()
   lockfileVerificationLogger.debug({
     status: 'started',
@@ -194,25 +258,15 @@ export async function verifyLockfileResolutions (
   // Guarantee a terminal `done` or `failed` event on every exit path
   // that emitted `started`. Without this, an unexpected throw from the
   // registry fan-out (or the policy-violation throw below) would leave
-  // the transient "Verifying lockfile…" line as the last frame the
+  // the transient "Verifying lockfile..." line as the last frame the
   // reporter rendered for this block, hanging spinner-style above the
   // failure output.
   let terminalStatus: 'done' | 'failed' = 'failed'
   try {
     const violations = await iterateLockfileViolations(candidates, verifiers, options?.concurrency)
-    if (violations.length === 0) {
-      terminalStatus = 'done'
-      // Persist the success so the next install can stat-only the lockfile.
-      if (cache) {
-        recordVerification(cache.cacheDir, {
-          lockfilePath: cache.lockfilePath,
-          verifiers: cacheVerifiers,
-          hashLockfile,
-        }, cachePrecomputed)
-      }
-      return
-    }
-    throw buildVerificationError(violations)
+    if (violations.length > 0) throw buildVerificationError(violations)
+    terminalStatus = 'done'
+    recordVerifiedLockfile(cacheContext)
   } finally {
     lockfileVerificationLogger.debug({
       status: terminalStatus,
@@ -250,14 +304,14 @@ function buildVerificationError (violations: ResolutionPolicyViolation[]): PnpmE
   // lockfile) escalates to the generic `LOCKFILE_RESOLUTION_VERIFICATION`
   // and the per-entry code goes into the breakdown so the user can see
   // which policy each entry tripped.
-  const distinctCodes = new Set(violations.map((v) => v.code))
+  const distinctCodes = new Set(violations.map((violation) => violation.code))
   const isMixed = distinctCodes.size > 1
   const errorCode = isMixed ? 'LOCKFILE_RESOLUTION_VERIFICATION' : violations[0].code
   const visible = violations.slice(0, MAX_VIOLATIONS_TO_PRINT)
   const omitted = violations.length - visible.length
   const formatEntry = isMixed
-    ? (v: ResolutionPolicyViolation): string => `  ${v.name}@${v.version} [${v.code}] ${v.reason}`
-    : (v: ResolutionPolicyViolation): string => `  ${v.name}@${v.version} ${v.reason}`
+    ? (violation: ResolutionPolicyViolation): string => `  ${violation.name}@${violation.version} [${violation.code}] ${violation.reason}`
+    : (violation: ResolutionPolicyViolation): string => `  ${violation.name}@${violation.version} ${violation.reason}`
   const breakdown = visible.map(formatEntry).join('\n')
   const details = omitted > 0
     ? `${breakdown}\n  …and ${omitted} more`
@@ -270,13 +324,20 @@ function buildVerificationError (violations: ResolutionPolicyViolation[]): PnpmE
     errorCode,
     `${violations.length} lockfile entries failed verification:\n${details}`,
     {
-      hint: 'The lockfile contains entries that the active policies reject. ' +
-        'This can mean the lockfile is stale, or that someone committed a ' +
-        'lockfile that bypassed the policy locally — inspect recent changes ' +
-        'to pnpm-lock.yaml before trusting it. If the changes look expected, ' +
-        'run "pnpm clean --lockfile" and then "pnpm install" to rebuild from ' +
-        'a fresh resolution. Alternatively, relax the policy that flagged ' +
-        'them.',
+      hint: violations.every((violation) => POLICY_VIOLATION_CODES.has(violation.code))
+        ? 'The lockfile contains entries that the active policies reject. ' +
+          'This can mean the lockfile is stale, or that someone committed a ' +
+          'lockfile that bypassed the policy locally — inspect recent changes ' +
+          'to pnpm-lock.yaml before trusting it. If the changes look expected, ' +
+          'run "pnpm clean --lockfile" and then "pnpm install" to rebuild from ' +
+          'a fresh resolution. If the fresh resolution still fails and you ' +
+          'trust the affected packages, relax the policy that flagged them.'
+        : 'The lockfile contains entries that pnpm cannot verify, whatever ' +
+          'the configured policies. This can mean the lockfile is stale, or ' +
+          'that it was tampered with — inspect recent changes to ' +
+          'pnpm-lock.yaml before trusting it. If the changes look expected, ' +
+          'run "pnpm clean --lockfile" and then "pnpm install" to rebuild ' +
+          'from a fresh resolution.',
     }
   )
 }
@@ -287,9 +348,7 @@ function buildVerificationError (violations: ResolutionPolicyViolation[]): PnpmE
  * returns the violations as data instead of throwing on the first batch.
  * No cache lookup or write — the throw-mode `verifyLockfileResolutions`
  * is what populates / honors the cache; this is for callers that need
- * to inspect violations (auto-collect into `minimumReleaseAgeExclude`,
- * the strict-mode interactive prompt, future resolver-specific
- * policies).
+ * to inspect violations.
  *
  * Returns an empty array when `verifiers` is empty or the lockfile has
  * no packages, so callers don't need a separate emptiness check.
@@ -315,11 +374,7 @@ function isRegistryShapedResolution (resolution: unknown): boolean {
     tarball?: unknown
     variants?: unknown
   }
-  if (type === 'variations') {
-    return Array.isArray(variants) && variants.every(
-      (variant) => isRegistryShapedResolution((variant as { resolution?: unknown })?.resolution)
-    )
-  }
+  if (type === 'variations') return areRegistryShapedVariants(variants)
   // Custom resolver protocols (`type: 'custom:*'`) are a legitimate
   // non-registry source the user opted into. They can only be materialized by
   // a project-configured custom fetcher — an unrecognized custom type throws at
@@ -327,6 +382,17 @@ function isRegistryShapedResolution (resolution: unknown): boolean {
   // cannot launder an artifact past this gate into a build.
   if (typeof type === 'string' && type.startsWith('custom:')) return true
   if (type != null) return false
+  return isRegistryShapedTarballResolution(gitHosted, tarball)
+}
+
+function areRegistryShapedVariants (variants: unknown): boolean {
+  return Array.isArray(variants) && variants.length > 0 && variants.every((variant) => {
+    const resolution = (variant as { resolution?: unknown })?.resolution
+    return resolution != null && isRegistryShapedResolution(resolution)
+  })
+}
+
+function isRegistryShapedTarballResolution (gitHosted: unknown, tarball: unknown): boolean {
   // Plain tarball / registry resolution. The lockfile is parsed from YAML
   // without schema validation, so the `gitHosted` flag is not trustworthy on
   // its own: a tampered entry could set a non-boolean (dodging a strict
@@ -339,11 +405,8 @@ function isRegistryShapedResolution (resolution: unknown): boolean {
   // must be an http(s) registry artifact: the npm verifier's tarball-URL
   // binding skips non-http(s) schemes (file:, etc.), so a `file:` tarball
   // under a name@semver key would otherwise be trusted with no safety net.
-  if (typeof tarball === 'string' && tarball !== '') {
-    if (!/^https?:\/\//i.test(tarball)) return false
-    if (isGitHostedTarballUrl(tarball)) return false
-  }
-  return true
+  if (typeof tarball !== 'string' || tarball === '') return true
+  return /^https?:\/\//i.test(tarball) && !isGitHostedTarballUrl(tarball)
 }
 
 interface Candidate {
@@ -355,7 +418,7 @@ interface Candidate {
 }
 
 // depPath can include peer-dependency and patch_hash suffixes (e.g.
-// `react@18.0.0(peer)(patch_hash=…)`); the same (name, version) pair may
+// `react@18.0.0(peer)(patch_hash=...)`); the same (name, version) pair may
 // therefore appear multiple times. Dedupe so we issue at most one
 // verification per package version.
 //
@@ -437,26 +500,16 @@ async function iterateLockfileViolations (
   // rejections once Promise.all rejects on the first.
   let fetchError: unknown
   const limit = pLimit(concurrency ?? DEFAULT_CONCURRENCY)
+  const verifyCandidate = async (candidate: Candidate): Promise<void> => {
+    try {
+      const violation = await findFirstViolation(candidate, verifiers)
+      if (violation != null) violations.push(violation)
+    } catch (err) {
+      fetchError ??= err
+    }
+  }
   await Promise.all(
-    Array.from(candidates.values(), ({ name, version, nonSemverVersion, registryName, resolution }) => limit(async () => {
-      try {
-        // Fan out across every active verifier; each handles its own
-        // protocol short-circuit (e.g. the npm verifier returns ok:true for
-        // git resolutions). We stop at the first failure per entry so a
-        // multi-verifier setup doesn't produce duplicate violations for the
-        // same (name, version).
-        for (const verifier of verifiers) {
-          // eslint-disable-next-line no-await-in-loop
-          const result = await verifier.verify(resolution, { name, version, nonSemverVersion, registryName })
-          if (!result.ok) {
-            violations.push({ name, version, resolution, code: result.code, reason: result.reason })
-            break
-          }
-        }
-      } catch (err) {
-        fetchError ??= err
-      }
-    }))
+    Array.from(candidates.values(), (candidate) => limit(async () => verifyCandidate(candidate)))
   )
   // A registry that couldn't be reached takes precedence over collected
   // violations: the run never finished verifying, so the batch is incomplete
@@ -464,4 +517,24 @@ async function iterateLockfileViolations (
   // re-run surfaces any remaining violations.
   if (fetchError != null) throw fetchError
   return violations
+}
+
+/**
+ * Fan out across every active verifier; each handles its own protocol
+ * short-circuit (e.g. the npm verifier returns ok:true for git resolutions).
+ * We stop at the first failure per entry so a multi-verifier setup doesn't
+ * produce duplicate violations for the same (name, version).
+ */
+async function findFirstViolation (
+  { name, version, nonSemverVersion, registryName, resolution }: Candidate,
+  verifiers: readonly ResolutionVerifier[]
+): Promise<ResolutionPolicyViolation | undefined> {
+  for (const verifier of verifiers) {
+    // eslint-disable-next-line no-await-in-loop -- the verifiers run in turn so an entry stops at its first failure
+    const result = await verifier.verify(resolution, { name, version, nonSemverVersion, registryName })
+    if (!result.ok) {
+      return { name, version, resolution, code: result.code, reason: result.reason }
+    }
+  }
+  return undefined
 }

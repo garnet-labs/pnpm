@@ -39,14 +39,59 @@ enum InheritMode {
     No,
 }
 
+/// Create `path` exclusively, readable only by its owner on Unix: the mode
+/// `NamedTempFile` would have given it.
+#[cfg(not(target_os = "wasi"))]
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+#[cfg(target_os = "wasi")]
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    crate::wasi_fs::create_new(path, 0o600)
+}
+
 fn write_tmp_over(path: &Path, bytes: &[u8], inherit: InheritMode) -> io::Result<()> {
-    let dir = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
     if let Some(parent) = dir {
         fs::create_dir_all(parent)?;
     }
-    let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or_else(|| Path::new(".")))?;
+    // Registered before the create, so no interrupt finds the temp file
+    // unregistered. A colliding random name is retried under a new one,
+    // whose registration replaces the old.
+    let mut _pending_temp = None;
+    let mut tmp = tempfile::Builder::new()
+        .make_in(dir.unwrap_or_else(|| Path::new(".")), |path| {
+            _pending_temp = Some(crate::pending_temp::track_temp_file(path));
+            create_private_file(path)
+        })?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
+    inherit_permissions(path, tmp.as_file(), inherit)?;
+    let mut pending = Some(tmp.into_temp_path());
+    crate::retry::retry_transient_file_locks(|| {
+        let temporary = pending.take().expect("temporary path retained after a failed persist");
+        match temporary.persist(path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                pending = Some(error.path);
+                Err(error.error)
+            }
+        }
+    })?;
+    Ok(())
+}
+
+fn inherit_permissions(path: &Path, file: &fs::File, inherit: InheritMode) -> io::Result<()> {
     // `NamedTempFile` creates with mode 0600 on Unix; persisting it over an
     // existing regular file would silently tighten that file's permissions, so
     // carry the target's mode across the rename to preserve it.
@@ -62,11 +107,17 @@ fn write_tmp_over(path: &Path, bytes: &[u8], inherit: InheritMode) -> io::Result
     {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = metadata.permissions().mode();
-        tmp.as_file().set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
-    #[cfg(not(unix))]
-    let _ = inherit;
-    tmp.persist(path).map_err(|err| err.error)?;
+    #[cfg(target_os = "wasi")]
+    if matches!(inherit, InheritMode::Yes)
+        && let Ok(mode) = crate::wasi_fs::path_mode(path)
+        && mode & libc::S_IFMT != libc::S_IFLNK
+    {
+        crate::wasi_fs::set_file_mode(file, mode & 0o7777)?;
+    }
+    #[cfg(not(any(unix, target_os = "wasi")))]
+    let _ = (path, file, inherit);
     Ok(())
 }
 

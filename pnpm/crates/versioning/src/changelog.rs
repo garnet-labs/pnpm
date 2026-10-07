@@ -40,15 +40,14 @@ pub fn compose_changelog_section(release: &PlannedRelease) -> String {
         entries.push(format_list_item(&intent.summary));
     }
     if !release.dependency_updates.is_empty() {
-        let dep_lines: Vec<String> = release
-            .dependency_updates
+        let dep_lines: Vec<String> = release.dependency_updates
             .iter()
             .map(|dep| format!("  - {}@{}", dep.name, dep.new_version))
             .collect();
         entries_by_bump[2].1.push(format!("- Updated dependencies:\n{}", dep_lines.join("\n")));
     }
 
-    let mut parts = vec![format!("## {}", release.new_version)];
+    let mut parts = vec![format!("## {}", release.version.next)];
     for (bump_type, entries) in &entries_by_bump {
         if entries.is_empty() {
             continue;
@@ -92,9 +91,7 @@ fn format_list_item(summary: &str) -> String {
 
 /// Places `section` at the top of a package's changelog: under the existing
 /// `# <name>` title when `existing` is `Some`, or under a freshly created
-/// title when `existing` is `None`. Used both to write a committed
-/// CHANGELOG.md (`repository` storage) and to build the changelog packed into
-/// a published tarball on top of the previous version's (`registry` storage).
+/// title when `existing` is `None`.
 #[must_use]
 pub fn render_changelog(existing: Option<&str>, pkg_name: &str, section: &str) -> String {
     let Some(existing) = existing else {

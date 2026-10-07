@@ -88,8 +88,8 @@ export async function handler (
   }
 }
 
-function printRemoving (p: string): void {
-  process.stdout.write(`Removing ${path.relative(process.cwd(), p) || '.'}\n`)
+function printRemoving (dir: string): void {
+  process.stdout.write(`Removing ${path.relative(process.cwd(), dir) || '.'}\n`)
 }
 
 async function cleanProjectDir (opts: { modulesDir: string, removeLockfile?: boolean }, dir: string): Promise<void> {
@@ -137,6 +137,8 @@ async function removeModulesDirContents (modulesDir: string): Promise<void> {
 async function getProjectDirs (
   opts: {
     dir: string
+    modulesDir?: string
+    modulesDirsByProjectName?: Record<string, string>
     workspaceDir?: string
     workspacePackagePatterns?: string[]
   }
@@ -146,6 +148,8 @@ async function getProjectDirs (
   }
   const pkgs = await findWorkspaceProjectsNoCheck(opts.workspaceDir, {
     patterns: opts.workspacePackagePatterns,
+    modulesDir: opts.modulesDir,
+    modulesDirsByProjectName: opts.modulesDirsByProjectName,
   })
   return pkgs.map((pkg) => pkg.rootDir)
 }

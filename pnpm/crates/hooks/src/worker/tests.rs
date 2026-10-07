@@ -24,7 +24,10 @@ async fn cancelled_request_removes_its_pending_entry() {
     assert!(cancelled.is_err(), "the never-resolving hook must outlive the local timeout");
 
     assert!(
-        worker.pending.lock().unwrap().is_empty(),
+        worker.pending
+            .lock()
+            .unwrap()
+            .is_empty(),
         "a cancelled request must not leak its pending entry",
     );
 }
@@ -88,6 +91,44 @@ async fn a_queued_request_does_not_spend_its_timeout_waiting_for_its_turn() {
         .expect("spawn worker");
 
     call_read_package_concurrently(&worker, 100).await;
+}
+
+/// A range that is not a string makes the manifest invalid, and the worker
+/// sends the manifest back as JSON, which drops the entry. The call fails
+/// instead, naming the dependency, the field and the package.
+#[tokio::test]
+async fn a_non_string_range_from_read_package_fails_the_call() {
+    let tmp = TempDir::new().expect("temp dir");
+    let pnpmfile_path = tmp.path().join(".pnpmfile.cjs");
+    std::fs::write(
+        &pnpmfile_path,
+        r"module.exports = {
+  hooks: {
+    readPackage: (pkg) => {
+      pkg.dependencies['ms'] = undefined
+      return pkg
+    },
+  },
+}
+",
+    )
+    .expect("write pnpmfile");
+    let worker = NodeWorker::spawn(&pnpmfile_path).await.expect("spawn worker");
+
+    let err = worker
+        .call(
+            "readPackage",
+            serde_json::json!({ "name": "debug", "version": "4.3.4" }),
+            Arc::new(|_| {}),
+        )
+        .await
+        .expect_err("a range that is not a string must fail the call");
+    assert!(
+        err.to_string().contains(
+            "readPackage hook returned an invalid range for 'ms' in the 'dependencies' of debug@4.3.4. Expected a string, got undefined."
+        ),
+        "{err}",
+    );
 }
 
 /// Every call must succeed; the value returned is the highest `peak` the

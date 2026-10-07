@@ -1,7 +1,7 @@
 //! The `globalShims` record: what it says, and what writing to it must
 //! never do.
 //!
-//! The record in the global `config.yaml` is one of three layers the
+//! The record in the global `config.yaml` is one of the layers the
 //! dispatcher reads — the pnpm home's `pnpm-workspace.yaml` and the
 //! environment both outrank it — so a command that edits it has to ask
 //! what the *resolved* setting would be, not what its own file says. Two
@@ -13,6 +13,7 @@
 //! - a removal never switches a shim *on*, which clearing the entry that
 //!   holds back a built-in shim would do.
 
+use crate::{cli_args::shim::ShimError, engine_pm::channel::PackageManager};
 use miette::{Context, IntoDiagnostic};
 use pnpm_config::{
     Config, GLOBAL_CONFIG_YAML_FILENAME, GlobalShims, GlobalShimsSetting, Host, NamedShimPolicy,
@@ -24,8 +25,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-
-use crate::{cli_args::shim::ShimError, engine_pm::channel::PackageManager};
 
 /// Record (or clear) `package`'s entry in the global `config.yaml`'s
 /// `globalShims` record, which is what the dispatcher consults at run
@@ -85,6 +84,9 @@ pub(super) fn set_policy(
 /// projects that pin nothing. Only a package the user has not decided
 /// about is recorded: an entry of its own, or a `globalShims: false` that
 /// turns every shim off, is a decision and stands.
+///
+/// pnpm itself is left out: its own executable switches to the version a
+/// project pins, so a shim in front of it would dispatch to nothing new.
 pub(crate) fn record_package_manager_shims<'a>(
     config: &Config,
     packages: impl IntoIterator<Item = &'a str>,
@@ -98,7 +100,7 @@ pub(crate) fn record_package_manager_shims<'a>(
     for package in packages {
         // A disable that outranks this record leaves the shim doing
         // nothing, and the entry would outlive the disable.
-        if PackageManager::parse(package).is_none()
+        if PackageManager::parse(package).is_none_or(|pm| pm == PackageManager::Pnpm)
             || recorded.contains_key(package)
             || !would_dispatch(config, package)?
         {
@@ -111,8 +113,7 @@ pub(crate) fn record_package_manager_shims<'a>(
 }
 
 pub(super) fn global_config_dir(config: &Config) -> miette::Result<PathBuf> {
-    config
-        .config_dir
+    config.config_dir
         .clone()
         .or_else(default_config_dir::<Host>)
         .ok_or_else(|| ShimError::NoGlobalDir.into())

@@ -64,9 +64,6 @@ pub fn build_deps_graph_for_platform(
 /// closure, so the bounded graph produces the exact same cache
 /// keys as the full graph for every root — observable behavior
 /// matches [`build_deps_graph`] for the inputs we care about.
-///
-/// Pacquet only uses the graph for cache hashing today, so the
-/// trimmed walk is sound here — same cache keys, fewer cycles spent.
 pub fn build_deps_subgraph<Iter>(
     snapshots: &HashMap<PackageKey, SnapshotEntry>,
     packages: &HashMap<PackageKey, PackageMetadata>,
@@ -133,10 +130,22 @@ fn full_pkg_id_for(
     if let Some(integrity) = resolution.integrity() {
         return format!("{pkg_id}:{integrity}");
     }
-    // Fallback for non-integrity resolutions (git, directory). We
-    // serialize the resolution to a JSON value and hash it. The hash
-    // is base64-encoded, the encoding the resulting
-    // `<pkg_id>:<digest>` string requires.
+    full_pkg_id_without_builtin_integrity(&pkg_id, resolution)
+}
+
+/// The `<pkg_id>:<...>` id of a resolution that
+/// [`LockfileResolution::integrity`] has no value for. A custom
+/// resolver's own `integrity` string stands in for it, as in pnpm 11's
+/// `createFullPkgId`. Any other resolution (git, directory, or custom
+/// without an integrity) is identified by a base64 hash of the whole
+/// object.
+pub(crate) fn full_pkg_id_without_builtin_integrity(
+    pkg_id: &str,
+    resolution: &LockfileResolution,
+) -> String {
+    if let Some(integrity) = resolution.custom_integrity().and_then(serde_json::Value::as_str) {
+        return format!("{pkg_id}:{integrity}");
+    }
     let resolution_value = serde_json::to_value(resolution).unwrap_or(serde_json::Value::Null);
     let hash =
         hash_object_with_encoding(&resolution_value, HashEncoding::Base64, /* sort */ true);
@@ -196,10 +205,15 @@ fn extend_children<Child>(
 pub fn in_lockfile_order<Value>(
     snapshots: &HashMap<PackageKey, Value>,
 ) -> Vec<(&PackageKey, &Value)> {
-    let mut entries: Vec<(String, &PackageKey, &Value)> =
-        snapshots.iter().map(|(key, value)| (key.to_string(), key, value)).collect();
+    let mut entries: Vec<(String, &PackageKey, &Value)> = snapshots
+        .iter()
+        .map(|(key, value)| (key.to_string(), key, value))
+        .collect();
     entries.sort_unstable_by(|(left, ..), (right, ..)| left.cmp(right));
-    entries.into_iter().map(|(_, key, value)| (key, value)).collect()
+    entries
+        .into_iter()
+        .map(|(_, key, value)| (key, value))
+        .collect()
 }
 
 #[cfg(test)]

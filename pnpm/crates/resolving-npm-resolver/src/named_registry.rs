@@ -8,14 +8,15 @@
 //! resolved via a named registry would 404 or, worse, hit a stale
 //! mirror under the default registry.
 
+pub use pnpm_lockfile::pick_registry_for_package;
+
+pub use pnpm_config::BUILTIN_REGISTRIES_BY_PREFIX;
+
 use std::collections::HashMap;
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-pub use pnpm_lockfile::pick_registry_for_package;
 use reqwest::Url;
-
-pub use pnpm_config::BUILTIN_REGISTRIES_BY_PREFIX;
 
 /// Failure from [`merge_named_registries`], surfaced with the
 /// `ERR_PNPM_INVALID_NAMED_REGISTRY_URL` code.
@@ -72,7 +73,7 @@ pub fn merge_named_registries(
     user_defined: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, MergeNamedRegistriesError> {
     for (alias, url) in user_defined {
-        if pnpm_deps_path::is_reserved_version_prefix(alias) {
+        if pnpm_deps_path::shadows_reserved_version_prefix(alias) {
             return Err(MergeNamedRegistriesError::ReservedAlias { alias: alias.clone() });
         }
         if !pnpm_deps_path::is_well_formed_registry_name(alias) {
@@ -117,7 +118,11 @@ pub fn named_registry_tarball_prefixes(
             format!("{}{}", parsed.origin().ascii_serialization(), pathname)
         })
         .collect();
-    prefixes.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    prefixes.sort_by(|a, b| {
+        b.len()
+            .cmp(&a.len())
+            .then_with(|| a.cmp(b))
+    });
     prefixes
 }
 

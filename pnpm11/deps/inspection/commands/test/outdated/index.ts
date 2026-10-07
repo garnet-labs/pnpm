@@ -12,17 +12,17 @@ import { fixtures } from '@pnpm/test-fixtures'
 import { REGISTRY_MOCK_PORT } from '@pnpm/testing.registry-mock'
 import { symlinkDirSync } from 'symlink-dir'
 
-const f = fixtures(import.meta.dirname)
-const hasOutdatedDepsFixture = f.find('has-outdated-deps')
-const has2OutdatedDepsFixture = f.find('has-2-outdated-deps')
-const hasOutdatedDepsFixtureAndExternalLockfile = path.join(f.find('has-outdated-deps-and-external-shrinkwrap'), 'pkg')
-const hasNotOutdatedDepsFixture = f.find('has-not-outdated-deps')
-const hasMajorOutdatedDepsFixture = f.find('has-major-outdated-deps')
-const hasNoLockfileFixture = f.find('has-no-lockfile')
-const withPnpmUpdateIgnore = f.find('with-pnpm-update-ignore')
-const hasOutdatedDepsUsingCatalogProtocol = f.find('has-outdated-deps-using-catalog-protocol')
-const hasOutdatedDepsUsingNpmAlias = f.find('has-outdated-deps-using-npm-alias')
-const hasOnlyDeprecatedDepsFixture = f.find('has-only-deprecated-deps')
+const testFixtures = fixtures(import.meta.dirname)
+const hasOutdatedDepsFixture = testFixtures.find('has-outdated-deps')
+const has2OutdatedDepsFixture = testFixtures.find('has-2-outdated-deps')
+const hasOutdatedDepsFixtureAndExternalLockfile = path.join(testFixtures.find('has-outdated-deps-and-external-shrinkwrap'), 'pkg')
+const hasNotOutdatedDepsFixture = testFixtures.find('has-not-outdated-deps')
+const hasMajorOutdatedDepsFixture = testFixtures.find('has-major-outdated-deps')
+const hasNoLockfileFixture = testFixtures.find('has-no-lockfile')
+const withPnpmUpdateIgnore = testFixtures.find('with-pnpm-update-ignore')
+const hasOutdatedDepsUsingCatalogProtocol = testFixtures.find('has-outdated-deps-using-catalog-protocol')
+const hasOutdatedDepsUsingNpmAlias = testFixtures.find('has-outdated-deps-using-npm-alias')
+const hasOnlyDeprecatedDepsFixture = testFixtures.find('has-only-deprecated-deps')
 
 const REGISTRY_URL = `http://localhost:${REGISTRY_MOCK_PORT}`
 
@@ -538,4 +538,60 @@ test('pnpm outdated --long with only deprecated packages', async () => {
 │                      │         │            │ https://foo.bar/qar                      │
 └──────────────────────┴─────────┴────────────┴──────────────────────────────────────────┘
 `)
+})
+
+test('pnpm outdated should fail when a specified package is not in dependencies', async () => {
+  tempDir()
+
+  fs.mkdirSync(path.resolve('node_modules/.pnpm'), { recursive: true })
+  fs.copyFileSync(path.join(hasOutdatedDepsFixture, 'node_modules/.pnpm/lock.yaml'), path.resolve('node_modules/.pnpm/lock.yaml'))
+  fs.copyFileSync(path.join(hasOutdatedDepsFixture, 'package.json'), path.resolve('package.json'))
+
+  await expect(
+    outdated.handler({
+      ...OUTDATED_OPTIONS,
+      dir: process.cwd(),
+    }, ['not-a-dep'])
+  ).rejects.toMatchObject({
+    code: 'ERR_PNPM_NO_PACKAGE_IN_DEPENDENCIES',
+    message: 'None of the specified packages were found in the dependencies.',
+  })
+
+  await expect(
+    outdated.handler({
+      ...OUTDATED_OPTIONS,
+      dir: process.cwd(),
+    }, ['is-positive', 'not-a-dep'])
+  ).rejects.toMatchObject({
+    code: 'ERR_PNPM_NO_PACKAGE_IN_DEPENDENCIES',
+    message: 'None of the specified packages were found in the dependencies.',
+  })
+
+  await expect(
+    outdated.handler({
+      ...OUTDATED_OPTIONS,
+      dev: false,
+      dir: process.cwd(),
+    }, ['is-positive'])
+  ).rejects.toMatchObject({
+    code: 'ERR_PNPM_NO_PACKAGE_IN_DEPENDENCIES',
+  })
+
+  const compoundResult = await outdated.handler({
+    ...OUTDATED_OPTIONS,
+    dir: process.cwd(),
+  }, ['!not-a-dep', 'is-*'])
+  expect(compoundResult.exitCode).toBe(1)
+
+  const excludedOnlyResult = await outdated.handler({
+    ...OUTDATED_OPTIONS,
+    dir: process.cwd(),
+  }, ['!is-*', '!@pnpm.e2e/*'])
+  expect(excludedOnlyResult.exitCode).toBe(0)
+
+  const cancelledResult = await outdated.handler({
+    ...OUTDATED_OPTIONS,
+    dir: process.cwd(),
+  }, ['is-positive', '!is-positive'])
+  expect(cancelledResult.exitCode).toBe(0)
 })

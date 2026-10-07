@@ -15,61 +15,52 @@
 //!   `minimumReleaseAge` and `trustPolicy='no-downgrade'` to every
 //!   npm-resolved lockfile entry the install loads.
 
-mod calc_specifier;
-mod calc_specifier_for_workspace_dep;
-mod create_npm_resolution_verifier;
-mod errors;
-mod fetch_attestation_published_at;
-mod fetch_full_metadata;
-mod fetch_full_metadata_cached;
-mod infer_range_spec_style;
-mod lookup_context;
+#[cfg(target_family = "wasm")]
+extern crate pnpm_http as reqwest;
+
 pub mod mirror;
-mod named_registry;
-mod named_registry_resolver;
-mod npm_resolver;
-mod parse_bare_specifier;
-mod pick_package;
-mod pick_package_from_meta;
-mod preferred_overlay;
-mod registry_url;
-mod resolve_from_workspace;
-mod trust_checks;
-mod violation_codes;
-mod workspace_pref_to_npm;
 
 pub use calc_specifier::{calc_prefixed_specifier, calc_specifier, calc_version_range};
-pub use calc_specifier_for_workspace_dep::{DeclaredSpecifiers, calc_specifier_for_workspace_dep};
+pub use calc_specifier_for_workspace_dep::{
+    DeclaredSpecifiers, calc_specifier_for_workspace_dep, can_drop_workspace_protocol,
+};
 pub use create_npm_resolution_verifier::{
     CreateNpmResolutionVerifierOptions, DistStats, NpmResolutionVerifier, ObservedDistStats,
-    create_npm_resolution_verifier, observed_dist_stats_sink,
+    VerificationArtifacts, VerificationMetadataClient, VerificationReleaseAgeOptions,
+    VerificationTrustOptions, create_npm_resolution_verifier, observed_dist_stats_sink,
 };
 pub use errors::{
     FetchMetadataError, InvalidTarballIntegrityError, InvalidTarballRevisionMetadataError,
 };
 pub use fetch_attestation_published_at::{FetchAttestationOptions, fetch_attestation_published_at};
 pub use fetch_full_metadata::{
-    FetchFullMetadataOptions, FetchFullMetadataOutcome, fetch_full_metadata,
+    FetchFullMetadataOptions, FetchFullMetadataOutcome, MetadataHttpClient, fetch_full_metadata,
 };
 pub use fetch_full_metadata_cached::{FetchFullMetadataCachedOptions, fetch_full_metadata_cached};
-pub use infer_range_spec_style::infer_range_spec_style;
+pub use infer_range_spec_style::{infer_range_spec_style, range_of_specifier};
+pub use lookup_context::VerifierLookups;
 pub use mirror::{ABBREVIATED_META_DIR, FULL_FILTERED_META_DIR, FULL_META_DIR};
 pub use named_registry::{
     BUILTIN_REGISTRIES_BY_PREFIX, MergeNamedRegistriesError, merge_named_registries,
     named_registry_tarball_prefixes, pick_registry_for_version,
 };
 pub use named_registry_resolver::NamedRegistryResolver;
-pub use npm_resolver::NpmResolver;
+pub use npm_resolver::{
+    NpmResolver, RegistryMetadataClient, RegistryMetadataFormat, detect_min_release_age_violation,
+    normalize_tarball_url,
+};
 pub use parse_bare_specifier::{
     JsrRegistryPackageSpec, NamedRegistryPackageSpec, ParseNamedRegistrySpecifierError,
     parse_bare_specifier, parse_jsr_specifier_to_registry_package_spec,
     parse_named_registry_specifier_to_registry_package_spec,
 };
 pub use pick_package::{
-    CachedPackument, InMemoryPackageMetaCache, MirrorPersistError, PackageMetaCache,
-    PackumentFetchLocker, PickPackageContext, PickPackageError, PickPackageOptions,
-    PickPackageResult, PickedManifestCache, persist_meta_to_mirror, pick_package,
-    shared_in_memory_cache, shared_packument_fetch_locker, shared_picked_manifest_cache,
+    CachedPackument, InMemoryPackageMetaCache, MetadataCachePolicy, MetadataPickRequest,
+    MetadataRequestContext, MirrorPersistError, OfflineStoreView, PackageMetaCache,
+    PackagePickPolicy, PackumentFetchLocker, PickPackageContext, PickPackageError,
+    PickPackageOptions, PickPackageResult, PickedManifestCache, persist_meta_to_mirror,
+    pick_package, shared_in_memory_cache, shared_packument_fetch_locker,
+    shared_picked_manifest_cache,
 };
 pub use pick_package_from_meta::{
     PickPackageFromMetaError, PickPackageFromMetaOptions, PickVersionByVersionRangeOptions,
@@ -81,10 +72,39 @@ pub use pnpm_lockfile::pick_registry_for_package;
 pub use registry_url::to_registry_url;
 pub use resolve_from_workspace::{
     ResolveFromWorkspaceError, ResolveFromWorkspaceOptions, pick_matching_local_version_or_null,
-    try_resolve_from_workspace,
+    resolve_workspace_package_dir, try_resolve_from_workspace,
 };
 pub use trust_checks::{
-    TrustCheckOptions, TrustEvidence, TrustViolation, fail_if_trust_downgraded, get_trust_evidence,
+    TrustCheckOptions, TrustEvidence, TrustHistory, TrustViolation, fail_if_trust_downgraded,
+    get_trust_evidence,
 };
 pub use violation_codes::{MINIMUM_RELEASE_AGE_VIOLATION_CODE, TRUST_DOWNGRADE_VIOLATION_CODE};
 pub use workspace_pref_to_npm::{InvalidWorkspaceSpecError, workspace_pref_to_npm};
+
+mod calc_specifier;
+mod calc_specifier_for_workspace_dep;
+mod create_npm_resolution_verifier;
+mod errors;
+mod fetch_attestation_published_at;
+mod fetch_full_metadata;
+mod fetch_full_metadata_cached;
+mod infer_range_spec_style;
+mod lookup_context;
+mod named_registry;
+mod named_registry_resolver;
+mod npm_resolver;
+mod parse_bare_specifier;
+mod pick_package;
+mod pick_package_from_meta;
+mod preferred_overlay;
+mod registry_url;
+mod resolve_from_workspace;
+mod trust_checks;
+mod violation_codes;
+mod warn_once;
+mod workspace_pref_to_npm;
+
+#[cfg(target_family = "wasm")]
+pub(crate) use pnpm_wasm_host::process_id;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::process::id as process_id;

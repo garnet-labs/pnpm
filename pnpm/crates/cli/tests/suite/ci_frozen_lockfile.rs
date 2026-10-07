@@ -19,13 +19,18 @@ fn pacquet_in_github_actions(workspace: &Path) -> Command {
     command
 }
 
+fn pacquet_in_aws_codebuild(workspace: &Path) -> Command {
+    let mut command = pacquet_without_ci(workspace);
+    command.env("CODEBUILD_BUILD_ARN", "arn:aws:codebuild:us-east-1:000000000000:build/project:1");
+    command
+}
+
 fn pacquet_without_ci(workspace: &Path) -> Command {
     let mut command = pacquet_in(workspace);
-    command
-        .env_remove("PNPM_CONFIG_CI")
-        .env_remove("CI")
-        .env_remove("GITHUB_ACTION")
-        .env_remove("GITHUB_ACTIONS");
+    command.env_remove("PNPM_CONFIG_CI").env_remove("NODE");
+    for name in pnpm_config::CI_ENV_VARS {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -41,8 +46,8 @@ fn outdated_lockfile_project() -> TempDir {
     .expect("write local dependency manifest");
     fs::write(
         workspace.join("package.json"),
-        serde_json::json!({ "dependencies": { "local-dependency": "file:dependency" } })
-            .to_string(),
+        serde_json::json!({ "dependencies": { "local-dependency": "file:dependency" } }).to_string(
+        ),
     )
     .expect("write project manifest");
     fs::write(workspace.join("pnpm-lock.yaml"), OUTDATED_LOCKFILE).expect("write stale lockfile");
@@ -61,14 +66,16 @@ fn assert_lockfile_was_updated(workspace: &Path) {
 
 #[test]
 fn ci_rejects_an_outdated_lockfile_by_default() {
-    for command_in_ci in [pacquet_in_ci, pacquet_in_github_actions] {
+    for command_in_ci in [pacquet_in_ci, pacquet_in_github_actions, pacquet_in_aws_codebuild] {
         let root = outdated_lockfile_project();
         let workspace = root.path();
         let lockfile_path = workspace.join("pnpm-lock.yaml");
 
-        let assert = command_in_ci(workspace).arg("install").assert().failure();
+        let assert = command_in_ci(workspace)
+            .arg("install")
+            .assert()
+            .failure();
         let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-        eprintln!("STDERR:\n{stderr}\n");
         assert!(
             stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"),
             "CI install must report the outdated lockfile; got:\n{stderr}",
@@ -102,7 +109,6 @@ fn ci_values_enable_the_default_in_github_actions() {
             .assert()
             .failure();
         let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-        eprintln!("STDERR:\n{stderr}\n");
         assert!(
             stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"),
             "CI={ci_value} in GitHub Actions must report the outdated lockfile; got:\n{stderr}",
@@ -132,7 +138,10 @@ fn workspace_manifest_cannot_disable_ci_detection() {
     fs::write(workspace.join("pnpm-workspace.yaml"), "ci: false\n")
         .expect("write workspace manifest");
 
-    let assert = pacquet_in_ci(workspace).arg("install").assert().failure();
+    let assert = pacquet_in_ci(workspace)
+        .arg("install")
+        .assert()
+        .failure();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(
         stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"),
@@ -147,49 +156,128 @@ fn workspace_manifest_cannot_disable_ci_detection() {
 
 #[test]
 fn ci_honors_explicit_prefer_frozen_lockfile_values() {
-    for prefer_arg in ["--prefer-frozen-lockfile", "--no-prefer-frozen-lockfile"] {
-        let root = outdated_lockfile_project();
-        let workspace = root.path();
+    let frozen_root = outdated_lockfile_project();
+    let frozen_workspace = frozen_root.path();
+    let assert = pacquet_in_ci(frozen_workspace)
+        .args(["install", "--prefer-frozen-lockfile"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"),
+        "CI install with --prefer-frozen-lockfile must report outdated lockfile; got:\n{stderr}",
+    );
+    assert_eq!(
+        fs::read_to_string(frozen_workspace.join("pnpm-lock.yaml"))
+            .expect("read lockfile after failed install"),
+        OUTDATED_LOCKFILE,
+    );
 
-        pacquet_in_ci(workspace).args(["install", prefer_arg]).assert().success();
-
-        assert_lockfile_was_updated(workspace);
-    }
+    let mutable_root = outdated_lockfile_project();
+    let mutable_workspace = mutable_root.path();
+    pacquet_in_ci(mutable_workspace)
+        .args(["install", "--no-prefer-frozen-lockfile"])
+        .assert()
+        .success();
+    assert_lockfile_was_updated(mutable_workspace);
 }
 
 #[test]
 fn ci_honors_configured_prefer_frozen_lockfile_values() {
-    for prefer_value in ["true", "false"] {
-        let root = outdated_lockfile_project();
-        let workspace = root.path();
+    let frozen_root = outdated_lockfile_project();
+    let frozen_workspace = frozen_root.path();
+    let assert = pacquet_in_ci(frozen_workspace)
+        .env("PNPM_CONFIG_PREFER_FROZEN_LOCKFILE", "true")
+        .arg("install")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"),
+        "CI install with prefer-frozen-lockfile=true must report outdated lockfile; got:\n{stderr}",
+    );
+    assert_eq!(
+        fs::read_to_string(frozen_workspace.join("pnpm-lock.yaml"))
+            .expect("read lockfile after failed install"),
+        OUTDATED_LOCKFILE,
+    );
 
-        pacquet_in_ci(workspace)
-            .env("PNPM_CONFIG_PREFER_FROZEN_LOCKFILE", prefer_value)
-            .arg("install")
-            .assert()
-            .success();
-
-        assert_lockfile_was_updated(workspace);
-    }
+    let mutable_root = outdated_lockfile_project();
+    let mutable_workspace = mutable_root.path();
+    pacquet_in_ci(mutable_workspace)
+        .env("PNPM_CONFIG_PREFER_FROZEN_LOCKFILE", "false")
+        .arg("install")
+        .assert()
+        .success();
+    assert_lockfile_was_updated(mutable_workspace);
 }
 
 #[test]
 fn ci_honors_pnpmfile_prefer_frozen_lockfile_values() {
-    for prefer_value in [true, false] {
-        let root = outdated_lockfile_project();
-        let workspace = root.path();
-        fs::write(
-            workspace.join(".pnpmfile.cjs"),
-            format!(
-                "module.exports = {{ hooks: {{ updateConfig (config) {{ config.preferFrozenLockfile = {prefer_value}; return config }} }} }}",
-            ),
-        )
-        .expect("write updateConfig hook");
+    let frozen_root = outdated_lockfile_project();
+    let frozen_workspace = frozen_root.path();
+    fs::write(
+        frozen_workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { config.preferFrozenLockfile = true; return config } } }",
+    )
+    .expect("write updateConfig hook");
+    let assert = pacquet_in_ci(frozen_workspace)
+        .arg("install")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE")
+            || stderr.contains("ERR_PNPM_LOCKFILE_CONFIG_MISMATCH"),
+        "got:\n{stderr}",
+    );
+    assert_eq!(
+        fs::read_to_string(frozen_workspace.join("pnpm-lock.yaml"))
+            .expect("read lockfile after failed install"),
+        OUTDATED_LOCKFILE,
+    );
 
-        pacquet_in_ci(workspace).arg("install").assert().success();
+    let mutable_root = outdated_lockfile_project();
+    let mutable_workspace = mutable_root.path();
+    fs::write(
+        mutable_workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { config.preferFrozenLockfile = false; return config } } }",
+    )
+    .expect("write updateConfig hook");
+    pacquet_in_ci(mutable_workspace)
+        .arg("install")
+        .assert()
+        .success();
+    assert_lockfile_was_updated(mutable_workspace);
+}
 
-        assert_lockfile_was_updated(workspace);
-    }
+#[test]
+fn ci_honors_workspace_manifest_prefer_frozen_lockfile_values() {
+    let frozen_root = outdated_lockfile_project();
+    let frozen_workspace = frozen_root.path();
+    fs::write(frozen_workspace.join("pnpm-workspace.yaml"), "preferFrozenLockfile: true\n")
+        .expect("write pnpm-workspace.yaml");
+    let assert = pacquet_in_ci(frozen_workspace)
+        .arg("install")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"), "got:\n{stderr}");
+    assert_eq!(
+        fs::read_to_string(frozen_workspace.join("pnpm-lock.yaml"))
+            .expect("read lockfile after failed install"),
+        OUTDATED_LOCKFILE,
+    );
+
+    let mutable_root = outdated_lockfile_project();
+    let mutable_workspace = mutable_root.path();
+    fs::write(mutable_workspace.join("pnpm-workspace.yaml"), "preferFrozenLockfile: false\n")
+        .expect("write pnpm-workspace.yaml");
+    pacquet_in_ci(mutable_workspace)
+        .arg("install")
+        .assert()
+        .success();
+    assert_lockfile_was_updated(mutable_workspace);
 }
 
 #[test]
@@ -248,6 +336,27 @@ fn configured_frozen_lockfile_values_take_priority_over_prefer_flags() {
     }
 }
 
+/// `--config.<setting>=<value>` reaches settings the command has no flag
+/// table entry for.
+#[test]
+fn dotted_frozen_lockfile_setting_rejects_an_outdated_lockfile() {
+    for token in ["--config.frozen-lockfile=true", "--config.frozenLockfile=true"] {
+        let root = outdated_lockfile_project();
+        let workspace = root.path();
+        let assert = pacquet_without_ci(workspace)
+            .args(["install", token])
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+        assert!(stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"), "{token}; got:\n{stderr}");
+        assert_eq!(
+            fs::read_to_string(workspace.join("pnpm-lock.yaml"))
+                .expect("read lockfile after failed install"),
+            OUTDATED_LOCKFILE,
+        );
+    }
+}
+
 #[test]
 fn ci_install_without_a_nonempty_lockfile_generates_one() {
     for create_empty_lockfile in [false, true] {
@@ -258,7 +367,10 @@ fn ci_install_without_a_nonempty_lockfile_generates_one() {
             fs::write(workspace.join("pnpm-lock.yaml"), "").expect("write empty lockfile");
         }
 
-        pacquet_in_ci(workspace).arg("install").assert().success();
+        pacquet_in_ci(workspace)
+            .arg("install")
+            .assert()
+            .success();
 
         let lockfile =
             fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read generated lockfile");
@@ -273,7 +385,10 @@ fn ci_install_with_a_semantically_empty_lockfile_updates_it() {
     fs::write(workspace.join("pnpm-lock.yaml"), EMPTY_LOCKFILE)
         .expect("write semantically empty lockfile");
 
-    pacquet_in_ci(workspace).arg("install").assert().success();
+    pacquet_in_ci(workspace)
+        .arg("install")
+        .assert()
+        .success();
 
     assert_lockfile_was_updated(workspace);
 }

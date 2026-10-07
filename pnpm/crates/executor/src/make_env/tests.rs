@@ -1,7 +1,7 @@
 use super::{
-    DEV_PREINSTALL_ALREADY_RAN_ENV, EnvOptions, VERIFY_DEPS_BEFORE_RUN_ENV, build_env,
-    build_env_for_platform, escape_newlines, is_dev_preinstall_marker, is_stamping_key,
-    sanitize_env_key, stamp_package,
+    DEV_PREINSTALL_ALREADY_RAN_ENV, EnvOptions, ROOT_PREINSTALL_ALREADY_RAN_ENV,
+    VERIFY_DEPS_BEFORE_RUN_ENV, build_env, build_env_for_platform, escape_newlines,
+    is_delegation_marker, is_stamping_key, path_value, sanitize_env_key, stamp_package,
 };
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -17,17 +17,21 @@ fn base_opts<'a>(
     extra_env: &'a HashMap<String, String>,
 ) -> EnvOptions<'a> {
     EnvOptions {
+        environment: crate::ScriptEnvironment {
+            init_cwd,
+            node_execpath: None,
+            npm_execpath: None,
+            node_gyp_path: None,
+            user_agent: None,
+            extra_env,
+        },
         stage: "postinstall",
         script: "echo hi",
         pkg_root,
-        init_cwd,
+
         script_src_dir: pkg_root,
-        node_execpath: None,
-        npm_execpath: None,
-        node_gyp_path: None,
-        user_agent: None,
+
         unsafe_perm: true,
-        extra_env,
     }
 }
 
@@ -127,17 +131,21 @@ fn make_env_stamps_lifecycle_specific_keys() {
     let extra = empty_extra();
 
     let opts = EnvOptions {
+        environment: crate::ScriptEnvironment {
+            init_cwd,
+            node_execpath: None,
+            npm_execpath: None,
+            node_gyp_path: None,
+            user_agent: None,
+            extra_env: &extra,
+        },
         stage: "preinstall",
         script: "node x.js",
         pkg_root,
-        init_cwd,
+
         script_src_dir: pkg_root,
-        node_execpath: None,
-        npm_execpath: None,
-        node_gyp_path: None,
-        user_agent: None,
+
         unsafe_perm: true,
-        extra_env: &extra,
     };
 
     let built = build_env(&opts, &json!({ "name": "y", "version": "1.0.0" }), HashMap::new());
@@ -146,7 +154,10 @@ fn make_env_stamps_lifecycle_specific_keys() {
     // assertions are correct on Windows (`\\` separator) as well as
     // POSIX. Path-separator handling itself is `std`'s job — these
     // tests verify build_env's mapping, not separator policy.
-    let expected_package_json = pkg_root.join("package.json").to_string_lossy().into_owned();
+    let expected_package_json = pkg_root
+        .join("package.json")
+        .to_string_lossy()
+        .into_owned();
     let expected_init_cwd = init_cwd.to_string_lossy().into_owned();
     let expected_src_dir = pkg_root.to_string_lossy().into_owned();
 
@@ -188,8 +199,10 @@ fn make_env_windows_tmpdir_override_removes_differently_cased_keys() {
     let expected_tmpdir = pkg_root.join("node_modules").join(".tmp");
 
     assert_eq!(built.env.get("TMPDIR"), Some(&expected_tmpdir.to_string_lossy().into_owned()));
-    let tmpdir_key_count =
-        built.env.keys().filter(|key| key.eq_ignore_ascii_case("TMPDIR")).count();
+    let tmpdir_key_count = built.env
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case("TMPDIR"))
+        .count();
     assert_eq!(tmpdir_key_count, 1);
 }
 
@@ -215,17 +228,21 @@ fn reserved_stamps_win_over_extra_env_but_custom_keys_apply() {
     extra.insert("CUSTOM".into(), "hello".into());
 
     let opts = EnvOptions {
+        environment: crate::ScriptEnvironment {
+            init_cwd: Path::new("/original"),
+            node_execpath: None,
+            npm_execpath: None,
+            node_gyp_path: Some(node_gyp),
+            user_agent: Some("pnpm"),
+            extra_env: &extra,
+        },
         stage: "postinstall",
         script: "REAL",
         pkg_root,
-        init_cwd: Path::new("/original"),
+
         script_src_dir: pkg_root,
-        node_execpath: None,
-        npm_execpath: None,
-        node_gyp_path: Some(node_gyp),
-        user_agent: Some("pnpm"),
+
         unsafe_perm: true,
-        extra_env: &extra,
     };
 
     let built = build_env(&opts, &json!({"name":"w","version":"0"}), HashMap::new());
@@ -245,6 +262,87 @@ fn reserved_stamps_win_over_extra_env_but_custom_keys_apply() {
     assert_eq!(built.env.get("npm_package_name").map(String::as_str), Some("from-hook"));
     // A brand-new key from `extraEnv` also applies.
     assert_eq!(built.env.get("CUSTOM").map(String::as_str), Some("hello"));
+}
+
+const BUNDLED_NODE_GYP: &str = "/pnpm/dist/node_modules/node-gyp/bin/node-gyp.js";
+
+/// Build the env with the bundled `node-gyp` default configured.
+fn build_with_node_gyp_default(
+    parent: HashMap<String, String>,
+    extra_env: &HashMap<String, String>,
+    is_windows: bool,
+) -> HashMap<String, String> {
+    let pkg_root = Path::new("/tmp/w");
+    let mut opts = base_opts(pkg_root, pkg_root, extra_env);
+    opts.environment.node_gyp_path = Some(Path::new(BUNDLED_NODE_GYP));
+    build_env_for_platform(&opts, &json!({"name":"w","version":"0"}), parent, is_windows).env
+}
+
+/// TS `npm-lifecycle` fills `npm_config_node_gyp` only when the
+/// environment left it unset, so an inherited value is kept.
+#[test]
+fn an_inherited_npm_config_node_gyp_is_kept_over_the_default() {
+    let parent =
+        HashMap::from([("npm_config_node_gyp".to_string(), "/user/node-gyp.js".to_string())]);
+
+    let env = build_with_node_gyp_default(parent, &empty_extra(), false);
+
+    assert_eq!(env.get("npm_config_node_gyp").map(String::as_str), Some("/user/node-gyp.js"));
+}
+
+#[test]
+fn node_gyp_path_fills_npm_config_node_gyp_when_the_environment_left_it_unset() {
+    let parent = HashMap::from([("npm_config_node_gyp".to_string(), String::new())]);
+
+    let env = build_with_node_gyp_default(parent, &empty_extra(), false);
+
+    assert_eq!(env.get("npm_config_node_gyp").map(String::as_str), Some(BUNDLED_NODE_GYP));
+}
+
+#[test]
+fn an_uppercase_inherited_npm_config_node_gyp_is_kept_on_windows() {
+    let parent =
+        HashMap::from([("NPM_CONFIG_NODE_GYP".to_string(), "/user/node-gyp.js".to_string())]);
+
+    let env = build_with_node_gyp_default(parent, &empty_extra(), true);
+
+    assert_eq!(env.get("NPM_CONFIG_NODE_GYP").map(String::as_str), Some("/user/node-gyp.js"));
+    assert!(!env.contains_key("npm_config_node_gyp"), "{env:?}");
+}
+
+/// An empty inherited alias is dropped before the default is stamped, so
+/// the two spellings cannot race in the child's environment on Windows.
+#[test]
+fn an_empty_inherited_alias_does_not_shadow_the_default_on_windows() {
+    let parent = HashMap::from([("NPM_CONFIG_NODE_GYP".to_string(), String::new())]);
+
+    let env = build_with_node_gyp_default(parent, &empty_extra(), true);
+
+    assert_eq!(env.get("npm_config_node_gyp").map(String::as_str), Some(BUNDLED_NODE_GYP));
+    assert!(!env.contains_key("NPM_CONFIG_NODE_GYP"), "{env:?}");
+}
+
+/// A user `extraEnv` overrides the default, and on Windows a differently
+/// cased `extraEnv` key replaces the stamped spelling rather than racing it.
+#[test]
+fn a_differently_cased_extra_env_node_gyp_replaces_the_default_on_windows() {
+    let extra =
+        HashMap::from([("NPM_CONFIG_NODE_GYP".to_string(), "/hook/node-gyp.js".to_string())]);
+
+    let env = build_with_node_gyp_default(HashMap::new(), &extra, true);
+
+    assert_eq!(env.get("NPM_CONFIG_NODE_GYP").map(String::as_str), Some("/hook/node-gyp.js"));
+    assert!(!env.contains_key("npm_config_node_gyp"), "{env:?}");
+}
+
+#[test]
+fn an_uppercase_inherited_npm_config_node_gyp_is_unrelated_on_posix() {
+    let parent =
+        HashMap::from([("NPM_CONFIG_NODE_GYP".to_string(), "/user/node-gyp.js".to_string())]);
+
+    let env = build_with_node_gyp_default(parent, &empty_extra(), false);
+
+    assert_eq!(env.get("npm_config_node_gyp").map(String::as_str), Some(BUNDLED_NODE_GYP));
 }
 
 #[test]
@@ -313,21 +411,26 @@ fn is_stamping_key_is_case_sensitive_on_posix() {
     assert!(is_stamping_key(DEV_PREINSTALL_ALREADY_RAN_ENV, false));
     assert!(!is_stamping_key(&DEV_PREINSTALL_ALREADY_RAN_ENV.to_lowercase(), false));
     assert!(is_stamping_key(&DEV_PREINSTALL_ALREADY_RAN_ENV.to_lowercase(), true));
+    assert!(is_stamping_key(ROOT_PREINSTALL_ALREADY_RAN_ENV, false));
+    assert!(!is_stamping_key(&ROOT_PREINSTALL_ALREADY_RAN_ENV.to_lowercase(), false));
+    assert!(is_stamping_key(&ROOT_PREINSTALL_ALREADY_RAN_ENV.to_lowercase(), true));
 }
 
 /// The marker describes the install currently running. Leaving it in a
 /// script's env would make a nested install started by that script
 /// treat its own root hook as already run.
 #[test]
-fn the_dev_preinstall_delegation_marker_never_reaches_a_script() {
+fn the_delegation_markers_never_reach_a_script() {
     let mut parent = HashMap::new();
     parent.insert(DEV_PREINSTALL_ALREADY_RAN_ENV.into(), "true".into());
+    parent.insert(ROOT_PREINSTALL_ALREADY_RAN_ENV.into(), "true".into());
 
     let pkg_root = Path::new("/tmp/nested");
     // Whichever way the value arrives: inherited above, or named by a
     // user's `extraEnv`, which is merged in after the parent-env filter.
     let mut extra = empty_extra();
     extra.insert(DEV_PREINSTALL_ALREADY_RAN_ENV.into(), "true".into());
+    extra.insert(ROOT_PREINSTALL_ALREADY_RAN_ENV.into(), "true".into());
     let built = build_env(
         &base_opts(pkg_root, pkg_root, &extra),
         &json!({ "name": "nested", "version": "1.0.0" }),
@@ -335,16 +438,19 @@ fn the_dev_preinstall_delegation_marker_never_reaches_a_script() {
     );
 
     assert_eq!(built.env.get(DEV_PREINSTALL_ALREADY_RAN_ENV), None);
+    assert_eq!(built.env.get(ROOT_PREINSTALL_ALREADY_RAN_ENV), None);
 }
 
 /// On Windows a differently-cased spelling is the same variable, so an
 /// `extraEnv` naming it that way must be dropped too.
 #[test]
 fn a_differently_cased_delegation_marker_is_dropped_on_windows() {
-    assert!(is_dev_preinstall_marker(DEV_PREINSTALL_ALREADY_RAN_ENV, false));
-    assert!(!is_dev_preinstall_marker(&DEV_PREINSTALL_ALREADY_RAN_ENV.to_lowercase(), false));
-    assert!(is_dev_preinstall_marker(&DEV_PREINSTALL_ALREADY_RAN_ENV.to_lowercase(), true));
-    assert!(!is_dev_preinstall_marker("PNPM_INTERNAL_SOMETHING_ELSE", true));
+    for marker in [DEV_PREINSTALL_ALREADY_RAN_ENV, ROOT_PREINSTALL_ALREADY_RAN_ENV] {
+        assert!(is_delegation_marker(marker, false));
+        assert!(!is_delegation_marker(&marker.to_lowercase(), false));
+        assert!(is_delegation_marker(&marker.to_lowercase(), true));
+    }
+    assert!(!is_delegation_marker("PNPM_INTERNAL_SOMETHING_ELSE", true));
 }
 
 /// Regression: the byte-level prefix check inside the Windows
@@ -401,4 +507,38 @@ fn escape_newlines_json_encodes_multi_line_only() {
     assert_eq!(escape_newlines("plain"), "plain");
     assert_eq!(escape_newlines("a\nb"), r#""a\nb""#);
     assert_eq!(escape_newlines(r#"has "quotes""#), r#"has "quotes""#);
+}
+
+#[cfg(unix)]
+#[test]
+fn package_manager_environment_preserves_native_node_paths() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, process::Command};
+
+    let node = b"/node-\xff/node";
+    let env = super::package_manager_env(
+        Path::new("/"),
+        Some(Path::new(OsStr::from_bytes(node))),
+        None,
+        None,
+    );
+    let output = Command::new("/bin/sh")
+        .args(["-c", r#"printf '%s\n' "$NODE" "$npm_node_execpath""#])
+        .envs(env)
+        .output()
+        .expect("spawn shell");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, [node.as_slice(), b"\n", node.as_slice(), b"\n"].concat());
+}
+
+/// Windows compares environment names case-insensitively, so its usual
+/// `Path` spelling supplies `PATH`. Elsewhere `Path` is a variable of its own.
+/// <https://github.com/pnpm/pnpm/issues/16308>
+#[test]
+fn path_value_reads_path_in_another_case_only_on_windows() {
+    let env = HashMap::from([("Path".to_string(), "/decoy/bin".to_string())]);
+    let expected = cfg!(windows).then(|| "/decoy/bin".to_string());
+    assert_eq!(path_value(&env), expected);
+
+    let env = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+    assert_eq!(path_value(&env).as_deref(), Some("/usr/bin"));
 }

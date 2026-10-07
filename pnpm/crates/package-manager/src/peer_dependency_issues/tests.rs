@@ -16,7 +16,10 @@ fn only_resolver_issue_candidates_are_walked() {
     struct RecordingReporter;
     impl Reporter for RecordingReporter {
         fn emit(event: &LogEvent) {
-            EVENTS.lock().unwrap().push(event.clone());
+            EVENTS
+                .lock()
+                .unwrap()
+                .push(event.clone());
         }
     }
 
@@ -65,7 +68,7 @@ snapshots:
         Some(&catalogs),
     )
     .expect_err("a resolver candidate with a missing peer must fail in strict mode");
-    assert!(matches!(error, InstallError::PeerDependencyIssues));
+    assert!(matches!(error, InstallError::PeerDependencyIssues { rendered: None }));
     let events = EVENTS.lock().unwrap();
     assert!(matches!(events.as_slice(), [LogEvent::Global(_)]), "unexpected events: {events:?}");
 }

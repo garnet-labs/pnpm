@@ -30,30 +30,43 @@
 //! the workspace volume, so `eslint --fix` fails with a
 //! "`TSConfig` does not include this file" error on every project file.
 //!
-//! The hardlink attempt itself is threaded through the
-//! [`LinkProbe`] capability so tests can answer the linkability
-//! question without touching disk. The production [`Host`] impl
-//! performs the real link attempts via [`host_can_link_between_dirs`].
-//!
 //! [`pnpm_store_dir::STORE_VERSION`] (`"v11"`) is *not* appended in
 //! this module; the path returned here is the un-suffixed base. Every
 //! caller wraps the result in [`pnpm_store_dir::StoreDir::from`],
-//! which appends the suffix in one place — an
-//! `if (!endsWith(v11)) append(v11)` step. Doing the join at
+//! which appends the suffix in one place. Doing the join at
 //! construction guarantees that everything pacquet exposes externally
 //! (the `storeDir` written to `.modules.yaml`, the path printed by
 //! `pacquet store path`, the NDJSON `context` log event) matches the
-//! value pnpm produces, so switching between the two tools no longer
-//! trips `ERR_PNPM_UNEXPECTED_STORE`.
-//!
-//! [`Host`]: crate::api::Host
+//! value pnpm produces.
 
 use crate::api::LinkProbe;
+use pnpm_store_dir::StoreDir;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// A default store that the store resolution moved off the pnpm home
+/// directory: `home_store_dir` is the store the project cannot hard link
+/// from, `store_dir` the one chosen on the project's volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRelocation {
+    pub home_store_dir: StoreDir,
+    pub store_dir: StoreDir,
+}
+
+impl StoreRelocation {
+    /// The warning for a relocation that leaves an existing home store
+    /// unused, for example one pre-populated in a container image.
+    pub fn warning(&self) -> String {
+        format!(
+            "The store at {} is not used because packages cannot be hard linked from it into this project. Using the store at {} instead. Set storeDir to choose the store.",
+            self.home_store_dir.root().display(),
+            self.store_dir.root().display(),
+        )
+    }
+}
 
 /// Resolve where to place the default pnpm store given the `SmartDefault`
 /// home-based path and the project root.
@@ -182,7 +195,7 @@ pub(crate) fn host_can_link_between_dirs(from_dir: &Path, to_dir: &Path) -> bool
 /// reading, which is sufficient because each callsite uses the path
 /// once and removes it.
 fn path_temp_in(folder: &Path) -> PathBuf {
-    let pid = std::process::id();
+    let pid = pnpm_fs::process_id();
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
     folder.join(format!("_tmp_{pid}_{nanos:08x}"))
 }

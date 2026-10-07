@@ -2,9 +2,10 @@ use crate::{FileHash, StoreDir};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_fs::{
-    EnsureFileError, cas_write_lock, create_exclusive_temp_file, ensure_file, ensure_parent_dir,
+    EnsureFileError, cas_write_lock, create_exclusive_temp_file, ensure_cas_file,
+    ensure_parent_dir,
     file_mode::{EXEC_MODE, is_executable},
-    rename_with_retry,
+    overwrite_file_in_place, rename_with_retry,
 };
 use sha2::{Digest, Sha512};
 use std::{
@@ -93,7 +94,7 @@ impl StoreDir {
 
         self.ensure_shard_dir(&file_path, file_hash[0])?;
 
-        ensure_file(&file_path, buffer, mode).map_err(WriteCasFileError::WriteFile)?;
+        ensure_cas_file(&file_path, buffer, mode).map_err(WriteCasFileError::WriteFile)?;
         Ok((file_path, file_hash))
     }
 
@@ -113,7 +114,9 @@ impl StoreDir {
     /// to [`StoreDir::write_cas_file`] lands at the same path with the
     /// same guarantees: an existing regular file at the target is kept
     /// as the live entry only after a byte-compare against the streamed
-    /// content, and anything else is atomically replaced.
+    /// content, a corrupt regular file is repaired in place so its
+    /// inode — and every hard link to it — survives (pnpm/pnpm#3445),
+    /// and anything else is atomically replaced.
     ///
     /// When `expected_size` is given, a reader that yields any other
     /// number of bytes fails with the `Read` variant *before* anything
@@ -126,105 +129,32 @@ impl StoreDir {
         executable: bool,
         expected_size: Option<u64>,
     ) -> Result<(PathBuf, FileHash, u64), WriteCasFileFromReaderError> {
-        let write_error =
-            |error| WriteCasFileFromReaderError::Write(WriteCasFileError::WriteFile(error));
-        let io_write_error = |file_path: &PathBuf, error| {
-            write_error(EnsureFileError::WriteFile { file_path: file_path.clone(), error })
-        };
-
         let files_dir = self.files_dir();
-        ensure_parent_dir(files_dir).map_err(write_error)?;
+        ensure_parent_dir(files_dir).map_err(write_cas_error)?;
         let mode = executable.then_some(EXEC_MODE);
         let (tmp_path, file) =
-            create_exclusive_temp_file(files_dir, "stream", mode).map_err(write_error)?;
+            create_exclusive_temp_file(files_dir, "stream", mode).map_err(write_cas_error)?;
 
-        // Bytes arrive in decompressor-sized chunks (tens of KB);
-        // BufWriter coalesces them so the kernel sees fewer, larger
-        // writes.
-        let mut writer = io::BufWriter::with_capacity(COPY_BUFFER_SIZE, file);
-        let mut hasher = Sha512::new();
-        let mut copy_buffer = vec![0u8; COPY_BUFFER_SIZE];
-        let mut size: u64 = 0;
-        let result = loop {
-            match reader.read(&mut copy_buffer) {
-                Ok(0) => break Ok(()),
-                Ok(read) => {
-                    hasher.update(&copy_buffer[..read]);
-                    if let Err(error) = writer.write_all(&copy_buffer[..read]) {
-                        break Err(io_write_error(&tmp_path, error));
-                    }
-                    size += read as u64;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => break Err(WriteCasFileFromReaderError::Read(error)),
+        let streamed = stream_into_temp_file(reader, file, &tmp_path, expected_size);
+        let (file_hash, size) = match streamed {
+            Ok(streamed) => streamed,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(error);
             }
         };
-        let result = result.and_then(|()| {
-            writer
-                .into_inner()
-                .map_err(|error| io_write_error(&tmp_path, error.into_error()))
-                .map(drop)
-        });
-        if let Err(error) = result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(error);
-        }
-        if let Some(expected) = expected_size
-            && size != expected
-        {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(WriteCasFileFromReaderError::Read(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("reader yielded {size} bytes where {expected} were expected"),
-            )));
-        }
 
-        let file_hash = hasher.finalize();
         let file_path = self.cas_file_path(file_hash, executable);
         if let Err(error) = self.ensure_shard_dir(&file_path, file_hash[0]) {
             let _ = fs::remove_file(&tmp_path);
             return Err(WriteCasFileFromReaderError::Write(error));
         }
 
-        // Serialize with buffer-based writers ([`ensure_file`]) and
-        // verifiers of the same path, per [`cas_write_lock`]'s
-        // coordination contract.
-        let lock = cas_write_lock(&file_path);
-        let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // A regular file already at the hash-derived target is kept —
-        // preserving its inode — only after its bytes are verified
-        // against the freshly streamed temp, the same guarantee
-        // [`ensure_file`]'s byte-compare gives the buffered writer.
-        // Anything else (missing, torn or corrupt blob, symlink or
-        // other non-regular dirent) is atomically replaced by the
-        // rename, which is self-healing in every such state.
-        let existing_is_live = fs::symlink_metadata(&file_path)
-            .is_ok_and(|meta| meta.file_type().is_file() && meta.len() == size)
-            && files_have_equal_contents(&tmp_path, &file_path);
-        if existing_is_live {
-            let _ = fs::remove_file(&tmp_path);
-            return Ok((file_path, file_hash, size));
-        }
-        if let Err(error) = rename_with_retry(&tmp_path, &file_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(write_error(EnsureFileError::RenameFile {
-                tmp_path,
-                file_path: file_path.clone(),
-                error,
-            }));
-        }
+        commit_streamed_temp_file(&tmp_path, &file_path, size)?;
         Ok((file_path, file_hash, size))
     }
 
-    /// Ensure the shard directory (`files/XX/`) exists. The CAS has
-    /// 256 shards keyed by `file_hash[0]`; `create_dir_all` does a
-    /// `stat` syscall every call even when the directory is already
-    /// there, so remember which shards we've created and skip on
-    /// repeat. Duplicate mkdirs across threads are benign — the first
-    /// few writes into a fresh shard may each call `create_dir_all`,
-    /// which is idempotent; once any of them completes and inserts
-    /// into the cache, subsequent writes take the fast path.
+    /// Ensure the shard directory (`files/XX/`) exists.
     fn ensure_shard_dir(&self, file_path: &Path, shard_byte: u8) -> Result<(), WriteCasFileError> {
         if !self.shard_already_ensured(shard_byte) {
             let parent = file_path.parent().expect("CAS file path always has a parent shard dir");
@@ -233,6 +163,115 @@ impl StoreDir {
         }
         Ok(())
     }
+}
+
+fn write_cas_error(error: EnsureFileError) -> WriteCasFileFromReaderError {
+    WriteCasFileFromReaderError::Write(WriteCasFileError::WriteFile(error))
+}
+
+/// Commit a fully streamed temp file to its content-addressed path,
+/// consuming the temp in every outcome.
+///
+/// A regular file already at the hash-derived target is kept —
+/// preserving its inode — only after its bytes are verified against the
+/// freshly streamed temp, the same guarantee [`ensure_cas_file`]'s
+/// byte-compare gives the buffered writer. A corrupt regular file is
+/// repaired in place. Anything else (missing or torn blob, symlink or
+/// other non-regular dirent, refused in-place write) is atomically
+/// replaced by the rename, which is self-healing in every such state.
+fn commit_streamed_temp_file(
+    tmp_path: &Path,
+    file_path: &Path,
+    size: u64,
+) -> Result<(), WriteCasFileFromReaderError> {
+    // Serialize with buffer-based writers ([`ensure_cas_file`]) and
+    // verifiers of the same path, per [`cas_write_lock`]'s
+    // coordination contract.
+    let lock = cas_write_lock(file_path);
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let existing_meta = fs::symlink_metadata(file_path).ok();
+    let existing_is_regular = existing_meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_file());
+    let existing_is_live = existing_meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_file() && meta.len() == size)
+        && files_have_equal_contents(tmp_path, file_path);
+    if existing_is_live || (existing_is_regular && repair_in_place(tmp_path, file_path)) {
+        let _ = fs::remove_file(tmp_path);
+        return Ok(());
+    }
+    if let Err(error) = rename_with_retry(tmp_path, file_path) {
+        let _ = fs::remove_file(tmp_path);
+        return Err(write_cas_error(EnsureFileError::RenameFile {
+            tmp_path: tmp_path.to_path_buf(),
+            file_path: file_path.to_path_buf(),
+            error,
+        }));
+    }
+    Ok(())
+}
+
+/// Overwrite the corrupt regular file at `file_path` in place with the
+/// bytes just streamed into `tmp_path`, keeping the inode so hard links
+/// to it from other projects' `node_modules` are healed by the same
+/// write (pnpm/pnpm#3445). Returns false — the caller falls back to the
+/// atomic rename — when the in-place write is refused or the result
+/// fails a byte-compare against the temp, which covers a concurrent
+/// process still mid-write on the same path.
+fn repair_in_place(tmp_path: &Path, file_path: &Path) -> bool {
+    let Ok(mut tmp_reader) = fs::File::open(tmp_path) else { return false };
+    overwrite_file_in_place(file_path, &mut tmp_reader)
+        && files_have_equal_contents(tmp_path, file_path)
+}
+
+/// Copy the reader into the temp file, hashing as it goes, and return the
+/// content hash and byte count.
+///
+/// The caller removes the temp file on every error.
+fn stream_into_temp_file(
+    reader: &mut dyn Read,
+    file: fs::File,
+    tmp_path: &Path,
+    expected_size: Option<u64>,
+) -> Result<(FileHash, u64), WriteCasFileFromReaderError> {
+    // Bytes arrive in decompressor-sized chunks (tens of KB);
+    // BufWriter coalesces them so the kernel sees fewer, larger
+    // writes.
+    let mut writer = io::BufWriter::with_capacity(COPY_BUFFER_SIZE, file);
+    let mut hasher = Sha512::new();
+    let mut copy_buffer = vec![0u8; COPY_BUFFER_SIZE];
+    let mut size: u64 = 0;
+    let io_write_error = |error| {
+        write_cas_error(EnsureFileError::WriteFile { file_path: tmp_path.to_path_buf(), error })
+    };
+
+    loop {
+        match reader.read(&mut copy_buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&copy_buffer[..read]);
+                writer
+                    .write_all(&copy_buffer[..read])
+                    .map_err(io_write_error)?;
+                size += read as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(WriteCasFileFromReaderError::Read(error)),
+        }
+    }
+    writer.into_inner().map_err(|error| io_write_error(error.into_error()))?;
+
+    if let Some(expected) = expected_size
+        && size != expected
+    {
+        return Err(WriteCasFileFromReaderError::Read(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("reader yielded {size} bytes where {expected} were expected"),
+        )));
+    }
+    Ok((hasher.finalize(), size))
 }
 
 /// Chunk size for [`StoreDir::write_cas_file_from_reader`]'s read loop
@@ -253,8 +292,9 @@ fn files_have_equal_contents(left: &Path, right: &Path) -> bool {
     let mut reader_a = io::BufReader::with_capacity(COPY_BUFFER_SIZE, file_a);
     let mut reader_b = io::BufReader::with_capacity(COPY_BUFFER_SIZE, file_b);
     loop {
-        let Ok(chunk_a) = reader_a.fill_buf() else { return false };
-        let Ok(chunk_b) = reader_b.fill_buf() else { return false };
+        let (Ok(chunk_a), Ok(chunk_b)) = (reader_a.fill_buf(), reader_b.fill_buf()) else {
+            return false;
+        };
         if chunk_a.is_empty() || chunk_b.is_empty() {
             return chunk_a.is_empty() && chunk_b.is_empty();
         }

@@ -37,6 +37,9 @@
       "path": "../../crypto/object-hasher"
     },
     {
+      "path": "../../hooks/read-package-hook"
+    },
+    {
       "path": "../../installing/context"
     },
     {
@@ -62,6 +65,9 @@
     },
     {
       "path": "../../workspace/workspace-manifest-reader"
+    },
+    {
+      "path": "../path"
     }
   ]
 }

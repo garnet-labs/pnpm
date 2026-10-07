@@ -1,10 +1,6 @@
 //! Dispatcher-side surface of `@pnpm/resolving.resolver-base`. Defines
 //! the [`WantedDependency`] → [`ResolveResult`] contract and the
 //! [`Resolver`] trait every per-protocol resolver implements.
-//!
-//! Future per-protocol resolvers (npm, git, tarball, local, jsr,
-//! runtimes, named-registry, workspace) implement [`Resolver`]; the
-//! default-resolver dispatcher composes them into a chain.
 
 use std::{collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
@@ -26,7 +22,7 @@ use crate::verifier::ResolutionPolicyViolation;
 ///   `file:…`) from the git / local / tarball resolvers.
 ///
 /// Consumers that need the structured `name@version` form read
-/// [`ResolveResult::name_ver`] instead.
+/// [`ResolvedPackageInfo::name_ver`] instead.
 #[derive(Debug, Display, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, From)]
 #[serde(transparent)]
 pub struct PkgResolutionId(String);
@@ -70,8 +66,7 @@ impl From<PkgNameVer> for PkgResolutionId {
 /// `..WantedDependency::default()` in struct literals — a bare
 /// `WantedDependency::default()` with both halves `None` is a
 /// programming error the type system doesn't catch. The invariant is
-/// upheld by construction sites (the parse-wanted-dependency port
-/// and the deps-resolver's manifest reader); resolvers that walk a
+/// upheld by construction sites; resolvers that walk a
 /// [`WantedDependency`] with both halves empty should return
 /// `Ok(None)` so the chain falls through to the
 /// "spec not supported" terminal.
@@ -154,6 +149,7 @@ impl VersionSelectorEntry {
 pub struct PreferredVersionsOverlay {
     entries: BTreeMap<String, Vec<String>>,
     parent: Option<Arc<PreferredVersionsOverlay>>,
+    is_direct_deps: bool,
 }
 
 impl PreferredVersionsOverlay {
@@ -164,10 +160,28 @@ impl PreferredVersionsOverlay {
         parent: Option<Arc<PreferredVersionsOverlay>>,
         entries: BTreeMap<String, Vec<String>>,
     ) -> Option<Arc<PreferredVersionsOverlay>> {
+        Self::layer_with_direct(parent, entries, false)
+    }
+
+    /// Layer `entries` over `parent` as direct dependencies of an importer.
+    #[must_use]
+    pub fn layer_direct(
+        parent: Option<Arc<PreferredVersionsOverlay>>,
+        entries: BTreeMap<String, Vec<String>>,
+    ) -> Option<Arc<PreferredVersionsOverlay>> {
+        Self::layer_with_direct(parent, entries, true)
+    }
+
+    #[must_use]
+    pub fn layer_with_direct(
+        parent: Option<Arc<PreferredVersionsOverlay>>,
+        entries: BTreeMap<String, Vec<String>>,
+        is_direct_deps: bool,
+    ) -> Option<Arc<PreferredVersionsOverlay>> {
         if entries.is_empty() {
             return parent;
         }
-        Some(Arc::new(PreferredVersionsOverlay { entries, parent }))
+        Some(Arc::new(PreferredVersionsOverlay { entries, parent, is_direct_deps }))
     }
 
     /// Every version the chain prefers for `name`, nearest level
@@ -177,16 +191,45 @@ impl PreferredVersionsOverlay {
         let mut versions: Vec<&str> = Vec::new();
         let mut layer = Some(self);
         while let Some(current) = layer {
-            if let Some(found) = current.entries.get(name) {
-                for version in found {
-                    if !versions.contains(&version.as_str()) {
-                        versions.push(version);
-                    }
+            layer = current.parent.as_deref();
+            let Some(found) = current.entries.get(name) else { continue };
+            for version in found {
+                if !versions.contains(&version.as_str()) {
+                    versions.push(version);
                 }
             }
-            layer = current.parent.as_deref();
         }
         versions
+    }
+
+    /// Every version the chain prefers for `name`, nearest level first,
+    /// tagged with [`DIRECT_DEP_SELECTOR_WEIGHT`] for the importer direct-dependency level
+    /// or `1` for descendant levels. Duplicate versions across levels retain the maximum weight.
+    #[must_use]
+    pub fn weighted_versions_for(&self, name: &str) -> Vec<(&str, u32)> {
+        let mut versions: Vec<(&str, u32)> = Vec::new();
+        let mut layer = Some(self);
+        while let Some(current) = layer {
+            let is_direct = current.is_direct_deps;
+            layer = current.parent.as_deref();
+            let Some(found) = current.entries.get(name) else { continue };
+            let weight = if is_direct { DIRECT_DEP_SELECTOR_WEIGHT } else { 1 };
+            for version in found {
+                record_weighted_version(&mut versions, version.as_str(), weight);
+            }
+        }
+        versions
+    }
+}
+
+fn record_weighted_version<'a>(versions: &mut Vec<(&'a str, u32)>, version: &'a str, weight: u32) {
+    if let Some(index) = versions
+        .iter()
+        .position(|(v, _)| *v == version)
+    {
+        versions[index].1 = versions[index].1.max(weight);
+    } else {
+        versions.push((version, weight));
     }
 }
 
@@ -200,10 +243,6 @@ pub const EXISTING_VERSION_SELECTOR_WEIGHT: u32 = 1_000_000;
 
 /// One project in the current workspace that resolution can satisfy
 /// `workspace:`-protocol entries from.
-///
-/// `manifest` is held as an opaque [`DependencyManifest`] alias today
-/// (a thin wrapper around `serde_json::Value`); once `package-manifest`
-/// gains a typed in-memory manifest, swap the alias.
 #[derive(Debug, Clone)]
 pub struct WorkspacePackage {
     pub root_dir: PathBuf,
@@ -299,15 +338,38 @@ pub struct CurrentPkg {
     pub resolution: LockfileResolution,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<std::sync::Arc<serde_json::Value>>,
 }
 
 /// Options the dispatcher hands a resolver per-resolve.
 #[derive(Debug, Default, Clone)]
 pub struct ResolveOptions {
+    pub project: ResolverProjectOptions,
+    pub version: VersionSelectionOptions,
+    pub refresh: ResolutionRefreshOptions,
+    pub policy: ResolutionPolicyOptions,
+    pub specifier: ResolverSpecifierOptions,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ResolverProjectOptions {
     pub project_dir: PathBuf,
     pub lockfile_dir: PathBuf,
-    /// Previously-resolved lockfile entry. The `currentPkg` field.
-    pub current_pkg: Option<CurrentPkg>,
+    /// Behind [`Arc`] for the same reason as
+    /// [`VersionSelectionOptions::preferred_versions`]: the tree walker clones
+    /// [`ResolveOptions`] per adjusted resolve and every workspace
+    /// package carries its full manifest, so a by-value map turned each
+    /// clone into a deep copy of every project manifest in the
+    /// workspace.
+    pub workspace_packages: Option<Arc<WorkspacePackages>>,
+    pub prefer_workspace_packages: bool,
+    pub link_workspace_packages: pnpm_config::LinkWorkspacePackages,
+    pub inject_workspace_packages: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct VersionSelectionOptions {
     /// Lockfile + manifest preferred-versions seed the npm picker biases
     /// toward (so pins that still satisfy their range survive a
     /// re-resolve). Held behind [`Arc`] because the tree walker clones
@@ -317,25 +379,28 @@ pub struct ResolveOptions {
     pub preferred_versions: Arc<PreferredVersions>,
     /// Per-level preferred-version additions from the tree walk. See
     /// [`PreferredVersionsOverlay`]. `None` outside the walk (importer
-    /// direct deps resolve against [`Self::preferred_versions`] only).
+    /// direct deps resolve against [`VersionSelectionOptions::preferred_versions`] only).
     pub preferred_versions_overlay: Option<Arc<PreferredVersionsOverlay>>,
-    /// Behind [`Arc`] for the same reason as
-    /// [`Self::preferred_versions`]: the tree walker clones
-    /// [`ResolveOptions`] per adjusted resolve and every workspace
-    /// package carries its full manifest, so a by-value map turned each
-    /// clone into a deep copy of every project manifest in the
-    /// workspace.
-    pub workspace_packages: Option<Arc<WorkspacePackages>>,
     pub default_tag: Option<String>,
     pub pick_lowest_version: bool,
-    pub prefer_workspace_packages: bool,
-    pub always_try_workspace_packages: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ResolutionRefreshOptions {
+    /// Previously-resolved lockfile entry. The `currentPkg` field.
+    pub current_pkg: Option<CurrentPkg>,
+    /// Prefer this edge's current version over workspace-wide selectors.
+    pub prefer_current_version: bool,
+    /// The walk reopened this edge's locked version, for deduplication or an
+    /// update, so the resolver picks again instead of reusing
+    /// [`Self::current_pkg`] as it is.
+    pub repick_current_version: bool,
     pub update: UpdateBehavior,
     /// True only when this specific package matches the user's update
     /// target (e.g. `pnpm up <name>`). Unlike `update`, this is false for
     /// unrelated packages that get re-resolved as a side effect of an
     /// update. The npm picker uses it to warn when a
-    /// [`preferred_versions`](Self::preferred_versions) selector holds
+    /// [`preferred_versions`](VersionSelectionOptions::preferred_versions) selector holds
     /// the update target below the newest version its range admits —
     /// the seed already withholds the target's own lockfile pins, so
     /// any remaining preference is one a fresh install would apply too.
@@ -344,7 +409,64 @@ pub struct ResolveOptions {
     /// is the authority on integrity values. The `--update-checksums`
     /// flag.
     pub update_checksums: bool,
-    pub inject_workspace_packages: bool,
+    /// `true` suppresses on-disk and in-memory cache write-back during
+    /// resolution. The `dryRun` flag at the resolver boundary.
+    pub dry_run: bool,
+}
+
+impl ResolutionRefreshOptions {
+    /// Whether the resolution must see versions published since the
+    /// metadata mirror was written: an update is running, or this package
+    /// is its target.
+    #[must_use]
+    pub fn refreshes_metadata(&self) -> bool {
+        self.update != UpdateBehavior::Off || self.update_requested
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ResolutionPolicyOptions {
+    /// `minimumReleaseAge` cutoff. Versions published after this point
+    /// are filtered out by the npm picker (or reported inline via
+    /// [`ResolveResult::policy_violation`] when no mature pick exists).
+    /// `None` disables the maturity filter.
+    pub published_by: Option<DateTime<Utc>>,
+    /// Release-age cutoff to try when the time-based cutoff has no match.
+    /// Only used when later than `published_by`.
+    pub fallback_published_by: Option<DateTime<Utc>>,
+    /// Per-package exclude policy for the maturity filter. `None`
+    /// applies the filter uniformly.
+    pub published_by_exclude: Option<PackageVersionPolicy>,
+    /// `trustPolicy='no-downgrade'` gate. When `Some(NoDowngrade)`, the
+    /// npm resolver rejects a freshly picked version whose trust
+    /// evidence is weaker than an earlier-published version's — the
+    /// resolver-time counterpart to the lockfile verifier's check.
+    /// `None`/`Some(Off)` disables it.
+    pub trust_policy: Option<TrustPolicy>,
+    /// Per-package exclude policy for the trust gate. `None` applies
+    /// the gate uniformly.
+    pub trust_policy_exclude: Option<PackageVersionPolicy>,
+    /// Max age, in minutes, before which the trust gate still applies.
+    /// A picked version older than this skips the check. `None` always
+    /// checks. The `trustPolicyIgnoreAfter` setting.
+    pub trust_policy_ignore_after: Option<u64>,
+    /// Optional guard that rejects concrete npm package versions after
+    /// the normal picker selects them. The npm resolvers then exclude
+    /// the rejected version and pick again, so a vulnerable or otherwise
+    /// disallowed high version can fall back to a lower safe version
+    /// instead of aborting the whole resolution.
+    pub package_version_guard: Option<Arc<dyn PackageVersionGuard>>,
+    /// When `true`, reject exotic (git, tarball, file, ...) dependencies
+    /// appearing anywhere below the importer. Direct dependencies are
+    /// still allowed; only transitive deps are gated. The check
+    /// consults [`ResolveResult::resolved_via`] against the closed set
+    /// of non-exotic provenance tags. Implements the `blockExoticSubdeps`
+    /// setting.
+    pub block_exotic_subdeps: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ResolverSpecifierOptions {
     /// Ask the resolver to report a manifest-ready
     /// [`normalized_bare_specifier`](ResolveResult::normalized_bare_specifier)
     /// for the version it picked, so `add` / `update` can write it back
@@ -361,48 +483,6 @@ pub struct ResolveOptions {
     /// How [`Self::calc_specifier`] writes a dependency that resolved to
     /// a workspace package. The `saveWorkspaceProtocol` setting.
     pub save_workspace_protocol: SaveWorkspaceProtocol,
-    /// `minimumReleaseAge` cutoff. Versions published after this point
-    /// are filtered out by the npm picker (or reported inline via
-    /// [`ResolveResult::policy_violation`] when no mature pick exists).
-    /// `None` disables the maturity filter.
-    pub published_by: Option<DateTime<Utc>>,
-    /// Per-package exclude policy for the maturity filter. `None`
-    /// applies the filter uniformly.
-    pub published_by_exclude: Option<PackageVersionPolicy>,
-    /// Resolve named-registry packages to registry-qualified resolution
-    /// ids (`<name>@<registryName>:<version>`) — the lockfile 12.0 format
-    /// that keeps the same name@version from different registries
-    /// distinct. Mirrors the TypeScript
-    /// `RequestPackageOptions.namedRegistryQualifiedIds`.
-    /// `trustPolicy='no-downgrade'` gate. When `Some(NoDowngrade)`, the
-    /// npm resolver rejects a freshly picked version whose trust
-    /// evidence is weaker than an earlier-published version's — the
-    /// resolver-time counterpart to the lockfile verifier's check.
-    /// `None`/`Some(Off)` disables it.
-    pub trust_policy: Option<TrustPolicy>,
-    /// Per-package exclude policy for the trust gate. `None` applies
-    /// the gate uniformly.
-    pub trust_policy_exclude: Option<PackageVersionPolicy>,
-    /// Max age, in minutes, before which the trust gate still applies.
-    /// A picked version older than this skips the check. `None` always
-    /// checks. The `trustPolicyIgnoreAfter` setting.
-    pub trust_policy_ignore_after: Option<u64>,
-    /// `true` suppresses on-disk and in-memory cache write-back during
-    /// resolution. The `dryRun` flag at the resolver boundary.
-    pub dry_run: bool,
-    /// Optional guard that rejects concrete npm package versions after
-    /// the normal picker selects them. The npm resolvers then exclude
-    /// the rejected version and pick again, so a vulnerable or otherwise
-    /// disallowed high version can fall back to a lower safe version
-    /// instead of aborting the whole resolution.
-    pub package_version_guard: Option<Arc<dyn PackageVersionGuard>>,
-    /// When `true`, reject exotic (git, tarball, file, ...) dependencies
-    /// appearing anywhere below the importer. Direct dependencies are
-    /// still allowed; only transitive deps are gated. The check
-    /// consults [`ResolveResult::resolved_via`] against the closed set
-    /// of non-exotic provenance tags. Implements the `blockExoticSubdeps`
-    /// setting.
-    pub block_exotic_subdeps: bool,
 }
 
 /// In-memory manifest shape a resolver may attach to its
@@ -416,7 +496,7 @@ pub struct ResolveOptions {
 pub type DependencyManifest = serde_json::Value;
 
 /// `Arc`-shared variant of [`DependencyManifest`], used in
-/// [`ResolveResult::manifest`]. Wrapping the manifest avoids the
+/// [`ResolvedPackageInfo::manifest`]. Wrapping the manifest avoids the
 /// deep-clone of the JSON tree every time a [`ResolveResult`]
 /// propagates — the deps-resolver stores one copy in
 /// `ResolvedPackage` and another in each `DependenciesGraph` node,
@@ -430,30 +510,7 @@ pub type SharedDependencyManifest = Arc<DependencyManifest>;
 pub struct ResolveResult {
     /// Branded resolution identifier — see [`PkgResolutionId`].
     pub id: PkgResolutionId,
-    /// Structured `name@version` when the resolver knows both at
-    /// resolve time. The npm-registry resolver always fills this;
-    /// resolvers that learn the package name from the manifest only
-    /// after the fetch (git / tarball / local) leave it `None` and
-    /// downstream consumers (virtual-store layout, dedupe keys) must
-    /// fall back to reading the manifest, whose `name` and `version`
-    /// are the canonical sources for non-npm resolutions.
-    pub name_ver: Option<PkgNameVer>,
-    /// `latest` tag at the moment of resolution. Filled by the npm
-    /// resolver; absent for protocols that have no notion of latest
-    /// (git, file, link, ...).
-    pub latest: Option<String>,
-    /// ISO-8601 publish timestamp. Filled by the npm resolver when
-    /// available; consulted by the `minimumReleaseAge` verifier.
-    pub published_at: Option<String>,
-    /// The manifest fragment the resolver fetched. Optional because
-    /// some protocols defer manifest reading to the fetch step.
-    /// Held as [`SharedDependencyManifest`] (`Arc`-shared) so the
-    /// deps-resolver's tree walk and the per-snapshot graph copies
-    /// don't deep-clone the JSON tree per occurrence.
-    pub manifest: Option<SharedDependencyManifest>,
-    /// Where the artifact lives. Pacquet reuses
-    /// [`LockfileResolution`] for this — a discriminated union over
-    /// tarball/registry/directory/git/binary/variations.
+    /// Where the artifact lives.
     pub resolution: LockfileResolution,
     /// Provenance tag (`"npm-registry"`, `"git-repository"`,
     /// `"local-tarball"`, ...). Used by deps-installer logs and by
@@ -472,6 +529,47 @@ pub struct ResolveResult {
     /// downgrade). The deps-resolver aggregates these across every
     /// resolve call into a single set the install command can react to.
     pub policy_violation: Option<ResolutionPolicyViolation>,
+    pub package: ResolvedPackageInfo,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ResolvedPackageInfo {
+    /// Structured `name@version` when the resolver knows both at
+    /// resolve time. The npm-registry resolver always fills this;
+    /// resolvers that learn the package name from the manifest only
+    /// after the fetch (git / tarball / local) leave it `None` and
+    /// downstream consumers (virtual-store layout, dedupe keys) must
+    /// fall back to reading the manifest, whose `name` and `version`
+    /// are the canonical sources for non-npm resolutions.
+    pub name_ver: Option<PkgNameVer>,
+    /// `latest` tag at the moment of resolution. Filled by the npm
+    /// resolver; absent for protocols that have no notion of latest
+    /// (git, file, link, ...).
+    pub latest: Option<String>,
+    /// ISO-8601 publish timestamp. Filled by the npm resolver when
+    /// available; consulted by the `minimumReleaseAge` verifier.
+    pub published_at: Option<String>,
+    /// The manifest fragment the resolver fetched. Optional because
+    /// some protocols defer manifest reading to the fetch step.
+    pub manifest: Option<SharedDependencyManifest>,
+    /// A version of the same package the registry does not report as
+    /// deprecated, for the deprecation warning to point at. Filled by the npm
+    /// resolver, and only for a deprecated pick. Absent for a resolution
+    /// reused from the lockfile, which holds no packument to work it out
+    /// from, and for protocols with no notion of published versions.
+    pub non_deprecated_alternative: Option<NonDeprecatedAlternative>,
+}
+
+/// A version of a package that is not deprecated, as the resolver read it off
+/// the packument. Unlike the deprecation notice this is pnpm's own reading
+/// rather than publisher-written text.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct NonDeprecatedAlternative {
+    pub version: String,
+    /// Whether reaching it means widening the declared range. Only ever true
+    /// for a dependency that declared a range: a tag says nothing about which
+    /// versions are acceptable, so there is no range to be outside of.
+    pub outside_declared_range: bool,
 }
 
 /// Input to [`Resolver::resolve_latest`]. The resolver decides whether
@@ -553,4 +651,19 @@ impl Resolver for Arc<dyn Resolver> {
     ) -> ResolveLatestFuture<'a> {
         (**self).resolve_latest(query, opts)
     }
+}
+
+/// Resolve a dependency's concrete package version. Returns `None` when
+/// the resolver does not claim it or cannot provide a structured version.
+pub async fn resolve_package_version(
+    resolver: &dyn Resolver,
+    wanted: &WantedDependency,
+    options: &ResolveOptions,
+) -> Result<Option<String>, ResolveError> {
+    Ok(resolver
+        .resolve(wanted, options)
+        .await?
+        .and_then(|result| {
+            result.package.name_ver.map(|name_ver| name_ver.suffix.to_string())
+        }))
 }

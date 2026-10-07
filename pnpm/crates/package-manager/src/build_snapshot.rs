@@ -9,8 +9,7 @@ use pnpm_resolving_npm_resolver::InvalidTarballRevisionMetadataError;
 use std::collections::HashMap;
 
 /// Result of converting a resolved [`PackageVersion`] into the v9 lockfile
-/// shape: a `PackageKey` (used to index both `packages:` and `snapshots:`), the
-/// per-version `PackageMetadata`, and the per-instance `SnapshotEntry`.
+/// shape.
 #[derive(Debug)]
 pub struct BuiltSnapshot {
     pub package_key: PackageKey,
@@ -56,13 +55,13 @@ pub fn registry_package_key(package: &PackageVersion) -> Result<PackageKey, Buil
     let name = PkgName::parse(package.name.as_str())
         .map_err(|source| BuildSnapshotError::ParseName { name: package.name.clone(), source })?;
     let version_string = package.version.to_string();
-    let peer = version_string.parse::<PkgVerPeer>().map_err(|source| {
-        BuildSnapshotError::ParseVersion {
+    let peer = version_string
+        .parse::<PkgVerPeer>()
+        .map_err(|source| BuildSnapshotError::ParseVersion {
             name: package.name.clone(),
             version: version_string,
             source,
-        }
-    })?;
+        })?;
     Ok(PkgNameVerPeer::new(name, peer))
 }
 
@@ -78,23 +77,7 @@ pub fn build_package_snapshot(
 ) -> Result<BuiltSnapshot, BuildSnapshotError> {
     let package_key = registry_package_key(package)?;
 
-    let integrity =
-        package.dist.integrity.clone().ok_or_else(|| BuildSnapshotError::MissingIntegrity {
-            name: package.name.clone(),
-            version: package.version.to_string(),
-        })?;
-    let revision = package
-        .dist
-        .revision
-        .clone()
-        .map(serde_json::from_value::<TarballRevision>)
-        .transpose()
-        .map_err(|source| {
-            BuildSnapshotError::InvalidRevision(InvalidTarballRevisionMetadataError::new(
-                &package.dist.tarball,
-                source.to_string(),
-            ))
-        })?;
+    let resolution = registry_resolution(package)?;
 
     let mut dependencies: HashMap<PkgName, SnapshotDepRef> = HashMap::new();
     for (dep_name, ver_peer) in resolved_dependencies {
@@ -104,7 +87,7 @@ pub fn build_package_snapshot(
     }
 
     let metadata = PackageMetadata {
-        resolution: LockfileResolution::Registry(RegistryResolution { integrity, revision }),
+        resolution: LockfileResolution::Registry(resolution),
         version: None,
         engines: None,
         cpu: None,
@@ -132,3 +115,24 @@ pub fn build_package_snapshot(
 
 #[cfg(test)]
 mod tests;
+
+fn registry_resolution(package: &PackageVersion) -> Result<RegistryResolution, BuildSnapshotError> {
+    let integrity = package.dist.integrity
+        .clone()
+        .ok_or_else(|| BuildSnapshotError::MissingIntegrity {
+            name: package.name.clone(),
+            version: package.version.to_string(),
+        })?;
+    let revision = package.dist.revision
+        .clone()
+        .map(serde_json::from_value::<TarballRevision>)
+        .transpose()
+        .map_err(|source| {
+            BuildSnapshotError::InvalidRevision(InvalidTarballRevisionMetadataError::new(
+                &package.dist.tarball,
+                source.to_string(),
+            ))
+        })?;
+
+    Ok(RegistryResolution { integrity, revision })
+}

@@ -23,10 +23,10 @@ unmaintained = "workspace"
 yanked = "warn"
 ignore = [
   # `pgp` pulls in `rsa` to verify OpenPGP signatures made by RSA Node.js
-  # release keys. Pacquet only performs public-key signature verification here;
-  # it never handles RSA private keys, so the private-key timing side channel
-  # described by this advisory is not reachable through this use.
-  { id = "RUSTSEC-2023-0071", reason = "Only public-key OpenPGP signature verification is performed for pinned Node.js release keys; no RSA private-key operation is exposed." },
+  # release keys. `openidconnect` also uses it to verify pnpr OIDC tokens.
+  # Production code only performs public-key verification in both paths;
+  # the private-key timing side channel is not reachable.
+  { id = "RUSTSEC-2023-0071", reason = "Only public-key verification is performed for Node.js OpenPGP release signatures and pnpr OIDC tokens; no RSA private-key operation is exposed." },
   # quick-xml DoS advisories (quadratic duplicate-attribute check, unbounded
   # namespace-declaration allocation). quick-xml is reached only through
   # object_store's S3 XML response parsing in pnpr, so the XML comes from the
@@ -70,6 +70,8 @@ allow = [
 ]
 confidence-threshold = 0.8
 exceptions = [
+  # `cap-primitives` uses winx for descriptor-relative traversal on Windows.
+  { name = "winx", allow = ["Apache-2.0 WITH LLVM-exception"] },
   # The first-party `pnpr*` crates are licensed under PolyForm Shield (see
   # `pnpr/LICENSE.md`), not the MIT used by the rest of the workspace.
   # cargo-deny only recognizes the PolyForm-Noncommercial identifier for this
@@ -77,10 +79,14 @@ exceptions = [
   # below pin it by file hash). Every new `pnpr-*` crate needs an entry here
   # and a matching clarify block, or `Cargo Deny` fails it as unlicensed.
   { name = "pnpr", allow = ["PolyForm-Noncommercial-1.0.0"] },
+  { name = "pnpr-pipeline-runs", allow = ["PolyForm-Noncommercial-1.0.0"] },
   { name = "pnpr-shared-artifacts", allow = ["PolyForm-Noncommercial-1.0.0"] },
   { name = "pnpr-search", allow = ["PolyForm-Noncommercial-1.0.0"] },
+  { name = "pnpr-oci", allow = ["PolyForm-Noncommercial-1.0.0"] },
   { name = "pnpr-osv", allow = ["PolyForm-Noncommercial-1.0.0"] },
   { name = "pnpr-auth", allow = ["PolyForm-Noncommercial-1.0.0"] },
+  { name = "pnpr-cargo", allow = ["PolyForm-Noncommercial-1.0.0"] },
+  { name = "pnpr-pypi", allow = ["PolyForm-Noncommercial-1.0.0"] },
   { name = "pnpr-config", allow = ["PolyForm-Noncommercial-1.0.0"] },
   { name = "pnpr-error", allow = ["PolyForm-Noncommercial-1.0.0"] },
   { name = "pnpr-fixtures", allow = ["PolyForm-Noncommercial-1.0.0"] },
@@ -108,12 +114,32 @@ expression = "PolyForm-Noncommercial-1.0.0"
 license-files = [{ path = "../../LICENSE.md", hash = 0x652a978e }]
 
 [[licenses.clarify]]
+name = "pnpr-cargo"
+expression = "PolyForm-Noncommercial-1.0.0"
+license-files = [{ path = "../../LICENSE.md", hash = 0x652a978e }]
+
+[[licenses.clarify]]
+name = "pnpr-pypi"
+expression = "PolyForm-Noncommercial-1.0.0"
+license-files = [{ path = "../../LICENSE.md", hash = 0x652a978e }]
+
+[[licenses.clarify]]
 name = "pnpr-route"
 expression = "PolyForm-Noncommercial-1.0.0"
 license-files = [{ path = "../../LICENSE.md", hash = 0x652a978e }]
 
 [[licenses.clarify]]
+name = "pnpr-oci"
+expression = "PolyForm-Noncommercial-1.0.0"
+license-files = [{ path = "../../LICENSE.md", hash = 0x652a978e }]
+
+[[licenses.clarify]]
 name = "pnpr-osv"
+expression = "PolyForm-Noncommercial-1.0.0"
+license-files = [{ path = "../../LICENSE.md", hash = 0x652a978e }]
+
+[[licenses.clarify]]
+name = "pnpr-pipeline-runs"
 expression = "PolyForm-Noncommercial-1.0.0"
 license-files = [{ path = "../../LICENSE.md", hash = 0x652a978e }]
 
@@ -202,7 +228,7 @@ skip-tree = []
 unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/pnpm/node-semver-rs"]
 
 [sources.allow-org]
 github = []

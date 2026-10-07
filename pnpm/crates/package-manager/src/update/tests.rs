@@ -1,17 +1,61 @@
 use super::{
-    KeptRangeVerdict, UpdateError, apply_bumped_manifest_specs, expand_update_selectors,
-    insert_update_target, is_workspace_local_path_specifier, judge_against_kept_range,
-    parse_update_param, persist_selected_manifests, prepare_selected_manifests,
-    reject_versions_of_indirect_update_specs, selected_project_indices, update_target_name,
+    UpdateError, UpdateExplicitGroups, UpdateOptions, UpdateResources,
+    is_workspace_local_path_specifier, prepare_selected_manifests,
+    reject_versions_of_indirect_update_specs, selected_project_indices,
+};
+use crate::update::{
+    install::persistence::{apply_bumped_manifest_specs, persist_selected_manifests},
+    rewrite::{KeptRangeVerdict, judge_against_kept_range, requested_version_rewrite},
+    selectors::{
+        expand_update_selectors, insert_update_target, parse_update_param, update_target_name,
+    },
 };
 use pnpm_config::{CatalogMode, Config};
-use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::SilentReporter;
 use pnpm_workspace::Project;
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use tempfile::tempdir;
+
+/// The update inputs a manifest-preparation test varies, over a leaked
+/// config and idle clients.
+fn test_update(
+    config: Config,
+    packages: &[String],
+    latest: bool,
+    save: bool,
+) -> (UpdateOptions<'_>, UpdateResources) {
+    (
+        UpdateOptions {
+            resolved_packages: Box::leak(Box::new(super::ResolvedPackages::default())),
+            http_client: Box::leak(Box::new(pnpm_network::ThrottledClient::default())),
+            config: Box::leak(Box::new(config)),
+            lockfile: crate::CommandLockfile::loaded(None, None),
+            lockfile_only: false,
+            selection: crate::UpdateSelection {
+                packages,
+                depth: 0,
+                workspace_packages: None,
+                interactive: false,
+            },
+            version: crate::UpdateVersionOptions {
+                latest,
+                patches: false,
+                range_spec_style: pnpm_registry::RangeSpecStyle::Major,
+                save,
+            },
+        },
+        UpdateResources {
+            tarball_mem_cache: std::sync::Arc::new(pnpm_tarball::MemCache::default()),
+            http_client_arc: std::sync::Arc::new(pnpm_network::ThrottledClient::default()),
+            include_direct: vec![DependencyGroup::Prod],
+            explicit_groups: UpdateExplicitGroups::default(),
+            supported_architectures: None,
+            resolution_observer: None,
+        },
+    )
+}
 
 #[test]
 fn parses_bare_name_without_version() {
@@ -101,6 +145,104 @@ fn a_wildcard_selector_does_not_shadow_an_alias_selector_that_also_matches() {
 }
 
 #[test]
+fn a_requested_version_is_recorded_under_the_declared_operator() {
+    use pnpm_registry::RangeSpecStyle;
+
+    for (previous, expected) in [
+        ("^100.0.0", "^100.1.0"),
+        ("~100.0.0", "~100.1.0"),
+        ("100.0.0", "100.1.0"),
+        ("npm:dep@^100.0.0", "npm:dep@^100.1.0"),
+        ("jsr:^100.0.0", "jsr:^100.1.0"),
+        ("jsr:@scope/dep@~100.0.0", "jsr:@scope/dep@~100.1.0"),
+        ("jsr:@scope/dep", "jsr:@scope/dep@100.1.0"),
+        ("gh:^100.0.0", "100.1.0"),
+        ("latest", "100.1.0"),
+        ("catalog:", "100.1.0"),
+        ("workspace:^", "100.1.0"),
+    ] {
+        assert_eq!(
+            requested_version_rewrite("dep", "100.1.0", previous, RangeSpecStyle::Major),
+            expected,
+            "rewrite over {previous}",
+        );
+    }
+    assert_eq!(
+        requested_version_rewrite("dep", "^100.1.0", "~100.0.0", RangeSpecStyle::Major),
+        "^100.1.0",
+    );
+    assert_eq!(requested_version_rewrite("dep", "next", "^100.0.0", RangeSpecStyle::Major), "next");
+}
+
+#[test]
+fn a_requested_version_on_a_node_runtime_declaration_uses_the_runtime_rule() {
+    use pnpm_registry::RangeSpecStyle;
+
+    for (previous, expected) in [
+        ("runtime:^26.8.2", "runtime:^26.9.0"),
+        ("runtime:26.8.2", "runtime:26.9.0"),
+        ("runtime:unknown/^26.8.2", "runtime:unknown/^26.8.2"),
+    ] {
+        assert_eq!(
+            requested_version_rewrite("node", "26.9.0", previous, RangeSpecStyle::Major),
+            expected,
+            "rewrite over {previous}",
+        );
+    }
+    assert_eq!(
+        requested_version_rewrite(
+            "node",
+            "24.0.0-rc.4",
+            "runtime:rc/^24.0.0-rc.3",
+            RangeSpecStyle::Major,
+        ),
+        "runtime:24.0.0-rc.4",
+    );
+    assert_eq!(
+        requested_version_rewrite("node", "^26", "runtime:^26.8.2", RangeSpecStyle::Major),
+        "runtime:^26",
+    );
+    assert_eq!(
+        requested_version_rewrite("node", "runtime:26", "runtime:^26.8.2", RangeSpecStyle::Major),
+        "runtime:26",
+    );
+    assert_eq!(
+        requested_version_rewrite(
+            "node",
+            "runtime:26.9.0",
+            "runtime:^26.8.2",
+            RangeSpecStyle::Major,
+        ),
+        "runtime:^26.9.0",
+    );
+}
+
+/// The deno and bun resolvers report a `runtime:` declaration back as written,
+/// so the selector is recorded as asked rather than moved onto an operator the
+/// next resolve would not report.
+#[test]
+fn a_requested_version_on_a_deno_or_bun_runtime_declaration_is_recorded_as_asked() {
+    use pnpm_registry::RangeSpecStyle;
+
+    for alias in ["deno", "bun"] {
+        for (requested, previous, expected) in [
+            ("1.2.5", "runtime:^1.2.0", "runtime:1.2.5"),
+            ("^1.3", "runtime:^1.2.0", "runtime:^1.3"),
+            ("1.2.5", "runtime:latest", "runtime:1.2.5"),
+            ("canary", "runtime:latest", "runtime:canary"),
+            ("runtime:1.2.5", "runtime:^1.2.0", "runtime:1.2.5"),
+            ("runtime:canary", "runtime:latest", "runtime:canary"),
+        ] {
+            assert_eq!(
+                requested_version_rewrite(alias, requested, previous, RangeSpecStyle::Major),
+                expected,
+                "rewrite of {previous} to {requested} under {alias}",
+            );
+        }
+    }
+}
+
+#[test]
 fn workspace_local_path_specifiers_are_detected() {
     for spec in [
         "workspace:.",
@@ -150,8 +292,7 @@ fn a_bumped_range_lands_in_the_group_it_was_read_from() {
     .expect("write package.json");
     let mut manifest = PackageManifest::from_path(package_json).expect("read package.json");
 
-    let bumped =
-        BTreeMap::from([("foo".to_string(), (DependencyGroup::Optional, "^1.2.0".to_string()))]);
+    let bumped = vec![("foo".to_string(), DependencyGroup::Optional, "^1.2.0".to_string())];
     assert!(apply_bumped_manifest_specs::<SilentReporter>(&mut manifest, &bumped, false));
 
     assert_eq!(dependency_specifier_in(&manifest, DependencyGroup::Prod, "foo"), Some("1.0.0"));
@@ -174,8 +315,7 @@ fn a_bump_for_an_undeclared_group_writes_nothing() {
     .expect("write package.json");
     let mut manifest = PackageManifest::from_path(package_json).expect("read package.json");
 
-    let bumped =
-        BTreeMap::from([("foo".to_string(), (DependencyGroup::Dev, "^1.2.0".to_string()))]);
+    let bumped = vec![("foo".to_string(), DependencyGroup::Dev, "^1.2.0".to_string())];
     assert!(!apply_bumped_manifest_specs::<SilentReporter>(&mut manifest, &bumped, false));
 
     assert_eq!(dependency_specifier_in(&manifest, DependencyGroup::Prod, "foo"), Some("1.0.0"));
@@ -187,7 +327,10 @@ fn dependency_specifier_in<'a>(
     group: DependencyGroup,
     alias: &str,
 ) -> Option<&'a str> {
-    manifest.dependencies([group]).find(|(name, _)| *name == alias).map(|(_, spec)| spec)
+    manifest
+        .dependencies([group])
+        .find(|(name, _)| *name == alias)
+        .map(|(_, spec)| spec)
 }
 
 #[tokio::test]
@@ -200,38 +343,32 @@ async fn selected_update_prepares_and_persists_only_selected_projects() {
         .map(|name| project_with_foo(dir.path(), name))
         .collect::<Vec<_>>();
     let ordered_dirs = [projects[1].root_dir.clone(), projects[0].root_dir.clone()];
-    let selected_dirs = ordered_dirs.iter().cloned().collect::<HashSet<_>>();
+    let selected_dirs = ordered_dirs
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
     let indices = selected_project_indices(&projects, &ordered_dirs, &selected_dirs);
     let config = Config::new();
-    let http_client = std::sync::Arc::new(ThrottledClient::default());
 
+    let packages = ["foo@2.0.0".to_string()];
+    let (update, owned) = test_update(config, &packages, false, true);
     let prepared = prepare_selected_manifests::<SilentReporter>(
         &mut projects,
         &indices,
         dir.path(),
-        &http_client,
-        &config,
-        None,
-        &["foo@2.0.0".to_string()],
-        false,
-        false,
-        true,
-        &[DependencyGroup::Prod],
-        0,
-        None,
-        false,
-        None,
+        update,
+        &owned,
     )
     .await
     .expect("prepare selected manifests");
     persist_selected_manifests::<SilentReporter>(&mut projects, &prepared.persist_indices)
         .expect("persist selected manifests");
 
-    assert_eq!(dependency_specifier(&projects[0].manifest), "2.0.0");
-    assert_eq!(dependency_specifier(&projects[1].manifest), "2.0.0");
+    assert_eq!(dependency_specifier(&projects[0].manifest), "^2.0.0");
+    assert_eq!(dependency_specifier(&projects[1].manifest), "^2.0.0");
     assert_eq!(dependency_specifier(&projects[2].manifest), "^1.0.0");
-    assert_eq!(saved_dependency_specifier(&projects[0].manifest), "2.0.0");
-    assert_eq!(saved_dependency_specifier(&projects[1].manifest), "2.0.0");
+    assert_eq!(saved_dependency_specifier(&projects[0].manifest), "^2.0.0");
+    assert_eq!(saved_dependency_specifier(&projects[1].manifest), "^2.0.0");
     assert_eq!(saved_dependency_specifier(&projects[2].manifest), "^1.0.0");
     assert_eq!(prepared.seed_policies.len(), 2);
 }
@@ -241,31 +378,27 @@ async fn selected_update_no_save_mutates_in_memory_without_persisting() {
     let dir = tempdir().expect("create tempdir");
     std::fs::write(dir.path().join("pnpm-workspace.yaml"), "packages:\n  - '*'\n")
         .expect("write workspace manifest");
-    let mut projects =
-        ["a", "b"].into_iter().map(|name| project_with_foo(dir.path(), name)).collect::<Vec<_>>();
+    let mut projects = ["a", "b"]
+        .into_iter()
+        .map(|name| project_with_foo(dir.path(), name))
+        .collect::<Vec<_>>();
     let ordered_dirs = [projects[0].root_dir.clone()];
-    let selected_dirs = ordered_dirs.iter().cloned().collect::<HashSet<_>>();
+    let selected_dirs = ordered_dirs
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
     let indices = selected_project_indices(&projects, &ordered_dirs, &selected_dirs);
     let mut config = Config::new();
     config.catalog_mode = CatalogMode::Prefer;
-    let http_client = std::sync::Arc::new(ThrottledClient::default());
 
+    let packages = ["foo@1.5.0".to_string()];
+    let (update, owned) = test_update(config, &packages, false, false);
     let prepared = prepare_selected_manifests::<SilentReporter>(
         &mut projects,
         &indices,
         dir.path(),
-        &http_client,
-        &config,
-        None,
-        &["foo@1.5.0".to_string()],
-        false,
-        false,
-        false,
-        &[DependencyGroup::Prod],
-        0,
-        None,
-        false,
-        None,
+        update,
+        &owned,
     )
     .await
     .expect("prepare selected manifests");
@@ -275,8 +408,7 @@ async fn selected_update_no_save_mutates_in_memory_without_persisting() {
     assert_eq!(saved_dependency_specifier(&projects[0].manifest), "^1.0.0");
     assert!(prepared.persist_indices.is_empty());
     assert_eq!(
-        prepared
-            .catalogs_override
+        prepared.catalogs_override
             .as_ref()
             .and_then(|catalogs| catalogs.get("default"))
             .and_then(|catalog| catalog.get("foo"))
@@ -292,27 +424,21 @@ async fn selected_update_no_save_skips_a_selector_outside_the_kept_range() {
         .expect("write workspace manifest");
     let mut projects = vec![project_with_foo(dir.path(), "a")];
     let ordered_dirs = [projects[0].root_dir.clone()];
-    let selected_dirs = ordered_dirs.iter().cloned().collect::<HashSet<_>>();
+    let selected_dirs = ordered_dirs
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
     let indices = selected_project_indices(&projects, &ordered_dirs, &selected_dirs);
     let config = Config::new();
-    let http_client = std::sync::Arc::new(ThrottledClient::default());
 
-    let prepared = prepare_selected_manifests::<SilentReporter>(
+    let packages = ["foo@2.0.0".to_string()];
+    let (update, owned) = test_update(config, &packages, false, false);
+    let mut prepared = prepare_selected_manifests::<SilentReporter>(
         &mut projects,
         &indices,
         dir.path(),
-        &http_client,
-        &config,
-        None,
-        &["foo@2.0.0".to_string()],
-        false,
-        false,
-        false,
-        &[DependencyGroup::Prod],
-        0,
-        None,
-        false,
-        None,
+        update,
+        &owned,
     )
     .await
     .expect("prepare selected manifests");
@@ -323,6 +449,37 @@ async fn selected_update_no_save_skips_a_selector_outside_the_kept_range() {
     assert_eq!(dependency_specifier(&projects[0].manifest), "^1.0.0");
     assert!(prepared.persist_indices.is_empty());
     assert!(prepared.catalogs_override.is_none());
+    assert!(prepared.take_seed(update).preferred_versions_override.is_empty());
+}
+
+#[tokio::test]
+async fn selected_update_no_save_keeps_an_override_owned_specifier() {
+    let dir = tempdir().expect("create tempdir");
+    std::fs::write(dir.path().join("pnpm-workspace.yaml"), "packages:\n  - '*'\n")
+        .expect("write workspace manifest");
+    let mut projects = vec![project_with_foo(dir.path(), "a")];
+    let selected_indices = [0];
+    let mut config = Config::new();
+    config.overrides =
+        Some(std::iter::once(("foo@^1.0.0".to_string(), "^2.0.0".to_string())).collect());
+    let packages = ["foo@2.0.1".to_string()];
+    let (update, owned) = test_update(config, &packages, false, false);
+    let mut prepared = prepare_selected_manifests::<SilentReporter>(
+        &mut projects,
+        &selected_indices,
+        dir.path(),
+        update,
+        &owned,
+    )
+    .await
+    .expect("prepare selected manifests");
+
+    // The requested version fits the override, but rewriting the original
+    // declaration would make the scoped override stop matching on the next install.
+    assert_eq!(dependency_specifier(&projects[0].manifest), "^1.0.0");
+    assert_eq!(saved_dependency_specifier(&projects[0].manifest), "^1.0.0");
+    let seed = prepared.take_seed(update);
+    assert!(seed.preferred_versions_override.is_empty());
 }
 
 #[tokio::test]
@@ -331,29 +488,20 @@ async fn selected_update_depth_zero_skips_projects_without_a_matching_dependency
     let mut projects = [project_without_foo(dir.path(), "a"), project_with_foo(dir.path(), "b")];
     let selected_indices = [0, 1];
     let config = Config::new();
-    let http_client = std::sync::Arc::new(ThrottledClient::default());
 
+    let packages = ["foo@2.0.0".to_string()];
+    let (update, owned) = test_update(config, &packages, false, true);
     let prepared = prepare_selected_manifests::<SilentReporter>(
         &mut projects,
         &selected_indices,
         dir.path(),
-        &http_client,
-        &config,
-        None,
-        &["foo@2.0.0".to_string()],
-        false,
-        false,
-        true,
-        &[DependencyGroup::Prod],
-        0,
-        None,
-        false,
-        None,
+        update,
+        &owned,
     )
     .await
     .expect("prepare selected manifests");
 
-    assert_eq!(dependency_specifier(&projects[1].manifest), "2.0.0");
+    assert_eq!(dependency_specifier(&projects[1].manifest), "^2.0.0");
     assert_eq!(prepared.persist_indices, vec![1]);
 }
 
@@ -366,24 +514,15 @@ async fn selected_update_latest_depth_zero_errors_when_no_project_matches() {
     let mut projects = [project_without_foo(dir.path(), "a"), project_without_foo(dir.path(), "b")];
     let selected_indices = [0, 1];
     let config = Config::new();
-    let http_client = std::sync::Arc::new(ThrottledClient::default());
 
+    let packages = ["foo".to_string()];
+    let (update, owned) = test_update(config, &packages, true, true);
     let prepared = prepare_selected_manifests::<SilentReporter>(
         &mut projects,
         &selected_indices,
         dir.path(),
-        &http_client,
-        &config,
-        None,
-        &["foo".to_string()],
-        true,
-        false,
-        true,
-        &[DependencyGroup::Prod],
-        0,
-        None,
-        false,
-        None,
+        update,
+        &owned,
     )
     .await;
 
@@ -413,24 +552,15 @@ async fn latest_leaves_specifiers_no_resolver_claims() {
         let dir = tempdir().expect("create tempdir");
         let mut projects = [project_with_foo_specifier(dir.path(), "a", specifier)];
         let config = unroutable_registry_config();
-        let http_client = std::sync::Arc::new(ThrottledClient::default());
 
+        let packages: [String; 0] = [];
+        let (update, owned) = test_update(config, &packages, true, true);
         let prepared = prepare_selected_manifests::<SilentReporter>(
             &mut projects,
             &[0],
             dir.path(),
-            &http_client,
-            &config,
-            None,
-            &[],
-            true,
-            false,
-            true,
-            &[DependencyGroup::Prod],
-            0,
-            None,
-            false,
-            None,
+            update,
+            &owned,
         )
         .await
         .unwrap_or_else(|error| {
@@ -450,24 +580,15 @@ async fn latest_rewrites_a_specifier_the_npm_resolver_claims() {
     let dir = tempdir().expect("create tempdir");
     let mut projects = [project_with_foo(dir.path(), "a")];
     let config = unroutable_registry_config();
-    let http_client = std::sync::Arc::new(ThrottledClient::default());
 
+    let packages: [String; 0] = [];
+    let (update, owned) = test_update(config, &packages, true, true);
     let result = prepare_selected_manifests::<SilentReporter>(
         &mut projects,
         &[0],
         dir.path(),
-        &http_client,
-        &config,
-        None,
-        &[],
-        true,
-        false,
-        true,
-        &[DependencyGroup::Prod],
-        0,
-        None,
-        false,
-        None,
+        update,
+        &owned,
     )
     .await;
 
@@ -494,11 +615,11 @@ fn project_with_foo_specifier(root: &std::path::Path, name: &str, specifier: &st
     }
 }
 
-// A closed port, so any dependency that reaches registry resolution fails
-// loudly instead of hitting the network. Retries are off so that failure is
-// immediate rather than a minute of backoff.
+// An address whose connect fails at once on every OS, so any dependency that
+// reaches registry resolution fails loudly instead of hitting the network.
+// Retries are off so that failure is immediate rather than a minute of backoff.
 fn unroutable_registry_config() -> Config {
-    Config { registry: "http://127.0.0.1:1/".to_string(), fetch_retries: 0, ..Config::new() }
+    Config { registry: "http://0.0.0.0:1/".to_string(), fetch_retries: 0, ..Config::new() }
 }
 
 fn project_without_foo(root: &std::path::Path, name: &str) -> Project {
@@ -565,7 +686,10 @@ fn only_a_requested_version_gets_a_verdict() {
 /// rendered as `(covers 1.x, covers 2.x)` — the shape the reuse walk asks
 /// [`UpdateTargets::covers`] for.
 fn covers(selectors: &[&str], name: &str, versions: &[&str]) -> Vec<bool> {
-    let parsed = selectors.iter().map(|selector| parse_update_param(selector)).collect::<Vec<_>>();
+    let parsed = selectors
+        .iter()
+        .map(|selector| parse_update_param(selector))
+        .collect::<Vec<_>>();
     let expanded = expand_update_selectors(&parsed);
     let mut targets = pnpm_resolving_deps_resolver::UpdateTargets::default();
     insert_update_target(&mut targets, &expanded, name);
@@ -640,7 +764,10 @@ fn reject_indirect(selectors: &[&str]) -> Result<(), super::UpdateError> {
     )
     .expect("write package.json");
     let manifest = PackageManifest::from_path(package_json).expect("read package.json");
-    let parsed = selectors.iter().map(|input| parse_update_param(input)).collect::<Vec<_>>();
+    let parsed = selectors
+        .iter()
+        .map(|input| parse_update_param(input))
+        .collect::<Vec<_>>();
     reject_versions_of_indirect_update_specs::<SilentReporter>(
         &parsed,
         &[&manifest],

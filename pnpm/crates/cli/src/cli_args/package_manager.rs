@@ -1,7 +1,5 @@
 use miette::IntoDiagnostic;
 use pnpm_config::{PNPM_VERSION, PmOnFail};
-use pnpm_env_installer::is_package_manager_resolved;
-use pnpm_lockfile::EnvLockfile;
 use pnpm_package_manifest::{
     package_manager_spec::{
         dev_engines_package_managers, is_version_request, split_spec, version_without_build,
@@ -31,6 +29,9 @@ pub(crate) struct WantedPackageManager {
 pub(crate) struct PackageManagerToSync {
     pub(crate) specifier: String,
     pub(crate) version: String,
+    /// `version` is the running pnpm, picked for a range pin, and still has
+    /// to be held to the project's `minimumReleaseAge`.
+    pub(crate) running_pnpm_for_range: bool,
 }
 
 /// The pnpm version to record under the env lockfile's
@@ -55,58 +56,38 @@ pub(crate) fn package_manager_to_sync(
     if let Some(version) =
         source_version.filter(|version| version_satisfies(version, wanted_version))
     {
-        return Some(PackageManagerToSync { specifier: wanted_version.to_string(), version });
+        return Some(PackageManagerToSync {
+            specifier: wanted_version.to_string(),
+            version,
+            running_pnpm_for_range: false,
+        });
     }
     if let Some(version) =
         exact_version(wanted_version).filter(|version| version_satisfies(version, wanted_version))
     {
-        return Some(PackageManagerToSync { specifier: wanted_version.to_string(), version });
+        return Some(PackageManagerToSync {
+            specifier: wanted_version.to_string(),
+            version,
+            running_pnpm_for_range: false,
+        });
     }
     // A range pin names no exact version, so the running pnpm's version is
     // the one the project actually uses.
-    version_satisfies(PNPM_VERSION, wanted_version).then(|| PackageManagerToSync {
-        specifier: wanted_version.to_string(),
-        version: PNPM_VERSION.to_string(),
-    })
+    version_satisfies(PNPM_VERSION, wanted_version)
+        .then(|| PackageManagerToSync {
+            specifier: wanted_version.to_string(),
+            version: PNPM_VERSION.to_string(),
+            running_pnpm_for_range: true,
+        })
 }
 
-/// Whether the pnpm version the manifest at `root_dir` pins still has to be
-/// recorded in the env lockfile there. The install family records it from
-/// its own pipeline, so an install that short-circuits before the pipeline
-/// has to give up its fast path — a plain install would otherwise keep
-/// reporting success while leaving every `--frozen-lockfile` run failing on
-/// the unwritten entry.
-///
-/// `root_manifest` is that manifest when the caller already holds it, so a
-/// fast path does not read the same file twice.
-///
-/// A manifest that cannot be read answers `false`: the full install path
-/// reports that, and a fast path is not where it should surface.
-pub(crate) fn package_manager_needs_recording(
-    root_dir: &Path,
-    on_fail: Option<PmOnFail>,
-    root_manifest: Option<&Value>,
-) -> bool {
-    let read;
-    let manifest = if let Some(manifest) = root_manifest {
-        manifest
-    } else {
-        let Ok(Some(manifest)) = read_manifest_json(&root_dir.join("package.json")) else {
-            return false;
-        };
-        read = manifest;
-        &read
-    };
-    let Some(package_manager) = package_manager_to_sync(manifest, root_dir, on_fail) else {
-        return false;
-    };
-    !EnvLockfile::read(root_dir).ok().flatten().is_some_and(|env_lockfile| {
-        is_package_manager_resolved(
-            &env_lockfile,
-            &package_manager.specifier,
-            &package_manager.version,
-        )
-    })
+/// The root project's `package.json` as raw JSON, for the config-load
+/// warnings that inspect it before the install path reads the manifest
+/// properly. A manifest that is missing, unreadable, or malformed yields
+/// `None`: a warning has nothing to say about one, and the install path
+/// reports it with far more context.
+pub(crate) fn read_root_manifest_json(root_dir: &Path) -> Option<Value> {
+    read_manifest_json(&root_dir.join("package.json")).ok().flatten()
 }
 
 pub(crate) fn read_manifest_json(path: &Path) -> miette::Result<Option<Value>> {
@@ -118,9 +99,27 @@ pub(crate) fn read_manifest_json(path: &Path) -> miette::Result<Option<Value>> {
     parse_manifest(&content).into_diagnostic().map(Some)
 }
 
+/// The root project's manifest, whichever supported basename it uses, as a
+/// JSON value. A manifest that is missing, unreadable, or malformed yields
+/// `None`: pre-command checks have nothing to switch or sync, and the command
+/// path reports it with far more context.
+///
+/// [`pnpm_workspace::try_read_project_manifest`] decides between
+/// `package.json`, `package.json5`, and `package.yaml`, the same way the
+/// install pipeline does, so a pin recorded from the pre-command checks is
+/// the one the install reads.
+pub(crate) fn read_root_manifest(root_dir: &Path) -> Option<Value> {
+    pnpm_workspace::try_read_project_manifest(root_dir)
+        .ok()
+        .flatten()
+        .map(|(_, manifest)| manifest.value().clone())
+}
+
 pub(crate) fn wanted_package_manager(manifest: &Value) -> Option<WantedPackageManager> {
     if let Some(mut pm) = parse_dev_engines_package_manager(manifest) {
-        if pm.version.as_deref().is_some_and(|version| node_semver::Range::parse(version).is_err())
+        if pm.version
+            .as_deref()
+            .is_some_and(|version| node_semver::Range::parse(version).is_err())
         {
             pm.version = None;
         }
@@ -134,7 +133,10 @@ pub(crate) fn wanted_package_manager(manifest: &Value) -> Option<WantedPackageMa
 
 fn parse_dev_engines_package_manager(manifest: &Value) -> Option<WantedPackageManager> {
     let entries: Vec<&Value> = dev_engines_package_managers(manifest).collect();
-    let declared_as_list = manifest.get("devEngines")?.get("packageManager")?.is_array();
+    let declared_as_list = manifest
+        .get("devEngines")?
+        .get("packageManager")?
+        .is_array();
     let (index, entry) = if declared_as_list {
         // pnpm's own entry is the one that governs this CLI; without one,
         // the first entry does.
@@ -146,8 +148,11 @@ fn parse_dev_engines_package_manager(manifest: &Value) -> Option<WantedPackageMa
     } else {
         (None, *entries.first()?)
     };
-    let on_fail =
-        entry.get("onFail").and_then(Value::as_str).map(ToString::to_string).or_else(|| {
+    let on_fail = entry
+        .get("onFail")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
             let index = index?;
             Some(if index == entries.len() - 1 { "error" } else { "ignore" }.to_string())
         });
@@ -161,7 +166,10 @@ fn package_manager_from_engine(
 ) -> Option<WantedPackageManager> {
     Some(WantedPackageManager {
         name: value.get("name")?.as_str()?.to_string(),
-        version: value.get("version").and_then(Value::as_str).map(ToString::to_string),
+        version: value
+            .get("version")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
         from_dev_engines,
         on_fail,
     })
@@ -194,9 +202,15 @@ pub(crate) fn current_source_pnpm_version() -> Option<String> {
 }
 
 fn pnpm_version_from(root_dir: &Path) -> Option<String> {
-    let path = root_dir.join("pnpm11").join("pnpm").join("package.json");
+    let path = root_dir
+        .join("pnpm11")
+        .join("pnpm")
+        .join("package.json");
     let value = read_manifest_json(&path).ok()??;
-    value.get("version").and_then(Value::as_str).map(ToString::to_string)
+    value
+        .get("version")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 /// The one version `version` pins, or `None` when it pins a range, a

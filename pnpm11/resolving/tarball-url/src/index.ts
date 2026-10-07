@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer'
-import util from 'node:util'
 
 import { formatIntegrity, parseIntegrity } from '@pnpm/crypto.integrity'
+import { isError } from '@pnpm/error'
 import type { RegistryServerType } from '@pnpm/types'
 
 const PUBLIC_NPM_REGISTRY = 'https://registry.npmjs.org/'
@@ -62,7 +62,7 @@ export function parseIntegrityAddress (integrity: unknown): IntegrityAddress | u
   try {
     parsed = parseIntegrity(integrity)
   } catch (err: unknown) {
-    if (util.types.isNativeError(err) && 'code' in err && err.code === 'ERR_PNPM_INVALID_INTEGRITY') {
+    if (isError(err) && 'code' in err && err.code === 'ERR_PNPM_INVALID_INTEGRITY') {
       return undefined
     }
     throw err
@@ -86,9 +86,7 @@ export function isValidTarballRevision (revision: unknown): revision is number {
 
 /**
  * Build the canonical tarball URL of an npm package — i.e. the URL pnpm derives
- * from a package's name, version, and registry. Vendored from the
- * `get-npm-tarball-url` package so the logic and its inverse
- * ({@link isCanonicalRegistryTarballUrl}) live together in the monorepo.
+ * from a package's name, version, and registry.
  *
  * This is the single source of the URL shape: the lockfile writer drops a
  * tarball URL only when this function rebuilds it, and the lockfile reader

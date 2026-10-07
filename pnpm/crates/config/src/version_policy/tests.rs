@@ -5,8 +5,10 @@ use crate::version_policy::{
 use pretty_assertions::assert_eq;
 
 fn expand(specs: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> =
-        expand_package_version_specs(specs.iter().copied()).unwrap().into_iter().collect();
+    let mut out: Vec<String> = expand_package_version_specs(specs.iter().copied())
+        .unwrap()
+        .into_iter()
+        .collect();
     out.sort();
     out
 }
@@ -96,6 +98,17 @@ fn create_policy_wildcard_name_matches_via_matcher() {
     assert_eq!(policy.matches("is-odd"), PolicyMatch::AnyVersion);
     assert_eq!(policy.matches("is-even"), PolicyMatch::AnyVersion);
     assert_eq!(policy.matches("lodash"), PolicyMatch::No);
+}
+
+#[test]
+fn covers_every_version_only_for_a_bare_name_or_wildcard_match() {
+    let policy =
+        create_package_version_policy(["axios@1.12.2", "is-*", "lodash@4.17.21", "lodash"])
+            .unwrap();
+    assert!(!policy.covers_every_version("axios"));
+    assert!(policy.covers_every_version("is-odd"));
+    assert!(policy.covers_every_version("lodash"));
+    assert!(!policy.covers_every_version("react"));
 }
 
 #[test]

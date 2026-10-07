@@ -8,7 +8,7 @@
 //! Specs of known hosts are identities, not transport choices —
 //! `parse_bare_specifier`'s module doc states the rule.
 //!
-//! Three pieces:
+//! Pieces:
 //!
 //! - [`create_git_hosted_pkg_id()`] — pure ID builder for git resolutions.
 //! - [`parse_bare_specifier()`] — recognise + normalise the input
@@ -32,12 +32,13 @@
 //!   default [`pnpm_network::ThrottledClient`], same as the rest of
 //!   the install path.
 
-mod create_git_hosted_pkg_id;
-mod git_resolver;
-mod hosted_git;
-mod parse_bare_specifier;
-mod resolve_ref;
-mod runners;
+#[cfg(target_family = "wasm")]
+pub(crate) use pnpm_process as process;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::process;
+
+#[cfg(target_family = "wasm")]
+extern crate pnpm_http as reqwest;
 
 pub use create_git_hosted_pkg_id::create_git_hosted_pkg_id;
 pub use git_resolver::{GitFetchContext, GitProbe, GitResolver, ProbeFuture};
@@ -47,3 +48,11 @@ pub use resolve_ref::{
     GitCommandRunner, GitResolveRefError, GitRunError, get_repo_refs, resolve_ref,
 };
 pub use runners::{RealGitProbe, RealGitRunner};
+
+mod create_git_hosted_pkg_id;
+mod git_resolver;
+mod hosted_git;
+mod parse_bare_specifier;
+mod pinned_remote;
+mod resolve_ref;
+mod runners;

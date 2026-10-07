@@ -9,9 +9,17 @@ import { fileURLToPath } from 'node:url'
 
 import { getBinCandidates, splitBinSpecifier } from '../native-binary.mjs'
 
+// Captured once, before any test fakes them. Restoring from these rather than
+// from whatever was current at the call means repeated fakes cannot restore
+// each other's state: `node:test` runs `after` hooks in registration order, so
+// a later fake's hook is the last to run.
+const REAL_HOST = ['platform', 'arch', 'report']
+  .map(key => [key, Object.getOwnPropertyDescriptor(process, key)])
+const REAL_ENDIANNESS = Object.getOwnPropertyDescriptor(os, 'endianness')
+
 const wrapperDir = path.resolve(fileURLToPath(import.meta.url), '../..')
 const wrapperManifest = JSON.parse(fs.readFileSync(path.join(wrapperDir, 'package.json'), 'utf8'))
-const HAS_A_SHELL = process.platform === 'win32' && 'Windows has no sh'
+const NO_SH = process.platform === 'win32' && 'Windows has no sh'
 
 test('npm installs a shim that runs the native pnpm binary', (t) => {
   assert.equal(wrapperManifest.bin.pnpm, 'pnpm')
@@ -27,6 +35,40 @@ test('npm installs a shim that runs the native pnpm binary', (t) => {
     assert.match(fs.readFileSync(powershellShim, 'utf8'), /pnpm\.exe/)
     assert.match(execFileSync('pwsh', ['-NoProfile', '-File', powershellShim, '--version'], { encoding: 'utf8' }), /^v\d+/)
   } else {
+    assertNativeAliases(path.join(prefix, 'bin'))
+  }
+})
+
+// A local install writes shims before preinstall rewrites `bin` to `pnpm.exe`.
+// Postinstall has to rebuild those project shims. The global case above does
+// not cover `node_modules/.bin`.
+test('npm installs local Windows shims that name the native executable', (t) => {
+  const { prefix } = installFixtureWithNpm(t, ['--dangerously-allow-all-scripts'], { global: false })
+
+  if (process.platform === 'win32') {
+    const binDir = path.join(prefix, 'node_modules', '.bin')
+    const cmdShim = path.join(binDir, 'pnpm.cmd')
+    assert.match(fs.readFileSync(cmdShim, 'utf8'), /pnpm\.exe/)
+    assert.match(execFileSync('cmd.exe', ['/d', '/s', '/c', 'call', cmdShim, '--version'], { encoding: 'utf8' }), /^v\d+/)
+
+    const powershellShim = path.join(binDir, 'pnpm.ps1')
+    assert.match(fs.readFileSync(powershellShim, 'utf8'), /pnpm\.exe/)
+    assert.match(execFileSync('pwsh', ['-NoProfile', '-File', powershellShim, '--version'], { encoding: 'utf8' }), /^v\d+/)
+  } else {
+    assertNativeAliases(path.join(prefix, 'node_modules', '.bin'))
+  }
+})
+
+// `--location=global` leaves `npm_config_global` unset and sets npm's project
+// prefix to the global prefix, so only `npm_config_location` marks it global.
+test('npm installs global Windows shims that name the native executable with --location=global', (t) => {
+  const { prefix } = installFixtureWithNpm(t, ['--dangerously-allow-all-scripts', '--location=global'], { global: false })
+
+  assert.equal(fs.existsSync(path.join(prefix, 'node_modules', '.bin')), false)
+  if (process.platform === 'win32') {
+    assert.match(fs.readFileSync(path.join(prefix, 'pnpm.cmd'), 'utf8'), /pnpm\.exe/)
+    assert.match(fs.readFileSync(path.join(prefix, 'pnpm.ps1'), 'utf8'), /pnpm\.exe/)
+  } else {
     assert.equal(execFileSync(path.join(prefix, 'bin', 'pnpm'), ['works'], { encoding: 'utf8' }), 'fixture:works\n')
   }
 })
@@ -35,7 +77,7 @@ test('npm installs a shim that runs the native pnpm binary', (t) => {
 // interpreter for it, which is what keeps it working once the native binary
 // takes the same path. Windows has no shell that could run it instead.
 test('the shim runs pnpm through Node.js when npm skipped the install scripts', {
-  skip: HAS_A_SHELL,
+  skip: NO_SH,
 }, (t) => {
   const { prefix, fixtureDir } = installFixtureWithNpm(t, ['--ignore-scripts'])
   const placeholder = fs.readFileSync(path.join(fixtureDir, 'pnpm'), 'utf8')
@@ -52,7 +94,7 @@ test('the shim runs pnpm through Node.js when npm skipped the install scripts', 
 // Its two bin-link shapes are covered separately: a shim that execs the target,
 // and a symlink to it.
 test('pnpm links a shim that runs the placeholder when it skipped the build scripts', {
-  skip: HAS_A_SHELL,
+  skip: NO_SH,
 }, (t) => {
   const { projectDir } = installFixtureWithPnpm(t, [])
   const bin = path.join(projectDir, 'node_modules', '.bin', 'pnpm')
@@ -64,7 +106,7 @@ test('pnpm links a shim that runs the placeholder when it skipped the build scri
 // The shape `installPnpmToTools` produces for the version store a
 // `packageManager` pin is delegated to.
 test('pnpm links a symlink that runs the placeholder when executables are symlinked', {
-  skip: HAS_A_SHELL,
+  skip: NO_SH,
 }, (t) => {
   const { projectDir } = installFixtureWithPnpm(t, ['--config.node-linker=hoisted'])
   const bin = path.join(projectDir, 'node_modules', '.bin', 'pnpm')
@@ -73,22 +115,144 @@ test('pnpm links a symlink that runs the placeholder when executables are symlin
   assert.equal(runThroughShell(bin, ['works']), 'fixture:works\n')
 })
 
+// The constraint ../pnpm explains. Published pnpm 11 releases depend on it, so
+// no change elsewhere in this repository can lift it.
+test('every bin is shebang-less', () => {
+  for (const file of Object.values(wrapperManifest.bin)) {
+    assert.doesNotMatch(fs.readFileSync(path.join(wrapperDir, file), 'utf8'), /^#!/, `${file} must not carry a shebang`)
+  }
+})
+
+// The order those pnpm 11 releases install in: bins linked while the
+// placeholders are in place, then the native binary moved onto them, with no
+// relink afterwards.
+test('a bin shim linked before the native binary arrived runs the native binary', { skip: NO_SH }, t => {
+  const { projectDir } = installFixtureWithPnpm(t, [])
+  const installedWrapper = path.join(projectDir, 'node_modules', 'pnpm-install-fixture')
+  execFileSync(process.execPath, ['install.js'], {
+    cwd: installedWrapper,
+    env: { ...process.env, npm_lifecycle_event: 'preinstall' },
+    stdio: 'pipe',
+  })
+  assertPnpmNativeAliases(projectDir)
+})
+
+test('pnpm links native aliases after an approved fresh install', { skip: NO_SH }, t => {
+  const { projectDir } = installFixtureWithPnpm(t, [], { ignoreScripts: false })
+  assertPnpmNativeAliases(projectDir)
+})
+
+test('pnpm replaces Node shims after rebuilding a previously blocked install', { skip: NO_SH }, t => {
+  const { projectDir, tempDir } = installFixtureWithPnpm(t, [])
+  const bin = path.join(projectDir, 'node_modules', '.bin', 'pnpm')
+  assert.equal(execFileSync(bin, ['works'], { encoding: 'utf8' }), 'fixture:works\n')
+  execFileSync('pnpm', [
+    'rebuild', 'pnpm-install-fixture', '--ignore-workspace',
+    '--store-dir', path.join(tempDir, 'store'), '--config.dangerously-allow-all-builds=true',
+  ], { cwd: projectDir, stdio: 'pipe' })
+  assertPnpmNativeAliases(projectDir)
+})
+
+test('linux riscv64 resolves the glibc package, and nothing under musl', async (t) => {
+  const { setLibc } = fakeHost(t, 'linux', 'riscv64')
+
+  // `native-binary.mjs` reads process.platform and process.arch at module
+  // scope, so it has to be imported again once they are faked. The libc is
+  // read per call, so one import covers both cases.
+  const { getBinCandidates: candidates } = await import('../native-binary.mjs?riscv64')
+
+  setLibc('glibc')
+  assert.deepEqual(candidates(), ['@pnpm/exe.linux-riscv64/pnpm'])
+
+  // No musl binary is released for riscv64, and the glibc one cannot run
+  // there, so the installer reports an unsupported platform instead.
+  setLibc('musl')
+  assert.deepEqual(candidates(), [])
+})
+
+test('linux ppc64 and s390x resolve their glibc packages', async (t) => {
+  // The musl half of the contract is pinned by the riscv64 case above; these
+  // two share that code path and only need their table entries checked.
+  for (const [arch, specifier] of [
+    ['ppc64', '@pnpm/exe.linux-ppc64/pnpm'],
+    ['s390x', '@pnpm/exe.linux-s390x/pnpm'],
+  ]) {
+    const { setLibc, setEndianness } = fakeHost(t, 'linux', arch)
+    const { getBinCandidates: candidates } = await import(`../native-binary.mjs?${arch}`)
+
+    setLibc('glibc')
+    setEndianness('LE')
+    assert.deepEqual(candidates(), [specifier])
+  }
+})
+
+test('big-endian POWER resolves nothing, since only the little-endian build ships', async (t) => {
+  const { setLibc, setEndianness } = fakeHost(t, 'linux', 'ppc64')
+  const { getBinCandidates: candidates } = await import('../native-binary.mjs?ppc64-be')
+
+  setLibc('glibc')
+  // Node labels both byte orders `ppc64` and npm's `cpu` field cannot separate
+  // them, so npm will happily install the little-endian package here.
+  setEndianness('BE')
+  assert.deepEqual(candidates(), [])
+
+  setEndianness('LE')
+  assert.deepEqual(candidates(), ['@pnpm/exe.linux-ppc64/pnpm'])
+})
+
+test('android resolves its own package rather than a linux one', async (t) => {
+  for (const [arch, specifier] of [
+    ['arm64', '@pnpm/exe.android-arm64/pnpm'],
+    ['x64', '@pnpm/exe.android-x64/pnpm'],
+  ]) {
+    fakeHost(t, 'android', arch)
+    const { getBinCandidates: candidates } = await import(`../native-binary.mjs?android-${arch}`)
+
+    // Android is bionic, so the libc ordering the linux entries go through
+    // never applies to it.
+    assert.deepEqual(candidates(), [specifier])
+  }
+})
+
+test('freebsd x64 resolves the native package', async (t) => {
+  fakeHost(t, 'freebsd', 'x64')
+  const { getBinCandidates: candidates } = await import('../native-binary.mjs?freebsd')
+
+  // FreeBSD has no glibc/musl split, so its entry is a bare specifier and the
+  // libc ordering never applies to it.
+  assert.deepEqual(candidates(), ['@pnpm/exe.freebsd-x64/pnpm'])
+})
+
+test('an architecture released for both libcs still offers the other as a fallback', async (t) => {
+  const { setLibc } = fakeHost(t, 'linux', 'x64')
+  const { getBinCandidates: candidates } = await import('../native-binary.mjs?x64')
+
+  setLibc('glibc')
+  assert.deepEqual(candidates(), ['@pnpm/exe.linux-x64/pnpm', '@pnpm/exe.linux-x64-musl/pnpm'])
+
+  setLibc('musl')
+  assert.deepEqual(candidates(), ['@pnpm/exe.linux-x64-musl/pnpm', '@pnpm/exe.linux-x64/pnpm'])
+})
+
 /**
- * Install the wrapper fixture globally with npm into a prefix of its own.
+ * Install the wrapper fixture with npm into a prefix of its own, globally by
+ * default or as a project dependency.
  * Throws when npm fails; the temp tree is removed when `t` ends.
  *
  * @param {import('node:test').TestContext} t The test, for cleanup.
  * @param {string[]} npmFlags Extra `npm install` flags, e.g. `--ignore-scripts`.
+ * @param {{ global?: boolean }} [options] Pass `global: false` to install into
+ *   the prefix as a project, whose shims land in `node_modules/.bin`.
  * @returns {{ prefix: string, fixtureDir: string }} The npm prefix the shims
  *   landed in, and the fixture wrapper it was installed from.
  */
-function installFixtureWithNpm (t, npmFlags) {
+function installFixtureWithNpm (t, npmFlags, options = {}) {
   const { tempDir, fixtureDir } = writeFixture(t)
 
   const prefix = path.join(tempDir, 'prefix')
   runNpm([
     'install',
-    '--global',
+    ...(options.global === false ? [] : ['--global']),
     '--install-links=true',
     ...npmFlags,
     '--prefix',
@@ -101,15 +265,16 @@ function installFixtureWithNpm (t, npmFlags) {
 /**
  * Install the wrapper fixture into a project of its own with the `pnpm` on
  * PATH, from a tarball so it is unpacked rather than linked, and with its build
- * scripts skipped. Throws when pnpm fails; the temp tree is removed when `t`
+ * scripts skipped unless requested. Throws when pnpm fails; the temp tree is removed when `t`
  * ends.
  *
  * @param {import('node:test').TestContext} t The test, for cleanup.
  * @param {string[]} pnpmFlags Extra `pnpm add` flags, e.g. a node linker.
- * @returns {{ projectDir: string, fixtureDir: string }} The project the bin was
+ * @param {{ignoreScripts?: boolean}} [options] Whether to skip dependency build scripts.
+ * @returns {{ projectDir: string, fixtureDir: string, tempDir: string }} The project the bin was
  *   linked into, and the fixture wrapper it was installed from.
  */
-function installFixtureWithPnpm (t, pnpmFlags) {
+function installFixtureWithPnpm (t, pnpmFlags, { ignoreScripts = true } = {}) {
   const { tempDir, fixtureDir } = writeFixture(t)
   runNpm(['pack', fixtureDir, '--pack-destination', tempDir], tempDir)
   const tarball = path.join(tempDir, 'pnpm-install-fixture-1.0.0.tgz')
@@ -125,10 +290,10 @@ function installFixtureWithPnpm (t, pnpmFlags) {
     '--ignore-workspace',
     '--store-dir',
     path.join(tempDir, 'store'),
-    '--ignore-scripts',
+    ...(ignoreScripts ? ['--ignore-scripts'] : ['--config.dangerously-allow-all-builds=true']),
     ...pnpmFlags,
   ], { cwd: projectDir, stdio: 'pipe' })
-  return { projectDir, fixtureDir }
+  return { projectDir, fixtureDir, tempDir }
 }
 
 /**
@@ -158,14 +323,14 @@ function writeFixture (t) {
 
   const fixtureDir = path.join(tempDir, 'wrapper')
   fs.mkdirSync(path.join(fixtureDir, 'bin'), { recursive: true })
-  for (const file of ['install.js', 'native-binary.mjs', 'bin/pnpm.mjs', wrapperManifest.bin.pnpm]) {
+  for (const file of ['install.js', 'native-binary.mjs', 'bin/pnpm.mjs', 'bin/pnpx.mjs', ...Object.values(wrapperManifest.bin)]) {
     fs.copyFileSync(path.join(wrapperDir, file), path.join(fixtureDir, file))
   }
   fs.writeFileSync(path.join(fixtureDir, 'package.json'), JSON.stringify({
     name: 'pnpm-install-fixture',
     version: '1.0.0',
     type: 'module',
-    bin: { pnpm: wrapperManifest.bin.pnpm },
+    bin: wrapperManifest.bin,
     scripts: {
       preinstall: 'node install.js',
       postinstall: 'node install.js',
@@ -176,9 +341,34 @@ function writeFixture (t) {
   return { tempDir, fixtureDir }
 }
 
+function assertPnpmNativeAliases (projectDir) {
+  const decoys = path.join(projectDir, 'no-node')
+  fs.mkdirSync(decoys)
+  fs.writeFileSync(path.join(decoys, 'node'), '#!/bin/sh\nexit 99\n', { mode: 0o755 })
+  for (const name of Object.keys(wrapperManifest.bin)) {
+    const installed = path.join(projectDir, 'node_modules', 'pnpm-install-fixture', name)
+    assert.match(fs.readFileSync(installed, 'utf8'), /^#!\/bin\/sh\nprintf/)
+    const bin = path.join(projectDir, 'node_modules', '.bin', name)
+    assert.equal(execFileSync(bin, ['works'], {
+      encoding: 'utf8', env: { ...process.env, PATH: `${decoys}${path.delimiter}${process.env.PATH}` },
+    }), 'fixture:works\n')
+  }
+}
+
+function assertNativeAliases (binDirectory) {
+  for (const name of Object.keys(wrapperManifest.bin)) {
+    const bin = path.join(binDirectory, name)
+    assert.match(fs.readFileSync(bin, 'utf8'), /^#!\/bin\/sh\nprintf/)
+    assert.equal(execFileSync(bin, ['works'], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: path.join(binDirectory, 'no-node-on-path') },
+    }), 'fixture:works\n')
+  }
+}
+
 /**
  * Run `bin` from a shell, as a user's `pnpm` is run. A shebang-less bin is
- * reached only that way outside Linux, whose libc retries ENOEXEC under `/bin/sh`
+ * reached only that way without glibc, which retries ENOEXEC under `/bin/sh`
  * itself. Throws when it exits non-zero.
  *
  * @param {string} bin Absolute path to the bin to run.
@@ -203,12 +393,50 @@ function runNpm (args, cwd) {
   }
 }
 
+/**
+ * Present the running process as a `platform`/`arch` host, restoring the real
+ * descriptors when the test ends.
+ *
+ * @param {import('node:test').TestContext} t The test, for cleanup.
+ * @param {string} platform The `process.platform` to present.
+ * @param {string} arch The `process.arch` to present.
+ * @returns {{ setLibc: (libc: 'glibc' | 'musl') => void, setEndianness: (order: 'LE' | 'BE') => void }}
+ *   `setLibc` fakes the `process.report` that `detectLinuxLibc` reads and
+ *   `setEndianness` fakes `os.endianness()`, so a case does not depend on the
+ *   host's own libc or byte order.
+ */
+function fakeHost (t, platform, arch) {
+  t.after(() => {
+    for (const [key, descriptor] of REAL_HOST) {
+      if (descriptor) Object.defineProperty(process, key, descriptor)
+    }
+    if (REAL_ENDIANNESS) Object.defineProperty(os, 'endianness', REAL_ENDIANNESS)
+  })
+  Object.defineProperty(process, 'platform', { value: platform, configurable: true })
+  Object.defineProperty(process, 'arch', { value: arch, configurable: true })
+  return {
+    setLibc (libc) {
+      const header = libc === 'glibc' ? { glibcVersionRuntime: '2.39' } : {}
+      Object.defineProperty(process, 'report', {
+        value: { getReport: () => ({ header }) },
+        configurable: true,
+      })
+    },
+    setEndianness (order) {
+      Object.defineProperty(os, 'endianness', { value: () => order, configurable: true })
+    },
+  }
+}
+
 function writeNativeFixture (destPath) {
   if (process.platform === 'win32') {
     try {
       fs.linkSync(process.execPath, destPath)
     } catch (err) {
-      if (err.code !== 'EXDEV') throw err
+      // EXDEV is a cross-volume link. EPERM is a same-volume link the process
+      // is not allowed to create (for example node.exe under Program Files).
+      // A copy is still a runnable stand-in for the native binary.
+      if (err.code !== 'EXDEV' && err.code !== 'EPERM') throw err
       fs.copyFileSync(process.execPath, destPath)
     }
   } else {

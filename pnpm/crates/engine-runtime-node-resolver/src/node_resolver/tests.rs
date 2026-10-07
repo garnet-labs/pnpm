@@ -1,14 +1,14 @@
-use std::sync::Arc;
-
+use super::{
+    FetchShasumsFileError, NodeResolver, NodeResolverError,
+    assets::{bin_spec_for_platform, parse_node_file_name},
+    exact_release_version, normalize_node_runtime_version_specifier, parse_node_specifier,
+    read_musl_assets, read_node_assets_from_mirror,
+};
+use pnpm_lockfile::PlatformAssetResolution;
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use pnpm_resolving_resolver_base::{ResolveOptions, Resolver, WantedDependency};
 use pretty_assertions::assert_eq;
-
-use super::{
-    NodeResolver, NodeResolverError, bin_spec_for_platform, exact_release_version,
-    normalize_node_runtime_version_specifier, parse_node_file_name, parse_node_specifier,
-    read_node_assets_from_mirror,
-};
+use std::sync::Arc;
 
 fn resolver() -> NodeResolver {
     NodeResolver::new(Arc::new(ThrottledClient::new_for_installs()))
@@ -21,7 +21,10 @@ async fn declines_non_node_alias() {
         bare_specifier: Some("runtime:22.0.0".to_string()),
         ..WantedDependency::default()
     };
-    let outcome = resolver().resolve(&wanted, &ResolveOptions::default()).await.unwrap();
+    let outcome = resolver()
+        .resolve(&wanted, &ResolveOptions::default())
+        .await
+        .unwrap();
     assert!(outcome.is_none());
 }
 
@@ -34,7 +37,10 @@ async fn declines_node_without_runtime_prefix() {
         bare_specifier: Some("^22".to_string()),
         ..WantedDependency::default()
     };
-    let outcome = resolver().resolve(&wanted, &ResolveOptions::default()).await.unwrap();
+    let outcome = resolver()
+        .resolve(&wanted, &ResolveOptions::default())
+        .await
+        .unwrap();
     assert!(outcome.is_none());
 }
 
@@ -47,11 +53,16 @@ async fn offline_raises_no_offline_nodejs_resolution() {
         bare_specifier: Some("runtime:22.0.0".to_string()),
         ..WantedDependency::default()
     };
-    let err = resolver.resolve(&wanted, &ResolveOptions::default()).await.unwrap_err();
+    let err = resolver
+        .resolve(&wanted, &ResolveOptions::default())
+        .await
+        .unwrap_err();
     let code: &dyn miette::Diagnostic =
         err.downcast_ref::<super::NodeResolverError>().expect("error is a NodeResolverError");
     assert_eq!(
-        code.code().map(|code| code.to_string()).as_deref(),
+        code.code()
+            .map(|code| code.to_string())
+            .as_deref(),
         Some("ERR_PNPM_NO_OFFLINE_NODEJS_RESOLUTION"),
     );
 }
@@ -75,6 +86,12 @@ fn parses_node_file_names() {
     assert_eq!(windows.platform, "win");
     assert_eq!(windows.arch, "x64");
     assert!(!windows.is_musl);
+
+    let windows_arm64 =
+        parse_node_file_name("node-v22.0.0-win-arm64.zip", version).expect("windows arm64");
+    assert_eq!(windows_arm64.platform, "win");
+    assert_eq!(windows_arm64.arch, "arm64");
+    assert!(!windows_arm64.is_musl);
 
     assert!(parse_node_file_name("node-v22.0.0.pkg", version).is_none());
     assert!(parse_node_file_name("node-v22.0.0-headers.tar.gz", version).is_none());
@@ -135,9 +152,10 @@ async fn resolve_save_specifier_pins_the_picked_version() {
         .create_async()
         .await;
     let mut resolver = resolver();
-    resolver
-        .node_download_mirrors
-        .insert("release".to_string(), format!("{}/download/release/", server.url()));
+    resolver.node_download_mirrors.insert(
+        "release".to_string(),
+        format!("{}/download/release/", server.url()),
+    );
 
     let cases = [
         ("26", None, "runtime:26.5.0"),
@@ -166,14 +184,17 @@ async fn resolve_save_specifier_errors_when_no_version_satisfies() {
         .create_async()
         .await;
     let mut resolver = resolver();
-    resolver
-        .node_download_mirrors
-        .insert("release".to_string(), format!("{}/download/release/", server.url()));
+    resolver.node_download_mirrors.insert(
+        "release".to_string(),
+        format!("{}/download/release/", server.url()),
+    );
 
     let err = resolver.resolve_save_specifier("99", None).await.unwrap_err();
     let code: &dyn miette::Diagnostic = &err;
     assert_eq!(
-        code.code().map(|code| code.to_string()).as_deref(),
+        code.code()
+            .map(|code| code.to_string())
+            .as_deref(),
         Some("ERR_PNPM_NODEJS_VERSION_NOT_FOUND"),
     );
 }
@@ -253,9 +274,10 @@ fn exact_release_versions_are_their_own_resolution() {
 #[tokio::test]
 async fn resolve_save_specifier_saves_an_exact_version_without_network() {
     let mut resolver = resolver();
-    resolver
-        .node_download_mirrors
-        .insert("release".to_string(), "http://127.0.0.1:9/download/release/".to_string());
+    resolver.node_download_mirrors.insert(
+        "release".to_string(),
+        "http://127.0.0.1:9/download/release/".to_string(),
+    );
 
     assert_eq!(resolver.resolve_save_specifier("22.11.0", None).await.unwrap(), "runtime:22.11.0");
 }
@@ -280,20 +302,26 @@ async fn exact_resolve_of_a_nonexistent_version_raises_version_not_found() {
         .create_async()
         .await;
     let mut resolver = resolver();
-    resolver
-        .node_download_mirrors
-        .insert("release".to_string(), format!("{}/download/release/", server.url()));
+    resolver.node_download_mirrors.insert(
+        "release".to_string(),
+        format!("{}/download/release/", server.url()),
+    );
     let wanted = WantedDependency {
         alias: Some("node".to_string()),
         bare_specifier: Some("runtime:22.99.0".to_string()),
         ..WantedDependency::default()
     };
 
-    let err = resolver.resolve(&wanted, &ResolveOptions::default()).await.unwrap_err();
+    let err = resolver
+        .resolve(&wanted, &ResolveOptions::default())
+        .await
+        .unwrap_err();
     let code: &dyn miette::Diagnostic =
         err.downcast_ref::<NodeResolverError>().expect("error is a NodeResolverError");
     assert_eq!(
-        code.code().map(|code| code.to_string()).as_deref(),
+        code.code()
+            .map(|code| code.to_string())
+            .as_deref(),
         Some("ERR_PNPM_NODEJS_VERSION_NOT_FOUND"),
     );
     index.assert_async().await;
@@ -316,16 +344,20 @@ async fn exact_resolve_keeps_the_asset_error_when_the_version_exists() {
         .create_async()
         .await;
     let mut resolver = resolver();
-    resolver
-        .node_download_mirrors
-        .insert("release".to_string(), format!("{}/download/release/", server.url()));
+    resolver.node_download_mirrors.insert(
+        "release".to_string(),
+        format!("{}/download/release/", server.url()),
+    );
     let wanted = WantedDependency {
         alias: Some("node".to_string()),
         bare_specifier: Some("runtime:22.11.0".to_string()),
         ..WantedDependency::default()
     };
 
-    let err = resolver.resolve(&wanted, &ResolveOptions::default()).await.unwrap_err();
+    let err = resolver
+        .resolve(&wanted, &ResolveOptions::default())
+        .await
+        .unwrap_err();
     let err = err.downcast_ref::<NodeResolverError>().expect("error is a NodeResolverError");
     assert!(matches!(err, NodeResolverError::FetchVerifiedNodeShasums(_)));
 }
@@ -374,6 +406,180 @@ async fn asset_reader_serves_repeat_reads_from_the_cache() {
     shasums.assert_async().await;
 }
 
+#[tokio::test]
+async fn musl_reader_reports_no_assets_for_a_release_without_musl_builds() {
+    let assets = read_musl_assets_from_mock(404, None).await
+        .expect("a release without musl builds resolves to no musl assets");
+
+    assert!(assets.is_empty());
+}
+
+#[tokio::test]
+async fn musl_reader_propagates_a_blocked_mirror() {
+    let err = read_musl_assets_from_mock(403, None).await
+        .expect_err("a blocked mirror fails the resolve");
+
+    assert!(matches!(
+        err,
+        NodeResolverError::FetchShasumsFile(FetchShasumsFileError::StatusNotOk { status: 403, .. })
+    ));
+}
+
+#[tokio::test]
+async fn musl_reader_propagates_a_mirror_server_error() {
+    let err = read_musl_assets_from_mock(500, None).await
+        .expect_err("an erroring mirror fails the resolve");
+
+    assert!(matches!(
+        err,
+        NodeResolverError::FetchShasumsFile(FetchShasumsFileError::StatusNotOk { status: 500, .. })
+    ));
+}
+
+#[tokio::test]
+async fn musl_reader_propagates_an_unreachable_mirror() {
+    // Binding and dropping a listener hands back a port the OS just confirmed
+    // free, so the connect is refused instead of answered or left hanging.
+    // `0.0.0.0` fails it at once on Windows too, unlike a refused loopback port.
+    let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read the bound address")
+        .port();
+
+    let err = read_musl_assets(
+        &ThrottledClient::new_for_installs(),
+        &AuthHeaders::default(),
+        &format!("http://0.0.0.0:{closed_port}/download/release/"),
+        "22.11.0",
+        None,
+    )
+    .await
+    .expect_err("an unreachable mirror fails the resolve");
+
+    assert!(matches!(
+        err,
+        NodeResolverError::FetchShasumsFile(FetchShasumsFileError::Network { .. })
+    ));
+}
+
+#[tokio::test]
+async fn musl_reader_keeps_only_the_musl_assets() {
+    let assets = read_musl_assets_from_mock(200, Some(SHASUMS_WITH_GLIBC_AND_MUSL_ASSETS))
+        .await
+        .expect("read the musl asset list");
+
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].targets[0].libc.as_deref(), Some("musl"));
+}
+
+async fn read_musl_assets_from_mock(
+    status: usize,
+    body: Option<&str>,
+) -> Result<Vec<PlatformAssetResolution>, NodeResolverError> {
+    let mut server = mockito::Server::new_async().await;
+    let mut mock =
+        server.mock("GET", "/download/release/v22.11.0/SHASUMS256.txt").with_status(status);
+    if let Some(body) = body {
+        mock = mock.with_body(body);
+    }
+    let _mock = mock.create_async().await;
+
+    read_musl_assets(
+        &ThrottledClient::new_for_installs(),
+        &AuthHeaders::default(),
+        &format!("{}/download/release/", server.url()),
+        "22.11.0",
+        None,
+    )
+    .await
+}
+
+const SHASUMS_WITH_GLIBC_AND_MUSL_ASSETS: &str = "\
+ed52239294ad517fbe91a268146d5d2aa8a17d2d62d64873e43219078ba71c4e  node-v22.11.0-linux-x64.tar.gz
+696cb00a4b9d0e4dd2eb95e5fe32e8ff1ac2c3dfe54c7a2a5f03f7f9e6f0b1c2  node-v22.11.0-linux-x64-musl.tar.gz
+";
+
 const SHASUMS_WITH_ONE_NODE_ASSET: &str = "\
 ed52239294ad517fbe91a268146d5d2aa8a17d2d62d64873e43219078ba71c4e  node-v22.11.0-linux-x64.tar.gz
 ";
+
+const SHASUMS_WITH_WIN_ASSETS_NODE_22: &str = "\
+b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2  node-v22.11.0-win-x64.zip
+a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  node-v22.11.0-win-arm64.zip
+";
+
+const SHASUMS_WITH_WIN_X64_NODE_18: &str = "\
+c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3  node-v18.20.0-win-x64.zip
+";
+
+#[tokio::test]
+async fn resolves_native_win_arm64_variant_for_node_20_plus() {
+    let mut server = mockito::Server::new_async().await;
+    let _shasums = server
+        .mock("GET", "/download/rc/v22.11.0/SHASUMS256.txt")
+        .with_status(200)
+        .with_body(SHASUMS_WITH_WIN_ASSETS_NODE_22)
+        .create_async()
+        .await;
+    let client = ThrottledClient::new_for_installs();
+    let mirror = format!("{}/download/rc/", server.url());
+
+    let assets = read_node_assets_from_mirror(
+        &client,
+        &AuthHeaders::default(),
+        &mirror,
+        "22.11.0",
+        false,
+        false,
+        None,
+    )
+    .await
+    .expect("fetch the asset list");
+
+    let win_arm64 = assets
+        .iter()
+        .find(|asset| {
+            asset.targets
+                .iter()
+                .any(|target| target.os == "win32" && target.cpu == "arm64")
+        })
+        .expect("win32-arm64 variant exists");
+
+    assert_eq!(win_arm64.targets.len(), 1);
+    assert_eq!(win_arm64.targets[0].os, "win32");
+    assert_eq!(win_arm64.targets[0].cpu, "arm64");
+}
+
+#[tokio::test]
+async fn includes_win32_arm64_target_on_win_x64_variant_for_node_under_20() {
+    let mut server = mockito::Server::new_async().await;
+    let _shasums = server
+        .mock("GET", "/download/rc/v18.20.0/SHASUMS256.txt")
+        .with_status(200)
+        .with_body(SHASUMS_WITH_WIN_X64_NODE_18)
+        .create_async()
+        .await;
+    let client = ThrottledClient::new_for_installs();
+    let mirror = format!("{}/download/rc/", server.url());
+
+    let assets = read_node_assets_from_mirror(
+        &client,
+        &AuthHeaders::default(),
+        &mirror,
+        "18.20.0",
+        false,
+        false,
+        None,
+    )
+    .await
+    .expect("fetch the asset list");
+
+    assert_eq!(assets.len(), 1);
+    let targets = &assets[0].targets;
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].os, "win32");
+    assert_eq!(targets[0].cpu, "x64");
+    assert_eq!(targets[1].os, "win32");
+    assert_eq!(targets[1].cpu, "arm64");
+}
