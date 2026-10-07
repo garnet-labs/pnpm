@@ -99,6 +99,7 @@ fn client_builder(
     trust_roots: TrustRoots,
     forbid_redirects: bool,
 ) -> Result<reqwest::ClientBuilder, ForInstallsError> {
+    // Each scheme proxy below carries the resolved no_proxy list.
     let mut builder =
         default_client_builder(inputs.settings).dns_resolver(Arc::clone(&inputs.dns_resolver));
     if let Some(url) = inputs.https.clone() {
