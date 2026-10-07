@@ -4,6 +4,13 @@ name: Garnet Proxy Routing
 # pull requests that touch the install client's proxy wiring. Fork-only
 # recorder; it never runs upstream.
 on:
+  push:
+    branches: [garnet/proxy-base]
+    paths:
+      - pnpm/crates/network/src/client_builder.rs
+      - pnpm/crates/network/src/proxy.rs
+      - .garnet/proxy-routing/**
+      - .github/workflows/garnet-proxy-routing.yml
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -16,22 +23,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: garnet-proxy-routing-${{ github.event.pull_request.number }}
+  group: garnet-proxy-routing-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   proxy-routing:
     name: proxy-routing (ubuntu)
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
     env:
-      EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Verify executed commit
@@ -39,7 +46,7 @@ jobs:
         run: |
           actual=$(git rev-parse HEAD)
           [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
-          echo "executed $actual (pull request head)"
+          echo "executed $actual (${{ github.event_name }} head)"
 
       - name: Install Rust Toolchain
         uses: $/.github/actions/rustup
