@@ -1,16 +1,12 @@
-# Acceptance gate: publishes the `garnet/evidence` check run on the pull
-# request head. It succeeds only when a finalized Garnet Runtime Review comment,
-# written by the Garnet App, is bound to the exact head; a record still being
-# written is pending; missing, stale, or third-party evidence fails.
-# Runs from the default branch after a recording workflow completes and again
-# each time the Garnet App posts or edits its comment, so the check follows the
-# record as more jobs finish. It never checks out or executes pull request code.
-# Mark the check `garnet/evidence` required in branch protection to make
-# evidence a merge condition.
+# Acceptance gate, paused: run by hand only (workflow_dispatch with a pull
+# request number). When run, it publishes the `garnet/evidence` check run on the
+# pull request head. It succeeds only when a finalized Garnet Runtime Review
+# comment, written by the Garnet App, is bound to the exact head; a record still
+# being written is pending; missing, stale, or third-party evidence fails. It
+# never checks out or executes pull request code. Live records do not declare
+# capture completeness yet, so it cannot pass and must not be a required check.
 name: Garnet evidence gate
 
-# Paused: live records do not declare capture completeness yet, so this gate
-# cannot pass. Run it by hand until they do.
 on:
   workflow_dispatch:
     inputs:
