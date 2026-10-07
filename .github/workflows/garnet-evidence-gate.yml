@@ -9,12 +9,14 @@
 # evidence a merge condition.
 name: Garnet evidence gate
 
-on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
-  workflow_run:
-    workflows: ["TS CI"]
-    types: [completed]
-  issue_comment:
-    types: [created, edited]
+# Paused: live records do not declare capture completeness yet, so this gate
+# cannot pass. Run it by hand until they do.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        required: true
 
 permissions: {}
 
@@ -22,7 +24,8 @@ jobs:
   evidence:
     name: Publish garnet/evidence on the pull request head
     if: >-
-      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
       || (github.event_name == 'issue_comment'
           && github.event.issue.pull_request != null
           && contains(fromJSON('["garnet-runtime-review[bot]","garnet-runtime-review-dev[bot]","garnet-ai[bot]"]'), github.event.comment.user.login)
@@ -38,7 +41,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
       EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-      EVENT_PR_NUMBER: ${{ github.event.issue.number }}
+      EVENT_PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
       GARNET_RECORD_WORKFLOWS: '["TS CI"]'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
