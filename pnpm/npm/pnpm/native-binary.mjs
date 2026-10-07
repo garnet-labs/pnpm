@@ -50,8 +50,6 @@ const PLATFORMS = {
     arm64: '@pnpm/exe.android-arm64/pnpm',
     x64: '@pnpm/exe.android-x64/pnpm',
   },
-  // Android is bionic, which is neither of the two libcs the linux entries
-  // above are keyed on, so it takes a bare specifier of its own.
 }
 
 /**
