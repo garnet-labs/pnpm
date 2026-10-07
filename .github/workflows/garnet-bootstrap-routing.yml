@@ -1,0 +1,51 @@
+name: Garnet Bootstrap Routing
+
+# Records the Corepack entry point's first run (.garnet/bootstrap-routing) for
+# pull requests that touch it. Fork-only recorder; it never runs upstream.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - pnpm/npm/pnpm/bin/pnpm.mjs
+      - pnpm/npm/pnpm/native-binary.mjs
+      - .garnet/bootstrap-routing/**
+      - .github/workflows/garnet-bootstrap-routing.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-bootstrap-routing-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-routing:
+    name: bootstrap-routing (ubuntu, node 22)
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify executed commit
+        shell: bash
+        run: |
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
+          echo "executed $actual (pull request head)"
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
+
+      - uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: First run of the Corepack entry point
+        run: bash .garnet/bootstrap-routing/run.sh
