@@ -1,0 +1,76 @@
+name: Garnet Proxy Routing
+
+# Records one `pnpm ping` through the proxy fixture (.garnet/proxy-routing) for
+# pull requests that touch the install client's proxy wiring. Fork-only
+# recorder; it never runs upstream.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - pnpm/crates/network/src/client_builder.rs
+      - pnpm/crates/network/src/proxy.rs
+      - .garnet/proxy-routing/**
+      - .github/workflows/garnet-proxy-routing.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-proxy-routing-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  proxy-routing:
+    name: proxy-routing (ubuntu)
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    env:
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify executed commit
+        shell: bash
+        run: |
+          actual=$(git rev-parse HEAD)
+          [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
+          echo "executed $actual (pull request head)"
+
+      - name: Install Rust Toolchain
+        uses: $/.github/actions/rustup
+
+      - uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3.0.0
+        with:
+          install: false
+
+      - name: Install just
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: just
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          unset PNPM_HOME
+          unset XDG_DATA_HOME
+          just install
+
+      - name: Build the install client
+        run: cargo build -p pnpm-cli --bin pnpm
+
+      - uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
+      - name: Ping the registry with proxy=false
+        env:
+          PNPM_BIN: ${{ github.workspace }}/target/debug/pnpm
+        run: bash .garnet/proxy-routing/run.sh
+
+      - name: Let the job settle
+        run: sleep 20
