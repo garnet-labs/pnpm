@@ -118,10 +118,8 @@ function preambleFor(head, stamp = { recorded: null, jobs: null }) {
       "the sticky Garnet Runtime Review comment on this PR so reviewers that read only",
       "the description ground in the same bytes. The comment is the source: it gains",
       "jobs as they finish and this block follows it. Facts only. Judgment stays with",
-      "the reviewer. Cite grounded findings as:",
+      "the reviewer.",
     ].join(" "),
-    "",
-    `> Runtime evidence (Garnet, head \`${sha7}\`): \`<execution chain>\` → \`<destination>\` (\`<workflow>/<job>\`) — \`<Execution Profile URL>\``,
     "",
   ].join("\n")
   return preamble
