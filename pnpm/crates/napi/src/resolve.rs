@@ -7,13 +7,7 @@
 //! Mirrors the install path's
 //! [`DefaultResolver`][pnpm_resolving_default_resolver::DefaultResolver] chain (see
 //! `pnpm_package_manager::install_with_fresh_lockfile`) so a single
-//! resolve claims every protocol the install claims: npm registry
-//! (`name@version` / `range` / `tag`, incl. the `foo@npm:bar` alias
-//! form), git URLs, `http(s)` tarball URLs, `file:` / `link:` /
-//! `workspace:` and bare filesystem paths, the node / deno / bun
-//! runtime specs — including the `yarn@runtime:` line that ships as
-//! release archives rather than as an npm package — and `<alias>:`
-//! named-registry specs. A specifier no
+//! resolve claims every protocol the install claims. A specifier no
 //! resolver in the chain claims surfaces as
 //! `ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER`.
 //!
@@ -22,29 +16,25 @@
 //! shared with the other single-resolve callers; its module documents the
 //! two deviations from the install chain. See `pnpm/plans/NAPI.md`.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 
 use napi_derive::napi;
-use pnpm_network::ThrottledClient;
 use pnpm_resolving_default_resolver::standalone::{StandaloneChainOptions, build_standalone_chain};
 use pnpm_resolving_resolver_base::{ResolveOptions, WantedDependency};
 
 use crate::{
     config::{ConfigOverlay, resolve_config},
     error::to_napi_error,
-    reporter_bridge::NodeBridgeReporter,
 };
 
-/// The `(alias, bareSpecifier)` a resolve is requested for. Mirrors
-/// `WantedDependency` in `index.d.ts`.
+/// The `(alias, bareSpecifier)` a resolve is requested for.
 #[napi(object)]
 pub struct WantedDependencyInput {
     pub alias: Option<String>,
     pub bare_specifier: Option<String>,
 }
 
-/// Options for [`resolve_dependency`]. Mirrors `ResolveOptions` in
-/// `index.d.ts`.
+/// Options for [`resolve_dependency`].
 #[napi(object)]
 pub struct ResolveDependencyOptions {
     pub dir: String,
@@ -60,7 +50,7 @@ pub struct ResolveDependencyOptions {
     pub auth_header_by_uri: Option<HashMap<String, String>>,
 }
 
-/// Result of [`resolve_dependency`]. Mirrors `ResolveResult` in `index.d.ts`.
+/// Result of [`resolve_dependency`].
 #[napi(object)]
 pub struct ResolveDependencyResult {
     pub id: String,
@@ -88,32 +78,29 @@ pub async fn resolve_dependency(
     rx.await.map_err(|_| napi::Error::from_reason("resolve worker thread panicked"))?
 }
 
+fn normalize_wanted_dependency(wanted: WantedDependencyInput) -> WantedDependency {
+    WantedDependency {
+        alias: wanted.alias,
+        // An empty bareSpecifier means "no range given" — pnpm v11's
+        // resolver treated it like an absent pref (resolve the latest
+        // matching version); passing it through verbatim would fall off
+        // the resolver chain as ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER.
+        bare_specifier: wanted.bare_specifier.filter(|spec| !spec.trim().is_empty()),
+        injected: None,
+        prev_specifier: None,
+        optional: None,
+    }
+}
+
 fn run_resolve_blocking(
     wanted: WantedDependencyInput,
     options: &ResolveDependencyOptions,
 ) -> napi::Result<ResolveDependencyResult> {
     let dir = PathBuf::from(&options.dir);
-    let overlay = ConfigOverlay {
-        store_dir: options.store_dir.as_ref().map(PathBuf::from),
-        cache_dir: options.cache_dir.as_ref().map(PathBuf::from),
-        registries: options.registries.as_ref().map(|map| map.clone().into_iter().collect()),
-        offline: options.offline,
-        prefer_offline: options.prefer_offline,
-        auth_header_by_uri: options.auth_header_by_uri.clone().map(|map| map.into_iter().collect()),
-        ..ConfigOverlay::default()
-    };
-    let config = resolve_config(&dir, &overlay).map_err(|error| to_napi_error(&error))?;
+    let config =
+        resolve_config(&dir, &resolve_overlay(options)).map_err(|error| to_napi_error(&error))?;
 
-    let http_client = Arc::new(
-        ThrottledClient::for_installs(
-            &config.proxy,
-            &config.tls,
-            &config.tls_by_uri,
-            &config.network_settings(),
-        )
-        .map_err(|error| to_napi_error(&error))?,
-    );
-    http_client.set_warning_handler(pnpm_reporter::emit_global_warning::<NodeBridgeReporter>);
+    let http_client = crate::install::install_http_client(config)?;
 
     let resolver = build_standalone_chain(&StandaloneChainOptions {
         config,
@@ -129,19 +116,15 @@ fn run_resolve_blocking(
     })
     .map_err(|error| to_napi_error(&error))?;
 
-    let wanted_dependency = WantedDependency {
-        alias: wanted.alias,
-        // An empty bareSpecifier means "no range given" — pnpm v11's
-        // resolver treated it like an absent pref (resolve the latest
-        // matching version); passing it through verbatim would fall off
-        // the resolver chain as ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER.
-        bare_specifier: wanted.bare_specifier.filter(|spec| !spec.trim().is_empty()),
-        injected: None,
-        prev_specifier: None,
-        optional: None,
+    let wanted_dependency = normalize_wanted_dependency(wanted);
+    let resolve_options = ResolveOptions {
+        project: pnpm_resolving_resolver_base::ResolverProjectOptions {
+            project_dir: dir.clone(),
+            lockfile_dir: dir,
+            ..Default::default()
+        },
+        ..ResolveOptions::default()
     };
-    let resolve_options =
-        ResolveOptions { project_dir: dir.clone(), lockfile_dir: dir, ..ResolveOptions::default() };
 
     // A single dependency resolve is one packument fetch — no task parallelism
     // to exploit — and this already runs on a dedicated worker thread. Use a
@@ -149,8 +132,10 @@ fn run_resolve_blocking(
     // worker-thread pool (a per-call multi-thread runtime would multiply threads
     // under concurrent resolves). The install path keeps a multi-thread runtime
     // because it fetches packages in parallel.
-    let runtime =
-        tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
             napi::Error::from_reason(format!("failed to build tokio runtime: {error}"))
         })?;
 
@@ -163,19 +148,33 @@ fn run_resolve_blocking(
         // `Resolver::resolve` erases its error to `ResolveError`
         // (`Box<dyn Error>`), so the underlying miette `Diagnostic` — and its
         // `ERR_PNPM_*` code / hint — is already gone by the time it reaches
-        // here; only the message survives. Restoring the code on this path
-        // requires the resolver trait to carry a typed diagnostic error, a
-        // pacquet-core change tracked as a follow-up.
+        // here; only the message survives.
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
 
     Ok(ResolveDependencyResult {
         id: resolved.id.to_string(),
-        manifest: resolved.manifest.map(|manifest| (*manifest).clone()),
+        manifest: resolved.package.manifest.map(|manifest| (*manifest).clone()),
         resolved_via: resolved.resolved_via,
         normalized_bare_specifier: resolved.normalized_bare_specifier,
-        latest: resolved.latest,
+        latest: resolved.package.latest,
     })
 }
 
 #[cfg(test)]
 mod tests;
+
+fn resolve_overlay(options: &ResolveDependencyOptions) -> ConfigOverlay {
+    ConfigOverlay {
+        store_dir: options.store_dir.as_ref().map(PathBuf::from),
+        cache_dir: options.cache_dir.as_ref().map(PathBuf::from),
+        registries: options.registries
+            .as_ref()
+            .map(|map| map.clone().into_iter().collect()),
+        offline: options.offline,
+        prefer_offline: options.prefer_offline,
+        auth_header_by_uri: options.auth_header_by_uri
+            .clone()
+            .map(|map| map.into_iter().collect()),
+        ..ConfigOverlay::default()
+    }
+}

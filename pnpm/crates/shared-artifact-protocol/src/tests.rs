@@ -12,7 +12,7 @@ use crate::{
     ARTIFACT_KIND, ArtifactBlobUpload, ArtifactCandidate, ArtifactFile, ArtifactManifest,
     ArtifactPayload, ArtifactSubject, BuilderProfile, CompatibilityConstraints,
     CompatibilityScopes, LinuxGlibcPlatform, MacOsPlatform, OwnerScope, PackageIdentity,
-    PublishArtifactRequest, SIGNATURE_ALGORITHM, SignedArtifactEnvelope,
+    PublishArtifactRequest, SIGNATURE_ALGORITHM, SYMLINK_MODE, SignedArtifactEnvelope,
     WORKSPACE_TASK_ARTIFACT_KIND, WindowsPlatform, blob_id, compatibility_rank,
     compatibility_scopes, linux_glibc_supported_tags, linux_glibc_tag, macos_supported_tags,
     macos_tag, platform_fingerprint, validate_manifest_path, verify_blob, windows_supported_tags,
@@ -175,7 +175,10 @@ fn rejects_oversized_envelope_fields_without_decoding_them() {
         payload: "A".repeat(crate::MAX_ENCODED_SIGNED_PAYLOAD_SIZE + 1),
         signature: BASE64.encode([0; 8]),
     };
-    let error = oversized_payload.decode_payload().unwrap_err().to_string();
+    let error = oversized_payload
+        .decode_payload()
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("signed payload exceeds"), "{error}");
 
     let payload_bytes = serde_json::to_vec(&payload(integrity(b"addon"))).unwrap();
@@ -185,7 +188,10 @@ fn rejects_oversized_envelope_fields_without_decoding_them() {
         payload: BASE64.encode(&payload_bytes),
         signature: "A".repeat(crate::MAX_ENCODED_SIGNATURE_SIZE + 1),
     };
-    let error = oversized_signature.digest().unwrap_err().to_string();
+    let error = oversized_signature
+        .digest()
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("DER-encoded P-256 signature"), "{error}");
 }
 
@@ -255,6 +261,23 @@ fn rejects_duplicate_and_case_colliding_paths() {
     let file_integrity = integrity(b"addon");
     let mut artifact = payload(file_integrity);
     artifact.manifest.deleted.push("BUILD/addon.node".to_string());
+    assert!(artifact.validate().is_err());
+}
+
+/// An added entry is a plain or executable file, or a symlink whose blob is
+/// its target. Any other mode would have no defined restore.
+#[test]
+fn accepts_symlink_entries_and_no_other_mode() {
+    let mut artifact = payload(integrity(b"addon"));
+    artifact.manifest.added.push(ArtifactFile {
+        path: "build/addon-alias.node".to_string(),
+        integrity: integrity(b"addon.node"),
+        mode: SYMLINK_MODE,
+        size: 10,
+    });
+    artifact.validate().unwrap();
+
+    artifact.manifest.added[0].mode = 0o744;
     assert!(artifact.validate().is_err());
 }
 
@@ -440,7 +463,10 @@ fn windows_compatibility_uses_kernel_version_floors() {
 #[test]
 fn scopes_name_the_machines_constraints_reach() {
     let tagged = |tags: &[&str]| CompatibilityConstraints::Tagged {
-        tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+        tags: tags
+            .iter()
+            .map(|tag| (*tag).to_string())
+            .collect(),
     };
     let scopes = |tags: &[&str]| match compatibility_scopes(&tagged(tags)) {
         CompatibilityScopes::These(scopes) => scopes,

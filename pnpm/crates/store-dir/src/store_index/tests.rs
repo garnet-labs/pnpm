@@ -1,6 +1,7 @@
 use super::{
-    CafsFileInfo, GET_MANY_CHUNK, PackageFilesIndex, SideEffectsDiff, StoreIndex, StoreIndexError,
-    git_hosted_store_index_key, immutable_sqlite_uri, pick_store_index_key, store_index_key,
+    CafsFileInfo, PackageFilesIndex, SideEffectsDiff, StoreIndex, StoreIndexError,
+    git_hosted_store_index_key, immutable_sqlite_uri, pick_store_index_key,
+    queries::GET_MANY_CHUNK, store_index_key,
 };
 use crate::StoreDir;
 use pretty_assertions::assert_eq;
@@ -30,7 +31,7 @@ fn immutable_uri_absolutizes_a_relative_path() {
     assert!(uri.ends_with("/relative-store/index.db?immutable=1"), "{uri}");
 }
 
-fn sample_index() -> PackageFilesIndex {
+pub(super) fn sample_index() -> PackageFilesIndex {
     let mut files = HashMap::new();
     files.insert(
         "package.json".to_string(),
@@ -97,7 +98,10 @@ async fn writer_persists_remote_side_effects_and_bounded_quarantine() {
     let dir = tempdir().unwrap();
     let store_dir = StoreDir::new(dir.path());
     let key = store_index_key("sha512-remote", "native-addon@1.0.0");
-    StoreIndex::open(store_dir.root()).unwrap().set(&key, &sample_index()).unwrap();
+    StoreIndex::open(store_dir.root())
+        .unwrap()
+        .set(&key, &sample_index())
+        .unwrap();
 
     let (writer, task) = super::StoreIndexWriter::spawn(&store_dir);
     writer.queue_remote_side_effects(
@@ -119,12 +123,18 @@ async fn writer_persists_remote_side_effects_and_bounded_quarantine() {
     drop(writer);
     task.await.unwrap().unwrap();
 
-    let row = StoreIndex::open(store_dir.root()).unwrap().get(&key).unwrap().unwrap();
+    let row = StoreIndex::open(store_dir.root())
+        .unwrap()
+        .get(&key)
+        .unwrap()
+        .unwrap();
     assert!(row.side_effects.unwrap().contains_key("linux"));
     let quarantine = row.remote_side_effects_quarantine.unwrap();
     assert_eq!(
         quarantine["https://pnpr.example/"],
-        (6..70).map(|index| format!("{index:064}")).collect::<Vec<_>>(),
+        (6..70)
+            .map(|index| format!("{index:064}"))
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -142,16 +152,62 @@ fn set_then_get_round_trips() {
     let original = sample_index();
 
     idx.set(&key, &original).unwrap();
-    let loaded = idx.get(&key).unwrap().expect("row must exist after set");
+    let loaded = idx
+        .get(&key)
+        .unwrap()
+        .expect("row must exist after set");
 
     assert_eq!(loaded, original);
+}
+
+#[test]
+fn readonly_index_reads_wal_commits_and_checkpointed_growth() {
+    let dir = tempdir().unwrap();
+    let writer = StoreIndex::open(dir.path()).unwrap();
+    let initial = sample_index();
+    for i in 0..1000 {
+        writer
+            .set(&format!("pkg-{i:06}"), &initial)
+            .unwrap();
+    }
+    writer.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let reader = StoreIndex::open_readonly(dir.path()).unwrap();
+    assert_eq!(
+        reader
+            .get("pkg-000000")
+            .unwrap()
+            .as_ref(),
+        Some(&initial),
+    );
+
+    let mut added = sample_index();
+    added.files.get_mut("index.js").unwrap().size = 4096;
+    for i in 1000..1100 {
+        writer
+            .set(&format!("pkg-{i:06}"), &added)
+            .unwrap();
+    }
+    assert_eq!(
+        reader
+            .get("pkg-001099")
+            .unwrap()
+            .as_ref(),
+        Some(&added),
+    );
+    writer.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(reader.get("pkg-001099").unwrap(), Some(added));
+    assert_eq!(reader.get("pkg-000000").unwrap(), Some(initial));
 }
 
 #[test]
 fn get_returns_none_for_missing_key() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
-    assert!(idx.get("sha512-never\tnone@0.0.0").unwrap().is_none());
+    assert!(
+        idx.get("sha512-never\tnone@0.0.0")
+            .unwrap()
+            .is_none(),
+    );
     assert!(!idx.contains_key("sha512-never\tnone@0.0.0").unwrap());
 }
 
@@ -166,11 +222,16 @@ fn get_by_pkg_id_escapes_like_metacharacters() {
     idx.set(&store_index_key("sha512-neighbor", wildcard_neighbor_pkg_id), &neighbor_payload)
         .unwrap();
 
-    assert!(idx.get_by_pkg_id(exact_pkg_id).unwrap().is_none());
+    assert!(
+        idx.get_by_pkg_id(exact_pkg_id)
+            .unwrap()
+            .is_none(),
+    );
 
     let mut exact_payload = sample_index();
     exact_payload.algo = "sha512-special".to_string();
-    idx.set(&store_index_key("sha512-exact", exact_pkg_id), &exact_payload).unwrap();
+    idx.set(&store_index_key("sha512-exact", exact_pkg_id), &exact_payload)
+        .unwrap();
 
     assert_eq!(idx.get_by_pkg_id(exact_pkg_id).unwrap(), Some(exact_payload));
 }
@@ -219,7 +280,10 @@ fn open_immutable_handles_a_store_path_containing_a_question_mark() {
     let key = store_index_key("sha512-q", "q-pkg@1.0.0");
     let payload = sample_index();
 
-    StoreIndex::open(&store_dir).unwrap().set(&key, &payload).unwrap();
+    StoreIndex::open(&store_dir)
+        .unwrap()
+        .set(&key, &payload)
+        .unwrap();
 
     let idx = StoreIndex::open_immutable(&store_dir).unwrap();
     assert_eq!(idx.get(&key).unwrap().unwrap(), payload);
@@ -230,7 +294,8 @@ fn index_db_lives_at_store_dir_v11() {
     let root = tempdir().unwrap();
     let store = StoreDir::new(root.path());
     let idx = StoreIndex::open_in(&store).unwrap();
-    idx.set("k\tv", &sample_index()).unwrap();
+    idx.set("k\tv", &sample_index())
+        .unwrap();
     assert!(store.root().join("index.db").exists());
 }
 
@@ -261,7 +326,10 @@ fn get_decodes_msgpackr_records_rows() {
         )
         .unwrap();
 
-    let loaded = idx.get(key).unwrap().expect("row must decode");
+    let loaded = idx
+        .get(key)
+        .unwrap()
+        .expect("row must decode");
     assert_eq!(loaded.algo, "sha512");
     let info = loaded.files.get("package.json").unwrap();
     assert_eq!(info.digest, "abc");
@@ -274,7 +342,8 @@ fn get_decodes_msgpackr_records_rows() {
 fn get_many_returns_empty_for_empty_input() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
-    idx.set(&store_index_key("sha512-a", "x@1.0.0"), &sample_index()).unwrap();
+    idx.set(&store_index_key("sha512-a", "x@1.0.0"), &sample_index())
+        .unwrap();
 
     let out = idx.get_many(&[]).unwrap();
     assert!(out.is_empty());
@@ -299,8 +368,9 @@ fn get_many_all_hit_returns_every_row() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
     let payload = sample_index();
-    let keys: Vec<String> =
-        (0..5).map(|index| store_index_key("sha512-x", &format!("pkg{index}@1.0.0"))).collect();
+    let keys: Vec<String> = (0..5)
+        .map(|index| store_index_key("sha512-x", &format!("pkg{index}@1.0.0")))
+        .collect();
     for key in &keys {
         idx.set(key, &payload).unwrap();
     }
@@ -317,8 +387,9 @@ fn for_each_raw_visits_every_row() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
     let payload = sample_index();
-    let mut keys: Vec<String> =
-        (0..3).map(|index| store_index_key("sha512-x", &format!("pkg{index}@1.0.0"))).collect();
+    let mut keys: Vec<String> = (0..3)
+        .map(|index| store_index_key("sha512-x", &format!("pkg{index}@1.0.0")))
+        .collect();
     for key in &keys {
         idx.set(key, &payload).unwrap();
     }
@@ -341,10 +412,12 @@ fn get_many_mixed_hit_and_miss_returns_only_hits() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
     let payload = sample_index();
-    let hit_keys: Vec<String> =
-        (0..3).map(|index| store_index_key("sha512-h", &format!("hit{index}@1.0.0"))).collect();
-    let miss_keys: Vec<String> =
-        (0..3).map(|index| store_index_key("sha512-m", &format!("miss{index}@1.0.0"))).collect();
+    let hit_keys: Vec<String> = (0..3)
+        .map(|index| store_index_key("sha512-h", &format!("hit{index}@1.0.0")))
+        .collect();
+    let miss_keys: Vec<String> = (0..3)
+        .map(|index| store_index_key("sha512-m", &format!("miss{index}@1.0.0")))
+        .collect();
     for key in &hit_keys {
         idx.set(key, &payload).unwrap();
     }
@@ -367,10 +440,12 @@ fn contains_many_returns_only_present_keys() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
     let payload = sample_index();
-    let hit_keys: Vec<String> =
-        (0..3).map(|index| store_index_key("sha512-h", &format!("hit{index}@1.0.0"))).collect();
-    let miss_keys: Vec<String> =
-        (0..3).map(|index| store_index_key("sha512-m", &format!("miss{index}@1.0.0"))).collect();
+    let hit_keys: Vec<String> = (0..3)
+        .map(|index| store_index_key("sha512-h", &format!("hit{index}@1.0.0")))
+        .collect();
+    let miss_keys: Vec<String> = (0..3)
+        .map(|index| store_index_key("sha512-m", &format!("miss{index}@1.0.0")))
+        .collect();
     for key in &hit_keys {
         idx.set(key, &payload).unwrap();
     }
@@ -392,7 +467,11 @@ fn contains_many_returns_only_present_keys() {
 fn contains_many_handles_empty_input_and_more_keys_than_chunk_size() {
     let dir = tempdir().unwrap();
     let idx = StoreIndex::open(dir.path()).unwrap();
-    assert!(idx.contains_many(&[]).unwrap().is_empty());
+    assert!(
+        idx.contains_many(&[])
+            .unwrap()
+            .is_empty(),
+    );
 
     let payload = sample_index();
     let keys: Vec<String> = (0..(GET_MANY_CHUNK + 7))
@@ -425,7 +504,9 @@ fn get_many_skips_undecodable_rows() {
         )
         .unwrap();
 
-    let out = idx.get_many(&[good_key.clone(), bad_key.clone()]).unwrap();
+    let out = idx
+        .get_many(&[good_key.clone(), bad_key.clone()])
+        .unwrap();
 
     assert_eq!(out.len(), 1);
     assert!(out.contains_key(&good_key));
@@ -443,7 +524,9 @@ fn get_many_handles_more_keys_than_chunk_size() {
     let keys: Vec<String> = (0..total)
         .map(|index| store_index_key("sha512-c", &format!("chunked{index}@1.0.0")))
         .collect();
-    let entries = keys.iter().map(|key| (key.clone(), sample_index()));
+    let entries = keys
+        .iter()
+        .map(|key| (key.clone(), sample_index()));
     idx.set_many(entries).unwrap();
 
     let out = idx.get_many(&keys).unwrap();
@@ -506,4 +589,40 @@ fn open_immutable_reads_wal_db_on_readonly_directory() {
             "immutable open must not create the {sidecar} sidecar",
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn new_index_db_inherits_group_write_and_reopen_keeps_owner_and_mode() {
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
+    let store = tmp.path().join("store");
+    drop(StoreIndex::open(&store).unwrap());
+
+    let db = store.join("index.db");
+    let created = fs::metadata(&db).unwrap();
+    assert_ne!(created.permissions().mode() & 0o020, 0, "new index.db must be group-writable");
+    assert_eq!(created.gid(), fs::metadata(tmp.path()).unwrap().gid());
+    assert_eq!(
+        fs::metadata(&store)
+            .unwrap()
+            .permissions()
+            .mode()
+            & (0o020 | 0o2000),
+        0o020 | 0o2000,
+    );
+
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(&db).unwrap();
+    drop(StoreIndex::open(&store).unwrap());
+    let after = fs::metadata(&db).unwrap();
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.gid(), before.gid());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.permissions().mode() & 0o777, 0o600);
 }

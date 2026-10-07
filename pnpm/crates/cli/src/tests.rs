@@ -1,8 +1,11 @@
-use super::inject_alias_subcommand;
+use super::{inject_alias_subcommand, parse_cli_args, prepare_cli_argv, rayon_pool_size};
 use std::ffi::OsString;
 
 fn argv(parts: &[&str]) -> Vec<OsString> {
-    parts.iter().map(OsString::from).collect()
+    parts
+        .iter()
+        .map(OsString::from)
+        .collect()
 }
 
 #[test]
@@ -25,4 +28,28 @@ fn pnpm_pn_and_pacquet_names_are_left_untouched() {
 fn an_unknown_executable_name_is_left_untouched() {
     let original = argv(&["whatever", "install"]);
     assert_eq!(inject_alias_subcommand(None, original.clone()), original);
+}
+
+fn recursive_from_command_line(parts: &[&str]) -> bool {
+    let (command, argv) = prepare_cli_argv(argv(parts));
+    parse_cli_args(command, argv).expect("argv should parse").workspace.recursive_from_command_line
+}
+
+#[test]
+fn an_explicit_recursive_flag_is_recorded_as_coming_from_the_command_line() {
+    assert!(recursive_from_command_line(&["pnpm", "install", "-r"]));
+    assert!(recursive_from_command_line(&["pnpm", "--recursive", "install"]));
+}
+
+#[test]
+fn a_negated_recursive_flag_is_not_recorded_as_coming_from_the_command_line() {
+    assert!(!recursive_from_command_line(&["pnpm", "install", "-r", "--no-recursive"]));
+    assert!(!recursive_from_command_line(&["pnpm", "install"]));
+}
+
+#[test]
+fn rayon_pool_is_the_scaled_parallelism_between_4_and_16_threads() {
+    let parallelism = [1, 2, 3, 4, 8, 9, 32, 256];
+    assert_eq!(parallelism.map(|cores| rayon_pool_size(cores, 2)), [4, 4, 6, 8, 16, 16, 16, 16]);
+    assert_eq!(parallelism.map(|cores| rayon_pool_size(cores, 1)), [4, 4, 4, 4, 8, 9, 16, 16]);
 }

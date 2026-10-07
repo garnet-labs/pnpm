@@ -30,24 +30,35 @@ fn pkg(
         target: v(target),
         wanted: v(current),
         github_action: false,
-        deprecated: None,
-        homepage: None,
-        workspace: None,
+        metadata: crate::cli_args::outdated::query::OutdatedMetadata {
+            deprecated: None,
+            homepage: None,
+            workspace: None,
+        },
     }
 }
 
 /// The package each selectable row of a group updates, in order.
 fn values(group: &ChoiceGroup) -> Vec<&str> {
-    group.rows.iter().filter_map(|row| row.value.as_deref()).collect()
+    group.rows
+        .iter()
+        .filter_map(|row| row.value.as_deref())
+        .collect()
 }
 
 /// The terminal column each selectable row's `❯` starts at, in order.
 fn arrow_offsets(group: &ChoiceGroup) -> Vec<usize> {
-    group
-        .rows
+    group.rows
         .iter()
         .skip(1)
-        .map(|row| measure_text_width(row.label.split('❯').next().expect("row has an arrow")))
+        .map(|row| {
+            measure_text_width(
+                row.label
+                    .split('❯')
+                    .next()
+                    .expect("row has an arrow"),
+            )
+        })
         .collect()
 }
 
@@ -62,8 +73,10 @@ fn groups_by_dependency_type_in_manifest_order() {
 
     let groups = update_choices(&packages.iter().collect::<Vec<_>>(), false);
 
-    let rendered: Vec<(&str, Vec<&str>)> =
-        groups.iter().map(|group| (group.message.as_str(), values(group))).collect();
+    let rendered: Vec<(&str, Vec<&str>)> = groups
+        .iter()
+        .map(|group| (group.message.as_str(), values(group)))
+        .collect();
     assert_eq!(
         rendered,
         vec![
@@ -133,8 +146,10 @@ fn github_actions_form_their_own_group() {
 
     let groups = update_choices(&packages.iter().collect::<Vec<_>>(), false);
 
-    let rendered: Vec<(&str, Vec<&str>)> =
-        groups.iter().map(|group| (group.message.as_str(), values(group))).collect();
+    let rendered: Vec<(&str, Vec<&str>)> = groups
+        .iter()
+        .map(|group| (group.message.as_str(), values(group)))
+        .collect();
     assert_eq!(
         rendered,
         vec![("devDependencies", vec!["foo"]), ("GitHub Actions", vec!["actions/checkout"])],
@@ -213,8 +228,8 @@ fn columns_line_up_across_groups() {
 #[test]
 fn the_header_row_lines_up_with_its_rows() {
     let mut package = pkg("a", "a", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    package.homepage = Some("https://example.test/".to_string());
-    package.workspace = Some("web".to_string());
+    package.metadata.homepage = Some("https://example.test/".to_string());
+    package.metadata.workspace = Some("web".to_string());
 
     let groups = update_choices(&[&package], true);
 
@@ -238,7 +253,9 @@ fn the_header_row_lines_up_with_its_rows() {
 
 /// The terminal column `text` starts at in `line`.
 fn column_of(line: &str, text: &str) -> usize {
-    let start = line.find(text).unwrap_or_else(|| panic!("{text:?} is missing from {line:?}"));
+    let start = line
+        .find(text)
+        .unwrap_or_else(|| panic!("{text:?} is missing from {line:?}"));
     measure_text_width(&line[..start])
 }
 
@@ -306,7 +323,7 @@ fn two_aliases_of_one_package_are_both_offered() {
 #[test]
 fn control_characters_in_registry_metadata_are_stripped() {
     let mut package = pkg("foo", "foo\u{1b}[31m", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    package.homepage = Some("https://example.test/\u{1b}[2J\nEVIL".to_string());
+    package.metadata.homepage = Some("https://example.test/\u{1b}[2J\nEVIL".to_string());
     let packages = [package];
 
     let groups = update_choices(&packages.iter().collect::<Vec<_>>(), false);
@@ -323,9 +340,9 @@ fn control_characters_in_registry_metadata_are_stripped() {
 #[test]
 fn a_workspace_run_names_the_project_each_row_came_from() {
     let mut in_app = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    in_app.workspace = Some("app".to_string());
+    in_app.metadata.workspace = Some("app".to_string());
     let mut in_lib = pkg("foo", "foo", "1.1.0", "2.0.0", DependencyGroup::Prod);
-    in_lib.workspace = Some("lib".to_string());
+    in_lib.metadata.workspace = Some("lib".to_string());
     let packages = [in_app, in_lib];
 
     let groups = update_choices(&packages.iter().collect::<Vec<_>>(), true);
@@ -340,7 +357,7 @@ fn a_workspace_run_names_the_project_each_row_came_from() {
 #[test]
 fn a_single_project_run_has_no_workspace_column() {
     let mut package = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    package.workspace = Some("solo".to_string());
+    package.metadata.workspace = Some("solo".to_string());
     let packages = [package];
 
     let groups = update_choices(&packages.iter().collect::<Vec<_>>(), false);
@@ -355,9 +372,9 @@ fn a_single_project_run_has_no_workspace_column() {
 #[test]
 fn a_collapsed_row_names_every_project_it_covers() {
     let mut in_web = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    in_web.workspace = Some("web".to_string());
+    in_web.metadata.workspace = Some("web".to_string());
     let mut in_tooling = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    in_tooling.workspace = Some("tooling".to_string());
+    in_tooling.metadata.workspace = Some("tooling".to_string());
     let packages = [in_web, in_tooling];
 
     let groups = update_choices(&packages.iter().collect::<Vec<_>>(), true);
@@ -366,13 +383,72 @@ fn a_collapsed_row_names_every_project_it_covers() {
     assert!(groups[0].rows[1].label.contains("web, tooling"), "{}", groups[0].rows[1].label);
 }
 
+/// A dependency shared by every project of a large workspace would name
+/// all of them, so past a bound the cell names the projects that fit and
+/// counts the rest, keeping the row inside the terminal.
+#[test]
+fn a_row_shared_by_many_projects_counts_the_projects_that_do_not_fit() {
+    let packages: Vec<OutdatedPackage> = (1..=12)
+        .map(|index| {
+            let mut package = pkg("is-odd", "is-odd", "3.0.0", "3.0.1", DependencyGroup::Prod);
+            package.metadata.workspace = Some(format!("example-workspace-package-{index:02}"));
+            package
+        })
+        .collect();
+
+    let groups = update_choices(&packages.iter().collect::<Vec<_>>(), true);
+
+    let row = &groups[0].rows[1].label;
+    assert_eq!(workspace_cell(row), "example-workspace-package-01, +11 more", "{row}");
+}
+
+/// Every project that fits within the bound is named before the rest are
+/// counted.
+#[test]
+fn projects_that_fit_are_named_before_the_rest_are_counted() {
+    let packages: Vec<OutdatedPackage> = ["app", "web", "lib", "docs", "e2e", "tooling", "website"]
+        .into_iter()
+        .map(|workspace| {
+            let mut package = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
+            package.metadata.workspace = Some(workspace.to_string());
+            package
+        })
+        .collect();
+
+    let groups = update_choices(&packages.iter().collect::<Vec<_>>(), true);
+
+    let row = &groups[0].rows[1].label;
+    assert_eq!(workspace_cell(row), "app, web, lib, docs, +3 more", "{row}");
+}
+
+/// A lone project is named in full however long its name is.
+#[test]
+fn a_lone_project_with_a_long_name_is_named_in_full() {
+    let mut package = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
+    package.metadata.workspace = Some("a-project-name-longer-than-the-column".to_string());
+
+    let groups = update_choices(&[&package], true);
+
+    let row = &groups[0].rows[1].label;
+    assert_eq!(workspace_cell(row), "a-project-name-longer-than-the-column", "{row}");
+}
+
+/// The `Workspace` cell of a row without a URL: the text after the
+/// three-space gap that sets the column off.
+fn workspace_cell(label: &str) -> &str {
+    label
+        .rsplit("   ")
+        .next()
+        .unwrap_or_default()
+}
+
 /// A project appearing twice for one dependency is named once.
 #[test]
 fn a_repeated_project_is_named_once() {
     let mut first = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    first.workspace = Some("web".to_string());
+    first.metadata.workspace = Some("web".to_string());
     let mut second = pkg("foo", "foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
-    second.workspace = Some("web".to_string());
+    second.metadata.workspace = Some("web".to_string());
     let packages = [first, second];
 
     let groups = update_choices(&packages.iter().collect::<Vec<_>>(), true);

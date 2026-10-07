@@ -1,9 +1,9 @@
 /**
- * Node API bindings for the pnpm v12 Rust engine (pacquet).
+ * Node.js bindings for the pnpm engine.
  *
- * Shapes intentionally mirror the pnpm v11 TypeScript programmatic API
- * (`@pnpm/installing.deps-installer`, `@pnpm/installing.client`) so that
- * consumers migrating from the TS engine keep their call sites stable.
+ * Shapes mirror the programmatic API of `@pnpm/installing.deps-installer`
+ * and `@pnpm/installing.client`, so call sites written for those packages
+ * carry over.
  */
 
 export interface PackageManifest {
@@ -250,6 +250,14 @@ export interface InstallOptions extends SharedEngineOptions {
    * at all).
    */
   reporter?: ReporterOptions
+  /**
+   * Recorded as the lockfile's `pnpmfileChecksum` for the `readPackageHook`
+   * passed to the same call. Change it whenever the hook's behavior changes.
+   * The lockfile is reused while it stays the same. Without it the engine
+   * cannot tell whether the hook changed, so every install with a hook
+   * resolves again.
+   */
+  readPackageHookChecksum?: string
 }
 
 /** pnpm's `peerDependencyRules`. */
@@ -304,9 +312,7 @@ export interface ReporterOptions {
    * packages-diff summary — an entry is linked when it was symlinked in
    * rather than materialized from the store. A host that links its own
    * runtime into every project silences that noise without silencing the
-   * same packages when they are really installed. The Rust counterpart of
-   * the TypeScript reporter's `filterPkgsDiff` callback, which cannot
-   * cross the addon boundary.
+   * same packages when they are really installed.
    */
   hideLinkedPkgsDiff?: string[]
   /** Verbosity ceiling. Defaults to `'info'`. */
@@ -332,7 +338,7 @@ export interface ReporterOptions {
  * Receives each rendered output chunk instead of the engine writing it to
  * a file descriptor. For a host that has redirected its own output at the
  * JavaScript level — a monkey-patched `process.stdout.write`, a stream
- * that forwards to a remote terminal — where a write from Rust would
+ * that forwards to a remote terminal — where a write from the engine would
  * bypass the redirection. Chunks arrive in order and already carry their
  * newlines and cursor-control sequences; write them verbatim.
  */
@@ -361,6 +367,7 @@ export interface InstallResult {
  * @param readPackageHook a **synchronous** `(manifest, resolvedDir?) => manifest`
  *   transform applied to every resolved dependency manifest during resolution
  *   (the `readPackage` hook). Must return the manifest object, not a promise.
+ *   Pass `options.readPackageHookChecksum` to let installs reuse the lockfile.
  * @param onOutput receives the rendered output of `options.reporter`
  *   instead of the engine writing it to stdout/stderr.
  */
@@ -374,6 +381,11 @@ export function install(
 /**
  * Rebuild dependency build scripts against the already-materialized
  * `node_modules` (frozen path). Takes the same options shape as `install`.
+ * Nothing is resolved, so of the settings the lockfile records only the
+ * patches have to match the options, as in pnpm v11's `rebuild`: a lockfile
+ * resolved with other `readPackage` hooks or overrides is still rebuilt. The
+ * projects' manifests still have to match the lockfile, unless
+ * `ignorePackageManifest` is set.
  * @param selectedNames restrict the rebuild to these package names / build
  *   keys; omit (or pass an empty array) to rebuild every build-needing package.
  */
@@ -605,14 +617,18 @@ export interface DependentsOptions {
   virtualStoreDirMaxLength?: number
   /**
    * `package.json` fields to project onto every package node as
-   * `manifest`. This is what the TypeScript tree-builder's `nameFormatter`
-   * callback is for: the walk is synchronous Rust and cannot call back
-   * into JavaScript, so a host that renames nodes after a manifest field
-   * asks for that field here, writes `displayName` on the returned trees,
-   * and passes them to {@link renderDependents}. Nodes whose manifest is
+   * `manifest`. A host that renames nodes after a manifest field asks for
+   * that field here, writes `displayName` on the returned trees, and
+   * passes them to {@link renderDependents}. Nodes whose manifest is
    * unreadable — and every workspace-project node — carry none.
    */
   manifestFields?: string[]
+  /**
+   * Whether a `devDependencies` entry of the root importer provides a peer to
+   * every importer when a walk that leaves out a group decides which
+   * optional-peer edges to skip. Default `false`.
+   */
+  resolvePeersFromWorkspaceRoot?: boolean
 }
 
 /** One entry of a {@link DependentsTree}'s reverse tree. */
@@ -752,6 +768,12 @@ export interface FilterLockfileOptions {
    * possibly-stale lockfile wants.
    */
   failOnMissingDependencies?: boolean
+  /**
+   * Whether a `devDependencies` entry of the root importer provides a peer to
+   * every importer when the filter decides which optional-peer edges to
+   * skip. Default `false`.
+   */
+  resolvePeersFromWorkspaceRoot?: boolean
 }
 
 /**
@@ -775,5 +797,5 @@ export function filterLockfileByImporters<Lockfile = LockfileFile>(
  */
 export function readModulesManifest(modulesDir: string): Promise<Record<string, unknown> | null>
 
-/** Version of the underlying Rust engine (pacquet). */
+/** Version of the pnpm engine. */
 export function engineVersion(): string

@@ -514,6 +514,12 @@ test('createNpmResolutionVerifier() rejects a registry tarball with no integrity
   expect(result).toMatchObject({ ok: false, code: 'MISSING_TARBALL_INTEGRITY' })
 })
 
+test.each([undefined, null])('createNpmResolutionVerifier() skips an absent resolution for lockfile repair: %s', async (resolution) => {
+  const verifier = createNpmResolutionVerifier(makeVerifierOpts())
+  const result = await verifier.verify(resolution as unknown as Resolution, { name: 'foo', version: '1.0.0' })
+  expect(result).toEqual({ ok: true })
+})
+
 test('createNpmResolutionVerifier() rejects a canonical registry entry stripped down to {}', async () => {
   // A tampered lockfile can delete both the tarball URL and integrity from a canonical
   // registry entry; the URL is reconstructed from name+version, so it must still be rejected.
@@ -534,7 +540,7 @@ test('createNpmResolutionVerifier() treats an empty-string integrity as missing'
 test('createNpmResolutionVerifier() treats a non-string integrity as missing', async () => {
   const verifier = createNpmResolutionVerifier(makeVerifierOpts())
   for (const integrity of [true, [], {}] as unknown[]) {
-    // eslint-disable-next-line no-await-in-loop
+    // eslint-disable-next-line no-await-in-loop -- the cases share one verifier and are checked one by one
     const result = await verifier.verify(
       { integrity, tarball: REGISTRY_TARBALL } as unknown as Resolution,
       { name: 'foo', version: '1.0.0' }
@@ -910,7 +916,7 @@ test('createNpmResolutionVerifier() propagates the registry fetch error instead 
 test('createNpmResolutionVerifier() still flags a version absent from fetched metadata as TARBALL_URL_MISMATCH', async () => {
   // The metadata fetch succeeds but does not list the pinned version. That is a
   // genuine verification failure (not a transport error), so it must stay
-  // TARBALL_URL_MISMATCH — distinct from the new TARBALL_URL_FETCH_FAILED.
+  // TARBALL_URL_MISMATCH — distinct from TARBALL_URL_FETCH_FAILED.
   const meta = {
     name: 'present-pkg',
     'dist-tags': { latest: '1.0.0' },
@@ -934,3 +940,216 @@ test('createNpmResolutionVerifier() still flags a version absent from fetched me
 
   expect(result).toMatchObject({ ok: false, code: 'TARBALL_URL_MISMATCH' })
 })
+
+test('createNpmResolutionVerifier() routes packument fetch to matching configured registry for tarball URL', async () => {
+  const meta = {
+    name: 'unscoped-pkg',
+    'dist-tags': { latest: '1.0.0' },
+    versions: {
+      '1.0.0': {
+        name: 'unscoped-pkg',
+        version: '1.0.0',
+        dist: { tarball: 'https://hosted.example.com/unscoped-pkg/-/unscoped-pkg-1.0.0.tgz', shasum: 'aa' },
+      },
+    },
+    modified: '2020-01-01T00:00:00.000Z',
+  }
+  const pool = getMockAgent().get('https://hosted.example.com')
+  pool.intercept({ path: '/unscoped-pkg', method: 'GET' }).reply(200, meta).persist()
+
+  const verifier = createNpmResolutionVerifier(makeVerifierOpts({
+    registriesByScope: {
+      default: 'https://nonexistent.example.invalid/',
+      '@scoped': 'https://scoped.example.invalid/',
+      hosted: 'https://hosted.example.com/',
+    },
+  }))
+  const result = await verifier.verify(
+    {
+      integrity: 'sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+      tarball: 'https://hosted.example.com/unscoped-pkg/-/unscoped-pkg-1.0.0.tgz',
+    } as unknown as Resolution,
+    { name: 'unscoped-pkg', version: '1.0.0' }
+  )
+
+  expect(result).toMatchObject({ ok: true })
+})
+
+test('createNpmResolutionVerifier() queries private scoped registry and rejects mismatched default registry tarball', async () => {
+  const meta = {
+    name: '@private/pkg',
+    'dist-tags': { latest: '1.0.0' },
+    versions: {
+      '1.0.0': {
+        name: '@private/pkg',
+        version: '1.0.0',
+        dist: { tarball: 'https://private.example.com/@private/pkg/-/pkg-1.0.0.tgz', shasum: 'aa' },
+      },
+    },
+    modified: '2020-01-01T00:00:00.000Z',
+  }
+  const slash = '%2F'
+  const pool = getMockAgent().get('https://private.example.com')
+  pool.intercept({ path: `/@private${slash}pkg`, method: 'GET' }).reply(200, meta).persist()
+
+  const verifier = createNpmResolutionVerifier(makeVerifierOpts({
+    registriesByScope: {
+      default: 'https://public.example.com/',
+      '@private': 'https://private.example.com/',
+    },
+  }))
+  const result = await verifier.verify(
+    {
+      integrity: 'sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+      tarball: 'https://public.example.com/@private/pkg/-/pkg-1.0.0.tgz',
+    } as unknown as Resolution,
+    { name: '@private/pkg', version: '1.0.0' }
+  )
+
+  expect(result).toMatchObject({ ok: false, code: 'TARBALL_URL_MISMATCH' })
+})
+
+test('createNpmResolutionVerifier() keeps a scope-routed package on its registry when the tarball points at another scope\'s registry', async () => {
+  const metaOn = (registry: string) => ({
+    name: '@private/pkg',
+    'dist-tags': { latest: '1.0.0' },
+    versions: {
+      '1.0.0': {
+        name: '@private/pkg',
+        version: '1.0.0',
+        dist: { tarball: `${registry}@private/pkg/-/pkg-1.0.0.tgz`, shasum: 'aa' },
+      },
+    },
+    modified: '2020-01-01T00:00:00.000Z',
+  })
+  const slash = '%2F'
+  getMockAgent().get('https://private.example.com')
+    .intercept({ path: `/@private${slash}pkg`, method: 'GET' }).reply(200, metaOn('https://private.example.com/')).persist()
+  getMockAgent().get('https://proxy.example.com')
+    .intercept({ path: `/@private${slash}pkg`, method: 'GET' }).reply(200, metaOn('https://proxy.example.com/')).persist()
+
+  const verifier = createNpmResolutionVerifier(makeVerifierOpts({
+    registriesByScope: {
+      default: 'https://public.example.com/',
+      '@private': 'https://private.example.com/',
+      '@other': 'https://proxy.example.com/',
+    },
+  }))
+  const result = await verifier.verify(
+    {
+      integrity: 'sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+      tarball: 'https://proxy.example.com/@private/pkg/-/pkg-1.0.0.tgz',
+    } as unknown as Resolution,
+    { name: '@private/pkg', version: '1.0.0' }
+  )
+
+  expect(result).toMatchObject({ ok: false, code: 'TARBALL_URL_MISMATCH' })
+})
+
+test('createNpmResolutionVerifier() routes to more specific scoped registry when a broad named registry contains it', async () => {
+  const meta = {
+    name: '@corp/pkg',
+    'dist-tags': { latest: '1.0.0' },
+    versions: {
+      '1.0.0': {
+        name: '@corp/pkg',
+        version: '1.0.0',
+        dist: { tarball: 'https://registry.example.com/npm/corp/@corp/pkg/-/pkg-1.0.0.tgz', shasum: 'aa' },
+      },
+    },
+    modified: '2020-01-01T00:00:00.000Z',
+  }
+  const slash = '%2F'
+  const pool = getMockAgent().get('https://registry.example.com')
+  pool.intercept({ path: `/npm/corp/@corp${slash}pkg`, method: 'GET' }).reply(200, meta).persist()
+
+  const verifier = createNpmResolutionVerifier(makeVerifierOpts({
+    registriesByScope: {
+      default: 'https://public.example.com/',
+      broad: 'https://registry.example.com/npm/',
+      '@corp': 'https://registry.example.com/npm/corp/',
+    },
+  }))
+  const result = await verifier.verify(
+    {
+      integrity: 'sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+      tarball: 'https://registry.example.com/npm/corp/@corp/pkg/-/pkg-1.0.0.tgz',
+    } as unknown as Resolution,
+    { name: '@corp/pkg', version: '1.0.0' }
+  )
+
+  expect(result).toMatchObject({ ok: true })
+})
+
+test('createNpmResolutionVerifier() inspects and verifies inner resolutions in variations wrapper', async () => {
+  const meta = {
+    name: 'var-pkg',
+    'dist-tags': { latest: '1.0.0' },
+    versions: {
+      '1.0.0': {
+        name: 'var-pkg',
+        version: '1.0.0',
+        dist: { tarball: 'https://registry.npmjs.org/var-pkg/-/var-pkg-1.0.0.tgz', shasum: 'aa' },
+      },
+    },
+    modified: '2020-01-01T00:00:00.000Z',
+  }
+  const pool = getMockAgent().get('https://registry.npmjs.org')
+  pool.intercept({ path: '/var-pkg', method: 'GET' }).reply(200, meta).persist()
+
+  const verifier = createNpmResolutionVerifier(makeVerifierOpts())
+
+  // Matching inner resolution passes
+  const validResult = await verifier.verify(
+    {
+      type: 'variations',
+      variants: [
+        {
+          targets: [{ os: 'linux', cpu: 'x64' }],
+          resolution: {
+            integrity: FAKE_INTEGRITY,
+            tarball: 'https://registry.npmjs.org/var-pkg/-/var-pkg-1.0.0.tgz',
+          },
+        },
+      ],
+    } as unknown as Resolution,
+    { name: 'var-pkg', version: '1.0.0' }
+  )
+  expect(validResult).toMatchObject({ ok: true })
+
+  // Mismatched inner tarball URL is rejected
+  const mismatchedResult = await verifier.verify(
+    {
+      type: 'variations',
+      variants: [
+        {
+          targets: [{ os: 'linux', cpu: 'x64' }],
+          resolution: {
+            integrity: FAKE_INTEGRITY,
+            tarball: 'https://attacker.example/var-pkg-1.0.0.tgz',
+          },
+        },
+      ],
+    } as unknown as Resolution,
+    { name: 'var-pkg', version: '1.0.0' }
+  )
+  expect(mismatchedResult).toMatchObject({ ok: false, code: 'TARBALL_URL_MISMATCH' })
+
+  // Missing integrity in variant is rejected
+  const missingIntegrityResult = await verifier.verify(
+    {
+      type: 'variations',
+      variants: [
+        {
+          targets: [{ os: 'linux', cpu: 'x64' }],
+          resolution: {
+            tarball: 'https://registry.npmjs.org/var-pkg/-/var-pkg-1.0.0.tgz',
+          },
+        },
+      ],
+    } as unknown as Resolution,
+    { name: 'var-pkg', version: '1.0.0' }
+  )
+  expect(missingIntegrityResult).toMatchObject({ ok: false, code: 'MISSING_TARBALL_INTEGRITY' })
+})
+

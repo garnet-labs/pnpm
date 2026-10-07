@@ -16,15 +16,17 @@ use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_config::EnvVarOs;
 use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "wasi")]
+use std::os::wasi::fs::OpenOptionsExt;
 use std::{
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs,
+    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 
 /// Called before `setup` performs any side effect, so an unusable value
 /// aborts the command instead of half-completing it.
@@ -80,7 +82,10 @@ pub(super) struct BadGhActionsEnvFileValue {
 }
 
 fn validate_gh_actions_env_file_value(name: &'static str, value: &Path) -> miette::Result<()> {
-    if value.to_string_lossy().contains(['\n', '\r', '\0']) {
+    if value
+        .to_string_lossy()
+        .contains(['\n', '\r', '\0'])
+    {
         return Err(BadGhActionsEnvFileValue { name }.into());
     }
     Ok(())
@@ -151,7 +156,7 @@ fn append_line_to_regular_file(path: &Path, line: &str) -> std::io::Result<()> {
 fn open_for_append(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).append(true);
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     options.custom_flags(libc::O_NOFOLLOW);
     options.open(path)
 }

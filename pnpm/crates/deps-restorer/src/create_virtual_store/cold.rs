@@ -1,0 +1,350 @@
+use super::{
+    CreateVirtualStoreError, CreateVirtualStoreStoreContext, LinkPlan, RequiresBuildBySnapshot,
+    WantedEntries,
+    cache_keys::SlotReuse,
+    cas_paths_key, requires_build_from_cas_paths,
+    slot_linking::{COLD_LINK_CHUNK, LinkSlotsParallel, link_cold_chunk},
+};
+use crate::{CasPathsByPkgId, InstallPackageBySnapshot, InstallPackageBySnapshotError};
+use futures_util::{StreamExt, stream::FuturesUnordered};
+use miette::Diagnostic;
+use pnpm_lockfile::{PackageKey, PackageMetadata, PkgName, SnapshotEntry};
+use pnpm_reporter::{
+    LogEvent, LogLevel, Reporter, SkippedOptionalDependencyLog, SkippedOptionalPackage,
+    SkippedOptionalReason,
+};
+use pnpm_store_dir::store_index_key;
+use pnpm_tarball::{PrefetchResult, pending_progress_key};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+pub(super) struct ColdInputs<'i, 'a> {
+    pub(super) wanted: WantedEntries<'a>,
+    pub(super) store: CreateVirtualStoreStoreContext<'i>,
+    pub(super) prefetched: &'i PrefetchResult,
+    pub(super) marker_source: Option<&'i tempfile::NamedTempFile>,
+    pub(super) links: &'i LinkPlan<'a>,
+}
+/// A cold snapshot whose CAS paths are staged and whose slot link was
+/// deferred to [`link_slots_parallel`](crate::create_virtual_store::slot_linking::link_slots_parallel).
+pub(super) struct ColdCapture<'a> {
+    pub(super) snapshot_key: &'a PackageKey,
+    pub(super) snapshot: &'a SnapshotEntry,
+    pub(super) cas_paths: HashMap<String, PathBuf>,
+    pub(super) requires_build: bool,
+    pub(super) source_is_mutable: bool,
+    /// See [`crate::SlotImportSource::source_exists`].
+    pub(super) source_exists: bool,
+    pub(super) force_import: bool,
+}
+pub(super) fn add_cold_cas_paths(map: &mut CasPathsByPkgId, cold_cas_paths: Vec<ColdCapture<'_>>) {
+    map.reserve(cold_cas_paths.len());
+    for ColdCapture {
+        snapshot_key,
+        cas_paths: paths,
+        source_is_mutable,
+        source_exists,
+        ..
+    } in cold_cas_paths
+    {
+        map.entry(cas_paths_key(snapshot_key))
+            .or_insert_with(|| crate::HoistedPackageFiles {
+                cas_paths: Arc::new(paths),
+                source_is_mutable,
+                source_exists,
+            });
+    }
+}
+/// An optional snapshot whose fetch fails is dropped rather than aborting the
+/// install, and reported as a `pnpm:skipped-optional-dependency` with
+/// `reason=fetch_failure` so the user learns the package is missing.
+///
+/// Scoped via [`is_fetch_side_failure`] to the tarball-fetch / git-fetch /
+/// CAS-write variants — the fetch-side surface an optional snapshot is allowed
+/// to swallow. Local materialization (`CreateVirtualDir`) and config-shape
+/// errors (`MissingTarballIntegrity`, `UnsupportedResolution`) abort even for
+/// optional snapshots — they sit outside the swallowed fetch surface.
+pub(super) fn swallow_optional_fetch_failure<Reporter: self::Reporter, Captured>(
+    snapshot_key: &PackageKey,
+    snapshot: &SnapshotEntry,
+    err: InstallPackageBySnapshotError,
+    prefix: &str,
+) -> Result<(Option<PackageKey>, Option<Captured>), CreateVirtualStoreError> {
+    if !snapshot.optional || !is_fetch_side_failure(&err) {
+        return Err(CreateVirtualStoreError::InstallPackageBySnapshot(err));
+    }
+    let details = match err.code() {
+        Some(code) => format!("{code}: {err}"),
+        None => err.to_string(),
+    };
+    Reporter::emit(&LogEvent::SkippedOptionalDependency(SkippedOptionalDependencyLog {
+        level: LogLevel::Debug,
+        details: Some(details),
+        package: SkippedOptionalPackage::Installed {
+            id: snapshot_key.without_peer().to_string(),
+            name: snapshot_key.name.to_string(),
+            version: snapshot_key.suffix.version().to_string(),
+        },
+        parents: None,
+        prefix: prefix.to_string(),
+        reason: SkippedOptionalReason::FetchFailure,
+    }));
+    Ok((Some(snapshot_key.clone()), None))
+}
+/// See [`crate::unlink_fetch_failed_children`]. The hoisted linker has no
+/// slots, and a `frozenStore` store is read-only.
+pub(super) fn unlink_fetch_failed_children(
+    ctx: &crate::InstallContext<'_>,
+    snapshots: &HashMap<PackageKey, SnapshotEntry>,
+    fetch_failed: &HashSet<PackageKey>,
+) -> Result<(), CreateVirtualStoreError> {
+    if fetch_failed.is_empty() || ctx.is_hoisted() || ctx.config.frozen_store {
+        return Ok(());
+    }
+    crate::unlink_fetch_failed_children(snapshots, fetch_failed, ctx.linker.layout)
+        .map_err(|error| {
+            CreateVirtualStoreError::InstallPackageBySnapshot(
+                InstallPackageBySnapshotError::CreateVirtualDir(error),
+            )
+        })
+}
+/// The invariant inputs of one cold-batch drain.
+/// The cold batch: snapshots whose tarball was not already in the store.
+pub(super) struct ColdBatch<'a> {
+    pub(super) cold: &'a [(&'a PackageKey, &'a SnapshotEntry)],
+    pub(super) installer: InstallPackageBySnapshot<'a>,
+    pub(super) reuse: SlotReuse<'a>,
+    /// Kept alive by the caller for the whole batch: every slot that
+    /// needs a build marker hard-links this one file.
+    pub(super) marker_source: Option<&'a tempfile::NamedTempFile>,
+    pub(super) removed_aliases_by_key: &'a HashMap<PackageKey, Vec<PkgName>>,
+    pub(super) link_template: &'a LinkSlotsParallel<'a>,
+    pub(super) shared_packages: Option<&'a HashSet<&'a str>>,
+}
+/// Download every cold snapshot and link each one as it lands.
+///
+/// The downloads run as one cooperative fan-out and the links happen in
+/// chunks between completions — see [`drain_cold_downloads`] for why the
+/// two are interleaved rather than run in sequence.
+pub(super) async fn run_cold_batch<'a, Reporter: self::Reporter>(
+    batch: ColdBatch<'a>,
+    state: &mut ColdBatchState<'_>,
+    cold_cas_paths: &mut Vec<ColdCapture<'a>>,
+) -> Result<(), CreateVirtualStoreError> {
+    if batch.cold.is_empty() {
+        return Ok(());
+    }
+
+    let batch = &batch;
+    let mut downloads: FuturesUnordered<_> = batch.cold
+        .iter()
+        .map(|&(snapshot_key, snapshot)| download_one::<Reporter>(batch, snapshot_key, snapshot))
+        .collect();
+
+    let cold_template = LinkSlotsParallel { batch: "cold", ..*batch.link_template };
+    drain_cold_downloads::<Reporter, _>(
+        &mut downloads,
+        ColdDrain {
+            packages: batch.reuse.packages,
+            marker_path: batch.marker_source.map(tempfile::NamedTempFile::path),
+            removed_aliases_by_key: batch.removed_aliases_by_key,
+            template: &cold_template,
+            shared_packages: batch.shared_packages,
+            is_hoisted: batch.installer.ctx.is_hoisted(),
+        },
+        state,
+        cold_cas_paths,
+    )
+    .await
+}
+/// One cold download. A failed optional snapshot lands in the first
+/// slot instead of failing the batch; the second carries what the link
+/// pass still has to place.
+pub(super) async fn download_one<'a, Reporter: self::Reporter>(
+    batch: &ColdBatch<'a>,
+    snapshot_key: &'a PackageKey,
+    snapshot: &'a SnapshotEntry,
+) -> Result<(Option<PackageKey>, Option<ColdCapture<'a>>), CreateVirtualStoreError> {
+    let metadata_key = snapshot_key.without_peer();
+    let metadata = batch.reuse.packages
+        .get(&metadata_key)
+        .ok_or_else(|| CreateVirtualStoreError::MissingPackageMetadata {
+            snapshot_key: snapshot_key.to_string(),
+            metadata_key: metadata_key.to_string(),
+        })?;
+    let installed = match batch.installer.run::<Reporter>(snapshot_key, metadata, snapshot).await {
+        Ok(installed) => installed,
+        Err(err) => {
+            return drop_failed_download::<Reporter, _>(
+                batch,
+                snapshot_key,
+                snapshot,
+                metadata,
+                err,
+            );
+        }
+    };
+    let crate::InstalledPackage {
+        cas_paths,
+        source_is_mutable,
+        source_exists,
+    } = installed;
+    Ok((
+        None,
+        Some(ColdCapture {
+            snapshot_key,
+            snapshot,
+            requires_build: requires_build_from_cas_paths(&cas_paths),
+            cas_paths,
+            source_is_mutable,
+            source_exists,
+            force_import: batch.reuse.must_replace(snapshot_key),
+        }),
+    ))
+}
+/// A failed download that [`swallow_optional_fetch_failure`] keeps from
+/// failing the batch still settles the progress row its fetch announced.
+fn drop_failed_download<Reporter: self::Reporter, Captured>(
+    batch: &ColdBatch<'_>,
+    snapshot_key: &PackageKey,
+    snapshot: &SnapshotEntry,
+    metadata: &PackageMetadata,
+    err: InstallPackageBySnapshotError,
+) -> Result<(Option<PackageKey>, Option<Captured>), CreateVirtualStoreError> {
+    let failure = swallow_optional_fetch_failure::<Reporter, _>(
+        snapshot_key,
+        snapshot,
+        err,
+        batch.installer.ctx.requester,
+    );
+    if failure.is_ok()
+        && let Some(integrity) = metadata.resolution.integrity()
+    {
+        let key = store_index_key(&integrity.to_string(), &snapshot_key.without_peer().pkg_id());
+        if batch.link_template.progress_reported.contains(&pending_progress_key(&key)) {
+            batch.link_template.progress_reported.insert(key);
+        }
+    }
+    failure
+}
+pub(super) struct ColdDrain<'a> {
+    packages: &'a HashMap<PackageKey, PackageMetadata>,
+    marker_path: Option<&'a Path>,
+    removed_aliases_by_key: &'a HashMap<PackageKey, Vec<PkgName>>,
+    template: &'a LinkSlotsParallel<'a>,
+    shared_packages: Option<&'a HashSet<&'a str>>,
+    is_hoisted: bool,
+}
+/// Consume the cold downloads as they finish, linking each ready chunk.
+///
+/// The downloads deferred their slot links (`defer_link: true`) because a
+/// blocking link inside this single cooperative task would serialize them;
+/// linking chunks between completions keeps that work off the tail without
+/// starving the pipe — a chunk's `block_in_place` pause is milliseconds,
+/// absorbed by kernel socket buffers. GVS peer variants sharing one slot dir
+/// may split across chunks: chunks run sequentially, and a later pass over a
+/// complete slot short-circuits on its completion marker.
+pub(super) async fn drain_cold_downloads<'a, Reporter: self::Reporter, Download>(
+    downloads: &mut FuturesUnordered<Download>,
+    drain: ColdDrain<'_>,
+    state: &mut ColdBatchState<'_>,
+    cold_cas_paths: &mut Vec<ColdCapture<'a>>,
+) -> Result<(), CreateVirtualStoreError>
+where
+    Download: Future<
+        Output = Result<(Option<PackageKey>, Option<ColdCapture<'a>>), CreateVirtualStoreError>,
+    >,
+{
+    let mut ready: Vec<ColdCapture<'a>> = Vec::new();
+    while let Some(outcome) = downloads.next().await {
+        let Some(captured) = record_cold_outcome(outcome?, state, drain.shared_packages) else {
+            continue;
+        };
+        if drain.is_hoisted {
+            cold_cas_paths.push(captured);
+            continue;
+        }
+        ready.push(captured);
+        if ready.len() >= COLD_LINK_CHUNK {
+            let chunk = std::mem::take(&mut ready);
+            link_cold_chunk::<Reporter>(
+                &chunk,
+                drain.packages,
+                drain.marker_path,
+                drain.removed_aliases_by_key,
+                drain.template,
+            )?;
+        }
+    }
+    link_cold_chunk::<Reporter>(
+        &ready,
+        drain.packages,
+        drain.marker_path,
+        drain.removed_aliases_by_key,
+        drain.template,
+    )
+}
+/// The per-snapshot state the cold drain accumulates into.
+pub(super) struct ColdBatchState<'a> {
+    pub(super) fetch_failed: &'a mut HashSet<PackageKey>,
+    pub(super) requires_build_by_snapshot: &'a mut RequiresBuildBySnapshot,
+    pub(super) shared_base_cas_paths: &'a mut crate::shared_side_effects::BaseCasPaths,
+}
+/// Fold one completed download into the batch state, handing back the capture
+/// the link pass still has to place.
+pub(super) fn record_cold_outcome<'a>(
+    outcome: (Option<PackageKey>, Option<ColdCapture<'a>>),
+    state: &mut ColdBatchState<'_>,
+    shared_packages: Option<&HashSet<&str>>,
+) -> Option<ColdCapture<'a>> {
+    let (failure, captured) = outcome;
+    if let Some(key) = failure {
+        state.fetch_failed.insert(key);
+    }
+    let captured = captured?;
+    state.requires_build_by_snapshot.insert(
+        (*captured.snapshot_key).clone(),
+        captured.requires_build,
+    );
+    if shared_packages.is_some_and(|packages| {
+        packages.contains(captured.snapshot_key.name.to_string().as_str())
+    }) {
+        state.shared_base_cas_paths.insert(
+            (*captured.snapshot_key).clone(),
+            captured.cas_paths.clone(),
+        );
+    }
+    Some(captured)
+}
+/// True for the [`InstallPackageBySnapshotError`] variants pacquet
+/// classifies as **fetch-side** — the failures that happen while
+/// fetching a package into the CAS. These are the ones an optional
+/// snapshot is allowed to swallow:
+///
+/// - `DownloadTarball` — HTTP fetch, integrity check, gzip decode,
+///   CAS write.
+/// - `GitFetch` — `git` CLI clone / checkout / preparePackage /
+///   packlist / CAS import.
+/// - `DirectoryFetch` — local-directory walk / manifest read /
+///   packlist for injected workspace deps. Swallowed for optional
+///   snapshots uniformly with the tarball / git paths.
+///
+/// Excluded (propagate even for optional snapshots — they happen
+/// after the fetch, while linking the package into its slot):
+///
+/// - `CreateVirtualDir` — local materialization (clone / hardlink /
+///   copy / symlink from CAS into the slot dir).
+/// - `MissingTarballIntegrity`, `UnsupportedResolution` —
+///   config/shape errors raised before any fetch runs.
+pub(super) fn is_fetch_side_failure(err: &InstallPackageBySnapshotError) -> bool {
+    matches!(
+        err,
+        InstallPackageBySnapshotError::DownloadTarball(_)
+            | InstallPackageBySnapshotError::GitFetch(_)
+            | InstallPackageBySnapshotError::DirectoryFetch(_)
+            | InstallPackageBySnapshotError::CustomFetcher(_),
+    )
+}

@@ -4,10 +4,20 @@ use pipe_trait::Pipe;
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use serde::{Deserialize, Serialize};
 
-use crate::{NetworkError, PackageTag, RegistryError, package_distribution::PackageDistribution};
+use crate::{
+    NetworkError, PackageTag, RegistryError,
+    package_distribution::{AttestationsDist, PackageDistribution},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields mirror npm registry version metadata."
+    )
+)]
 pub struct PackageVersion {
     pub name: String,
     pub version: node_semver::Version,
@@ -72,9 +82,7 @@ pub struct PackageVersion {
     ///
     /// **Wire format:** the field is nominally a string, but the real
     /// npm registry occasionally serves `"deprecated": false` for
-    /// never-deprecated versions. Rust serde is strict, so we route
-    /// through a custom deserializer that normalizes the field to
-    /// `Option<String>`, treating a `false` boolean as absent.
+    /// never-deprecated versions.
     #[serde(
         default,
         deserialize_with = "deserialize_deprecated_field",
@@ -90,6 +98,73 @@ pub struct PackageVersion {
     /// passthrough and tolerates the historical shape variance npm serves.
     #[serde(flatten)]
     pub other: HashMap<String, serde_json::Value>,
+}
+
+/// The fields of a version that the lockfile policy checks read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionPolicyFields {
+    pub dist: PackageDistribution,
+    pub npm_user: Option<NpmUser>,
+}
+
+impl From<&PackageVersion> for VersionPolicyFields {
+    fn from(version: &PackageVersion) -> Self {
+        VersionPolicyFields { dist: version.dist.clone(), npm_user: version.npm_user.clone() }
+    }
+}
+
+/// A [`PackageVersion`] without its catch-all [`PackageVersion::other`]
+/// map, decoded for [`VersionPolicyFields`]. It declares every field
+/// [`PackageVersion`] declares, since a duplicated declared key fails either
+/// way, and gives each one that can fail the same deserializer. A fragment
+/// decodes here exactly when it decodes as a [`PackageVersion`]. Dropping
+/// the `#[serde(flatten)]` catch-all spares buffering and copying every
+/// other key of the manifest.
+#[derive(Deserialize)]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "Mirrors the declared fields of `PackageVersion`; grouping them would need `#[serde(flatten)]`, which buffers the manifest."
+    )
+)]
+pub(crate) struct PolicyFieldsProbe {
+    #[serde(rename = "name")]
+    _name: String,
+    #[serde(rename = "version")]
+    _version: node_semver::Version,
+    dist: PackageDistribution,
+    #[serde(default, rename = "dependencies", deserialize_with = "deserialize_dependency_map")]
+    _dependencies: Option<HashMap<String, String>>,
+    #[serde(default, rename = "devDependencies", deserialize_with = "deserialize_dependency_map")]
+    _dev_dependencies: Option<HashMap<String, String>>,
+    #[serde(default, rename = "peerDependencies", deserialize_with = "deserialize_dependency_map")]
+    _peer_dependencies: Option<HashMap<String, String>>,
+    #[serde(
+        default,
+        rename = "optionalDependencies",
+        deserialize_with = "deserialize_dependency_map"
+    )]
+    _optional_dependencies: Option<HashMap<String, String>>,
+    /// Declared only so a duplicated key fails as it does on
+    /// [`PackageVersion`]; its decoder there never fails, so it is skipped.
+    #[serde(default, rename = "peerDependenciesMeta")]
+    _peer_dependencies_meta: Option<serde::de::IgnoredAny>,
+    #[serde(
+        default,
+        rename = "_npmUser",
+        deserialize_with = "crate::wire_tolerance::deserialize_record_or_absent",
+        alias = "_npm_user"
+    )]
+    npm_user: Option<NpmUser>,
+    #[serde(default, rename = "deprecated", deserialize_with = "deserialize_deprecated_field")]
+    _deprecated: Option<String>,
+}
+
+impl From<PolicyFieldsProbe> for VersionPolicyFields {
+    fn from(probe: PolicyFieldsProbe) -> Self {
+        VersionPolicyFields { dist: probe.dist, npm_user: probe.npm_user }
+    }
 }
 
 impl Eq for PackageVersion {}
@@ -259,6 +334,40 @@ pub struct TrustedPublisher {
     pub oidc_config_id: Option<String>,
 }
 
+/// Fields read while comparing trust evidence across published versions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VersionTrustMetadata {
+    /// npm's publisher and approver markers.
+    #[serde(
+        default,
+        rename = "_npmUser",
+        alias = "_npm_user",
+        deserialize_with = "crate::wire_tolerance::deserialize_record_or_absent"
+    )]
+    pub npm_user: Option<NpmUser>,
+    /// Distribution metadata containing provenance attestations.
+    #[serde(default)]
+    pub dist: Option<VersionTrustDist>,
+}
+
+/// Trust-relevant fields from a version's distribution metadata.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionTrustDist {
+    /// Provenance and its optional registry URL.
+    #[serde(default, deserialize_with = "crate::wire_tolerance::deserialize_record_or_absent")]
+    pub attestations: Option<AttestationsDist>,
+}
+
+impl From<&PackageVersion> for VersionTrustMetadata {
+    fn from(version: &PackageVersion) -> Self {
+        VersionTrustMetadata {
+            npm_user: version.npm_user.clone(),
+            dist: Some(VersionTrustDist { attestations: version.dist.attestations.clone() }),
+        }
+    }
+}
+
 impl PartialEq for PackageVersion {
     fn eq(&self, other: &Self) -> bool {
         self.dist == other.dist
@@ -284,10 +393,12 @@ impl PackageVersion {
         // socket-bound stays effective under concurrent fan-out. See the
         // doc comment on `ThrottledClientGuard`.
         let guard = http_client.acquire_for_url(&url).await;
-        let mut request = guard.get(&url).header(
-            "accept",
-            "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
-        );
+        let mut request = guard
+            .get(&url)
+            .header(
+                "accept",
+                "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
+            );
         if let Some(value) = auth_headers.for_url_with_package(&url, Some(name)) {
             request = request.header("authorization", value);
         }

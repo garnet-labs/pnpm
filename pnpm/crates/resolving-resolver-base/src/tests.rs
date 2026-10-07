@@ -18,8 +18,7 @@ fn fake_resolution() -> LockfileResolution {
 
 /// [`ResolutionVerification::Err`] carries the verifier-supplied code
 /// and reason verbatim; the runner pulls these out to compose the
-/// install-level error breakdown. `code` is a `&'static str` so the
-/// per-policy constants can flow through without allocation.
+/// install-level error breakdown.
 #[test]
 fn resolution_verification_err_round_trip() {
     let verification = ResolutionVerification::Err {
@@ -80,7 +79,10 @@ impl ResolutionVerifier for StubVerifier {
         &self,
         cached_policy: &serde_json::Map<String, serde_json::Value>,
     ) -> bool {
-        cached_policy.get("stub").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        cached_policy
+            .get("stub")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -94,9 +96,11 @@ async fn resolution_verifier_dispatches_through_dyn() {
 
     let name: PkgName = "lodash".parse().unwrap();
     let resolution = fake_resolution();
-    let outcome = verifier
-        .verify(&resolution, VerifyCtx { name: &name, version: "4.17.21", registry_name: None })
-        .await;
+    let outcome = verifier.verify(
+        &resolution,
+        VerifyCtx { name: &name, version: "4.17.21", registry_name: None },
+    )
+    .await;
     assert_eq!(
         outcome,
         ResolutionVerification::Err { code: "STUB", reason: "stub fails by design".to_string() },
@@ -140,15 +144,18 @@ impl Resolver for StubResolver {
             let name_ver: PkgNameVer = "lodash@4.17.21".parse().expect("parse fake PkgNameVer");
             Ok(Some(ResolveResult {
                 id: (&name_ver).into(),
-                name_ver: Some(name_ver),
-                latest: None,
-                published_at: None,
-                manifest: None,
                 resolution: fake_resolution(),
                 resolved_via: "stub".to_string(),
                 normalized_bare_specifier: None,
                 alias: wanted_dependency.alias.clone(),
                 policy_violation: None,
+                package: crate::ResolvedPackageInfo {
+                    name_ver: Some(name_ver),
+                    latest: None,
+                    published_at: None,
+                    manifest: None,
+                    non_deprecated_alternative: None,
+                },
             }))
         })
     }

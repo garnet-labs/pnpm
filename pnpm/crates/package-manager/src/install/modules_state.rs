@@ -1,8 +1,26 @@
-use super::{
-    BTreeMap, Config, HashSet, HoistedDependencies, IncludedDependencies, InstallError,
-    LayoutVersion, Lockfile, Modules, ModulesNodeLinker, NodeLinker, PNPM_VERSION, PackageManifest,
-    Path, VersionPart, write_modules_manifest,
+pub(crate) use integrity::{
+    frozen_tree_intact, hoisted_linker_workspace_links_intact, hoisted_workspace_packages_present,
 };
+
+pub(super) use build_markers::{gvs_build_marker_present, gvs_build_markers_may_require_recovery};
+pub(super) use merge_metadata::{
+    current_contains_dep_path, merge_filtered_modules_metadata, merge_pending_builds,
+};
+
+mod build_markers;
+
+mod merge_metadata;
+
+mod integrity;
+
+use super::{
+    BTreeMap, Config, HoistedDependencies, Host, IncludedDependencies, InstallError, LayoutVersion,
+    Lockfile, Modules, ModulesNodeLinker, NodeLinker, PNPM_VERSION, PackageManifest, Path, PathBuf,
+    write_modules_manifest,
+};
+use pnpm_cmd_shim::bin_dir_is_relocatable;
+use pnpm_package_manifest::{BINDING_GYP, manifest_opts_out_of_gyp_build};
+use rayon::prelude::*;
 
 /// Translate pacquet's [`Config::node_linker`] into the
 /// [`pnpm_modules_yaml::NodeLinker`] enum used on disk. The two
@@ -13,6 +31,7 @@ pub(super) fn map_node_linker(linker: NodeLinker) -> ModulesNodeLinker {
         NodeLinker::Isolated => ModulesNodeLinker::Isolated,
         NodeLinker::Hoisted => ModulesNodeLinker::Hoisted,
         NodeLinker::Pnp => ModulesNodeLinker::Pnp,
+        NodeLinker::Loaded => ModulesNodeLinker::Loaded,
     }
 }
 
@@ -42,230 +61,110 @@ pub(super) fn modules_consistent_with(
     modules.included == included && modules_layout_consistent_with(modules, config, node_linker)
 }
 
-/// The subset of [`modules_consistent_with`] that, when it drifts, requires
-/// **wiping and recreating** `node_modules`. It deliberately excludes
-/// `included`: a `--prod`<->full switch is satisfied by relinking the
-/// newly-selected groups plus the targeted removal of the now-excluded
-/// ones ([`crate::prune_direct_deps_excluded_by_groups`]), not by
-/// deleting the directory. pnpm never purges the root project's
-/// `node_modules` for an included mismatch — its `validateModules` only
-/// does so for non-root importers (the `lockfileDir !== rootDir` check
-/// in `pnpm11/installing/deps-installer/src/install/validateModules.ts`)
-/// — so purging here would destroy the user's own non-pnpm entries (a
-/// vendored directory, stray files) on a routine flag change. The
-/// up-to-date fast path still compares `included` via
-/// [`modules_consistent_with`], so the relink it triggers stays correct.
-/// On-disk probe backing the frozen no-op short-circuit: the
-/// short-circuit skips the materialization walk entirely, so it must
-/// first prove the tree it would skip is still whole — pnpm's headless
-/// path stats every package dir on every run, which is what repairs a
-/// hand-deleted package. One metadata call per snapshot slot plus one
-/// per direct-dep link; any missing entry falls through to the full
-/// frozen path, which re-materializes it (emitting
-/// `pnpm:_broken_node_modules`).
-///
-/// Under a global virtual store the slot paths depend on graph hashes
-/// the short-circuit doesn't compute, and the hoisted linker has no
-/// virtual-store slots; both probe only the importer links.
-pub(super) fn frozen_tree_intact(
-    wanted: &Lockfile,
-    modules: &pnpm_modules_yaml::ModulesLayout,
+/// Whether a tree that moved with its project can be reused at all: only on
+/// unix, where directory links are relative symlinks rather than junctions,
+/// and only for an isolated or hoisted tree outside a global virtual store,
+/// whose links point into a store that registers projects by their path.
+pub(crate) fn tree_may_move(config: &Config, node_linker: NodeLinker) -> bool {
+    cfg!(any(unix, target_os = "wasi"))
+        && !config.enable_global_virtual_store
+        && node_linker != NodeLinker::Pnp
+}
+
+/// Whether a tree that moved with its project keeps working where it is now:
+/// [`tree_may_move`], and every importer, hoist, virtual-store slot and
+/// hoisted-package `.bin` holds only bins that name their paths relative to
+/// themselves, inside [`Config::modules_dir_anchor`].
+pub(crate) fn moved_tree_is_reusable(
     config: &Config,
-    workspace_root: &Path,
     node_linker: NodeLinker,
+    project_manifests: &[(PathBuf, &PackageManifest)],
+    lockfile: &Lockfile,
 ) -> bool {
-    if matches!(node_linker, NodeLinker::Pnp) && !workspace_root.join(crate::PNP_FILENAME).is_file()
-    {
-        return false;
-    }
-    let skipped = crate::SkippedSnapshots::from_strings(&modules.skipped);
-    let probe_slots =
-        !matches!(node_linker, NodeLinker::Hoisted) && !config.enable_global_virtual_store;
-    if probe_slots && let Some(snapshots) = wanted.snapshots.as_ref() {
-        let layout = crate::VirtualStoreLayout::legacy(
-            config.virtual_store_dir.clone(),
-            config.virtual_store_dir_max_length as usize,
-        );
-        let all_slots_present = snapshots.keys().all(|key| {
-            if skipped.contains(key) {
-                return true;
-            }
-            // The name is lockfile-controlled: join it with the same
-            // traversal-rejecting helper the linkers use, and treat a
-            // malformed name as not-intact so the full path's
-            // structural lockfile gate rejects it.
-            let slot_node_modules = layout.slot_dir(key).join("node_modules");
-            match crate::safe_join_modules_dir::safe_join_modules_dir(
-                &slot_node_modules,
-                &key.name.to_string(),
-            ) {
-                Ok(dir) => dir.is_dir(),
-                Err(_) => false,
-            }
-        });
-        if !all_slots_present {
-            return false;
+    let Some(root) = config.modules_dir_anchor() else { return false };
+    tree_may_move(config, node_linker)
+        && importer_bins_are_relocatable(config, project_manifests, root)
+        && match node_linker {
+            NodeLinker::Hoisted => hoisted_bins_are_relocatable(config, root),
+            _ => virtual_store_bins_are_relocatable(config, lockfile, root),
         }
-    }
-    if !config.symlink {
-        return probe_slots;
-    }
-    let groups = crate::prune_direct_deps::selected_groups(modules.included);
-    let modules_dir_name: &std::ffi::OsStr =
-        config.modules_dir.file_name().unwrap_or_else(|| std::ffi::OsStr::new("node_modules"));
-    wanted.importers.iter().all(|(importer_id, snapshot)| {
-        if crate::symlink_direct_dependencies::validate_importer_id(importer_id).is_err() {
-            return true;
-        }
-        let modules_dir =
-            crate::symlink_direct_dependencies::importer_root_dir(workspace_root, importer_id)
-                .join(modules_dir_name);
-        crate::symlink_direct_dependencies::direct_dep_names_for_importer(
-            snapshot,
-            groups.iter().copied(),
-            &skipped,
-            false,
-        )
-        .iter()
-        .all(|name| {
-            match crate::safe_join_modules_dir::safe_join_modules_dir(&modules_dir, name) {
-                // `metadata` follows the link, so a dangling direct-dep
-                // symlink (a wiped GVS store, a hand-deleted target)
-                // reads as broken and falls through to the repairing
-                // full path.
-                Ok(link) => std::fs::metadata(link).is_ok(),
-                // A malformed alias never probes the disk; the full
-                // path rejects it with its own typed error.
-                Err(_) => true,
-            }
-        })
-    })
 }
 
-/// Whether a GVS install can own slots whose interrupted build or patch
-/// application must be recovered from `.pnpm-needs-build`.
-///
-/// The marker is shared store state, so neither optimistic workspace state nor
-/// the frozen importer's symlinks can prove it absent. Only configurations
-/// capable of acting on one need to leave those no-op paths.
-pub(super) fn gvs_build_markers_may_require_recovery(config: &Config) -> bool {
-    config.enable_global_virtual_store
-        && (config.dangerously_allow_all_builds
-            || config.allow_builds.values().any(|allowed| *allowed)
-            || config.patched_dependencies.as_ref().is_some_and(|patches| !patches.is_empty()))
-}
-
-/// Probe the buildable or patched GVS slots this lockfile resolves to.
-/// Markers in sibling hash directories belong to other dependency graphs and
-/// cannot be recovered by materializing this one. The effective Node version
-/// participates only when materialization would run installability checks;
-/// constraint-free materialization keys the layout to the detected host Node.
-pub(super) fn gvs_build_marker_present(
-    wanted: &Lockfile,
+fn importer_bins_are_relocatable(
     config: &Config,
-    lockfile_dir: &Path,
-    effective_node_version: Option<&str>,
+    project_manifests: &[(PathBuf, &PackageManifest)],
+    root: &Path,
 ) -> bool {
-    if !gvs_build_markers_may_require_recovery(config) {
-        return false;
-    }
-    let Ok(policy) = crate::AllowBuildPolicy::from_config(config) else {
-        return true;
-    };
-    let Some(snapshots) = wanted.snapshots.as_ref() else {
-        return false;
-    };
-    let eligible_snapshots = snapshots
-        .keys()
-        .filter(|snapshot_key| {
-            crate::snapshot_has_patch(snapshot_key)
-                || policy.check(&snapshot_key.without_peer().to_string()) == Some(true)
-        })
-        .collect::<Vec<_>>();
-    let mut marker_candidate = false;
-    let mut visited_version_dirs = HashSet::new();
-    for &snapshot_key in &eligible_snapshots {
-        let metadata = wanted
-            .packages
-            .as_ref()
-            .and_then(|packages| packages.get(&snapshot_key.without_peer()));
-        let Some(version_dir) = crate::global_virtual_store_version_dir(
-            &config.global_virtual_store_dir,
-            snapshot_key,
-            metadata,
-        ) else {
-            return true;
-        };
-        if !visited_version_dirs.insert(version_dir.clone()) {
-            continue;
-        }
-        let hash_dirs = match std::fs::read_dir(version_dir) {
-            Ok(hash_dirs) => hash_dirs,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return true,
-        };
-        for hash_dir in hash_dirs {
-            let Ok(hash_dir) = hash_dir else {
-                return true;
-            };
-            let Ok(file_type) = hash_dir.file_type() else {
-                return true;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let Ok(pkg_dir) = crate::safe_join_modules_dir::safe_join_modules_dir(
-                &hash_dir.path().join("node_modules"),
-                &snapshot_key.name.to_string(),
-            ) else {
-                return true;
-            };
-            if pkg_dir.join(crate::NEEDS_BUILD_MARKER).is_file() {
-                marker_candidate = true;
-                break;
-            }
-        }
-        if marker_candidate {
-            break;
-        }
-    }
-    if !marker_candidate {
-        return false;
-    }
-    let effective_node_version = match (&wanted.snapshots, &wanted.packages) {
-        (Some(snapshots), Some(packages))
-            if !config.force
-                && !snapshots.is_empty()
-                && crate::any_installability_constraint(snapshots, packages) =>
-        {
-            effective_node_version
-        }
-        _ => None,
-    };
-    let layout = crate::virtual_store_layout_for_lockfile(
-        config,
-        effective_node_version,
-        wanted.snapshots.as_ref(),
-        wanted.packages.as_ref(),
-        Some(&policy),
-        Some(lockfile_dir),
-    );
-    if crate::validate_virtual_store_slot_containment(wanted.snapshots.as_ref(), &layout).is_err() {
-        return true;
-    }
+    let modules_dir_name: &std::ffi::OsStr = config.modules_dir_name();
+    bin_dir_is_relocatable(&config.modules_dir.join(".bin"), root)
+        && project_manifests
+            .iter()
+            .filter(|(project_dir, _)| project_dir != root)
+            .all(|(project_dir, _)| {
+                bin_dir_is_relocatable(&project_dir.join(modules_dir_name).join(".bin"), root)
+            })
+}
 
-    for snapshot_key in eligible_snapshots {
-        let Ok(pkg_dir) = crate::safe_join_modules_dir::safe_join_modules_dir(
-            &layout.slot_dir(snapshot_key).join("node_modules"),
-            &snapshot_key.name.to_string(),
-        ) else {
-            return true;
-        };
-        if pkg_dir.join(crate::NEEDS_BUILD_MARKER).is_file() {
-            return true;
-        }
-    }
-    false
+/// The bins of the packages hoisted into the virtual store, and each slot's
+/// own.
+fn virtual_store_bins_are_relocatable(config: &Config, lockfile: &Lockfile, root: &Path) -> bool {
+    let layout = crate::VirtualStoreLayout::legacy(
+        config.virtual_store_dir().to_path_buf(),
+        config.virtual_store_dir_max_length as usize,
+    );
+    bin_dir_is_relocatable(&config.install_state_dir.join("node_modules").join(".bin"), root)
+        && lockfile.snapshots
+            .as_ref()
+            .is_none_or(|snapshots| {
+                snapshots
+                    .par_iter()
+                    .all(|(key, _)| {
+                        slot_bins_are_relocatable(
+                            &layout.slot_dir(key).join("node_modules"),
+                            key,
+                            root,
+                        )
+                    })
+            })
+}
+
+/// The `.bin` dirs the hoisted linker writes inside the packages it placed,
+/// enumerated from the `hoistedLocations` the install recorded. A record that
+/// cannot be read, or a location naming a directory outside the tree, refuses
+/// the move.
+fn hoisted_bins_are_relocatable(config: &Config, root: &Path) -> bool {
+    let Ok(Some(modules)) = pnpm_modules_yaml::read_modules_manifest::<Host>(&config.modules_dir)
+    else {
+        return false;
+    };
+    modules.hoisted_locations
+        .iter()
+        .flat_map(BTreeMap::values)
+        .flatten()
+        .all(|location| {
+            let package_dir = root.join(location);
+            pnpm_fs::is_subdir(root, &package_dir)
+                && bin_dir_is_relocatable(&package_dir.join("node_modules").join(".bin"), root)
+        })
+}
+
+/// The `.bin` the install links into the slot's package, and the one next
+/// to the package, which the injected-deps syncer links a package's own
+/// bins into.
+fn slot_bins_are_relocatable(
+    slot_modules_dir: &Path,
+    key: &pnpm_lockfile::PackageKey,
+    root: &Path,
+) -> bool {
+    bin_dir_is_relocatable(&slot_modules_dir.join(".bin"), root)
+        // A malformed lockfile-controlled name fails closed.
+        && crate::safe_join_modules_dir::safe_join_modules_dir(
+            slot_modules_dir,
+            &key.name.to_string(),
+        )
+        .is_ok_and(|package_dir| {
+            bin_dir_is_relocatable(&package_dir.join("node_modules").join(".bin"), root)
+        })
 }
 
 /// The `validateModules` half pacquet enforces: when the mutation is
@@ -301,7 +200,20 @@ pub(super) fn normalized_pattern(pattern: Option<&[String]>) -> &[String] {
     pattern.unwrap_or(&[])
 }
 
-pub(super) fn modules_layout_consistent_with(
+/// The subset of [`modules_consistent_with`] that, when it drifts, requires
+/// **wiping and recreating** `node_modules`. It deliberately excludes
+/// `included`: a `--prod`<->full switch is satisfied by relinking the
+/// newly-selected groups plus the targeted removal of the now-excluded
+/// ones ([`crate::prune_direct_deps_excluded_by_groups`]), not by
+/// deleting the directory. pnpm never purges the root project's
+/// `node_modules` for an included mismatch: its `validateModules` only
+/// does so for non-root importers (the `lockfileDir !== rootDir` check
+/// in `pnpm11/installing/deps-installer/src/install/validateModules.ts`)
+/// so purging here would destroy the user's own non-pnpm entries (a
+/// vendored directory, stray files) on a routine flag change. The
+/// up-to-date fast path still compares `included` via
+/// [`modules_consistent_with`], so the relink it triggers stays correct.
+pub(crate) fn modules_layout_consistent_with(
     modules: &pnpm_modules_yaml::ModulesLayout,
     config: &Config,
     node_linker: NodeLinker,
@@ -315,10 +227,7 @@ pub(super) fn modules_layout_consistent_with(
     // Patterns compare normalized (upstream's `?? []`): `None` and an
     // empty list are the same disabled state, so the pair must not read
     // as layout drift — a purge every install for `hoistPattern: []`
-    // projects, and a spurious `*_DIFF` error for `add` / `remove`. A
-    // `virtualStoreOnly` install records empty patterns deliberately, so
-    // it skips the comparison entirely and lets the follow-up install
-    // complete the linking instead of purging.
+    // projects, and a spurious `*_DIFF` error for `add` / `remove`.
     let hoist_patterns_match = modules.virtual_store_only == Some(true)
         || (normalized_pattern(modules.hoist_pattern.as_deref())
             == normalized_pattern(config.hoist_pattern.as_deref())
@@ -330,7 +239,10 @@ pub(super) fn modules_layout_consistent_with(
         && modules.virtual_store_dir_max_length == config.virtual_store_dir_max_length
         && modules.store_dir == config.store_dir.display().to_string()
         && modules.virtual_store_dir
-            == config.effective_virtual_store_dir().to_string_lossy().as_ref()
+            == config
+                .virtual_store_dir()
+                .to_string_lossy()
+                .as_ref()
 }
 
 /// Whether `.modules.yaml` records any ignored build that the current
@@ -347,7 +259,10 @@ pub(super) fn has_newly_allowed_ignored_builds(
     modules: &pnpm_modules_yaml::ModulesLayout,
     config: &Config,
 ) -> bool {
-    let Some(ignored) = modules.ignored_builds.as_ref().filter(|set| !set.is_empty()) else {
+    let Some(ignored) = modules.ignored_builds
+        .as_ref()
+        .filter(|set| !set.is_empty())
+    else {
         return false;
     };
     // A malformed `allowBuilds` can't be evaluated here; let the full
@@ -356,29 +271,40 @@ pub(super) fn has_newly_allowed_ignored_builds(
     let Ok(policy) = crate::AllowBuildPolicy::from_config(config) else {
         return true;
     };
-    ignored.iter().any(|dep_path| policy.check(dep_path.as_str()) == Some(true))
+    ignored
+        .iter()
+        .any(|dep_path| policy.check(dep_path.as_str()) == Some(true))
 }
 
-/// Whether the current `allowBuilds` policy withdraws an approval that
-/// `.modules.yaml` recorded, leaving the package undecided again.
+/// Whether the `allowBuilds` entries the previous install recorded differ
+/// from the current setting: an entry flipped between `true` and `false`,
+/// or one added or removed. Placeholder entries the approval scaffold
+/// writes carry no decision and are ignored.
 ///
-/// The counterpart to [`has_newly_allowed_ignored_builds`]: a build the
-/// previous install ran is absent from `ignoredBuilds`, so nothing else
-/// on the frozen no-op fast path notices it is no longer approved
-/// (<https://github.com/pnpm/pnpm/issues/11035>).
-///
-/// Only a withdrawal to *undecided* counts. An entry the user flipped to
-/// an explicit `false` is silently skipped rather than reported, so it
-/// leaves the fast path intact — matching `BuildModules`.
-pub(super) fn has_revoked_allowed_builds(
+/// The counterpart to [`has_newly_allowed_ignored_builds`], which sees an
+/// ignored build the current policy allows. This sees every other move in
+/// the approval set, including the two that leave no trace for anything
+/// else on the frozen no-op fast path to notice: an approval withdrawn,
+/// whose package built last time and so is absent from `ignoredBuilds`
+/// (<https://github.com/pnpm/pnpm/issues/11035>), and a decision flipped
+/// between `true` and `false`, which leaves no ignored entry behind.
+pub(super) fn recorded_allow_builds_differ(
     modules: &pnpm_modules_yaml::ModulesLayout,
     config: &Config,
 ) -> bool {
-    let Some(recorded) = modules.allow_builds.as_ref() else { return false };
-    recorded
-        .iter()
-        .filter(|(_, value)| matches!(value, pnpm_modules_yaml::AllowBuildValue::Bool(true)))
-        .any(|(spec, _)| !config.allow_builds.contains_key(spec))
+    let recorded = || {
+        modules.allow_builds
+            .iter()
+            .flatten()
+            .filter_map(|(spec, value)| match value {
+                pnpm_modules_yaml::AllowBuildValue::Bool(decision) => {
+                    Some((spec.as_str(), decision))
+                }
+                pnpm_modules_yaml::AllowBuildValue::String(_) => None,
+            })
+    };
+    recorded().count() != config.allow_builds.len()
+        || recorded().any(|(spec, decision)| config.allow_builds.get(spec) != Some(decision))
 }
 
 /// The sorted `name@version` keys `.modules.yaml` recorded as ignored
@@ -402,7 +328,10 @@ pub(super) fn unapproved_recorded_ignored_builds(
     modules: &pnpm_modules_yaml::ModulesLayout,
     config: &Config,
 ) -> Result<Option<Vec<String>>, pnpm_config::version_policy::VersionPolicyError> {
-    let Some(ignored) = modules.ignored_builds.as_ref().filter(|set| !set.is_empty()) else {
+    let Some(ignored) = modules.ignored_builds
+        .as_ref()
+        .filter(|set| !set.is_empty())
+    else {
         return Ok(None);
     };
     let policy = crate::AllowBuildPolicy::from_config(config)?;
@@ -423,9 +352,7 @@ pub(super) fn unapproved_recorded_ignored_builds(
 /// hoist patterns are `None`, and under `nodeLinker: hoisted` (the
 /// hoisted linker uses `hoisted_locations` instead). Persisting it
 /// lets a subsequent install detect a hoist pattern change and
-/// re-hoist appropriately (the partial-install path tracked at
-/// pnpm/pacquet#433 will consume it; today every install does the
-/// full hoist anyway).
+/// re-hoist appropriately.
 ///
 /// `hoisted_locations` is the per-depPath list of lockfile-relative
 /// directory paths the hoisted linker placed each package at. Empty
@@ -467,7 +394,11 @@ pub(super) fn build_modules_manifest(
         // allows (see [`has_newly_allowed_ignored_builds`]). `None` when
         // empty, matching pnpm's omit-when-empty encoding.
         ignored_builds: (!ignored_builds.is_empty()).then(|| {
-            ignored_builds.iter().cloned().map(pnpm_modules_yaml::DepPath::from).collect()
+            ignored_builds
+                .iter()
+                .cloned()
+                .map(pnpm_modules_yaml::DepPath::from)
+                .collect()
         }),
         hoist_pattern: config.hoist_pattern.clone(),
         hoisted_dependencies,
@@ -497,17 +428,22 @@ pub(super) fn build_modules_manifest(
         // `iter_installability` excludes fetch-failure entries so they
         // don't get persisted across installs — optional fetch failures
         // are silently swallowed.
-        skipped: skipped.iter_installability().map(ToString::to_string).collect(),
+        skipped: skipped
+            .iter_installability()
+            .map(ToString::to_string)
+            .collect(),
         store_dir: config.store_dir.display().to_string(),
-        virtual_store_dir: config.effective_virtual_store_dir().to_string_lossy().into_owned(),
+        virtual_store_dir: config
+            .virtual_store_dir()
+            .to_string_lossy()
+            .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
         // The build-approval set this install ran under. A GVS install
         // hashes engine-specific slots for allowed builders, so the
         // recorded set is what a later install diffs against to decide
         // whether its slots need re-linking.
         allow_builds: Some(
-            config
-                .allow_builds
+            config.allow_builds
                 .iter()
                 .map(|(spec, allowed)| {
                     (spec.clone(), pnpm_modules_yaml::AllowBuildValue::Bool(*allowed))
@@ -552,180 +488,23 @@ where
     write_modules_manifest::<Sys>(modules_dir, modules).map_err(InstallError::WriteModules)
 }
 
-/// Includes the executor's implicit `node-gyp rebuild` fallback when a
-/// project has `binding.gyp` but no explicit preinstall or install script.
+/// Whether the project defines any of `stages`, counting the executor's
+/// implicit `node-gyp rebuild` fallback for `install` (which is skipped
+/// when the project opts out with `gypfile: false`).
 pub(super) fn project_requires_lifecycle_scripts(
     project_dir: &Path,
     manifest: &PackageManifest,
+    stages: &[&str],
 ) -> bool {
-    let has_lifecycle_script = pnpm_executor::PROJECT_LIFECYCLE_STAGES
+    let has_lifecycle_script = stages
         .iter()
         .any(|stage| matches!(manifest.script(stage, true), Ok(Some(_))));
     has_lifecycle_script
-        || (matches!(manifest.script("preinstall", true), Ok(None))
+        || (stages.contains(&"install")
+            && matches!(manifest.script("preinstall", true), Ok(None))
             && matches!(manifest.script("install", true), Ok(None))
-            && project_dir.join("binding.gyp").exists())
-}
-
-/// The `pendingBuilds` list for this install: the builds still owed,
-/// carried-over entries first, then the ones this install deferred.
-///
-/// A build stays owed until something runs it, so a carried-over entry
-/// survives unless its subject left the current lockfile or this run is
-/// the `pnpm rebuild` that discharged it.
-pub(super) fn merge_pending_builds<Deferred>(
-    previous: &[String],
-    deferred: Deferred,
-    current: Option<&Lockfile>,
-    rebuild: Option<&crate::RebuildOptions>,
-    rebuild_build_policy: Option<&crate::AllowBuildPolicy>,
-) -> Vec<String>
-where
-    Deferred: IntoIterator<Item = String>,
-{
-    // An importer id and a dep path are both plain strings on disk, so
-    // the current lockfile's `importers` — not the shape of the string —
-    // decides which one an entry is.
-    //
-    // Only dependencies are settled here: the build phase has already
-    // run by the time this file is written, while a project's scripts
-    // run after it. `drain_settled_projects` discharges those once they
-    // have actually succeeded. A dependency is settled only when the
-    // rebuild both selected it and was allowed to build it — a selected
-    // package the policy still blocks stays owed, matching pnpm's "drop
-    // only what was actually rebuilt".
-    let settled = |entry: &str| {
-        let (Some(rebuild), Some(policy)) = (rebuild, rebuild_build_policy) else { return false };
-        !current.is_some_and(|current| current.importers.contains_key(entry))
-            && rebuild.settles_dependency(entry)
-            && policy.check(pnpm_deps_path::remove_suffix(entry)) == Some(true)
-    };
-    let retained = previous.iter().filter(|entry| {
-        current.is_some_and(|current| current_contains_dep_path(current, entry)) && !settled(entry)
-    });
-    let mut seen = HashSet::new();
-    retained.cloned().chain(deferred).filter(|entry| seen.insert(entry.clone())).collect()
-}
-
-pub(super) fn merge_filtered_modules_metadata(
-    next: &mut Modules,
-    previous: &Modules,
-    current: &Lockfile,
-    selected: &Lockfile,
-) {
-    for (dep_path, aliases) in &previous.hoisted_dependencies {
-        if !retained_only_dep_path(current, selected, dep_path) {
-            continue;
-        }
-        let retained_aliases = next.hoisted_dependencies.entry(dep_path.clone()).or_default();
-        for (alias, kind) in aliases {
-            retained_aliases.entry(alias.clone()).or_insert(*kind);
-        }
-    }
-    if let Some(previous_locations) = previous.hoisted_locations.as_ref() {
-        for (dep_path, locations) in previous_locations {
-            if !retained_only_dep_path(current, selected, dep_path) {
-                continue;
-            }
-            let retained_locations = next.hoisted_locations.get_or_insert_default();
-            let retained = retained_locations.entry(dep_path.clone()).or_default();
-            for location in locations {
-                if !retained.contains(location) {
-                    retained.push(location.clone());
-                }
-            }
-        }
-    }
-    let new_pending_builds = std::mem::take(&mut next.pending_builds);
-    for dep_path in &previous.pending_builds {
-        if retained_only_dep_path(current, selected, dep_path)
-            && !next.pending_builds.contains(dep_path)
-        {
-            next.pending_builds.push(dep_path.clone());
-        }
-    }
-    for dep_path in new_pending_builds {
-        if !next.pending_builds.contains(&dep_path) {
-            next.pending_builds.push(dep_path);
-        }
-    }
-    let new_ignored_builds = next.ignored_builds.take();
-    if let Some(previous_ignored) = previous.ignored_builds.as_ref() {
-        for dep_path in previous_ignored {
-            if retained_only_dep_path(current, selected, dep_path.as_str()) {
-                let retained_ignored = next.ignored_builds.get_or_insert_default();
-                retained_ignored.insert(dep_path.clone());
-            }
-        }
-    }
-    if let Some(new_ignored_builds) = new_ignored_builds
-        && !new_ignored_builds.is_empty()
-    {
-        next.ignored_builds.get_or_insert_default().extend(new_ignored_builds);
-    }
-    let new_skipped = std::mem::take(&mut next.skipped);
-    for dep_path in &previous.skipped {
-        if retained_only_dep_path(current, selected, dep_path) && !next.skipped.contains(dep_path) {
-            next.skipped.push(dep_path.clone());
-        }
-    }
-    for dep_path in new_skipped {
-        if !next.skipped.contains(&dep_path) {
-            next.skipped.push(dep_path);
-        }
-    }
-    // A source the selected install re-materialized has its targets
-    // recomputed in `next`, so the previous file's targets for it are
-    // stale — a bumped injected dep moves to a new virtual-store slot and
-    // the old one is gone. Only sources no selected importer touched carry
-    // their previous targets forward.
-    let current_injected_sources = injected_source_paths(current);
-    let selected_injected_sources = injected_source_paths(selected);
-    if let Some(previous_injected) = previous.injected_deps.as_ref() {
-        for (source, targets) in previous_injected {
-            if current_injected_sources.contains(source)
-                && !selected_injected_sources.contains(source)
-            {
-                let retained_injected = next.injected_deps.get_or_insert_default();
-                retained_injected.entry(source.clone()).or_insert_with(|| targets.clone());
-            }
-        }
-    }
-}
-
-pub(super) fn retained_only_dep_path(
-    current: &Lockfile,
-    selected: &Lockfile,
-    dep_path: &str,
-) -> bool {
-    current_contains_dep_path(current, dep_path) && !current_contains_dep_path(selected, dep_path)
-}
-
-pub(super) fn injected_source_paths(lockfile: &Lockfile) -> HashSet<String> {
-    lockfile
-        .snapshots
-        .iter()
-        .flat_map(|snapshots| snapshots.keys())
-        .chain(lockfile.packages.iter().flat_map(|packages| packages.keys()))
-        .filter_map(|key| match key.suffix.version() {
-            VersionPart::File(path) => Some(path.strip_prefix("./").unwrap_or(path).to_string()),
-            VersionPart::Semver(_)
-            | VersionPart::NonSemver(_)
-            | VersionPart::RegistryQualified { .. } => None,
-        })
-        .collect()
-}
-
-pub(super) fn current_contains_dep_path(current: &Lockfile, dep_path: &str) -> bool {
-    if current.importers.contains_key(dep_path) {
-        return true;
-    }
-    let Ok(key) = dep_path.parse::<pnpm_lockfile::PackageKey>() else { return false };
-    current.snapshots.as_ref().is_some_and(|snapshots| snapshots.contains_key(&key))
-        || current
-            .packages
-            .as_ref()
-            .is_some_and(|packages| packages.contains_key(&key.without_peer()))
+            && !manifest_opts_out_of_gyp_build(manifest.value())
+            && project_dir.join(BINDING_GYP).exists())
 }
 
 /// Read a string field off a project manifest, returning `None` when
@@ -733,5 +512,12 @@ pub(super) fn current_contains_dep_path(current: &Lockfile, dep_path: &str) -> b
 /// shape — `name`/`version` are advisory metadata in this context, so
 /// pacquet matches by silently dropping non-string values.
 pub(super) fn manifest_string_field(manifest: &PackageManifest, key: &str) -> Option<String> {
-    manifest.value().get(key).and_then(|v| v.as_str()).map(ToString::to_string)
+    manifest
+        .value()
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,15 +1,13 @@
 //! The resolver-base seam. Two seams live here:
 //!
 //! 1. **Verifier seam** — [`ResolutionVerifier`] and friends, used by
-//!    every resolver-side policy check (today: the npm
-//!    `minimumReleaseAge` / `trustPolicy` runner). Pacquet's
+//!    every resolver-side policy check. Pacquet's
 //!    lockfile-verification runner depends on the trait without pulling
 //!    in any specific resolver.
 //!
 //! 2. **Dispatcher seam** — [`WantedDependency`], [`ResolveOptions`],
 //!    [`ResolveResult`], the [`Resolver`] trait, and the latest-version
-//!    companion. Future per-protocol resolvers (npm, git, tarball,
-//!    local, jsr, runtimes, named-registry, workspace) implement
+//!    companion. Per-protocol resolvers implement
 //!    [`Resolver`]; the default-resolver dispatcher composes them into
 //!    the chain.
 //!
@@ -17,33 +15,37 @@
 //! (a verifier needs [`pnpm_lockfile::LockfileResolution`]; a
 //! resolver result *also* carries one).
 
+pub use errors::{
+    GitResolveError, NoMatchingVersionError, RegistryResponseError, RegistryResponseErrorOptions,
+};
+pub use peer_range::{get_peer_version_range, is_acceptable_peer_spec, is_valid_peer_range};
+pub use pnpm_config::LinkWorkspacePackages;
+pub use publish_time::parse_packument_timestamp;
+pub use resolve::{
+    CurrentPkg, DIRECT_DEP_SELECTOR_WEIGHT, DependencyManifest, EXISTING_VERSION_SELECTOR_WEIGHT,
+    GuardExhaustionPolicy, LatestInfo, LatestQuery, NonDeprecatedAlternative, PackageVersionGuard,
+    PackageVersionGuardDecision, PackageVersionGuardError, PackageVersionGuardFuture,
+    PkgResolutionId, PreferredVersions, PreferredVersionsOverlay, ResolutionPolicyOptions,
+    ResolutionRefreshOptions, ResolveError, ResolveFuture, ResolveLatestFuture, ResolveOptions,
+    ResolveResult, ResolvedPackageInfo, Resolver, ResolverProjectOptions, ResolverSpecifierOptions,
+    SharedDependencyManifest, UpdateBehavior, VersionSelectionOptions, VersionSelectorEntry,
+    VersionSelectorType, VersionSelectorWithWeight, VersionSelectors, WantedDependency,
+    WorkspacePackage, WorkspacePackages, WorkspacePackagesByVersion, resolve_package_version,
+};
+pub use semver_range::{ANY_VERSION_RANGE, is_any_version_range, is_valid_semver_range};
+pub use unsupported_protocol::UnsupportedProtocolError;
+pub use verifier::{
+    PlannedCanonicalFetches, ResolutionPolicyViolation, ResolutionVerification, ResolutionVerifier,
+    VerifyCtx, VerifyFuture,
+};
+
 mod errors;
 mod peer_range;
 mod publish_time;
 mod resolve;
 mod semver_range;
+mod unsupported_protocol;
 mod verifier;
-
-pub use errors::{
-    GitResolveError, NoMatchingVersionError, RegistryResponseError, RegistryResponseErrorOptions,
-};
-pub use peer_range::{get_peer_version_range, is_acceptable_peer_spec, is_valid_peer_range};
-pub use publish_time::parse_packument_timestamp;
-pub use resolve::{
-    CurrentPkg, DIRECT_DEP_SELECTOR_WEIGHT, DependencyManifest, EXISTING_VERSION_SELECTOR_WEIGHT,
-    GuardExhaustionPolicy, LatestInfo, LatestQuery, PackageVersionGuard,
-    PackageVersionGuardDecision, PackageVersionGuardError, PackageVersionGuardFuture,
-    PkgResolutionId, PreferredVersions, PreferredVersionsOverlay, ResolveError, ResolveFuture,
-    ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver, SharedDependencyManifest,
-    UpdateBehavior, VersionSelectorEntry, VersionSelectorType, VersionSelectorWithWeight,
-    VersionSelectors, WantedDependency, WorkspacePackage, WorkspacePackages,
-    WorkspacePackagesByVersion,
-};
-pub use semver_range::{ANY_VERSION_RANGE, is_any_version_range, is_valid_semver_range};
-pub use verifier::{
-    PlannedCanonicalFetches, ResolutionPolicyViolation, ResolutionVerification, ResolutionVerifier,
-    VerifyCtx, VerifyFuture,
-};
 
 #[cfg(test)]
 mod tests;

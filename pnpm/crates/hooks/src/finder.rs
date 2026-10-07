@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -37,20 +38,50 @@ pub fn load_pnpmfile(root: &Path) -> Option<Arc<dyn PnpmfileHooks>> {
 /// own and stays out of `pnpmfileChecksum`, so nothing that trusts the checksum
 /// may treat it as accounted for — the same split pnpm's `requireHooks` makes
 /// with `includeInChecksum: false`.
+///
+/// The plugins among `config_dependencies` load between the two, and count
+/// toward the checksum like the project's own pnpmfile.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PnpmfileSelection<'a> {
     pub configured: Option<&'a [PathBuf]>,
     pub global: Option<&'a Path>,
+    pub config_dependencies: Option<&'a dyn ConfigDependencyNames>,
 }
 
+/// The names a project declares under `configDependencies`, whatever each
+/// entry records beside its name.
+pub trait ConfigDependencyNames: std::fmt::Debug + Sync {
+    fn config_dependency_names(&self) -> Box<dyn Iterator<Item = &str> + '_>;
+}
+
+impl<Value: std::fmt::Debug + Sync> ConfigDependencyNames for BTreeMap<String, Value> {
+    fn config_dependency_names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.keys().map(String::as_str))
+    }
+}
+
+/// The pnpmfiles `selection` names under `root`, in the order their hooks
+/// run: the global pnpmfile, the pnpmfiles of config-dependency plugins
+/// installed under `root`, then the project's own.
 #[must_use]
 pub fn find_pnpmfiles(root: &Path, selection: PnpmfileSelection<'_>) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = selection.global.map(Path::to_path_buf).into_iter().collect();
+    let mut paths: Vec<PathBuf> = selection.global
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    let plugins = selection.config_dependencies
+        .map(|dependencies| {
+            calc_pnpmfile_paths_of_plugin_deps(
+                &root.join("node_modules").join(".pnpm-config"),
+                dependencies.config_dependency_names(),
+            )
+        })
+        .unwrap_or_default();
     let project = match selection.configured {
         Some(configured) => configured.to_vec(),
         None => find_pnpmfile(root).into_iter().collect(),
     };
-    for path in project {
+    for path in plugins.into_iter().chain(project) {
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -76,10 +107,14 @@ pub fn validate_configured_pnpmfiles(
 ) -> Result<(), MissingPnpmfileError> {
     // Discovery is the only source that may come back empty without complaint,
     // so both explicitly named sources are checked and the default is not.
-    let mut named = selection
-        .global
+    let mut named = selection.global
         .into_iter()
-        .chain(selection.configured.unwrap_or(&[]).iter().map(PathBuf::as_path));
+        .chain(
+            selection.configured
+                .unwrap_or(&[])
+                .iter()
+                .map(PathBuf::as_path),
+        );
     match named.find(|path| !pnpmfile_exists(path)) {
         Some(missing) => Err(MissingPnpmfileError { path: missing.to_path_buf() }),
         None => Ok(()),
@@ -92,12 +127,12 @@ pub fn validate_configured_pnpmfiles(
 /// pnpmfile itself requires a missing module, say — is an execution failure and
 /// must keep reporting as one. Hence a bare existence test rather than
 /// [`Path::is_file`], and the `.cjs` suffix pnpm appends to a path that names
-/// neither module extension itself.
+/// none of the supported module extensions itself.
 fn pnpmfile_exists(path: &Path) -> bool {
     let names_a_module = path
         .extension()
         .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|extension| matches!(extension, "cjs" | "mjs"));
+        .is_some_and(|extension| matches!(extension, "cjs" | "js" | "mjs"));
     if names_a_module {
         return path.exists();
     }
@@ -115,7 +150,10 @@ pub fn load_pnpmfiles(
     let paths = find_pnpmfiles(root, selection);
     validate_configured_pnpmfiles(selection)?;
     let checksum_skips = usize::from(selection.global.is_some());
-    let hooks: Vec<_> = paths.into_iter().map(load_pnpmfile_at).collect();
+    let hooks: Vec<_> = paths
+        .into_iter()
+        .map(load_pnpmfile_at)
+        .collect();
     Ok(match (hooks.len(), checksum_skips) {
         (0, _) => None,
         // A lone project pnpmfile answers for its own checksum. Anything else
@@ -174,6 +212,45 @@ impl PnpmfileHooks for CombinedPnpmfileHooks {
             }
         }
         true
+    }
+
+    async fn has_read_package(&self) -> Result<bool, HookError> {
+        for hook in &self.hooks {
+            if hook.has_read_package().await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn has_after_all_resolved(&self) -> Result<bool, HookError> {
+        for hook in &self.hooks {
+            if hook.has_after_all_resolved().await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn has_pre_resolution(&self) -> Result<bool, HookError> {
+        for hook in &self.hooks {
+            if hook.has_pre_resolution().await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn untracked_read_package_hook(&self) -> Result<Option<bool>, HookError> {
+        if self.checksum_skips == 0 {
+            return Ok(None);
+        }
+        for hook in self.hooks.iter().take(self.checksum_skips) {
+            if hook.has_read_package().await? {
+                return Ok(Some(true));
+            }
+        }
+        Ok(Some(false))
     }
 
     async fn calculate_pnpmfile_checksum(&self) -> Option<String> {
@@ -262,8 +339,10 @@ pub fn calc_pnpmfile_paths_of_plugin_deps<'a>(
     config_modules_dir: &Path,
     config_dep_names: impl IntoIterator<Item = &'a str>,
 ) -> Vec<PathBuf> {
-    let mut names: Vec<&str> =
-        config_dep_names.into_iter().filter(|name| is_plugin_name(name)).collect();
+    let mut names: Vec<&str> = config_dep_names
+        .into_iter()
+        .filter(|name| is_plugin_name(name))
+        .collect();
     names.sort_unstable();
     names
         .into_iter()

@@ -19,6 +19,7 @@ use crate::{
     create_git_hosted_pkg_id::create_git_hosted_pkg_id,
     hosted_git::HostedOpts,
     parse_bare_specifier::{HostedPackageSpec, parse_bare_specifier},
+    pinned_remote::pinned_git_config,
     resolve_ref::{GitCommandRunner, GitResolveRefError, resolve_ref},
 };
 
@@ -64,11 +65,10 @@ pub trait GitProbe: Send + Sync {
 ///
 /// Either way this stops at the manifest: `prepare` / `prepublish` and
 /// packlist filtering stay in the install pass, so no package script
-/// runs during resolution. The install pass re-fetches to run them —
-/// unlike a registry tarball, a git-hosted one can't hand its
-/// extraction over through `MemCache` (only `Registry` resolutions read
-/// it) — so a git dep costs one extra fetch per install.
+/// runs during resolution. Plain Git resolutions share their source checkout
+/// with the install pass through the install-scoped source cache.
 pub struct GitFetchContext {
+    pub source_cache: Arc<pnpm_git_fetcher::GitSourceCache>,
     pub http_client: Arc<ThrottledClient>,
     pub store_dir: &'static StoreDir,
     pub store_index_writer: Option<Arc<StoreIndexWriter>>,
@@ -141,13 +141,18 @@ impl<Probe: GitProbe + 'static, Runner: GitCommandRunner + 'static> GitResolver<
         let Some(bare) = wanted_dependency.bare_specifier.as_deref() else { return Ok(None) };
         let Some(partial) = parse_bare_specifier(bare) else { return Ok(None) };
         let spec = partial.finalize();
-        let mut result = build_resolve_result(
-            spec,
-            self.probe.as_ref(),
-            self.runner.as_ref(),
-            wanted_dependency,
-        )
-        .await?;
+        let auth_headers =
+            self.fetch_context.as_ref().map(|ctx| ctx.auth_headers.as_ref());
+        if let Some(auth_headers) = auth_headers
+            && !auth_headers.allows_fetch(&spec.fetch_spec)
+        {
+            return Err(Box::new(pnpm_tarball::TarballError::OffAllowlist {
+                url: pnpm_network::redact_url_credentials(&spec.fetch_spec),
+            }));
+        }
+        let probe = AllowlistedProbe { inner: self.probe.as_ref(), auth_headers };
+        let mut result =
+            build_resolve_result(spec, &probe, self.runner.as_ref(), wanted_dependency).await?;
         self.read_package_metadata(&mut result).await?;
         Ok(Some(result))
     }
@@ -159,33 +164,8 @@ impl<Probe: GitProbe + 'static, Runner: GitCommandRunner + 'static> GitResolver<
         let Some(ctx) = self.fetch_context.as_ref() else { return Ok(()) };
         match &result.resolution {
             LockfileResolution::Tarball(tarball) => {
-                let tarball_url = tarball.tarball.clone();
-                // `#path:/packages/foo` points at one directory of the
-                // repo; the archive spans the whole repo, so its root
-                // `package.json` is the repo's, not this package's.
-                let manifest_subdir = tarball.path.clone();
-
-                // Silent reporter: the install pass owns the
-                // `resolved → found_in_store → imported` event ordering.
-                let resolved = FetchTarballForResolution {
-                    http_client: &ctx.http_client,
-                    store_dir: ctx.store_dir,
-                    store_index_writer: ctx.store_index_writer.clone(),
-                    package_url: &tarball_url,
-                    // A git host's archive URL is the package's only
-                    // identifier at this point — its name is what this
-                    // fetch is here to learn — and such archives carry
-                    // no scoped-registry auth.
-                    package_id: &tarball_url,
-                    auth_headers: &ctx.auth_headers,
-                    retry_opts: ctx.retry_opts,
-                    manifest_subdir: manifest_subdir.as_deref(),
-                }
-                .run::<SilentReporter>(None)
-                .await
-                .map_err(|err| Box::new(err) as ResolveError)?;
-
-                result.manifest = resolved.manifest.map(Arc::new);
+                let resolved = read_archive(ctx, tarball).await?;
+                result.package.manifest = resolved.manifest.map(Arc::new);
                 if let LockfileResolution::Tarball(tarball) = &mut result.resolution {
                     // A git host's archive carries no integrity of its
                     // own, and the install pass refuses a tarball
@@ -197,19 +177,26 @@ impl<Probe: GitProbe + 'static, Runner: GitCommandRunner + 'static> GitResolver<
                 }
             }
             LockfileResolution::Git(git) => {
+                let git_config = match ctx.auth_headers.connect_guard() {
+                    Some(guard) => pinned_git_config(&git.repo, guard).await
+                        .map_err(|err| Box::new(err) as ResolveError)?,
+                    None => Vec::new(),
+                };
                 // No archive endpoint to read, so the working tree is
                 // the only source of the name, and there is nothing to
                 // hash — the commit anchors the content.
                 let manifest = read_git_manifest(GitManifestQuery {
+                    source_cache: &ctx.source_cache,
                     repo: &git.repo,
                     commit: &git.commit,
                     path: git.path.as_deref(),
                     git_shallow_hosts: &ctx.git_shallow_hosts,
                     git_bin: None,
+                    git_config: &git_config,
                 })
                 .await
                 .map_err(|err| Box::new(err) as ResolveError)?;
-                result.manifest = manifest.map(Arc::new);
+                result.package.manifest = manifest.map(Arc::new);
             }
             _ => {}
         }
@@ -234,6 +221,60 @@ impl<Probe: GitProbe + 'static, Runner: GitCommandRunner + 'static> GitResolver<
         }
         Ok(Some(LatestInfo::default()))
     }
+}
+
+/// A [`GitProbe`] that reports an archive URL the fetch allowlist refuses as
+/// not fetchable, so the resolution falls back to the already-admitted repo
+/// instead of reaching the archive host.
+struct AllowlistedProbe<'a, Probe: ?Sized> {
+    inner: &'a Probe,
+    auth_headers: Option<&'a AuthHeaders>,
+}
+
+impl<Probe: GitProbe + ?Sized> GitProbe for AllowlistedProbe<'_, Probe> {
+    fn anonymous_head_ok<'a>(&'a self, url: &'a str) -> ProbeFuture<'a> {
+        if self.auth_headers.is_some_and(|auth_headers| !auth_headers.allows_fetch(url)) {
+            return Box::pin(std::future::ready(false));
+        }
+        self.inner.anonymous_head_ok(url)
+    }
+}
+
+/// Download a git host's archive, hash it, and read the manifest of the
+/// package it holds.
+async fn read_archive(
+    ctx: &GitFetchContext,
+    tarball: &pnpm_lockfile::TarballResolution,
+) -> Result<pnpm_tarball::ResolvedTarball, ResolveError> {
+    // Silent reporter: the install pass owns the
+    // `resolved → found_in_store → imported` event ordering.
+    FetchTarballForResolution {
+        http_client: &ctx.http_client,
+        store_dir: ctx.store_dir,
+        store_index_writer: ctx.store_index_writer.clone(),
+        // A git host's archive URL is the package's only identifier at
+        // this point — its name is what this fetch is here to learn —
+        // and such archives carry no scoped-registry auth or pinned hash.
+        package: pnpm_tarball::TarballPackage {
+            integrity: None,
+            unpacked_size: None,
+            file_count: None,
+            url: &tarball.tarball,
+            id: &tarball.tarball,
+        },
+        auth_headers: &ctx.auth_headers,
+        retry_opts: ctx.retry_opts,
+        // `#path:/packages/foo` points at one directory of the repo; the
+        // archive spans the whole repo, so its root `package.json` is
+        // the repo's, not this package's.
+        manifest_subdir: tarball.path.as_deref(),
+        // A git host's archive is addressed by commit, not by a registry
+        // revision.
+        revision_addressed: false,
+    }
+    .run::<SilentReporter>(None)
+    .await
+    .map_err(|err| Box::new(err) as ResolveError)
 }
 
 async fn build_resolve_result<Probe: GitProbe + ?Sized, Runner: GitCommandRunner + ?Sized>(
@@ -270,15 +311,18 @@ async fn build_resolve_result<Probe: GitProbe + ?Sized, Runner: GitCommandRunner
 
     Ok(ResolveResult {
         id: id_string.into(),
-        name_ver: None,
-        latest: None,
-        published_at: None,
-        manifest: None,
         resolution,
         resolved_via: "git-repository".to_string(),
         normalized_bare_specifier: Some(spec.normalized_bare_specifier),
         alias: wanted_dependency.alias.clone(),
         policy_violation: None,
+        package: pnpm_resolving_resolver_base::ResolvedPackageInfo {
+            name_ver: None,
+            latest: None,
+            published_at: None,
+            manifest: None,
+            non_deprecated_alternative: None,
+        },
     })
 }
 

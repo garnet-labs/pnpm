@@ -849,14 +849,12 @@ test('publish: runs all the lifecycle scripts', async () => {
     version: '0.0.0',
 
     scripts: {
-      // eslint-disable:object-literal-sort-keys
       prepublish: server.sendLineScript('prepublish'),
       prepare: server.sendLineScript('prepare'),
       prepublishOnly: server.sendLineScript('prepublishOnly'),
       prepack: server.sendLineScript('prepack'),
       publish: server.sendLineScript('publish'),
       postpublish: server.sendLineScript('postpublish'),
-      // eslint-enable:object-literal-sort-keys
     },
   })
 
@@ -887,14 +885,12 @@ test('publish: ignores all the lifecycle scripts when --ignore-scripts is used',
     version: '0.0.0',
 
     scripts: {
-      // eslint-disable:object-literal-sort-keys
       prepublish: server.sendLineScript('prepublish'),
       prepare: server.sendLineScript('prepare'),
       prepublishOnly: server.sendLineScript('prepublishOnly'),
       prepack: server.sendLineScript('prepack'),
       publish: server.sendLineScript('publish'),
       postpublish: server.sendLineScript('postpublish'),
-      // eslint-enable:object-literal-sort-keys
     },
   })
 
@@ -1084,3 +1080,29 @@ test('publish --json: writes per-package summary to stdout', async () => {
 
   await checkPkgExists(pkgName, '0.0.0')
 })
+
+test('publish inherits registry from workspace root .npmrc (pnpm/pnpm#7182)', async () => {
+  const pkgName = `@pnpmtest/test-workspace-npmrc-publish-${Date.now()}`
+  preparePackages([
+    {
+      name: pkgName,
+      version: '1.0.0',
+    },
+  ])
+
+  fs.writeFileSync('.npmrc', `registry=http://localhost:${REGISTRY_MOCK_PORT}/\n//localhost:${REGISTRY_MOCK_PORT}/:_authToken=${getRegistryMockToken()}\n`)
+  writeYamlFileSync('pnpm-workspace.yaml', { packages: ['**'] })
+
+  process.chdir(pkgName)
+
+  fs.writeFileSync('.npmrc', 'engine-strict=true\nsave-exact=true\n')
+
+  const result = crossSpawn.sync(pnpmBin, ['publish', '--no-git-checks'], { env: SPAWN_ENV })
+  if (result.status !== 0) {
+    throw new Error(`pnpm publish failed with status ${result.status}: ${result.stderr?.toString()}`)
+  }
+  expect(result.status).toBe(0)
+
+  await checkPkgExists(pkgName, '1.0.0')
+})
+

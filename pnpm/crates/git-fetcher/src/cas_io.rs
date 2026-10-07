@@ -1,18 +1,6 @@
 //! CAS I/O helpers shared between [`crate::GitFetcher`] (git clone +
 //! `preparePackage`) and [`crate::GitHostedTarballFetcher`] (tarball
 //! download + `preparePackage`).
-//!
-//! - [`materialize_into`] copies CAS-resident files into a fresh
-//!   working directory so the prepare phase has a writable tree.
-//!   Used by the git-hosted tarball fetcher: by the time the tarball
-//!   has been downloaded by `pnpm-tarball`, the files already live
-//!   in the CAS, so the prepare phase reads them out into a temp dir
-//!   it can mutate without corrupting the CAS.
-//! - [`import_into_cas`] writes a prepared file set back to the CAS
-//!   and produces the `relative-path → cas-path` map the install
-//!   dispatcher hands to `CreateVirtualDirBySnapshot`.
-//! - [`map_write_cas`] is a minor helper factored out alongside the
-//!   import.
 
 use crate::error::GitFetcherError;
 use pnpm_fs::file_mode::{cas_path_is_executable, is_executable, restore_exec_bit_from_cas_suffix};
@@ -180,14 +168,15 @@ pub(crate) fn synthesize_files_index(
 ) -> Result<HashMap<String, CafsFileInfo>, GitFetcherError> {
     let mut out = HashMap::with_capacity(cas_paths.len());
     for (rel, cas_path) in cas_paths {
-        let digest = cas_path_digest(cas_path).ok_or_else(|| {
-            GitFetcherError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "CAS path {cas_path:?} for {rel:?} does not match `files/XX/<rest>[-exec]`",
-                ),
-            ))
-        })?;
+        let digest = cas_path_digest(cas_path)
+            .ok_or_else(|| {
+                GitFetcherError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CAS path {cas_path:?} for {rel:?} does not match `files/XX/<rest>[-exec]`",
+                    ),
+                ))
+            })?;
         let executable = cas_path_is_executable(cas_path);
         // Match the read-side `cas_file_path_by_mode` round-trip rule:
         // any-exec-bit-set ↔ `-exec` suffix. The exact mode value is

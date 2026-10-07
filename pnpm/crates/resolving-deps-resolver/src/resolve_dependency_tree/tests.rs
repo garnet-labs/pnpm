@@ -18,7 +18,7 @@ impl Resolver for NestedWorkspaceLinkResolver {
         opts: &'a ResolveOptions,
     ) -> ResolveFuture<'a> {
         let target_dir = self.target_dir.clone();
-        let project_dir = opts.project_dir.clone();
+        let project_dir = opts.project.project_dir.clone();
         let alias = wanted.alias.clone().unwrap_or_default();
         Box::pin(async move {
             if alias != "shared" {
@@ -31,12 +31,6 @@ impl Resolver for NestedWorkspaceLinkResolver {
                 .replace('\\', "/");
             Ok(Some(ResolveResult {
                 id: PkgResolutionId::from(format!("link:{relative}")),
-                name_ver: None,
-                latest: None,
-                published_at: None,
-                manifest: Some(std::sync::Arc::new(
-                    serde_json::json!({ "name": "shared", "version": "1.0.0" }),
-                )),
                 resolution: LockfileResolution::Directory(DirectoryResolution {
                     directory: relative,
                 }),
@@ -44,6 +38,15 @@ impl Resolver for NestedWorkspaceLinkResolver {
                 normalized_bare_specifier: None,
                 alias: Some(alias),
                 policy_violation: None,
+                package: pnpm_resolving_resolver_base::ResolvedPackageInfo {
+                    name_ver: None,
+                    latest: None,
+                    published_at: None,
+                    manifest: Some(std::sync::Arc::new(
+                        serde_json::json!({ "name": "shared", "version": "1.0.0" }),
+                    )),
+                    non_deprecated_alternative: None,
+                },
             }))
         })
     }
@@ -81,7 +84,14 @@ async fn canonical_snapshot_link_id_is_relative_to_lockfile_root() {
         &manifest,
         [DependencyGroup::Prod],
         ResolveDependencyTreeOptions {
-            base_opts: ResolveOptions { project_dir, lockfile_dir, ..ResolveOptions::default() },
+            base_opts: ResolveOptions {
+                project: pnpm_resolving_resolver_base::ResolverProjectOptions {
+                    project_dir,
+                    lockfile_dir,
+                    ..Default::default()
+                },
+                ..ResolveOptions::default()
+            },
             patched_dependencies: None,
             manifest_hook: None,
             overrides_hook: None,
@@ -94,7 +104,7 @@ async fn canonical_snapshot_link_id_is_relative_to_lockfile_root() {
     .expect("resolve nested workspace link");
 
     let direct = tree.direct.first().expect("shared direct dependency");
-    assert_eq!(direct.id, "link:packages/shared");
+    assert_eq!(&*direct.id, "link:packages/shared");
     assert_eq!(direct.node_id, crate::NodeId::leaf("link:packages/shared"));
     assert!(tree.packages.contains_key("link:packages/shared"));
     assert!(!tree.packages.contains_key("link:../../../packages/shared"));

@@ -2,13 +2,19 @@
 
 This document provides context and instructions for AI agents working on the pnpm codebase.
 
-The repository contains three products:
+The repository contains these products:
 
 - The **TypeScript pnpm v11 CLI** — `pnpm11/`.
 - The **Rust pnpm v12 CLI (pacquet)** — `pnpm/`. pnpm v12 is the target for new feature development. See [`pnpm/AGENTS.md`](./pnpm/AGENTS.md) for pacquet-specific rules; it adds to (and never contradicts) the conventions below.
 - The **Rust pnpr registry server** — `pnpr/`. See [`pnpr/AGENTS.md`](./pnpr/AGENTS.md) for pnpr-specific rules; it adds to (and never contradicts) the conventions below.
 
 Sections below marked "(TypeScript only)" apply to TypeScript code only; they do not apply to Rust code in `pnpm/` or `pnpr/`. Everything else applies repo-wide unless a nested `AGENTS.md` specializes it.
+
+## Project philosophy
+
+Apply [PHILOSOPHY.md](./PHILOSOPHY.md) when implementing, triaging, or reviewing
+changes. It defines the core requirements and the approach to existing
+capabilities, abstractions, compatibility, and releases.
 
 ## pnpm v12 and v11 development policy
 
@@ -21,6 +27,14 @@ For bug fixes, first determine which versions contain the bug. If the bug is pre
 When a shared bug fix cannot be completed in both stacks in the same PR, call out the missing implementation in the PR description so it can be added before the PR lands.
 
 The pacquet-side version policy is in [`pnpm/AGENTS.md`](./pnpm/AGENTS.md#version-policy).
+
+## Website documentation
+
+User documentation lives in `pnpm/docs/` for v12, `pnpm11/docs/` for v11,
+and `pnpr/docs/` for the registry. Update
+the affected version's docs and sidebar in the same PR as a behavior change.
+See [DOCUMENTATION.md](./DOCUMENTATION.md) for local previews and release publishing.
+The blog and website application remain in pnpm/pnpm.io.
 
 ## Repository Structure
 
@@ -86,9 +100,20 @@ pnpm --filter pnpm run compile
 
 This runs `tsgo --build`, linting, and `pnpm run bundle` (which bundles all TypeScript packages into `pnpm11/pnpm/dist/pnpm.mjs`). Without this step, e2e tests will use a stale bundle and your changes won't be tested.
 
-## Testing (TypeScript only)
+## Testing
 
-Never run all tests in the repository as it takes a lot of time.
+Run the selection that covers what you changed, not the whole repository: the
+full suite takes a lot of time. This applies to every product here, TypeScript
+and Rust alike. Let CI run the rest — it runs the full Rust suite on
+Linux, macOS, and Windows and the full TypeScript suite for every pull request.
+The [`testing-changes`](./.agents/skills/testing-changes/SKILL.md) skill covers
+how to derive that selection from the diff in each product, and
+[`pnpm/CONTRIBUTING.md`](./pnpm/CONTRIBUTING.md#automated-checks) has the Rust
+workspace's checks, including the one case that does call for a full local run:
+a change whose affected set cannot be named, such as the workspace manifest,
+the lockfile, or the toolchain.
+
+The rest of this section is TypeScript only.
 
 Run tests for a specific project instead:
 
@@ -126,11 +151,9 @@ Do not dismiss a failing test as a "pre-existing" failure that is unrelated to y
 
 ## AI Review Guidance
 
-The repository's review framework lives in **[REVIEW_GUIDE.md](./REVIEW_GUIDE.md)** — how changes are accepted or rejected, the security-first / performance-second priorities, the security checklist and advisory regression themes, and the test/changeset/version-coverage expectations. Apply it when reviewing pull requests. (TypeScript-specific code style and engineering conventions for the CLI are documented in the "Code Style" section of this file; pacquet and pnpr follow their own `AGENTS.md` and style guides.)
+The repository's review framework lives in **[review-code review guide](./.agents/skills/review-code/references/REVIEW_GUIDE.md)** — how changes are accepted or rejected, the security-first / performance-second priorities, the security checklist and advisory regression themes, and the test/changeset/version-coverage expectations. Apply it when reviewing pull requests. (TypeScript-specific code style and engineering conventions for the CLI are documented in the "Code Style" section of this file; pacquet and pnpr follow their own `AGENTS.md` and style guides.)
 
 Security is the first review priority and performance the second. Surface only issues tied to the changed code, and explain the exploit path, impact, or hot path affected. See the guide's Security and Performance review sections for the full checklist.
-
-When reviewing a pull request, also apply **[REVIEW.md](./REVIEW.md)**: the PR description carries a `Runtime evidence (Garnet)` section (between `<!-- garnet:evidence:begin -->` and `<!-- garnet:evidence:end -->`) mirroring the head-SHA-bound, kernel-recorded execution profile of the instrumented CI run. Open the review with the one-line `**Runtime grounding** (head \`<sha7>\`): ...` verdict, use the record only when its `garnet:commit` marker equals the PR head (state stale/absent evidence explicitly otherwise), reconcile the recorded execution chains and outbound destinations with what the diff implies, label runtime-verified findings apart from static inference, and never repeat verdicts or safety judgments from the record itself.
 
 ## Code Reuse and Avoiding Duplication
 
@@ -170,7 +193,7 @@ You can confirm the hooks are active with `git config core.hooksPath` (it should
 
 **Do not write a bare `#NNN` (a `#` followed by digits) anywhere in a commit message.** A `commit-msg` hook (`.husky/reject-bare-issue-refs.mjs`) rejects them.
 
-GitHub turns any `#NNN` into a link to issue/PR `NNN` of *this* repo, which is almost never what a bare reference means. This is a frequent AI mistake in two forms:
+GitHub turns any `#NNN` into a link to issue/PR `NNN` of *this* repo, which is almost never what a bare reference means. This is a frequent AI mistake, in these forms:
 
 -   Using `#1`, `#2`, `#3`, … to enumerate items in a list. GitHub instead links them to unrelated issues `#1`, `#2`, `#3` of this repo. **Fix:** don't use `#` for enumeration — write `item 1`, `(1)`, `1.`, or rephrase.
 -   Referring to issue `#NNN` of a *different* repository. GitHub instead links it to issue `NNN` of this repo. **Fix:** use qualified syntax `owner/repo#NNN` or an absolute URL `https://github.com/owner/repo/issues/NNN`.
@@ -192,7 +215,9 @@ GitHub turns any `@name` into a mention of that user/org/team, which is wrong ei
 
 ## Changesets
 
-If your changes affect published packages, you MUST create a changeset file in the `.changeset` directory (`pnpm change` records one interactively; `pnpm change status` shows the pending release plan). The file describes the change and specifies the affected packages with their pending version bump types: patch, minor, or major. Write the description for pnpm users and keep it concise — it becomes a release note. Implementation rationale belongs in the commit message, not the changeset. The bare `pnpm version -r` consumes the pending changesets at release time; there is no separate `@changesets/cli` dependency.
+Bug fixes for features that have not yet been released do not need a changeset. This exemption applies to both TypeScript and Rust products. Check whether the affected feature has shipped before adding a changeset for a bug fix.
+
+Except for the unreleased-feature bug fixes described above, if your changes affect published packages, you MUST create a changeset file in the `.changeset` directory (`pnpm change` records one interactively; `pnpm change status` shows the pending release plan). The file describes the change and specifies the affected packages with their pending version bump types: patch, minor, or major. Write the description for pnpm users and keep it concise — it becomes a release note. Implementation rationale belongs in the commit message, not the changeset. The bare `pnpm version -r` consumes the pending changesets at release time; there is no separate `@changesets/cli` dependency.
 
 **IMPORTANT: For changes to the TypeScript pnpm v11 CLI, always explicitly include `"pnpm"` in the changeset with a patch bump.** The changeset description will appear on the release notes page. For pnpm v12 changes, follow the Rust-product rules below and target `pacquet` instead.
 
@@ -205,8 +230,17 @@ Example:
 "pacquet": patch
 ---
 
-Fixed a `pnpm install` bug that affected both pnpm v11 and v12.
+Fixed `pnpm install` failing when a workspace dependency uses an aliased catalog entry.
 ```
+
+The package targets already place each changeset on the correct release page.
+Do not name a pnpm release line or implementation in the release-note text,
+such as "pnpm v11", "pnpm v12", or "pacquet", merely to distinguish its
+targets. Describe the behavior of the published `pnpm` command.
+
+Use one changeset for several release lines only when the same release-note
+text applies to every target. If the user-visible behavior differs, create
+separate changesets with the targets and wording for each behavior.
 
 The TypeScript pnpm v11 CLI is maintenance-only. Its changesets use patch bumps for bug fixes and internal maintenance. Do not implement new features or breaking changes in v11.
 
@@ -249,7 +283,7 @@ After:
 
 ### Changesets for the Rust products
 
-The Rust products are released through the same native flow. Their npm wrapper packages are workspace packages with committed versions, so a user-visible change to a Rust product needs a changeset too, targeting:
+The Rust products are released through the same native flow. Their npm wrapper packages are workspace packages with committed versions, so a user-visible change to a Rust product needs a changeset too, unless it fixes a bug in an unreleased feature. Target:
 
 - `pacquet` — the Rust pnpm v12 CLI (published to npm as `pnpm` and `@pnpm/exe`; named `pacquet` in-repo so its name can't collide with the TypeScript CLI). `@pnpm/napi` is a `versioning.fixed` group with it and bumps with it automatically.
 - `@pnpm/napi` — the Node.js addon bindings for the Rust engine.
@@ -257,7 +291,7 @@ The Rust products are released through the same native flow. Their npm wrapper p
 
 pnpm v12 and its NAPI addon release as stable versions on the main lane. pnpr releases on the `alpha` prerelease lane configured in `pnpm-workspace.yaml`; `pnpm lane main --filter …` graduates it to a stable version.
 
-Do not add `"pnpm"` to a Rust-only changeset: in changesets, `pnpm` always means the TypeScript v11 CLI package. A changeset for a pnpm v12 feature or v12-only bug fix targets `pacquet` and omits `"pnpm"`. A shared bug fix that lands in both versions carries one changeset naming both the affected TypeScript packages (plus `"pnpm"`) and the Rust wrapper(s).
+Do not add `"pnpm"` to a Rust-only changeset: in changesets, `pnpm` always means the TypeScript v11 CLI package. A changeset for a pnpm v12 feature or v12-only bug fix targets `pacquet` and omits `"pnpm"`. A shared bug fix that lands in both versions may use one changeset naming both the affected TypeScript packages (plus `"pnpm"`) and the Rust wrapper(s) only when the same release-note text applies to both.
 
 Use `pacquet` as the changeset package name, but use `pnpm` in its release-note prose and command examples (`pnpm add`, not `pacquet add`). The published Rust CLI's executable is `pnpm`; `pacquet` is only its in-repo package identifier.
 
@@ -282,6 +316,45 @@ Write a comment only when:
 
 Before adding a comment, ask: "Could I rename, restructure, or extract instead?" If yes, do that. The bar for prose-in-code is high; the bar for prose-that-restates-code is "don't."
 
+### Register
+
+The readers are engineers. Write for them:
+
+-   **Concise.** State each fact once, in the shortest form that is still precise. Text that repeats information stated elsewhere links to it instead. Length is not thoroughness.
+-   **Structured.** Prefer a list, a table, or a labelled item over prose. Do not write long paragraphs. A doc block of several paragraphs is cut to the contract.
+-   **One word per concept.** A synonym signals a distinction, and a reader who meets one goes looking for it. Spell a value the way the code or the message spells it.
+
+### Prose that cannot go stale
+
+A sentence that repeats a fact the code states has no test. Write the form that cannot go stale:
+
+-   No count over a list that can grow ("three products"). Name the list, not its size.
+-   A predicate a reader can grep for ("every crate that depends on `pnpm-lockfile`") instead of a hand-maintained roster. A roster that helps is marked "for example".
+-   No verbatim quotation of another file's heading or prose. Link the section by anchor; in Rust, link the item.
+-   One home per fact. A limit, a default, a path, or a setting name is stated once and linked from everywhere else. A default is documented on the field that has it, never on the field's type or on an enum variant.
+-   Fake names in guide examples. Code copied from a live item drifts when the item changes.
+-   A statement about behaviour is a claim. Verify it with a test, a compiler experiment, or a measurement, or leave it out. Say in the pull request what could not be verified.
+-   A deliberate exception to the surrounding pattern gets a one-line comment at the site, so the next reader does not take it for an oversight. A parameter every caller passes with the same value either says why or goes.
+-   A document that describes planned work states its status at the top and is deleted when the work lands. Grep for its name to find the references that would dangle.
+
+### User-facing text
+
+Most documentation in this repository is internal. The user-facing text is:
+
+-   the website documentation under `pnpm/docs/`, `pnpm11/docs/`, and `pnpr/docs/`;
+-   changesets;
+-   doc comments on clap commands and arguments, which are the `--help` output;
+-   the `@pnpm/napi` type declarations in `pnpm/npm/napi/index.d.ts`;
+-   diagnostics and log messages;
+-   the READMEs of published npm packages.
+
+User-facing text names only what the user can reach: their project, their config, the `pnpm` command, npm, Node.js. It does not name a crate, a module, a Rust or TypeScript item, the other implementation, the in-repo package name `pacquet`, a workflow, or a `just` recipe. It states a limitation by what the user sees, not by the mechanism behind it. Everything else is contributor text and says what helps a contributor.
+
+### Reviewing documentation and comments
+
+-   A review does not increase verbosity. For a nitpick, prefer removal over addition.
+-   A fix for a nitpick follows the same rule: remove rather than add.
+
 ## Code Style (TypeScript only)
 
 This repository uses [Standard Style](https://github.com/standard/standard) with a few modifications:
@@ -300,6 +373,15 @@ To ensure your code adheres to the style guide, run:
 pnpm run lint
 ```
 
+### Size and shape limits
+
+`@pnpm/eslint-config` ports the perfectionist rules that the Rust workspace enforces through [`dylint.toml`](./dylint.toml), with the limits stated in the [pacquet style guide](./pnpm/CODE_STYLE_GUIDE.md#guides). It also enforces:
+
+-   Variables, parameters, and type parameters have descriptive names, not single letters.
+-   Every `eslint-disable` directive gives a reason after `--`.
+
+Tests are exempt from the length, local-name, and chain limits, as they are in Rust. Meet a limit by refactoring, not by disabling the rule: extract a helper named for what it does, return early, or name a predicate. Packages that do not pass the size limits yet are listed in `PENDING_SIZE_AND_SHAPE_REFACTOR` in [`eslint.config.mjs`](./eslint.config.mjs). When you refactor a package to pass them, remove it from that list.
+
 ### Conventions
 
 Recurring engineering conventions in this codebase — the rules reviewers most often enforce:
@@ -314,25 +396,28 @@ Recurring engineering conventions in this codebase — the rules reviewers most 
 
 ## Common Gotchas
 
-### Error Type Checking in Jest (TypeScript only)
+### Error Type Checking (TypeScript only)
 
-When checking if a caught error is an `Error` object, **do not use `instanceof Error`**. Jest runs tests in a VM context where `instanceof` checks can fail across realms.
-
-Instead, use `util.types.isNativeError()`:
+When checking if a caught value is an `Error`, use `isError()` from `@pnpm/error`. Do not use `instanceof Error` or `util.types.isNativeError()` alone. Jest runs tests in a VM context where `instanceof` fails across realms. StackBlitz WebContainers reject async `fs` calls with errors that `util.types.isNativeError()` does not recognize. `isError()` accepts both.
 
 ```typescript
-import util from 'util'
+import { isError } from '@pnpm/error'
 
 try {
   // ... some operation
 } catch (err: unknown) {
-  // ❌ Wrong - may fail in Jest
+  // ❌ Wrong - fails in Jest
   if (err instanceof Error && 'code' in err && err.code === 'ENOENT') {
     return null
   }
-  
-  // ✅ Correct - works across realms
+
+  // ❌ Wrong - fails in WebContainers
   if (util.types.isNativeError(err) && 'code' in err && err.code === 'ENOENT') {
+    return null
+  }
+
+  // ✅ Correct
+  if (isError(err) && 'code' in err && err.code === 'ENOENT') {
     return null
   }
   throw err
@@ -341,9 +426,27 @@ try {
 
 ## Working with GitHub PRs, Issues, and Comments
 
--   **Open every PR with the repository template.** `gh pr create` does not apply `.github/pull_request_template.md` automatically, so read that file and pass its filled-in contents as the PR body (`--body`/`--body-file`). Keep every section (Summary, Squash Commit Body, Checklist), fill them in for this change, mark the checklist items, and remove only the lines the template says are inapplicable.
--   **Keep PR titles and descriptions current.** When pushing new changes to a PR, review the title and description and update them if they no longer accurately reflect what the PR does.
--   **Reply to and resolve review conversations.** Once a review comment has been addressed, reply to the thread with a description of the resolution including the commit hash that fixed it, then mark the conversation as resolved.
+The [`pull-requests`](./.agents/skills/pull-requests/SKILL.md) skill covers taking
+a change through a pull request: opening it from the template, waiting for the
+checks, and working the review rounds. These rules hold whether or not it is loaded:
+
+-   **Open the PR as a draft.** CI runs on a draft in this repository and the
+    reviewers do not, so the checks and your own pass over the diff happen
+    before the first round of review. `gh pr ready <pr>` once the checks are
+    green and that pass is clean.
+-   **A push is not the end of the task.** Every push re-triggers CI and the
+    review bots. Wait for the checks and the new review round, investigate every
+    failure, verify each finding before acting on it, and push the fixes. Repeat
+    until the checks are green and a round produces nothing to act on. Handing
+    back a PR that has an unread round or a red check on it is unfinished work.
+-   **File tasks in [pnpm/tasks](https://github.com/pnpm/tasks), not in pnpm/pnpm.**
+    An issue in pnpm/pnpm is a bug report against released pnpm behavior.
+    Planned work goes to pnpm/tasks (`gh issue create -R pnpm/tasks`): follow-ups
+    left by a PR, refactors, performance work, v11/v12 parity gaps, CI, benchmark
+    and test-harness work, and docs to update after a release. Feature ideas go to
+    [Discussions](https://github.com/pnpm/pnpm/discussions/new?category=ideas).
+    Report a security vulnerability the way [SECURITY.md](./SECURITY.md)
+    directs, not as a task.
 -   **Sign all agent-authored content.** When posting a comment, creating an issue, or opening a PR, append a footer to the message indicating that it was written by an agent. The footer must include the name of the agent and the name of the model used. Example:
 
     ```markdown
@@ -351,24 +454,25 @@ try {
     Written by an agent (Claude Code, claude-opus-4-7).
     ```
 
-## Garnet pull requests on this fork
-
-This fork runs Garnet's runtime sensor on its CI. Two kinds of pull request carry Garnet work, and the label decides which bots speak on them:
-
--   **Test pull requests** (sensor pin bumps, Jibril release candidates, gate work, acceptance runs) carry the label `garnet-release-testing`. The label starts `.github/workflows/garnet-jibril-release-gate.yml`, which posts a ten-leg verdict comment on the pull request. Rules and the failure ledger: [`.github/garnet-gate/FAILURE_LEDGER.md`](./.github/garnet-gate/FAILURE_LEDGER.md).
--   **Demo pull requests** (anything written to be shared, presented, or offered upstream) never carry that label. The reader should see the change, the Runtime Review comment, and the pull request's own evidence, not a gate verdict. To gate the same commits, open a second pull request from the same branch and label that one.
-
-Before adding `garnet-release-testing` to a pull request, ask which kind it is. Removing the label does not remove a verdict comment the gate already posted; delete that comment by hand.
-
 ## Resolving Conflicts in GitHub PRs
 
-Use `shell/resolve-pr-conflicts.sh` to resolve PR conflicts:
+Use `.agents/skills/pull-requests/scripts/resolve-pr-conflicts.sh` to resolve PR conflicts:
 
 ```bash
-./shell/resolve-pr-conflicts.sh <PR_NUMBER>
+./.agents/skills/pull-requests/scripts/resolve-pr-conflicts.sh <PR_NUMBER>
 ```
 
-The script force-fetches the base branch (avoiding stale refs), rebases, auto-resolves `pnpm-lock.yaml` conflicts via `pnpm install`, force-pushes, and verifies GitHub sees the PR as mergeable. For non-lockfile conflicts it will pause and list the files that need manual resolution.
+The script force-fetches the base branch (avoiding stale refs), rebases, auto-resolves `pnpm-lock.yaml` conflicts via `pnpm install`, force-pushes, and verifies GitHub sees the PR as mergeable. For non-lockfile conflicts it will pause and list the files that need manual resolution; finish those with `<PR_NUMBER> --continue`, which resumes that paused rebase in place. Pass `--no-push` to stop after the rebase and print the push command instead of running it.
+
+## Agent Skills
+
+The repository's skills live in `.agents/skills/<name>/SKILL.md`, one directory per skill.
+
+Codex reads that directory as-is. Claude Code only looks in `.claude/skills`, so `.claude/skills` is a symlink to `../.agents/skills`. Git stores the symlink, and `.gitignore` keeps ignoring everything else under `.claude`, so a local `settings.local.json` stays untracked.
+
+Add a new skill under `.agents/skills`; nothing else needs to change.
+
+Git only writes a real symlink on Windows when the clone has `core.symlinks=true`, which needs Developer Mode or an elevated shell. Without it `.claude/skills` is checked out as a text file holding the target path, and Claude Code finds no skills. `CLAUDE.md` is a symlink to `AGENTS.md`, so such a clone loses the project instructions the same way.
 
 ## Key Configuration Files
 

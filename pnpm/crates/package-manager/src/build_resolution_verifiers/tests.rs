@@ -26,6 +26,7 @@ fn reserved_named_registry_is_an_error_not_a_panic() {
         None,
         None,
         None,
+        None,
     );
 
     assert!(
@@ -39,7 +40,12 @@ fn reserved_named_registry_is_an_error_not_a_panic() {
 async fn offline_config_threads_to_resolution_verifier() {
     let mut server = mockito::Server::new_async().await;
     let registry = format!("{}/", server.url());
-    let no_network = server.mock("GET", "/acme").with_status(500).expect(0).create_async().await;
+    let no_network = server
+        .mock("GET", "/acme")
+        .with_status(500)
+        .expect(0)
+        .create_async()
+        .await;
 
     let cache_dir = TempDir::new().expect("tempdir");
     let config = Config {
@@ -56,6 +62,7 @@ async fn offline_config_threads_to_resolution_verifier() {
         None,
         None,
         None,
+        None,
     )
     .expect("build verifiers");
     let name: PkgName = "acme".parse().expect("parse name");
@@ -67,9 +74,11 @@ async fn offline_config_threads_to_resolution_verifier() {
         path: None,
     });
 
-    let result = verifiers[0]
-        .verify(&resolution, VerifyCtx { name: &name, version: "1.0.0", registry_name: None })
-        .await;
+    let result = verifiers[0].verify(
+        &resolution,
+        VerifyCtx { name: &name, version: "1.0.0", registry_name: None },
+    )
+    .await;
 
     let ResolutionVerification::FetchFailed { message } = result else {
         panic!("expected offline metadata failure, got {result:?}");

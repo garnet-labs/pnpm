@@ -15,6 +15,8 @@
 //! turns that set into the grouped, column-aligned list the prompt
 //! renders. Which prompt that is comes in as an [`UpdatePrompt`].
 
+pub(crate) use global::select_global_package_groups;
+
 use crate::{
     checkbox_prompt::{
         CheckboxAnswer, CheckboxChoice, CheckboxItem, CheckboxPrompt, CheckboxTheme,
@@ -29,11 +31,12 @@ use crate::{
         pipelines::InstallFamilySelection,
         sanitize::sanitize_inline,
     },
-    github_actions,
 };
+
 use miette::{IntoDiagnostic, miette};
 use owo_colors::{OwoColorize, Stream};
 use pnpm_config::Config;
+use pnpm_github_actions as github_actions;
 use pnpm_lockfile::Lockfile;
 use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
@@ -108,13 +111,13 @@ impl UpdatePrompt {
                     })
                     .collect();
                 let prompt = match style {
-                    PromptStyle::Dependencies => {
-                        CheckboxPrompt::new(message, items).required(true).theme(CheckboxTheme {
+                    PromptStyle::Dependencies => CheckboxPrompt::new(message, items)
+                        .required(true)
+                        .theme(CheckboxTheme {
                             checked: "●".to_string(),
                             unchecked: "○".to_string(),
                             highlight_active: false,
-                        })
-                    }
+                        }),
                     PromptStyle::GlobalGroups => CheckboxPrompt::new(message, items),
                 };
                 match prompt
@@ -141,118 +144,6 @@ fn report_cancelled<Reporter: self::Reporter>() {
     }));
 }
 
-pub(crate) async fn select_global_package_groups<Reporter: self::Reporter>(
-    base_config: &'static Config,
-    packages: &[String],
-    latest: bool,
-    prompt: UpdatePrompt,
-) -> miette::Result<Option<HashSet<String>>> {
-    let global_pkg_dir = base_config.global_pkg_dir.clone().ok_or_else(|| {
-        miette!(code = "ERR_PNPM_NO_GLOBAL_BIN_DIR", "Unable to find the global packages directory")
-    })?;
-    let mut config = base_config.clone();
-    config.workspace_dir = None;
-    config.shared_workspace_lockfile = false;
-    config.lockfile_dir = None;
-    // A group's lockfile is written unconditionally (`run_group_install`
-    // forces it) because it is where the installed versions are recorded, so
-    // reading it back must not depend on the caller's `lockfile` setting.
-    config.lockfile = true;
-    let config = Config::leak(config);
-    let ignored = ignored_dependencies_matcher(config);
-    let query = OutdatedQuery {
-        target_version: if latest { TargetVersion::Latest } else { TargetVersion::WithinRange },
-        include_direct: &[DependencyGroup::Prod],
-        match_names: None,
-        ignore_names: ignored.as_ref(),
-        include_deprecated: false,
-    };
-    let mut rows: Vec<PromptRow> = Vec::new();
-    let global_packages = pnpm_global::scan_global_packages(&global_pkg_dir)
-        .map_err(|err| miette!("failed to scan global packages: {err}"))?;
-    if global_packages.is_empty() {
-        println!("No global packages found");
-        return Ok(None);
-    }
-    let global_packages: Vec<_> =
-        global_packages.into_iter().filter(|pkg| !has_pnpm_cli_dependency(pkg)).collect();
-    if global_packages.is_empty() {
-        println!(r#"No global packages to update. Run "pnpm self-update" to update pnpm itself."#);
-        return Ok(None);
-    }
-    // A global group is always updated as a whole, so the params select groups
-    // rather than dependencies, the same way `handle_global_update` reads them.
-    let matched_packages = if packages.is_empty() {
-        global_packages
-    } else {
-        let matched = global_packages
-            .into_iter()
-            .filter(|pkg| packages.iter().any(|param| pkg.has_alias(param)))
-            .collect::<Vec<_>>();
-        if matched.is_empty() {
-            println!("No matching global packages found");
-            return Ok(None);
-        }
-        matched
-    };
-    for pkg in matched_packages {
-        let state = crate::State::init(pkg.install_dir.join("package.json"), config, false)
-            .map_err(|err| miette::Report::new(err).wrap_err("initialize global state"))?;
-        let lockfile = state
-            .lockfile
-            .get()
-            .map_err(|err| miette::Report::new(err).wrap_err("load the lockfile"))?;
-        let outdated = collect_outdated_for_importer(
-            &state.manifest,
-            lockfile,
-            pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY,
-            config,
-            &state.http_client,
-            &query,
-        )
-        .await?;
-        if outdated.is_empty() {
-            continue;
-        }
-        let label = outdated
-            .iter()
-            .map(|package| {
-                format!(
-                    "{} {} → {}",
-                    sanitize_inline(&package.alias),
-                    package.current,
-                    package.target,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        rows.push(PromptRow::Choice { short: label.clone(), label, value: pkg.hash });
-    }
-    if rows.is_empty() {
-        let message = if latest {
-            "All of your dependencies are already up to date"
-        } else {
-            "All of your dependencies are already up to date inside the specified ranges. Use the --latest option to update the ranges in package.json"
-        };
-        println!("{message}");
-        return Ok(None);
-    }
-    let Some(selected_indices) = prompt.select(
-        "Choose which global package groups to update (space to select, enter to confirm)",
-        &rows,
-        PromptStyle::GlobalGroups,
-    )?
-    else {
-        report_cancelled::<Reporter>();
-        return Ok(None);
-    };
-    let selected = selected_packages(&rows, &selected_indices).into_iter().collect::<HashSet<_>>();
-    if selected.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(selected))
-}
-
 /// Gather outdated direct dependencies, prompt the user, and return the
 /// selected package names. `Ok(None)` means "nothing to do" — either no
 /// dependency has an update available or the prompt was answered with an
@@ -277,13 +168,7 @@ pub(crate) async fn select_packages<Reporter: self::Reporter>(
     )
     .await?;
     if options.include_github_actions {
-        append_github_actions::<Reporter>(
-            &mut choices,
-            root,
-            options.latest,
-            config.update_config.github_actions_server.as_deref(),
-        )
-        .await?;
+        append_github_actions::<Reporter>(&mut choices, root, options.latest, config).await?;
     }
     prompt_for_packages::<Reporter>(
         &choices,
@@ -301,8 +186,7 @@ pub(crate) async fn select_packages_for_projects<Reporter: self::Reporter>(
     http_client: &Arc<ThrottledClient>,
     options: InteractiveUpdateOptions<'_>,
 ) -> miette::Result<Option<Vec<String>>> {
-    let projects = selection
-        .projects
+    let projects = selection.projects
         .iter()
         .filter(|project| selection.selected_dirs.contains(&project.root_dir))
         .map(|project| InteractiveUpdateProject {
@@ -323,13 +207,7 @@ pub(crate) async fn select_packages_for_projects<Reporter: self::Reporter>(
     )
     .await?;
     if options.include_github_actions {
-        append_github_actions::<Reporter>(
-            &mut choices,
-            root,
-            options.latest,
-            config.update_config.github_actions_server.as_deref(),
-        )
-        .await?;
+        append_github_actions::<Reporter>(&mut choices, root, options.latest, config).await?;
     }
     prompt_for_packages::<Reporter>(&choices, options.latest, true, options.prompt)
 }
@@ -338,13 +216,19 @@ async fn append_github_actions<Reporter: self::Reporter>(
     choices: &mut Vec<OutdatedPackage>,
     root: &Path,
     latest: bool,
-    server_url: Option<&str>,
+    config: &Config,
 ) -> miette::Result<()> {
     choices.extend(
-        github_actions::find_outdated::<Reporter>(root, !latest, None, server_url)
-            .await?
-            .into_iter()
-            .map(OutdatedPackage::from),
+        github_actions::find_outdated::<Reporter>(
+            root,
+            !latest,
+            None,
+            config.update_config.github_actions_server.as_deref(),
+            crate::github_actions::release_age(config)?.as_ref(),
+        )
+        .await?
+        .into_iter()
+        .map(OutdatedPackage::from),
     );
     Ok(())
 }
@@ -365,18 +249,29 @@ async fn collect_choices(
         match_names: None,
         ignore_names: ignored.as_ref(),
         include_deprecated: false,
+        full_metadata: false,
     };
-    let run = OutdatedRun::new(config, Arc::clone(http_client))?;
-    let choices = futures_util::future::join_all(projects.iter().map(|project| {
-        collect_outdated_for_importer_in_run(
-            project.manifest,
-            lockfile,
-            &project.importer_id,
-            &query,
-            &run,
-        )
-    }))
+    let run = OutdatedRun::new(config, Arc::clone(http_client), &query)?;
+    let choices = futures_util::future::join_all(
+        projects
+            .iter()
+            .map(|project| {
+                collect_outdated_for_importer_in_run(
+                    project.manifest,
+                    lockfile,
+                    &project.importer_id,
+                    &query,
+                    &run,
+                )
+            }),
+    )
     .await;
+    unique_choices(choices)
+}
+
+fn unique_choices(
+    choices: Vec<miette::Result<Vec<OutdatedPackage>>>,
+) -> miette::Result<Vec<OutdatedPackage>> {
     // Keyed by workspace as well, so an entry each project contributed
     // survives to [`choices::update_choices`] — that is what lets a
     // collapsed row name every project it covers instead of the first.
@@ -389,7 +284,7 @@ async fn collect_choices(
                 choice.package_name.clone(),
                 choice.current.to_string(),
                 choice.target.to_string(),
-                choice.workspace.clone(),
+                choice.metadata.workspace.clone(),
             );
             if unique.insert(key) {
                 collected.push(choice);
@@ -399,6 +294,15 @@ async fn collect_choices(
     Ok(collected)
 }
 
+fn print_up_to_date(latest: bool) {
+    let message = if latest {
+        "All of your dependencies are already up to date"
+    } else {
+        "All of your dependencies are already up to date inside the specified ranges. Use the --latest option to update the ranges in package.json"
+    };
+    println!("{message}");
+}
+
 fn prompt_for_packages<Reporter: self::Reporter>(
     choices: &[OutdatedPackage],
     latest: bool,
@@ -406,12 +310,7 @@ fn prompt_for_packages<Reporter: self::Reporter>(
     prompt: UpdatePrompt,
 ) -> miette::Result<Option<Vec<String>>> {
     if choices.is_empty() {
-        let message = if latest {
-            "All of your dependencies are already up to date"
-        } else {
-            "All of your dependencies are already up to date inside the specified ranges. Use the --latest option to update the ranges in package.json"
-        };
-        println!("{message}");
+        print_up_to_date(latest);
         return Ok(None);
     }
 
@@ -448,14 +347,18 @@ fn flatten_groups(groups: &[choices::ChoiceGroup]) -> Vec<PromptRow> {
     for group in groups {
         let heading = format!("── {} ──", group.message);
         rows.push(PromptRow::Separator(bold(&heading)));
-        rows.extend(group.rows.iter().map(|row| match &row.value {
-            None => PromptRow::Separator(format!("  {}", row.label)),
-            Some(value) => PromptRow::Choice {
-                label: row.label.clone(),
-                short: sanitize_inline(value).into_owned(),
-                value: value.clone(),
-            },
-        }));
+        rows.extend(
+            group.rows
+                .iter()
+                .map(|row| match &row.value {
+                    None => PromptRow::Separator(format!("  {}", row.label)),
+                    Some(value) => PromptRow::Choice {
+                        label: row.label.clone(),
+                        short: sanitize_inline(value).into_owned(),
+                        value: value.clone(),
+                    },
+                }),
+        );
     }
     rows
 }
@@ -486,3 +389,5 @@ mod choices;
 
 #[cfg(test)]
 mod tests;
+
+mod global;

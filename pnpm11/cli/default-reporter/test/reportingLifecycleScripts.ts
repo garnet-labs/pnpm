@@ -668,10 +668,10 @@ test('collapse lifecycle output when it has too many lines', async () => {
     stage: 'postinstall',
     wd: 'packages/foo',
   })
-  for (let i = 0; i < 100; i++) {
+  for (let lineNumber = 0; lineNumber < 100; lineNumber++) {
     lifecycleLogger.debug({
       depPath: 'packages/foo',
-      line: `foo ${i}`,
+      line: `foo ${lineNumber}`,
       stage: 'postinstall',
       stdio: 'stdout',
       wd: 'packages/foo',
@@ -968,7 +968,7 @@ test('do not fail if the debug log has no output', async () => {
   })
   lifecycleLogger.debug({
     depPath: 'registry.npmjs.org/foo/1.0.0',
-    line: undefined as any, // eslint-disable-line @typescript-eslint/no-explicit-any
+    line: undefined as any, // eslint-disable-line @typescript-eslint/no-explicit-any -- simulates a malformed log that has no line
     stage: 'install',
     stdio: 'stdout',
     wd,
@@ -1049,3 +1049,29 @@ Running ${POSTINSTALL} for registry.npmjs.org/bar/1.0.0: ${childOutputColor('bar
 function failedAt (wd: string) {
   return chalk.red(`Failed in 1s at ${wd}`)
 }
+
+test('keeps only the colors of streamed script output', async () => {
+  const RED = '\u001B[31m'
+  const DEFAULT_COLOR = '\u001B[39m'
+  const output$ = toOutput$({
+    context: { argv: ['run'] },
+    reportingOptions: {
+      hideLifecyclePrefix: true,
+      streamLifecycleOutput: true,
+    },
+    streamParser: createStreamParser(),
+  })
+
+  lifecycleLogger.debug({
+    depPath: 'packages/colors',
+    line: `\u001B[1A\u001B[2K${RED}error${DEFAULT_COLOR}\u0007 TS2322\u001B]8;;https://example.com\u0007link\u001B]8;;\u0007 \u009D8;;https://example.com\u009Cdocs\u009D8;;\u009C`,
+    stage: 'build',
+    stdio: 'stdout',
+    wd: 'packages/colors',
+  })
+
+  expect.assertions(1)
+
+  const output = await firstValueFrom(output$.pipe(take(1), map(normalizeNewline)))
+  expect(output).toBe(chalk.level > 0 ? `${RED}error${DEFAULT_COLOR} TS2322link docs\u001B[0m` : 'error TS2322link docs')
+})

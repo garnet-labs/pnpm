@@ -3,8 +3,7 @@
 //! The graph crate reads projects through the [`BaseProject`] /
 //! [`GraphProject`] traits so it stays free of manifest parsing. This is
 //! the one place that bridges the two, shared by every caller that builds
-//! a workspace graph — the `--filter` selection, and the workspace-cycle
-//! report a full install makes.
+//! a workspace graph.
 
 use crate::Project;
 use indexmap::IndexMap;
@@ -24,13 +23,10 @@ impl BaseProject for GraphPkg<'_> {
     }
 
     fn manifest_name(&self) -> Option<&str> {
-        self.project.manifest.value().get("name").and_then(|name| name.as_str())
-    }
-}
-
-impl GraphProject for GraphPkg<'_> {
-    fn manifest_version(&self) -> Option<&str> {
-        self.project.manifest.value().get("version").and_then(|version| version.as_str())
+        self.project.manifest
+            .value()
+            .get("name")
+            .and_then(|name| name.as_str())
     }
 
     fn merged_dependencies(&self, ignore_dev_deps: bool) -> Vec<(String, String)> {
@@ -50,5 +46,14 @@ impl GraphProject for GraphPkg<'_> {
         absorb(DependencyGroup::Optional);
         absorb(DependencyGroup::Prod);
         merged.into_iter().collect()
+    }
+}
+
+impl GraphProject for GraphPkg<'_> {
+    fn manifest_version(&self) -> Option<&str> {
+        self.project.manifest
+            .value()
+            .get("version")
+            .and_then(|version| version.as_str())
     }
 }

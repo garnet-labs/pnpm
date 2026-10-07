@@ -6,7 +6,7 @@
 //! side for the directory case lives in `pnpm-directory-fetcher`;
 //! this crate is resolution-only.
 //!
-//! Three public entry points:
+//! Public entry points:
 //!
 //! - [`resolve_from_local_scheme`] — claims a wanted dep iff its bare
 //!   specifier starts with `link:`, `workspace:`, or `file:`. The
@@ -22,10 +22,6 @@
 //!   `workspace:` specs so they don't accidentally route to a
 //!   named-registry alias named `link` / `file` / `workspace`.
 
-mod chain;
-mod local_resolver;
-mod parse_bare_specifier;
-
 pub use chain::{LocalPathResolver, LocalResolver, LocalSchemeResolver};
 pub use local_resolver::{
     LocalCurrentPkg, LocalResolveResult, LocalResolverContext, LocalResolverOptions,
@@ -33,6 +29,15 @@ pub use local_resolver::{
     resolve_from_local_scheme, resolve_latest_from_local,
 };
 pub use parse_bare_specifier::{
-    PathProtocolNotSupportedError, WantedLocalDependency, is_local_filesystem_specifier,
-    is_tarball_filename, local_tarball_path,
+    PathProtocolNotSupportedError, WantedLocalDependency, local_file_path, local_tarball_path,
 };
+pub use pnpm_local_spec::{is_local_filesystem_specifier, is_tarball_filename};
+
+mod chain;
+mod local_resolver;
+mod parse_bare_specifier;
+
+#[cfg(not(target_family = "wasm"))]
+use home::home_dir;
+#[cfg(target_family = "wasm")]
+use pnpm_fs::home_dir;

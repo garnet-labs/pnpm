@@ -84,10 +84,6 @@ pub fn pnpr_command_with_binary(bin: &Path, port: u16, public_url: Option<&str>)
         "pnpr binary not found at {bin:?} — \
          run `cargo build -p pnpr` before invoking the mock",
     );
-    // Seed the runtime storage with the registry-mock fixtures
-    // before pnpr starts serving. Idempotent — existing
-    // files are left alone, so CI can cache the runtime path
-    // across runs and only npm-proxied entries get fetched fresh.
     let seeded = seed_runtime_storage()
         .unwrap_or_else(|err| panic!("seed registry-mock fixtures into runtime storage: {err}"));
     if seeded > 0 {
@@ -101,6 +97,16 @@ pub fn pnpr_command_with_binary(bin: &Path, port: u16, public_url: Option<&str>)
         default_public_url.trim_end_matches('/')
     };
     let mut cmd = Command::new(bin);
+    // pnpr binds each of its options to the `PNPR_*` variable named after
+    // it, so an ambient one — a developer's `PNPR_CONFIG`, a stray
+    // `PNPR_DISABLE_REGISTRY` — would quietly reconfigure the mock. The
+    // arguments below are the only thing allowed to.
+    for (name, _) in env::vars_os() {
+        let key = name.to_string_lossy().to_ascii_uppercase();
+        if key.starts_with("PNPR_") {
+            cmd.env_remove(&name);
+        }
+    }
     // `pnpr` defaults to its bundled registry-mock config (the fixture
     // namespace served from local hosted storage, everything else proxied
     // through the pattern-less npmjs upstream), which is exactly what the

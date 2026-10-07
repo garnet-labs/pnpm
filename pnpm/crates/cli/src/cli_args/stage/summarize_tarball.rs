@@ -2,17 +2,15 @@
 //! `pnpm publish --json` emits — used by `pnpm stage download` to describe a
 //! staged tarball without re-packing it.
 
-use std::{collections::BTreeSet, io::Read};
-
+use super::StageError;
 use flate2::read::GzDecoder;
 use miette::{Context, IntoDiagnostic};
 use pnpm_pack::sort_paths_en_locale;
 use pnpm_package_manifest::parse_manifest;
+use pnpm_package_name::is_valid_old_npm_package_name;
 use pnpm_publish::{PackedPkgInfo, PublishSummary, create_publish_summary};
-use pnpm_resolving_parse_wanted_dependency::is_valid_old_npm_package_name;
 use serde_json::Value;
-
-use super::StageError;
+use std::{collections::BTreeSet, io::Read};
 
 struct TarballContents {
     files: Vec<String>,
@@ -25,8 +23,12 @@ struct TarballContents {
 /// [`PublishSummary`]. The tarball must contain a parseable
 /// `package/package.json` with a name and version.
 pub(super) fn summarize_tarball(tarball_data: &[u8]) -> miette::Result<PublishSummary> {
-    let TarballContents { mut files, bundled, manifest, unpacked_size } =
-        read_tarball_contents(tarball_data, true)?;
+    let TarballContents {
+        mut files,
+        bundled,
+        manifest,
+        unpacked_size,
+    } = read_tarball_contents(tarball_data, true)?;
 
     sort_paths_en_locale(&mut files);
     let name = manifest_string(&manifest, "name");
@@ -63,30 +65,22 @@ fn read_tarball_contents(
 ) -> miette::Result<TarballContents> {
     let tar_bytes = maybe_gunzip(tarball_data)?;
     let mut archive = tar::Archive::new(tar_bytes.as_slice());
-    let mut files: Vec<String> = Vec::new();
-    let mut bundled: BTreeSet<String> = BTreeSet::new();
+    archive.set_max_metadata_size(Some(pnpm_tarball::MAX_TARBALL_METADATA_BYTES));
+    let mut contents = FileSummary::default();
     let mut manifest_text: Option<String> = None;
-    let mut unpacked_size: u64 = 0;
 
-    let entries =
-        archive.entries().into_diagnostic().wrap_err("read the staged tarball's entries")?;
+    let entries = archive
+        .entries()
+        .into_diagnostic()
+        .wrap_err("read the staged tarball's entries")?;
     for entry in entries {
         let mut entry = entry.into_diagnostic().wrap_err("read a staged tarball entry")?;
         let path = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
         if include_summary && entry.header().entry_type().is_file() {
-            unpacked_size += entry.header().size().unwrap_or(0);
-            files.push(path.strip_prefix("package/").unwrap_or(&path).to_owned());
-            if let Some(name) = bundled_dependency_name(&path) {
-                bundled.insert(name);
-            }
+            contents.push_file(&path, entry.header().size().unwrap_or(0));
         }
         if path == "package/package.json" {
-            let mut text = String::new();
-            entry
-                .read_to_string(&mut text)
-                .into_diagnostic()
-                .wrap_err("read package/package.json from the staged tarball")?;
-            manifest_text = Some(text);
+            manifest_text = Some(read_entry_text(&mut entry)?);
         }
     }
 
@@ -99,7 +93,43 @@ fn read_tarball_contents(
     }
     validate_package_identity(&name, &version)?;
 
-    Ok(TarballContents { files, bundled, manifest, unpacked_size })
+    Ok(TarballContents {
+        files: contents.files,
+        bundled: contents.bundled,
+        manifest,
+        unpacked_size: contents.unpacked_size,
+    })
+}
+
+fn read_entry_text(entry: &mut tar::Entry<'_, &[u8]>) -> miette::Result<String> {
+    let mut text = String::new();
+    entry
+        .read_to_string(&mut text)
+        .into_diagnostic()
+        .wrap_err("read package/package.json from the staged tarball")?;
+    Ok(text)
+}
+
+/// What the summary records about the tarball's file entries.
+#[derive(Default)]
+struct FileSummary {
+    files: Vec<String>,
+    bundled: BTreeSet<String>,
+    unpacked_size: u64,
+}
+
+impl FileSummary {
+    fn push_file(&mut self, path: &str, size: u64) {
+        self.unpacked_size += size;
+        self.files.push(
+            path.strip_prefix("package/")
+                .unwrap_or(path)
+                .to_owned(),
+        );
+        if let Some(name) = bundled_dependency_name(path) {
+            self.bundled.insert(name);
+        }
+    }
 }
 
 /// The safe tarball basename `<normalized-name>-<version>[-<suffix>].tgz`,
@@ -110,7 +140,9 @@ pub(super) fn create_tarball_filename(
     suffix: Option<&str>,
 ) -> Result<String, StageError> {
     validate_package_identity(name, version)?;
-    let suffix = suffix.map(|suffix| format!("-{suffix}")).unwrap_or_default();
+    let suffix = suffix
+        .map(|suffix| format!("-{suffix}"))
+        .unwrap_or_default();
     let filename = format!("{}-{version}{suffix}.tgz", normalize_package_name(name));
     // The name/version validation above should already exclude separators;
     // reject outright if a validated component still smuggled one in.
@@ -142,12 +174,16 @@ fn normalize_package_name(name: &str) -> String {
 fn bundled_dependency_name(path: &str) -> Option<String> {
     let rest = path.strip_prefix("package/node_modules/")?;
     let mut segments = rest.split('/');
-    let first = segments.next().filter(|segment| !segment.is_empty())?;
+    let first = segments
+        .next()
+        .filter(|segment| !segment.is_empty())?;
     if let Some(scope) = first.strip_prefix('@') {
         if scope.is_empty() {
             return None;
         }
-        let second = segments.next().filter(|segment| !segment.is_empty())?;
+        let second = segments
+            .next()
+            .filter(|segment| !segment.is_empty())?;
         return Some(format!("{first}/{second}"));
     }
     Some(first.to_owned())
@@ -177,5 +213,9 @@ fn maybe_gunzip(data: &[u8]) -> Result<Vec<u8>, StageError> {
 }
 
 fn manifest_string(manifest: &Value, key: &str) -> String {
-    manifest.get(key).and_then(Value::as_str).unwrap_or_default().to_owned()
+    manifest
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }

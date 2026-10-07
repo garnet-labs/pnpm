@@ -339,6 +339,41 @@ test('restart: run stop, restart and start and all the pre/post scripts', async 
   ])
 })
 
+test('restart: run stop and start with their pre/post scripts when there is no restart script', async () => {
+  await using server = await createTestIpcServer()
+
+  prepare({
+    scripts: {
+      poststop: server.sendLineScript('poststop'),
+      prestop: server.sendLineScript('prestop'),
+      stop: server.sendLineScript('stop'),
+
+      poststart: server.sendLineScript('poststart'),
+      prestart: server.sendLineScript('prestart'),
+      start: server.sendLineScript('start'),
+    },
+  })
+
+  await restart.handler({
+    ...DEFAULT_OPTS,
+    bin: 'node_modules/.bin',
+    dir: process.cwd(),
+    enablePrePostScripts: true,
+    extraBinPaths: [],
+    extraEnv: {},
+    pnpmHomeDir: '',
+  }, [])
+
+  expect(server.getLines()).toStrictEqual([
+    'prestop',
+    'stop',
+    'poststop',
+    'prestart',
+    'start',
+    'poststart',
+  ])
+})
+
 test('"pnpm run" prints the list of available commands', async () => {
   prepare({
     scripts: {
@@ -676,8 +711,8 @@ test('pnpm run with RegExp script selector should work parallel as a default beh
     pnpmHomeDir: '',
   }, ['/build:.*/'])
 
-  const outputsA = serverA.getLines().map(x => Number.parseInt(x))
-  const outputsB = serverB.getLines().map(x => Number.parseInt(x))
+  const outputsA = serverA.getLines().map(line => Number.parseInt(line))
+  const outputsB = serverB.getLines().map(line => Number.parseInt(line))
 
   expect(Math.max(outputsA[0], outputsB[0]) < Math.min(outputsA[outputsA.length - 1], outputsB[outputsB.length - 1])).toBeTruthy()
 })
@@ -703,8 +738,8 @@ test('pnpm run with RegExp script selector should work sequentially with --works
     workspaceConcurrency: 1,
   }, ['/build:.*/'])
 
-  const outputsA = serverA.getLines().map(x => Number.parseInt(x))
-  const outputsB = serverB.getLines().map(x => Number.parseInt(x))
+  const outputsA = serverA.getLines().map(line => Number.parseInt(line))
+  const outputsB = serverB.getLines().map(line => Number.parseInt(line))
 
   expect(outputsA[0] < outputsB[0] && outputsA[1] < outputsB[1]).toBeTruthy()
 })

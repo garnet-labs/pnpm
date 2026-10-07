@@ -1,7 +1,6 @@
+use super::{OwnerArgs, OwnerError};
 use pnpm_config::Config;
 use serde_json::json;
-
-use super::{OwnerArgs, OwnerError};
 
 #[test]
 fn owner_entry_deserializes() {
@@ -137,8 +136,11 @@ async fn owner_ls_success() {
 #[tokio::test]
 async fn owner_ls_404_returns_package_not_found() {
     let mut server = mockito::Server::new_async().await;
-    let mock =
-        server.mock("GET", "/-/package/unknown-pkg/owners").with_status(404).create_async().await;
+    let mock = server
+        .mock("GET", "/-/package/unknown-pkg/owners")
+        .with_status(404)
+        .create_async()
+        .await;
 
     let config = config_with_registry(&server.url());
     let args = owner_args("ls", &["unknown-pkg"]);
@@ -610,7 +612,7 @@ async fn owner_add_registry_override() {
 #[test]
 fn normalize_registry_url_adds_trailing_slash() {
     assert_eq!(
-        super::normalize_registry_url("https://registry.example.com"),
+        pnpm_network::normalize_registry_url("https://registry.example.com"),
         "https://registry.example.com/",
     );
 }
@@ -618,7 +620,7 @@ fn normalize_registry_url_adds_trailing_slash() {
 #[test]
 fn normalize_registry_url_preserves_trailing_slash() {
     assert_eq!(
-        super::normalize_registry_url("https://registry.example.com/"),
+        pnpm_network::normalize_registry_url("https://registry.example.com/"),
         "https://registry.example.com/",
     );
 }

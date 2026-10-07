@@ -39,7 +39,7 @@ pub fn resolve_install_dir(global_dir: &Path, hash: &str) -> io::Result<Option<P
 /// stay isolated. The parent `global_dir` must already exist.
 pub fn create_install_dir(global_dir: &Path) -> io::Result<PathBuf> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let pid = std::process::id();
+    let pid = pnpm_fs::process_id();
     let mut last_err = None;
     for _ in 0..10 {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
@@ -53,6 +53,21 @@ pub fn create_install_dir(global_dir: &Path) -> io::Result<PathBuf> {
             Err(error) => return Err(error),
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| io::Error::other("could not create a unique global install dir")))
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::other("could not create a unique global install dir")
+    }))
+}
+
+/// Whether `install_dir` resides within `global_dir`, checking both lexical
+/// paths and canonical targets to handle symlinked base directories.
+#[must_use]
+pub fn is_global_install_subdir(global_dir: &Path, install_dir: &Path) -> bool {
+    if pnpm_fs::is_subdir(global_dir, install_dir) {
+        return true;
+    }
+    let canonical_pkg =
+        std::fs::canonicalize(global_dir).unwrap_or_else(|_| global_dir.to_path_buf());
+    let canonical_install =
+        std::fs::canonicalize(install_dir).unwrap_or_else(|_| install_dir.to_path_buf());
+    pnpm_fs::is_subdir(&canonical_pkg, &canonical_install)
 }

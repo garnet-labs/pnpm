@@ -7,18 +7,20 @@
 //! crate produces: a **sigstore bundle v0.3** (single certificate, `dsse`
 //! Rekor entry) — not the legacy v0.2 form (`x509CertificateChain`, `intoto`
 //! Rekor entry), which pacquet deliberately does not reproduce.
-//! The npm registry accepts the v0.3 bundle: a package published this way was
-//! verified end-to-end against npmjs.com (`@pnpm.e2e/testing-provenance2`,
-//! recorded in the Rekor transparency log), so the modern bundle is sufficient
-//! and no legacy-compatibility path is needed.
+//! The npm registry accepts the v0.3 bundle, so no legacy-compatibility path
+//! is needed.
+
+mod gitlab_parameters;
 
 use std::time::Duration;
 
 use pnpm_diagnostics::miette::{self, Diagnostic};
+#[cfg(not(target_family = "wasm"))]
 use pnpm_network::{RetryOpts, redact_url_credentials};
 use pnpm_reporter::Reporter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
+#[cfg(not(target_family = "wasm"))]
 use sigstore_sign::{SigningContext, oidc::IdentityToken};
 
 use crate::{
@@ -29,6 +31,7 @@ use crate::{
         is_gitlab, truthy_env,
     },
 };
+use gitlab_parameters::gitlab_parameters;
 
 const IN_TOTO_STATEMENT_V1_TYPE: &str = "https://in-toto.io/Statement/v1";
 const IN_TOTO_STATEMENT_V01_TYPE: &str = "https://in-toto.io/Statement/v0.1";
@@ -109,6 +112,7 @@ pub struct SignedProvenance {
     pub data: String,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl SignProvenance for Host {
     async fn sign_statement(
         jwt: &str,
@@ -121,15 +125,27 @@ impl SignProvenance for Host {
         let deadline = timeout.unwrap_or(DEFAULT_SIGN_TIMEOUT);
         sign_with_retry(SIGN_RETRY_OPTS, || {
             with_sign_deadline(deadline, async {
-                let bundle =
-                    context.signer(token.clone()).sign_raw_statement(statement).await.map_err(
-                        |source| ProvenanceGenError::Sign { source: source.to_string() },
-                    )?;
+                let bundle = context
+                    .signer(token.clone())
+                    .sign_raw_statement(statement)
+                    .await
+                    .map_err(|source| ProvenanceGenError::Sign { source: source.to_string() })?;
                 let data = serde_json::to_string(&bundle).expect("serialize sigstore bundle");
                 Ok(SignedProvenance { media_type: bundle.media_type, data })
             })
         })
         .await
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl SignProvenance for Host {
+    async fn sign_statement(
+        _jwt: &str,
+        _statement: &[u8],
+        _timeout: Option<Duration>,
+    ) -> Result<SignedProvenance, ProvenanceGenError> {
+        Err(ProvenanceGenError::UnsupportedRuntime)
     }
 }
 
@@ -141,6 +157,7 @@ impl SignProvenance for Host {
 /// signing exchange. Every step is idempotent (a fresh ephemeral key,
 /// certificate, timestamp, and transparency-log entry per attempt), so
 /// re-running it is safe.
+#[cfg(not(target_family = "wasm"))]
 const SIGN_RETRY_OPTS: RetryOpts = RetryOpts {
     retries: 2,
     factor: 2,
@@ -152,8 +169,10 @@ const SIGN_RETRY_OPTS: RetryOpts = RetryOpts {
 /// `fetch-timeout` — the sigstore-rust clients set no request timeout of
 /// their own, so without a deadline a hung connection stalls the publish
 /// until the OS gives up on the socket.
+#[cfg(not(target_family = "wasm"))]
 const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(not(target_family = "wasm"))]
 async fn with_sign_deadline<Fut>(
     deadline: Duration,
     attempt: Fut,
@@ -172,6 +191,7 @@ where
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn sign_with_retry<Fut>(
     retry_opts: RetryOpts,
     mut attempt_fn: impl FnMut() -> Fut,
@@ -205,8 +225,9 @@ where
 /// (`pkg:npm/<name>@<version>`), with only a leading scope `@`
 /// percent-encoded to `%40` (the `/` is left intact).
 fn npm_purl(name: &str, version: &str) -> String {
-    let encoded =
-        name.strip_prefix('@').map_or_else(|| name.to_owned(), |rest| format!("%40{rest}"));
+    let encoded = name
+        .strip_prefix('@')
+        .map_or_else(|| name.to_owned(), |rest| format!("%40{rest}"));
     format!("pkg:npm/{encoded}@{version}")
 }
 
@@ -229,10 +250,12 @@ fn github_statement<Sys: EnvVar>(subject: &Value) -> Value {
     let workflow_ref = env::<Sys>("GITHUB_WORKFLOW_REF");
     // GITHUB_WORKFLOW_REF is `owner/repo/path@ref`; strip the `owner/repo/`
     // prefix, then split the remainder on `@` into path and ref.
-    let relative_ref =
-        workflow_ref.strip_prefix(&format!("{repository}/")).unwrap_or(&workflow_ref);
-    let (workflow_path, workflow_ref_only) =
-        relative_ref.split_once('@').unwrap_or((relative_ref, ""));
+    let relative_ref = workflow_ref
+        .strip_prefix(&format!("{repository}/"))
+        .unwrap_or(&workflow_ref);
+    let (workflow_path, workflow_ref_only) = relative_ref
+        .split_once('@')
+        .unwrap_or((relative_ref, ""));
 
     json!({
         "_type": IN_TOTO_STATEMENT_V1_TYPE,
@@ -260,18 +283,22 @@ fn github_statement<Sys: EnvVar>(subject: &Value) -> Value {
                     "digest": { "gitCommit": env::<Sys>("GITHUB_SHA") },
                 }],
             },
-            "runDetails": {
-                "builder": {
-                    "id": format!("{GITHUB_BUILDER_ID_PREFIX}/{}", env::<Sys>("RUNNER_ENVIRONMENT")),
-                },
-                "metadata": {
-                    "invocationId": format!(
-                        "{server_url}/{repository}/actions/runs/{}/attempts/{}",
-                        env::<Sys>("GITHUB_RUN_ID"),
-                        env::<Sys>("GITHUB_RUN_ATTEMPT"),
-                    ),
-                },
-            },
+            "runDetails": github_run_details::<Sys>(&server_url, &repository),
+        },
+    })
+}
+
+fn github_run_details<Sys: EnvVar>(server_url: &str, repository: &str) -> Value {
+    json!({
+        "builder": {
+            "id": format!("{GITHUB_BUILDER_ID_PREFIX}/{}", env::<Sys>("RUNNER_ENVIRONMENT")),
+        },
+        "metadata": {
+            "invocationId": format!(
+                "{server_url}/{repository}/actions/runs/{}/attempts/{}",
+                env::<Sys>("GITHUB_RUN_ID"),
+                env::<Sys>("GITHUB_RUN_ATTEMPT"),
+            ),
         },
     })
 }
@@ -293,6 +320,7 @@ fn gitlab_statement<Sys: EnvVar>(subject: &Value) -> Value {
                     "digest": { "sha1": env::<Sys>("CI_COMMIT_SHA") },
                     "entryPoint": env::<Sys>("CI_JOB_NAME"),
                 },
+                "parameters": gitlab_parameters::<Sys>(),
                 "environment": {
                     "name": env::<Sys>("CI_RUNNER_DESCRIPTION"),
                     "architecture": env::<Sys>("CI_RUNNER_EXECUTABLE_ARCH"),
@@ -369,6 +397,11 @@ impl From<GitHubRequestTokenError> for ProvenanceGenError {
 /// Failure surface of [`generate_provenance`].
 #[derive(Debug, derive_more::Display, derive_more::Error, Diagnostic)]
 pub enum ProvenanceGenError {
+    #[cfg(target_family = "wasm")]
+    #[display("Automatic provenance signing is not supported in WebContainers")]
+    #[diagnostic(code(ERR_PNPM_PROVENANCE_UNSUPPORTED_RUNTIME))]
+    UnsupportedRuntime,
+
     #[display("Automatic provenance generation is not supported for this CI provider")]
     #[diagnostic(code(ERR_PNPM_PROVENANCE_UNSUPPORTED_PROVIDER))]
     UnsupportedProvider,
@@ -397,7 +430,6 @@ pub enum ProvenanceGenError {
     #[display("invalid id-token request URL: {_0}")]
     InvalidRequestUrl(url::ParseError),
 
-    #[display("{_0}")]
     Fetch(OidcFetchError),
 
     #[display("invalid sigstore identity token: {source}")]

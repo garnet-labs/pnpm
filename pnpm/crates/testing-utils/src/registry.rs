@@ -61,8 +61,8 @@ impl TestRegistry {
     }
 
     #[must_use]
-    pub fn url(&self) -> String {
-        self.url.clone()
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Move `tag` to `version`, the way the JS harness's `addDistTag` does.
@@ -78,6 +78,15 @@ impl TestRegistry {
             "re-tagging needs a registry of the test's own — start it with add_mocked_registry_with_own_storage",
         );
         pnpr_fixtures::set_dist_tag(storage, package, version, tag);
+    }
+
+    /// See [`pnpr_fixtures::remove_version_field`]. Needs a registry of the
+    /// test's own, as [`Self::set_dist_tag`] does.
+    pub fn remove_version_field(&self, package: &str, version: &str, field: &str) {
+        let storage = self.storage.as_deref().expect(
+            "editing metadata needs a registry of the test's own — start it with add_mocked_registry_with_own_storage",
+        );
+        pnpr_fixtures::remove_version_field(storage, package, version, field);
     }
 }
 
@@ -117,13 +126,13 @@ impl TestRegistryInstance {
             RegistryMode::Proxy => Config::proxy(listen, storage),
             RegistryMode::Static => Config::static_serve(listen, storage),
         };
-        config.public_url = url.trim_end_matches('/').to_string();
+        config.http.public_url = url.trim_end_matches('/').to_string();
         // Registration is opt-in; tests that forward credentials create
         // accounts via adduser against this registry.
-        config.auth.htpasswd.max_users = pnpr::MaxUsers::Unlimited;
+        config.identity.auth.htpasswd.max_users = pnpr::MaxUsers::Unlimited;
         // A long TTL keeps the fixture packuments (whose `time` values are static)
         // from being treated as stale and refetched from the upstream.
-        config.packument_ttl = std::time::Duration::from_hours(8760);
+        config.http.packument_ttl = std::time::Duration::from_hours(8760);
         thread::Builder::new()
             .name("pacquet-test-registry".to_string())
             .spawn(move || run_registry(config, listener))

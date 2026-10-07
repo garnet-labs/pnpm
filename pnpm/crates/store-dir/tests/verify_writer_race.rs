@@ -93,24 +93,19 @@ fn cas_path_for(store: &StoreDir, content: &[u8]) -> std::path::PathBuf {
         .expect("sha512 hex is always a valid CAFS path")
 }
 
-/// The reproducer.
-///
-/// Pre-Option-C: the verifier deletes the file while the simulated
-/// writer "holds the lock", because `verify_file` doesn't acquire the
-/// lock at all.
-///
-/// Post-Option-C: the verifier acquires `cas_write_lock(path)`
-/// before deciding whether to delete. While the test holds the
-/// lock, the verifier blocks; we observe the file is still on disk.
-/// Then the test releases the lock, the verifier finishes, and we
-/// observe the file is still there (because the verifier now sees
-/// the final committed state).
+/// The verifier acquires `cas_write_lock(path)` before deciding whether
+/// to delete. While the test holds the lock, the verifier blocks; we
+/// observe the file is still on disk. Then the test releases the lock,
+/// the verifier finishes, and we observe the file is still there,
+/// because the verifier now sees the final committed state.
 #[test]
 fn verify_does_not_unlink_file_while_writer_holds_cas_lock() {
     let tmp = tempdir().expect("tempdir");
     let store = StoreDir::new(tmp.path().to_path_buf());
 
-    let expected_content: Vec<u8> = (0..CONTENT_SIZE).map(|i| (i % 256) as u8).collect();
+    let expected_content: Vec<u8> = (0..CONTENT_SIZE)
+        .map(|i| (i % 256) as u8)
+        .collect();
     let target = cas_path_for(&store, &expected_content);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).expect("create shard dir");
@@ -140,7 +135,9 @@ fn verify_does_not_unlink_file_while_writer_holds_cas_lock() {
     let result_slot_writer = Arc::clone(&result_slot);
     let target_for_verifier = target.clone();
     let verifier = thread::spawn(move || {
-        verifier_started_tx.send(()).expect("send start");
+        verifier_started_tx
+            .send(())
+            .expect("send start");
         let pkg_index = make_index("LICENSE", &verify_content);
         let cache = VerifiedFilesCache::new();
         let result = check_pkg_files_integrity(&verify_store, pkg_index, &cache);

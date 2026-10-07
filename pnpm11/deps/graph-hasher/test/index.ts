@@ -1,6 +1,6 @@
 import { describe, expect, test } from '@jest/globals'
 import { hashObject, hashObjectWithoutSorting } from '@pnpm/crypto.object-hasher'
-import { calcDepState, calcDepStateInputKey, calcGraphNodeHash, computeBuildRequiredDepPaths, findRuntimeNodeVersion, readSnapshotRuntimePin } from '@pnpm/deps.graph-hasher'
+import { calcDepState, calcDepStateInputKey, calcGraphNodeHash, computeBuildRequiredDepPaths, readSnapshotRuntimePin } from '@pnpm/deps.graph-hasher'
 import { engineName } from '@pnpm/engine.runtime.system-version'
 import type { DepPath, PkgIdWithPatchHash } from '@pnpm/types'
 
@@ -34,7 +34,7 @@ const depsGraph = {
 test('calcDepState()', () => {
   expect(calcDepState(depsGraph, {}, 'foo@1.0.0', {
     includeDepGraphHash: true,
-  })).toBe(`${ENGINE_NAME};deps=${hashObject({
+  })).toBe(`${ENGINE_NAME};format=2;deps=${hashObject({
     id: 'foo@1.0.0:000',
     deps: {
       bar: hashObject({
@@ -53,7 +53,7 @@ test('calcDepState()', () => {
 test('calcDepState() when scripts are ignored', () => {
   expect(calcDepState(depsGraph, {}, 'foo@1.0.0', {
     includeDepGraphHash: false,
-  })).toBe(ENGINE_NAME)
+  })).toBe(`${ENGINE_NAME};format=2`)
 })
 
 test('calcDepStateInputKey() excludes the host engine and includes patches', () => {
@@ -121,23 +121,6 @@ test('calcDepStateInputKey() isolates cyclic roots', () => {
   })).toBe(`dependency-side-effects:v1:deps=${rootBar}`)
 })
 
-test('findRuntimeNodeVersion() pulls the pinned major from a node@runtime: snapshot key', () => {
-  // Mirrors pacquet's `find_runtime_node_major` helper; both must
-  // agree on the version-extraction rule or the two tools would
-  // hash GVS slots under different engine majors for the same
-  // project. The peer-suffixed form must reduce to the same bare
-  // version as the form without a peer suffix.
-  expect(
-    findRuntimeNodeVersion(['leftpad@1.3.0', 'node@runtime:22.11.0'])
-  ).toBe('22.11.0')
-  expect(
-    findRuntimeNodeVersion(['node@runtime:22.11.0(node@22.11.0)'])
-  ).toBe('22.11.0')
-  expect(
-    findRuntimeNodeVersion(['leftpad@1.3.0', 'is-positive@3.1.0'])
-  ).toBeUndefined()
-})
-
 test('readSnapshotRuntimePin() pulls the own pin from a graph node child', () => {
   // The resolver desugars a dep's `engines.runtime` into
   // `dependencies.node: 'runtime:<version>'` and `refToRelative`
@@ -175,7 +158,7 @@ test('calcDepState() uses the snapshot\'s own engines.runtime pin', () => {
   expect(calcDepState(graph, {}, 'pinned@1.0.0', {
     includeDepGraphHash: false,
     nodeVersion: '20.5.0', // install-wide fallback differs from own pin
-  })).toBe(`${process.platform};${process.arch};node22`)
+  })).toBe(`${process.platform};${process.arch};node22;format=2`)
 })
 
 describe('calcGraphNodeHash', () => {

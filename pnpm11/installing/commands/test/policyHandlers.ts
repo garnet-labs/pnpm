@@ -1,6 +1,10 @@
 import { expect, jest, test } from '@jest/globals'
 
-import { type PolicyViolation, setupPolicyHandlers } from '../lib/policyHandlers.js'
+import type { PolicyViolation } from '../lib/policyHandlers.js'
+
+const confirm = jest.fn<(options: { message: string, default: boolean }) => Promise<boolean>>()
+jest.unstable_mockModule('@inquirer/prompts', () => ({ confirm }))
+const { setupPolicyHandlers } = await import('../lib/policyHandlers.js')
 
 function violation (
   name: string,
@@ -14,47 +18,29 @@ function violation (
 // original descriptor — not just the value — so the property's
 // configurability/enumerability shape doesn't leak between tests when
 // the host process didn't define an own `isTTY` at all.
-function withStdinTTY (value: boolean | undefined, fn: () => void | Promise<void>): void | Promise<void> {
+async function withStdinTTY (value: boolean | undefined, fn: () => void | Promise<void>): Promise<void> {
   const originalDescriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')
   Object.defineProperty(process.stdin, 'isTTY', { value, configurable: true, writable: true })
-  const restore = (): void => {
+  try {
+    await fn()
+  } finally {
     if (originalDescriptor) {
       Object.defineProperty(process.stdin, 'isTTY', originalDescriptor)
     } else {
       delete (process.stdin as { isTTY?: boolean }).isTTY
     }
   }
-  let result: void | Promise<void>
-  try {
-    result = fn()
-  } catch (err) {
-    restore()
-    throw err
-  }
-  if (result && typeof (result as Promise<void>).then === 'function') {
-    return (result as Promise<void>).then(
-      (v) => {
-        restore(); return v
-      },
-      (err) => {
-        restore(); throw err
-      }
-    )
-  }
-  restore()
-  return result
 }
 
 test('setupPolicyHandlers returns undefined when no policy is active', () => {
   expect(setupPolicyHandlers({})).toBeUndefined()
 })
 
-test('setupPolicyHandlers returns a plan even when strict mode is on without a TTY', () => {
-  // Pre-refactor this returned undefined and the resolver did the fail-fast
-  // throw. Now the plan is always returned: the strict-no-TTY case throws
-  // from the handler with the full violation list, not just the first
-  // immature pick the resolver happened to hit.
-  withStdinTTY(false, () => {
+test('setupPolicyHandlers returns a plan even when strict mode is on without a TTY', async () => {
+  // The plan is always returned: the strict-no-TTY case throws from the
+  // handler with the full violation list, not just the first immature pick
+  // the resolver happened to hit.
+  await withStdinTTY(false, () => {
     expect(setupPolicyHandlers({
       minimumReleaseAge: 60,
       minimumReleaseAgeStrict: true,
@@ -79,8 +65,8 @@ test('strict no-TTY plan throws from the hook with the full violation list', asy
   })
 })
 
-test('setupPolicyHandlers returns a plan when ci=false and stdin is a TTY', () => {
-  withStdinTTY(true, () => {
+test('setupPolicyHandlers returns a plan when ci=false and stdin is a TTY', async () => {
+  await withStdinTTY(true, () => {
     const plan = setupPolicyHandlers({
       minimumReleaseAge: 60,
       minimumReleaseAgeStrict: true,
@@ -178,4 +164,37 @@ test('the hook is a no-op in loose mode regardless of violations', async () => {
   // `pickManifestUpdates` at the end of the install.
   await expect(plan.handleResolutionPolicyViolations([violation('foo', '1.0.0')]))
     .resolves.toBeUndefined()
+})
+
+test('strict no-TTY errors count unique package versions', async () => {
+  await withStdinTTY(false, async () => {
+    const plan = setupPolicyHandlers({ minimumReleaseAge: 60, minimumReleaseAgeStrict: true, ci: false })!
+    await expect(plan.handleResolutionPolicyViolations([
+      violation('foo', '1.0.0'),
+      violation('foo', '2.0.0'),
+      violation('foo', '1.0.0'),
+      violation('bar', '1.0.0'),
+    ])).rejects.toMatchObject({
+      message: '3 versions do not meet the minimumReleaseAge constraint:\n  bar@1.0.0 stub reason\n  foo@1.0.0 stub reason\n  foo@2.0.0 stub reason',
+    })
+  })
+})
+
+test('approval prompts list each package version once', async () => {
+  confirm.mockResolvedValueOnce(true)
+  await withStdinTTY(true, async () => {
+    const plan = setupPolicyHandlers({ minimumReleaseAge: 60, minimumReleaseAgeStrict: true, ci: false })!
+    await plan.handleResolutionPolicyViolations([
+      violation('foo', '1.0.0'),
+      violation('bar', '1.0.0'),
+      violation('foo', '2.0.0'),
+      violation('foo', '1.0.0'),
+      violation('ignored', '1.0.0', 'TRUST_DOWNGRADE'),
+    ])
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(confirm).toHaveBeenCalledWith({
+      message: '3 versions do not meet the minimumReleaseAge constraint:\n  bar@1.0.0\n  foo@1.0.0\n  foo@2.0.0\nAdd to minimumReleaseAgeExclude in pnpm-workspace.yaml and proceed with the install?',
+      default: false,
+    })
+  })
 })

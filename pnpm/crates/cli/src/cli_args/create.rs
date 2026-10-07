@@ -88,13 +88,21 @@ impl CreateArgs {
         dir: &Path,
         config: &'static mut Config,
     ) -> miette::Result<()> {
-        let CreateArgs { command, allow_build, shell_mode, cpu, os, libc } = self;
+        let CreateArgs {
+            command,
+            allow_build,
+            shell_mode,
+            cpu,
+            os,
+            libc,
+        } = self;
         let mut command_iter = command.into_iter();
         let name = command_iter.next().ok_or(CreateError::MissingArgs)?;
         let args: Vec<String> = command_iter.collect();
         let create_name = convert_to_create_name(&name);
         let dlx_args = DlxArgs {
             command: std::iter::once(create_name).chain(args).collect(),
+            version: None,
             package: vec![],
             allow_build,
             shell_mode,

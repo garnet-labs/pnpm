@@ -17,6 +17,9 @@
       "path": "../../../bins/linker"
     },
     {
+      "path": "../../../building/during-install"
+    },
+    {
       "path": "../../../building/policy"
     },
     {
@@ -53,6 +56,9 @@
       "path": "../../../deps/security/signatures"
     },
     {
+      "path": "../../../exec/npm-lifecycle"
+    },
+    {
       "path": "../../../global/commands"
     },
     {
@@ -75,6 +81,9 @@
     },
     {
       "path": "../../../network/auth-header"
+    },
+    {
+      "path": "../../../os/env/path-extender"
     },
     {
       "path": "../../../pkg-manifest/utils"

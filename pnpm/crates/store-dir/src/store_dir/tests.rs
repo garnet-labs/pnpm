@@ -55,7 +55,10 @@ fn from_pathbuf_does_not_double_append_when_already_suffixed() {
 fn modules_yaml_serialized_store_dir_carries_store_version() {
     let store = StoreDir::new("/tmp/.pnpm-store");
     let recorded = store.display().to_string();
-    let pnpm_would_emit = Path::new("/tmp/.pnpm-store").join(STORE_VERSION).display().to_string();
+    let pnpm_would_emit = Path::new("/tmp/.pnpm-store")
+        .join(STORE_VERSION)
+        .display()
+        .to_string();
     assert_eq!(recorded, pnpm_would_emit);
 }
 
@@ -114,6 +117,41 @@ fn init_rejects_non_directory_files_path() {
             "a failing init must not seed the shard cache",
         );
     }
+}
+
+/// A group-writable store directory (shared store, setgid) must pass
+/// group-write and setgid to `files/` and the shards `init` creates.
+/// New CAS files then inherit that mode. A pre-existing `v11` directory
+/// is not chmod'd.
+#[cfg(unix)]
+#[test]
+fn init_new_shards_inherit_group_write_and_setgid() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use tempfile::tempdir;
+
+    let tempdir = tempdir().unwrap();
+    let versioned = tempdir.path().join("v11");
+    std::fs::create_dir(&versioned).unwrap();
+    std::fs::set_permissions(&versioned, std::fs::Permissions::from_mode(0o2775)).unwrap();
+
+    let store = StoreDir::new(tempdir.path());
+    store.init().unwrap();
+
+    let files = versioned.join("files");
+    let shard = files.join("00");
+    for dir in [&versioned, &files, &shard] {
+        let mode = std::fs::metadata(dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o020, 0, "{} must stay group-writable, mode {mode:04o}", dir.display());
+        assert_ne!(mode & 0o2000, 0, "{} must stay setgid, mode {mode:04o}", dir.display());
+    }
+    assert_eq!(
+        std::fs::metadata(&versioned).unwrap().mode() & 0o7777,
+        0o2775,
+        "init must not chmod the store directory that already existed",
+    );
 }
 
 #[test]

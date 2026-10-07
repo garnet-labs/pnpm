@@ -5,11 +5,17 @@ use command_extra::CommandExtra;
 use pnpm_config::WorkspaceSettings;
 use pnpm_lockfile::EnvLockfile;
 use pnpm_modules_yaml::{Host, NodeLinker, read_modules_manifest};
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-#[cfg(unix)]
-use pnpm_testing_utils::fs::is_symlink_or_junction;
+use pnpm_testing_utils::{
+    bin::{AddMockedRegistry, CommandTempCwd},
+    fs::{bump_mtime, is_symlink_or_junction},
+};
 use pnpm_workspace_state::ConfigDependency;
-use std::{fs, path::Path, process::Command};
+use std::{
+    fmt::Write as _,
+    fs,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 fn pacquet_at(workspace: &Path) -> Command {
     Command::cargo_bin("pnpm").expect("find the pnpm binary").with_current_dir(workspace)
@@ -21,8 +27,13 @@ fn pacquet_at(workspace: &Path) -> Command {
 /// `pnpm-lock.yaml`).
 #[test]
 fn installs_configurational_dependencies() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     fs::write(workspace.join("package.json"), serde_json::json!({}).to_string())
@@ -35,7 +46,10 @@ fn installs_configurational_dependencies() {
     yaml.push_str("\nconfigDependencies:\n  '@pnpm.e2e/foo': 100.0.0\n");
     fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let installed = workspace.join("node_modules/.pnpm-config/@pnpm.e2e/foo/package.json");
     assert!(installed.exists(), "config dep must be linked under .pnpm-config");
@@ -44,6 +58,54 @@ fn installs_configurational_dependencies() {
     assert!(lockfile.starts_with("---\n"), "env document must lead pnpm-lock.yaml");
     assert!(lockfile.contains("configDependencies:"));
     assert!(lockfile.contains("@pnpm.e2e/foo"));
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn config_dependency_install_waits_for_the_store_operation_lock() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir.clone());
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(workspace.join("package.json"), serde_json::json!({}).to_string())
+        .expect("write package.json");
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    yaml.push_str("\nconfigDependencies:\n  '@pnpm.e2e/foo': 100.0.0\n");
+    fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
+
+    let prune_lock = store_dir.lock_for_prune().expect("lock store for prune");
+    let output_path = workspace.join("config-dependency-lock.ndjson");
+    let mut install = pacquet_at(&workspace)
+        .with_args(["--reporter=ndjson", "--loglevel=debug", "install"])
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&output_path).expect("create install output"))
+        .spawn()
+        .expect("spawn install");
+    _utils::wait_for_child_output(
+        &mut install,
+        &output_path,
+        "Waiting for the configuration dependency store operation lock",
+    );
+    _utils::assert_child_output_stays_absent(
+        &mut install,
+        &output_path,
+        "Acquired the configuration dependency store operation lock",
+    );
+
+    drop(prune_lock);
+    assert!(_utils::wait_for_child(&mut install).success());
+    let output = fs::read_to_string(&output_path).expect("read completed install output");
+    assert!(
+        output.contains("Acquired the configuration dependency store operation lock"),
+        "{output}",
+    );
+    assert!(
+        workspace.join("node_modules/.pnpm-config/@pnpm.e2e/foo/package.json").exists(),
+        "config dependency must be materialized after the prune lock is released",
+    );
 
     drop((root, mock_instance));
 }
@@ -63,12 +125,120 @@ fn second_install_keeps_config_dependency() {
     yaml.push_str("\nconfigDependencies:\n  '@pnpm.e2e/foo': 100.0.0\n");
     fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
 
-    pacquet_at(&workspace).with_arg("install").assert().success();
-    pacquet_at(&workspace).with_arg("install").assert().success();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
 
     assert!(
         workspace.join("node_modules/.pnpm-config/@pnpm.e2e/foo/package.json").exists(),
         "config dep must remain linked after a repeat install",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn offline_config_dependency_reuses_regular_dependency_store_entry() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    let version = "100.0.0";
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "regular-store-seed",
+            "version": "1.0.0",
+            "dependencies": { name: version },
+        })
+        .to_string(),
+    )
+    .expect("write seed package.json");
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "name": "config-dep-consumer", "version": "1.0.0" }).to_string(),
+    )
+    .expect("replace package.json");
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    write!(yaml, "\nconfigDependencies:\n  '{name}': {version}\n").expect(
+        "append configDependencies",
+    );
+    fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
+
+    pacquet_at(&workspace)
+        .with_args(["install", "--offline"])
+        .assert()
+        .success();
+
+    assert!(
+        workspace
+            .join("node_modules/.pnpm-config/@pnpm.e2e/dep-of-pkg-with-1-dep/package.json")
+            .exists(),
+        "offline config dependency must reuse the store entry from the regular dependency",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn offline_config_dependency_reuses_prior_config_dependency_store_entry() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir.clone());
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    let version = "100.0.0";
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "name": "config-dep-consumer", "version": "1.0.0" }).to_string(),
+    )
+    .expect("write package.json");
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    write!(yaml, "\nconfigDependencies:\n  '{name}': {version}\n").expect(
+        "append configDependencies",
+    );
+    fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    let links_dir = store_dir.links();
+    if links_dir.exists() {
+        fs::remove_dir_all(&links_dir).expect("remove global virtual store links");
+    }
+
+    pacquet_at(&workspace)
+        .with_args(["install", "--offline"])
+        .assert()
+        .success();
+
+    assert!(
+        workspace
+            .join("node_modules/.pnpm-config/@pnpm.e2e/dep-of-pkg-with-1-dep/package.json")
+            .exists(),
+        "offline config dependency must reuse the row written by the prior config-dependency install",
     );
 
     drop((root, mock_instance));
@@ -95,20 +265,131 @@ fn update_config_hook_mutates_config_before_install() {
     )
     .expect("write .pnpmfile.cjs");
 
-    pacquet_at(&workspace).with_arg("install").assert().success();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
 
     let dep = workspace.join("node_modules/@pnpm.e2e/foo");
     assert!(dep.join("package.json").exists(), "dependency is installed");
-    // On Unix, hoisted linking materializes the dep as a real directory
-    // (isolated would symlink it), which proves the hook flipped
-    // `nodeLinker`. Windows top-level deps are junctions under both
-    // linkers — see `hoisted_node_linker.rs`'s `#![cfg(unix)]` gate — so
-    // the cross-platform proof that `updateConfig` ran lives in
-    // `update_config_hook_injects_catalog`.
-    #[cfg(unix)]
+    // Hoisted linking materializes the dep as a real directory, where
+    // isolated would link it into the virtual store, so this is what
+    // proves the hook flipped `nodeLinker`.
     assert!(
         !is_symlink_or_junction(&dep).unwrap(),
         "updateConfig forced nodeLinker: hoisted, so the dep is a real directory, not a symlink",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// The command line outranks an `updateConfig` hook: the hook's rerouted
+/// default registry and flipped `nodeLinker` both lose to the flags, so
+/// the install still fetches from the mocked registry and lays the
+/// dependency out hoisted.
+#[test]
+fn update_config_hook_cannot_override_command_line_settings() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let registry_url = mock_instance.url();
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/foo": "100.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) {\n  config.registries = { default: 'http://127.0.0.1:1/' };\n  config.nodeLinker = 'isolated';\n  return config;\n} } }",
+    )
+    .expect("write .pnpmfile.cjs");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .with_arg("--registry")
+        .with_arg(registry_url)
+        .with_arg("--config.node-linker=hoisted")
+        .assert()
+        .success();
+
+    let dep = workspace.join("node_modules/@pnpm.e2e/foo");
+    assert!(dep.join("package.json").exists(), "dependency is installed from the CLI registry");
+    #[cfg(unix)]
+    assert!(
+        !is_symlink_or_junction(&dep).unwrap(),
+        "--config.node-linker=hoisted outranks the hook's nodeLinker: isolated",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// A `--config.@<scope>:registry` override survives a hook that reroutes
+/// the same scope.
+#[test]
+fn update_config_hook_cannot_override_command_line_scoped_registry() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let registry_url = mock_instance.url();
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/foo": "100.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) {\n  config.registries = { '@pnpm.e2e': 'http://127.0.0.1:1/' };\n  return config;\n} } }",
+    )
+    .expect("write .pnpmfile.cjs");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .with_arg(format!("--config.@pnpm.e2e:registry={registry_url}"))
+        .assert()
+        .success();
+
+    assert!(
+        workspace.join("node_modules/@pnpm.e2e/foo/package.json").exists(),
+        "dependency is installed from the CLI scoped registry",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// A CLI `--no-proxy` override survives a hook that sets an unreachable
+/// proxy and clears `noProxy`: requests to the mocked registry at
+/// `127.0.0.1` still bypass the proxy and the install succeeds.
+#[test]
+fn update_config_hook_cannot_override_command_line_proxy_settings() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let registry_url = mock_instance.url();
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/foo": "100.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) {\n  config.httpProxy = 'http://127.0.0.1:1/';\n  config.noProxy = '';\n  return config;\n} } }",
+    )
+    .expect("write .pnpmfile.cjs");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .with_arg("--registry")
+        .with_arg(registry_url)
+        .with_arg("--no-proxy=127.0.0.1")
+        .assert()
+        .success();
+
+    assert!(
+        workspace.join("node_modules/@pnpm.e2e/foo/package.json").exists(),
+        "dependency is installed because CLI --no-proxy is preserved",
     );
 
     drop((root, mock_instance));
@@ -183,8 +464,10 @@ fn add_config_accepts_multiple_package_selectors_in_one_operation() {
         assert_eq!(dependency.specifier, "100.0.0");
         assert_eq!(dependency.version, "100.0.0");
 
-        let installed =
-            workspace.join("node_modules/.pnpm-config").join(package_name).join("package.json");
+        let installed = workspace
+            .join("node_modules/.pnpm-config")
+            .join(package_name)
+            .join("package.json");
         assert!(installed.exists(), "config dependency installed at {}", installed.display());
     }
 
@@ -242,7 +525,10 @@ fn update_config_hook_injects_catalog() {
     )
     .expect("write .pnpmfile.cjs");
 
-    pacquet_at(&workspace).with_arg("install").assert().success();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
 
     assert!(
         workspace.join("node_modules/.pnpm/@pnpm.e2e+foo@100.0.0").exists(),
@@ -252,8 +538,10 @@ fn update_config_hook_injects_catalog() {
     drop((root, mock_instance));
 }
 
+/// The hook reads the store the command line chose, and its own
+/// `storeDir` loses to it: the install records the CLI store.
 #[test]
-fn update_config_observes_and_can_replace_the_cli_store_dir() {
+fn update_config_observes_but_cannot_replace_the_cli_store_dir() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
@@ -270,7 +558,10 @@ fn update_config_observes_and_can_replace_the_cli_store_dir() {
     )
     .expect("write .pnpmfile.cjs");
 
-    pacquet_at(&workspace).with_args(["install", "--store-dir=cli-store"]).assert().success();
+    pacquet_at(&workspace)
+        .with_args(["install", "--store-dir=cli-store"])
+        .assert()
+        .success();
 
     let observed = fs::read_to_string(workspace.join("observed-store.txt"))
         .expect("read store observed by updateConfig");
@@ -281,20 +572,19 @@ fn update_config_observes_and_can_replace_the_cli_store_dir() {
     )
     .expect("read .modules.yaml")
     .expect(".modules.yaml exists");
-    let hook_store =
-        dunce::canonicalize(&workspace).expect("canonicalize workspace").join("hook-store/v11");
+    let cli_store =
+        dunce::canonicalize(&workspace).expect("canonicalize workspace").join("cli-store/v11");
     assert_eq!(
         dunce::canonicalize(&modules.store_dir).expect("canonicalize recorded store"),
-        hook_store,
+        cli_store,
     );
     assert_eq!(
         dunce::canonicalize(&modules.virtual_store_dir)
             .expect("canonicalize recorded virtual store"),
-        hook_store.join("links"),
+        cli_store.join("links"),
     );
-    let index_path = hook_store.join("index.db");
-    eprintln!("Checking for hook store index: {}", index_path.display());
-    assert!(index_path.is_file());
+    assert!(cli_store.join("index.db").is_file());
+    assert!(!workspace.join("hook-store").exists(), "the hook's storeDir was not used");
 
     drop((root, mock_instance));
 }
@@ -312,7 +602,10 @@ fn update_config_observes_an_empty_cli_store_dir() {
     )
     .expect("write .pnpmfile.cjs");
 
-    pacquet_at(&workspace).with_args(["install", "--store-dir="]).assert().success();
+    pacquet_at(&workspace)
+        .with_args(["install", "--store-dir="])
+        .assert()
+        .success();
 
     assert_eq!(
         fs::read_to_string(workspace.join("observed-store.txt"))
@@ -352,7 +645,10 @@ fn ignore_pnpmfile_skips_a_config_dependency_plugin_pnpmfile() {
             .node_linker
     };
 
-    pacquet_at(&workspace).with_args(["install", "--ignore-pnpmfile"]).assert().success();
+    pacquet_at(&workspace)
+        .with_args(["install", "--ignore-pnpmfile"])
+        .assert()
+        .success();
     assert_eq!(
         recorded_node_linker(),
         Some(NodeLinker::Isolated),
@@ -362,7 +658,10 @@ fn ignore_pnpmfile_skips_a_config_dependency_plugin_pnpmfile() {
     // Install again with the plugin honored, so the assertion above
     // cannot pass on a fixture whose hook never ran.
     fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
-    pacquet_at(&workspace).with_arg("install").assert().success();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
     assert_eq!(
         recorded_node_linker(),
         Some(NodeLinker::Hoisted),
@@ -371,3 +670,168 @@ fn ignore_pnpmfile_skips_a_config_dependency_plugin_pnpmfile() {
 
     drop((root, mock_instance));
 }
+
+/// A config-dependency plugin's pnpmfile takes part in the install like the
+/// project's own: its `readPackage` hook shapes the resolved graph, and the
+/// lockfile's `pnpmfileChecksum` answers for it, so a frozen install accepts
+/// the lockfile the plugin shaped.
+#[test]
+fn config_dependency_plugin_read_package_hook_shapes_the_install() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/foo": "100.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    yaml.push_str("\nconfigDependencies:\n  '@pnpm.e2e/pnpm-plugin-read-package': 1.0.0\n");
+    fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let lockfile = pnpm_lockfile::Lockfile::load_wanted_from_dir(&workspace)
+        .expect("load wanted lockfile")
+        .expect("wanted lockfile");
+    let foo_key: pnpm_lockfile::PackageKey =
+        "@pnpm.e2e/foo@100.0.0".parse().expect("parse the foo snapshot key");
+    let bar_name = pnpm_lockfile::PkgName::parse("@pnpm.e2e/bar").expect("parse bar's name");
+    let foo_snapshot = lockfile.snapshots
+        .as_ref()
+        .and_then(|snapshots| snapshots.get(&foo_key))
+        .expect("foo snapshot");
+    dbg!(foo_snapshot);
+    assert!(
+        foo_snapshot.dependencies
+            .as_ref()
+            .is_some_and(|dependencies| dependencies.contains_key(&bar_name)),
+        "the plugin's readPackage hook adds bar to foo",
+    );
+    assert!(lockfile.pnpmfile_checksum.is_some(), "the plugin's pnpmfile is checksummed");
+
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    pacquet_at(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+    assert!(
+        workspace.join("node_modules/.pnpm/@pnpm.e2e+bar@100.0.0").exists(),
+        "the frozen install materializes the dependency the plugin added",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// Two branches that each added a config dependency conflict inside the
+/// env document — the *first* YAML document of `pnpm-lock.yaml` — where
+/// the main lockfile's own conflict recovery never looks.
+#[test]
+fn install_merges_a_conflicted_env_document() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(workspace.join("package.json"), serde_json::json!({}).to_string())
+        .expect("write package.json");
+
+    let ours = env_document_locking(&workspace, "'@pnpm.e2e/foo': 100.0.0");
+    let theirs = env_document_locking(&workspace, "'@pnpm.e2e/bar': 100.0.0");
+    assert_ne!(ours, theirs, "the conflict sides must lock different config dependencies");
+
+    set_config_dependencies(&workspace, "'@pnpm.e2e/foo': 100.0.0\n  '@pnpm.e2e/bar': 100.0.0");
+    let main_document = fs::read_to_string(workspace.join("pnpm-lock.yaml"))
+        .expect("read lockfile")
+        .rsplit_once("\n---\n")
+        .expect("combined lockfile")
+        .1
+        .to_string();
+    fs::write(
+        workspace.join("pnpm-lock.yaml"),
+        format!("---\n<<<<<<< HEAD\n{ours}=======\n{theirs}>>>>>>> branch\n---\n{main_document}"),
+    )
+    .expect("write conflicted lockfile");
+    bump_mtime(&workspace.join("pnpm-lock.yaml"));
+
+    let install = pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&install.get_output().stdout);
+    eprintln!("STDOUT:\n{stdout}");
+    assert!(stdout.contains("Merge conflict detected in pnpm-lock.yaml and successfully merged"));
+
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(!lockfile.contains("<<<<<<<"), "the markers must be gone:\n{lockfile}");
+    let env =
+        EnvLockfile::read(&workspace).expect("the env document parses").expect("env document");
+    let config_deps = &env.importers[EnvLockfile::ROOT_IMPORTER_KEY].config_dependencies;
+    dbg!(config_deps);
+    assert!(config_deps.contains_key("@pnpm.e2e/foo"), "our side's config dep survives");
+    assert!(config_deps.contains_key("@pnpm.e2e/bar"), "their side's config dep survives");
+
+    drop((root, mock_instance));
+}
+
+/// Install `config_deps` and return the env document the install wrote,
+/// as the text one side of a conflict would carry.
+fn env_document_locking(workspace: &Path, config_deps: &str) -> String {
+    set_config_dependencies(workspace, config_deps);
+    let _ = fs::remove_file(workspace.join("pnpm-lock.yaml"));
+    pacquet_at(workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    let (env, _) = lockfile
+        .strip_prefix("---\n")
+        .expect("env document leads the lockfile")
+        .split_once("\n---\n")
+        .expect("combined lockfile");
+    format!("{env}\n")
+}
+
+fn set_config_dependencies(workspace: &Path, config_deps: &str) {
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    let base: String = yaml
+        .lines()
+        .take_while(|line| !line.starts_with("configDependencies:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&yaml_path, format!("{base}\nconfigDependencies:\n  {config_deps}\n"))
+        .expect("write pnpm-workspace.yaml");
+}
+
+#[test]
+fn update_config_hook_switches_loaded_linker_back_to_isolated_layout() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({"dependencies": {"@pnpm.e2e/foo": "100.0.0"}}).to_string(),
+    )
+    .unwrap();
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).unwrap();
+    yaml.push_str("nodeLinker:\n  type: loaded\n");
+    fs::write(yaml_path, yaml).unwrap();
+    fs::write(workspace.join(".pnpmfile.cjs"), "module.exports = { hooks: { updateConfig(config) { config.nodeLinker = 'isolated'; return config } } }").unwrap();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    assert!(workspace.join("node_modules/@pnpm.e2e/foo/package.json").is_file());
+    assert!(!workspace.join(".pnpm/.modules.yaml").exists());
+    let modules = fs::read_to_string(workspace.join("node_modules/.modules.yaml")).unwrap();
+    assert!(!modules.contains("enableGlobalVirtualStore: true"));
+    drop((root, mock_instance));
+}
+
+mod release_age;

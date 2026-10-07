@@ -40,6 +40,44 @@ The act of cloning or creating an owned data from another owned/borrowed data.
 
 ## Guides
 
+### Function length
+
+Keep production function bodies within 40 lines of code. Extract helpers around distinct responsibilities and reuse existing helpers where possible. `perfectionist::overly_long_function` enforces this across the Rust workspace through [`dylint.toml`](../dylint.toml).
+
+Tests are exempt, so a test can keep its setup, action, and assertions together.
+
+### Nesting depth
+
+Keep function and method bodies within three levels of nesting, including tests. Prefer guard clauses, match guards, and helpers named for a distinct responsibility. `perfectionist::excessive_nesting` enforces this across the Rust workspace through [`dylint.toml`](../dylint.toml).
+
+Keep iterator closures simple. A single expression can make a chain easy to follow. When a closure needs several statements, prefer an explicit loop or a named helper. Preserve lazy evaluation, allocation behavior, and short-circuiting when choosing between them.
+
+### Condition complexity
+
+Keep `if`, `while`, and match-guard conditions within five `&&` or `||` operators, including tests. `perfectionist::overly_complex_condition` enforces this across the Rust workspace through [`dylint.toml`](../dylint.toml).
+
+A longer condition is two predicates the author did not name. Name the whole condition, extract a helper for the group of clauses that names a concept, or split the leading clauses into a guard clause. Keep a helper call inside the short-circuit chain rather than binding its result above the condition, so the clauses after it stay unevaluated until the condition reaches them, and keep a `while` condition's work on every iteration.
+
+### Method chains
+
+Keep production method chains within nine calls. Consecutive calls to the same method count once; `.await` and `?` do not add to the count. Tests are exempt.
+
+`perfectionist::overly_long_method_chain` enforces this through [`dylint.toml`](../dylint.toml). When a chain exceeds the limit, name an intermediate value or extract a helper for a distinct operation.
+
+### File length
+
+Keep production Rust files within 400 lines of code and test-only Rust files within 800. Count nonblank lines containing code, including multiline string content, and exclude comment-only lines. Split files into modules around distinct responsibilities or test scenarios. Keep tests in their existing test binary.
+
+`perfectionist::overly_long_file` enforces the 400-line production limit across the Rust workspace through [`dylint.toml`](../dylint.toml). Test files are exempt from the rule, so their 800-line limit is on you to keep.
+
+### Struct fields
+
+Keep structs within eight fields, including test structs. `perfectionist::too_many_struct_fields` enforces this across the Rust workspace through [`dylint.toml`](../dylint.toml).
+
+Group fields by a shared responsibility and reuse existing types. Pass a group directly to helpers that need it, or put its behavior on the group. Avoid repeating the group name in its fields: prefer `store.dir` and `package.integrity`.
+
+A struct that must match a fixed external configuration, serialized document, or binding interface may use a scoped `#[expect(perfectionist::too_many_struct_fields, reason = "...")]`, gated with `cfg_attr(dylint_lib = "perfectionist", ...)`. Name the format or interface in the reason. Internal runtime state and options should be refactored.
+
 ### Naming convention
 
 Follow [the Rust API guidelines](https://rust-lang.github.io/api-guidelines/naming.html). Specific naming conventions for generics, variables, and closure parameters are covered in the sections below.
@@ -61,7 +99,7 @@ pub use install_package_from_registry::InstallPackageFromRegistry;
 
 ### Import Organization
 
-Prefer **merged imports**. Combine multiple items from the same crate root into a single `use` statement with nested braces rather than separate `use` lines (the `crate` granularity). Import ordering is enforced by `cargo fmt`; the granularity is enforced by [`perfectionist::import_granularity_mismatch`](https://github.com/KSXGitHub/perfectionist/blob/0.0.0-rc.21/rules/import_granularity_mismatch.md) (configured to `crate` in `dylint.toml`). Imports gated by a platform attribute such as `#[cfg(unix)]` go in a separate block after the main imports.
+Prefer **merged imports**. Combine multiple items from the same crate root into a single `use` statement with nested braces rather than separate `use` lines (the `crate` granularity). Import ordering is enforced by the [pinned formatter](../CONTRIBUTING.md#rust-formatting); the granularity is enforced by [`perfectionist::import_granularity_mismatch`](https://github.com/KSXGitHub/perfectionist/blob/0.0.0-rc.21/rules/import_granularity_mismatch.md) (configured to `crate` in `dylint.toml`). Imports gated by a platform attribute such as `#[cfg(unix)]` go in a separate block after the main imports.
 
 ```rust
 use crate::{
@@ -77,7 +115,7 @@ use std::os::unix::fs::PermissionsExt;
 
 ### No star imports
 
-Avoid star (glob) imports inside the bodies of regular modules. Import items explicitly by name everywhere except the two cases noted below. The rule applies to production code, tests, integration tests, build scripts, and developer tooling under `tasks/`.
+Avoid star (glob) imports inside the bodies of regular modules. Import items explicitly by name everywhere except the cases noted below. The rule applies to production code, tests, integration tests, build scripts, and developer tooling under `tasks/`.
 
 The two exceptions are:
 
@@ -212,6 +250,14 @@ let a = node_bin_dir(&my_path_buf);
 let b = node_bin_dir(my_path_ref);
 ```
 
+### Getters return the borrowed form
+
+A getter — an inherent `&self` method named for the field it reads, or one named `get_*` — returns the [borrowed] form of that field: `&str` for a `String`, `&Path` for a `PathBuf`, `&[T]` for a `Vec<T>`, `Option<&T>` for an `Option<T>`.
+
+A getter that copies decides for every caller that they wanted an owned value, and most did not: they compare, print, or pass it on. The borrowed form serves every caller and leaves the one that needs ownership to copy at the call site, where the reader can see it. Where every call site would copy the borrow straight back, name the method `to_*` instead, the prefix for a conversion that costs something.
+
+`perfectionist::cloning_getter` enforces this across the Rust workspace through [`dylint.toml`](../dylint.toml). An `Rc` or `Arc` field is exempt, since cloning one bumps a refcount rather than copying what it points at.
+
 ### Trait Bounds
 
 Prefer `where` clauses over inline bounds when there are multiple constraints:
@@ -341,6 +387,10 @@ If the identifier is not directly in scope, use a path link (`` [`crate::store::
 A doc comment (`///` or `//!`) is rendered by `rustdoc` as the documentation of the item it attaches to, and it is visible to every reader who can see that item. The doc comment of a `pub` item therefore reaches every downstream user of the crate, including users who never read the source. Do not reference items more private than the item being documented. Disallowed references include a private function named in the doc comment of a `pub` item, a `pub(crate)` type named in the doc comment of a `pub` item, and a private constant named in the doc comment of a `pub(crate)` item. A reader who only sees the rendered docs cannot follow such a reference, and intra-doc links to inaccessible items become broken links in `cargo doc` output.
 
 If the explanation genuinely depends on that more private item, choose one of two fixes. The first option is to widen the visibility of the referenced item, adding a re-export when one fits the API. The second option is to move the explanation into a regular `//` comment on the implementation, where readers of the source can see it. Reserve `///` and `//!` for things a downstream user of the item needs to know. Use `//` for notes useful only to someone reading the source.
+
+Doc comments on clap commands and arguments are the `--help` output. The `@pnpm/napi` type declarations in `pnpm/npm/napi/index.d.ts`, and the doc comments on the `#[napi]` items they declare, describe the addon to its users. All of these follow the [user-facing text](../AGENTS.md#user-facing-text) rules.
+
+A default is documented on the field that has it, in the spelling the config file uses. The `#[default]` attribute on an enum variant is code and stays; prose on the variant or on the type claiming the default moves to the field, per [prose that cannot go stale](../AGENTS.md#prose-that-cannot-go-stale).
 
 ```rust
 // Bad: public doc references a private helper
@@ -748,15 +798,15 @@ fn install_step<R: Reporter>(prefix: String) {
 }
 ```
 
-Production callers turbofish at the entry point:
+Production callers turbofish at the entry point. The CLI's entry point is `CliReporter` (`crates/cli/src/cli_args/reporter.rs`), which picks the sink per event:
 
 ```rust
-Install { /* ... */ }.run::<NdjsonReporter>().await
+Install { /* ... */ }.run::<CliReporter>().await
 ```
 
 Tests use the no-op `SilentReporter` when they don't care about emits, or a recording fake when they do (see [Testing](#testing-the-emit) below).
 
-The generic monomorphises away — there's no runtime cost. The ergonomic cost is one `<R: Reporter>` per intermediate fn and one turbofish at the production entry point. When threading reaches into a struct, add `<R: Reporter>` to the impl method or carry an install-scoped state field that the relevant emit depends on (see `link_file::log_method_once`'s `&AtomicU8` parameter for an example of the latter — the function dedupes per-install rather than per-process).
+The generic costs nothing at runtime, but every distinct `R` compiles its own copy of the code generic over it. So the CLI instantiates commands with `CliReporter` rather than once per sink: change the sink with `select_reporter`, and hide events with `EventFilter` rather than a wrapper `Reporter` type. The ergonomic cost is one `<R: Reporter>` per intermediate fn and one turbofish at the production entry point. When threading reaches into a struct, add `<R: Reporter>` to the impl method or carry an install-scoped state field that the relevant emit depends on (see `link_file::log_method_once`'s `&AtomicU8` parameter for an example of the latter — the function dedupes per-install rather than per-process).
 
 #### Where to put the emit
 
