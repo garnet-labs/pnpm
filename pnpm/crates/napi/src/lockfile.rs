@@ -22,7 +22,9 @@ use std::{
 };
 
 use napi_derive::napi;
-use pnpm_lockfile::{FilterByImportersOptions, IncludedDependencies, Lockfile, PackageKey};
+use pnpm_lockfile::{
+    FilterByImportersOptions, IncludedDependencies, Lockfile, PackageKey, PeerEdgeOptions,
+};
 
 use crate::error::to_napi_error;
 
@@ -48,8 +50,7 @@ impl LockfileKind {
     }
 }
 
-/// Inputs for [`read_lockfile`]. Mirrors [`ReadLockfileOptions`] in
-/// `index.d.ts`.
+/// Inputs for [`read_lockfile`].
 #[napi(object)]
 pub struct ReadLockfileOptions {
     /// Lockfile / workspace root directory.
@@ -61,8 +62,7 @@ pub struct ReadLockfileOptions {
     pub modules_dir: Option<String>,
 }
 
-/// Inputs for [`write_lockfile`]. Mirrors [`WriteLockfileOptions`] in
-/// `index.d.ts`.
+/// Inputs for [`write_lockfile`].
 #[napi(object)]
 pub struct WriteLockfileOptions {
     /// Lockfile / workspace root directory.
@@ -75,8 +75,7 @@ pub struct WriteLockfileOptions {
     pub modules_dir: Option<String>,
 }
 
-/// Inputs for [`filter_lockfile_by_importers`]. Mirrors
-/// [`FilterLockfileOptions`] in `index.d.ts`.
+/// Inputs for [`filter_lockfile_by_importers`].
 #[napi(object)]
 pub struct FilterLockfileOptions {
     /// Whether the listed importers keep their `dependencies`. Defaults to
@@ -95,6 +94,10 @@ pub struct FilterLockfileOptions {
     /// drops the reference and keeps walking — what a caller inspecting a
     /// possibly-stale lockfile wants.
     pub fail_on_missing_dependencies: Option<bool>,
+    /// Whether a `devDependencies` entry of the root importer provides a peer to
+    /// every importer when the filter decides which optional-peer edges to
+    /// skip. Defaults to `false`.
+    pub resolve_peers_from_workspace_root: Option<bool>,
 }
 
 /// The lockfile as JSON, or `null` when the file is absent or empty.
@@ -123,11 +126,11 @@ pub async fn read_lockfile(
 pub async fn write_lockfile(options: WriteLockfileOptions) -> napi::Result<()> {
     let kind = LockfileKind::parse(options.kind.as_deref())?;
     let path = lockfile_path(&options.dir, options.modules_dir.as_deref(), &kind);
-    let lockfile: Lockfile = serde_json::from_value(options.lockfile).map_err(|err| {
-        napi::Error::from_reason(format!("the lockfile argument is not a lockfile: {err}"))
-    })?;
-    tokio::task::spawn_blocking(move || lockfile.save_to_path(&path))
-        .await
+    let lockfile: Lockfile = serde_json::from_value(options.lockfile)
+        .map_err(|err| {
+            napi::Error::from_reason(format!("the lockfile argument is not a lockfile: {err}"))
+        })?;
+    tokio::task::spawn_blocking(move || lockfile.save_to_path(&path)).await
         .map_err(|join_error| {
             napi::Error::from_reason(format!("writeLockfile task panicked: {join_error}"))
         })?
@@ -146,18 +149,19 @@ pub fn filter_lockfile_by_importers(
     importer_ids: Vec<String>,
     options: Option<FilterLockfileOptions>,
 ) -> napi::Result<serde_json::Value> {
-    let lockfile: Lockfile = serde_json::from_value(lockfile).map_err(|err| {
-        napi::Error::from_reason(format!("the lockfile argument is not a lockfile: {err}"))
-    })?;
+    let lockfile: Lockfile = serde_json::from_value(lockfile)
+        .map_err(|err| {
+            napi::Error::from_reason(format!("the lockfile argument is not a lockfile: {err}"))
+        })?;
     let options = options.unwrap_or(FilterLockfileOptions {
         include_dependencies: None,
         include_dev_dependencies: None,
         include_optional_dependencies: None,
         skipped: None,
         fail_on_missing_dependencies: None,
+        resolve_peers_from_workspace_root: None,
     });
-    let skipped: HashSet<PackageKey> = options
-        .skipped
+    let skipped: HashSet<PackageKey> = options.skipped
         .unwrap_or_default()
         .iter()
         // An unparsable dep path matches no snapshot key, so skipping it
@@ -175,7 +179,14 @@ pub fn filter_lockfile_by_importers(
                     optional_dependencies: options.include_optional_dependencies.unwrap_or(true),
                 },
                 skipped,
-                fail_on_missing_dependencies: options.fail_on_missing_dependencies.unwrap_or(false),
+                fail_on_missing_dependencies: options
+                    .fail_on_missing_dependencies
+                    .unwrap_or(false),
+                peer_edges: PeerEdgeOptions {
+                    resolve_peers_from_workspace_root: options
+                        .resolve_peers_from_workspace_root
+                        .unwrap_or(false),
+                },
             },
         )
         .map_err(|error| to_napi_error(&error))?;
@@ -184,8 +195,7 @@ pub fn filter_lockfile_by_importers(
 }
 
 /// The `.modules.yaml` state of an installed `node_modules`, or `null`
-/// when the directory has none. Same reader the engine uses, so a host
-/// needs no `@pnpm/installing.modules-yaml`.
+/// when the directory has none.
 #[napi]
 pub async fn read_modules_manifest(modules_dir: String) -> napi::Result<Option<serde_json::Value>> {
     let manifest = tokio::task::spawn_blocking(move || {
@@ -198,9 +208,10 @@ pub async fn read_modules_manifest(modules_dir: String) -> napi::Result<Option<s
     .map_err(|error| napi::Error::from_reason(format!("reading the modules manifest: {error}")))?;
     manifest
         .map(|manifest| {
-            serde_json::to_value(manifest).map_err(|err| {
-                napi::Error::from_reason(format!("serializing the modules manifest: {err}"))
-            })
+            serde_json::to_value(manifest)
+                .map_err(|err| {
+                    napi::Error::from_reason(format!("serializing the modules manifest: {err}"))
+                })
         })
         .transpose()
 }
@@ -210,17 +221,11 @@ fn lockfile_path(dir: &str, modules_dir: Option<&str>, kind: &LockfileKind) -> P
     match kind {
         LockfileKind::Wanted => dir.join(Lockfile::FILE_NAME),
         LockfileKind::Current => {
-            let modules_dir = modules_dir.map_or_else(
-                || dir.join("node_modules"),
-                |modules_dir| {
-                    let modules_dir = Path::new(modules_dir);
-                    if modules_dir.is_absolute() {
-                        modules_dir.to_path_buf()
-                    } else {
-                        dir.join(modules_dir)
-                    }
-                },
-            );
+            let modules_dir = match modules_dir.map(Path::new) {
+                Some(modules_dir) if modules_dir.is_absolute() => modules_dir.to_path_buf(),
+                Some(modules_dir) => dir.join(modules_dir),
+                None => dir.join("node_modules"),
+            };
             modules_dir.join(".pnpm").join(Lockfile::CURRENT_FILE_NAME)
         }
     }

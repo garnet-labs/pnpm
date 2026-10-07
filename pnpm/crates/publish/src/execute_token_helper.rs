@@ -1,13 +1,5 @@
 //! run a configured `tokenHelper` command and
 //! return the auth token it prints.
-//!
-//! The publish PUT now authenticates through the shared
-//! [`AuthHeaders`](pnpm_network::AuthHeaders) map, which carries an
-//! un-executed `tokenHelper` command per registry and runs it lazily on
-//! lookup (see `pnpm_network::token_helper`) — so a `tokenHelper`-only
-//! registry is authenticated on publish without this helper. This
-//! function is retained for the publish-specific path that needs the bare
-//! token (no `Bearer` scheme) rather than a finished header value.
 
 use std::io;
 
@@ -27,7 +19,10 @@ where
     let Some((program, args)) = token_helper.split_first() else {
         return Ok(String::new());
     };
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .collect();
     let output = Sys::run(program, &args, None)?;
 
     // A non-zero exit aborts the publish rather than
@@ -52,7 +47,9 @@ where
 /// Strip a leading `Bearer ` (case-insensitive, requiring at least one
 /// trailing whitespace) from `token`.
 fn strip_bearer_prefix(token: &str) -> &str {
-    let Some(after_scheme) = token.get(..6).filter(|head| head.eq_ignore_ascii_case("bearer"))
+    let Some(after_scheme) = token
+        .get(..6)
+        .filter(|head| head.eq_ignore_ascii_case("bearer"))
     else {
         return token;
     };

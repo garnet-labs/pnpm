@@ -1,6 +1,6 @@
 {
   "name": "@pnpm/installing.deps-restorer",
-  "version": "1103.1.0",
+  "version": "1103.2.4",
   "description": "Fast installation using only pnpm-lock.yaml",
   "keywords": [
     "pnpm",
@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@pnpm/bins.linker": "workspace:*",
+    "@pnpm/bins.remover": "workspace:*",
     "@pnpm/building.during-install": "workspace:*",
     "@pnpm/building.policy": "workspace:*",
     "@pnpm/config.normalize-registries": "workspace:*",
@@ -49,6 +50,7 @@
     "@pnpm/deps.path": "workspace:*",
     "@pnpm/error": "workspace:*",
     "@pnpm/exec.lifecycle": "workspace:*",
+    "@pnpm/fs.read-modules-dir": "workspace:*",
     "@pnpm/fs.symlink-dependency": "workspace:*",
     "@pnpm/installing.linking.direct-dep-linker": "workspace:*",
     "@pnpm/installing.linking.hoist": "workspace:*",

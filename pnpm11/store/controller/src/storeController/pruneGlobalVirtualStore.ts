@@ -1,8 +1,8 @@
 import crypto from 'node:crypto'
 import { type Dirent, promises as fs } from 'node:fs'
 import path from 'node:path'
-import util from 'node:util'
 
+import { isError } from '@pnpm/error'
 import { globalInfo } from '@pnpm/logger'
 import { rimraf } from '@zkochan/rimraf'
 import { isSubdir } from 'is-subdir'
@@ -65,35 +65,34 @@ async function findAllNodeModulesDirs (projectDir: string): Promise<string[]> {
   const nodeModulesDirs: string[] = []
 
   async function scan (dir: string): Promise<void> {
-    let entries: Dirent[]
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-
+    const entries = await readDirEntriesSafely(dir)
+    if (!entries) return
     const subdirs: string[] = []
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
-
       const entryPath = path.join(dir, entry.name)
-
       if (entry.name === 'node_modules') {
         nodeModulesDirs.push(entryPath)
-        // Don't descend into node_modules
       } else if (!entry.name.startsWith('.')) {
-        // Collect directories to descend into (workspace packages, etc.)
-        // Skip hidden directories like .git, .pnpm
         subdirs.push(entryPath)
       }
     }
-
-    // Scan subdirectories concurrently
     await Promise.all(subdirs.map((subdir) => scan(subdir)))
   }
 
   await scan(projectDir)
   return nodeModulesDirs
+}
+
+async function readDirEntriesSafely (dir: string): Promise<Dirent[] | null> {
+  try {
+    return await fs.readdir(dir, { withFileTypes: true })
+  } catch (err: unknown) {
+    if (isError(err) && 'code' in err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+      return null
+    }
+    throw err
+  }
 }
 
 /**
@@ -106,71 +105,84 @@ async function walkSymlinksToStore (
   reachable: Set<string>,
   visited: Set<string>
 ): Promise<void> {
-  // Prevent infinite loops from circular symlinks
   const dirHash = await getRealPathHash(dir)
   if (visited.has(dirHash)) {
     return
   }
   visited.add(dirHash)
 
-  let entries: Dirent[]
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true })
-  } catch {
-    return
-  }
+  const entries = await readDirEntriesSafely(dir)
+  if (!entries) return
 
   await Promise.all(
-    entries.map(async (entry) => {
-      const entryPath = path.join(dir, entry.name)
-
-      if (entry.isSymbolicLink()) {
-        try {
-          const target = await fs.readlink(entryPath)
-          const absoluteTarget = path.isAbsolute(target)
-            ? target
-            : path.resolve(dir, target)
-
-          // Check if this symlink points into the global virtual store
-          if (isSubdir(linksDir, absoluteTarget)) {
-            // Mark the package directory as reachable
-            // The path structure is:
-            //   - Scoped:   {linksDir}/{scope}/{pkgName}/{version}/{hash}/node_modules/{pkgName}
-            //   - Unscoped: {linksDir}/@/{pkgName}/{version}/{hash}/node_modules/{pkgName}
-            // We want to mark the {hash} directory
-            const relPath = path.relative(linksDir, absoluteTarget)
-            const parts = relPath.split(path.sep)
-            // Find the hash directory (the one containing node_modules)
-            const nodeModulesIdx = parts.indexOf('node_modules')
-            if (nodeModulesIdx !== -1) {
-              // Store relative path like "@scope/pkg-a/1.0.0/hash123" or "@/pkg-a/1.0.0/hash123"
-              const relativePath = parts.slice(0, nodeModulesIdx).join(path.sep)
-              reachable.add(relativePath)
-              // Also walk into the package's node_modules for transitive deps
-              const pkgNodeModules = path.join(linksDir, relativePath, 'node_modules')
-              await walkSymlinksToStore(pkgNodeModules, linksDir, reachable, visited)
-            }
-          }
-        } catch {
-          // Ignore broken symlinks
-        }
-      } else if (entry.isDirectory() && entry.name !== '.pnpm') {
-        // Recurse into directories (but not .pnpm which is the local virtual store)
-        await walkSymlinksToStore(entryPath, linksDir, reachable, visited)
-      }
-    })
+    entries.map((entry) => processDirEntry(entry, { dir, linksDir, reachable, visited }))
   )
+}
+
+interface ProcessDirEntryOptions {
+  dir: string
+  linksDir: string
+  reachable: Set<string>
+  visited: Set<string>
+}
+
+async function processDirEntry (
+  entry: Dirent,
+  { dir, linksDir, reachable, visited }: ProcessDirEntryOptions
+): Promise<void> {
+  const entryPath = path.join(dir, entry.name)
+  if (entry.isSymbolicLink()) {
+    try {
+      await markSymlinkTargetReachable({ dir, entryPath, linksDir, reachable, visited })
+    } catch {
+      // Ignore broken symlinks
+    }
+  } else if (entry.isDirectory() && entry.name !== '.pnpm') {
+    await walkSymlinksToStore(entryPath, linksDir, reachable, visited)
+  }
+}
+
+interface MarkSymlinkTargetReachableOptions {
+  dir: string
+  entryPath: string
+  linksDir: string
+  reachable: Set<string>
+  visited: Set<string>
+}
+
+async function markSymlinkTargetReachable ({ dir, entryPath, linksDir, reachable, visited }: MarkSymlinkTargetReachableOptions): Promise<void> {
+  const target = await fs.readlink(entryPath)
+  const absoluteTarget = path.isAbsolute(target)
+    ? target
+    : path.resolve(dir, target)
+
+  if (!isSubdir(linksDir, absoluteTarget)) return
+  // Mark the package directory as reachable
+  // The path structure is:
+  //   - Scoped:   {linksDir}/{scope}/{pkgName}/{version}/{hash}/node_modules/{pkgName}
+  //   - Unscoped: {linksDir}/@/{pkgName}/{version}/{hash}/node_modules/{pkgName}
+  // We want to mark the {hash} directory
+  const relPath = path.relative(linksDir, absoluteTarget)
+  const parts = relPath.split(path.sep)
+  const nodeModulesIdx = parts.indexOf('node_modules')
+  if (nodeModulesIdx === -1) return
+  // Store relative path like "@scope/pkg-a/1.0.0/hash123" or "@/pkg-a/1.0.0/hash123"
+  const relativePath = parts.slice(0, nodeModulesIdx).join(path.sep)
+  reachable.add(relativePath)
+  // Also walk into the package's node_modules for transitive deps
+  const pkgNodeModules = path.join(linksDir, relativePath, 'node_modules')
+  await walkSymlinksToStore(pkgNodeModules, linksDir, reachable, visited)
 }
 
 /**
  * Resolve symlinks and return a hash of the real path (for cycle detection)
  */
-async function getRealPathHash (p: string): Promise<string> {
+async function getRealPathHash (dir: string): Promise<string> {
   let realPath: string
   try {
-    realPath = await fs.realpath(p)
+    realPath = await fs.realpath(dir)
   } catch {
-    realPath = p
+    realPath = dir
   }
   // Create a compact hash for in-memory use (base64url is shorter than hex that we use for file name hashes)
   return crypto.createHash('sha256').update(realPath).digest('base64url')
@@ -208,14 +220,12 @@ async function removeUnreachablePackages (
           )
           count += removedVersions.count
           if (removedVersions.allRemoved) {
-            // Remove the package directory when all its versions are removed
             await rimraf(pkgDir)
             removedPkgs++
           }
         })
       )
 
-      // If we removed all packages in scope, remove the scope directory
       if (removedPkgs === pkgNames.length && pkgNames.length > 0) {
         await rimraf(scopePath)
       }
@@ -243,7 +253,6 @@ async function removeUnreachableVersions (
       const versionDir = path.join(pkgDir, version)
       const hashes = await getSubdirsSafely(versionDir)
 
-      // Remove unreachable hash directories
       let removedHashes = 0
       await Promise.all(
         hashes.map(async (hash) => {
@@ -256,7 +265,6 @@ async function removeUnreachableVersions (
         })
       )
 
-      // If we removed all hashes, remove the version directory
       if (removedHashes === hashes.length && hashes.length > 0) {
         await rimraf(versionDir)
         removedVersions++
@@ -270,9 +278,9 @@ async function removeUnreachableVersions (
   }
 }
 
-async function pathExists (p: string): Promise<boolean> {
+async function pathExists (checkedPath: string): Promise<boolean> {
   try {
-    await fs.stat(p)
+    await fs.stat(checkedPath)
     return true
   } catch {
     return false
@@ -284,7 +292,7 @@ async function getSubdirsSafely (dir: string): Promise<string[]> {
   try {
     entries = await fs.readdir(dir, { withFileTypes: true }) as Dirent[]
   } catch (err: unknown) {
-    if (util.types.isNativeError(err) && 'code' in err && err.code === 'ENOENT') {
+    if (isError(err) && 'code' in err && err.code === 'ENOENT') {
       return []
     }
     throw err

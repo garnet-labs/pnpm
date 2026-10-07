@@ -61,6 +61,7 @@ impl LazyLockfile {
         cell.set(LoadedWantedLockfile {
             lockfile: lockfile.map(Arc::new),
             pre_merge_importers: None,
+            merged_conflict_files: 0,
         })
         .expect("a fresh OnceLock accepts the first set");
         LazyLockfile { source: None, cell, fix_cell: OnceLock::new(), prefetch: Mutex::new(None) }
@@ -122,6 +123,14 @@ impl LazyLockfile {
         Ok(self.load_for_fix()?.pre_merge_importers())
     }
 
+    fn merged_conflict_files(&self) -> Result<usize, LoadLockfileError> {
+        Ok(self.load()?.merged_conflict_files)
+    }
+
+    fn merged_conflict_files_for_fix(&self) -> Result<usize, LoadLockfileError> {
+        Ok(self.load_for_fix()?.merged_conflict_files())
+    }
+
     fn load(&self) -> Result<&LoadedWantedLockfile, LoadLockfileError> {
         if let Some(loaded) = self.cell.get() {
             return Ok(loaded);
@@ -153,7 +162,12 @@ impl LazyLockfile {
         let loaded = if let Some((dir, selection)) = self.source.as_ref() {
             Lockfile::load_wanted_detailed_for_fix(dir, selection)?
         } else {
-            LoadedRepairLockfile::from_loaded(self.cell.get().cloned().unwrap_or_default())
+            LoadedRepairLockfile::from_loaded(
+                self.cell
+                    .get()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
         };
         Ok(self.fix_cell.get_or_init(|| loaded))
     }
@@ -174,14 +188,13 @@ impl LazyLockfile {
         }
         self.source
             .as_ref()
-            .is_some_and(|(dir, selection)| Lockfile::wanted_exists(dir, &selection.file_name))
+            .is_some_and(|(dir, selection)| selection.wanted_exists_on_disk(dir))
     }
 }
 
 /// A wanted lockfile that is either already parsed (callers that
 /// re-resolve after a manifest mutation hold one) or lazily loadable.
-/// `Copy` so it threads through the install pipeline like the
-/// `Option<&Lockfile>` it replaces.
+/// `Copy` so it threads through the install pipeline.
 #[derive(Clone, Copy)]
 pub enum MaybeLazyLockfile<'a> {
     Loaded(Option<&'a Lockfile>),
@@ -253,6 +266,15 @@ impl<'a> MaybeLazyLockfile<'a> {
             MaybeLazyLockfile::Loaded(_) => Ok(None),
             MaybeLazyLockfile::Lazy(lazy) => lazy.pre_merge_importers(),
             MaybeLazyLockfile::Repair(lazy) => lazy.pre_merge_importers_for_fix(),
+        }
+    }
+
+    /// Number of wanted or branch lockfiles whose Git conflict markers were merged while loading.
+    pub fn merged_conflict_files(self) -> Result<usize, LoadLockfileError> {
+        match self {
+            MaybeLazyLockfile::Loaded(_) => Ok(0),
+            MaybeLazyLockfile::Lazy(lazy) => lazy.merged_conflict_files(),
+            MaybeLazyLockfile::Repair(lazy) => lazy.merged_conflict_files_for_fix(),
         }
     }
 }

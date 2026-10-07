@@ -9,15 +9,13 @@ use std::{
 /// Content hash of a file.
 pub type FileHash = digest::Output<Sha512>;
 
-/// Major version of the pnpm store layout that pacquet writes to and reads
-/// from.
-///
-/// The constant is part of the public contract pnpm exposes to every
-/// project's `.modules.yaml` (the recorded `storeDir` is the
-/// [`STORE_VERSION`]-suffixed path), so changing it requires moving in
-/// lockstep with pnpm — otherwise both tools start refusing each
-/// other's stores with `ERR_PNPM_UNEXPECTED_STORE`.
+/// Store namespace recorded in each project's `.modules.yaml`.
+/// Native clients share the pnpm store layout. WASI uses a separate namespace
+/// because its host leases cannot coordinate native `SQLite` advisory locks.
+#[cfg(not(target_os = "wasi"))]
 pub const STORE_VERSION: &str = "v11";
+#[cfg(target_os = "wasi")]
+pub const STORE_VERSION: &str = "v11-wasm";
 
 /// Represent a store directory.
 ///
@@ -26,9 +24,8 @@ pub const STORE_VERSION: &str = "v11";
 /// * The store directory can and often act as a global shared cache of all installation of different workspaces.
 /// * The location of the store directory can be customized by `store-dir` field.
 /// * The on-disk layout matches pnpm v11 (`<root>/files/XX/…[-exec]` + `<root>/index.db`)
-///   where `<root>` already includes the `v11` suffix, so the two tools share both the
-///   physical layout *and* the user-visible `storeDir` string written to
-///   `.modules.yaml`.
+///   under the platform's [`STORE_VERSION`] namespace. WASI stores retain the
+///   file and index formats but do not share live files with native clients.
 //
 // `#[serde(from = "PathBuf", into = "PathBuf")]` routes both
 // directions through the `PathBuf` boundary so deserialization goes
@@ -85,9 +82,8 @@ impl Eq for StoreDir {}
 impl From<PathBuf> for StoreDir {
     /// Wrap a raw path into a [`StoreDir`], appending [`STORE_VERSION`]
     /// when the path doesn't already end with that segment — the same
-    /// rule pnpm applies, so both tools record the same `storeDir`
-    /// string in `.modules.yaml` and switching between them stops
-    /// tripping `ERR_PNPM_UNEXPECTED_STORE`.
+    /// rule used by pnpm's native clients. WASI appends its isolated namespace
+    /// even when the supplied path ends in the native `v11` namespace.
     fn from(root: PathBuf) -> Self {
         let root = if root.file_name().and_then(|name| name.to_str()) == Some(STORE_VERSION) {
             root
@@ -128,10 +124,7 @@ impl StoreDir {
         self.files_dir().clone()
     }
 
-    /// Borrow the memoised `<root>/files` path. The CAS write hot
-    /// path calls this per CAFS file written, so caching the joined
-    /// path saves one `PathBuf` allocation per call (~170k on the
-    /// alotta-files clean install).
+    /// Borrow the memoised `<root>/files` path.
     pub(crate) fn files_dir(&self) -> &PathBuf {
         self.cached_files_dir.get_or_init(|| self.root.join("files"))
     }
@@ -161,13 +154,14 @@ impl StoreDir {
         self.root.join("tmp")
     }
 
+    /// A path under [`Self::tmp`] no other process names, for a
+    /// directory labelled `label` (a single path component).
+    pub fn unique_tmp_dir(&self, label: &str) -> PathBuf {
+        self.tmp().join(unique_dir_name(label))
+    }
+
     /// Path to the shared global-virtual-store directory inside the
-    /// store, at `<store-dir>/links`. pnpm builds this as
-    /// `<storeDir>/links` where `storeDir` already carries the
-    /// [`STORE_VERSION`] (`"v11"`) suffix. Pacquet's [`StoreDir::from`]
-    /// applies the same suffix, so `self.root` is already the v11 path
-    /// and the on-disk location is `<root>/links`, identical to pnpm's.
-    /// Sharing this path across pnpm and pacquet is the whole point.
+    /// store, at `<store-dir>/links`.
     pub fn links(&self) -> PathBuf {
         self.root.join("links")
     }
@@ -175,17 +169,12 @@ impl StoreDir {
     /// Path to the per-store projects registry — a flat directory of
     /// symlinks (`<store>/projects/<short-hash>` → project dir) the
     /// global-virtual-store prune sweep walks when deciding which
-    /// `<store>/links/...` slots are still referenced. Uses the same
-    /// `{storeDir}/projects/` layout pnpm 11 does — `<store>` already
-    /// carries the v11 suffix on both sides per [`Self::links`].
+    /// `<store>/links/...` slots are still referenced.
     pub fn projects(&self) -> PathBuf {
         self.root.join("projects")
     }
 
-    /// Borrow the raw store-root path. Most code should prefer the
-    /// purpose-built helpers (`v11`, `tmp`, `links`, `projects`); this
-    /// is for the few callers that need to compute a sibling path the
-    /// helpers don't cover.
+    /// Borrow the raw store-root path.
     pub fn root(&self) -> &std::path::Path {
         &self.root
     }
@@ -207,6 +196,11 @@ impl StoreDir {
     ///
     /// Other errors propagate; the caller degrades them to a warning
     /// and falls back to the per-write lazy mkdir.
+    ///
+    /// On Unix, `files/` and each shard this call creates receive the
+    /// group-write and setgid bits of the nearest directory that already
+    /// existed. A directory that already existed is not modified, so a
+    /// shared store keeps the mode another user left on it.
     pub fn init(&self) -> std::io::Result<()> {
         let files = self.files();
         // `is_dir()` rather than `exists()`: if `files` is present but
@@ -220,41 +214,69 @@ impl StoreDir {
         if files.is_dir() {
             return Ok(());
         }
-        std::fs::create_dir_all(&files)?;
+        pnpm_fs::file_mode::create_dir_all_inheriting_mode(&files)?;
         for shard in 0u8..=255 {
             // Two-char lowercase hex keyed off the first byte of the
             // sha512 digest, matching `StoreDir::file_path_by_hex_str`.
-            let shard_dir = files.join(format!("{shard:02x}"));
-            if let Err(error) = std::fs::create_dir(&shard_dir) {
-                if error.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(error);
-                }
-                // `AlreadyExists` is benign only when the existing
-                // entry resolves to a directory — a parallel pnpm
-                // or pacquet process racing the same layout is
-                // fine, and a symlink pointing at a real directory
-                // is too (ops folks occasionally spread a store
-                // across disks that way). `Path::is_dir` follows
-                // symlinks, which is the desired semantics here. A
-                // regular file, a non-dir symlink, or a broken
-                // symlink would make `mark_shard_ensured` a lie and
-                // punt the failure to a much less actionable
-                // `open` error inside the per-file CAFS write.
-                // Reject upfront.
-                if !shard_dir.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!(
-                            "CAFS shard path {} exists but does not resolve to a directory",
-                            shard_dir.display(),
-                        ),
-                    ));
-                }
-            }
+            create_shard_dir(&files, &files.join(format!("{shard:02x}")))?;
             self.mark_shard_ensured(shard);
         }
         Ok(())
     }
+}
+
+/// Create one CAFS shard under `files`. A shard this call creates takes
+/// the group permission and setgid bits of `files`. One that already
+/// existed keeps its mode.
+fn create_shard_dir(
+    #[cfg_attr(
+        not(any(unix, target_os = "wasi")),
+        allow(unused, reason = "POSIX mode bits are only applied on Unix and WASI")
+    )]
+    files: &path::Path,
+    shard_dir: &path::Path,
+) -> std::io::Result<()> {
+    match std::fs::create_dir(shard_dir) {
+        Ok(()) => {
+            #[cfg(any(unix, target_os = "wasi"))]
+            pnpm_fs::file_mode::grant_inherited_dir_mode(shard_dir, files)?;
+            Ok(())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => {
+            // `AlreadyExists` is benign only when the existing
+            // entry resolves to a directory — a parallel pnpm
+            // or pacquet process racing the same layout is
+            // fine, and a symlink pointing at a real directory
+            // is too (ops folks occasionally spread a store
+            // across disks that way). `Path::is_dir` follows
+            // symlinks, which is the desired semantics here. A
+            // regular file, a non-dir symlink, or a broken
+            // symlink would make `mark_shard_ensured` a lie and
+            // punt the failure to a much less actionable
+            // `open` error inside the per-file CAFS write.
+            // Reject upfront.
+            if !shard_dir.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "CAFS shard path {} exists but does not resolve to a directory",
+                        shard_dir.display(),
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A directory name no concurrent process produces, so installs that
+/// share a parent directory never collide.
+pub(crate) fn unique_dir_name(label: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos =
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_nanos());
+    format!("{label}-{}-{nanos}", pnpm_fs::process_id())
 }
 
 #[cfg(test)]

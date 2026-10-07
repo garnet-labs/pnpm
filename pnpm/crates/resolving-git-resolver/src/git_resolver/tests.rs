@@ -1,7 +1,8 @@
-use super::{GitProbe, GitResolver, ProbeFuture};
+use super::{AllowlistedProbe, GitProbe, GitResolver, ProbeFuture};
 use crate::resolve_ref::{GitCommandRunner, GitRunError};
 use miette::Diagnostic;
 use pnpm_lockfile::LockfileResolution;
+use pnpm_network::{AuthHeaders, UpstreamRouteHook};
 use pnpm_resolving_resolver_base::{
     GitResolveError, ResolveOptions, ResolveResult, Resolver, WantedDependency,
 };
@@ -26,7 +27,10 @@ impl FakeProbe {
 
 impl GitProbe for FakeProbe {
     fn anonymous_head_ok<'a>(&'a self, url: &'a str) -> ProbeFuture<'a> {
-        self.calls.lock().unwrap().push(url.to_string());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(url.to_string());
         let ok = self.archive_ok;
         Box::pin(async move { ok })
     }
@@ -42,7 +46,10 @@ impl GitCommandRunner for FakeRunner {
         repo: &'a str,
         ref_: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<String, GitRunError>> + Send + 'a>> {
-        self.calls.lock().unwrap().push((repo.to_string(), ref_.map(str::to_string)));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((repo.to_string(), ref_.map(str::to_string)));
         let stdout = self.stdout.clone();
         Box::pin(async move { Ok(stdout) })
     }
@@ -101,8 +108,11 @@ async fn resolve_with(
         bare_specifier: Some(bare_specifier.to_string()),
         ..WantedDependency::default()
     };
-    let result =
-        resolver.resolve(&wanted, &ResolveOptions::default()).await.unwrap().expect("claimed");
+    let result = resolver
+        .resolve(&wanted, &ResolveOptions::default())
+        .await
+        .unwrap()
+        .expect("claimed");
     (result, runner, probe)
 }
 
@@ -114,7 +124,13 @@ async fn declines_non_git_specifier() {
         bare_specifier: Some("1.2.3".to_string()),
         ..WantedDependency::default()
     };
-    assert!(resolver.resolve(&wanted, &ResolveOptions::default()).await.unwrap().is_none());
+    assert!(
+        resolver
+            .resolve(&wanted, &ResolveOptions::default())
+            .await
+            .unwrap()
+            .is_none(),
+    );
 }
 
 #[tokio::test]
@@ -340,15 +356,63 @@ async fn unreachable_remote_names_the_dependency_and_how_to_substitute_the_trans
 }
 
 // A known host's SSH URL is an identity that finalises to HTTPS (see
-// `parse_bare_specifier`), so the hint applies there too. Only an unknown
-// host's URL keeps the transport the user wrote.
+// `parse_bare_specifier`), so the HTTPS hint applies there too. Only an
+// unknown host's URL keeps the transport the user wrote.
 #[tokio::test]
-async fn unreachable_ssh_remote_carries_no_transport_substitution_hint() {
+async fn unreachable_ssh_remote_that_refuses_the_key_explains_ssh_agent() {
     let err = resolve_unreachable(
         "git+ssh://git@example.com/foo/bar.git",
         "git@example.com: Permission denied (publickey).",
     )
     .await;
 
+    let help = err
+        .help()
+        .expect("publickey help")
+        .to_string();
+    assert!(help.contains("ssh-add -l"), "{help}");
+    assert!(
+        help.contains(
+            r#"git config --global url."https://example.com/".insteadOf "ssh://git@example.com/""#
+        ),
+        "{help}",
+    );
+    assert!(!help.contains(r#"url."git@example.com:".insteadOf"#), "{help}");
+}
+
+#[tokio::test]
+async fn unreachable_ssh_remote_that_is_not_a_key_refusal_carries_no_auth_hint() {
+    let err = resolve_unreachable(
+        "git+ssh://git@example.com/foo/bar.git",
+        "ssh: connect to host example.com port 22: Connection refused",
+    )
+    .await;
+
     assert!(err.help().is_none());
+}
+
+/// Refuses every fetch whose URL names `host`.
+struct DenyHost(&'static str);
+
+impl UpstreamRouteHook for DenyHost {
+    fn authorize(&self, _url: &str, _package: Option<&str>) -> Option<String> {
+        None
+    }
+
+    fn allows_fetch(&self, url: &str) -> bool {
+        !url.contains(self.0)
+    }
+}
+
+/// <https://github.com/pnpm/pnpm/issues/12705>
+#[tokio::test]
+async fn an_archive_host_off_the_fetch_allowlist_is_not_probed() {
+    let probe = FakeProbe::new(true);
+    let auth_headers =
+        AuthHeaders::default().with_route_hook(Arc::new(DenyHost("codeload.github.com")));
+    let allowlisted = AllowlistedProbe { inner: &probe, auth_headers: Some(&auth_headers) };
+
+    assert!(!allowlisted.anonymous_head_ok("https://codeload.github.com/foo/bar/tar.gz/0").await);
+    assert!(allowlisted.anonymous_head_ok("https://archive.example/foo/bar/0").await);
+    assert_eq!(probe.calls.lock().unwrap().as_slice(), ["https://archive.example/foo/bar/0"]);
 }

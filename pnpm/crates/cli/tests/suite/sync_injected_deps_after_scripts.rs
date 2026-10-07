@@ -5,7 +5,7 @@
 //! every injected copy pointing at the old inodes. The setting names
 //! the scripts after which those copies are refreshed.
 
-use crate::_utils::pacquet_in;
+use crate::_utils::{pacquet_in, wait_for_child_output};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
@@ -13,6 +13,17 @@ use std::{fs, path::Path};
 
 /// The injected copies of `project-1` inside the virtual store: every
 /// `project-1` directory under `node_modules/.pnpm`.
+struct StopChild(Option<std::process::Child>);
+
+impl Drop for StopChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn injected_copies(workspace: &Path) -> Vec<std::path::PathBuf> {
     let virtual_store = workspace.join("node_modules/.pnpm");
     let mut copies: Vec<_> = fs::read_dir(&virtual_store)
@@ -75,18 +86,29 @@ fn write_workspace(workspace: &Path, sync_after: &str) {
 
 #[test]
 fn a_listed_script_refreshes_every_injected_copy() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     write_workspace(&workspace, "syncInjectedDepsAfterScripts:\n  - build\n");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let copies = injected_copies(&workspace);
     assert!(!copies.is_empty(), "the install should have injected project-1 somewhere");
 
-    pacquet_in(&workspace.join("project-1")).with_args(["run", "build"]).assert().success();
+    pacquet_in(&workspace.join("project-1"))
+        .with_args(["run", "build"])
+        .assert()
+        .success();
 
     for copy in &copies {
         assert_eq!(
@@ -102,23 +124,165 @@ fn a_listed_script_refreshes_every_injected_copy() {
 
 #[test]
 fn an_unlisted_script_leaves_the_injected_copies_alone() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     write_workspace(&workspace, "");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     let copies = injected_copies(&workspace);
     assert!(!copies.is_empty(), "the install should have injected project-1 somewhere");
 
-    pacquet_in(&workspace.join("project-1")).with_args(["run", "build"]).assert().success();
+    pacquet_in(&workspace.join("project-1"))
+        .with_args(["run", "build"])
+        .assert()
+        .success();
 
     for copy in &copies {
         assert!(
             !copy.join("distribution/generated.js").exists(),
             "the injected copy at {copy:?} should not have gained the generated file",
+        );
+    }
+
+    drop((mock_instance, root));
+}
+
+/// A long-running script listed in `syncInjectedDepsAfterScripts` publishes
+/// injected copies before it exits. The published file is its own inode, so
+/// a watcher on the injected directory sees the write.
+#[test]
+fn a_listed_script_publishes_injected_edits_before_it_exits() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_workspace(&workspace, "syncInjectedDepsAfterScripts:\n  - dev\n");
+    fs::write(
+        workspace.join("project-1/package.json"),
+        serde_json::json!({
+            "name": "project-1",
+            "version": "1.0.0",
+            "scripts": {
+                "dev": "node dev.cjs",
+            },
+        })
+        .to_string(),
+    )
+    .expect("write the dev script manifest");
+    fs::write(
+        workspace.join("project-1/dev.cjs"),
+        "require('fs').writeFileSync(__dirname + '/distribution/live.js', 'live')\nsetInterval(() => {}, 1000)\n",
+    )
+    .expect("write the dev script");
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let copies = injected_copies(&workspace);
+    assert!(!copies.is_empty(), "the install should have injected project-1 somewhere");
+
+    let mut child = StopChild(Some(
+        pacquet_in(&workspace.join("project-1"))
+            .with_args(["run", "dev"])
+            .spawn()
+            .expect("spawn the dev script"),
+    ));
+    let live = copies[0].join("distribution/live.js");
+    wait_for_child_output(child.0.as_mut().expect("child"), &live, "live");
+    let source = workspace.join("project-1/distribution/live.js");
+    for copy in &copies {
+        let path = copy.join("distribution/live.js");
+        assert_eq!(fs::read_to_string(&path).expect("read the injected copy"), "live");
+        assert!(
+            !same_file::is_same_file(&source, &path).unwrap(),
+            "the injected file at {path:?} is its own inode, so a watcher on it sees the write",
+        );
+    }
+
+    drop((mock_instance, root));
+}
+
+/// A lockfile can carry an injected copy no project reaches: pnpm 11
+/// leaves the snapshot behind when `dedupeInjectedDeps` turns an
+/// importer's copy back into a `link:`. A fresh install materializes
+/// that copy and the virtual-store sweep removes it again, so
+/// `.modules.yaml` must not record it, or the sync after the script
+/// fails on the missing directory.
+#[test]
+fn a_copy_no_project_reaches_is_not_recorded_for_the_sync() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_workspace(&workspace, "syncInjectedDepsAfterScripts:\n  - build\n");
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+
+    // The shape of a fresh clone: the stale snapshot is in the lockfile
+    // and nothing is installed yet, so the sweep runs.
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    let mut lockfile = fs::read_to_string(&lockfile_path).expect("read the lockfile");
+    lockfile.push_str("  'project-1@file:project-1(is-positive@1.0.0)': {}\n");
+    fs::write(&lockfile_path, lockfile).expect("write the lockfile");
+
+    pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+
+    let modules = pnpm_modules_yaml::read_modules_manifest::<pnpm_modules_yaml::Host>(
+        &workspace.join("node_modules"),
+    )
+    .expect("read .modules.yaml")
+    .expect(".modules.yaml must exist after an install");
+    let recorded: Vec<_> = modules.injected_deps
+        .expect("the install injected project-1")
+        .into_values()
+        .flatten()
+        .collect();
+    assert_eq!(recorded.len(), 1, "only the copy project-2 depends on is recorded: {recorded:?}");
+    for target in &recorded {
+        assert!(workspace.join(target).is_dir(), "the recorded copy {target:?} should exist");
+    }
+
+    pacquet_in(&workspace.join("project-1"))
+        .with_args(["run", "build"])
+        .assert()
+        .success();
+
+    for copy in &injected_copies(&workspace) {
+        assert_eq!(
+            fs::read_to_string(copy.join("distribution/generated.js"))
+                .expect("read the refreshed injected copy"),
+            "generated",
+            "the injected copy at {copy:?} should have gained the generated file",
         );
     }
 
@@ -162,7 +326,10 @@ fn bin_dirs_holding(dir: &Path, bin_name: &str) -> Vec<std::path::PathBuf> {
             if !path.is_dir() {
                 continue;
             }
-            if path.file_name().is_some_and(|name| name == ".bin") {
+            if path
+                .file_name()
+                .is_some_and(|name| name == ".bin")
+            {
                 let holds =
                     [bin_name.to_string(), format!("{bin_name}.CMD"), format!("{bin_name}.ps1")]
                         .iter()
@@ -182,8 +349,13 @@ fn bin_dirs_holding(dir: &Path, bin_name: &str) -> Vec<std::path::PathBuf> {
 
 #[test]
 fn a_listed_script_removes_the_link_of_a_bin_it_dropped() {
-    let CommandTempCwd { pacquet, root, workspace, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     write_workspace(&workspace, "syncInjectedDepsAfterScripts:\n  - build\n");
@@ -218,14 +390,20 @@ fn a_listed_script_removes_the_link_of_a_bin_it_dropped() {
     )
     .expect("write drop-bin.cjs");
 
-    pacquet.with_arg("install").assert().success();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
 
     assert!(
         !bin_dirs_holding(&workspace, "dropped-cli").is_empty(),
         "the install should have linked the bin somewhere",
     );
 
-    pacquet_in(&workspace.join("project-1")).with_args(["run", "build"]).assert().success();
+    pacquet_in(&workspace.join("project-1"))
+        .with_args(["run", "build"])
+        .assert()
+        .success();
 
     assert_eq!(
         bin_dirs_holding(&workspace, "dropped-cli"),
@@ -236,6 +414,20 @@ fn a_listed_script_removes_the_link_of_a_bin_it_dropped() {
         !bin_dirs_holding(&workspace, "kept-cli").is_empty(),
         "the bin the script kept should still be linked",
     );
+    if cfg!(unix) {
+        for bin_dir in bin_dirs_holding(&workspace, "kept-cli") {
+            let shim =
+                fs::read_to_string(bin_dir.join("kept-cli")).expect("read the relinked shim");
+            let target = shim
+                .lines()
+                .find_map(|line| line.strip_prefix("# cmd-shim-target="))
+                .expect("a target marker");
+            assert!(
+                Path::new(target).is_relative(),
+                "the shim in {bin_dir:?} must name its target relative to itself:\n{shim}",
+            );
+        }
+    }
 
     drop((mock_instance, root));
 }

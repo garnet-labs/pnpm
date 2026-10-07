@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, expect, jest, test } from '@jest/globals'
 import { assertProject } from '@pnpm/assert-project'
+import { WANTED_LOCKFILE } from '@pnpm/constants'
 import { depPathToFilename } from '@pnpm/deps.path'
 import {
   addDependenciesToPackage,
@@ -16,8 +17,8 @@ import { isCI } from 'ci-info'
 
 import { testDefaults } from '../utils/index.js'
 
-const f = fixtures(import.meta.dirname)
-const withGitProtocolDepFixture = f.find('with-git-protocol-dep')
+const testFixtures = fixtures(import.meta.dirname)
+const withGitProtocolDepFixture = testFixtures.find('with-git-protocol-dep')
 
 beforeEach(async () => {
   await setupMockAgent()
@@ -72,7 +73,7 @@ test('from a github repo with different name via named installation', async () =
     testDefaults({ fastUnpack: false, reporter })
   )
 
-  const m = project.requireModule('say-hi')
+  const moduleExports = project.requireModule('say-hi')
 
   expect(reporter).toHaveBeenCalledWith(expect.objectContaining({
     added: expect.objectContaining({
@@ -85,7 +86,7 @@ test('from a github repo with different name via named installation', async () =
     name: 'pnpm:root',
   }))
 
-  expect(m).toBe('Hi')
+  expect(moduleExports).toBe('Hi')
 
   expect(manifest.dependencies).toStrictEqual({ 'say-hi': 'github:zkochan/hi#4cdebec76b7b9d1f6e219e06c42d92a6b8ea60cd' })
 
@@ -101,7 +102,6 @@ test('from a github repo with different name via named installation', async () =
   project.isExecutable('.bin/szia')
 })
 
-// This used to fail. Maybe won't be needed once api/install.ts gets refactored and covered with dedicated unit tests
 test('from a github repo with different name', async () => {
   const project = prepareEmpty()
   getMockAgent().get('https://github.com')
@@ -116,7 +116,7 @@ test('from a github repo with different name', async () => {
     },
   }, testDefaults({ fastUnpack: false, reporter }))
 
-  const m = project.requireModule('say-hi')
+  const moduleExports = project.requireModule('say-hi')
 
   expect(reporter).toHaveBeenCalledWith(expect.objectContaining({
     added: expect.objectContaining({
@@ -129,7 +129,7 @@ test('from a github repo with different name', async () => {
     name: 'pnpm:root',
   }))
 
-  expect(m).toBe('Hi')
+  expect(moduleExports).toBe('Hi')
 
   expect(manifest.dependencies).toStrictEqual({
     'say-hi': 'github:zkochan/hi#4cdebec76b7b9d1f6e219e06c42d92a6b8ea60cd',
@@ -155,9 +155,9 @@ test('a subdependency is from a github repo with different name', async () => {
 
   await addDependenciesToPackage({}, ['@pnpm.e2e/has-aliased-git-dependency'], testDefaults({ fastUnpack: false }))
 
-  const m = project.requireModule('@pnpm.e2e/has-aliased-git-dependency')
+  const moduleExports = project.requireModule('@pnpm.e2e/has-aliased-git-dependency')
 
-  expect(m).toBe('Hi')
+  expect(moduleExports).toBe('Hi')
 
   const lockfile = project.readLockfile()
   expect(lockfile.snapshots['@pnpm.e2e/has-aliased-git-dependency@1.0.0'].dependencies).toStrictEqual({
@@ -188,9 +188,9 @@ test.skip('from a non-github git repo', async () => {
 
   await addDependenciesToPackage({}, ['git+http://ikt.pm2.io/ikt.git#3325a3e39a502418dc2e2e4bf21529cbbde96228'], testDefaults())
 
-  const m = project.requireModule('ikt')
+  const moduleExports = project.requireModule('ikt')
 
-  expect(m).toBeTruthy()
+  expect(moduleExports).toBeTruthy()
 
   const lockfile = project.readLockfile()
 
@@ -328,6 +328,35 @@ test('re-adding a git repo with a different tag', async () => {
   )
 })
 
+// https://github.com/pnpm/pnpm/issues/13338
+test('a git-hosted tarball reused from the store keeps its integrity in a fresh lockfile', async () => {
+  const project = prepareEmpty()
+  getMockAgent().get('https://github.com')
+    .intercept({ path: '/kevva/is-negative', method: 'HEAD' })
+    .reply(200)
+    .times(2)
+  const manifest = { dependencies: { 'is-negative': 'github:kevva/is-negative#1.0.0' } }
+  const coldStoreOpts = testDefaults({ lockfileOnly: true })
+  await install(manifest, coldStoreOpts)
+  const coldStorePackages = project.readLockfile().packages
+
+  fs.rmSync(WANTED_LOCKFILE)
+  await install(manifest, testDefaults({ lockfileOnly: true, storeDir: coldStoreOpts.storeDir }))
+
+  expect(coldStorePackages).toStrictEqual({
+    'is-negative@https://codeload.github.com/kevva/is-negative/tar.gz/163360a8d3ae6bee9524541043197ff356f8ed99': {
+      resolution: {
+        tarball: 'https://codeload.github.com/kevva/is-negative/tar.gz/163360a8d3ae6bee9524541043197ff356f8ed99',
+        integrity: expect.stringMatching(/^sha512-/),
+        gitHosted: true,
+      },
+      version: '1.0.0',
+      engines: { node: '>=0.10.0' },
+    },
+  })
+  expect(project.readLockfile().packages).toStrictEqual(coldStorePackages)
+})
+
 test('should not update when adding unrelated dependency', async () => {
   process.chdir(withGitProtocolDepFixture)
   fs.rmSync('./node_modules', {
@@ -405,5 +434,5 @@ test('no hash character for github subdirectory install', async () => {
   ], testDefaults())
 
   expect(fs.readdirSync('./node_modules/.pnpm'))
-    .toContain('only-allow@https+++codeload.github.com+pnpm+only-allow+tar.gz+91ab41994c6a1b7319869fa8864163c9954f56ec+path++')
+    .toContain('only-allow@https+++codeload.github.com+pnpm+only-allow+tar.gz+91ab41994c6a1b7319869fa88_56355147ba630bfd9db93b3858553cde') // cspell:disable-line
 })

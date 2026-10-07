@@ -11,15 +11,14 @@
 
 use crate::{
     InstallabilityHost, SkippedSnapshots, add_direct_runtime_skips, compute_skipped_snapshots,
-    extend_skipped_with_dependency_closure,
+    extend_skipped_with_dependency_closure, find_root_runtime_node_version,
     install_frozen_lockfile::{find_runtime_node_major, parse_major_from_version},
 };
-use pnpm_lockfile::{Lockfile, PackageKey, PackageMetadata, ProjectSnapshot, SnapshotEntry};
-use pnpm_modules_yaml::IncludedDependencies;
+use pnpm_config::Config;
+use pnpm_lockfile::ProjectSnapshot;
 use pnpm_package_is_installable::{InstallabilityError, SupportedArchitectures};
 use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
+    collections::HashMap,
     sync::{Arc, OnceLock},
 };
 
@@ -94,18 +93,20 @@ impl HostDetection {
     pub async fn resolve(self) -> Option<InstallabilityHost> {
         match self {
             HostDetection::Resolved(host) => host,
-            HostDetection::Pending { task, engine_strict, supported_architectures } => {
-                task.await.unwrap_or_else(|error| {
-                    tracing::warn!(
-                        target: "pacquet::install",
-                        ?error,
-                        "host detection task failed; falling back to the synthetic host",
-                    );
-                    let mut host = synthetic_installability_host(engine_strict);
-                    host.supported_architectures = supported_architectures;
-                    Some(host)
-                })
-            }
+            HostDetection::Pending {
+                task,
+                engine_strict,
+                supported_architectures,
+            } => task.await.unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "pacquet::install",
+                    ?error,
+                    "host detection task failed; falling back to the synthetic host",
+                );
+                let mut host = synthetic_installability_host(engine_strict);
+                host.supported_architectures = supported_architectures;
+                Some(host)
+            }),
         }
     }
 }
@@ -166,14 +167,11 @@ pub async fn detect_installability_host(
 }
 
 pub struct SkipSetInputs<'a> {
+    pub closure: crate::SkipSetClosure<'a>,
+    pub entries: pnpm_lockfile::LockfileEntries<'a>,
     pub requester: &'a str,
     /// Importers the installability pass evaluates against.
     pub importers: &'a HashMap<String, ProjectSnapshot>,
-    /// The snapshots and metadata being evaluated. Under a filtered
-    /// install these are the materialization closure's, not the whole
-    /// lockfile's.
-    pub snapshots: Option<&'a HashMap<PackageKey, SnapshotEntry>>,
-    pub packages: Option<&'a HashMap<PackageKey, PackageMetadata>>,
     /// `None` when installability checks are bypassed — see
     /// [`detect_installability_host`].
     pub installability_host: Option<&'a InstallabilityHost>,
@@ -195,12 +193,6 @@ pub struct SkipSetInputs<'a> {
     /// distinction visible where the reason for it lives.
     pub exclude_optional: bool,
     pub skip_runtimes: bool,
-    /// The lockfile whose importers anchor the reachability closure —
-    /// the full one, even under a filtered install.
-    pub closure_lockfile: &'a Lockfile,
-    pub closure_root: &'a Path,
-    pub closure_importer_ids: &'a HashSet<String>,
-    pub included: IncludedDependencies,
 }
 
 /// Compute the snapshots this install must not materialize: the
@@ -215,30 +207,21 @@ pub struct SkipSetInputs<'a> {
 pub fn compute_skip_set<Reporter: pnpm_reporter::Reporter>(
     inputs: SkipSetInputs<'_>,
 ) -> Result<SkippedSnapshots, Box<InstallabilityError>> {
-    let SkipSetInputs {
-        requester,
-        importers,
-        snapshots,
-        packages,
-        installability_host,
-        seed,
-        exclude_optional,
-        skip_runtimes,
-        closure_lockfile,
-        closure_root,
-        closure_importer_ids,
-        included,
-    } = inputs;
-
-    let mut skipped = match (snapshots, packages, installability_host) {
-        (Some(snapshots), Some(packages), Some(host)) => compute_skipped_snapshots::<Reporter>(
-            importers, snapshots, packages, host, requester, seed,
-        )?,
-        // Constraint-free lockfile: keep the seed verbatim, so a
-        // snapshot recorded as skipped previously survives the
-        // constraint having since been removed from the lockfile.
-        _ => seed,
-    };
+    let mut skipped =
+        match (inputs.entries.snapshots, inputs.entries.packages, inputs.installability_host) {
+            (Some(snapshots), Some(packages), Some(host)) => compute_skipped_snapshots::<Reporter>(
+                inputs.importers,
+                snapshots,
+                packages,
+                host,
+                inputs.requester,
+                inputs.seed,
+            )?,
+            // Constraint-free lockfile: keep the seed verbatim, so a
+            // snapshot recorded as skipped previously survives the
+            // constraint having since been removed from the lockfile.
+            _ => inputs.seed,
+        };
 
     // The lockfile's `optional` flag is set only when a snapshot is
     // reachable *exclusively* through optional edges, so a dependency
@@ -246,7 +229,9 @@ pub fn compute_skip_set<Reporter: pnpm_reporter::Reporter>(
     // These land in the transient `optional_excluded` subset: excluded
     // from materialization, but kept out of `.modules.yaml.skipped` so a
     // later install without the flag brings them back.
-    if exclude_optional && let Some(snapshots) = snapshots {
+    if inputs.exclude_optional
+        && let Some(snapshots) = inputs.entries.snapshots
+    {
         for (key, snapshot) in snapshots {
             if snapshot.optional {
                 skipped.add_optional_excluded(key.clone());
@@ -254,19 +239,40 @@ pub fn compute_skip_set<Reporter: pnpm_reporter::Reporter>(
         }
     }
 
-    if skip_runtimes && let Some(packages) = packages {
-        add_direct_runtime_skips(&mut skipped, importers, packages);
+    if inputs.skip_runtimes
+        && let Some(packages) = inputs.entries.packages
+    {
+        add_direct_runtime_skips(&mut skipped, inputs.importers, packages);
     }
 
     extend_skipped_with_dependency_closure(
         &mut skipped,
-        closure_lockfile,
-        closure_root,
-        closure_importer_ids,
-        included,
+        inputs.closure.lockfile,
+        inputs.closure.root,
+        inputs.closure.importer_ids,
+        inputs.closure.groups,
     );
 
     Ok(skipped)
+}
+
+/// `host` with its Node.js version set to the one the root project's
+/// runtime dependency is locked to, unless `nodeVersion` is configured.
+#[must_use]
+pub fn with_locked_runtime_node(
+    host: Option<&InstallabilityHost>,
+    config: &Config,
+    importers: &HashMap<String, ProjectSnapshot>,
+) -> Option<InstallabilityHost> {
+    let host = host?.clone();
+    let locked_node_version = config.node_version
+        .is_none()
+        .then(|| find_root_runtime_node_version(importers))
+        .flatten();
+    Some(match locked_node_version {
+        Some(node_version) => InstallabilityHost { node_version, ..host },
+        None => host,
+    })
 }
 
 /// A `node --version` probe still in flight. See
@@ -338,22 +344,22 @@ pub fn engine_name_from_host(host_node: &HostNode) -> Option<String> {
         .map(|major| pnpm_graph_hasher::engine_name(major, None, None))
 }
 
-/// The engine name a lockfile `node@runtime:` pin implies, when one is
+/// The engine name the root project's `node@runtime:` pin implies, when one is
 /// present. Both engine-resolution paths — [`resolve_engine_name`] and
 /// the frozen path's deferred-host branch — apply this one rule, so
 /// they can't drift apart on how a pin keys the store.
 #[must_use]
 pub fn engine_name_from_runtime_pin(
-    snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
+    importers: &HashMap<String, ProjectSnapshot>,
 ) -> Option<String> {
-    find_runtime_node_major(snapshots)
+    find_runtime_node_major(importers)
         .map(|major| pnpm_graph_hasher::engine_name(major, None, None))
 }
 
 /// Resolve the engine name that keys the install's store slots and the
 /// side-effects-cache prefix.
 ///
-/// A `node@runtime:` pin in the lockfile wins outright, so pinned and
+/// The root project's `node@runtime:` pin wins outright, so pinned and
 /// non-pinned installs on the same host share one store rather than
 /// splitting it under whatever `node --version` the shell reports. Then
 /// the already-detected host, then a probe.
@@ -363,10 +369,10 @@ pub fn engine_name_from_runtime_pin(
 /// store, whose layout needs the name synchronously.
 pub async fn resolve_engine_name(
     enable_global_virtual_store: bool,
-    snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
+    importers: &HashMap<String, ProjectSnapshot>,
     host_node: Option<&HostNode>,
 ) -> (Option<String>, Option<DeferredEngineName>) {
-    if let Some(name) = engine_name_from_runtime_pin(snapshots) {
+    if let Some(name) = engine_name_from_runtime_pin(importers) {
         return (Some(name), None);
     }
     match host_node {

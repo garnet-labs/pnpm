@@ -17,7 +17,10 @@ fn specified_scripts_start_fallback() {
         vec!["start".to_string()],
     );
     assert!(
-        ScriptSelector::new("start").unwrap().select(&manifest).is_empty(),
+        ScriptSelector::new("start")
+            .unwrap()
+            .select(&manifest)
+            .is_empty(),
         "the fallback belongs to `run`, not to the recursive selector",
     );
 }
@@ -25,7 +28,12 @@ fn specified_scripts_start_fallback() {
 #[test]
 fn specified_scripts_missing_is_empty() {
     let manifest = json!({ "scripts": { "build": "tsc" } });
-    assert!(ScriptSelector::new("nonexistent").unwrap().select(&manifest).is_empty());
+    assert!(
+        ScriptSelector::new("nonexistent")
+            .unwrap()
+            .select(&manifest)
+            .is_empty(),
+    );
 }
 
 #[test]
@@ -49,6 +57,33 @@ fn specified_scripts_selects_every_regexp_match() {
         ScriptSelector::new("/^build/").unwrap().select(&manifest),
         vec!["build:backend".to_string(), "build:frontend".to_string(), "build".to_string()],
     );
+}
+
+#[test]
+fn specified_scripts_supports_ecmascript_lookaround() {
+    let manifest = json!({ "scripts": { "hello:a": "echo a", "hello:b": "echo b" } });
+    assert_eq!(
+        ScriptSelector::new(r"/^hello:(?!b).*$/").unwrap().select(&manifest),
+        vec!["hello:a".to_string()],
+    );
+    assert_eq!(
+        ScriptSelector::new(r"/(?<=:)b$/").unwrap().select(&manifest),
+        vec!["hello:b".to_string()],
+    );
+}
+
+/// Unflagged JavaScript matches UTF-16 code units, so `.` does not
+/// cover a character outside the Basic Multilingual Plane.
+#[test]
+fn specified_scripts_match_utf16_code_units() {
+    let manifest = json!({ "scripts": { "😀": "echo smile" } });
+    assert!(
+        ScriptSelector::new("/^.$/")
+            .unwrap()
+            .select(&manifest)
+            .is_empty(),
+    );
+    assert_eq!(ScriptSelector::new("/^..$/").unwrap().select(&manifest), vec!["😀".to_string()]);
 }
 
 /// An exact hit wins over the regexp reading, so a script literally named
@@ -75,7 +110,10 @@ fn specified_scripts_treats_non_literals_as_names() {
     let manifest = json!({ "scripts": { "build": "tsc" } });
     for name in ["/a/b/", "//", "/build", "build/", "/[/"] {
         assert!(
-            ScriptSelector::new(name).unwrap().select(&manifest).is_empty(),
+            ScriptSelector::new(name)
+                .unwrap()
+                .select(&manifest)
+                .is_empty(),
             "{name} is not a regexp selector",
         );
     }

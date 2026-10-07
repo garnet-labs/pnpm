@@ -1,6 +1,9 @@
 use crate::{
     State,
-    cli_args::{add::add_package, global::handle_global_add},
+    cli_args::{
+        add::{AddRequest, add_package},
+        global::handle_global_add,
+    },
 };
 use clap::Args;
 use derive_more::{Display, Error};
@@ -26,7 +29,8 @@ pub struct RuntimeArgs {
     #[clap(short = 'P', long = "save-prod")]
     pub save_prod: bool,
 
-    /// Runtime subcommand and arguments.
+    /// Subcommand and its arguments: `set <name> [<version>]`, where `<name>`
+    /// is `node`, `deno`, or `bun`.
     pub params: Vec<String>,
 }
 
@@ -79,8 +83,11 @@ impl RuntimeArgs {
     pub async fn run<Reporter: self::Reporter + 'static>(self, state: State) -> miette::Result<()> {
         let request = self.set_request()?;
         let config = state.config;
-        let prefix =
-            state.manifest.path().parent().expect("manifest path has a parent").to_path_buf();
+        let prefix = state.manifest
+            .path()
+            .parent()
+            .expect("manifest path has a parent")
+            .to_path_buf();
         add_package::<Reporter, _>(
             state,
             &request.package_name,
@@ -118,9 +125,10 @@ impl RuntimeArgs {
         dir: &Path,
     ) -> miette::Result<()> {
         let request = self.set_request()?;
+        let global_request = AddRequest::from(request.package_name.as_str());
         Box::pin(handle_global_add::<Reporter>(
             config,
-            std::slice::from_ref(&request.package_name),
+            std::slice::from_ref(&global_request),
             RangeSpecStyle::Major,
             config.supported_architectures.clone(),
             // `pnpm runtime` installs a runtime, not user packages; it has
@@ -138,8 +146,7 @@ impl RuntimeArgs {
         if subcommand != "set" {
             return Err(RuntimeError::UnknownSubcommand { subcommand: subcommand.clone() });
         }
-        let runtime_name = self
-            .params
+        let runtime_name = self.params
             .get(1)
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())

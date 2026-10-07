@@ -71,7 +71,53 @@ pub(crate) fn write_pm_shims(
     Ok(written)
 }
 
-#[cfg(unix)]
+/// Put the running pnpm on the build's `PATH` as `pnpm`, returning the
+/// scratch directory its shim lives in.
+///
+/// Without the running pnpm, or when the shim cannot be written, the
+/// host's pnpm prepares the dependency.
+pub(crate) fn provide_running_pnpm(pnpm_execpath: Option<&Path>) -> Option<tempfile::TempDir> {
+    let pnpm_execpath = pnpm_execpath?;
+    let provided = tempfile::tempdir()
+        .and_then(|dir| {
+            write_running_pnpm_shim(dir.path(), pnpm_execpath)?;
+            Ok(dir)
+        });
+    provided
+        .inspect_err(|error| {
+            tracing::warn!(
+                target: "pacquet::git_fetcher",
+                "could not provide the running pnpm for the build: {error}",
+            );
+        })
+        .ok()
+}
+
+/// Write a `pnpm` shim into `dir` that runs `pnpm_execpath` itself.
+fn write_running_pnpm_shim(dir: &Path, pnpm_execpath: &Path) -> io::Result<PathBuf> {
+    let (file_name, contents) = running_pnpm_shim_file(pnpm_execpath);
+    let path = dir.join(file_name);
+    write_executable(&path, &contents)?;
+    Ok(path)
+}
+
+#[cfg(any(unix, target_os = "wasi"))]
+fn running_pnpm_shim_file(pnpm_execpath: &Path) -> (String, String) {
+    use pnpm_cmd_shim::sh_single_quote;
+
+    let pnpm = sh_single_quote(&pnpm_execpath.to_string_lossy());
+    ("pnpm".to_string(), format!("#!/bin/sh\nexec {pnpm} \"$@\"\n"))
+}
+
+#[cfg(windows)]
+fn running_pnpm_shim_file(pnpm_execpath: &Path) -> (String, String) {
+    use pnpm_cmd_shim::cmd_escape;
+
+    let pnpm = cmd_escape(&pnpm_execpath.to_string_lossy());
+    ("pnpm.cmd".to_string(), format!("@\"{pnpm}\" %*\r\n"))
+}
+
+#[cfg(any(unix, target_os = "wasi"))]
 fn shim_files(
     name: &str,
     run_as: &[&str],
@@ -80,7 +126,10 @@ fn shim_files(
 ) -> Vec<(String, String)> {
     use pnpm_cmd_shim::sh_single_quote;
 
-    let run_as: Vec<String> = run_as.iter().map(|word| sh_single_quote(word)).collect();
+    let run_as: Vec<String> = run_as
+        .iter()
+        .map(|word| sh_single_quote(word))
+        .collect();
     let contents = format!(
         "#!/bin/sh\nexec {pnpm} dlx --package {spec} {run_as} \"$@\"\n",
         pnpm = sh_single_quote(&pnpm_execpath.to_string_lossy()),
@@ -101,8 +150,10 @@ fn shim_files(
 
     let pnpm = cmd_escape(&pnpm_execpath.to_string_lossy());
     let spec = cmd_escape(spec);
-    let run_as: Vec<String> =
-        run_as.iter().map(|word| format!(r#""{}""#, cmd_escape(word))).collect();
+    let run_as: Vec<String> = run_as
+        .iter()
+        .map(|word| format!(r#""{}""#, cmd_escape(word)))
+        .collect();
     let run_as = run_as.join(" ");
     let contents = format!("@\"{pnpm}\" dlx --package \"{spec}\" {run_as} %*\r\n");
     vec![(format!("{name}.cmd"), contents)]
@@ -133,6 +184,8 @@ fn command_line_safe(version_spec: &str) -> Option<&str> {
 /// something half-written.
 fn write_executable(path: &Path, contents: &str) -> io::Result<()> {
     write_atomic(path, contents.as_bytes())?;
+    #[cfg(target_os = "wasi")]
+    pnpm_fs::file_mode::set_path_permissions(path, 0o755)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

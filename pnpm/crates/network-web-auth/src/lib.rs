@@ -2,33 +2,10 @@
 //! challenge handling.
 //!
 //! This is the Rust port of the TypeScript `@pnpm/network.web-auth`
-//! package. It is shared infrastructure for the registry-auth commands:
-//! `pnpm publish` drives its OTP challenges through this crate, and the
-//! commands pacquet has not ported yet (`pnpm login` and friends) will
-//! reuse the same flow when they land.
-//!
-//! # Dependency-injection seam
-//!
-//! The TypeScript package injects every side effect — the clock, the
-//! sleep timer, `fetch`, the OTP prompt, the "press Enter" readline, the
-//! browser opener — as a bag of closures on a `context` object. This crate
-//! ports that seam to pacquet's convention: one `self`-less capability
-//! trait per effect ([`Clock`], [`Sleep`], [`WebAuthFetch`], [`OpenUrl`],
-//! [`OpenUrlAndWait`], [`EnterKeyListener`], [`PromptOtp`], and the
-//! [`StdinIsTty`] / [`StdoutIsTty`] probes), composed as bounds on a single
-//! `Sys` type parameter, with the real OS behind [`Host`] and `fn`-bound
-//! unit-struct fakes in tests. User-facing messages flow through the
-//! `R: Reporter` seam on pacquet's `pnpm:global` channel rather than a
-//! capability, matching pnpm's `globalInfo` / `globalWarn`.
+//! package.
 
-mod capabilities;
-mod format_auth_url_message;
-mod generate_qr_code;
-mod global_log;
-mod poll_for_web_auth_token;
-mod prompt_browser_open;
-mod web_auth_timeout_error;
-mod with_otp_handling;
+#[cfg(target_family = "wasm")]
+extern crate pnpm_http as reqwest;
 
 pub use capabilities::{
     Clock, EnterKeyListener, Host, OpenUrl, OpenUrlAndWait, PromptError, PromptOtp, Sleep,
@@ -47,3 +24,12 @@ pub use with_otp_handling::{
     OtpSession, SyntheticOtpError, WithOtpError, otp_challenge_from_unauthorized_body,
     with_otp_handling,
 };
+
+mod capabilities;
+mod format_auth_url_message;
+mod generate_qr_code;
+mod global_log;
+mod poll_for_web_auth_token;
+mod prompt_browser_open;
+mod web_auth_timeout_error;
+mod with_otp_handling;

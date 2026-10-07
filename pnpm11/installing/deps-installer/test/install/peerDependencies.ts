@@ -25,7 +25,7 @@ import { readYamlFileSync } from 'read-yaml-file'
 
 import { testDefaults } from '../utils/index.js'
 
-const f = fixtures(import.meta.dirname)
+const testFixtures = fixtures(import.meta.dirname)
 
 test("don't fail when peer dependency is fetched from GitHub", async () => {
   prepareEmpty()
@@ -1499,7 +1499,7 @@ test('local tarball dependency with peer dependency', async () => {
   const reporter = jest.fn()
 
   const { updatedManifest: manifest } = await addDependenciesToPackage({}, [
-    `file:${f.find('tar-pkg-with-peers-1.0.0.tgz')}`,
+    `file:${testFixtures.find('tar-pkg-with-peers-1.0.0.tgz')}`,
     'bar@npm:@pnpm.e2e/bar@100.0.0',
     'foo@npm:@pnpm.e2e/foo@100.0.0',
   ], testDefaults({ reporter }))
@@ -1522,6 +1522,23 @@ test('local tarball dependency with peer dependency', async () => {
       .filter((dir) => dir.includes('file+'))
     expect(updatedLocalPkgDirs).toStrictEqual(integrityLocalPkgDirs)
   }
+})
+
+test('local tarball dependency with aliased peer dependency does not report peer issues', async () => {
+  prepareEmpty()
+
+  const reporter = jest.fn()
+  const tarballPath = testFixtures.find('tar-pkg-with-aliased-peer-1.0.0.tgz')
+
+  await addDependenciesToPackage({}, [
+    `file:${tarballPath}`,
+    'peer-a-aliased@npm:@pnpm.e2e/peer-a@1.0.0',
+    '@pnpm.e2e/peer-a@1.0.0',
+  ], testDefaults({ reporter, strictPeerDependencies: false }))
+
+  expect(reporter).not.toHaveBeenCalledWith(expect.objectContaining({
+    name: 'pnpm:peer-dependency-issues',
+  }))
 })
 
 test('peer dependency that is resolved by a dev dependency', async () => {
@@ -1706,6 +1723,53 @@ test('deduplicate packages that have peers, when adding new dependency in a work
   expect(depPaths).toHaveLength(8)
   expect(depPaths).toContain(`@pnpm.e2e/abc@1.0.0${createPeerDepGraphHash([{ name: '@pnpm.e2e/peer-a', version: '1.0.0' }, { name: '@pnpm.e2e/peer-b', version: '1.0.0' }, { name: '@pnpm.e2e/peer-c', version: '1.0.0' }])}`)
   expect(depPaths).toContain(`@pnpm.e2e/abc-parent-with-ab@1.0.0${createPeerDepGraphHash([{ name: '@pnpm.e2e/peer-c', version: '1.0.0' }])}`)
+})
+
+test('deduplicate a package whose dependency peers back on it and has an optional peer', async () => {
+  // The fixtures carry the shape from https://github.com/pnpm/pnpm/issues/11834,
+  // which the manifests below do not show: @pnpm.e2e/circular-peer-host depends
+  // on @pnpm.e2e/circular-peer-plugin, which peers back on its own parent and
+  // declares @pnpm.e2e/peer-c as an optional peer through peerDependenciesMeta
+  // alone. Only project-1 supplies peer-c, and auto-install-peers is off so
+  // dedupePeerDependents alone has to collapse the variants. pacquet's
+  // counterpart is `a_circular_peers_optional_peer_is_shared_by_every_importer`
+  // in pnpm/crates/cli/tests/suite/workspace_install.rs.
+  const manifest1 = {
+    name: 'project-1',
+    dependencies: {
+      '@pnpm.e2e/circular-peer-host': '1.0.0',
+      '@pnpm.e2e/peer-c': '2.0.0',
+    },
+  }
+  const manifest2 = {
+    name: 'project-2',
+    dependencies: {
+      '@pnpm.e2e/circular-peer-host': '1.0.0',
+    },
+  }
+  preparePackages([
+    { location: 'project-1', package: manifest1 },
+    { location: 'project-2', package: manifest2 },
+  ])
+
+  const importers: MutatedProject[] = [
+    { mutation: 'install', rootDir: path.resolve('project-1') as ProjectRootDir },
+    { mutation: 'install', rootDir: path.resolve('project-2') as ProjectRootDir },
+  ]
+  const allProjects = [
+    { buildIndex: 0, manifest: manifest1, rootDir: path.resolve('project-1') as ProjectRootDir },
+    { buildIndex: 0, manifest: manifest2, rootDir: path.resolve('project-2') as ProjectRootDir },
+  ]
+  await mutateModules(importers, testDefaults({ allProjects, autoInstallPeers: false, dedupePeerDependents: true }))
+
+  const lockfile = readYamlFileSync<LockfileFile>(path.resolve(WANTED_LOCKFILE))
+  const deduped = '1.0.0(@pnpm.e2e/peer-c@2.0.0)'
+  expect(Object.keys(lockfile.snapshots ?? {}).filter((depPath) => depPath.startsWith('@pnpm.e2e/circular-peer-host@')))
+    .toStrictEqual([`@pnpm.e2e/circular-peer-host@${deduped}`])
+  const dependent = (importerId: string): string =>
+    lockfile.importers![importerId].dependencies!['@pnpm.e2e/circular-peer-host'].version
+  expect(dependent('project-1')).toBe(deduped)
+  expect(dependent('project-2')).toBe(deduped)
 })
 
 test('an optional peer declared by a workspace project is not added to its own importer, when auto-install-peers is off', async () => {
@@ -2604,4 +2668,120 @@ test('adding unrelated dep does not churn transitivePeerDependencies', async () 
   for (const [key, snapshot] of Object.entries(allSnapshotsBefore)) {
     expect(lockfileAfter.snapshots[key]).toStrictEqual(snapshot)
   }
+})
+
+// Covers https://github.com/pnpm/pnpm/issues/8912
+test.each([true, false])('an optional peer that is also a regular dependency is installed as the dependency, with autoInstallPeers=%s', async (autoInstallPeers) => {
+  await addDistTag({ package: '@pnpm.e2e/bravo-dep', version: '1.1.0', distTag: 'latest' })
+  const project = prepareEmpty()
+
+  const { updatedManifest: manifest } = await addDependenciesToPackage(
+    {},
+    ['@pnpm.e2e/has-optional-peer-also-in-deps@1.0.0'],
+    testDefaults({ autoInstallPeers })
+  )
+
+  const snapshotKey = '@pnpm.e2e/has-optional-peer-also-in-deps@1.0.0'
+  expect(project.readLockfile().snapshots[snapshotKey]?.dependencies).toStrictEqual({ '@pnpm.e2e/bravo-dep': '1.0.0' })
+  expect(fs.existsSync(path.resolve('node_modules/.pnpm/@pnpm.e2e+has-optional-peer-also-in-deps@1.0.0/node_modules/@pnpm.e2e/bravo-dep'))).toBeTruthy()
+
+  await addDependenciesToPackage(manifest, ['is-negative@1.0.0'], testDefaults({ autoInstallPeers }))
+
+  expect(project.readLockfile().snapshots[snapshotKey]?.dependencies).toStrictEqual({ '@pnpm.e2e/bravo-dep': '1.0.0' })
+})
+
+// Covers https://github.com/pnpm/pnpm/issues/16654
+test('changing overrides re-resolves a dependency that the lockfile records as an optional peer aliased to another package', async () => {
+  await addDistTag({ package: '@pnpm.e2e/bravo-dep', version: '1.1.0', distTag: 'latest' })
+  const project = prepareEmpty()
+  const { updatedManifest: manifest } = await addDependenciesToPackage(
+    {},
+    ['@pnpm.e2e/aliases-optional-peer-of-dep@1.0.0'],
+    testDefaults()
+  )
+
+  // Older pnpm versions resolved the optional peer to the parent's aliased
+  // dependency. `@pnpm.e2e/bravo-dep@1.2.0` does not exist.
+  const lockfile = project.readLockfile()
+  const childKey = '@pnpm.e2e/has-optional-peer-range-also-in-deps@1.0.0'
+  const peersSuffix = '(@pnpm.e2e/foo@1.2.0)'
+  lockfile.packages[childKey] = {
+    ...lockfile.packages[childKey],
+    peerDependencies: { '@pnpm.e2e/bravo-dep': '^1.0.0' },
+    peerDependenciesMeta: { '@pnpm.e2e/bravo-dep': { optional: true } },
+  }
+  delete lockfile.snapshots[childKey]
+  delete lockfile.packages['@pnpm.e2e/bravo-dep@1.1.0']
+  delete lockfile.snapshots['@pnpm.e2e/bravo-dep@1.1.0']
+  lockfile.snapshots[`${childKey}${peersSuffix}`] = {
+    optionalDependencies: { '@pnpm.e2e/bravo-dep': '@pnpm.e2e/foo@1.2.0' },
+  }
+  lockfile.snapshots['@pnpm.e2e/aliases-optional-peer-of-dep@1.0.0'].dependencies!['@pnpm.e2e/has-optional-peer-range-also-in-deps'] = `1.0.0${peersSuffix}`
+  fs.writeFileSync(WANTED_LOCKFILE, JSON.stringify(lockfile))
+
+  await install(manifest, testDefaults({
+    lockfileOnly: true,
+    // The CLI's default. It makes the resolver look up the locked version in the registry.
+    minimumReleaseAge: 1440,
+    overrides: { '@pnpm.e2e/bar@<100': '100.0.0' },
+  }))
+
+  expect(project.readLockfile().snapshots[childKey]?.dependencies).toStrictEqual({ '@pnpm.e2e/bravo-dep': '1.1.0' })
+})
+
+// Covers https://github.com/pnpm/pnpm/issues/16615
+test('adding an unrelated dependency keeps the peer dependencies a locked package records', async () => {
+  const project = prepareEmpty()
+  const { updatedManifest: manifest } = await addDependenciesToPackage(
+    {},
+    ['@pnpm.e2e/abc-optional-peers@1.0.0', '@pnpm.e2e/peer-a@1.0.0', '@pnpm.e2e/peer-b@1.0.0'],
+    testDefaults()
+  )
+
+  // A registry whose metadata omits peerDependenciesMeta records the optional
+  // peer as required, unlike the package.json in the store.
+  const lockfile = project.readLockfile()
+  const snapshotKey = Object.keys(lockfile.snapshots).find((key) => key.startsWith('@pnpm.e2e/abc-optional-peers@'))!
+  lockfile.packages['@pnpm.e2e/abc-optional-peers@1.0.0'].peerDependenciesMeta = {
+    '@pnpm.e2e/peer-c': { optional: true },
+  }
+  lockfile.snapshots[snapshotKey] = {
+    dependencies: {
+      '@pnpm.e2e/peer-a': '1.0.0',
+      '@pnpm.e2e/peer-b': '1.0.0',
+    },
+  }
+  fs.writeFileSync(WANTED_LOCKFILE, JSON.stringify(lockfile))
+
+  await addDependenciesToPackage(manifest, ['is-negative@1.0.0'], testDefaults())
+
+  const lockfileAfter = project.readLockfile()
+  expect(lockfileAfter.packages['@pnpm.e2e/abc-optional-peers@1.0.0']).toStrictEqual(lockfile.packages['@pnpm.e2e/abc-optional-peers@1.0.0'])
+  expect(lockfileAfter.snapshots[snapshotKey]).toStrictEqual(lockfile.snapshots[snapshotKey])
+})
+
+test('a local directory dependency records the peer dependencies its package.json declares now', async () => {
+  const project = prepareEmpty()
+  fs.mkdirSync('local-pkg')
+  const localManifest = {
+    name: 'local-pkg',
+    version: '1.0.0',
+    peerDependencies: { '@pnpm.e2e/peer-a': '^1.0.0' },
+  }
+  fs.writeFileSync('local-pkg/package.json', JSON.stringify(localManifest))
+  const { updatedManifest: manifest } = await addDependenciesToPackage(
+    {},
+    ['file:./local-pkg', '@pnpm.e2e/peer-a@1.0.0'],
+    testDefaults()
+  )
+
+  fs.writeFileSync('local-pkg/package.json', JSON.stringify({
+    ...localManifest,
+    peerDependenciesMeta: { '@pnpm.e2e/peer-a': { optional: true } },
+  }))
+  await addDependenciesToPackage(manifest, ['is-negative@1.0.0'], testDefaults())
+
+  expect(project.readLockfile().packages['local-pkg@file:local-pkg'].peerDependenciesMeta).toStrictEqual({
+    '@pnpm.e2e/peer-a': { optional: true },
+  })
 })

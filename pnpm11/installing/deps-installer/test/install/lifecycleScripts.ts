@@ -164,6 +164,78 @@ test('run install scripts in the current project', async () => {
   ])
 })
 
+test('prepare scripts are not run when devDependencies are excluded (e.g. install --prod)', async () => {
+  await using server = await createTestIpcServer()
+  prepareEmpty()
+  const { updatedManifest: manifest } = await addDependenciesToPackage({
+    scripts: {
+      install: `node -e "console.log('install-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      postinstall: `node -e "console.log('postinstall-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      preinstall: `node -e "console.log('preinstall-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      prepare: `node -e "console.log('prepare-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      preprepare: `node -e "console.log('preprepare-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      postprepare: `node -e "console.log('postprepare-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+    },
+  }, [], testDefaults({ fastUnpack: false }))
+  server.clear()
+  await install(manifest, testDefaults({
+    fastUnpack: false,
+    include: {
+      dependencies: true,
+      devDependencies: false,
+      optionalDependencies: true,
+    },
+  }))
+
+  expect(server.getLines()).toStrictEqual([
+    `preinstall-${process.cwd()}`,
+    `install-${process.cwd()}`,
+    `postinstall-${process.cwd()}`,
+  ])
+})
+
+test('prepare scripts are not run when installing with package arguments in hoisted mode', async () => {
+  await using server = await createTestIpcServer()
+  prepareEmpty()
+  await addDependenciesToPackage({
+    scripts: {
+      install: `node -e "console.log('install-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      postinstall: `node -e "console.log('postinstall-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      preinstall: `node -e "console.log('preinstall-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      prepare: `node -e "console.log('prepare-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      preprepare: `node -e "console.log('preprepare-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+      postprepare: `node -e "console.log('postprepare-' + process.cwd())" | ${server.generateSendStdinScript()}`,
+    },
+  }, ['@pnpm.e2e/pkg-with-1-dep@100.0.0'], testDefaults({ fastUnpack: false, nodeLinker: 'hoisted' }))
+
+  expect(server.getLines()).toStrictEqual([
+    `preinstall-${process.cwd()}`,
+    `install-${process.cwd()}`,
+    `postinstall-${process.cwd()}`,
+  ])
+})
+
+// https://github.com/pnpm/pnpm/issues/7065
+test('pnpm:devPreinstall does not run when devDependencies are not installed', async () => {
+  await using server = await createTestIpcServer()
+  prepareEmpty()
+  await install({
+    scripts: {
+      'pnpm:devPreinstall': `node -e "console.log('pnpm:devPreinstall')" | ${server.generateSendStdinScript()}`,
+      preinstall: `node -e "console.log('preinstall')" | ${server.generateSendStdinScript()}`,
+    },
+  }, testDefaults({
+    fastUnpack: false,
+    include: {
+      dependencies: true,
+      devDependencies: false,
+      optionalDependencies: true,
+    },
+  }))
+
+  expect(server.getLines()).toStrictEqual(['preinstall'])
+})
+
 test('run install scripts in the current project when its name is different than its directory', async () => {
   await using server = await createTestIpcServer()
   prepareEmpty()
@@ -194,6 +266,48 @@ test('installation fails if lifecycle script fails', async () => {
       },
     }, testDefaults({ fastUnpack: false }))
   ).rejects.toThrow(/@ preinstall: `exit 1`/)
+})
+
+// https://github.com/pnpm/pnpm/issues/3760
+test('the root project preinstall script runs before its dependencies are installed', async () => {
+  await using server = await createTestIpcServer()
+  prepareEmpty()
+  const reportDepPresence = (stage: string) =>
+    `node -e "console.log('${stage} ' + require('fs').existsSync('node_modules/is-positive'))" | ${server.generateSendStdinScript()}`
+  const manifest = {
+    dependencies: {
+      'is-positive': '1.0.0',
+    },
+    scripts: {
+      preinstall: reportDepPresence('preinstall'),
+      postinstall: reportDepPresence('postinstall'),
+    },
+  }
+
+  await install(manifest, testDefaults({ fastUnpack: false }))
+  expect(server.getLines()).toStrictEqual(['preinstall false', 'postinstall true'])
+
+  server.clear()
+  rimrafSync('node_modules')
+  await install(manifest, testDefaults({ fastUnpack: false, frozenLockfile: true }))
+  expect(server.getLines()).toStrictEqual(['preinstall false', 'postinstall true'])
+})
+
+test('a failing root project preinstall script aborts the install before any dependency is installed', async () => {
+  prepareEmpty()
+
+  await expect(
+    install({
+      dependencies: {
+        'is-positive': '1.0.0',
+      },
+      scripts: {
+        preinstall: 'exit 1',
+      },
+    }, testDefaults({ fastUnpack: false }))
+  ).rejects.toThrow(/@ preinstall: `exit 1`/)
+  expect(fs.existsSync('node_modules/is-positive')).toBeFalsy()
+  expect(fs.existsSync('pnpm-lock.yaml')).toBeFalsy()
 })
 
 test('INIT_CWD is always set to lockfile directory', async () => {
@@ -302,9 +416,9 @@ testOnNonWindows('lifecycle scripts have access to node-gyp', async () => {
 
   process.env[PATH] = initialPath
     .split(path.delimiter)
-    .filter((p: string) => !p.includes('node-gyp-bin') &&
-      !p.includes(`${path.sep}npm${path.sep}`) &&
-      !p.includes(`${path.sep}.npm${path.sep}`))
+    .filter((dir: string) => !dir.includes('node-gyp-bin') &&
+      !dir.includes(`${path.sep}npm${path.sep}`) &&
+      !dir.includes(`${path.sep}.npm${path.sep}`))
     .join(path.delimiter)
 
   await addDependenciesToPackage({}, ['drivelist@5.1.8'], testDefaults({ fastUnpack: false, allowBuilds: { drivelist: true } }))
@@ -426,6 +540,25 @@ test('git-hosted packages prepared in a shared store still require project appro
     lockfileDir: projectC,
   })).rejects.toThrow('needs to execute build scripts but is not in the "allowBuilds" allowlist')
   expect(fs.existsSync(path.join(projectC, 'node_modules/test-git-fetch/output.json'))).toBeFalsy()
+})
+
+test.each(['test-git-fetch', 'artifact', 'repository'])('explicitly denied git preparation preserves source and separates cached builds (%s)', async (rule) => {
+  const project = prepareEmpty()
+  const gitDependency = await createGitPreparePackage()
+  const manifest = { dependencies: { 'test-git-fetch': gitDependency } }
+  const key = rule === 'artifact' ? `test-git-fetch@${gitDependency}`
+    : rule === 'repository' ? `test-git-fetch@${gitDependency.slice(0, gitDependency.lastIndexOf('#'))}` : rule
+  const opts = testDefaults({ fastUnpack: false, allowBuilds: { [key]: false } })
+  for (const allowed of [false, false, true, false]) {
+    fs.rmSync('node_modules', { force: true, recursive: true })
+    // eslint-disable-next-line no-await-in-loop -- each install reuses the store populated by the previous one
+    await install(manifest, {
+      ...opts,
+      allowBuilds: allowed ? { [`test-git-fetch@${gitDependency}`]: true } : { [key]: false },
+    })
+    expect(project.requireModule('test-git-fetch')).toBe('ok')
+    expect(fs.existsSync('node_modules/test-git-fetch/output.json')).toBe(allowed)
+  }
 })
 
 async function createGitPreparePackage (): Promise<string> {
@@ -667,6 +800,23 @@ test('selectively ignore scripts in some dependencies by allowBuilds (not others
   expect(fs.existsSync('node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example/generated-by-preinstall.js')).toBeFalsy()
   expect(fs.existsSync('node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example/generated-by-postinstall.js')).toBeFalsy()
   expect(fs.existsSync('node_modules/@pnpm.e2e/install-script-example/generated-by-install.js')).toBeTruthy()
+})
+
+test('a dependency that ships a binding.gyp and sets gypfile: false is not asked to build', async () => {
+  prepareEmpty()
+  const reporter = jest.fn()
+
+  await addDependenciesToPackage({},
+    ['@pnpm.e2e/gypfile-false@1.0.0'],
+    testDefaults({ fastUnpack: false, allowBuilds: {}, reporter })
+  )
+
+  const pkgDir = 'node_modules/@pnpm.e2e/gypfile-false'
+  expect(fs.existsSync(path.join(pkgDir, 'binding.gyp'))).toBeTruthy()
+  expect(fs.existsSync(path.join(pkgDir, 'generated.js'))).toBeFalsy()
+
+  const ignoredPkgsLog = reporter.mock.calls.find((call) => (call[0] as Record<string, unknown>).name === 'pnpm:ignored-scripts')![0] as Record<string, unknown>
+  expect(ignoredPkgsLog.packageNames).toStrictEqual([])
 })
 
 test('selectively allow scripts in some dependencies by allowBuilds', async () => {
@@ -950,4 +1100,39 @@ test('build dependencies that were not previously built after allowBuilds change
   expect(fs.existsSync('node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example/generated-by-preinstall.js')).toBeTruthy()
   expect(fs.existsSync('node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example/generated-by-postinstall.js')).toBeTruthy()
   expect(fs.existsSync('node_modules/@pnpm.e2e/install-script-example/generated-by-install.js')).toBeTruthy()
+})
+
+test.each([false, true])('persist ignored builds after allowing previously ignored scripts (approve all: %s)', async (approveAll) => {
+  const project = prepareEmpty()
+  const { updatedManifest: manifest } = await addDependenciesToPackage({},
+    ['@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0', '@pnpm.e2e/install-script-example@1.0.0'],
+    testDefaults({ fastUnpack: false, allowBuilds: {} })
+  )
+
+  const initialModulesManifest = project.readModulesManifest()!
+  expect(initialModulesManifest.allowBuilds).toStrictEqual({})
+  expect(Array.from(initialModulesManifest.ignoredBuilds!).sort()).toStrictEqual([
+    '@pnpm.e2e/install-script-example@1.0.0',
+    '@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0',
+  ])
+  expect(fs.existsSync('node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example/generated-by-postinstall.js')).toBeFalsy()
+  expect(fs.existsSync('node_modules/@pnpm.e2e/install-script-example/generated-by-install.js')).toBeFalsy()
+
+  const allowBuilds = {
+    '@pnpm.e2e/pre-and-postinstall-scripts-example': true,
+    ...(approveAll ? { '@pnpm.e2e/install-script-example': true } : {}),
+  }
+  await install(manifest, testDefaults({
+    fastUnpack: false,
+    frozenLockfile: true,
+    allowBuilds,
+  }))
+
+  expect(fs.existsSync('node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example/generated-by-postinstall.js')).toBeTruthy()
+  expect(fs.existsSync('node_modules/@pnpm.e2e/install-script-example/generated-by-install.js')).toBe(approveAll)
+  const modulesManifest = project.readModulesManifest()
+  expect(modulesManifest).not.toBeNull()
+  expect(Array.from(modulesManifest!.ignoredBuilds ?? [])).toStrictEqual(
+    approveAll ? [] : ['@pnpm.e2e/install-script-example@1.0.0']
+  )
 })

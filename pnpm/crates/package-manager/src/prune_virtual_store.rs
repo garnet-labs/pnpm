@@ -3,12 +3,7 @@
 //! references, together with the throttle that decides whether the
 //! sweep runs this install.
 //!
-//! Only the virtual-store sweep happens here. The rest of `prune` —
-//! removing changed direct dependencies from importer
-//! `node_modules`, the hoisted-dependency removal (pacquet handles that
-//! in [`crate::link_hoisted_modules()`]), and the `pnpm:stats` `removed`
-//! count derived from the current-vs-wanted orphan diff — is not part
-//! of this slice.
+//! Only the virtual-store sweep happens here.
 
 use std::{
     collections::HashSet,
@@ -68,7 +63,8 @@ fn cache_expired(pruned_at: &str, max_age_minutes: u64, now: SystemTime) -> bool
 ///
 /// The needed set is `node_modules` plus one
 /// [`PkgNameVerPeer::to_virtual_store_name`] per non-skipped snapshot
-/// key; any other on-disk entry is surplus and removed.
+/// key; other on-disk entries are surplus and removed, except regular
+/// lockfiles and their temporary files, which may have concurrent writers.
 ///
 /// `snapshot_keys` are the wanted lockfile's `snapshots:` keys — the
 /// peer-suffixed dep paths that name the per-package subdirectories of
@@ -121,8 +117,9 @@ pub fn prune_target_within_modules(
 ) -> Option<PathBuf> {
     let modules_dir = dunce::canonicalize(modules_dir).ok()?;
     let virtual_store_dir = pnpm_fs::realpath_missing(virtual_store_dir).ok()?;
-    (virtual_store_dir != modules_dir && virtual_store_dir.starts_with(&modules_dir))
-        .then_some(virtual_store_dir)
+    (virtual_store_dir != modules_dir && virtual_store_dir.starts_with(&modules_dir)).then_some(
+        virtual_store_dir,
+    )
 }
 
 /// Whether two paths refer to the same directory. Compares canonicalized
@@ -165,7 +162,7 @@ fn needed_virtual_store_names<'a>(
     needed
 }
 
-/// List the immediate entry names of the virtual store directory.
+/// List immediate virtual-store entries other than regular lockfile files.
 /// A missing directory yields an empty list (a first install has
 /// nothing to prune). Any other read error returns `None` so the sweep
 /// can't delete packages it failed to enumerate, and the caller knows
@@ -186,9 +183,26 @@ fn read_virtual_store_dir(virtual_store_dir: &Path) -> Option<Vec<String>> {
     Some(
         entries
             .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|entry| {
+                !is_lockfile_name(&entry.file_name().to_string_lossy())
+                    || entry
+                        .file_type()
+                        .is_ok_and(|kind| !kind.is_file())
+            })
+            .map(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect(),
     )
+}
+
+fn is_lockfile_name(name: &str) -> bool {
+    name == Lockfile::CURRENT_FILE_NAME
+        || name.starts_with("lock.yaml.")
+        || (name.starts_with(".lock.yaml.") && name.ends_with(".tmp"))
 }
 
 /// `rimraf` a surplus virtual-store entry, returning whether the entry is

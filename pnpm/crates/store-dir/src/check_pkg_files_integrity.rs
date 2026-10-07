@@ -3,8 +3,12 @@
 //! are still on disk and still match the recorded digests. This module
 //! implements that check — with a fast path that skips filesystem work
 //! entirely when the caller opted out of integrity verification.
+pub use package_dir_matches_index::package_dir_matches_index;
 
-use crate::{CafsFileInfo, PackageFilesIndex, SideEffectsDiff, StoreDir};
+use crate::{
+    CafsFileInfo, PackageFilesIndex, SideEffectsDiff, SideEffectsOverlay, StoreDir,
+    symlinks::{read_recorded_symlink_target, writes_below_a_symlink},
+};
 use dashmap::DashSet;
 use sha2::{Digest, Sha512};
 use std::{
@@ -60,8 +64,12 @@ impl VerifiedFileIntegrityTally {
     /// a small number and silence the report. 2^64 ns is ~584 years, so
     /// this never fires in practice.
     fn record(&self, elapsed: Duration) {
-        self.nanos
-            .fetch_add(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        self.nanos.fetch_add(
+            elapsed
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
         self.files.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -130,8 +138,7 @@ pub type VerifiedFilesCache = DashSet<PathBuf>;
 /// dispatches into.
 pub type SharedVerifiedFilesCache = Arc<VerifiedFilesCache>;
 
-/// `in-tarball filename` → `CAFS path`. Return value of the two verify
-/// entry points below.
+/// `in-tarball filename` → `CAFS path`.
 pub type FilesMap = HashMap<String, PathBuf>;
 
 /// Result of a `PackageFilesIndex`-row verification pass.
@@ -150,11 +157,13 @@ pub type FilesMap = HashMap<String, PathBuf>;
 /// entry by the dep-state cache key (`<engine>` or
 /// `<engine>;deps=…;patch=…`, produced by `pnpm-graph-hasher`'s
 /// `calc_dep_state`) to decide whether the package is already built.
+/// A cache key whose recorded diff has nothing to restore is absent, so
+/// presence of an entry means there is build output to materialize.
 #[derive(Debug)]
 pub struct VerifyResult {
     pub passed: bool,
     pub files_map: FilesMap,
-    pub side_effects_maps: Option<HashMap<String, FilesMap>>,
+    pub side_effects_maps: Option<HashMap<String, SideEffectsOverlay>>,
     pub side_effects: Option<HashMap<String, SideEffectsDiff>>,
     pub remote_side_effects_quarantine: Option<HashMap<String, Vec<String>>>,
 }
@@ -164,36 +173,7 @@ pub struct VerifyResult {
 /// No stat syscalls — the caller trusts the index, and any missing /
 /// corrupt CAFS file surfaces lazily at import time.
 pub fn build_file_maps_from_index(store_dir: &StoreDir, entry: PackageFilesIndex) -> VerifyResult {
-    let PackageFilesIndex { files, side_effects, remote_side_effects_quarantine, .. } = entry;
-    let mut files_map = HashMap::with_capacity(files.len());
-    let mut passed = true;
-    // Consume `entry.files` so the owned `String` filenames move into
-    // `files_map` without a per-file clone.
-    for (filename, info) in files {
-        let Some(path) = store_dir.cas_file_path_by_mode(&info.digest, info.mode) else {
-            // A malformed digest (non-hex / too short) makes this entry
-            // unreconstructable. pnpm doesn't validate the digest and
-            // would crash at import time; this `None` is a
-            // pacquet-specific guardrail.
-            tracing::debug!(
-                target: "pacquet::store_index",
-                ?filename,
-                digest = %info.digest,
-                "malformed CAFS digest in store-index row; re-fetching",
-            );
-            passed = false;
-            continue;
-        };
-        files_map.insert(filename, path);
-    }
-    let side_effects_maps = build_side_effects_maps(store_dir, side_effects.as_ref(), &files_map);
-    VerifyResult {
-        passed,
-        files_map,
-        side_effects_maps,
-        side_effects,
-        remote_side_effects_quarantine,
-    }
+    defer_pkg_files_integrity(store_dir, entry).0
 }
 
 /// Careful path used when `verify-store-integrity` is `true` (the
@@ -209,45 +189,88 @@ pub fn check_pkg_files_integrity(
     entry: PackageFilesIndex,
     verified_files_cache: &VerifiedFilesCache,
 ) -> VerifyResult {
-    // Destructure so the owned `files` HashMap and `algo` String can be
-    // consumed below, moving the filenames into `files_map` without a
-    // per-file clone on the hot path.
-    let PackageFilesIndex { files, algo, side_effects, remote_side_effects_quarantine, .. } = entry;
-    let mut all_verified = true;
+    let (mut result, pending) = defer_pkg_files_integrity(store_dir, entry);
+    result.passed = pending.verify(store_dir, verified_files_cache) && result.passed;
+    result
+}
+
+/// The maps of [`build_file_maps_from_index`] together with the files
+/// check that would turn them into [`check_pkg_files_integrity`]'s
+/// answer, for a caller that reads many rows but materializes few:
+/// it builds every row's maps here and runs [`PendingFilesCheck::verify`]
+/// only for the rows it goes on to import.
+pub fn defer_pkg_files_integrity(
+    store_dir: &StoreDir,
+    entry: PackageFilesIndex,
+) -> (VerifyResult, PendingFilesCheck) {
+    let PackageFilesIndex {
+        files,
+        algo,
+        side_effects,
+        remote_side_effects_quarantine,
+        ..
+    } = entry;
     let mut files_map = HashMap::with_capacity(files.len());
-    for (filename, info) in files {
+    let mut passed = true;
+    for (filename, info) in &files {
         let Some(path) = store_dir.cas_file_path_by_mode(&info.digest, info.mode) else {
+            // A malformed digest (non-hex / too short) makes this entry
+            // unreconstructable. pnpm doesn't validate the digest and
+            // would crash at import time; this `None` is a
+            // pacquet-specific guardrail.
             tracing::debug!(
                 target: "pacquet::store_index",
                 ?filename,
                 digest = %info.digest,
                 "malformed CAFS digest in store-index row; re-fetching",
             );
-            all_verified = false;
+            passed = false;
             continue;
         };
-        if !verified_files_cache.contains(&path) {
-            if verify_file(&path, &filename, &info, &algo) {
-                // Concurrency note: another thread may verify the same
-                // path between the `contains` check and our `insert`,
-                // doing the stat twice. That's benign — `verify_file`
-                // is idempotent and the cache converges to the same
-                // state either way. Pnpm's worker_threads cache has
-                // the same race-window for the same reason.
-                verified_files_cache.insert(path.clone());
-            } else {
-                all_verified = false;
-            }
-        }
-        files_map.insert(filename, path);
+        files_map.insert(filename.clone(), path);
     }
     let side_effects_maps = build_side_effects_maps(store_dir, side_effects.as_ref(), &files_map);
-    VerifyResult {
-        passed: all_verified,
+    let result = VerifyResult {
+        passed,
         files_map,
         side_effects_maps,
         side_effects,
         remote_side_effects_quarantine,
+    };
+    (result, PendingFilesCheck { files, algo })
+}
+
+/// The on-disk check of one store-index row's files, split off its
+/// map building by [`defer_pkg_files_integrity`].
+#[derive(Debug)]
+pub struct PendingFilesCheck {
+    files: HashMap<String, CafsFileInfo>,
+    algo: String,
+}
+
+impl PendingFilesCheck {
+    /// Whether every file the row records is still on disk with its
+    /// recorded content. A file already in `verified_files_cache` is
+    /// trusted without a stat; one that passes here is added to it.
+    #[must_use]
+    pub fn verify(self, store_dir: &StoreDir, verified_files_cache: &VerifiedFilesCache) -> bool {
+        let mut all_verified = true;
+        for (filename, info) in &self.files {
+            // A malformed digest already failed the row's maps.
+            let Some(path) = store_dir.cas_file_path_by_mode(&info.digest, info.mode) else {
+                all_verified = false;
+                continue;
+            };
+            if verified_files_cache.contains(&path) {
+                continue;
+            }
+            if verify_file(&path, filename, info, &self.algo) {
+                verified_files_cache.insert(path);
+            } else {
+                all_verified = false;
+            }
+        }
+        all_verified
     }
 }
 
@@ -260,58 +283,135 @@ fn build_side_effects_maps(
     store_dir: &StoreDir,
     side_effects: Option<&HashMap<String, SideEffectsDiff>>,
     base_files: &FilesMap,
-) -> Option<HashMap<String, FilesMap>> {
+) -> Option<HashMap<String, SideEffectsOverlay>> {
     let raw = side_effects?;
-    let mut out: HashMap<String, FilesMap> = HashMap::with_capacity(raw.len());
-    'next_key: for (cache_key, diff) in raw {
-        let SideEffectsDiff { added, deleted, .. } = diff;
-        let mut overlay: FilesMap = HashMap::with_capacity(base_files.len());
-        if let Some(added) = added {
-            for (filename, info) in added {
-                // The overlay map is later joined onto the package
-                // directory and written during import, so a poisoned /
-                // corrupted index row (store integrity is explicitly not
-                // a tamper boundary — see `verify_file`) could otherwise
-                // escape the slot via a `..` or absolute `added` key.
-                if !is_safe_overlay_path(filename) {
-                    tracing::debug!(
-                        target: "pacquet::store_index",
-                        ?filename,
-                        cache_key,
-                        "unsafe path in side-effects `added` overlay; dropping this cache_key entry entirely so the importer falls back to rebuild",
-                    );
-                    continue 'next_key;
-                }
-                let Some(path) = store_dir.cas_file_path_by_mode(&info.digest, info.mode) else {
-                    // A future importer that flips `is_built = true` on
-                    // overlay presence would otherwise turn a malformed
-                    // digest into a silent corruption: build skipped but
-                    // a required artifact missing from disk.
-                    tracing::debug!(
-                        target: "pacquet::store_index",
-                        ?filename,
-                        digest = %info.digest,
-                        cache_key,
-                        "malformed CAFS digest in side-effects `added` overlay; dropping this cache_key entry entirely so the importer falls back to rebuild",
-                    );
-                    continue 'next_key;
-                };
-                overlay.insert(filename.clone(), path);
-            }
+    let mut out: HashMap<String, SideEffectsOverlay> = HashMap::with_capacity(raw.len());
+    for (cache_key, diff) in raw {
+        if let Some(overlay) = side_effects_overlay(store_dir, cache_key, diff, base_files) {
+            out.insert(cache_key.clone(), overlay);
         }
-        // Promote `deleted` to a `HashSet` once per cache key so
-        // the `base_files` walk stays linear in `|base|` instead of
-        // `O(|base| * |deleted|)`.
-        let deleted_set: std::collections::HashSet<String> =
-            deleted.iter().flatten().cloned().collect();
-        for (filename, path) in base_files {
-            if !deleted_set.contains(filename) && !overlay.contains_key(filename) {
-                overlay.insert(filename.clone(), path.clone());
-            }
-        }
-        out.insert(cache_key.clone(), overlay);
     }
     Some(out)
+}
+
+/// One cache key's overlay of `diff` over `base_files`, or `None` when the
+/// entry has to be dropped so the importer falls back to rebuilding it.
+/// `cache_key` names the entry in the log of that decision.
+#[must_use]
+pub fn side_effects_overlay(
+    store_dir: &StoreDir,
+    cache_key: &str,
+    diff: &SideEffectsDiff,
+    base_files: &FilesMap,
+) -> Option<SideEffectsOverlay> {
+    if diff.is_empty() {
+        tracing::debug!(
+            target: "pacquet::store_index",
+            cache_key,
+            "side-effects row records no in-package change; dropping this cache_key entry entirely so the importer falls back to rebuild",
+        );
+        return None;
+    }
+    let SideEffectsDiff { added, deleted, .. } = diff;
+    let mut files: FilesMap = HashMap::with_capacity(base_files.len());
+    let mut symlinks = HashMap::new();
+    for (filename, info) in added.iter().flatten() {
+        let path = overlay_path(store_dir, cache_key, filename, info)?;
+        if info.is_symlink() {
+            symlinks.insert(filename.clone(), overlay_symlink_target(cache_key, filename, &path)?);
+        } else {
+            files.insert(filename.clone(), path);
+        }
+    }
+    // Promote `deleted` to a `HashSet` once per cache key so
+    // the `base_files` walk stays linear in `|base|` instead of
+    // `O(|base| * |deleted|)`.
+    let deleted_set: std::collections::HashSet<String> = deleted
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    for (filename, path) in base_files {
+        if !deleted_set.contains(filename)
+            && !files.contains_key(filename)
+            && !symlinks.contains_key(filename)
+        {
+            files.insert(filename.clone(), path.clone());
+        }
+    }
+    restorable_overlay(cache_key, SideEffectsOverlay { files, symlinks })
+}
+
+/// `overlay`, or `None` when its symlinks cannot be restored on this host
+/// or restoring them would let a write follow one of them.
+fn restorable_overlay(cache_key: &str, overlay: SideEffectsOverlay) -> Option<SideEffectsOverlay> {
+    if overlay.symlinks.is_empty()
+        || !(cfg!(windows) || writes_below_a_symlink(&overlay.symlinks, overlay.files.keys()))
+    {
+        return Some(overlay);
+    }
+    tracing::debug!(
+        target: "pacquet::store_index",
+        cache_key,
+        "side-effects symlinks cannot be restored here; dropping this cache_key entry entirely so the importer falls back to rebuild",
+    );
+    None
+}
+
+/// The target of one recorded symlink, or `None` when the entry cannot be
+/// restored and its whole cache key must be dropped.
+fn overlay_symlink_target(cache_key: &str, filename: &str, cas_path: &Path) -> Option<String> {
+    let target = read_recorded_symlink_target(filename, cas_path).unwrap_or_else(|error| {
+        tracing::debug!(target: "pacquet::store_index", ?error, ?cas_path, "failed to read a side-effects symlink target");
+        None
+    });
+    if target.is_none() {
+        tracing::debug!(
+            target: "pacquet::store_index",
+            ?filename,
+            cache_key,
+            "unrestorable symlink in side-effects `added` overlay; dropping this cache_key entry entirely so the importer falls back to rebuild",
+        );
+    }
+    target
+}
+
+/// The CAS path one `added` entry points at, or `None` when the entry
+/// cannot be trusted and its whole cache key must be dropped.
+fn overlay_path(
+    store_dir: &StoreDir,
+    cache_key: &str,
+    filename: &str,
+    info: &CafsFileInfo,
+) -> Option<PathBuf> {
+    // The overlay map is later joined onto the package directory and
+    // written during import, so a poisoned / corrupted index row (store
+    // integrity is explicitly not a tamper boundary — see `verify_file`)
+    // could otherwise escape the slot via a `..` or absolute `added` key.
+    if !is_safe_overlay_path(filename) {
+        tracing::debug!(
+            target: "pacquet::store_index",
+            ?filename,
+            cache_key,
+            "unsafe path in side-effects `added` overlay; dropping this cache_key entry entirely so the importer falls back to rebuild",
+        );
+        return None;
+    }
+    let path = store_dir.cas_file_path_by_mode(&info.digest, info.mode);
+    if path.is_none() {
+        // A future importer that flips `is_built = true` on overlay
+        // presence would otherwise turn a malformed digest into a silent
+        // corruption: build skipped but a required artifact missing from
+        // disk.
+        tracing::debug!(
+            target: "pacquet::store_index",
+            ?filename,
+            digest = %info.digest,
+            cache_key,
+            "malformed CAFS digest in side-effects `added` overlay; dropping this cache_key entry entirely so the importer falls back to rebuild",
+        );
+    }
+    path
 }
 
 /// Whether `filename` is a safe package-relative path to write under the
@@ -327,7 +427,8 @@ fn is_safe_overlay_path(filename: &str) -> bool {
         return false;
     }
     let path = Path::new(filename);
-    path.components().all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    path.components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 /// `true` when the on-disk file is either unmodified since the last
@@ -358,8 +459,6 @@ fn is_safe_overlay_path(filename: &str) -> bool {
 /// another *process* sharing the store may be importing from it — see
 /// [`scrub_directory_at_cafs_path`].
 fn verify_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> bool {
-    // Lock-free fast path. `check_file` is read-only and only touches
-    // the file's metadata; no risk of clobbering a writer's state.
     let Some((is_modified, _)) = check_file(path, info.checked_at) else {
         tracing::debug!(
             target: "pacquet::store_index",
@@ -373,12 +472,10 @@ fn verify_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> 
         return true;
     }
 
-    // Slow path: the file's mtime indicates a recent change. Acquire
-    // the per-path lock and re-check so a concurrent writer's
-    // `write_all` lands before we decide whether to delete. The
-    // common case (unmodified file from a prior install) never gets
-    // here — the lock cost only applies to files actually being
-    // re-verified, which is rare.
+    verify_modified_file(path, filename, info, algo)
+}
+
+fn verify_modified_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> bool {
     let lock = pnpm_fs::cas_write_lock(path);
     let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -464,7 +561,7 @@ fn scrub_directory_at_cafs_path(path: &Path) {
     let mut scrub_path = path.as_os_str().to_owned();
     scrub_path.push(format!(
         ".pacquet-scrub-{}-{}",
-        std::process::id(),
+        pnpm_fs::process_id(),
         SCRUB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let scrub_path = Path::new(&scrub_path);
@@ -503,8 +600,7 @@ fn scrub_directory_at_cafs_path(path: &Path) {
 /// re-fetch". That's a safer default for a cache-hint path — we don't
 /// want a transient `EACCES` on a CAS blob to panic the install — and
 /// the content-hash check in [`verify_file_integrity`] still catches
-/// actual corruption. If we ever want pnpm-strict error propagation,
-/// changing the return type to `Result<Option<…>>` is the right shape.
+/// actual corruption.
 ///
 /// 100 ms of slack on the mtime comparison matches pnpm's threshold —
 /// accounts for coarse mtime resolution on some filesystems plus the
@@ -526,42 +622,6 @@ fn check_file(path: &Path, checked_at: Option<u64>) -> Option<(bool, u64)> {
     Some((is_modified, meta.len()))
 }
 
-/// Whether the materialized package under `dir` still matches the store
-/// row it was expanded from.
-///
-/// This is pnpm's `dint.check`, and answers what `pnpm store status`
-/// asks: has anything edited the package after it was linked out of the
-/// store. Only the files the row records are checked — a file *added*
-/// under `dir` afterwards is not a change to what the store holds — and
-/// a missing, unreadable, or re-hashed file all read as mutated.
-#[must_use]
-pub fn package_dir_matches_index(dir: &Path, index: &PackageFilesIndex) -> bool {
-    index.files.iter().all(|(path, file)| {
-        join_inside(dir, path)
-            .is_some_and(|path| verify_file_integrity(&path, &file.digest, &index.algo))
-    })
-}
-
-/// `dir` joined with a recorded in-package path, or `None` if that path is
-/// anything other than a sequence of plain names.
-///
-/// The recorded paths come from archive entries. Extraction rejects a
-/// leading separator and `..`, but not a Windows drive prefix — and
-/// [`Path::join`] discards its base when the argument has one, which would
-/// point the hash at a file outside the package. Rejecting here keeps that
-/// decision local to the one caller that joins index keys onto a
-/// directory rather than reading them out of the CAS.
-fn join_inside(dir: &Path, relative: &str) -> Option<PathBuf> {
-    let mut joined = dir.to_path_buf();
-    for component in Path::new(relative).components() {
-        match component {
-            std::path::Component::Normal(segment) => joined.push(segment),
-            _ => return None,
-        }
-    }
-    Some(joined)
-}
-
 /// Streams the file through the hasher in 64 KiB chunks and compares
 /// the digest against the stored hex `digest`.
 ///
@@ -577,7 +637,17 @@ fn join_inside(dir: &Path, relative: &str) -> Option<PathBuf> {
 /// unknown-algo behaviour. An I/O error mid-read also falls through to
 /// `false` so the caller re-fetches rather than deciding on a partial
 /// hash.
-fn verify_file_integrity(path: &Path, digest: &str, algo: &str) -> bool {
+pub(super) fn file_content_matches_digest(path: &Path, digest: &str, algo: &str) -> bool {
+    if algo != "sha512" {
+        return false;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    hash_matches(file, digest)
+}
+
+pub(super) fn verify_file_integrity(path: &Path, digest: &str, algo: &str) -> bool {
     if algo != "sha512" {
         return false;
     }
@@ -614,6 +684,8 @@ fn hash_matches(file: fs::File, digest: &str) -> bool {
     }
     format!("{:x}", hasher.finalize()) == digest
 }
+
+mod package_dir_matches_index;
 
 #[cfg(test)]
 mod tests;

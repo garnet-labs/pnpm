@@ -1,14 +1,22 @@
+use crate::_utils;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pipe_trait::Pipe;
 use pnpm_store_dir::STORE_VERSION;
-use pnpm_testing_utils::bin::CommandTempCwd;
+use pnpm_testing_utils::{bin::CommandTempCwd, command_env::CommandTestExt};
 use pretty_assertions::assert_eq;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
+
+fn pacquet_at(workspace: &Path) -> Command {
+    Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(workspace)
+        .without_ambient_pnpm_config()
+}
 
 /// Canonicalize a path the same way the production CLI does. The CLI
 /// runs `dunce::canonicalize` on `--dir` and threads that through to
@@ -54,7 +62,7 @@ fn store_path_accepts_the_silent_shorthand() {
 
 #[test]
 fn store_path_should_return_store_dir_from_pnpm_workspace_yaml() {
-    // `storeDir` is a project-structural setting — in pnpm 11 (and now
+    // `storeDir` is a project-structural setting — in pnpm 11 (and
     // pacquet) it's only honoured from `pnpm-workspace.yaml`, not `.npmrc`.
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
 
@@ -63,7 +71,10 @@ fn store_path_should_return_store_dir_from_pnpm_workspace_yaml() {
         .expect("write to pnpm-workspace.yaml");
 
     eprintln!("Executing pacquet store path...");
-    let output = pacquet.with_args(["store", "path"]).output().expect("run pacquet store path");
+    let output = pacquet
+        .with_args(["store", "path"])
+        .output()
+        .expect("run pacquet store path");
     dbg!(&output);
 
     eprintln!("Exit status code");
@@ -108,7 +119,10 @@ fn store_path_resolves_global_and_dotted_overrides_from_workspace_root() {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim_end(),
-            canonicalize(&workspace).join(expected_name).join(STORE_VERSION).to_string_lossy(),
+            canonicalize(&workspace)
+                .join(expected_name)
+                .join(STORE_VERSION)
+                .to_string_lossy(),
         );
     }
 
@@ -133,7 +147,10 @@ fn store_path_expands_a_quoted_home_override() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim_end(),
-        home_dir.join("pacquet-quoted-store").join(STORE_VERSION).to_string_lossy(),
+        home_dir
+            .join("pacquet-quoted-store")
+            .join(STORE_VERSION)
+            .to_string_lossy(),
     );
 
     drop(root);
@@ -173,9 +190,14 @@ fn empty_store_dir_override_restores_the_platform_default() {
 
 #[test]
 fn store_status_reports_an_untouched_store() {
-    let CommandTempCwd { mut pacquet, workspace, root: _root, .. } =
-        CommandTempCwd::init().add_mocked_registry();
-    pacquet.arg("add").arg("is-odd@3.0.1").assert().success();
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    pacquet
+        .arg("add")
+        .arg("is-odd@3.0.1")
+        .assert()
+        .success();
 
     let output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
@@ -191,9 +213,14 @@ fn store_status_reports_an_untouched_store() {
 
 #[test]
 fn store_status_reports_a_package_edited_after_it_was_linked_out() {
-    let CommandTempCwd { mut pacquet, workspace, root: _root, .. } =
-        CommandTempCwd::init().add_mocked_registry();
-    pacquet.arg("add").arg("is-odd@3.0.1").assert().success();
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    pacquet
+        .arg("add")
+        .arg("is-odd@3.0.1")
+        .assert()
+        .success();
 
     let installed_index = workspace.join("node_modules/.pnpm/is-odd@3.0.1/node_modules/is-odd");
     fs::write(installed_index.join("index.js"), "module.exports = 'tampered'\n")
@@ -210,14 +237,214 @@ fn store_status_reports_a_package_edited_after_it_was_linked_out() {
     assert!(!output.status.success(), "store status must fail once a package is modified");
     assert!(stderr.contains("ERR_PNPM_MODIFIED_DEPENDENCY"), "stderr={stderr}");
     assert!(stderr.contains("is-odd@3.0.1"), "stderr={stderr}");
+    assert!(!stderr.contains("help:"), "stderr={stderr}");
+    assert!(!stderr.contains("--force"), "stderr={stderr}");
+}
+
+/// A package resolved against peer dependencies materializes into a
+/// peer-suffixed slot (`<name>@<version>_<peer>@<version>`), which is
+/// also the dep path that `snapshots:` and `.modules.yaml.skipped`
+/// record. Checking the bare `name@version` directory finds nothing on
+/// disk and reports every peer-resolved package as modified.
+#[test]
+fn store_status_checks_packages_in_peer_suffixed_slots() {
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    // `@pnpm.e2e/abc` peer-depends on peer-a, peer-b, and peer-c. With
+    // auto-install-peers (the default) all three resolve, suffixing
+    // abc's snapshot key.
+    pacquet
+        .arg("add")
+        .arg("@pnpm.e2e/abc@1.0.0")
+        .assert()
+        .success();
+
+    let pnpm_dir = workspace.join("node_modules/.pnpm");
+    let abc_slot = fs::read_dir(&pnpm_dir)
+        .expect("read the virtual store")
+        .filter_map(Result::ok)
+        .map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .find(|name| name.starts_with("@pnpm.e2e+abc@1.0.0_"))
+        .expect("abc must materialize into a peer-suffixed slot");
+
+    let output = Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .args(["store", "status"])
+        .output()
+        .expect("run pacquet store status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("stderr={stderr}");
+    assert!(
+        output.status.success(),
+        "an untouched peer-resolved package must not be reported as modified: {stderr}",
+    );
+
+    let installed_package_json = pnpm_dir
+        .join(&abc_slot)
+        .join("node_modules")
+        .join("@pnpm.e2e")
+        .join("abc")
+        .join("package.json");
+    fs::write(&installed_package_json, "{}\n").expect("edit the installed package");
+
+    let output = Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .args(["store", "status"])
+        .output()
+        .expect("run pacquet store status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("stderr={stderr}");
+    assert!(
+        !output.status.success(),
+        "an edit inside the peer-suffixed slot must be reported: {stderr}",
+    );
+    assert!(stderr.contains("ERR_PNPM_MODIFIED_DEPENDENCY"), "stderr={stderr}");
+    // The report names the snapshot dep path, peer suffix included.
+    assert!(stderr.contains("@pnpm.e2e/abc@1.0.0("), "stderr={stderr}");
+}
+
+/// A platform-skipped optional is recorded in `.modules.yaml.skipped`
+/// under its snapshot (peer-suffixed) key and never materializes.
+/// Filtering on the peer-stripped `packages:` key misses that record
+/// and reports the absent directory as a modification, so long as the
+/// package has a store row (without one the check bails out earlier).
+#[test]
+fn store_status_ignores_skipped_optional_packages() {
+    let CommandTempCwd {
+        mut pacquet,
+        workspace,
+        root: _root,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"name":"fixture","dependencies":{"is-odd":"3.0.1"},"optionalDependencies":{"@pnpm.e2e/not-compatible-with-any-os":"*"}}"#,
+    )
+    .expect("write package.json");
+    // The peer added through packageExtensions suffixes the snapshot key,
+    // which is the key `.modules.yaml.skipped` records. Appended, so the
+    // fixture's `storeDir`/`cacheDir` entries stay in place.
+    _utils::append_workspace_yaml_key(
+        &workspace,
+        "packageExtensions",
+        "\n  '@pnpm.e2e/not-compatible-with-any-os':\n    peerDependencies:\n      '@pnpm.e2e/peer-a': ^1.0.0",
+    );
+
+    pacquet
+        .arg("install")
+        .assert()
+        .success();
+
+    let lockfile = pnpm_lockfile::Lockfile::load_wanted_from_dir(&workspace)
+        .expect("parse pnpm-lock.yaml")
+        .expect("install writes pnpm-lock.yaml");
+    let snapshot_key = lockfile.snapshots
+        .iter()
+        .flatten()
+        .map(|(key, _)| key)
+        .find(|key| key.to_string().starts_with("@pnpm.e2e/not-compatible-with-any-os@1.0.0("))
+        .expect("the skipped optional must have a peer-suffixed snapshot key");
+    let modules = pnpm_modules_yaml::read_modules_manifest::<pnpm_modules_yaml::Host>(
+        &workspace.join("node_modules"),
+    )
+    .expect("parse .modules.yaml")
+    .expect("install writes .modules.yaml");
+    assert!(
+        modules.skipped.contains(&snapshot_key.to_string()),
+        "the skipped optional must be recorded under its snapshot key {snapshot_key}, got {:?}",
+        modules.skipped,
+    );
+    let metadata = lockfile.packages
+        .as_ref()
+        .and_then(|packages| packages.get(&snapshot_key.without_peer()))
+        .expect("the skipped optional must have a packages entry");
+    let store_index_key = pnpm_deps_restorer::store_index_key_for_resolution(
+        &metadata.resolution,
+        &snapshot_key.pkg_id(),
+        true,
+    )
+    .expect("a registry tarball has a store index key");
+
+    // Prime the store row the check looks up: the skipped package was
+    // never fetched by the install, and without a row store status would
+    // not inspect its directory at all.
+    Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .with_args(["store", "add", "@pnpm.e2e/not-compatible-with-any-os@1.0.0"])
+        .assert()
+        .success();
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir);
+    let store_index = pnpm_store_dir::StoreIndex::open_readonly_in(&store_dir)
+        .expect("open the store index store add just wrote");
+    let keys = store_index.keys().expect("read the store index keys");
+    assert!(
+        keys.contains(&store_index_key),
+        "store add must write the row store status looks up ({store_index_key}), got {keys:?}",
+    );
+
+    let output = Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .args(["store", "status"])
+        .output()
+        .expect("run pacquet store status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("stderr={stderr}");
+    assert!(
+        output.status.success(),
+        "a skipped optional must not be reported as modified: {stderr}",
+    );
+    assert!(stderr.contains("Packages in the store are untouched"), "stderr={stderr}");
+}
+
+#[test]
+fn store_status_does_not_falsely_report_package_with_postinstall_script_as_modified() {
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    pacquet
+        .arg("add")
+        .arg("@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0")
+        .arg("--allow-build=@pnpm.e2e/pre-and-postinstall-scripts-example")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .args(["store", "status"])
+        .output()
+        .expect("run pacquet store status");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("stderr={stderr}");
+    assert!(output.status.success(), "store status must succeed for built packages: {stderr}");
+    assert!(stderr.contains("Packages in the store are untouched"), "stderr={stderr}");
 }
 
 #[test]
 fn store_add_fetches_a_package_without_touching_the_project() {
-    let CommandTempCwd { pacquet, workspace, root: _root, npmrc_info, .. } =
-        CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd {
+        pacquet,
+        workspace,
+        root: _root,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
 
-    pacquet.with_args(["store", "add", "is-odd@3.0.1"]).assert().success();
+    pacquet
+        .with_args(["store", "add", "is-odd@3.0.1"])
+        .assert()
+        .success();
 
     assert!(!workspace.join("node_modules").exists(), "store add must not install anything");
     assert!(!workspace.join("package.json").exists(), "store add must not write a manifest");
@@ -230,9 +457,87 @@ fn store_add_fetches_a_package_without_touching_the_project() {
         .expect("open the store index store add just wrote");
     let keys = store_index.keys().expect("read the store index keys");
     assert!(
-        keys.iter().any(|key| key.contains("is-odd@3.0.1")),
+        keys.iter()
+            .any(|key| key.contains("is-odd@3.0.1")),
         "store add must record is-odd@3.0.1 in the store index, got {keys:?}",
     );
+}
+
+#[test]
+fn store_add_waits_for_the_store_operation_lock() {
+    let CommandTempCwd {
+        pacquet,
+        workspace,
+        root: _root,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir);
+    pacquet_at(&workspace)
+        .with_args(["store", "add", "@pnpm.e2e/foo@100.0.0"])
+        .assert()
+        .success();
+    let prune_lock = store_dir.lock_for_prune().expect("lock store for prune");
+    let alternate_temp = workspace.join("alternate-temp");
+    fs::create_dir(&alternate_temp).expect("create alternate temporary directory");
+    let output_path = workspace.join("store-add-lock.ndjson");
+
+    let mut add = pacquet
+        .with_args([
+            "--reporter=ndjson",
+            "--loglevel=debug",
+            "store",
+            "add",
+            "@pnpm.e2e/foo@100.0.0",
+        ])
+        .env("TMPDIR", &alternate_temp)
+        .env("TEMP", &alternate_temp)
+        .env("TMP", &alternate_temp)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&output_path).expect("create store add output"))
+        .spawn()
+        .expect("spawn store add");
+    _utils::wait_for_child_output(
+        &mut add,
+        &output_path,
+        "Waiting for the store add operation lock",
+    );
+    _utils::assert_child_output_stays_absent(
+        &mut add,
+        &output_path,
+        "Acquired the store add operation lock",
+    );
+    drop(prune_lock);
+    assert!(_utils::wait_for_child(&mut add).success());
+    let output = fs::read_to_string(&output_path).expect("read completed store add output");
+    assert!(output.contains("Acquired the store add operation lock"), "{output}");
+}
+
+#[cfg(unix)]
+#[test]
+fn store_operation_lock_lives_in_the_xdg_runtime_dir() {
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let runtime_dir = workspace.join("runtime");
+    fs::create_dir(&runtime_dir).expect("create XDG_RUNTIME_DIR");
+
+    pacquet
+        .with_args(["store", "add", "@pnpm.e2e/foo@100.0.0"])
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .assert()
+        .success();
+
+    let lock_dirs: Vec<_> = fs::read_dir(&runtime_dir)
+        .expect("read XDG_RUNTIME_DIR")
+        .map(|entry| entry.expect("read XDG_RUNTIME_DIR entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pnpm-store-operation-locks-"))
+        })
+        .collect();
+    assert_eq!(lock_dirs.len(), 1, "{lock_dirs:?}");
+    assert!(lock_dirs[0].join("all-stores.lock").is_file());
 }
 
 #[test]
@@ -247,6 +552,126 @@ fn store_add_fails_when_a_package_cannot_be_fetched() {
     eprintln!("stderr={stderr}");
     assert!(!output.status.success(), "store add must fail when a package cannot be fetched");
     assert!(stderr.contains("ERR_PNPM_STORE_ADD_FAILURE"), "stderr={stderr}");
+}
+
+#[test]
+fn store_prune_reports_undecodable_entries() {
+    for count in [0, 1, 2] {
+        let CommandTempCwd { pacquet, root, .. } = CommandTempCwd::init();
+        let store_dir = pnpm_store_dir::StoreDir::from(root.path().join("store"));
+        drop(pnpm_store_dir::StoreIndex::open_in(&store_dir).expect("initialize store index"));
+        Command::new("node")
+            .with_args([
+                "-e",
+                r"
+                const { DatabaseSync } = require('node:sqlite');
+                const db = new DatabaseSync(process.argv[1]);
+                const insert = db.prepare('INSERT INTO package_index (key, data) VALUES (?, ?)');
+                for (let i = 0; i < Number(process.argv[2]); i++) {
+                    insert.run(`unreadable-${i}`, Buffer.from([0xc1]));
+                }
+                db.close();
+                ",
+            ])
+            .with_arg(store_dir.root().join("index.db"))
+            .with_arg(count.to_string())
+            .assert()
+            .success();
+
+        let output = pacquet
+            .with_args(["store", "prune", "--store-dir"])
+            .with_arg(store_dir.root())
+            .output()
+            .expect("run store prune");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "store prune failed: {stderr}");
+        if count == 0 {
+            assert!(!stderr.contains("could not be read"), "stderr={stderr}");
+        } else {
+            let noun = if count == 1 { "entry" } else { "entries" };
+            let notice = format!("Kept {count} package index {noun} that could not be read");
+            assert!(stderr.contains(&notice), "stderr={stderr}");
+        }
+        assert_eq!(
+            pnpm_store_dir::StoreIndex::open_readonly_in(&store_dir)
+                .expect("open pruned store index")
+                .keys()
+                .expect("read retained keys")
+                .len(),
+            count,
+        );
+    }
+}
+
+#[test]
+fn store_prune_removes_packages_left_unreferenced_by_remove() {
+    let CommandTempCwd {
+        root: _root, workspace, npmrc_info, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    pacquet_at(&workspace)
+        .with_args(["add", "is-positive@1.0.0", "--package-import-method=hardlink"])
+        .assert()
+        .success();
+
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir);
+    let package_keys = || {
+        pnpm_store_dir::StoreIndex::open_readonly_in(&store_dir)
+            .expect("open store index")
+            .keys()
+            .expect("read store index keys")
+    };
+    assert!(
+        package_keys()
+            .iter()
+            .any(|key| key.contains("is-positive@1.0.0")),
+    );
+
+    pacquet_at(&workspace)
+        .with_args(["remove", "is-positive", "--package-import-method=hardlink"])
+        .assert()
+        .success();
+    assert!(
+        package_keys()
+            .iter()
+            .any(|key| key.contains("is-positive@1.0.0")),
+    );
+
+    let output = pacquet_at(&workspace)
+        .with_args(["store", "prune"])
+        .output()
+        .expect("run store prune");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "store prune failed: {stderr}");
+    assert!(stderr.contains("Removed "), "store prune must report what it reclaimed: {stderr}");
+    assert!(
+        !package_keys()
+            .iter()
+            .any(|key| key.contains("is-positive@1.0.0")),
+        "store prune must remove the unreferenced package row",
+    );
+}
+
+/// Private engine installs live in pnpm's own engine store, which
+/// `pnpm store prune` otherwise never visits.
+#[test]
+fn store_prune_removes_the_private_engine_installs_no_process_holds() {
+    let CommandTempCwd { pacquet, root, .. } = CommandTempCwd::init();
+    let pnpm_home = root.path().join("pnpm-home");
+    let engine_store = pnpm_store_dir::StoreDir::new(pnpm_home.join("package-manager-store"));
+    let held = engine_store
+        .create_private_install("pnpm-9.3.0")
+        .expect("create a private install this process holds");
+    let orphan = engine_store.tmp().join("private/pnpm-9.3.0-orphan");
+    fs::create_dir_all(&orphan).expect("leave a private install behind");
+
+    pacquet
+        .with_env("PNPM_HOME", &pnpm_home)
+        .with_args(["store", "prune"])
+        .assert()
+        .success();
+
+    assert!(!orphan.exists(), "prune must remove the private install nobody holds");
+    assert!(held.dir().exists(), "prune must keep the private install in use");
 }
 
 /// The resolver chain claims every protocol pnpm supports, but only an
@@ -269,4 +694,154 @@ fn store_add_refuses_a_specifier_with_no_archive_to_fetch() {
     eprintln!("stderr={stderr}");
     assert!(!output.status.success());
     assert!(stderr.contains("ERR_PNPM_STORE_ADD_UNSUPPORTED_SPEC"), "stderr={stderr}");
+}
+
+#[test]
+fn store_prune_honors_dlx_cache_max_age() {
+    for max_age in [0, 1440] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        let settings = format!(
+            "storeDir: ../pacquet-store\ncacheDir: ../pacquet-cache\ndlxCacheMaxAge: {max_age}\n",
+        );
+        fs::write(workspace.join("pnpm-workspace.yaml"), settings)
+            .expect("write the workspace settings");
+        fs::create_dir_all(root.path().join("pacquet-store")).expect("create the store directory");
+
+        let dlx_cache_dir = root.path().join("pacquet-cache/dlx");
+        for (key, prepare) in [("first-key", "1-1"), ("second-key", "2-2")] {
+            let prepare_dir = dlx_cache_dir.join(key).join(prepare);
+            fs::create_dir_all(&prepare_dir).expect("create the prepare dir");
+            pnpm_fs::force_symlink_dir(&prepare_dir, &dlx_cache_dir.join(key).join("pkg"))
+                .expect("point pkg at the prepare dir");
+        }
+
+        pacquet
+            .with_args(["store", "prune"])
+            .assert()
+            .success();
+
+        for key in ["first-key", "second-key"] {
+            assert_eq!(
+                dlx_cache_dir.join(key).exists(),
+                max_age > 0,
+                "store prune must honor dlxCacheMaxAge={max_age}",
+            );
+        }
+    }
+}
+
+/// The dlx cache holds hard links into the store, so one prune must drop an
+/// expired entry and reclaim the packages only that entry used.
+#[test]
+fn store_prune_reclaims_packages_of_an_expired_dlx_cache_entry() {
+    let CommandTempCwd {
+        root: _root, workspace, npmrc_info, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    _utils::append_workspace_yaml_key(&workspace, "packageImportMethod", "hardlink");
+    pacquet_at(&workspace)
+        .with_args(["dlx", "--package=is-positive@1.0.0", "node", "-e", "0"])
+        .assert()
+        .success();
+
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir);
+    let package_keys = || {
+        pnpm_store_dir::StoreIndex::open_readonly_in(&store_dir)
+            .expect("open store index")
+            .keys()
+            .expect("read store index keys")
+    };
+    assert!(
+        package_keys()
+            .iter()
+            .any(|key| key.contains("is-positive@1.0.0")),
+    );
+
+    _utils::append_workspace_yaml_key(&workspace, "dlxCacheMaxAge", 0);
+    pacquet_at(&workspace)
+        .with_args(["store", "prune"])
+        .assert()
+        .success();
+
+    let dlx_entries = fs::read_dir(npmrc_info.cache_dir.join("dlx")).map_or(0, Iterator::count);
+    assert_eq!(dlx_entries, 0, "store prune must remove the expired dlx cache entry");
+    assert!(
+        !package_keys()
+            .iter()
+            .any(|key| key.contains("is-positive@1.0.0")),
+        "store prune must reclaim the packages of the expired dlx cache entry",
+    );
+}
+
+/// A group-writable, setgid store stands in for a multi-user store. Install
+/// must not replace `index.db` or drop group-write from store files.
+#[cfg(unix)]
+#[test]
+fn install_keeps_a_group_writable_store() {
+    use pnpm_testing_utils::bin::AddMockedRegistry;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+    _utils::enable_gvs_in_workspace_yaml(&workspace, "");
+
+    let versioned = store_dir.join(STORE_VERSION);
+    fs::create_dir_all(&versioned).expect("create the versioned store");
+    fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o2775)).expect("chmod store");
+    fs::set_permissions(&versioned, fs::Permissions::from_mode(0o2775))
+        .expect("chmod versioned store");
+
+    let index = versioned.join("index.db");
+    fs::write(&index, []).expect("seed index.db");
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o664)).expect("chmod index.db");
+    let before = fs::metadata(&index).expect("stat index.db");
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": { "@pnpm.e2e/hello-world-js-bin": "1.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let assert_index = |label: &str| {
+        let meta = fs::metadata(&index).expect("stat index.db");
+        assert_eq!(meta.uid(), before.uid(), "{label} uid");
+        assert_eq!(meta.gid(), before.gid(), "{label} gid");
+        assert_eq!(meta.ino(), before.ino(), "{label} inode");
+        assert_eq!(meta.mode() & 0o777, 0o664, "{label} mode");
+    };
+
+    pacquet_at(&workspace)
+        .arg("install")
+        .assert()
+        .success();
+    assert_index("first install");
+    assert_eq!(fs::metadata(&versioned).unwrap().mode() & 0o7777, 0o2775);
+
+    let files_dir = versioned.join("files");
+    assert!(files_dir.is_dir(), "install must write content-addressed files");
+    let store_gid = fs::metadata(&versioned).unwrap().gid();
+    let mut stack = vec![files_dir];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read store files") {
+            let path = entry.expect("store entry").path();
+            let meta = fs::symlink_metadata(&path).expect("stat store entry");
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                assert_eq!(meta.gid(), store_gid, "{}", path.display());
+                assert_ne!(meta.mode() & 0o020, 0, "{}", path.display());
+            }
+        }
+    }
+
+    pacquet_at(&workspace)
+        .arg("install")
+        .assert()
+        .success();
+    assert_index("second install");
+
+    drop((root, mock_instance));
 }

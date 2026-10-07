@@ -3,7 +3,10 @@
 use crate::{
     node_id::NodeId,
     resolve_peers::{ResolvePeersOptions, discovery::PeerDiscoveryCaches, walker::Walker},
-    resolved_tree::{DependenciesTreeNode, PeerDep, ResolvedPackage, ResolvedTree, TreeChildren},
+    resolved_tree::{
+        ChildEdge, DependenciesTreeNode, DirectDep, PeerDep, ResolvedPackage, ResolvedPackageInput,
+        ResolvedTree, TreeChildren,
+    },
 };
 use pnpm_lockfile::{
     DirectoryResolution, LockfileResolution, PkgName, PkgNameVer, TarballResolution,
@@ -21,8 +24,28 @@ pub(super) fn tree_node(
         Arc::from(pkg_id.to_string()),
         TreeChildren::Realized(Arc::new(children)),
         depth,
-        true,
     )
+}
+
+/// A regular (non-optional) child edge.
+pub(super) fn child_edge(alias: &str, pkg_id: &str) -> ChildEdge {
+    ChildEdge { alias: alias.to_string(), pkg_id: Arc::from(pkg_id), optional: false }
+}
+
+/// Add an importer-level direct dependency whose children the peer walk
+/// expands from [`ResolvedTree::children_by_id`].
+pub(super) fn add_lazy_direct_dep(
+    dependencies_tree: &mut HashMap<NodeId, DependenciesTreeNode>,
+    direct: &mut Vec<DirectDep>,
+    alias: &str,
+    pkg_id: &str,
+) {
+    let node_id = NodeId::next();
+    dependencies_tree.insert(
+        node_id.clone(),
+        DependenciesTreeNode::new(Arc::from(pkg_id), TreeChildren::Lazy, 0),
+    );
+    direct.push(DirectDep { alias: alias.to_string(), node_id, id: pkg_id.into() });
 }
 
 pub(super) fn walker_for_tests(tree: &mut ResolvedTree) -> Walker<'_> {
@@ -42,8 +65,10 @@ pub(super) fn package(
     peer_dependencies: &[(&str, &str)],
     is_leaf: bool,
 ) -> ResolvedPackage {
-    let peer_dependencies: Vec<_> =
-        peer_dependencies.iter().map(|(name, version)| (*name, *version, false)).collect();
+    let peer_dependencies: Vec<_> = peer_dependencies
+        .iter()
+        .map(|(name, version)| (*name, *version, false))
+        .collect();
     package_with_peer_dependencies(name, version, &peer_dependencies, is_leaf)
 }
 
@@ -59,24 +84,20 @@ pub(super) fn package_with_peer_dependencies(
             ((*name).to_string(), PeerDep { version: (*version).to_string(), optional: *optional })
         })
         .collect();
-    ResolvedPackage {
+    ResolvedPackage::new(ResolvedPackageInput {
         id: format!("{name}@{version}").into(),
         result: Arc::new(resolve_result(name, version)),
         peer_dependencies,
         optional: false,
         is_leaf,
-    }
+    })
 }
 
 pub(super) fn linked_package(name: &str, id: &str, directory: &str) -> ResolvedPackage {
-    ResolvedPackage {
+    ResolvedPackage::new(ResolvedPackageInput {
         id: Arc::from(id.to_string()),
         result: Arc::new(ResolveResult {
             id: PkgResolutionId::from(id.to_string()),
-            name_ver: None,
-            latest: None,
-            published_at: None,
-            manifest: Some(Arc::new(serde_json::json!({ "name": name, "version": "1.0.0" }))),
             resolution: LockfileResolution::Directory(DirectoryResolution {
                 directory: directory.to_string(),
             }),
@@ -84,11 +105,18 @@ pub(super) fn linked_package(name: &str, id: &str, directory: &str) -> ResolvedP
             normalized_bare_specifier: None,
             alias: Some(name.to_string()),
             policy_violation: None,
+            package: pnpm_resolving_resolver_base::ResolvedPackageInfo {
+                name_ver: None,
+                latest: None,
+                published_at: None,
+                manifest: Some(Arc::new(serde_json::json!({ "name": name, "version": "1.0.0" }))),
+                non_deprecated_alternative: None,
+            },
         }),
         peer_dependencies: BTreeMap::new(),
         optional: false,
         is_leaf: true,
-    }
+    })
 }
 
 pub(super) fn resolve_result(name: &str, version: &str) -> ResolveResult {
@@ -98,10 +126,6 @@ pub(super) fn resolve_result(name: &str, version: &str) -> ResolveResult {
     );
     ResolveResult {
         id: (&name_ver).into(),
-        name_ver: Some(name_ver),
-        latest: Some(version.to_string()),
-        published_at: None,
-        manifest: None,
         resolution: LockfileResolution::Tarball(TarballResolution {
             tarball: format!("https://registry.example/{name}-{version}.tgz"),
             integrity: None,
@@ -113,5 +137,12 @@ pub(super) fn resolve_result(name: &str, version: &str) -> ResolveResult {
         normalized_bare_specifier: None,
         alias: Some(name.to_string()),
         policy_violation: None,
+        package: pnpm_resolving_resolver_base::ResolvedPackageInfo {
+            name_ver: Some(name_ver),
+            latest: Some(version.to_string()),
+            published_at: None,
+            manifest: None,
+            non_deprecated_alternative: None,
+        },
     }
 }

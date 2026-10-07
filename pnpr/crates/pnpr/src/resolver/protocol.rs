@@ -7,9 +7,73 @@ use indexmap::IndexMap;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::{PackageExtension, RegistryDeclaration};
 use pnpm_network::AuthHeadersByScope;
-use serde::Deserialize;
+use pnpr_registry::Ecosystem;
+use serde::{Deserialize, Serialize};
 
 pub type DepMap = BTreeMap<String, String>;
+
+/// The `ecosystem` field alone, read before the rest of the body so each
+/// ecosystem's request is deserialized into its own shape.
+///
+/// `POST /-/pnpr/v0/resolve` keeps one address for every ecosystem and the
+/// body names which one it speaks, so a client needs no second endpoint and
+/// no second handshake. An absent field means npm. The ecosystems pnpr
+/// *serves* here are a subset of the ones it knows: a request naming one it
+/// does not resolve is refused rather than misread.
+#[derive(Debug, Default, Deserialize)]
+pub struct EcosystemProbe {
+    #[serde(default)]
+    pub ecosystem: Ecosystem,
+}
+
+/// Body of `POST /-/pnpr/v0/resolve` with `"ecosystem": "cargo"`.
+///
+/// Cargo resolution reads one input only the client has — its workspace
+/// manifests — so the request carries them as a `cargo metadata`
+/// document, and the server runs the same resolver the client would have
+/// run locally against index files it fetches (and caches) itself. pnpm
+/// sends the document reduced to the dependency graph, but a full
+/// `cargo metadata` output resolves the same way.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CargoResolveRequest {
+    /// `cargo metadata --no-deps --format-version 1` output for the
+    /// workspace being resolved.
+    pub metadata: String,
+    /// The sparse index to resolve against. Falls back to the crates.io
+    /// sparse index when absent; either way the server fetches it only if
+    /// its route policy allows that origin.
+    #[serde(default)]
+    pub registry: Option<String>,
+}
+
+/// Body of `POST /-/pnpr/v0/resolve` with `"ecosystem": "pypi"`.
+///
+/// A Python resolution is for one interpreter: the same requirements
+/// resolve differently against a different marker environment or a
+/// different set of wheel tags, so the client's own travel with the
+/// request and the lockfile that comes back records them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PypiResolveRequest {
+    /// PEP 508 requirement strings, as the project's manifest spells them.
+    pub requirements: Vec<String>,
+    /// The interpreter the environment is for.
+    pub target: pnpm_python_resolver::Target,
+    /// The Simple API base URL to resolve against. The server fetches it
+    /// only if its route policy allows that origin.
+    pub index: String,
+    /// The project's own `requires-python`, recorded in the lockfile.
+    #[serde(default)]
+    pub requires_python: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPublishConfig {
+    pub directory: Option<String>,
+    pub link_directory: Option<bool>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,11 +87,17 @@ pub struct ResolveRequestProject {
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
+    pub publish_config: Option<ProjectPublishConfig>,
+    #[serde(default)]
     pub dependencies: DepMap,
     #[serde(default)]
     pub dev_dependencies: DepMap,
     #[serde(default)]
     pub optional_dependencies: DepMap,
+    /// Auto-installed as dependencies of the importer when the request
+    /// enables `autoInstallPeers`.
+    #[serde(default)]
+    pub peer_dependencies: DepMap,
 }
 
 fn root_dir() -> String {
@@ -43,6 +113,13 @@ fn root_dir() -> String {
 /// parse.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "pnpr resolution request wire format is flat"
+    )
+)]
 pub struct ResolveRequest {
     #[serde(default)]
     pub dependencies: Option<DepMap>,
@@ -50,6 +127,8 @@ pub struct ResolveRequest {
     pub dev_dependencies: Option<DepMap>,
     #[serde(default)]
     pub optional_dependencies: Option<DepMap>,
+    #[serde(default)]
+    pub peer_dependencies: Option<DepMap>,
     #[serde(default)]
     pub projects: Option<Vec<ResolveRequestProject>>,
     /// The client's default registry. Falls back to npmjs when absent.
@@ -65,7 +144,7 @@ pub struct ResolveRequest {
     /// a key is always a URL, which is what lets the boundary checks read one
     /// as a fetch target. A request in the older shape fails to parse.
     #[serde(default)]
-    pub registries: BTreeMap<String, RegistryDeclaration>,
+    pub registries: IndexMap<String, RegistryDeclaration>,
     /// The caller's forwarded upstream credentials so the server resolves
     /// and fetches private content as the caller. Keyed as
     /// `auth_headers[registry_uri][scope]`; the `@` scope stores
@@ -180,9 +259,11 @@ pub struct ProjectDeps {
     pub dir: String,
     pub name: Option<String>,
     pub version: Option<String>,
+    pub publish_config: Option<ProjectPublishConfig>,
     pub dependencies: DepMap,
     pub dev_dependencies: DepMap,
     pub optional_dependencies: DepMap,
+    pub peer_dependencies: DepMap,
 }
 
 impl ResolveRequest {
@@ -191,16 +272,21 @@ impl ResolveRequest {
     /// maps to a single root (`.`) importer; an empty/absent `projects`
     /// array falls back to it too.
     pub fn projects_normalized(&self) -> Vec<ProjectDeps> {
-        if let Some(projects) = self.projects.as_ref().filter(|projects| !projects.is_empty()) {
+        if let Some(projects) = self.projects
+            .as_ref()
+            .filter(|projects| !projects.is_empty())
+        {
             return projects
                 .iter()
                 .map(|project| ProjectDeps {
                     dir: project.dir.clone(),
                     name: project.name.clone(),
                     version: project.version.clone(),
+                    publish_config: project.publish_config.clone(),
                     dependencies: project.dependencies.clone(),
                     dev_dependencies: project.dev_dependencies.clone(),
                     optional_dependencies: project.optional_dependencies.clone(),
+                    peer_dependencies: project.peer_dependencies.clone(),
                 })
                 .collect();
         }
@@ -208,9 +294,11 @@ impl ResolveRequest {
             dir: root_dir(),
             name: None,
             version: None,
+            publish_config: None,
             dependencies: self.dependencies.clone().unwrap_or_default(),
             dev_dependencies: self.dev_dependencies.clone().unwrap_or_default(),
             optional_dependencies: self.optional_dependencies.clone().unwrap_or_default(),
+            peer_dependencies: self.peer_dependencies.clone().unwrap_or_default(),
         }]
     }
 }

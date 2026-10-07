@@ -6,10 +6,10 @@ use crate::{
         Engine, InvalidNodeVersionError, UnsupportedEngineError, WantedEngine, check_engine,
     },
     check_platform::{
-        SupportedArchitectures, UnsupportedPlatformError, WantedPlatformRef, check_platform,
-        platform_is_supported,
+        UnsupportedPlatformError, WantedPlatformRef, check_platform, platform_is_supported,
     },
     infer_platform_from_package_name::inferred_platform,
+    supported_architectures::SupportedArchitectures,
 };
 use derive_more::{Display, Error};
 use miette::Diagnostic;
@@ -39,20 +39,16 @@ pub enum SkipReason {
     UnsupportedPlatform,
 }
 
-/// Errors [`package_is_installable`] can surface. The first two
-/// variants carry an unsupported-engine or unsupported-platform error.
-/// The third propagates [`check_engine`]'s `ERR_PNPM_INVALID_NODE_VERSION`
+/// Errors [`package_is_installable`] can surface. `InvalidNodeVersion`
+/// propagates [`check_engine`]'s `ERR_PNPM_INVALID_NODE_VERSION`
 /// failure so callers keep that error code instead of seeing it
 /// collapsed into a misleading engine-mismatch error.
 #[derive(Debug, Display, Error, Diagnostic, Clone, PartialEq, Eq)]
 pub enum InstallabilityError {
-    #[display("{_0}")]
     #[diagnostic(transparent)]
     Engine(UnsupportedEngineError),
-    #[display("{_0}")]
     #[diagnostic(transparent)]
     Platform(UnsupportedPlatformError),
-    #[display("{_0}")]
     #[diagnostic(transparent)]
     InvalidNodeVersion(InvalidNodeVersionError),
 }
@@ -137,14 +133,6 @@ pub fn check_package(
     manifest: &PackageInstallabilityManifest,
     options: &InstallabilityOptions<'_>,
 ) -> Result<Option<InstallabilityError>, InvalidNodeVersionError> {
-    // Defaulting each absent platform axis to `['any']` is functionally
-    // equivalent to "no constraint", since `check_list` short-circuits a
-    // single-element `['any']` to accept. `check_platform` already skips
-    // an axis when the wanted slice is `None`, so we pass the manifest
-    // fields by reference straight through — no `vec!["any".to_string()]`
-    // per axis, no `WantedPlatform { ... }` clone of the manifest's owned
-    // vectors. The owned `WantedPlatform` only materialises inside
-    // `check_platform` when an error is returned.
     let wanted = WantedPlatformRef {
         os: manifest.os.as_deref(),
         cpu: manifest.cpu.as_deref(),
@@ -216,11 +204,6 @@ pub fn package_is_installable(
     let warn = match check_package(package_id, manifest, options) {
         Ok(maybe) => maybe,
         Err(invalid_node) => {
-            // `check_engine` fails on an invalid node version
-            // regardless of `engineStrict`. Surface as the dedicated
-            // `InvalidNodeVersion` variant so callers keep the
-            // `ERR_PNPM_INVALID_NODE_VERSION` code and message rather
-            // than a synthesized engine mismatch.
             return Err(Box::new(InstallabilityError::InvalidNodeVersion(invalid_node)));
         }
     };
@@ -259,11 +242,13 @@ pub fn platform_is_supported_with_inference(
     options: &InstallabilityOptions<'_>,
 ) -> bool {
     let inferred = inferred_platform(name, declared);
-    let wanted = inferred.as_ref().map_or(declared, |platform| WantedPlatformRef {
-        os: platform.os.as_deref(),
-        cpu: platform.cpu.as_deref(),
-        libc: platform.libc.as_deref(),
-    });
+    let wanted = inferred
+        .as_ref()
+        .map_or(declared, |platform| WantedPlatformRef {
+            os: platform.os.as_deref(),
+            cpu: platform.cpu.as_deref(),
+            libc: platform.libc.as_deref(),
+        });
     platform_is_supported(
         wanted,
         options.supported_architectures,

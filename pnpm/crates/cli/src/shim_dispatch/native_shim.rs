@@ -20,11 +20,11 @@ use super::{dispatch_target, trusted_shim_settings};
 use crate::cli_args::global_bin_lock::try_acquire_global_bin_lock;
 use miette::{Context as _, IntoDiagnostic as _};
 use pnpm_cmd_shim::is_safe_bin_name;
-use pnpm_resolving_parse_wanted_dependency::is_valid_old_npm_package_name;
+use pnpm_package_name::is_valid_old_npm_package_name;
 use std::{
     ffi::{OsStr, OsString},
-    fs,
-    io::{self, Read as _},
+    fs, io,
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
@@ -65,7 +65,9 @@ impl ShimTarget {
 
     fn decode(bytes: &[u8]) -> Option<Self> {
         let raw = decode_os(bytes)?;
-        if let Some(package) = raw.to_str().and_then(|raw| raw.strip_prefix(VIRTUAL_TARGET_PREFIX))
+        if let Some(package) = raw
+            .to_str()
+            .and_then(|raw| raw.strip_prefix(VIRTUAL_TARGET_PREFIX))
         {
             return is_valid_old_npm_package_name(package)
                 .then(|| ShimTarget::Virtual(package.to_string()));
@@ -89,7 +91,7 @@ pub(crate) fn install_native_shim(
     name: &str,
     target: &ShimTarget,
 ) -> io::Result<()> {
-    install_native_shim_from(&std::env::current_exe()?, bin_dir, name, target)
+    install_native_shim_from(&pnpm_executor::current_executable()?, bin_dir, name, target)
 }
 
 /// Publish `source` as the shim `name`, recording `target` beside it. The
@@ -113,7 +115,11 @@ pub(crate) fn install_native_shim_from(
     let target_file = target_file_path(bin_dir, name);
     let executable = executable_path(bin_dir, name);
     pnpm_fs::write_atomic(&target_file, &target.encode())?;
-    crate::executable_link::replace_executable(source, &executable).inspect_err(|_| {
+    #[cfg(not(target_os = "wasi"))]
+    let published = crate::executable_link::replace_executable(source, &executable);
+    #[cfg(target_os = "wasi")]
+    let published = wasm_shim::publish(source, &executable);
+    published.inspect_err(|_| {
         // A sidecar without an executable would list as a shim; a sidecar
         // beside an older executable is a live shim with its new target.
         if !executable.exists() {
@@ -137,12 +143,14 @@ pub(crate) fn native_shim_target(bin_dir: &Path, name: &str) -> io::Result<Optio
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    ShimTarget::decode(&bytes).map(Some).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} does not hold a shim target", target_file.display()),
-        )
-    })
+    ShimTarget::decode(&bytes)
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} does not hold a shim target", target_file.display()),
+            )
+        })
 }
 
 pub(crate) fn native_shim_is_installed(bin_dir: &Path, name: &str) -> bool {
@@ -191,7 +199,7 @@ pub(crate) fn refresh_native_shims(source: &Path, bin_dir: &Path) -> io::Result<
 }
 
 pub(crate) fn migrate_legacy_shims(bin_dir: &Path) -> io::Result<()> {
-    migrate_legacy_shims_from(&std::env::current_exe()?, bin_dir)
+    migrate_legacy_shims_from(&pnpm_executor::current_executable()?, bin_dir)
 }
 
 /// Turn every legacy shim into a native shim, then drop the
@@ -247,7 +255,10 @@ fn legacy_shim_target(path: &Path) -> io::Result<Option<ShimTarget>> {
         return Ok(None);
     }
     let body = String::from_utf8_lossy(&bytes);
-    if !body.lines().any(|line| line == LEGACY_CONTEXT_AWARE_MARKER) {
+    if !body
+        .lines()
+        .any(|line| line == LEGACY_CONTEXT_AWARE_MARKER)
+    {
         return Ok(None);
     }
     let target = body
@@ -283,8 +294,10 @@ pub(super) fn dispatch_legacy_shim(rest: &[OsString]) -> i32 {
 }
 
 fn executing_dispatcher_bin_dir(shim: &Path) -> Option<PathBuf> {
-    let supplied_bin_dir = shim.parent().filter(|dir| !dir.as_os_str().is_empty())?;
-    let dispatcher = std::env::current_exe().ok()?;
+    let supplied_bin_dir = shim
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())?;
+    let dispatcher = pnpm_executor::current_executable().ok()?;
     let dispatcher_name = format!("{LEGACY_DISPATCHER_NAME}{}", std::env::consts::EXE_SUFFIX);
     if dispatcher.file_name() != Some(OsStr::new(&dispatcher_name)) {
         return None;
@@ -337,7 +350,7 @@ fn parse_legacy_shim_argv(rest: &[OsString]) -> Option<(&str, &Path, ShimTarget,
 /// Intercept a launch under a shim name. `None` means this is pnpm
 /// itself and the regular CLI should proceed.
 pub(super) fn try_native_dispatch(argv: &[OsString]) -> Option<i32> {
-    let executable = std::env::current_exe().ok()?;
+    let executable = pnpm_executor::current_executable().ok()?;
     let name = shim_name(executable.file_name()?)?;
     let bin_dir = executable.parent()?;
     let target = match native_shim_target(bin_dir, &name) {
@@ -388,22 +401,31 @@ fn shim_name(file_name: &OsStr) -> Option<String> {
     Some(file_name.to_str()?.to_string())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn encode_os(value: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(target_os = "wasi")]
+    use std::os::wasi::ffi::OsStrExt as _;
     value.as_bytes().to_vec()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn decode_os(bytes: &[u8]) -> Option<OsString> {
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt as _;
+    #[cfg(target_os = "wasi")]
+    use std::os::wasi::ffi::OsStringExt as _;
     Some(OsString::from_vec(bytes.to_vec()))
 }
 
 #[cfg(windows)]
 fn encode_os(value: &OsStr) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt as _;
-    value.encode_wide().flat_map(u16::to_le_bytes).collect()
+    value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }
 
 #[cfg(windows)]
@@ -411,7 +433,16 @@ fn decode_os(bytes: &[u8]) -> Option<OsString> {
     use std::os::windows::ffi::OsStringExt as _;
     let mut chunks = bytes.chunks_exact(2);
     let value = OsString::from_wide(
-        &chunks.by_ref().map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])).collect::<Vec<_>>(),
+        &chunks
+            .by_ref()
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>(),
     );
-    chunks.remainder().is_empty().then_some(value)
+    chunks
+        .remainder()
+        .is_empty()
+        .then_some(value)
 }
+
+#[cfg(target_os = "wasi")]
+mod wasm_shim;

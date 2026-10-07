@@ -1,7 +1,7 @@
 use super::{
     COMPLETE_FILE, build_storage_at, build_storage_at_with_substitutions, discard_unusable_storage,
-    ensure_storage, latest_version, packages_dir, publish_storage, restore_claimed_storage,
-    set_dist_tag,
+    ensure_storage, latest_version, packages_dir, publish_storage, remove_tree,
+    restore_claimed_storage, set_dist_tag,
 };
 use std::{collections::BTreeSet, fs, path::Path};
 use tempfile::TempDir;
@@ -13,7 +13,12 @@ fn tarball_entries(tarball: &Path) -> BTreeSet<String> {
         .entries()
         .expect("read tar entries")
         .map(|entry| {
-            entry.expect("read tar entry").path().expect("tar entry path").display().to_string()
+            entry
+                .expect("read tar entry")
+                .path()
+                .expect("tar entry path")
+                .display()
+                .to_string()
         })
         .collect()
 }
@@ -26,8 +31,9 @@ fn tarball_package_manifest(tarball: &Path) -> serde_json::Value {
         .expect("read tar entries")
         .find_map(|entry| {
             let entry = entry.expect("read tar entry");
-            (entry.path().expect("tar entry path") == Path::new("package/package.json"))
-                .then_some(entry)
+            (entry.path().expect("tar entry path") == Path::new("package/package.json")).then_some(
+                entry,
+            )
         })
         .expect("package.json entry");
     serde_json::from_reader(&mut entry).expect("parse package.json entry")
@@ -87,10 +93,9 @@ fn case_colliding_files_are_composed_in_memory() {
 #[test]
 fn bundle_dependencies_embed_node_modules() {
     let storage = ensure_storage();
-    let bundled = tarball_entries(
-        &storage
-            .join("@pnpm.e2e/pkg-with-bundle-dependencies/pkg-with-bundle-dependencies-1.0.0.tgz"),
-    );
+    let bundled = tarball_entries(&storage.join(
+        "@pnpm.e2e/pkg-with-bundle-dependencies/pkg-with-bundle-dependencies-1.0.0.tgz",
+    ));
     assert!(
         bundled.contains("package/node_modules/@pnpm.e2e/hello-world-js-bin/package.json"),
         "{bundled:?}",
@@ -100,7 +105,9 @@ fn bundle_dependencies_embed_node_modules() {
         "@pnpm.e2e/pkg-with-bundle-dependencies-false/pkg-with-bundle-dependencies-false-1.0.0.tgz",
     ));
     assert!(
-        !not_bundled.iter().any(|entry| entry.contains("node_modules")),
+        !not_bundled
+            .iter()
+            .any(|entry| entry.contains("node_modules")),
         "bundleDependencies:false must not embed node_modules: {not_bundled:?}",
     );
 }
@@ -113,10 +120,9 @@ fn root_license_is_injected_except_for_self_contained_workspaces() {
     let abc = tarball_entries(&storage.join("@pnpm.e2e/abc/abc-1.0.0.tgz"));
     assert!(abc.contains("package/LICENSE"), "{abc:?}");
 
-    let bundled =
-        tarball_entries(&storage.join(
-            "@pnpm.e2e/pkg-with-bundled-dependencies/pkg-with-bundled-dependencies-1.0.0.tgz",
-        ));
+    let bundled = tarball_entries(&storage.join(
+        "@pnpm.e2e/pkg-with-bundled-dependencies/pkg-with-bundled-dependencies-1.0.0.tgz",
+    ));
     assert!(!bundled.contains("package/LICENSE"), "{bundled:?}");
 }
 
@@ -255,4 +261,26 @@ fn tagging_an_unpublished_version_fails_loudly() {
     build_storage_at(&packages_dir(), out.path());
 
     set_dist_tag(out.path(), "@pnpm.e2e/foo", "999.0.0", "latest");
+}
+
+#[test]
+fn removing_a_tree_accepts_one_that_is_already_gone() {
+    let root = TempDir::new().expect("create temp dir");
+    let absent = root.path().join("storage.stale");
+
+    remove_tree(&absent, "remove unusable registry fixture storage");
+
+    assert!(!absent.exists());
+}
+
+#[test]
+fn removing_a_tree_takes_out_its_whole_subtree() {
+    let root = TempDir::new().expect("create temp dir");
+    let tree = root.path().join("storage.stale");
+    fs::create_dir_all(tree.join("@pnpm.e2e")).expect("create nested dir");
+    fs::write(tree.join("@pnpm.e2e").join("packument"), "stale").expect("write stale file");
+
+    remove_tree(&tree, "remove unusable registry fixture storage");
+
+    assert!(!tree.exists());
 }

@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use miette::Diagnostic;
-use pnpm_resolving_resolver_base::{VersionSelectorEntry, VersionSelectorType};
+use pnpm_resolving_resolver_base::{
+    EXISTING_VERSION_SELECTOR_WEIGHT, VersionSelectorEntry, VersionSelectorType,
+    VersionSelectorWithWeight,
+};
 use pretty_assertions::assert_eq;
 
 use super::{
@@ -14,11 +17,17 @@ fn write(dir: &Path, name: &str, contents: &str) {
 }
 
 fn code_of(error: &ImportLockfileError) -> String {
-    error.code().expect("error carries a code").to_string()
+    error
+        .code()
+        .expect("error carries a code")
+        .to_string()
 }
 
 fn names(versions: &VersionsByPackageName) -> Vec<&str> {
-    versions.keys().map(String::as_str).collect()
+    versions
+        .keys()
+        .map(String::as_str)
+        .collect()
 }
 
 #[test]
@@ -110,7 +119,7 @@ fn an_unparsable_npm_lockfile_names_the_file() {
 }
 
 #[test]
-fn every_collected_version_becomes_a_plain_version_selector() {
+fn every_collected_version_becomes_a_lockfile_weighted_version_selector() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write(
         tmp.path(),
@@ -122,11 +131,17 @@ fn every_collected_version_becomes_a_plain_version_selector() {
     let preferred_versions = to_preferred_versions(&versions);
 
     assert_eq!(
-        preferred_versions.keys().map(String::as_str).collect::<Vec<_>>(),
+        preferred_versions
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         vec!["is-negative", "is-positive"],
     );
     assert_eq!(
         preferred_versions["is-positive"].get("1.0.0"),
-        Some(&VersionSelectorEntry::Plain(VersionSelectorType::Version)),
+        Some(&VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+            selector_type: VersionSelectorType::Version,
+            weight: EXISTING_VERSION_SELECTOR_WEIGHT,
+        })),
     );
 }

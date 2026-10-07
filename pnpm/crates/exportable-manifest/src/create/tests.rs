@@ -17,9 +17,11 @@ fn build(dir: &Path, manifest: &Value, opts: &CreateExportableManifestOptions<'_
 fn default_opts(catalogs: &Catalogs) -> CreateExportableManifestOptions<'_> {
     CreateExportableManifestOptions {
         catalogs,
+        workspace_dir: None,
         modules_dir: None,
         skip_manifest_obfuscation: false,
         embed_readme: false,
+        workspace_packages: None,
     }
 }
 
@@ -63,9 +65,11 @@ fn skip_obfuscation_keeps_scripts_and_package_manager() {
     let catalogs = empty_catalogs();
     let opts = CreateExportableManifestOptions {
         catalogs: &catalogs,
+        workspace_dir: None,
         modules_dir: None,
         skip_manifest_obfuscation: true,
         embed_readme: false,
+        workspace_packages: None,
     };
     let out = build(
         dir.path(),
@@ -290,17 +294,112 @@ fn publish_config_is_removed_when_emptied() {
 
 #[test]
 fn readme_is_embedded_when_requested() {
+    for readme_file_name in ["README.md", "README", "readme.markdown"] {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(readme_file_name), "# Hello").unwrap();
+        let catalogs = empty_catalogs();
+        let opts = CreateExportableManifestOptions {
+            catalogs: &catalogs,
+            workspace_dir: None,
+            modules_dir: None,
+            skip_manifest_obfuscation: false,
+            embed_readme: true,
+            workspace_packages: None,
+        };
+        let out = build(dir.path(), &json!({ "name": "foo", "version": "1.0.0" }), &opts);
+        assert_eq!(out["readme"], json!("# Hello"), "{readme_file_name}");
+    }
+}
+
+#[test]
+fn readme_md_is_preferred_over_other_readme_candidates() {
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("README.md"), "# Hello").unwrap();
+    fs::write(dir.path().join("README.md"), "# Preferred").unwrap();
+    fs::write(dir.path().join("readme.markdown"), "# Markdown").unwrap();
+    fs::write(dir.path().join("README"), "# Bare").unwrap();
     let catalogs = empty_catalogs();
     let opts = CreateExportableManifestOptions {
         catalogs: &catalogs,
+        workspace_dir: None,
         modules_dir: None,
         skip_manifest_obfuscation: false,
         embed_readme: true,
+        workspace_packages: None,
     };
     let out = build(dir.path(), &json!({ "name": "foo", "version": "1.0.0" }), &opts);
-    assert_eq!(out["readme"], json!("# Hello"));
+    assert_eq!(out["readme"], json!("# Preferred"));
+}
+
+#[test]
+fn readme_md_is_preferred_over_bare_readme() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("README.md"), "# Preferred").unwrap();
+    fs::write(dir.path().join("README"), "# Bare").unwrap();
+    let catalogs = empty_catalogs();
+    let opts = CreateExportableManifestOptions {
+        catalogs: &catalogs,
+        workspace_dir: None,
+        modules_dir: None,
+        skip_manifest_obfuscation: false,
+        embed_readme: true,
+        workspace_packages: None,
+    };
+    let out = build(dir.path(), &json!({ "name": "foo", "version": "1.0.0" }), &opts);
+    assert_eq!(out["readme"], json!("# Preferred"));
+}
+
+#[test]
+fn lowest_markdown_readme_name_is_embedded() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("README.mdown"), "# Mdown").unwrap();
+    fs::write(dir.path().join("README.markdown"), "# Markdown").unwrap();
+    fs::write(dir.path().join("README.a"), "# A").unwrap();
+    let catalogs = empty_catalogs();
+    let opts = CreateExportableManifestOptions {
+        catalogs: &catalogs,
+        workspace_dir: None,
+        modules_dir: None,
+        skip_manifest_obfuscation: false,
+        embed_readme: true,
+        workspace_packages: None,
+    };
+    let out = build(dir.path(), &json!({ "name": "foo", "version": "1.0.0" }), &opts);
+    assert_eq!(out["readme"], json!("# A"));
+}
+
+#[test]
+fn readme_with_invalid_utf8_is_embedded_lossily() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("README"), b"text\xff").unwrap();
+    let catalogs = empty_catalogs();
+    let opts = CreateExportableManifestOptions {
+        catalogs: &catalogs,
+        workspace_dir: None,
+        modules_dir: None,
+        skip_manifest_obfuscation: false,
+        embed_readme: true,
+        workspace_packages: None,
+    };
+    let out = build(dir.path(), &json!({ "name": "foo", "version": "1.0.0" }), &opts);
+    assert_eq!(out["readme"], json!("text\u{FFFD}"));
+}
+
+#[test]
+fn markdown_readme_is_preferred_over_bare_readme() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("README"), "# Bare").unwrap();
+    fs::write(dir.path().join("readme.markdown"), "# Markdown").unwrap();
+    let catalogs = empty_catalogs();
+    let opts = CreateExportableManifestOptions {
+        catalogs: &catalogs,
+        workspace_dir: None,
+        modules_dir: None,
+        skip_manifest_obfuscation: false,
+        embed_readme: true,
+        workspace_packages: None,
+    };
+    let out = build(dir.path(), &json!({ "name": "foo", "version": "1.0.0" }), &opts);
+    assert_eq!(out["readme"], json!("# Markdown"));
 }
 
 #[test]
@@ -325,9 +424,11 @@ fn readme_symlink_is_not_embedded() {
     let catalogs = empty_catalogs();
     let opts = CreateExportableManifestOptions {
         catalogs: &catalogs,
+        workspace_dir: None,
         modules_dir: None,
         skip_manifest_obfuscation: false,
         embed_readme: true,
+        workspace_packages: None,
     };
     let out = build(dir.path(), &json!({ "name": "foo", "version": "1.0.0" }), &opts);
     assert!(out.get("readme").is_none());
@@ -344,4 +445,75 @@ fn missing_name_surfaces_transform_error() {
     )
     .unwrap_err();
     assert!(matches!(err, CreateExportableManifestError::Transform(_)));
+}
+
+/// A catalog measures a relative path from `pnpm-workspace.yaml`, while
+/// the exported manifest is read from the package's own directory, so
+/// the two have to name the same place.
+#[test]
+fn local_catalog_entry_is_reanchored_on_the_exported_package() {
+    let workspace = tempdir().unwrap();
+    let package_dir = workspace.path().join("packages/foo");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    let catalogs = Catalogs::from([(
+        "default".to_string(),
+        Catalog::from([
+            ("from-tarball".to_string(), "file:./tarballs/from-tarball-1.0.0.tgz".to_string()),
+            ("local-lib".to_string(), "link:./libs/local-lib".to_string()),
+        ]),
+    )]);
+    let opts = CreateExportableManifestOptions {
+        catalogs: &catalogs,
+        workspace_dir: Some(workspace.path()),
+        modules_dir: None,
+        skip_manifest_obfuscation: false,
+        embed_readme: false,
+        workspace_packages: None,
+    };
+
+    let out = build(
+        &package_dir,
+        &json!({
+            "name": "foo",
+            "version": "1.0.0",
+            "dependencies": { "from-tarball": "catalog:", "local-lib": "catalog:" },
+        }),
+        &opts,
+    );
+
+    assert_eq!(
+        out["dependencies"],
+        json!({
+            "from-tarball": "file:../../tarballs/from-tarball-1.0.0.tgz",
+            "local-lib": "link:../../libs/local-lib",
+        }),
+    );
+}
+
+/// Without a workspace directory there is no anchor to measure from, so
+/// the entry is emitted as the catalog wrote it.
+#[test]
+fn local_catalog_entry_without_a_workspace_dir_is_emitted_as_written() {
+    let dir = tempdir().unwrap();
+    let catalogs = Catalogs::from([(
+        "default".to_string(),
+        Catalog::from([(
+            "from-tarball".to_string(),
+            "file:./tarballs/from-tarball-1.0.0.tgz".to_string(),
+        )]),
+    )]);
+    let out = build(
+        dir.path(),
+        &json!({
+            "name": "foo",
+            "version": "1.0.0",
+            "dependencies": { "from-tarball": "catalog:" },
+        }),
+        &default_opts(&catalogs),
+    );
+
+    assert_eq!(
+        out["dependencies"],
+        json!({ "from-tarball": "file:./tarballs/from-tarball-1.0.0.tgz" }),
+    );
 }

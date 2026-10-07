@@ -7,11 +7,28 @@
 //! command-specific error codes) live in `run/recursive.rs` and
 //! `exec/recursive.rs`.
 
+pub use dependencies::{
+    filtered_projects_dependencies, projects_with_workspace_dependencies, sequence_graph,
+};
+pub use execution_args::RecursiveExecutionArgs;
+pub use importer_selection::{selected_workspace_importer_ids, selectors_narrow_the_run};
+pub use summary::{ExecutionStatus, Status, count_failures, write_recursive_summary};
+pub use unmatched::UnmatchedFilters;
+
+mod dependencies;
+mod execution_args;
+mod importer_selection;
+mod unmatched;
+
+use crate::cli_args::{
+    catalogs::{configured_catalogs, workspace_catalogs},
+    verify_deps::with_dependencies,
+};
 use derive_more::{Display, Error};
 use indexmap::IndexMap;
 use miette::{Context, Diagnostic, IntoDiagnostic};
+use pnpm_catalogs_types::Catalogs;
 use pnpm_config::{Config, LinkWorkspacePackages};
-use pnpm_package_manager::{GraphSequencerResult, graph_sequencer};
 use pnpm_workspace::{
     FindWorkspaceProjectsOpts, GraphPkg, Project, find_workspace_projects,
     importer_id_from_root_dir, read_workspace_manifest, workspace_package_patterns,
@@ -23,12 +40,12 @@ use pnpm_workspace_projects_filter::{
 use pnpm_workspace_projects_graph::{
     BaseProject, CreateProjectsGraphOptions, ProjectGraph, create_projects_graph,
 };
-use rayon::prelude::*;
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
 };
+use unmatched::unmatched_filters;
 
 /// `Cannot find package {resume_from}` — raised by both recursive `run`
 /// and recursive `exec` when `--resume-from` names a package that is not
@@ -50,114 +67,12 @@ pub const NO_MATCHING_PROJECTS_CODE: &str = "ERR_PNPM_NO_MATCHING_PROJECTS";
 
 /// `--fail-if-no-match` with an empty workspace-project selection. The
 /// message is already on stdout by the time this is returned; see
-/// [`ensure_projects_matched`].
+/// [`UnmatchedFilters::report`].
 #[derive(Debug, Display, Error, Diagnostic)]
-#[display("{message}")]
 #[diagnostic(code(ERR_PNPM_NO_MATCHING_PROJECTS))]
 pub struct NoMatchingProjects {
     #[error(not(source))]
     pub message: String,
-}
-
-/// The dependency edges among the `--filter`-selected projects, resolved
-/// through the full workspace graph so a relationship between two selected
-/// projects via an unselected one becomes a direct edge. Keys keep the
-/// selection order.
-pub fn filtered_projects_dependencies<Pkg: Sync>(
-    selected: &ProjectGraph<Pkg>,
-    all: &ProjectGraph<Pkg>,
-    prod_all: Option<&ProjectGraph<Pkg>>,
-    prod_only_selected: &HashSet<PathBuf>,
-) -> IndexMap<PathBuf, Vec<PathBuf>> {
-    let sorted: HashSet<&Path> = selected.keys().map(PathBuf::as_path).collect();
-    // Each project's tunneling walk reads only shared references, so
-    // the projects fan out across the rayon pool; collecting the
-    // parallel iterator into a `Vec` keeps the selection order.
-    selected
-        .keys()
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|&project_dir| {
-            let full_graph = match prod_all {
-                Some(prod_all) if prod_only_selected.contains(project_dir) => prod_all,
-                _ => all,
-            };
-            (project_dir.clone(), sorted_dependencies(selected, full_graph, project_dir, &sorted))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect()
-}
-
-/// Sequence `projects_graph` into one deterministic topological order,
-/// resolving transitive edges through `full_projects_graph`.
-pub fn sequence_graph<Pkg>(
-    projects_graph: &ProjectGraph<Pkg>,
-    full_projects_graph: &ProjectGraph<Pkg>,
-) -> GraphSequencerResult<PathBuf> {
-    sequence_graph_by_project(projects_graph, |_| full_projects_graph)
-}
-
-/// Sequence `projects_graph`, resolving each project's transitive edges
-/// through the full graph that `full_graph_for` returns for it. A
-/// `--filter-prod` selection routes its projects to the prod-pruned graph so
-/// pruned dev edges stay pruned, while regular projects route to the full
-/// graph.
-fn sequence_graph_by_project<'g, Pkg: 'g>(
-    projects_graph: &ProjectGraph<Pkg>,
-    full_graph_for: impl Fn(&Path) -> &'g ProjectGraph<Pkg>,
-) -> GraphSequencerResult<PathBuf> {
-    let sorted_dirs: Vec<PathBuf> = projects_graph.keys().cloned().collect();
-    let sorted: HashSet<&Path> = sorted_dirs.iter().map(PathBuf::as_path).collect();
-    let dependency_graph: HashMap<PathBuf, Vec<PathBuf>> = projects_graph
-        .keys()
-        .map(|project_dir| {
-            let dependencies = sorted_dependencies(
-                projects_graph,
-                full_graph_for(project_dir),
-                project_dir,
-                &sorted,
-            );
-            (project_dir.clone(), dependencies)
-        })
-        .collect();
-    graph_sequencer(&dependency_graph, &sorted_dirs)
-}
-
-/// The dependencies of `project_dir` that are themselves in `sorted`, reached
-/// by tunneling past any project outside `sorted`. A transitive dependency
-/// between two sorted projects thus becomes a direct edge.
-///
-/// `project_dir`'s own edges are read from `projects_graph`, so a selection
-/// that deliberately narrows them (e.g. a prod-only filter that drops dev
-/// edges) is respected; `full_projects_graph` is consulted only to walk
-/// through the projects outside `sorted`.
-fn sorted_dependencies<Pkg>(
-    projects_graph: &ProjectGraph<Pkg>,
-    full_projects_graph: &ProjectGraph<Pkg>,
-    project_dir: &Path,
-    sorted: &HashSet<&Path>,
-) -> Vec<PathBuf> {
-    let mut dependencies: Vec<PathBuf> = Vec::new();
-    // Borrowed paths and an FxHash set: this walk runs once per
-    // selected project, and cloning every visited `PathBuf` into a
-    // SipHash set dominated it on a workspace-scale graph.
-    let mut visited: rustc_hash::FxHashSet<&Path> = rustc_hash::FxHashSet::default();
-    let mut stack: Vec<&Path> = projects_graph
-        .get(project_dir)
-        .map(|node| node.dependencies.iter().map(PathBuf::as_path).collect())
-        .unwrap_or_default();
-    while let Some(dependency_dir) = stack.pop() {
-        if dependency_dir == project_dir || !visited.insert(dependency_dir) {
-            continue;
-        }
-        if sorted.contains(dependency_dir) {
-            dependencies.push(dependency_dir.to_path_buf());
-        } else if let Some(node) = full_projects_graph.get(dependency_dir) {
-            stack.extend(node.dependencies.iter().map(PathBuf::as_path));
-        }
-    }
-    dependencies
 }
 
 /// The project directory `--resume-from` names, located by manifest name;
@@ -172,34 +87,6 @@ pub fn find_resume_root(
         .find(|(_, node)| node.package.manifest_name() == Some(resume_from))
         .map(|(root, _)| root.clone())
         .ok_or_else(|| ResumeFromNotFound { resume_from: resume_from.to_string() })
-}
-
-/// Write the recursive summary to `pnpm-exec-summary.json` under `dir`.
-///
-/// The per-task map is nested under an `executionStatus` key. Keys are
-/// project directories, `#`-qualified with the task name for tasks
-/// `dependsOn` pulled in — see `task_summary_key`.
-pub fn write_recursive_summary(
-    dir: &Path,
-    summary: &IndexMap<String, ExecutionStatus>,
-) -> miette::Result<()> {
-    let path = dir.join("pnpm-exec-summary.json");
-    let mut contents =
-        serde_json::to_string_pretty(&ExecSummaryFile { execution_status: summary.clone() })
-            .into_diagnostic()?;
-    contents.push('\n');
-    std::fs::write(&path, contents)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("writing {}", path.display()))
-}
-
-/// Count the tasks whose action failed.
-///
-/// The caller turns a non-zero count into its command-specific
-/// `ERR_PNPM_RECURSIVE_FAIL` error. Skipped dependents of a failed task do
-/// not add to the count: the failure that blocked them is already counted.
-pub fn count_failures(summary: &IndexMap<String, ExecutionStatus>) -> usize {
-    summary.values().filter(|status| status.status == Status::Failure).count()
 }
 
 /// Enumerate the projects of the workspace rooted at `workspace_root`,
@@ -229,7 +116,10 @@ pub fn discover_workspace_projects(
     };
     let projects = find_workspace_projects(
         workspace_root,
-        &FindWorkspaceProjectsOpts { patterns: patterns.clone() },
+        &FindWorkspaceProjectsOpts {
+            patterns: patterns.clone(),
+            ignored_directories: config.managed_directories(),
+        },
     )
     .wrap_err("finding workspace projects")?;
     Ok((projects, patterns))
@@ -260,6 +150,83 @@ impl<'a> RecursiveSelection<'a> {
     }
 }
 
+/// The projects a gated recursive command holds to the modules-directory
+/// requirement: `project_dirs` themselves, plus, while the workspace shares
+/// one lockfile, every workspace dependency they reach that the install the
+/// gate spawns selects.
+///
+/// That install selects the dependencies of the selected projects, so a
+/// workspace dependency without a modules directory leaves the selection out
+/// of date too. A negated selector reaches the install unchanged, so a
+/// dependency it excludes is not required; `project_dirs` themselves always
+/// are. With a lockfile per project the spawned
+/// install selects nothing beyond the project it installs, so the selection
+/// alone is what the check inspects. `prefix` is where the command's path
+/// selectors resolve.
+pub fn projects_to_verify<'dirs>(
+    project_dirs: impl IntoIterator<Item = &'dirs Path>,
+    selection: &RecursiveSelection<'_>,
+    config: &Config,
+    prefix: &Path,
+) -> miette::Result<Vec<PathBuf>> {
+    if !config.verify_deps_before_run.is_enabled() {
+        return Ok(Vec::new());
+    }
+    if !config.shares_one_lockfile() {
+        return Ok(project_dirs
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect());
+    }
+    let project_dirs: Vec<&Path> = project_dirs.into_iter().collect();
+    let mut projects = projects_with_workspace_dependencies(
+        project_dirs.iter().copied(),
+        selection.full_graph(),
+        selection.prod_all.as_ref(),
+        &selection.prod_only_selected,
+    );
+    if has_negated_selector(config) {
+        let mut kept = install_selected_projects(selection, config, prefix)?;
+        kept.extend(project_dirs.iter().map(|dir| dir.to_path_buf()));
+        projects.retain(|project_dir| kept.contains(project_dir));
+    }
+    Ok(projects)
+}
+
+fn has_negated_selector(config: &Config) -> bool {
+    config.filter
+        .iter()
+        .chain(&config.filter_prod)
+        .any(|selector| selector.starts_with('!'))
+}
+
+/// The projects the install the gate spawns selects, evaluated against the
+/// graphs the command's own selection was drawn from.
+fn install_selected_projects(
+    selection: &RecursiveSelection<'_>,
+    config: &Config,
+    prefix: &Path,
+) -> miette::Result<HashSet<PathBuf>> {
+    let walk_opts = recursive_filter_options(config, prefix);
+    let filter = with_dependencies_selectors(&config.filter);
+    let mut installed: HashSet<PathBuf> =
+        filter_against(selection.full_graph(), &filter, None, false, prefix, &walk_opts)?
+            .into_iter()
+            .collect();
+    if let Some(prod_all) = &selection.prod_all {
+        let filter_prod = with_dependencies_selectors(&config.filter_prod);
+        installed.extend(filter_against(prod_all, &filter_prod, None, true, prefix, &walk_opts)?);
+    }
+    Ok(installed)
+}
+
+fn with_dependencies_selectors(selectors: &[String]) -> Vec<String> {
+    selectors
+        .iter()
+        .map(|selector| with_dependencies(selector))
+        .collect()
+}
+
 /// Build the `--filter`-selected workspace projects the recursive command
 /// runs over, together with the graphs [`filtered_projects_dependencies`] resolves
 /// order through. `prefix` is where path selectors resolve; `auto_exclude_root`
@@ -276,15 +243,27 @@ pub fn select_recursive_projects<'a>(
     prefix: &Path,
     auto_exclude_root: AutoExcludeRoot<'_>,
 ) -> miette::Result<RecursiveSelection<'a>> {
-    // The filter graphs are built with the configured `link-workspace-packages`
-    // policy. Under the default `link-workspace-packages: false` a bare-semver
-    // range naming a sibling is not a workspace edge, so it drives neither
-    // selection nor order; only a `workspace:` range or an enabled policy links
-    // it.
-    let graph_options = CreateProjectsGraphOptions {
-        link_workspace_packages: Some(config.link_workspace_packages != LinkWorkspacePackages::Off),
-        ..CreateProjectsGraphOptions::default()
-    };
+    let (selection, unmatched) =
+        select_recursive_projects_deferring_no_match(projects, config, prefix, auto_exclude_root)?;
+    match unmatched {
+        Some(unmatched) => Err(unmatched.report()),
+        None => Ok(selection),
+    }
+}
+
+/// [`select_recursive_projects`], with a `--fail-if-no-match` selection
+/// that came back empty returned instead of raised. An install that has a
+/// non-npm ecosystem enabled decides after that ecosystem resolved its own
+/// selection: a `--filter` selector can name a project only that ecosystem
+/// knows about.
+pub fn select_recursive_projects_deferring_no_match<'a>(
+    projects: &'a [Project],
+    config: &Config,
+    prefix: &Path,
+    auto_exclude_root: AutoExcludeRoot<'_>,
+) -> miette::Result<(RecursiveSelection<'a>, Option<UnmatchedFilters>)> {
+    let catalogs = configured_catalogs(config)?;
+    let graph_options = recursive_graph_options(config, &catalogs);
     let all = build_graph(projects, graph_options);
 
     // Routes into the selection pass whose `follow_prod_deps_only` matches: the
@@ -293,13 +272,7 @@ pub fn select_recursive_projects<'a>(
     let root_selector = auto_exclude_root.root_selector(config, prefix);
 
     if config.filter.is_empty() && config.filter_prod.is_empty() && root_selector.is_none() {
-        ensure_projects_matched(all.len(), all.len(), config, prefix)?;
-        return Ok(RecursiveSelection {
-            selected: all,
-            all: None,
-            prod_all: None,
-            prod_only_selected: HashSet::new(),
-        });
+        return Ok(unnarrowed_selection(all, config, prefix));
     }
 
     // Run the filters against the graphs already built here, so nothing is
@@ -308,25 +281,10 @@ pub fn select_recursive_projects<'a>(
     // selectors run separately so the projects a `--filter-prod` selector
     // contributes can be sorted through the prod-pruned graph; their union is
     // the same set a single combined filter call would return.
-    let prod_all = if config.filter_prod.is_empty() {
-        None
-    } else {
-        Some(build_graph(
-            projects,
-            CreateProjectsGraphOptions { ignore_dev_deps: true, ..graph_options },
-        ))
-    };
+    let prod_all = production_filter_graph(projects, config, graph_options);
 
     let root_in_prod = !config.filter_prod.is_empty();
-    let walk_opts = FilterWorkspaceProjectsOptions {
-        // The mode user-written `{<dir>}` selectors match in. The
-        // generated `!{<workspace-root>}` selector pins itself to glob
-        // matching instead — see `filter_against`.
-        use_glob_dir_filtering: !config.legacy_dir_filtering,
-        workspace_dir: config.workspace_dir.as_deref().unwrap_or(prefix).to_path_buf(),
-        test_pattern: config.test_pattern.clone(),
-        changed_files_ignore_pattern: config.changed_files_ignore_pattern.clone(),
-    };
+    let walk_opts = recursive_filter_options(config, prefix);
     let regular_selected = filter_against(
         &all,
         &config.filter,
@@ -347,63 +305,65 @@ pub fn select_recursive_projects<'a>(
         None => Vec::new(),
     };
 
+    let (selected, prod_only_selected) =
+        merge_selected_graphs(&all, prod_all.as_ref(), &regular_selected, &prod_selected);
+
+    let unmatched = unmatched_filters(selected.len(), all.len(), config, prefix);
+    Ok((RecursiveSelection { selected, all: Some(all), prod_all, prod_only_selected }, unmatched))
+}
+
+/// Every project, for a run no selector narrowed. `all` already is the full
+/// graph, so the sort has nothing to resolve edges through.
+fn unnarrowed_selection<'a>(
+    all: ProjectGraph<GraphPkg<'a>>,
+    config: &Config,
+    prefix: &Path,
+) -> (RecursiveSelection<'a>, Option<UnmatchedFilters>) {
+    let unmatched = unmatched_filters(all.len(), all.len(), config, prefix);
+    let selection = RecursiveSelection {
+        selected: all,
+        all: None,
+        prod_all: None,
+        prod_only_selected: HashSet::new(),
+    };
+    (selection, unmatched)
+}
+
+/// Assemble the selected graph out of the two passes' results, and name
+/// the projects only the prod pass selected.
+///
+/// Prod-selected projects come first with their prod-pruned edges, so
+/// the sort never sees the dev edges that selection dropped. A project
+/// also matched by a regular selector keeps this earlier position but
+/// has its node overwritten with the full-graph one, and is left out of
+/// `prod_only_selected`. Insertion order is user-visible: the recursive
+/// runners use it as the dispatch tie-break order.
+fn merge_selected_graphs<'a>(
+    all: &ProjectGraph<GraphPkg<'a>>,
+    prod_all: Option<&ProjectGraph<GraphPkg<'a>>>,
+    regular_selected: &[PathBuf],
+    prod_selected: &[PathBuf],
+) -> (ProjectGraph<GraphPkg<'a>>, HashSet<PathBuf>) {
     let mut selected: ProjectGraph<GraphPkg<'a>> = ProjectGraph::new();
     let mut prod_only_selected: HashSet<PathBuf> = HashSet::new();
-
-    // Order and node assignment: prod-selected projects come first with their
-    // prod-pruned edges, so the sort never sees the dev edges that selection
-    // dropped. A project also matched by a regular selector keeps this earlier
-    // position but has its node overwritten with the full-graph one below, and
-    // is left out of `prod_only_selected`. Insertion order is user-visible: the
-    // recursive runners use it as the dispatch tie-break order.
-    if let Some(prod_all) = &prod_all {
+    if let Some(prod_all) = prod_all {
         let regular: HashSet<&PathBuf> = regular_selected.iter().collect();
-        for dir in &prod_selected {
-            if let Some(node) = prod_all.get(dir) {
-                selected.insert(dir.clone(), node.clone());
-                if !regular.contains(dir) {
-                    prod_only_selected.insert(dir.clone());
-                }
+        for dir in prod_selected {
+            let Some(node) = prod_all.get(dir) else { continue };
+            selected.insert(dir.clone(), node.clone());
+            if !regular.contains(dir) {
+                prod_only_selected.insert(dir.clone());
             }
         }
     }
     // Regular-selected projects keep their full (dev-inclusive) edges,
     // overwriting the prod node for any project selected both ways.
-    for dir in &regular_selected {
+    for dir in regular_selected {
         if let Some(node) = all.get(dir) {
             selected.insert(dir.clone(), node.clone());
         }
     }
-
-    ensure_projects_matched(selected.len(), all.len(), config, prefix)?;
-    Ok(RecursiveSelection { selected, all: Some(all), prod_all, prod_only_selected })
-}
-
-/// pnpm's `--fail-if-no-match`: a selection that came back empty ends the
-/// run with exit code 1 instead of letting the command operate on no
-/// project at all.
-///
-/// pnpm prints the sentence to stdout and sets `process.exitCode = 1`, so
-/// the message is printed here and the returned error carries
-/// [`NO_MATCHING_PROJECTS_CODE`], which `is_reported_error` recognizes as
-/// already-printed.
-fn ensure_projects_matched(
-    selected_count: usize,
-    all_count: usize,
-    config: &Config,
-    prefix: &Path,
-) -> miette::Result<()> {
-    if !config.fail_if_no_match || selected_count != 0 {
-        return Ok(());
-    }
-    let workspace_dir = notice_workspace_dir(config, prefix);
-    let message = if all_count == 0 {
-        format!(r#"No projects found in "{}""#, workspace_dir.display())
-    } else {
-        no_projects_matched_message(workspace_dir)
-    };
-    println!("{message}");
-    Err(NoMatchingProjects { message }.into())
+    (selected, prod_only_selected)
 }
 
 /// The directory pnpm names in its empty-selection notices: the workspace
@@ -428,20 +388,25 @@ pub fn selected_importer_ids(
     selection: &RecursiveSelection<'_>,
     lockfile_dir: &Path,
 ) -> Vec<String> {
-    selection
-        .selected
+    selection.selected
         .keys()
         .map(|project_dir| importer_id_from_root_dir(lockfile_dir, project_dir))
         .collect()
 }
 
 /// Build the workspace [`ProjectGraph`] from `projects` under `options`.
-fn build_graph(
-    projects: &[Project],
-    options: CreateProjectsGraphOptions,
-) -> ProjectGraph<GraphPkg<'_>> {
-    create_projects_graph(projects.iter().map(|project| GraphPkg { project }).collect(), &options)
-        .graph
+fn build_graph<'p>(
+    projects: &'p [Project],
+    options: CreateProjectsGraphOptions<'_>,
+) -> ProjectGraph<GraphPkg<'p>> {
+    create_projects_graph(
+        projects
+            .iter()
+            .map(|project| GraphPkg { project })
+            .collect(),
+        &options,
+    )
+    .graph
 }
 
 /// Apply one group of selectors (regular or `--filter-prod`) against the
@@ -449,7 +414,7 @@ fn build_graph(
 /// selection order. `root_selector` is the optional
 /// `{<workspace-root>}` selector appended to this pass. A pass with no
 /// `filters` and no `root_selector` selects nothing.
-fn filter_against<Pkg: BaseProject>(
+pub fn filter_against<Pkg: BaseProject>(
     graph: &ProjectGraph<Pkg>,
     filters: &[String],
     root_selector: Option<&str>,
@@ -509,7 +474,7 @@ impl AutoExcludeRoot<'_> {
     /// augmentation applies. [`select_recursive_projects`] routes it into
     /// the pass whose `follow_prod_deps_only` matches (the prod pass when
     /// a `--filter-prod` selector is present, else the regular pass).
-    fn root_selector(&self, config: &Config, prefix: &Path) -> Option<String> {
+    pub fn root_selector(&self, config: &Config, prefix: &Path) -> Option<String> {
         // pnpm pushes this inclusion onto the `--filter` list rather than
         // replacing it, and for every recursive command — so unlike the
         // exclusion below it is ungated, and it is additive.
@@ -524,8 +489,7 @@ impl AutoExcludeRoot<'_> {
         }
         // An inclusion selector already pins the selected set, so the
         // root is kept only if it matches one.
-        if config
-            .filter
+        if config.filter
             .iter()
             .chain(config.filter_prod.iter())
             .any(|filter| !filter.starts_with('!'))
@@ -558,42 +522,51 @@ fn is_root_only_patterns(patterns: &[String]) -> bool {
     patterns.len() == 1 && patterns[0] == "."
 }
 
-/// `pnpm-exec-summary.json` top-level shape: `{ "executionStatus": { ... } }`.
-#[derive(Serialize)]
-struct ExecSummaryFile {
-    #[serde(rename = "executionStatus")]
-    execution_status: IndexMap<String, ExecutionStatus>,
-}
+#[cfg(test)]
+mod tests;
 
-/// One package's entry in the recursive summary. `duration` is in
-/// milliseconds and present only once the action has run; `prefix` and
-/// `message` are filled in for failures.
-#[derive(Debug, Clone, Serialize)]
-pub struct ExecutionStatus {
-    pub status: Status,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-impl ExecutionStatus {
-    pub fn queued() -> Self {
-        ExecutionStatus { status: Status::Queued, duration: None, prefix: None, message: None }
+/// User directory selectors follow the configured legacy/glob mode; generated
+/// root-exclusion selectors choose glob matching in the filtering helper.
+pub fn recursive_filter_options(config: &Config, prefix: &Path) -> FilterWorkspaceProjectsOptions {
+    FilterWorkspaceProjectsOptions {
+        // The mode user-written `{<dir>}` selectors match in. The
+        // generated `!{<workspace-root>}` selector pins itself to glob
+        // matching instead — see `filter_against`.
+        use_glob_dir_filtering: !config.legacy_dir_filtering,
+        workspace_dir: config.workspace_dir
+            .as_deref()
+            .unwrap_or(prefix)
+            .to_path_buf(),
+        test_pattern: config.test_pattern.clone(),
+        changed_files_ignore_pattern: config.changed_files_ignore_pattern.clone(),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Queued,
-    Running,
-    Passed,
-    Skipped,
-    Failure,
+fn production_filter_graph<'a>(
+    projects: &'a [Project],
+    config: &Config,
+    graph_options: CreateProjectsGraphOptions<'_>,
+) -> Option<ProjectGraph<GraphPkg<'a>>> {
+    if config.filter_prod.is_empty() {
+        None
+    } else {
+        Some(build_graph(
+            projects,
+            CreateProjectsGraphOptions { ignore_dev_deps: true, ..graph_options },
+        ))
+    }
 }
 
-#[cfg(test)]
-mod tests;
+/// Respect the configured linking policy when determining workspace edges.
+fn recursive_graph_options<'a>(
+    config: &'a Config,
+    catalogs: &'a Catalogs,
+) -> CreateProjectsGraphOptions<'a> {
+    CreateProjectsGraphOptions {
+        link_workspace_packages: Some(config.link_workspace_packages != LinkWorkspacePackages::Off),
+        catalogs: workspace_catalogs(config, catalogs),
+        ..CreateProjectsGraphOptions::default()
+    }
+}
+
+mod summary;

@@ -16,7 +16,22 @@ fn update_args(args: &[&str]) -> UpdateArgs {
 }
 
 fn options(prod: bool, dev: bool, optional: bool, no_optional: bool) -> UpdateDependencyOptions {
-    UpdateDependencyOptions { prod, dev, optional, no_optional }
+    UpdateDependencyOptions { prod, dev, optional, no_optional, peer: false }
+}
+
+#[test]
+fn peer_is_opt_in() {
+    let mut options = options(false, false, false, false);
+    options.peer = true;
+    assert!(options.include_direct().contains(&DependencyGroup::Peer));
+}
+
+#[test]
+fn interactive_peer_is_rejected() {
+    let error = update_args(&["--interactive", "--peer"])
+        .check_interactive_peer_options()
+        .expect_err("interactive peer updates are not supported");
+    assert!(error.to_string().contains("--peer cannot be combined with --interactive"));
 }
 
 #[test]
@@ -101,11 +116,15 @@ fn workspace_option_is_checked_before_anything_is_read() {
     let workspace_root = std::path::Path::new("/workspace");
 
     assert_eq!(
-        update_args(&[]).check_workspace_option(Some(workspace_root)).expect("no flag"),
+        update_args(&[])
+            .check_workspace_option(Some(workspace_root))
+            .expect("no flag"),
         None,
     );
     assert_eq!(
-        update_args(&["--workspace"]).check_workspace_option(Some(workspace_root)).expect("linked"),
+        update_args(&["--workspace"])
+            .check_workspace_option(Some(workspace_root))
+            .expect("linked"),
         Some(workspace_root),
     );
 
@@ -159,7 +178,7 @@ fn pnpr_server_flag_applies_to_config() {
 #[test]
 fn patches_is_a_selectorless_update_mode() {
     let patches = update_args(&["--patches"]);
-    assert!(patches.patches);
+    assert!(patches.selection.patches);
     patches.check_patches_options().expect("standalone --patches");
 
     for args in [
@@ -188,4 +207,8 @@ fn constrained_patch_refresh_stays_on_the_client() {
     );
     assert!(!update_args(&["--patches"]).can_delegate_patch_refresh(true, &all_groups));
     assert!(!update_args(&["--patches"]).can_delegate_patch_refresh(false, &prod_only));
+    assert!(
+        !update_args(&["--patches", "--no-optional"])
+            .can_delegate_patch_refresh(false, &all_groups),
+    );
 }

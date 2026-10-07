@@ -6,9 +6,12 @@ import { expect, jest, test } from '@jest/globals'
 import { LOCKFILE_VERSION } from '@pnpm/constants'
 import { lockfileVerificationLogger } from '@pnpm/core-loggers'
 import type { LockfileObject } from '@pnpm/lockfile.fs'
+import { prepareEmpty } from '@pnpm/prepare'
 import type { ResolutionVerifier } from '@pnpm/resolving.resolver-base'
+import { getIntegrity, REGISTRY_MOCK_PORT } from '@pnpm/testing.registry-mock'
 
 import { verifyLockfileResolutions } from '../../src/install/verifyLockfileResolutions.js'
+import { testDefaults } from '../utils/index.js'
 
 const GIT_COMMIT = '0123456789abcdef0123456789abcdef01234567'
 
@@ -71,6 +74,7 @@ test('throws with the verifier-supplied code and reason on a single failure', as
 
   await expect(verifyLockfileResolutions(lockfile, [verifier])).rejects.toMatchObject({
     code: 'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION',
+    hint: expect.stringMatching(/If the changes look expected[\s\S]*If the fresh resolution still fails and you trust the affected packages, relax the policy that flagged them\./),
     message: expect.stringMatching(/is-odd@0\.1\.2 was published yesterday/),
   })
 })
@@ -119,6 +123,53 @@ test('throws a generic code with per-entry codes in the breakdown when violation
   })
 })
 
+test.each([
+  'MISSING_TARBALL_INTEGRITY',
+  'TARBALL_URL_MISMATCH',
+  'TARBALL_REVISION_MISMATCH',
+  'MISSING_NAMED_REGISTRY',
+])('does not suggest relaxing a policy for %s, alone or in a mixed batch', async (code) => {
+  const lockfile = makeLockfile({
+    'is-odd@0.1.2': { resolution: tarballResolution('sha512-a') },
+    'broken@1.0.0': { resolution: tarballResolution('sha512-b') },
+  })
+  const structuralOnly = wrap(async (_, { name }) =>
+    name === 'broken' ? { ok: false, code, reason: 'broken' } : { ok: true }
+  )
+  const mixed = wrap(async (_, { name }) =>
+    name === 'broken'
+      ? { ok: false, code, reason: 'broken' }
+      : { ok: false, code: 'MINIMUM_RELEASE_AGE_VIOLATION', reason: 'too fresh' }
+  )
+
+  await expect(verifyLockfileResolutions(lockfile, [structuralOnly])).rejects.toMatchObject({
+    code: `ERR_PNPM_${code}`,
+    hint: expect.not.stringMatching(/relax the policy/),
+  })
+  await expect(verifyLockfileResolutions(lockfile, [mixed])).rejects.toMatchObject({
+    code: 'ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION',
+    hint: expect.not.stringMatching(/relax the policy/),
+  })
+})
+
+test('does not suggest relaxing a policy when a mixed batch includes a structural violation', async () => {
+  const lockfile = makeLockfile({
+    'is-odd@0.1.2': { resolution: tarballResolution('sha512-a') },
+    'no-integrity@1.0.0': { resolution: tarballResolution('sha512-b') },
+  })
+  const verifier = wrap(async (_, { name }) => {
+    if (name === 'is-odd') {
+      return { ok: false, code: 'MINIMUM_RELEASE_AGE_VIOLATION', reason: 'too fresh' }
+    }
+    return { ok: false, code: 'MISSING_TARBALL_INTEGRITY', reason: 'has no "integrity" field' }
+  })
+
+  await expect(verifyLockfileResolutions(lockfile, [verifier])).rejects.toMatchObject({
+    code: 'ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION',
+    hint: expect.not.stringMatching(/relax the policy/),
+  })
+})
+
 test('lists violations in stable order across multiple failures', async () => {
   const lockfile = makeLockfile({
     'fresh-b@2.0.0': { resolution: tarballResolution('sha512-b') },
@@ -136,9 +187,9 @@ test('lists violations in stable order across multiple failures', async () => {
 
 test('caps printed violations at 20 with an "…and N more" summary', async () => {
   const packages: Record<string, { resolution: unknown }> = {}
-  for (let i = 0; i < 25; i++) {
-    packages[`pkg-${String(i).padStart(2, '0')}@1.0.0`] = {
-      resolution: tarballResolution(`sha512-${i}`),
+  for (let index = 0; index < 25; index++) {
+    packages[`pkg-${String(index).padStart(2, '0')}@1.0.0`] = {
+      resolution: tarballResolution(`sha512-${index}`),
     }
   }
   const lockfile = makeLockfile(packages)
@@ -212,7 +263,7 @@ test('the verifier sees the resolution shape verbatim', async () => {
 test('keeps the per-policy code when every violation in the batch shares it', async () => {
   // Same code across all violations → throw with that code so existing
   // handlers / docs / search routes still match. Mixed-code coverage is
-  // in the dedicated "throws a generic code …" test above.
+  // in the dedicated "throws a generic code ..." test above.
   const lockfile = makeLockfile({
     'a@1.0.0': { resolution: tarballResolution('sha512-a') },
     'b@1.0.0': { resolution: tarballResolution('sha512-b') },
@@ -377,12 +428,57 @@ test('does not write a cache record when verification rejects', async () => {
   }
 })
 
+const isA100 = (name: string, version: string): boolean => name === 'a' && version === '1.0.0'
+
+test('re-resolved entries skip the policy verifiers', async () => {
+  const lockfile = makeLockfile({
+    'a@1.0.0': { resolution: tarballResolution('sha512-a') },
+    'b@1.0.0': { resolution: tarballResolution('sha512-b') },
+  })
+  const rejecting = wrap(async () => ({
+    ok: false,
+    code: 'MINIMUM_RELEASE_AGE_VIOLATION',
+    reason: 'version not present in registry manifest',
+  }))
+
+  const error = await verifyLockfileResolutions(lockfile, [rejecting], { isReplaced: isA100 }).catch((err: unknown) => err)
+
+  expect(error).toMatchObject({ message: expect.stringContaining('b@1.0.0 version not present') })
+  expect(error).not.toMatchObject({ message: expect.stringContaining('a@1.0.0') })
+})
+
+test('does not write a cache record when re-resolved entries were skipped', async () => {
+  const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'pnpm-vlr-'))
+  try {
+    const cacheDir = path.join(tmpDir, 'cache')
+    const lockfilePath = path.join(tmpDir, 'pnpm-lock.yaml')
+    await fs.promises.writeFile(lockfilePath, 'lockfileVersion: \'9.0\'\n')
+    const lockfile = makeLockfile({
+      'a@1.0.0': { resolution: tarballResolution('sha512-a') },
+    })
+    const rejecting = wrap(async () => ({
+      ok: false,
+      code: 'POLICY_X',
+      reason: 'failed',
+    }), exampleSlot(60))
+
+    await verifyLockfileResolutions(lockfile, [rejecting], { cacheDir, lockfilePath, isReplaced: isA100 })
+
+    await expect(
+      verifyLockfileResolutions(lockfile, [rejecting], { cacheDir, lockfilePath })
+    ).rejects.toThrow()
+  } finally {
+    await fs.promises.rm(tmpDir, { recursive: true, force: true })
+  }
+})
+
 test('rejects a registry-style depPath backed by a git resolution, even with no verifiers', async () => {
   const lockfile = makeLockfile({
     'foo@1.0.0': { resolution: { type: 'git', repo: 'https://example.com/foo.git', commit: 'abc123' } },
   })
   await expect(verifyLockfileResolutions(lockfile, [])).rejects.toMatchObject({
     code: 'ERR_PNPM_RESOLUTION_SHAPE_MISMATCH',
+    hint: expect.not.stringMatching(/relax the policy/),
     message: expect.stringMatching(/foo@1\.0\.0/),
   })
 })
@@ -438,6 +534,36 @@ test('rejects a registry-style depPath whose variations resolution hides a git v
   })
 })
 
+test('the npm verifier rejects a variations resolution whose inner tarball is not the registry tarball', async () => {
+  prepareEmpty()
+  const { resolutionVerifiers } = testDefaults()
+  const integrity = getIntegrity('@pnpm.e2e/dep-of-pkg-with-1-dep', '100.0.0')
+  const lockfile = makeLockfile({
+    '@pnpm.e2e/dep-of-pkg-with-1-dep@100.0.0': {
+      resolution: {
+        type: 'variations',
+        variants: [
+          {
+            targets: [{ os: 'darwin' }],
+            resolution: {
+              integrity,
+              tarball: `http://localhost:${REGISTRY_MOCK_PORT}/@pnpm.e2e/dep-of-pkg-with-1-dep/-/dep-of-pkg-with-1-dep-100.0.0.tgz`,
+            },
+          },
+          {
+            targets: [{ os: 'linux' }],
+            resolution: { integrity, tarball: 'https://evil.example/dep-of-pkg-with-1-dep-100.0.0.tgz' },
+          },
+        ],
+      },
+    },
+  })
+  await expect(verifyLockfileResolutions(lockfile, resolutionVerifiers)).rejects.toMatchObject({
+    code: 'ERR_PNPM_TARBALL_URL_MISMATCH',
+    message: expect.stringContaining('@pnpm.e2e/dep-of-pkg-with-1-dep@100.0.0'),
+  })
+})
+
 test('does not flag artifact depPaths with non-registry resolutions', async () => {
   const lockfile = makeLockfile({
     'foo@git+https://example.com/foo.git#abc123': { resolution: { type: 'git', repo: 'https://example.com/foo.git', commit: 'abc123' }, version: '1.0.0' },
@@ -453,7 +579,7 @@ test('rejects a registry-style depPath whose git-host tarball clears the gitHost
     const lockfile = makeLockfile({
       'foo@1.0.0': { resolution: { integrity: 'sha512-deadbeef', tarball: `https://codeload.github.com/org/foo/tar.gz/${GIT_COMMIT}`, gitHosted } as never },
     })
-    // eslint-disable-next-line no-await-in-loop
+    // eslint-disable-next-line no-await-in-loop -- one case at a time keeps a failure tied to its input
     await expect(verifyLockfileResolutions(lockfile, [])).rejects.toMatchObject({
       code: 'ERR_PNPM_RESOLUTION_SHAPE_MISMATCH',
     })
@@ -476,6 +602,24 @@ test('accepts a registry-style depPath backed by a custom resolver resolution', 
   await expect(verifyLockfileResolutions(lockfile, [])).resolves.toBeUndefined()
 })
 
+test('rejects a registry-style depPath whose variations resolution has a variant without a resolution', async () => {
+  const lockfile = makeLockfile({
+    'foo@1.0.0': { resolution: { type: 'variations', variants: [{ targets: [{ os: 'linux' }] }] } as never },
+  })
+  await expect(verifyLockfileResolutions(lockfile, [])).rejects.toMatchObject({
+    code: 'ERR_PNPM_RESOLUTION_SHAPE_MISMATCH',
+  })
+})
+
+test('rejects a registry-style depPath backed by an empty variations resolution', async () => {
+  const lockfile = makeLockfile({
+    'foo@1.0.0': { resolution: { type: 'variations', variants: [] } as never },
+  })
+  await expect(verifyLockfileResolutions(lockfile, [])).rejects.toMatchObject({
+    code: 'ERR_PNPM_RESOLUTION_SHAPE_MISMATCH',
+  })
+})
+
 test('rejects a registry-style depPath backed by a non-http(s) tarball URL', async () => {
   // The npm verifier skips non-http(s) tarballs, so a file: artifact under a
   // semver key would be trusted with no tarball-URL binding to catch it.
@@ -483,7 +627,7 @@ test('rejects a registry-style depPath backed by a non-http(s) tarball URL', asy
     const lockfile = makeLockfile({
       'foo@1.0.0': { resolution: { integrity: 'sha512-deadbeef', tarball } as never },
     })
-    // eslint-disable-next-line no-await-in-loop
+    // eslint-disable-next-line no-await-in-loop -- one case at a time keeps a failure tied to its input
     await expect(verifyLockfileResolutions(lockfile, [])).rejects.toMatchObject({
       code: 'ERR_PNPM_RESOLUTION_SHAPE_MISMATCH',
     })

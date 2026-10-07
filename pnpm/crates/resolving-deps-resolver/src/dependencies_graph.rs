@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use pnpm_deps_path::DepPath;
 use pnpm_resolving_resolver_base::ResolveResult;
@@ -28,6 +28,22 @@ pub struct DependenciesGraphNode {
     /// is built once and read by the install dispatch; nothing
     /// mutates the inner `ResolveResult` after `resolve_peers`.
     pub resolve_result: std::sync::Arc<ResolveResult>,
+    pub depth: i32,
+    /// `true` when this snapshot has zero unresolved + missing peers,
+    /// i.e. its depPath equals its `pkgIdWithPatchHash`.
+    pub is_pure: bool,
+    /// Mirrors [`crate::ResolvedPackage::optional`]: `true` when every
+    /// path from any importer to this package goes through at least
+    /// one `optionalDependencies` edge. Threaded through from the
+    /// tree-walker so the lockfile adapter can set `SnapshotEntry.optional`.
+    /// Every peer-variant of the same `pkgIdWithPatchHash` shares the
+    /// same value because they share one [`crate::ResolvedPackage`].
+    pub optional: bool,
+    pub edges: ResolvedDependencyEdges,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedDependencyEdges {
     /// `alias → DepPath` edges to children + resolved peers. Children
     /// inherited from the per-occurrence tree node, peers added during
     /// peer resolution.
@@ -44,18 +60,6 @@ pub struct DependenciesGraphNode {
     pub transitive_peer_dependencies: HashSet<String>,
     /// Names of peers actually resolved (parents present in the chain).
     pub resolved_peer_names: HashSet<String>,
-    pub depth: i32,
-    pub installable: bool,
-    /// `true` when this snapshot has zero unresolved + missing peers,
-    /// i.e. its depPath equals its `pkgIdWithPatchHash`.
-    pub is_pure: bool,
-    /// Mirrors [`crate::ResolvedPackage::optional`]: `true` when every
-    /// path from any importer to this package goes through at least
-    /// one `optionalDependencies` edge. Threaded through from the
-    /// tree-walker so the lockfile adapter can set `SnapshotEntry.optional`.
-    /// Every peer-variant of the same `pkgIdWithPatchHash` shares the
-    /// same value because they share one [`crate::ResolvedPackage`].
-    pub optional: bool,
 }
 
 /// Issues collected during peer resolution, simplified to the surface
@@ -107,7 +111,7 @@ pub struct PeerDependencyIssue {
 /// record per occurrence; the names are cloned out only when a
 /// consumer materializes the chain via [`Self::to_refs`].
 #[derive(Default, Clone)]
-pub struct ParentChain(pub(crate) SharedChain<String>);
+pub struct ParentChain(pub(crate) SharedChain<Arc<str>>);
 
 impl ParentChain {
     /// Build a chain from names given root importer first.
@@ -115,7 +119,7 @@ impl ParentChain {
     pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
         let mut chain = SharedChain::default();
         for name in names {
-            chain = chain.pushed(name);
+            chain = chain.pushed(name.into());
         }
         ParentChain(chain)
     }
@@ -129,7 +133,7 @@ impl ParentChain {
         self.0
             .to_root_vec()
             .into_iter()
-            .map(|name| ParentPackageRef { name, version: String::new() })
+            .map(|name| ParentPackageRef { name: name.to_string(), version: String::new() })
             .collect()
     }
 }
@@ -144,7 +148,9 @@ impl Eq for ParentChain {}
 
 impl std::fmt::Debug for ParentChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.0.to_root_vec()).finish()
+        f.debug_list()
+            .entries(self.0.to_root_vec())
+            .finish()
     }
 }
 

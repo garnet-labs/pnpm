@@ -65,8 +65,7 @@ impl From<&str> for AccessToken {
 pub struct AccessList(Vec<AccessToken>);
 
 impl AccessList {
-    /// Build from already-resolved tokens (the config loader's path,
-    /// where `team:` references have been resolved to member sets).
+    /// Build from already-resolved tokens.
     #[must_use]
     pub fn new(tokens: Vec<AccessToken>) -> Self {
         Self(tokens)
@@ -74,21 +73,26 @@ impl AccessList {
 
     /// Build from individual built-in or username tokens (e.g. the
     /// elements of a YAML sequence). Each string is one token, taken
-    /// verbatim; `team:` references cannot be built this way — they need
-    /// the owning registry's team declarations (the config loader
-    /// resolves them and builds the list with `Self::new`).
+    /// verbatim; `team:` references cannot be built this way.
     pub fn from_tokens<Tokens, Token>(tokens: Tokens) -> Self
     where
         Tokens: IntoIterator<Item = Token>,
         Token: AsRef<str>,
     {
-        Self(tokens.into_iter().map(|token| AccessToken::from(token.as_ref())).collect())
+        Self(
+            tokens
+                .into_iter()
+                .map(|token| AccessToken::from(token.as_ref()))
+                .collect(),
+        )
     }
 
     /// Whether `identity` satisfies any token in the list.
     #[must_use]
     pub fn allows(&self, identity: &Identity) -> bool {
-        self.0.iter().any(|token| identity.satisfies(token))
+        self.0
+            .iter()
+            .any(|token| identity.satisfies(token))
     }
 
     #[must_use]
@@ -163,8 +167,7 @@ pub struct PackageRules {
     /// Winner lookup by specificity tier, rebuilt whenever the rule set
     /// changes: at most one key per tier can match a given name, so the
     /// most specific match resolves with map lookups instead of a scan of
-    /// every rule — `for_package` runs on every read, write, search hit,
-    /// and route classification.
+    /// every rule.
     index: RuleIndex,
     /// Fallbacks for fields the winning entry omits (and for every name
     /// when the map itself is empty = the registry claims every name).
@@ -181,6 +184,7 @@ pub struct PackageRules {
 struct RuleIndex {
     exact: BTreeMap<String, usize>,
     scopes: BTreeMap<String, usize>,
+    namespaces: BTreeMap<String, usize>,
     any_scoped: Option<usize>,
     all: Option<usize>,
 }
@@ -196,6 +200,9 @@ impl RuleIndex {
                 PackagePattern::Scope(scope) => {
                     index.scopes.insert(scope.clone(), position);
                 }
+                PackagePattern::Namespace(namespace) => {
+                    index.namespaces.insert(namespace.clone(), position);
+                }
                 PackagePattern::AnyScoped => index.any_scoped = Some(position),
                 PackagePattern::All => index.all = Some(position),
             }
@@ -207,6 +214,13 @@ impl RuleIndex {
     /// with a matching key.
     fn winner(&self, package: &str) -> Option<usize> {
         if let Some(&position) = self.exact.get(package) {
+            return Some(position);
+        }
+        // An npm scope carries a leading `@`, which no image repository name
+        // may, so the two tier-two keyspaces cannot collide.
+        if let Some(namespace) = PackagePattern::namespace_of(package)
+            && let Some(&position) = self.namespaces.get(namespace)
+        {
             return Some(position);
         }
         if let Some(scope) = PackagePattern::scope_of(package) {
@@ -260,9 +274,7 @@ impl PackageRules {
         }
     }
 
-    /// Override the registry-level unpublish default (nobody). Used by the
-    /// programmatic registry-mock constructors, whose fixtures exercise
-    /// unpublish flows with any authenticated user.
+    /// Override the registry-level unpublish default (nobody).
     #[must_use]
     pub fn with_default_unpublish(mut self, unpublish: AccessList) -> Self {
         self.default_unpublish = unpublish;
@@ -282,7 +294,10 @@ impl PackageRules {
     /// every path to the registry.
     #[must_use]
     pub fn patterns(&self) -> Vec<PackagePattern> {
-        self.rules.iter().map(|rule| rule.pattern.clone()).collect()
+        self.rules
+            .iter()
+            .map(|rule| rule.pattern.clone())
+            .collect()
     }
 
     /// Whether any rule carries the given field, i.e. the map refines that
@@ -290,7 +305,9 @@ impl PackageRules {
     /// `unpublish:` values on an upstream registry, where no write can land.
     #[must_use]
     pub fn refines_writes(&self) -> bool {
-        self.rules.iter().any(|rule| rule.publish.is_some() || rule.unpublish.is_some())
+        self.rules
+            .iter()
+            .any(|rule| rule.publish.is_some() || rule.unpublish.is_some())
     }
 
     /// Whether any package carries an explicit access policy.
@@ -301,13 +318,12 @@ impl PackageRules {
 
     /// The effective permissions for `package`: the **most specific**
     /// matching entry's fields, each falling back to the registry-level
-    /// default. Selection is order-free — the restricted pattern language
-    /// guarantees at most one matching key per specificity tier, so the
-    /// winner is unique regardless of where it appears in the map — and
-    /// indexed, so it costs tier lookups rather than a scan of every rule.
+    /// default.
     #[must_use]
     pub fn for_package(&self, package: &str) -> Effective<'_> {
-        let winner = self.index.winner(package).map(|position| &self.rules[position]);
+        let winner = self.index
+            .winner(package)
+            .map(|position| &self.rules[position]);
         let explicit_access = winner.and_then(|rule| rule.access.as_ref());
         Effective {
             access: explicit_access.unwrap_or(&self.default_access),
@@ -336,10 +352,27 @@ impl PackageRules {
     #[must_use]
     pub fn any_access_admits(&self, identity: &Identity) -> bool {
         self.default_access.allows(identity)
-            || self
-                .rules
+            || self.rules
                 .iter()
-                .any(|rule| rule.access.as_ref().is_some_and(|access| access.allows(identity)))
+                .any(|rule| {
+                    rule.access
+                        .as_ref()
+                        .is_some_and(|access| access.allows(identity))
+                })
+    }
+
+    /// Whether every package-specific access refinement and the registry
+    /// default admit `identity`.
+    #[must_use]
+    pub fn all_access_admit(&self, identity: &Identity) -> bool {
+        self.default_access.allows(identity)
+            && self.rules
+                .iter()
+                .all(|rule| {
+                    rule.access
+                        .as_ref()
+                        .is_none_or(|access| access.allows(identity))
+                })
     }
 }
 

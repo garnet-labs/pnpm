@@ -1,7 +1,8 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
-import { beforeEach, expect, jest, test } from '@jest/globals'
+import { afterEach, beforeEach, expect, jest, test } from '@jest/globals'
 import { tempDir } from '@pnpm/prepare'
 
 // Mock renameOverwriteSync so we can verify it's called (or not called)
@@ -14,8 +15,15 @@ jest.unstable_mockModule('rename-overwrite', () => ({
 
 const { importIndexedDir } = await import('../src/importIndexedDir.js')
 
+const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+
 beforeEach(() => {
   renameOverwriteSyncMock.mockReset()
+})
+
+afterEach(() => {
+  jest.restoreAllMocks()
+  Object.defineProperty(process, 'platform', platform)
 })
 
 test('safeToSkip skips when target already exists (content-addressed)', () => {
@@ -23,7 +31,6 @@ test('safeToSkip skips when target already exists (content-addressed)', () => {
   const srcFile = path.join(tmp, 'src', 'package.json')
   const newDir = path.join(tmp, 'dest')
 
-  // Create source file in CAS
   fs.mkdirSync(path.join(tmp, 'src'), { recursive: true })
   fs.writeFileSync(srcFile, '{"name":"pkg","version":"1.0.0"}')
 
@@ -41,6 +48,36 @@ test('safeToSkip skips when target already exists (content-addressed)', () => {
   // renameOverwriteSync should not be called on any platform.
   expect(renameOverwriteSyncMock).not.toHaveBeenCalled()
 })
+
+test('safeToSkip skips importing when the completion marker already exists', () => {
+  const tmp = tempDir()
+  const srcDir = path.join(tmp, 'src')
+  const newDir = path.join(tmp, 'dest')
+  const srcPackageJson = path.join(srcDir, 'package.json')
+  const srcIndexJs = path.join(srcDir, 'index.js')
+
+  fs.mkdirSync(srcDir, { recursive: true })
+  fs.writeFileSync(srcPackageJson, '{"name":"pkg","version":"1.0.0"}')
+  fs.writeFileSync(srcIndexJs, 'module.exports = 1')
+
+  fs.mkdirSync(newDir, { recursive: true })
+  fs.copyFileSync(srcPackageJson, path.join(newDir, 'package.json'))
+  fs.copyFileSync(srcIndexJs, path.join(newDir, 'index.js'))
+
+  const importFileMock = jest.fn(() => {
+    throw new Error('importer should not run when the completion marker already exists')
+  })
+  const filenames = new Map([
+    ['index.js', srcIndexJs],
+    ['package.json', srcPackageJson],
+  ])
+
+  importIndexedDir({ importFile: importFileMock, importFileAtomic: importFileMock }, newDir, filenames, { safeToSkip: true })
+
+  expect(importFileMock).not.toHaveBeenCalled()
+  expect(renameOverwriteSyncMock).not.toHaveBeenCalled()
+})
+
 
 test('fast-path failure does not delete directory populated by another process', () => {
   const tmp = tempDir()
@@ -149,7 +186,6 @@ test('safeToSkip creates dir when target does not exist', () => {
   const srcFile = path.join(tmp, 'src', 'index.js')
   const newDir = path.join(tmp, 'dest')
 
-  // Create source file
   fs.mkdirSync(path.join(tmp, 'src'), { recursive: true })
   fs.writeFileSync(srcFile, 'content')
 
@@ -159,4 +195,34 @@ test('safeToSkip creates dir when target does not exist', () => {
   importIndexedDir({ importFile: fs.copyFileSync, importFileAtomic: fs.copyFileSync }, newDir, filenames, { safeToSkip: true })
 
   expect(fs.existsSync(path.join(newDir, 'index.js'))).toBe(true)
+})
+
+test('the staged directory is renamed into place after a WSL file lock clears', () => {
+  Object.defineProperty(process, 'platform', { value: 'linux' })
+  jest.spyOn(os, 'release').mockReturnValue('5.15.167.4-microsoft-standard-WSL2')
+  const tmp = tempDir()
+  const srcPkgJson = path.join(tmp, 'src', 'package.json')
+  fs.mkdirSync(path.dirname(srcPkgJson), { recursive: true })
+  fs.writeFileSync(srcPkgJson, '{"name":"pkg"}')
+  const newDir = path.join(tmp, 'dest')
+  // An existing target sends the import through the staging directory.
+  fs.mkdirSync(newDir, { recursive: true })
+  renameOverwriteSyncMock
+    .mockImplementationOnce(() => {
+      throw Object.assign(new Error('EACCES: permission denied, rename'), { code: 'EACCES' })
+    })
+    .mockImplementation((stage, target) => {
+      fs.rmSync(target as string, { recursive: true, force: true })
+      fs.renameSync(stage as string, target as string)
+    })
+
+  importIndexedDir(
+    { importFile: fs.copyFileSync, importFileAtomic: fs.copyFileSync },
+    newDir,
+    new Map([['package.json', srcPkgJson]]),
+    {}
+  )
+
+  expect(renameOverwriteSyncMock).toHaveBeenCalledTimes(2)
+  expect(fs.readFileSync(path.join(newDir, 'package.json'), 'utf8')).toBe('{"name":"pkg"}')
 })

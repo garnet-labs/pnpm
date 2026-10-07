@@ -21,7 +21,7 @@ fn engine_only_key() {
             include_dep_graph_hash: false,
         },
     );
-    assert_eq!(result, "darwin;arm64;node20");
+    assert_eq!(result, "darwin;arm64;node20;format=2");
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn patch_appended_without_dep_graph_hash() {
             include_dep_graph_hash: false,
         },
     );
-    assert_eq!(result, "linux;x64;node22;patch=sha256-abc");
+    assert_eq!(result, "linux;x64;node22;format=2;patch=sha256-abc");
 }
 
 #[test]
@@ -63,9 +63,12 @@ fn dep_graph_hash_for_leaf_uses_id_and_empty_deps() {
         },
     );
     let parts: Vec<&str> = result.split(';').collect();
-    assert!(parts.len() == 4, "expected `<plat>;<arch>;node<n>;deps=<hash>`, got {result:?}");
-    assert!(parts[3].starts_with("deps="), "fourth segment must be `deps=...`: {result:?}");
-    assert!(parts[3][5..].len() >= 40, "hash payload must be non-trivial: {result:?}");
+    assert!(
+        parts.len() == 5,
+        "expected `<plat>;<arch>;node<n>;format=2;deps=<hash>`, got {result:?}",
+    );
+    assert!(parts[4].starts_with("deps="), "fifth segment must be `deps=...`: {result:?}");
+    assert!(parts[4][5..].len() >= 40, "hash payload must be non-trivial: {result:?}");
 }
 
 #[test]
@@ -381,4 +384,49 @@ fn warming_makes_cyclic_dep_states_independent_of_query_order() {
         calc_dep_graph_hash(&graph, &mut per_key_cache, &mut HashSet::new(), key);
     }
     assert_eq!(forward_cache, per_key_cache);
+}
+
+/// The digest is a store-layout contract: it names the directory a
+/// global-virtual-store slot lives in, so a change to the bytes fed to
+/// SHA-256 relocates every package in every store.
+/// `calc_dep_graph_hash` writes those bytes itself instead of building
+/// the `serde_json` value [`hash_object`] would serialize, and only
+/// this test holds the two to the same output.
+///
+/// The fixture covers what the hand-written serializer has to get
+/// right: aliases in an order the sort has to correct, a child the
+/// graph has no node for, and a node with no children at all.
+#[test]
+fn dep_graph_hash_matches_the_object_hash_of_the_value_it_models() {
+    fn node(id: &str, children: &[(&str, &str)]) -> DepsGraphNode<String> {
+        DepsGraphNode {
+            full_pkg_id: format!("{id}@1.0.0:sha512-{id}"),
+            children: children
+                .iter()
+                .map(|(alias, key)| ((*alias).to_string(), (*key).to_string()))
+                .collect(),
+        }
+    }
+    let graph: HashMap<String, DepsGraphNode<String>> = HashMap::from([
+        ("root".to_string(), node("root", &[("z", "leaf"), ("a", "mid"), ("m", "absent")])),
+        ("mid".to_string(), node("mid", &[("leaf", "leaf")])),
+        ("leaf".to_string(), node("leaf", &[])),
+    ]);
+
+    let mut cache = HashMap::new();
+    for dep_path in ["root", "mid", "leaf"] {
+        let dep_path = dep_path.to_string();
+        let actual = calc_dep_graph_hash(&graph, &mut cache, &mut HashSet::new(), &dep_path);
+        let node = &graph[&dep_path];
+        let mut deps = serde_json::Map::new();
+        for (alias, child_key) in &node.children {
+            let child = calc_dep_graph_hash(&graph, &mut cache, &mut HashSet::new(), child_key);
+            deps.insert(alias.clone(), serde_json::Value::String(child));
+        }
+        let expected = hash_object(&serde_json::json!({
+            "id": node.full_pkg_id.clone(),
+            "deps": serde_json::Value::Object(deps),
+        }));
+        assert_eq!(actual, expected, "dep-graph hash diverged for {dep_path:?}");
+    }
 }

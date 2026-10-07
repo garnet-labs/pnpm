@@ -301,3 +301,195 @@ function linkAdoptingExisting (src: string, dest: string): void {
 }
 
 const linkingImporter = { importFile: linkAdoptingExisting, importFileAtomic: linkAdoptingExisting }
+
+test('importIndexedDir() recreates the internal symlinks of a local directory', async () => {
+  const tmp = tempDir()
+  const src = path.join(tmp, 'src')
+  fs.mkdirSync(path.join(src, 'sub'), { recursive: true })
+  fs.writeFileSync(path.join(src, 'package.json'), '{"name":"pkg"}')
+  fs.writeFileSync(path.join(src, 'real.txt'), 'real')
+  fs.writeFileSync(path.join(src, 'sub/nested.txt'), 'nested')
+  fs.writeFileSync(path.join(tmp, 'outside.txt'), 'outside')
+  fs.symlinkSync('real.txt', path.join(src, 'file-link'), 'file')
+  fs.symlinkSync(path.join(src, 'real.txt'), path.join(src, 'absolute-link'), 'file')
+  fs.symlinkSync(path.join(src, 'sub'), path.join(src, 'dir-link'), 'junction')
+  fs.symlinkSync('../outside.txt', path.join(src, 'outside-link'), 'file')
+  fs.writeFileSync(path.join(src, 'left-out.txt'), 'left out')
+  fs.symlinkSync('left-out.txt', path.join(src, 'left-out-link'), 'file')
+  fs.mkdirSync(path.join(src, 'left-out-dir'))
+  fs.symlinkSync(path.join(src, 'left-out-dir'), path.join(src, 'left-out-dir-link'), 'junction')
+
+  const newDir = path.join(tmp, 'dest')
+  const filenames = new Map([
+    ['package.json', path.join(src, 'package.json')],
+    ['real.txt', path.join(src, 'real.txt')],
+    ['sub/nested.txt', path.join(src, 'sub/nested.txt')],
+    ['file-link', path.join(src, 'file-link')],
+    ['absolute-link', path.join(src, 'absolute-link')],
+    ['dir-link', path.join(src, 'dir-link')],
+    ['outside-link', path.join(src, 'outside-link')],
+    ['left-out-link', path.join(src, 'left-out-link')],
+    ['left-out-dir-link', path.join(src, 'left-out-dir-link')],
+  ])
+  importIndexedDir({ importFile: fs.copyFileSync, importFileAtomic: fs.copyFileSync }, newDir, filenames, { resolvedFrom: 'local-dir' })
+
+  expect(fs.readlinkSync(path.join(newDir, 'file-link'))).toBe('real.txt')
+  expect(fs.readlinkSync(path.join(newDir, 'absolute-link'))).toBe('real.txt')
+  expect(fs.readFileSync(path.join(newDir, 'dir-link/nested.txt'), 'utf8')).toBe('nested')
+  expect(fs.lstatSync(path.join(newDir, 'dir-link')).isSymbolicLink()).toBe(true)
+  expect(fs.lstatSync(path.join(newDir, 'outside-link')).isFile()).toBe(true)
+  expect(fs.readFileSync(path.join(newDir, 'outside-link'), 'utf8')).toBe('outside')
+  expect(fs.lstatSync(path.join(newDir, 'left-out-link')).isFile()).toBe(true)
+  expect(fs.readFileSync(path.join(newDir, 'left-out-link'), 'utf8')).toBe('left out')
+  expect(fs.existsSync(path.join(newDir, 'left-out-dir-link'))).toBe(false)
+})
+
+test('importIndexedDir() relativizes an absolute symlink that reaches the package through a linked root', async () => {
+  const tmp = tempDir()
+  const src = path.join(tmp, 'src')
+  fs.mkdirSync(src, { recursive: true })
+  fs.writeFileSync(path.join(src, 'real.txt'), 'real')
+  const rootLink = path.join(tmp, 'src-link')
+  fs.symlinkSync(src, rootLink, 'dir')
+  fs.symlinkSync(path.join(rootLink, 'real.txt'), path.join(src, 'link.txt'), 'file')
+
+  const newDir = path.join(tmp, 'dest')
+  importIndexedDir(
+    { importFile: fs.copyFileSync, importFileAtomic: fs.copyFileSync },
+    newDir,
+    new Map([
+      ['real.txt', path.join(src, 'real.txt')],
+      ['link.txt', path.join(src, 'link.txt')],
+    ]),
+    { resolvedFrom: 'local-dir' }
+  )
+
+  expect(fs.readlinkSync(path.join(newDir, 'link.txt'))).toBe('real.txt')
+})
+
+test('importIndexedDir() imports a symlink from the store as a file', async () => {
+  const tmp = tempDir()
+  const src = path.join(tmp, 'src')
+  fs.mkdirSync(src, { recursive: true })
+  fs.writeFileSync(path.join(src, 'real.txt'), 'real')
+  fs.symlinkSync('real.txt', path.join(src, 'file-link'), 'file')
+
+  const newDir = path.join(tmp, 'dest')
+  importIndexedDir(
+    { importFile: fs.copyFileSync, importFileAtomic: fs.copyFileSync },
+    newDir,
+    new Map([['file-link', path.join(src, 'file-link')]]),
+    { resolvedFrom: 'remote' }
+  )
+
+  expect(fs.lstatSync(path.join(newDir, 'file-link')).isFile()).toBe(true)
+})
+
+test.each([
+  ['directly', { resolvedFrom: 'local-dir' as const }],
+  ['through a staging directory', { resolvedFrom: 'local-dir' as const, keepModulesDir: true }],
+])('importIndexedDir() falls back to a junction pointing into the imported directory when imported %s', async (_, opts) => {
+  const tmp = tempDir()
+  const src = path.join(tmp, 'src')
+  fs.mkdirSync(path.join(src, '..generated'), { recursive: true })
+  fs.writeFileSync(path.join(src, '..generated/gen.txt'), 'generated content')
+  fs.writeFileSync(path.join(src, 'package.json'), '{"name":"pkg"}')
+  fs.symlinkSync(path.join(src, '..generated'), path.join(src, 'gen-link'), 'junction')
+
+  const newDir = path.join(tmp, 'dest')
+  const filenames = new Map([
+    ['package.json', path.join(src, 'package.json')],
+    ['..generated/gen.txt', path.join(src, '..generated/gen.txt')],
+    ['gen-link', path.join(src, 'gen-link')],
+  ])
+
+  const originalPlatform = process.platform
+  const realSymlinkSync = fs.symlinkSync.bind(fs)
+  const symlinkSpy = jest.spyOn(fs, 'symlinkSync').mockImplementation((target, dest, type) => {
+    if (type === 'dir') {
+      const err = new Error('EPERM: operation not permitted, symlink') as NodeJS.ErrnoException
+      err.code = 'EPERM'
+      throw err
+    }
+    return realSymlinkSync(target, dest, type)
+  })
+
+  try {
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+    importIndexedDir({ importFile: fs.copyFileSync, importFileAtomic: fs.copyFileSync }, newDir, filenames, opts)
+  } finally {
+    symlinkSpy.mockRestore()
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+  }
+
+  expect(fs.readlinkSync(path.join(newDir, 'gen-link'))).toBe(path.join(newDir, '..generated'))
+  expect(fs.readFileSync(path.join(newDir, 'gen-link/gen.txt'), 'utf8')).toBe('generated content')
+})
+
+const testOnPosix = process.platform === 'win32' ? test.skip : test
+
+testOnPosix.each([
+  ['a fresh directory', {}],
+  ['a staged directory', { keepModulesDir: true }],
+  ['a shared directory', { safeToSkip: true }],
+])('importIndexedDir() creates the symlinks of a cached build in %s', async (_name, opts) => {
+  const tmp = tempDir()
+  const src = path.join(tmp, 'src')
+  fs.mkdirSync(src, { recursive: true })
+  fs.writeFileSync(path.join(src, 'package.json'), '{"name":"pkg"}')
+  fs.writeFileSync(path.join(src, 'tool'), 'tool')
+
+  const newDir = path.join(tmp, 'dest')
+  const filenames = new Map([
+    ['package.json', path.join(src, 'package.json')],
+    ['bin/tool', path.join(src, 'tool')],
+  ])
+  const symlinks = new Map([['bin/tool-alias', 'tool'], ['links/bin', '../bin']])
+  importIndexedDir(linkingImporter, newDir, filenames, { ...opts, symlinks })
+
+  expect(fs.readlinkSync(path.join(newDir, 'bin/tool-alias'))).toBe('tool')
+  expect(fs.readFileSync(path.join(newDir, 'links/bin/tool'), 'utf8')).toBe('tool')
+})
+
+testOnPosix('importIndexedDir() safeToSkip repairs a symlink of a cached build', async () => {
+  const tmp = tempDir()
+  const src = path.join(tmp, 'src')
+  fs.mkdirSync(src, { recursive: true })
+  fs.writeFileSync(path.join(src, 'package.json'), '{"name":"pkg"}')
+  fs.writeFileSync(path.join(src, 'tool'), 'tool')
+
+  const newDir = path.join(tmp, 'dest')
+  const filenames = new Map([
+    ['package.json', path.join(src, 'package.json')],
+    ['tool', path.join(src, 'tool')],
+  ])
+  importIndexedDir(linkingImporter, newDir, filenames, { safeToSkip: true })
+  // The directory is complete but was imported without the build's links, or
+  // with a link that was later replaced.
+  fs.writeFileSync(path.join(newDir, 'tool-alias'), 'a copy of tool')
+
+  importIndexedDir(linkingImporter, newDir, filenames, { safeToSkip: true, symlinks: new Map([['tool-alias', 'tool'], ['tool-link', 'tool']]) })
+
+  expect(fs.readlinkSync(path.join(newDir, 'tool-alias'))).toBe('tool')
+  expect(fs.readlinkSync(path.join(newDir, 'tool-link'))).toBe('tool')
+})
+
+testOnPosix('importIndexedDir() safeToSkip does not follow a stale symlink on the path to a cached build link', async () => {
+  const tmp = tempDir()
+  const src = path.join(tmp, 'src')
+  fs.mkdirSync(src, { recursive: true })
+  fs.writeFileSync(path.join(src, 'package.json'), '{"name":"pkg"}')
+  const outside = path.join(tmp, 'outside')
+  fs.mkdirSync(outside)
+
+  const newDir = path.join(tmp, 'dest')
+  const filenames = new Map([['package.json', path.join(src, 'package.json')]])
+  importIndexedDir(linkingImporter, newDir, filenames, { safeToSkip: true })
+  fs.symlinkSync(outside, path.join(newDir, 'bin'))
+
+  importIndexedDir(linkingImporter, newDir, filenames, { safeToSkip: true, symlinks: new Map([['bin/tool', '../package.json']]) })
+
+  expect(fs.lstatSync(path.join(newDir, 'bin')).isDirectory()).toBe(true)
+  expect(fs.readlinkSync(path.join(newDir, 'bin/tool'))).toBe('../package.json')
+  expect(fs.readdirSync(outside)).toStrictEqual([])
+})

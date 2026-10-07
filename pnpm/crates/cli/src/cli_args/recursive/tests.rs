@@ -6,12 +6,13 @@
 //! selection resolves through the prod-pruned graph so the dev edges it
 //! dropped are not pulled back in.
 
-use super::{filtered_projects_dependencies, graph_sequencer, sequence_graph};
+use super::{filtered_projects_dependencies, projects_with_workspace_dependencies, sequence_graph};
+use pnpm_package_manager::graph_sequencer;
 use pnpm_workspace_projects_graph::{ProjectGraph, ProjectGraphNode};
 use pretty_assertions::assert_eq;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 fn make_graph(adjacency: &[(&str, &[&str])]) -> ProjectGraph<()> {
@@ -45,11 +46,17 @@ fn merge(graphs: [ProjectGraph<()>; 2]) -> ProjectGraph<()> {
 }
 
 fn dirs(names: &[&str]) -> Vec<PathBuf> {
-    names.iter().map(PathBuf::from).collect()
+    names
+        .iter()
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn prod_only(names: &[&str]) -> HashSet<PathBuf> {
-    names.iter().map(PathBuf::from).collect()
+    names
+        .iter()
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn filtered_order(
@@ -63,7 +70,14 @@ fn filtered_order(
         .iter()
         .map(|(project, dependencies)| (project.clone(), dependencies.clone()))
         .collect();
-    graph_sequencer(&edges, &dependencies.keys().cloned().collect::<Vec<_>>()).order
+    graph_sequencer(
+        &edges,
+        &dependencies
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+    .order
 }
 
 #[test]
@@ -181,7 +195,61 @@ fn detects_a_cycle_that_passes_through_unselected_projects() {
     let result = sequence_graph(&select(&graph, &["a", "c"]), &graph);
     dbg!(&result);
     assert!(
-        result.cycles.iter().any(|cycle| cycle.len() > 1),
+        result.cycles
+            .iter()
+            .any(|cycle| cycle.len() > 1),
         "a -> b -> c -> a is a cycle once b is tunneled through",
+    );
+}
+
+#[test]
+fn projects_with_workspace_dependencies_follows_dependencies_transitively() {
+    // b is not selected, but the install a filtered command spawns materializes
+    // it, so it is held to the modules-directory requirement too.
+    let full = make_graph(&[("a", &["b"]), ("b", &["c"]), ("c", &[]), ("d", &[])]);
+    assert_eq!(
+        projects_with_workspace_dependencies([Path::new("a")], &full, None, &prod_only(&[])),
+        dirs(&["a", "b", "c"]),
+    );
+}
+
+#[test]
+fn projects_with_workspace_dependencies_reads_a_prod_only_root_from_the_prod_graph() {
+    // a's dev edge to b is gone in the prod graph, so b is not required.
+    let full = make_graph(&[("a", &["b"]), ("b", &[])]);
+    let prod = make_graph(&[("a", &[]), ("b", &[])]);
+    assert_eq!(
+        projects_with_workspace_dependencies(
+            [Path::new("a")],
+            &full,
+            Some(&prod),
+            &prod_only(&["a"]),
+        ),
+        dirs(&["a"]),
+    );
+}
+
+#[test]
+fn projects_with_workspace_dependencies_reads_a_regular_root_from_the_full_graph() {
+    // The same graphs, with a selected by a regular filter: its dev edge holds.
+    let full = make_graph(&[("a", &["b"]), ("b", &[])]);
+    let prod = make_graph(&[("a", &[]), ("b", &[])]);
+    assert_eq!(
+        projects_with_workspace_dependencies([Path::new("a")], &full, Some(&prod), &prod_only(&[])),
+        dirs(&["a", "b"]),
+    );
+}
+
+#[test]
+fn projects_with_workspace_dependencies_lists_a_shared_dependency_once() {
+    let full = make_graph(&[("a", &["c"]), ("b", &["c"]), ("c", &[])]);
+    assert_eq!(
+        projects_with_workspace_dependencies(
+            [Path::new("a"), Path::new("b")],
+            &full,
+            None,
+            &prod_only(&[]),
+        ),
+        dirs(&["a", "c", "b"]),
     );
 }

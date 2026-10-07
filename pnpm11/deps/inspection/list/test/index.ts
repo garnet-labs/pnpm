@@ -10,7 +10,7 @@ import { renderParseable } from '../lib/renderParseable.js'
 import { renderTree } from '../lib/renderTree.js'
 
 const DEV_DEP_ONLY_CLR = chalk.yellow
-const PROD_DEP_CLR = (s: string) => s // just use the default color
+const PROD_DEP_CLR = (text: string) => text // just use the default color
 const OPTIONAL_DEP_CLR = chalk.blue
 const NOT_SAVED_DEP_CLR = chalk.red
 const VERSION_CLR = chalk.gray
@@ -24,16 +24,16 @@ const UNSAVED_DEPENDENCIES = chalk.cyanBright('not saved (you should add these d
 const highlighted = chalk.bold
 const boldHighlighted = highlighted.underline
 
-const f = fixtures(import.meta.dirname)
-const fixture = f.find('fixture')
-const fixtureWithNoPkgNameAndNoVersion = f.find('fixture-with-no-pkg-name-and-no-version')
-const fixtureWithNoPkgVersion = f.find('fixture-with-no-pkg-version')
-const fixtureWithExternalLockfile = path.join(f.find('fixture-with-external-shrinkwrap'), 'pkg')
-const workspaceWith2Pkgs = f.find('workspace-with-2-pkgs')
-const workspaceWithDifferentDeps = f.find('workspace-with-different-deps')
-const workspaceWithPrivatePkgs = f.find('workspace-with-private-pkgs')
-const emptyFixture = f.find('empty')
-const fixtureWithAliasedDep = f.find('with-aliased-dep')
+const testFixtures = fixtures(import.meta.dirname)
+const fixture = testFixtures.find('fixture')
+const fixtureWithNoPkgNameAndNoVersion = testFixtures.find('fixture-with-no-pkg-name-and-no-version')
+const fixtureWithNoPkgVersion = testFixtures.find('fixture-with-no-pkg-version')
+const fixtureWithExternalLockfile = path.join(testFixtures.find('fixture-with-external-shrinkwrap'), 'pkg')
+const workspaceWith2Pkgs = testFixtures.find('workspace-with-2-pkgs')
+const workspaceWithDifferentDeps = testFixtures.find('workspace-with-different-deps')
+const workspaceWithPrivatePkgs = testFixtures.find('workspace-with-private-pkgs')
+const emptyFixture = testFixtures.find('empty')
+const fixtureWithAliasedDep = testFixtures.find('with-aliased-dep')
 
 test('list all deps of a package that has an external lockfile', async () => {
   expect(await list([fixtureWithExternalLockfile], {
@@ -794,7 +794,7 @@ ${boldHighlighted(`fixture@1.0.0 ${fixture}`)}
 })
 
 test('peer dependencies are marked', async () => {
-  const fixture = f.find('with-peer')
+  const fixture = testFixtures.find('with-peer')
   const output = await list([fixture], { depth: 1, lockfileDir: fixture, virtualStoreDirMaxLength: 120 })
   expect(output).toBe(`${LEGEND}
 
@@ -811,7 +811,7 @@ ${boldHighlighted(`with-peer@1.0.0 ${fixture}`)}
 })
 
 test('peer dependencies are marked when searching', async () => {
-  const fixture = f.find('with-peer')
+  const fixture = testFixtures.find('with-peer')
   const output = await listForPackages(['ajv'], [fixture], { depth: 1, lockfileDir: fixture, virtualStoreDirMaxLength: 120 })
   expect(output).toBe(`${LEGEND}
 
@@ -824,7 +824,7 @@ ${boldHighlighted(`with-peer@1.0.0 ${fixture}`)}
 })
 
 test('--only-projects shows only projects', async () => {
-  const fixture = f.find('workspace-with-nested-workspace-deps')
+  const fixture = testFixtures.find('workspace-with-nested-workspace-deps')
   const output = await list([fixture], { depth: 999, lockfileDir: fixture, onlyProjects: true, virtualStoreDirMaxLength: 120 })
 
   // The "workspace-with-nested-workspace-deps" test case has an external
@@ -839,6 +839,115 @@ ${boldHighlighted(`root@1.0.0 ${fixture}`)}
   └─┬ @scope/b${VERSION_CLR('@link:packages/b')}
     └── @scope/c${VERSION_CLR('@link:packages/c')}`)
 })
+
+test('--only-projects shows the projects of a workspace with dedicated lockfiles', async () => {
+  const fixture = testFixtures.find('workspace-with-nested-workspace-deps-and-dedicated-lockfiles')
+  const output = await list([fixture], {
+    depth: Infinity,
+    lockfileDir: fixture,
+    onlyProjects: true,
+    virtualStoreDirMaxLength: 120,
+    workspaceProjectDirs: dedicatedLockfilesWorkspaceProjectDirs(fixture),
+  })
+
+  // The linked "external" directory has a lockfile but is not a workspace
+  // project, so it is not printed. The second "@scope/b" is not walked again.
+  // "@scope/c" has no lockfile yet, so it is printed without dependencies.
+
+  expect(output).toBe(`${LEGEND}
+
+${boldHighlighted(`root@1.0.0 ${fixture}`)}
+│
+│   ${DEPENDENCIES}
+├─┬ @scope/a${VERSION_CLR('@link:packages/a')}
+│ └─┬ @scope/b${VERSION_CLR('@link:packages/b')}
+│   └── @scope/c${VERSION_CLR('@link:packages/c')}
+└── @scope/b${VERSION_CLR('@link:packages/b')} [deduped]`)
+})
+
+test('--only-projects respects the depth in a workspace with dedicated lockfiles', async () => {
+  const fixture = testFixtures.find('workspace-with-nested-workspace-deps-and-dedicated-lockfiles')
+  const output = await list([fixture], {
+    depth: 1,
+    lockfileDir: fixture,
+    onlyProjects: true,
+    virtualStoreDirMaxLength: 120,
+    workspaceProjectDirs: dedicatedLockfilesWorkspaceProjectDirs(fixture),
+  })
+
+  expect(output).toBe(`${LEGEND}
+
+${boldHighlighted(`root@1.0.0 ${fixture}`)}
+│
+│   ${DEPENDENCIES}
+├─┬ @scope/a${VERSION_CLR('@link:packages/a')}
+│ └── @scope/b${VERSION_CLR('@link:packages/b')}
+└─┬ @scope/b${VERSION_CLR('@link:packages/b')}
+  └── @scope/c${VERSION_CLR('@link:packages/c')}`)
+})
+
+test('--only-projects finds a searched project behind projects with dedicated lockfiles', async () => {
+  const fixture = testFixtures.find('workspace-with-nested-workspace-deps-and-dedicated-lockfiles')
+  const output = await listForPackages(['@scope/c'], [fixture], {
+    depth: Infinity,
+    lockfileDir: fixture,
+    onlyProjects: true,
+    virtualStoreDirMaxLength: 120,
+    workspaceProjectDirs: dedicatedLockfilesWorkspaceProjectDirs(fixture),
+  })
+
+  expect(output).toBe(`${LEGEND}
+
+${boldHighlighted(`root@1.0.0 ${fixture}`)}
+│
+│   ${DEPENDENCIES}
+├─┬ @scope/a${VERSION_CLR('@link:packages/a')}
+│ └─┬ @scope/b${VERSION_CLR('@link:packages/b')}
+│   └── ${highlighted(`@scope/c${VERSION_CLR('@link:packages/c')}`)}
+└── @scope/b${VERSION_CLR('@link:packages/b')} [deduped]`)
+})
+
+test('--only-projects stops at a cycle between projects with dedicated lockfiles', async () => {
+  const fixture = testFixtures.find('workspace-with-cyclic-dedicated-lockfiles')
+  const output = await list([fixture], {
+    depth: Infinity,
+    lockfileDir: fixture,
+    onlyProjects: true,
+    virtualStoreDirMaxLength: 120,
+    workspaceProjectDirs: [fixture, ...['a', 'b'].map((name) => path.join(fixture, 'packages', name))],
+  })
+
+  expect(output).toBe(`${LEGEND}
+
+${boldHighlighted(`root@1.0.0 ${fixture}`)}
+│
+│   ${DEPENDENCIES}
+└─┬ @scope/a${VERSION_CLR('@link:packages/a')}
+  └─┬ @scope/b${VERSION_CLR('@link:packages/b')}
+    └── @scope/a${VERSION_CLR('@link:packages/a')}`)
+})
+
+test('--only-projects matches each alias of a project with a dedicated lockfile', async () => {
+  const fixture = testFixtures.find('workspace-with-aliased-dedicated-lockfiles')
+  const output = await listForPackages(['alias-two'], [fixture], {
+    depth: Infinity,
+    lockfileDir: fixture,
+    onlyProjects: true,
+    virtualStoreDirMaxLength: 120,
+    workspaceProjectDirs: [fixture, path.join(fixture, 'packages/c')],
+  })
+
+  expect(output).toBe(`${LEGEND}
+
+${boldHighlighted(`root@1.0.0 ${fixture}`)}
+│
+│   ${DEPENDENCIES}
+└── ${highlighted(`alias-two${VERSION_CLR('@link:packages/c')}`)}`)
+})
+
+function dedicatedLockfilesWorkspaceProjectDirs (fixture: string): string[] {
+  return [fixture, ...['a', 'b', 'c'].map((name) => path.join(fixture, 'packages', name))]
+}
 
 test('renderTree displays npm: protocol for aliased packages', async () => {
   const testPath = '/test/path'
@@ -1028,7 +1137,7 @@ test('renderParseable search: shared dep across packages is not duplicated', asy
   expect(lines).toContain('/workspace/packages/pkg-a')
   expect(lines).toContain('/workspace/packages/pkg-b')
   expect(lines).toContain('/workspace/packages/shared')
-  expect(lines.filter((l) => l === '/workspace/packages/shared')).toHaveLength(1)
+  expect(lines.filter((line) => line === '/workspace/packages/shared')).toHaveLength(1)
 })
 
 test('renderParseable search: packages unrelated to search are excluded', async () => {

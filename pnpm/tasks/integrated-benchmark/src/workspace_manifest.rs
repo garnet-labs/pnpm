@@ -14,10 +14,17 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields mirror the benchmark fixture pnpm-workspace.yaml format."
+    )
+)]
 pub struct MinimalWorkspaceManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store_dir: Option<String>,
-    /// Packument-metadata cache location (`<cacheDir>/v11/metadata-full`).
+    /// Packument-metadata cache location (`<cacheDir>/v12/metadata-full`).
     /// The benchmark forces this bench-local (`./cache-dir`) for the same
     /// reason it forces `storeDir` local: so the cold-cache scenarios can
     /// wipe it per-iteration. Left at the global default it would survive
@@ -54,9 +61,7 @@ pub struct MinimalWorkspaceManifest {
     /// default flip surfaces in CI rather than silently changing
     /// the on-disk layout being measured: with GVS on, slot
     /// directories move to `<storeDir>/links/<scope>/<name>/<version>/<hash>`,
-    /// a different shape from the project-local baseline. A
-    /// separate GVS-on benchmark variant lives behind a caller-
-    /// supplied `--fixture-dir` with the flag flipped to `true`.
+    /// a different shape from the project-local baseline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_global_virtual_store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,17 +83,14 @@ pub struct SupportedArchitectures {
 
 impl MinimalWorkspaceManifest {
     /// The default manifest the benchmark uses when no `--fixture-dir`
-    /// is provided. Loaded from the static
-    /// `tasks/integrated-benchmark/src/fixtures/pnpm-workspace.yaml`
-    /// text fixture, parallel to how `package.json` and `pnpm-lock.yaml`
-    /// are bundled.
+    /// is provided.
     ///
     /// The fixture pins `supportedArchitectures` to every OS/CPU/libc
     /// pnpm releases for, so pnpm on Linux CI doesn't skip darwin-only
     /// optionals (e.g. `fsevents`) while pacquet installs every snapshot
     /// unconditionally — the asymmetry would tilt the benchmark in
     /// pnpm's favour. It also pins `allowBuilds` to `false` for the
-    /// three packages whose postinstalls would otherwise trip pnpm's
+    /// packages whose postinstalls would otherwise trip pnpm's
     /// `ERR_PNPM_IGNORED_BUILDS` warning under `ignore-scripts=true`.
     pub fn default_for_benchmark() -> Self {
         serde_saphyr::from_str(PNPM_WORKSPACE).expect("parse default pnpm-workspace.yaml fixture")

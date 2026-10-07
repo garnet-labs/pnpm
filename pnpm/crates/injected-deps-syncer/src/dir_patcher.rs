@@ -1,24 +1,31 @@
 //! Bring one directory tree in step with another by hardlinking, so an
 //! injected copy of a workspace package can be refreshed in place
-//! without re-running the installer.
+//! without re-running the installer. A target on another filesystem
+//! than its source gets copies instead.
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_directory_fetcher::{DirectoryFetcher, DirectoryFetcherError};
+use pnpm_fs::{FsHardLink, Host, is_cross_device};
 use std::{
     collections::{BTreeMap, HashMap},
     fs, io,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 /// A file's identity. An inode number is only unique within one
 /// filesystem, so the volume it came from is part of the identity:
 /// without it two unrelated files on different volumes can collide and
-/// be mistaken for the same one.
+/// be mistaken for the same one. Length and modification time travel
+/// with that identity so a watcher publish can tell an in-place edit
+/// of a hardlink from a copy that already matches the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileId {
     pub device: u64,
     pub inode: u64,
+    pub len: u64,
+    pub modified: SystemTime,
 }
 
 /// What a path in an [`InodeMap`] holds.
@@ -26,7 +33,9 @@ pub struct FileId {
 /// A file carries its identity rather than its content, because that is
 /// all a hardlink comparison needs: two paths hold the same bytes
 /// exactly when they are the same file, so an unchanged file costs no
-/// filesystem work.
+/// filesystem work. A copy made because the target is on another
+/// filesystem never shares its source's identity, so every sync copies
+/// it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Value {
     Dir,
@@ -86,7 +95,7 @@ pub enum PatchError {
         error: io::Error,
     },
 
-    #[display("Failed to hardlink {source:?} to {target:?}: {error}")]
+    #[display("Failed to hardlink or copy {source:?} to {target:?}: {error}")]
     #[diagnostic(code(ERR_PNPM_INJECTED_DEPS_SYNC_LINK))]
     Link {
         source: PathBuf,
@@ -113,19 +122,21 @@ pub struct DirPatcher {
 
 impl DirPatcher {
     /// Diff `source_dir` against each of `target_dirs`, reading each
-    /// tree once.
+    /// tree once. `include_only_package_files` reads the source the way
+    /// [`DirectoryFetcher::include_only_package_files`] does.
     pub fn from_multiple_targets(
         source_dir: &Path,
         target_dirs: &[PathBuf],
+        include_only_package_files: bool,
     ) -> Result<Vec<Self>, PatchError> {
-        let source_map = load_inode_map(source_dir)?;
+        let source_map = load_inode_map(source_dir, include_only_package_files)?;
         target_dirs
             .iter()
             .map(|target_dir| {
                 Ok(DirPatcher {
                     source_dir: source_dir.to_path_buf(),
                     target_dir: target_dir.clone(),
-                    patch: diff_dir(&load_inode_map(target_dir)?, &source_map),
+                    patch: diff_dir(&load_inode_map(target_dir, false)?, &source_map),
                 })
             })
             .collect()
@@ -150,8 +161,12 @@ pub fn diff_dir(old_index: &InodeMap, new_index: &InodeMap) -> DirDiff {
             new_value: *new_value,
         })
         .collect();
-    let removed =
-        old_index.keys().filter(|path| !new_index.contains_key(*path)).rev().cloned().collect();
+    let removed = old_index
+        .keys()
+        .filter(|path| !new_index.contains_key(*path))
+        .rev()
+        .cloned()
+        .collect();
     DirDiff { changes, removed }
 }
 
@@ -166,18 +181,31 @@ pub fn apply_patch(
     source_dir: &Path,
     target_dir: &Path,
 ) -> Result<(), PatchError> {
+    apply_patch_with_link::<Host>(patch, source_dir, target_dir)
+}
+
+pub(crate) fn apply_patch_with_link<Sys: FsHardLink>(
+    patch: &DirDiff,
+    source_dir: &Path,
+    target_dir: &Path,
+) -> Result<(), PatchError> {
     for path in &patch.removed {
         remove_recursive(&target_dir.join(path))?;
     }
-    let (new_dirs, new_files): (Vec<_>, Vec<_>) =
-        patch.changes.iter().partition(|change| change.new_value == Value::Dir);
+    let (new_dirs, new_files): (Vec<_>, Vec<_>) = patch.changes
+        .iter()
+        .partition(|change| change.new_value == Value::Dir);
     for change in new_dirs.into_iter().chain(new_files) {
-        apply_change(change, source_dir, target_dir)?;
+        apply_change_with_link::<Sys>(change, source_dir, target_dir)?;
     }
     Ok(())
 }
 
-fn apply_change(change: &Change, source_dir: &Path, target_dir: &Path) -> Result<(), PatchError> {
+fn apply_change_with_link<Sys: FsHardLink>(
+    change: &Change,
+    source_dir: &Path,
+    target_dir: &Path,
+) -> Result<(), PatchError> {
     let target_path = target_dir.join(&change.path);
     if change.old_value.is_some() {
         remove_recursive(&target_path)?;
@@ -190,13 +218,127 @@ fn apply_change(change: &Change, source_dir: &Path, target_dir: &Path) -> Result
         Value::File(_) => {
             let source_path = source_dir.join(&change.path);
             retry_over_blocking_inode(&target_path, || {
-                fs::hard_link(&source_path, &target_path).map_err(|error| PatchError::Link {
-                    source: source_path.clone(),
-                    target: target_path.clone(),
-                    error,
-                })
+                link_or_copy::<Sys>(&source_path, &target_path)
+                    .map_err(|error| PatchError::Link {
+                        source: source_path.clone(),
+                        target: target_path.clone(),
+                        error,
+                    })
             })
         }
+    }
+}
+
+/// A source directory's files, read once per poll and published to each of
+/// its injected copies.
+pub struct PublishSource<'a> {
+    pub dir: &'a Path,
+    pub map: InodeMap,
+}
+
+impl<'a> PublishSource<'a> {
+    pub fn load(dir: &'a Path) -> Result<Self, PatchError> {
+        Ok(PublishSource { dir, map: load_inode_map(dir, false)? })
+    }
+}
+
+/// Copy changed files from `source.dir` into `target_dir` as independent
+/// files, so a watcher on `target_dir` sees the write.
+///
+/// Hardlink sync shares inodes, and an in-place write through the source
+/// path does not notify a watcher on the injected directory. A plain copy
+/// followed by a rename does. `edited_since` is fixed for one watch: a
+/// hardlink is republished once when its modification time is at least
+/// that instant, and a copy whose length and modification time already
+/// match the source is left alone.
+pub fn publish_edits(
+    source: &PublishSource<'_>,
+    target_dir: &Path,
+    edited_since: SystemTime,
+) -> Result<(), PatchError> {
+    let PublishSource { dir: source_dir, map: source_map } = source;
+    let target_map = load_inode_map(target_dir, false)?;
+    let patch = diff_dir(&target_map, source_map);
+    for path in &patch.removed {
+        remove_recursive(&target_dir.join(path))?;
+    }
+    for (path, value) in source_map {
+        if *value != Value::Dir || path == "." {
+            continue;
+        }
+        ensure_directory(&target_dir.join(path), target_map.get(path))?;
+    }
+    for (path, value) in source_map {
+        let Value::File(source_id) = value else {
+            continue;
+        };
+        if !should_publish(source_id, target_map.get(path), edited_since) {
+            continue;
+        }
+        publish_file(&source_dir.join(path), &target_dir.join(path), source_id.modified)?;
+    }
+    Ok(())
+}
+
+fn should_publish(source: &FileId, target: Option<&Value>, edited_since: SystemTime) -> bool {
+    let Some(Value::File(target_id)) = target else {
+        return true;
+    };
+    if source.device == target_id.device && source.inode == target_id.inode {
+        return source.modified >= edited_since;
+    }
+    source.len != target_id.len || source.modified != target_id.modified
+}
+
+fn ensure_directory(target_path: &Path, old: Option<&Value>) -> Result<(), PatchError> {
+    if old.is_some_and(|value| *value != Value::Dir) {
+        remove_recursive(target_path)?;
+    }
+    fs::create_dir_all(target_path)
+        .map_err(|error| PatchError::CreateDir { path: target_path.to_path_buf(), error })
+}
+
+fn publish_file(
+    source_path: &Path,
+    target_path: &Path,
+    modified: SystemTime,
+) -> Result<(), PatchError> {
+    if let Some(parent) = target_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| PatchError::CreateDir { path: parent.to_path_buf(), error })?;
+    }
+    if fs::symlink_metadata(target_path).is_ok_and(|metadata| metadata.is_dir()) {
+        remove_recursive(target_path)?;
+    }
+    pnpm_fs::copy_file_atomic(source_path, target_path)
+        .map_err(|error| PatchError::Link {
+            source: source_path.to_path_buf(),
+            target: target_path.to_path_buf(),
+            error,
+        })?;
+    if let Err(error) = fs::File::options()
+        .write(true)
+        .open(target_path)
+        .and_then(|file| file.set_modified(modified))
+    {
+        tracing::debug!(
+            target: "pacquet::sync_injected_deps",
+            path = ?target_path,
+            "Failed to preserve the modification time of a published injected file: {error}",
+        );
+    }
+    Ok(())
+}
+
+fn link_or_copy<Sys: FsHardLink>(source_path: &Path, target_path: &Path) -> io::Result<()> {
+    match Sys::hard_link(source_path, target_path) {
+        Err(error) if is_cross_device(&error) => {
+            pnpm_fs::copy_file_atomic(source_path, target_path)
+        }
+        result => result,
     }
 }
 
@@ -234,11 +376,12 @@ fn remove_recursive(target_path: &Path) -> Result<(), PatchError> {
     }
 }
 
-fn load_inode_map(dir: &Path) -> Result<InodeMap, PatchError> {
+fn load_inode_map(dir: &Path, include_only_package_files: bool) -> Result<InodeMap, PatchError> {
     let output = DirectoryFetcher {
         directory: dir.to_path_buf(),
-        include_only_package_files: false,
+        include_only_package_files,
         resolve_symlinks: false,
+        preserve_symlinks: false,
         allow_path_escape: false,
     }
     .run()
@@ -275,9 +418,9 @@ pub fn extend_files_map(files_map: &HashMap<String, PathBuf>) -> Result<InodeMap
 fn stat_skipping_missing(path: &Path) -> Result<Option<fs::Metadata>, PatchError> {
     match fs::metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        result => {
-            result.map(Some).map_err(|error| PatchError::Stat { path: path.to_path_buf(), error })
-        }
+        result => result
+            .map(Some)
+            .map_err(|error| PatchError::Stat { path: path.to_path_buf(), error }),
     }
 }
 
@@ -298,26 +441,29 @@ fn add_inode_and_ancestors(result: &mut InodeMap, relative_path: &str, value: Va
 /// it comes from a handle instead, the same call libuv makes to fill
 /// Node's `Stats.ino`.
 fn file_id(path: &Path, metadata: &fs::Metadata) -> Result<FileId, PatchError> {
+    let len = metadata.len();
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         let _ = path;
-        Ok(FileId { device: metadata.dev(), inode: metadata.ino() })
+        Ok(FileId { device: metadata.dev(), inode: metadata.ino(), len, modified })
     }
     #[cfg(windows)]
     {
-        let _ = metadata;
-        windows_file_id(path).map_err(|error| PatchError::Stat { path: path.to_path_buf(), error })
+        let (device, inode) = windows_file_index(path)
+            .map_err(|error| PatchError::Stat { path: path.to_path_buf(), error })?;
+        Ok(FileId { device, inode, len, modified })
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (path, metadata);
-        Ok(FileId { device: 0, inode: 0 })
+        let _ = path;
+        Ok(FileId { device: 0, inode: 0, len, modified })
     }
 }
 
 #[cfg(windows)]
-fn windows_file_id(path: &Path) -> io::Result<FileId> {
+fn windows_file_index(path: &Path) -> io::Result<(u64, u64)> {
     use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -332,10 +478,10 @@ fn windows_file_id(path: &Path) -> io::Result<FileId> {
     }
     // SAFETY: a successful `GetFileInformationByHandle` initializes `info`.
     let info = unsafe { info.assume_init() };
-    Ok(FileId {
-        device: u64::from(info.dwVolumeSerialNumber),
-        inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    })
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
 }
 
 #[cfg(test)]

@@ -21,7 +21,10 @@ use std::{future::Future, time::Duration};
 
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 
-use crate::{ThrottledClient, ThrottledClientGuard, redact_url_credentials};
+use crate::{
+    AuthHeaders, SecureAuthResponse, ThrottledClient, ThrottledClientGuard, is_permanent_error,
+    redact_url_credentials, redact_url_for_display,
+};
 
 /// Settings for the per-request retry loop. Maps to the
 /// `fetch-retries` / `fetch-retry-factor` / `fetch-retry-mintimeout` /
@@ -140,51 +143,92 @@ pub async fn send_with_retry_at_priority<'client>(
     let mut attempt = 0;
     loop {
         let client = http_client.acquire_for_url_with_priority(url, priority).await;
-        match build_request(&client).send().await {
-            Ok(response)
-                if should_retry_status(response.status()) && attempt < retry_opts.retries =>
-            {
-                let status = response.status();
-                drop(response);
+        let response = build_request(&client).send().await;
+        match classify_response(http_client, url, attempt, retry_opts, response) {
+            AttemptOutcome::Success(response) => return Ok((client, response)),
+            AttemptOutcome::Fatal(error) => return Err(error),
+            AttemptOutcome::Retry(delay) => {
                 drop(client);
-                let delay = retry_opts.delay_for(attempt);
-                tracing::warn!(
-                    target: "pnpm_network::retry",
-                    url = %redact_url_credentials(url),
-                    ?status,
-                    attempt = attempt + 1,
-                    max_attempts = retry_opts.retries + 1,
-                    ?delay,
-                    "Request failed; retrying after backoff",
-                );
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Ok(response) => return Ok((client, response)),
-            Err(error) if attempt < retry_opts.retries => {
-                drop(client);
-                let delay = retry_opts.delay_for(attempt);
-                // reqwest embeds the full request URL in its error, which can
-                // carry a secret in the path (e.g. `logout`'s revoke token).
-                // The `url=` field already logs the URL the caller handed us
-                // (token-free for such callers), so drop the URL from the
-                // error to keep it out of the log.
-                let error = error.without_url();
-                tracing::warn!(
-                    target: "pnpm_network::retry",
-                    url = %redact_url_credentials(url),
-                    error = %redact_url_credentials(&format!("{error:?}")),
-                    attempt = attempt + 1,
-                    max_attempts = retry_opts.retries + 1,
-                    ?delay,
-                    "Request errored; retrying after backoff",
-                );
-                tokio::time::sleep(delay).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
         }
     }
+}
+
+enum AttemptOutcome {
+    Success(Response),
+    Fatal(reqwest::Error),
+    Retry(std::time::Duration),
+}
+
+fn classify_response(
+    http_client: &ThrottledClient,
+    url: &str,
+    attempt: u32,
+    retry_opts: RetryOpts,
+    response: Result<Response, reqwest::Error>,
+) -> AttemptOutcome {
+    match response {
+        Ok(res) if should_retry_status(res.status()) && attempt < retry_opts.retries => {
+            let delay = retry_opts.delay_for(attempt);
+            warn_retry_status(url, res.status(), attempt, retry_opts, delay);
+            AttemptOutcome::Retry(delay)
+        }
+        Ok(res) => AttemptOutcome::Success(res),
+        Err(err) => {
+            http_client.downscale_on_timeout(url, &err);
+            if attempt >= retry_opts.retries || is_permanent_error(&err) {
+                AttemptOutcome::Fatal(err)
+            } else {
+                let delay = retry_opts.delay_for(attempt);
+                warn_retry_error(url, err, attempt, retry_opts, delay);
+                AttemptOutcome::Retry(delay)
+            }
+        }
+    }
+}
+
+fn warn_retry_status(
+    url: &str,
+    status: reqwest::StatusCode,
+    attempt: u32,
+    retry_opts: RetryOpts,
+    delay: std::time::Duration,
+) {
+    tracing::warn!(
+        target: "pnpm_network::retry",
+        url = %redact_url_for_display(url),
+        ?status,
+        attempt = attempt + 1,
+        max_attempts = u64::from(retry_opts.retries) + 1,
+        ?delay,
+        "Request failed; retrying after backoff",
+    );
+}
+
+fn warn_retry_error(
+    url: &str,
+    error: reqwest::Error,
+    attempt: u32,
+    retry_opts: RetryOpts,
+    delay: std::time::Duration,
+) {
+    // reqwest embeds the full request URL in its error, which can
+    // carry a secret in the path (e.g. `logout`'s revoke token).
+    // The `url=` field already logs the URL the caller handed us
+    // (token-free for such callers), so drop the URL from the
+    // error to keep it out of the log.
+    let error = error.without_url();
+    tracing::warn!(
+        target: "pnpm_network::retry",
+        url = %redact_url_for_display(url),
+        error = %redact_url_credentials(&format!("{error:?}")),
+        attempt = attempt + 1,
+        max_attempts = u64::from(retry_opts.retries) + 1,
+        ?delay,
+        "Request errored; retrying after backoff",
+    );
 }
 
 /// Run `attempt` — a full "issue the request, then read and parse its
@@ -223,10 +267,10 @@ where
                 let delay = retry_opts.delay_for(attempt);
                 tracing::warn!(
                     target: "pnpm_network::retry",
-                    url = %redact_url_credentials(url),
+                    url = %redact_url_for_display(url),
                     error = %redact_url_credentials(&format!("{error:?}")),
                     attempt = attempt + 1,
-                    max_attempts = retry_opts.retries + 1,
+                    max_attempts = u64::from(retry_opts.retries) + 1,
                     ?delay,
                     "Reading response body failed; retrying after backoff",
                 );
@@ -234,6 +278,73 @@ where
                 attempt += 1;
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+pub(crate) async fn get_secure_bytes(
+    client: &ThrottledClient,
+    url: &str,
+    auth: &AuthHeaders,
+    accept: Option<&str>,
+    retry_opts: RetryOpts,
+    body_limit: usize,
+) -> Result<SecureAuthResponse, reqwest::Error> {
+    let authorize = |url: &str| auth.for_secure_url(url);
+    get_bytes(client, url, authorize, accept, retry_opts, body_limit).await
+}
+
+/// Retry a GET whose `authorize` header is chosen for each redirect hop's URL.
+pub(crate) async fn get_bytes(
+    client: &ThrottledClient,
+    url: &str,
+    authorize: impl Fn(&str) -> Option<String> + Copy + Sync,
+    accept: Option<&str>,
+    retry_opts: RetryOpts,
+    body_limit: usize,
+) -> Result<SecureAuthResponse, reqwest::Error> {
+    let result = retry_async(
+        url,
+        retry_opts,
+        |error| match error {
+            SecureAttemptError::Response(_) => true,
+            SecureAttemptError::Request(error) => {
+                !error.is_builder() && !error.is_redirect() && !is_permanent_error(error)
+            }
+        },
+        || async {
+            let response = client
+                .get_limited_bytes_with_scoped_auth(url, authorize, accept, body_limit)
+                .await
+                .map_err(|error| SecureAttemptError::Request(error.without_url()))?;
+            if !response.body_truncated && should_retry_status(response.status) {
+                Err(SecureAttemptError::Response(response))
+            } else {
+                Ok(response)
+            }
+        },
+    )
+    .await;
+    match result {
+        Ok(response) | Err(SecureAttemptError::Response(response)) => Ok(response),
+        Err(SecureAttemptError::Request(error)) => Err(error),
+    }
+}
+
+enum SecureAttemptError {
+    Response(SecureAuthResponse),
+    Request(reqwest::Error),
+}
+
+impl std::fmt::Debug for SecureAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Response(response) => formatter
+                .debug_tuple("HTTP")
+                .field(&response.status)
+                .finish(),
+            // Response bodies and transport error URLs can contain registry credentials.
+            Self::Request(_) => formatter.write_str("request transport or body error"),
         }
     }
 }

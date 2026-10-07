@@ -12,7 +12,7 @@ use pnpm_deps_restorer::{PathNode, graph_sequencer};
 use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
 use pnpm_workspace::{GraphPkg, Project};
 use pnpm_workspace_projects_graph::{
-    CreateProjectsGraphOptions, ProjectGraph, create_projects_graph,
+    CreateProjectsGraphOptions, ProjectGraph, WorkspaceCatalogs, create_projects_graph,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -25,7 +25,7 @@ use std::{
 /// Edges are read from `graph` alone: an edge leaving it — a selected
 /// project depending on an unselected one — is dropped rather than
 /// followed, so two selected projects joined only through a third are
-/// not a cycle. pnpm sequences its selected graph the same way. The
+/// not a cycle. pnpm sequences its selected graph the same way.
 /// Self-references are reported by the sequencer but do not make a workspace
 /// unorderable, so only cycles with more than one project are returned.
 #[must_use]
@@ -33,13 +33,15 @@ pub fn workspace_cycles<Pkg>(graph: &ProjectGraph<Pkg>) -> Option<Vec<Vec<PathBu
     // The sequencer runs over borrowed paths: a workspace-scale graph
     // holds tens of thousands of edges, and cloning every `PathBuf`
     // into a throwaway map cost more than the sort itself.
-    let dirs: Vec<PathNode<'_>> = graph.keys().map(|dir| PathNode(dir)).collect();
+    let dirs: Vec<PathNode<'_>> = graph
+        .keys()
+        .map(|dir| PathNode(dir))
+        .collect();
     let included: HashSet<PathNode<'_>> = dirs.iter().copied().collect();
     let edges: HashMap<PathNode<'_>, Vec<PathNode<'_>>> = graph
         .iter()
         .map(|(dir, node)| {
-            let dependencies = node
-                .dependencies
+            let dependencies = node.dependencies
                 .iter()
                 .map(|dependency| PathNode(dependency))
                 .filter(|dependency| included.contains(dependency))
@@ -47,11 +49,15 @@ pub fn workspace_cycles<Pkg>(graph: &ProjectGraph<Pkg>) -> Option<Vec<Vec<PathBu
             (PathNode(dir), dependencies)
         })
         .collect();
-    let cycles = graph_sequencer(&edges, &dirs)
-        .cycles
+    let cycles = graph_sequencer(&edges, &dirs).cycles
         .into_iter()
         .filter(|cycle| cycle.len() > 1)
-        .map(|cycle| cycle.into_iter().map(|node| node.0.to_path_buf()).collect())
+        .map(|cycle| {
+            cycle
+                .into_iter()
+                .map(|node| node.0.to_path_buf())
+                .collect()
+        })
         .collect::<Vec<Vec<PathBuf>>>();
     (!cycles.is_empty()).then_some(cycles)
 }
@@ -60,24 +66,27 @@ pub fn workspace_cycles<Pkg>(graph: &ProjectGraph<Pkg>) -> Option<Vec<Vec<PathBu
 /// narrows `projects` to a `--filter`ed or `-r` selection, `None` covers
 /// the whole workspace.
 ///
-/// A selected project keeps the dependency list it has in the full
-/// graph; [`workspace_cycles`] then drops the edges that leave the
-/// selection, which is how pnpm sequences its selected graph.
+/// A selected project keeps the dependency list it has in the full graph.
 #[must_use]
 pub fn install_scope_cycles(
     config: &Config,
     projects: &[Project],
     selected_dirs: Option<&HashSet<PathBuf>>,
+    catalogs: Option<WorkspaceCatalogs<'_>>,
 ) -> Option<Vec<Vec<PathBuf>>> {
     if projects.len() < 2 {
         return None;
     }
     let mut graph = create_projects_graph(
-        projects.iter().map(|project| GraphPkg { project }).collect(),
+        projects
+            .iter()
+            .map(|project| GraphPkg { project })
+            .collect(),
         &CreateProjectsGraphOptions {
             link_workspace_packages: Some(
                 config.link_workspace_packages != LinkWorkspacePackages::Off,
             ),
+            catalogs,
             ..CreateProjectsGraphOptions::default()
         },
     )
@@ -123,14 +132,19 @@ fn render_cycles(cycles: &[Vec<PathBuf>]) -> String {
     }
     let rendered = cycles
         .iter()
-        .map(|cycle| cycle.iter().map(|dir| dir.to_string_lossy()).collect::<Vec<_>>().join(", "))
+        .map(|cycle| {
+            cycle
+                .iter()
+                .map(|dir| dir.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
         .collect::<Vec<_>>()
         .join("; ");
     format!(": {rendered}")
 }
 
 #[derive(Debug, derive_more::Display, derive_more::Error, miette::Diagnostic)]
-#[display("{message}")]
 #[diagnostic(code(ERR_PNPM_DISALLOW_WORKSPACE_CYCLES))]
 pub struct CyclicWorkspaceDependenciesError {
     #[error(not(source))]

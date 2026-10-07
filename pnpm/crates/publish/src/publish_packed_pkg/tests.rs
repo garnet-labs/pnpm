@@ -1,10 +1,10 @@
-use std::time::Duration;
-
 use super::{
     DistHashes, PackedPkg, PublishHttpError, PublishNetwork, PublishPackedPkgError,
-    PublishPackedPkgOptions, build_publish_document, clean_version, is_otp_challenge,
-    parse_otp_challenge, publish_packed_pkg, publish_with_otp_handling, put_publish,
-    registry_for_display, web_auth_fetch_options,
+    PublishPackedPkgOptions, build_publish_document,
+    document::clean_version,
+    publish_packed_pkg, publish_with_otp_handling, registry_for_display,
+    request::{is_otp_challenge, parse_otp_challenge, put_publish},
+    web_auth_fetch_options,
 };
 use crate::{
     capabilities::{Clock, EnvVar, OidcFetch, OidcFetchError, OidcRequest, OidcResponse},
@@ -23,6 +23,7 @@ use pnpm_network_web_auth_testing::{
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 /// A `WebAuthFetchOptions` the success paths never reach: when the PUT
 /// resolves without a 401 challenge the web-auth poller is never invoked, so
@@ -153,8 +154,13 @@ fn parse_otp_challenge_reads_each_url_independently() {
 #[tokio::test]
 async fn put_publish_returns_an_ok_response_on_success() {
     let mut server = mockito::Server::new_async().await;
-    let mock =
-        server.mock("PUT", "/pkg").with_status(200).with_body("").expect(1).create_async().await;
+    let mock = server
+        .mock("PUT", "/pkg")
+        .with_status(200)
+        .with_body("")
+        .expect(1)
+        .create_async()
+        .await;
     let client = ThrottledClient::default();
     let url = format!("{}/pkg", server.url());
 
@@ -172,7 +178,12 @@ async fn put_publish_returns_an_ok_response_on_success() {
 #[tokio::test]
 async fn put_publish_reports_a_non_success_status_without_erroring() {
     let mut server = mockito::Server::new_async().await;
-    server.mock("PUT", "/pkg").with_status(500).with_body("boom").create_async().await;
+    server
+        .mock("PUT", "/pkg")
+        .with_status(500)
+        .with_body("boom")
+        .create_async()
+        .await;
     let client = ThrottledClient::default();
     let url = format!("{}/pkg", server.url());
 
@@ -208,7 +219,12 @@ async fn put_publish_maps_a_www_authenticate_otp_to_a_challenge() {
 async fn put_publish_maps_a_one_time_pass_body_to_a_web_auth_challenge() {
     let mut server = mockito::Server::new_async().await;
     let challenge_body = r#"{"error":"one-time pass required","authUrl":"https://r/auth/abc","doneUrl":"https://r/auth/abc/done"}"#;
-    server.mock("PUT", "/pkg").with_status(401).with_body(challenge_body).create_async().await;
+    server
+        .mock("PUT", "/pkg")
+        .with_status(401)
+        .with_body(challenge_body)
+        .create_async()
+        .await;
     let client = ThrottledClient::default();
     let url = format!("{}/pkg", server.url());
 
@@ -295,17 +311,17 @@ async fn put_publish_omits_auth_and_otp_headers_when_absent() {
     let client = ThrottledClient::default();
     let url = format!("{}/pkg", server.url());
 
-    put_publish(&client, &url, None, "publish", body(), None, false)
-        .await
+    put_publish(&client, &url, None, "publish", body(), None, false).await
         .expect("the PUT completes");
     mock.assert_async().await;
 }
 
 #[tokio::test]
 async fn put_publish_classifies_a_connection_failure_as_a_transport_error() {
-    // Port 1 has no listener, so the request never gets a response.
+    // The connect to `0.0.0.0:1` fails at once on every OS, so the request never
+    // gets a response.
     let client = ThrottledClient::default();
-    let err = put_publish(&client, "http://127.0.0.1:1/pkg", None, "publish", body(), None, false)
+    let err = put_publish(&client, "http://0.0.0.0:1/pkg", None, "publish", body(), None, false)
         .await
         .expect_err("a refused connection is a transport failure");
     assert!(matches!(err, PublishHttpError::Transport { .. }));
@@ -314,8 +330,13 @@ async fn put_publish_classifies_a_connection_failure_as_a_transport_error() {
 #[tokio::test]
 async fn publish_with_otp_handling_returns_the_response_when_no_otp_is_required() {
     let mut server = mockito::Server::new_async().await;
-    let mock =
-        server.mock("PUT", "/pkg").with_status(200).with_body("").expect(1).create_async().await;
+    let mock = server
+        .mock("PUT", "/pkg")
+        .with_status(200)
+        .with_body("")
+        .expect(1)
+        .create_async()
+        .await;
     let client = ThrottledClient::default();
     let url = format!("{}/pkg", server.url());
 
@@ -339,9 +360,7 @@ async fn publish_with_otp_handling_returns_the_response_when_no_otp_is_required(
 /// not just a post-challenge retry. `publish_with_otp_handling` invokes its
 /// operation with no challenge OTP first, so the configured one has to fall
 /// through; regressing that would make `--otp` a no-op until the registry
-/// challenges. The single `expect(1)` mock matches `npm-otp` on the first
-/// request and returns 200, so a dropped OTP or an extra challenge round-trip
-/// fails the assertion.
+/// challenges.
 #[tokio::test]
 async fn publish_with_otp_handling_sends_a_configured_otp_on_the_first_attempt() {
     let mut server = mockito::Server::new_async().await;
@@ -373,11 +392,8 @@ async fn publish_with_otp_handling_sends_a_configured_otp_on_the_first_attempt()
 }
 
 /// The classic OTP flow, driven end-to-end through the publish HTTP layer:
-/// prompt for an OTP on the challenge and retry. The first PUT
-/// (no `npm-otp`) gets a 401 OTP challenge, the fake host prompts and returns
-/// the code, and the retry PUT — distinguished by the `npm-otp` header it now
-/// carries — succeeds. Exercises the `put_publish` ↔ `with_otp_handling` seam
-/// a mocked operation cannot.
+/// prompt for an OTP on the challenge and retry. Exercises the `put_publish`
+/// ↔ `with_otp_handling` seam a mocked operation cannot.
 #[tokio::test]
 async fn classic_otp_flow_prompts_then_retries_with_the_code() {
     web_auth_fake!(FakeHost, RecordingReporter, set_input);
@@ -544,7 +560,9 @@ async fn web_auth_flow_polls_then_retries_with_the_web_token() {
     .expect("the web-auth retry succeeds");
     assert!(response.ok);
     assert!(
-        infos().iter().any(|message| message.contains("https://registry.npmjs.org/auth/abc")),
+        infos()
+            .iter()
+            .any(|message| message.contains("https://registry.npmjs.org/auth/abc")),
         "the auth URL should be surfaced, got {:?}",
         infos(),
     );
@@ -674,15 +692,18 @@ async fn publish_packed_pkg_dry_run_returns_the_summary_without_publishing() {
         unpacked_size: 42,
     };
     let opts = PublishPackedPkgOptions {
-        default_registry: "https://registry.example/".to_owned(),
-        scoped_registries: std::collections::BTreeMap::new(),
-        access: None,
-        tag: "latest".to_owned(),
-        otp: None,
-        provenance: None,
         dry_run: true,
         stage: false,
-        http: OidcHttpOptions::default(),
+        wait_timeout: Duration::ZERO,
+        registry: crate::PublishRegistryOptions {
+            default: "https://registry.example/".to_owned(),
+            scoped: std::collections::BTreeMap::new(),
+            access: None,
+            tag: "latest".to_owned(),
+            otp: None,
+            provenance: None,
+            http: OidcHttpOptions::default(),
+        },
     };
     let client = ThrottledClient::default();
     let auth_headers = AuthHeaders::default();
@@ -771,15 +792,18 @@ async fn publish_packed_pkg_attaches_signed_provenance_to_the_document() {
         unpacked_size: 0,
     };
     let opts = PublishPackedPkgOptions {
-        default_registry: format!("{}/", server.url()),
-        scoped_registries: std::collections::BTreeMap::new(),
-        access: None,
-        tag: "latest".to_owned(),
-        otp: None,
-        provenance: Some(true),
         dry_run: false,
         stage: false,
-        http: OidcHttpOptions::default(),
+        wait_timeout: Duration::ZERO,
+        registry: crate::PublishRegistryOptions {
+            default: format!("{}/", server.url()),
+            scoped: std::collections::BTreeMap::new(),
+            access: None,
+            tag: "latest".to_owned(),
+            otp: None,
+            provenance: Some(true),
+            http: OidcHttpOptions::default(),
+        },
     };
     let mock = server
         .mock("PUT", "/pkg")

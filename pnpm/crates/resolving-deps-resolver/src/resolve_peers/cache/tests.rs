@@ -35,7 +35,7 @@ fn materialized_nodes_referenced_by_peer_outputs_are_retained() {
         &HashSet::from_iter([unreferenced.clone()]),
         None,
         &unreferenced,
-    ));
+    ),);
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn previously_resolved_children_prefers_closest_same_package_ancestor() {
     let mut walker = walker_for_tests(&mut tree);
 
     let parent_node_ids = SharedChain::default().pushed(far_parent).pushed(close_parent);
-    let parent_pkg_ids = SharedChain::default().pushed("loop@1.0.0".to_string());
+    let parent_pkg_ids = SharedChain::default().pushed("loop@1.0.0".into());
     let children =
         walker.previously_resolved_children(&parent_node_ids, &parent_pkg_ids, "loop@1.0.0");
 

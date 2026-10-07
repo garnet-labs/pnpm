@@ -5,8 +5,8 @@ use pnpm_lockfile::PackageKey;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    env, fs,
-    io::{self, Write},
+    env, fs, io,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -86,6 +86,14 @@ pub(crate) fn read_edit_dir_state(
         .map_err(|source| StateFileError::Parse { path: path.clone(), source })?;
     let key = edit_dir_key(edit_dir)?;
     Ok(state.get(&key).cloned())
+}
+
+pub(crate) fn read_all_edit_dir_states(
+    modules_dir: &Path,
+) -> Result<BTreeMap<String, EditDirState>, StateFileError> {
+    let path = checked_state_file_path_for_read(modules_dir)?;
+    let Some(text) = read_state_file_text(&path)? else { return Ok(BTreeMap::new()) };
+    serde_json::from_str(&text).map_err(|source| StateFileError::Parse { path, source })
 }
 
 pub(crate) fn write_edit_dir_state(
@@ -184,7 +192,7 @@ fn reject_state_symlink_if_exists(path: &Path) -> Result<(), StateFileError> {
 
 fn write_state_file_atomically(target: &Path, content: &[u8]) -> io::Result<()> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut tmp = pnpm_fs::private_named_tempfile_in(parent)?;
     tmp.write_all(content)?;
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|error| error.error)?;

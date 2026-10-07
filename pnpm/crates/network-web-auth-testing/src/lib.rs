@@ -6,10 +6,7 @@
 //! expands, inside a `#[test]` body, to fn-local `thread_local!` statics and a
 //! `reset`, plus — one per named argument — a `FakeHost` (implementing every
 //! web-auth capability), the recording / strict reporters, and the `set_*` /
-//! `infos` / `warns` config functions. No scenario state lives at module
-//! scope, so concurrently running tests can never share or race on it — this
-//! is the "state in a `static` inside the `#[test]` body" rule of the
-//! "Dependency injection for tests" section of `pnpm/CODE_STYLE_GUIDE.md`.
+//! `infos` / `warns` config functions.
 //!
 //! The stateless pieces — [`InputResponse`], [`SleepBehavior`],
 //! [`FetchScript`], [`FakeOtpError`], and the response builders
@@ -28,8 +25,9 @@ use serde_json::json;
 #[derive(Debug, derive_more::Display, derive_more::Error, Diagnostic)]
 pub enum FakeOtpError {
     #[display("otp challenge")]
-    Otp { body: Option<OtpErrorBody> },
-    #[display("{_0}")]
+    Otp {
+        body: Option<OtpErrorBody>,
+    },
     Other(#[error(not(source))] String),
 }
 
@@ -75,7 +73,7 @@ pub type FetchScript = Box<dyn FnMut() -> Result<WebAuthFetchResponse, WebAuthFe
 /// helper is emitted unused and none needs an `#[allow(dead_code)]`. Name
 /// exactly the ones the scenario uses:
 ///
-/// - `FakeHost` — the unit host implementing all eight web-auth capabilities
+/// - `FakeHost` — the unit host implementing all web-auth capabilities
 ///   over the statics, i.e. the `Sys` provider the flow runs against.
 /// - `RecordingReporter` — captures every `pnpm:global` message for `infos` /
 ///   `warns` to read; `UnexpectedReporter` — panics on any emission, for a

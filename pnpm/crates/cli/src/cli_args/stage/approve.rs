@@ -5,33 +5,37 @@
 //! proof of presence covers all of them. Every selected tarball is downloaded
 //! first, and its published manifest determines dependency order.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
-
-use derive_more::{Display, Error};
-use dialoguer::MultiSelect;
-use miette::{Diagnostic, IntoDiagnostic};
-use node_semver::Version;
-use pnpm_config::Config;
-use pnpm_network_web_auth::{Host as WebAuthHost, OtpSession, StdinIsTty, StdoutIsTty};
-use pnpm_package_manifest::PackageManifest;
-use pnpm_reporter::Reporter;
-use pnpm_resolving_parse_wanted_dependency::is_valid_old_npm_package_name;
-use pnpm_resolving_resolver_base::{
-    ANY_VERSION_RANGE, is_any_version_range, is_valid_semver_range,
-};
-use pnpm_workspace::{GraphPkg, Project};
-use pnpm_workspace_projects_graph::{CreateProjectsGraphOptions, create_projects_graph};
-use serde_json::Value;
-
 use super::{
     StageArgs, StageContext, StageError, StageRegistryError, fetch_stage_items,
     fetch_stage_tarball, global_info, global_warn, is_uuid, stage_endpoint_url, stage_json_request,
     stage_request_in_session, summarize_tarball::read_tarball_manifest,
 };
 use crate::cli_args::{recursive::sequence_graph, sanitize::sanitize_inline};
+#[cfg(target_family = "wasm")]
+use crate::dialoguer_wasm::MultiSelect;
+use derive_more::{Display, Error};
+#[cfg(not(target_family = "wasm"))]
+use dialoguer::MultiSelect;
+use miette::{Diagnostic, IntoDiagnostic};
+use node_semver::Version;
+use ordering::{read_stage_approval_order, sort_items_for_approval, unavailable_dependencies};
+use pnpm_config::Config;
+use pnpm_network_web_auth::{Host as WebAuthHost, OtpSession, StdinIsTty, StdoutIsTty};
+use pnpm_package_manifest::PackageManifest;
+use pnpm_package_name::is_valid_old_npm_package_name;
+use pnpm_reporter::Reporter;
+use pnpm_resolving_resolver_base::{
+    ANY_VERSION_RANGE, is_any_version_range, is_valid_semver_range,
+};
+use pnpm_workspace::{GraphPkg, Project};
+use pnpm_workspace_projects_graph::{
+    CreateProjectsGraphOptions, ProjectGraph, create_projects_graph,
+};
+use serde_json::Value;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 /// `pnpm stage approve` with no `<stage-id>` outside an interactive
 /// terminal, where the staged versions cannot be chosen.
@@ -88,7 +92,11 @@ impl StageApprovalItem {
         // hidden character must never be what makes a value valid. A name
         // that fails is not displayed. A valid name is URL-safe, so it is
         // also safe to display.
-        let id = item.get("id").and_then(Value::as_str).filter(|id| is_uuid(id))?.to_owned();
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_uuid(id))?
+            .to_owned();
         let package_name = item
             .get("packageName")
             .and_then(Value::as_str)
@@ -126,8 +134,12 @@ impl StageApprovalItem {
     fn choice(&self) -> String {
         let details: Vec<String> = [
             self.tag.clone(),
-            self.created_at.as_ref().map(|created_at| format!("staged {created_at}")),
-            self.actor.as_ref().map(|actor| format!("by {actor}")),
+            self.created_at
+                .as_ref()
+                .map(|created_at| format!("staged {created_at}")),
+            self.actor
+                .as_ref()
+                .map(|actor| format!("by {actor}")),
         ]
         .into_iter()
         .flatten()
@@ -138,13 +150,6 @@ impl StageApprovalItem {
             format!("{} ({})", self.label(), details.join(", "))
         }
     }
-}
-
-/// The dependency order derived from the exact tarballs being approved.
-struct StageApprovalOrder {
-    dependency_stage_ids: HashMap<String, Vec<String>>,
-    order_indices: HashMap<String, usize>,
-    package_names: HashMap<String, String>,
 }
 
 pub(super) async fn stage_approve<Reporter: self::Reporter>(
@@ -209,8 +214,7 @@ fn parse_stage_ids(params: &[String]) -> Result<Vec<String>, StageError> {
 }
 
 async fn approval_items(context: &StageContext) -> miette::Result<Vec<StageApprovalItem>> {
-    Ok(fetch_stage_items(context, None)
-        .await?
+    Ok(fetch_stage_items(context, None).await?
         .iter()
         .filter_map(StageApprovalItem::from_value)
         .collect())
@@ -267,7 +271,10 @@ fn with_id(item: &Value, stage_id: &str) -> Value {
 fn prompt_for_staged_packages(
     staged: &[StageApprovalItem],
 ) -> miette::Result<Vec<StageApprovalItem>> {
-    let choices: Vec<String> = staged.iter().map(StageApprovalItem::choice).collect();
+    let choices: Vec<String> = staged
+        .iter()
+        .map(StageApprovalItem::choice)
+        .collect();
     let selected = MultiSelect::new()
         .with_prompt(
             "Choose which staged packages to approve (<space> to select, <enter> to confirm)",
@@ -275,7 +282,11 @@ fn prompt_for_staged_packages(
         .items(&choices)
         .interact_opt()
         .into_diagnostic()?;
-    Ok(selected.unwrap_or_default().into_iter().map(|index| staged[index].clone()).collect())
+    Ok(selected
+        .unwrap_or_default()
+        .into_iter()
+        .map(|index| staged[index].clone())
+        .collect())
 }
 
 async fn approve_staged_packages<Reporter: self::Reporter>(
@@ -344,152 +355,15 @@ async fn approve_staged_package<Reporter: self::Reporter>(
 }
 
 fn is_stage_registry_error(error: &miette::Report) -> bool {
-    error.code().is_some_and(|code| code.to_string() == "ERR_PNPM_STAGE_REGISTRY_ERROR")
+    error
+        .code()
+        .is_some_and(|code| code.to_string() == "ERR_PNPM_STAGE_REGISTRY_ERROR")
 }
 
 fn is_missing_stage_error(error: &miette::Report) -> bool {
-    error.downcast_ref::<StageRegistryError>().is_some_and(|error| error.status == 404)
-}
-
-/// Download every selected package before approval and derive the graph from
-/// the package.json files that will reach the registry.
-async fn read_stage_approval_order(
-    context: &StageContext,
-    items: &[StageApprovalItem],
-) -> miette::Result<StageApprovalOrder> {
-    let mut projects = Vec::with_capacity(items.len());
-    let mut stage_id_by_package_version: HashMap<(String, String), String> = HashMap::new();
-    for item in items {
-        let root_dir = PathBuf::from(&item.id);
-        let tarball = fetch_stage_tarball(context, &item.id).await?;
-        let manifest = read_tarball_manifest(&tarball)?;
-        let package_name = manifest
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or(StageError::TarballManifestNotFound)?
-            .to_owned();
-        let version = manifest
-            .get("version")
-            .and_then(Value::as_str)
-            .ok_or(StageError::TarballManifestNotFound)?
-            .to_owned();
-        if let Some(first_stage_id) = stage_id_by_package_version
-            .insert((package_name.clone(), version.clone()), item.id.clone())
-        {
-            return Err(StageError::DuplicateStagePackage {
-                first_stage_id,
-                second_stage_id: item.id.clone(),
-                package_name,
-                version,
-            }
-            .into());
-        }
-        let manifest = manifest_for_graph(manifest);
-        projects.push(Project {
-            manifest: PackageManifest::from_value(root_dir.join("package.json"), manifest),
-            root_dir,
-            dependency_manifest: None,
-        });
-    }
-    let graph = create_projects_graph(
-        projects.iter().map(|project| GraphPkg { project }).collect(),
-        &CreateProjectsGraphOptions {
-            link_workspace_packages: Some(true),
-            ..CreateProjectsGraphOptions::default()
-        },
-    )
-    .graph;
-    let mut dependency_stage_ids_by_stage_id = HashMap::new();
-    let mut order_index_by_stage_id = HashMap::new();
-    let mut package_name_by_stage_id = HashMap::new();
-    for (order_index, root_dir) in sequence_graph(&graph, &graph).order.into_iter().enumerate() {
-        let stage_id = root_dir.to_string_lossy().into_owned();
-        order_index_by_stage_id.insert(stage_id.clone(), order_index);
-        dependency_stage_ids_by_stage_id.insert(
-            stage_id.clone(),
-            graph[&root_dir]
-                .dependencies
-                .iter()
-                .map(|dependency| dependency.to_string_lossy().into_owned())
-                .collect(),
-        );
-        if let Some(package_name) =
-            graph[&root_dir].package.project.manifest.value().get("name").and_then(Value::as_str)
-        {
-            package_name_by_stage_id.insert(stage_id, package_name.to_owned());
-        }
-    }
-    Ok(StageApprovalOrder {
-        dependency_stage_ids: dependency_stage_ids_by_stage_id,
-        order_indices: order_index_by_stage_id,
-        package_names: package_name_by_stage_id,
-    })
-}
-
-/// Approve staged dependencies before the selected packages that need them.
-fn sort_items_for_approval(
-    mut items: Vec<StageApprovalItem>,
-    order: &StageApprovalOrder,
-) -> Vec<StageApprovalItem> {
-    items.sort_by_key(|item| order_index_of(item, order));
-    items
-}
-
-/// Selected staged dependencies of `item` whose approval failed or was skipped.
-fn unavailable_dependencies(
-    item: &StageApprovalItem,
-    unpublished_stage_ids: &HashSet<String>,
-    order: &StageApprovalOrder,
-) -> Vec<String> {
-    order
-        .dependency_stage_ids
-        .get(&item.id)
-        .into_iter()
-        .flatten()
-        .filter(|stage_id| unpublished_stage_ids.contains(*stage_id))
-        .map(|stage_id| {
-            order.package_names.get(stage_id).cloned().unwrap_or_else(|| stage_id.clone())
-        })
-        .collect()
-}
-
-fn order_index_of(item: &StageApprovalItem, order: &StageApprovalOrder) -> usize {
-    order.order_indices.get(&item.id).copied().unwrap_or(usize::MAX)
-}
-
-fn manifest_for_graph(mut manifest: Value) -> Value {
-    for field in ["peerDependencies", "devDependencies", "optionalDependencies", "dependencies"] {
-        let Some(dependencies) = manifest.get(field).and_then(Value::as_object) else {
-            continue;
-        };
-        let normalized = dependencies
-            .iter()
-            .filter_map(|(name, spec)| {
-                let spec = spec.as_str()?;
-                let (registry_name, registry_spec) =
-                    PackageManifest::resolve_registry_dependency(name, spec);
-                let (name, spec) =
-                    if let Some(registry_spec) = registry_spec_for_graph(registry_spec) {
-                        (registry_name, registry_spec)
-                    } else {
-                        (name.as_str(), spec)
-                    };
-                Some((name.to_owned(), Value::String(spec.to_owned())))
-            })
-            .collect();
-        manifest[field] = Value::Object(normalized);
-    }
-    manifest
-}
-
-fn registry_spec_for_graph(spec: &str) -> Option<&str> {
-    if Version::parse(spec).is_ok() {
-        return Some(spec);
-    }
-    if !is_valid_semver_range(spec) {
-        return None;
-    }
-    Some(if is_any_version_range(spec) { ANY_VERSION_RANGE } else { spec })
+    error
+        .downcast_ref::<StageRegistryError>()
+        .is_some_and(|error| error.status == 404)
 }
 
 fn render_package_count(count: usize) -> String {
@@ -498,3 +372,5 @@ fn render_package_count(count: usize) -> String {
 
 #[cfg(test)]
 mod tests;
+
+mod ordering;

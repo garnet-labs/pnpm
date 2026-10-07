@@ -1,16 +1,28 @@
-use async_trait::async_trait;
-use derive_more::Display;
-use serde_json::Value;
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+#[cfg(target_family = "wasm")]
+pub(crate) use pnpm_process as process;
+#[cfg(target_family = "wasm")]
+pub(crate) use pnpm_process::asynchronous as async_process;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::process;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use tokio::process as async_process;
 
 pub mod custom_fetcher_adapter;
 pub mod custom_resolver_adapter;
 pub mod finder;
 pub mod node_runtime;
 pub mod worker;
-
 pub use worker::LogFn;
+
+use async_trait::async_trait;
+use derive_more::Display;
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+
+/// The `loadPnpmfile(path)` helper both Node entry points prepend to the script
+/// they generate.
+pub(crate) const LOAD_PNPMFILE: &str = include_str!("load_pnpmfile.cjs");
 
 /// A native operation requested by a JavaScript custom fetcher.
 pub struct FetcherCallback {
@@ -45,7 +57,14 @@ pub enum HookError {
     Timeout(String, u64),
 
     #[display("Error during pnpmfile execution. pnpmfile: \"{pnpmfile}\". Error: \"{message}\".")]
-    Execution { pnpmfile: String, message: String },
+    Execution {
+        pnpmfile: String,
+        message: String,
+    },
+
+    BadReadPackageResult {
+        message: String,
+    },
 }
 
 /// Context provided to pnpmfile hooks.
@@ -154,6 +173,27 @@ pub trait PnpmfileHooks: Send + Sync {
     /// Whether this pnpmfile exports a callable `filterLog` hook.
     async fn has_filter_log(&self) -> bool {
         false
+    }
+
+    /// Whether this pnpmfile exports a callable `readPackage` hook.
+    async fn has_read_package(&self) -> Result<bool, HookError> {
+        Ok(false)
+    }
+
+    /// Whether this pnpmfile exports a callable `afterAllResolved` hook.
+    async fn has_after_all_resolved(&self) -> Result<bool, HookError> {
+        Ok(false)
+    }
+
+    /// Whether this pnpmfile exports a callable `preResolution` hook.
+    async fn has_pre_resolution(&self) -> Result<bool, HookError> {
+        Ok(false)
+    }
+
+    /// The `readPackage` capability of a checksum-excluded hook source.
+    /// `None` means this hook set has no such source.
+    async fn untracked_read_package_hook(&self) -> Result<Option<bool>, HookError> {
+        Ok(None)
     }
 
     /// Compute the `pnpmfileChecksum` recorded in `pnpm-lock.yaml`, or
@@ -308,6 +348,11 @@ pub trait CustomResolver: Send + Sync {
 /// exports any. Only a lockfile that records no checksum needs the
 /// pnpmfile evaluated, to tell "no pnpmfile" from "a pnpmfile that
 /// exports none".
+///
+/// Hooks that answer `None` from
+/// [`PnpmfileHooks::calculate_pnpmfile_checksum`] to stay out of the
+/// comparison, such as [`ChecksumFreeHooks`], therefore only stay out of
+/// it while `recorded` is `None`.
 pub async fn current_pnpmfile_checksum(
     hooks: Option<&Arc<dyn PnpmfileHooks>>,
     recorded: Option<&str>,
@@ -320,6 +365,16 @@ pub async fn current_pnpmfile_checksum(
         return Some(hash);
     }
     hooks.calculate_pnpmfile_checksum().await
+}
+
+/// The `readPackage` capability of a checksum-excluded hook source.
+pub async fn untracked_read_package_hook(
+    hooks: Option<&Arc<dyn PnpmfileHooks>>,
+) -> Result<Option<bool>, HookError> {
+    match hooks {
+        Some(hooks) => hooks.untracked_read_package_hook().await,
+        None => Ok(None),
+    }
 }
 
 /// A no-op implementation of [`PnpmfileHooks`].
@@ -342,3 +397,106 @@ impl PnpmfileHooks for NoopHooks {
         true
     }
 }
+
+/// Hooks that run but contribute no `pnpmfileChecksum`, pnpm's
+/// `calculatePnpmfileChecksum: undefined`.
+///
+/// For an install against a lockfile that was written elsewhere and
+/// deliberately records no checksum, such as the one `pnpm deploy`
+/// generates for the deploy directory: the hooks' effects are already
+/// part of the recorded snapshots, so a checksum could only fail the
+/// frozen-lockfile gate.
+///
+/// The suppression is bounded to that case:
+/// [`current_pnpmfile_checksum`] answers a lockfile that does record one
+/// from [`PnpmfileHooks::source_path`], which this wrapper keeps
+/// delegating.
+#[derive(derive_more::From)]
+pub struct ChecksumFreeHooks(Arc<dyn PnpmfileHooks>);
+
+#[async_trait]
+impl PnpmfileHooks for ChecksumFreeHooks {
+    async fn read_package(
+        &self,
+        pkg: Value,
+        ctx: HookContext,
+    ) -> Result<ReadPackageResult, HookError> {
+        self.0.read_package(pkg, ctx).await
+    }
+
+    async fn after_all_resolved(
+        &self,
+        lockfile: Value,
+        ctx: HookContext,
+    ) -> Result<Value, HookError> {
+        self.0.after_all_resolved(lockfile, ctx).await
+    }
+
+    async fn update_config(&self, config: Value, ctx: HookContext) -> Result<Value, HookError> {
+        self.0.update_config(config, ctx).await
+    }
+
+    async fn before_packing(
+        &self,
+        manifest: Value,
+        dir: &std::path::Path,
+        ctx: HookContext,
+    ) -> Result<Value, HookError> {
+        self.0.before_packing(manifest, dir, ctx).await
+    }
+
+    async fn pre_resolution(&self, ctx: PreResolutionHookContext, logger: PreResolutionHookLogger) {
+        self.0.pre_resolution(ctx, logger).await;
+    }
+
+    async fn filter_log(&self, log: Value, ctx: HookContext) -> bool {
+        self.0.filter_log(log, ctx).await
+    }
+
+    async fn has_filter_log(&self) -> bool {
+        self.0.has_filter_log().await
+    }
+
+    async fn has_read_package(&self) -> Result<bool, HookError> {
+        self.0.has_read_package().await
+    }
+
+    async fn has_after_all_resolved(&self) -> Result<bool, HookError> {
+        self.0.has_after_all_resolved().await
+    }
+
+    async fn has_pre_resolution(&self) -> Result<bool, HookError> {
+        self.0.has_pre_resolution().await
+    }
+
+    async fn untracked_read_package_hook(&self) -> Result<Option<bool>, HookError> {
+        self.0.untracked_read_package_hook().await
+    }
+
+    async fn calculate_pnpmfile_checksum(&self) -> Option<String> {
+        None
+    }
+
+    fn source_path(&self) -> Option<&std::path::Path> {
+        self.0.source_path()
+    }
+
+    async fn get_custom_resolvers(&self) -> Result<Vec<Arc<dyn CustomResolver>>, HookError> {
+        self.0.get_custom_resolvers().await
+    }
+
+    async fn get_custom_fetchers(&self) -> Result<Vec<Arc<dyn CustomFetcher>>, HookError> {
+        self.0.get_custom_fetchers().await
+    }
+
+    async fn get_finder_names(&self) -> Result<Vec<String>, HookError> {
+        self.0.get_finder_names().await
+    }
+
+    async fn run_finder(&self, finder_name: &str, ctx: Value) -> Result<Value, HookError> {
+        self.0.run_finder(finder_name, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests;
