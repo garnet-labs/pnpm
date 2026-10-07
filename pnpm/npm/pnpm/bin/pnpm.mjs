@@ -11,7 +11,7 @@
 // Corepack installs no dependencies and runs no lifecycle scripts, so the
 // `@pnpm/exe.<target>` package that carries the binary is absent and
 // `install.js` never ran. The binary is therefore downloaded on first use and
-// kept next to this wrapper — where the native binary also finds the `dist/`
+// kept next to this wrapper, where the native binary also finds the `dist/`
 // payload it ships node-gyp in. The placeholder's installs usually do carry
 // that package, and the binary is taken from there.
 //
