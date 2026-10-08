@@ -4,6 +4,8 @@ reviews:
   auto_review:
     base_branches:
       - "^garnet/bootstrap-routing-base$"
+      - "^garnet/routing-base$"
+      - "^garnet/proxy-base$"
   # Skip generated, vendored, and snapshot files so reviews focus on hand-written code.
   path_filters:
     - "!pnpm-lock.yaml"

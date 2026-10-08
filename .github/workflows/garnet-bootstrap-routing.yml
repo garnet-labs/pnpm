@@ -3,6 +3,13 @@ name: Garnet Bootstrap Routing
 # Records the Corepack entry point's first run (.garnet/bootstrap-routing) for
 # pull requests that touch it. Fork-only recorder; it never runs upstream.
 on:
+  push:
+    branches: [garnet/routing-base]
+    paths:
+      - pnpm/npm/pnpm/bin/pnpm.mjs
+      - pnpm/npm/pnpm/native-binary.mjs
+      - .garnet/bootstrap-routing/**
+      - .github/workflows/garnet-bootstrap-routing.yml
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -15,21 +22,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: garnet-bootstrap-routing-${{ github.event.pull_request.number }}
+  group: garnet-bootstrap-routing-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   bootstrap-routing:
     name: bootstrap-routing (ubuntu, node 22)
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Verify executed commit
@@ -37,7 +44,7 @@ jobs:
         run: |
           actual=$(git rev-parse HEAD)
           [ "$actual" = "$EXPECTED_SHA" ] || { echo "checked out $actual, expected $EXPECTED_SHA"; exit 1; }
-          echo "executed $actual (pull request head)"
+          echo "executed $actual (${{ github.event_name }} head)"
 
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
@@ -49,3 +56,6 @@ jobs:
 
       - name: First run of the Corepack entry point
         run: bash .garnet/bootstrap-routing/run.sh
+
+      - name: Let the job settle
+        run: sleep 20
