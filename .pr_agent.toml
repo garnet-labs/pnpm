@@ -49,6 +49,9 @@ auto_approve_for_no_suggestions = true
 auto_approve_for_low_review_effort = 2
 
 [review_agent]
+# Balanced effort on every PR: Auto routed the README-only stale-evidence PR to
+# "Skipped", so the compliance agent never ran its checklist.
+override_effort = "standard"
 # `both` keeps every finding in the review summary; the threshold only
 # controls which ones are *also* posted as standalone inline threads.
 # Keep that bar high so per-push re-reviews don't repost low-severity
