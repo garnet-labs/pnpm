@@ -1,0 +1,24 @@
+# Qodo compliance checklist. Read from the default branch on every review.
+pr_compliances:
+  - title: "Garnet runtime evidence bound to the head commit"
+    compliance_label: false
+    objective: >-
+      For changes to network, registry, proxy, resolver, configuration or
+      build-script gates, the review must read the Garnet Runtime Review
+      record for this PR's head commit and tie recorded program and
+      destination changes to the diff. The authoritative record is the sticky
+      comment posted by garnet-runtime-review[bot] (marker
+      <!-- garnet-runtime-review -->, carrying <!-- garnet:commit <sha> -->).
+      The PR description may hold a copy between <!-- garnet:evidence:begin -->
+      and <!-- garnet:evidence:end -->; the description is editable by the
+      author, so the copy counts only when its garnet:commit equals the head
+      SHA and its content matches that comment.
+    success_criteria: >-
+      A record bound to the current head SHA exists, and the review cites that
+      SHA and the evidence link and names every recorded program-to-destination
+      change the diff does not explain. Evidence never approves a PR.
+    failure_criteria: >-
+      The record is missing, still recording, bound to another commit, or the
+      description copy cannot be matched to the App comment. Report
+      "No Execution Profile for the current head" and quote both SHAs; absence
+      of evidence is not a clean run.
