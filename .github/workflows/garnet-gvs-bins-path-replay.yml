@@ -1,0 +1,133 @@
+name: Garnet GVS bins PATH replay
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/garnet-gvs-bins-path-replay.yml'
+      - 'fixtures/garnet-gvs-bins-path/**'
+
+concurrency:
+  group: garnet-gvs-bins-path-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    name: GVS rebuild (${{ matrix.bin_path_mode }})
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        bin_path_mode:
+          - runtime-only
+          - runtime-with-root-bins
+    env:
+      FIXTURE_DIR: fixtures/garnet-gvs-bins-path
+      BIN_PATH_MODE: ${{ matrix.bin_path_mode }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install the recorded pnpm version
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global pnpm@12.3.4
+          pnpm --version
+
+      - name: Prepare deferred GVS build
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_node=$(readlink -f "$(which node)")
+          trace_file="$RUNNER_TEMP/gvs-bins-path-${BIN_PATH_MODE}.txt"
+          echo "GVS_RUNTIME_NODE=$runtime_node" >> "$GITHUB_ENV"
+          echo "GVS_RUNTIME_DIR=$(dirname "$runtime_node")" >> "$GITHUB_ENV"
+          echo "GVS_TRACE_FILE=$trace_file" >> "$GITHUB_ENV"
+
+          (
+            cd "$FIXTURE_DIR"
+            npm pack ./probe --pack-destination .
+          )
+          pnpm --dir "$FIXTURE_DIR" install --ignore-scripts
+
+          if [ "$BIN_PATH_MODE" = runtime-only ]; then
+            rm -f \
+              "$FIXTURE_DIR/node_modules/.bin/garnet-root-tool" \
+              "$FIXTURE_DIR/node_modules/.bin/node"
+          fi
+
+      - name: Start Garnet recording
+        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764 # action main
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0
+          debug: true
+        env:
+          GARNET_PROFILE_JOB: gvs-bins-path/${{ matrix.bin_path_mode }}
+
+      - name: Rebuild deferred dependency
+        id: rebuild
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$BIN_PATH_MODE" = runtime-only ]; then
+            rebuild_path="$GVS_RUNTIME_DIR:$PATH"
+          else
+            rebuild_path="$GVS_RUNTIME_DIR:$GITHUB_WORKSPACE/$FIXTURE_DIR/node_modules/.bin:$PATH"
+          fi
+          PATH="$rebuild_path" pnpm --dir "$FIXTURE_DIR/app" rebuild --pending
+
+      - name: Assert native oracle
+        id: assertion
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$GVS_TRACE_FILE"
+          grep -Fq "node-runtime.execPath=$GVS_RUNTIME_NODE" "$GVS_TRACE_FILE"
+
+          if [ "$BIN_PATH_MODE" = runtime-only ]; then
+            grep -Fq 'root-tool.invoked=missing' "$GVS_TRACE_FILE"
+            ! grep -Fq 'node-shadow.invoked=' "$GVS_TRACE_FILE"
+          else
+            grep -Fq 'root-tool.invoked=' "$GVS_TRACE_FILE"
+          fi
+
+      - name: Report native oracle
+        if: always()
+        shell: bash
+        env:
+          REBUILD_OUTCOME: ${{ steps.rebuild.outcome }}
+          ASSERTION_OUTCOME: ${{ steps.assertion.outcome }}
+        run: |
+          {
+            echo "## GVS dependency build PATH: $BIN_PATH_MODE"
+            echo
+            echo "- Head: \`$(git rev-parse HEAD)\`"
+            echo "- Rebuild: \`$REBUILD_OUTCOME\`"
+            echo "- Oracle assertion: \`$ASSERTION_OUTCOME\`"
+            echo "- Dependency: \`$(readlink -f "$FIXTURE_DIR/app/node_modules/garnet-gvs-build-probe")\`"
+            echo
+            echo '```text'
+            if [ -f "$GVS_TRACE_FILE" ]; then
+              cat "$GVS_TRACE_FILE"
+            else
+              echo "native oracle was not written"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Let the sensor settle
+        if: always()
+        run: sleep 35

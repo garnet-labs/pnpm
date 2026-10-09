@@ -1,0 +1,10 @@
+{
+  "name": "garnet-node-shadow",
+  "version": "1.0.0",
+  "bin": {
+    "node": "node"
+  },
+  "files": [
+    "node"
+  ]
+}

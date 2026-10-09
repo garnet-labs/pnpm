@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+: "${GVS_TRACE_FILE:?}"
+
+{
+  echo "root-tool.invoked=$(readlink -f "$0")"
+  echo "root-tool.argv=$*"
+} >> "$GVS_TRACE_FILE"

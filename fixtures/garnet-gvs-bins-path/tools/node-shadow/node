@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+: "${GVS_RUNTIME_NODE:?}"
+: "${GVS_TRACE_FILE:?}"
+
+{
+  echo "node-shadow.invoked=$(readlink -f "$0")"
+  echo "node-shadow.delegate=$GVS_RUNTIME_NODE"
+} >> "$GVS_TRACE_FILE"
+
+exec "$GVS_RUNTIME_NODE" "$@"
