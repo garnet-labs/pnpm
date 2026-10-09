@@ -32,6 +32,12 @@ jobs:
           && github.event.issue.pull_request != null
           && contains(fromJSON('["garnet-runtime-review[bot]","garnet-runtime-review-dev[bot]","garnet-ai[bot]"]'), github.event.comment.user.login)
           && contains(github.event.comment.body, '<!-- garnet-runtime-review -->'))
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null
+          && github.event.action == 'created'
+          && startsWith(github.event.comment.body, '/garnet rereview')
+          && (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+              || github.event.comment.user.login == 'devin-ai-integration[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -43,6 +49,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       EVENT_PR_NUMBER: ${{ github.event.issue.number }}
+      GARNET_REREVIEW: ${{ github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/garnet rereview') && '1' || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
