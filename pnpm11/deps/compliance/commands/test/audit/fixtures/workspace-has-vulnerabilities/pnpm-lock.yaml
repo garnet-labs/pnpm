@@ -17,19 +17,19 @@ importers:
   packages/b:
     dependencies:
       minimist:
-        specifier: 1.2.0
-        version: 1.2.0
+        specifier: 1.2.6
+        version: 1.2.6
 
 packages:
 
   lodash@4.17.20:
     resolution: {integrity: sha512-PlhdFcillOINfeV7Ni6oF1TAEayyZBoZ8bcshTHqOYJYlrqzRK5hagpagky5o4HfCzzd1TRkXPMFq6cKk9rGmA==}
 
-  minimist@1.2.0:
-    resolution: {integrity: sha512-7Wl+Jz+IGWuSdgsQEJ4JunV0si/iMhg42MnQQG6h1R6TNeVenp4U9x5CC5v/gYqz/fENLQITAWXidNtVL0NNbw==}
+  minimist@1.2.6:
+    resolution: {integrity: sha512-Jsjnk4bw3YJqYzbdyBiNsPWHPfO++UGG749Cxs6peCu5Xg4nrena6OVxOYxrQTqww0Jmwt+Ref8rggumkTLz9Q==}
 
 snapshots:
 
   lodash@4.17.20: {}
 
-  minimist@1.2.0: {}
+  minimist@1.2.6: {}
