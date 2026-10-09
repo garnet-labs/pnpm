@@ -3,8 +3,11 @@
 # same bytes. Runs from the default branch with the repository token after a
 # recording workflow completes and again each time the Garnet App posts or edits
 # its comment (the App adds jobs to one comment as they finish, so the
-# description follows the record). It never checks out or executes pull request
-# code, requests no reviews and publishes no check.
+# description follows the record). Once a final head-bound record is mirrored it
+# publishes a draft pull request (ready for review), and on `/garnet rereview`
+# cycles a published one draft -> ready, so reviews start with the record
+# present. It never checks out or executes pull request code, never judges the
+# pull request and publishes no check.
 name: Garnet evidence mirror
 
 on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
@@ -32,6 +35,12 @@ jobs:
           && github.event.issue.pull_request != null
           && contains(fromJSON('["garnet-runtime-review[bot]","garnet-runtime-review-dev[bot]","garnet-ai[bot]"]'), github.event.comment.user.login)
           && contains(github.event.comment.body, '<!-- garnet-runtime-review -->'))
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null
+          && github.event.action == 'created'
+          && startsWith(github.event.comment.body, '/garnet rereview')
+          && (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+              || github.event.comment.user.login == 'devin-ai-integration[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -39,10 +48,9 @@ jobs:
       actions: read
       pull-requests: write
     env:
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_TOKEN: ${{ github.token }}
       EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       EVENT_PR_NUMBER: ${{ github.event.issue.number }}
+      GARNET_REREVIEW: ${{ github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/garnet rereview') && '1' || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -57,6 +65,8 @@ jobs:
       - name: Resolve the open pull requests at this head
         id: head
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -n "${EVENT_PR_NUMBER}" ]; then
@@ -72,6 +82,7 @@ jobs:
         if: steps.head.outputs.sha != '' && steps.head.outputs.prs != ''
         shell: bash
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.head.outputs.sha }}
           PRS: ${{ steps.head.outputs.prs }}
         run: |

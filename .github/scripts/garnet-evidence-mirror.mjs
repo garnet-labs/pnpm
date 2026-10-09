@@ -9,7 +9,13 @@ import { pathToFileURL } from "node:url";
  * App appends jobs to one comment as they finish, so the block names the
  * recorded time and job count it copied and is re-run on every edit.
  * Required environment: GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER, HEAD_SHA.
- * Optional environment: GITHUB_API_URL.
+ * Optional environment: GITHUB_API_URL, GARNET_REREVIEW.
+ *
+ * Reviewer timing: review bots start on the push, before the record is bound.
+ * Once a final head-bound record is mirrored, a draft PR is published (marked
+ * ready for review) so every reviewer starts with the record present; with
+ * GARNET_REREVIEW=1 (the `/garnet rereview` comment) a published PR is cycled
+ * draft -> ready to request the reviews again. Neither path judges the PR.
  */
 const RUNTIME_REVIEW_MARKER = "<!-- garnet-runtime-review -->"
 const BEGIN = "<!-- garnet:evidence:begin -->"
@@ -45,6 +51,38 @@ async function github(path, init = {}) {
   })
   if (!res.ok) throw new Error(`${init.method || "GET"} ${path}: ${res.status} ${await res.text()}`)
   return res.json()
+}
+
+async function graphql(query, variables) {
+  const res = await fetch(`${api}/graphql`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  })
+  const payload = await res.json()
+  if (!res.ok || payload.errors) throw new Error(`graphql: ${res.status} ${JSON.stringify(payload.errors ?? payload)}`)
+  return payload.data
+}
+
+async function setDraft(nodeId, draft) {
+  const mutation = draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview"
+  await graphql(
+    `mutation($id: ID!) { ${mutation}(input: { pullRequestId: $id }) { pullRequest { isDraft } } }`,
+    { id: nodeId },
+  )
+}
+
+/**
+ * A record is final when its machine register parses with a job count; while
+ * the App is still recording there is no register to copy.
+ * @param {string} body
+ * @returns {boolean}
+ */
+export function isFinalRecord(body) {
+  return recordStamp(body).jobs !== null
 }
 
 async function listComments() {
@@ -217,17 +255,58 @@ async function main() {
   const nextBody = upsert(currentBody, block)
   if (nextBody === currentBody) {
     console.log("Evidence section already current; nothing to do.")
+  } else {
+    await github(`/repos/${repo}/pulls/${prNumber}`, {
+      method: "PATCH",
+      body: JSON.stringify({ body: nextBody }),
+    })
+    console.log(
+      comment
+        ? `Mirrored head-bound record (comment ${comment.id}) into the PR description.`
+        : "No head-bound record found; description section states evidence is missing.",
+    )
+  }
+  await publishForReview(pr, comment)
+}
+
+/**
+ * Publishes the PR to its reviewers only once a final record is bound to the
+ * head, so their reviews start with the evidence present.
+ * @param {{node_id: string, draft: boolean, state: string, head: {sha: string}}} pr
+ * @param {{id: number, body: string}|null} comment
+ */
+async function publishForReview(pr, comment) {
+  const sha7 = headSha.slice(0, 7)
+  const rereview = process.env.GARNET_REREVIEW === "1"
+  if (pr.state !== "open") return
+  if (comment === null || !isFinalRecord(comment.body)) {
+    const why = comment === null ? "no record is bound to this head" : "the record for this head is not final"
+    console.log(`Not publishing head ${sha7} for review: ${why}.`)
+    if (rereview) {
+      await github(`/repos/${repo}/issues/${prNumber}/comments`, {
+        method: "POST",
+        body: JSON.stringify({
+          body: `<!-- garnet:rereview refused ${headSha} -->\nRe-review not requested: ${why} (head \`${sha7}\`). Reviews are requested only once a final Runtime Review record is bound to the current head.`,
+        }),
+      })
+    }
     return
   }
-  await github(`/repos/${repo}/pulls/${prNumber}`, {
-    method: "PATCH",
-    body: JSON.stringify({ body: nextBody }),
+  if (!pr.draft && !rereview) {
+    console.log(`Head ${sha7} is bound and the PR is already published; nothing to request.`)
+    return
+  }
+  if (!pr.draft) {
+    await setDraft(pr.node_id, true)
+  }
+  await setDraft(pr.node_id, false)
+  await github(`/repos/${repo}/issues/${prNumber}/comments`, {
+    method: "POST",
+    body: JSON.stringify({
+      body: `<!-- garnet:rereview requested ${headSha} -->\nRuntime evidence for head \`${sha7}\` is bound to this pull request (comment ${comment.id}); the pull request was ${pr.draft ? "published" : "republished"} for review so it is read with the record present.`,
+    }),
   })
-  console.log(
-    comment
-      ? `Mirrored head-bound record (comment ${comment.id}) into the PR description.`
-      : "No head-bound record found; description section states evidence is missing.",
-  )
+  console.log(`${pr.draft ? "Published" : "Republished"} PR ${prNumber} for review at bound head ${sha7}.`)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()
