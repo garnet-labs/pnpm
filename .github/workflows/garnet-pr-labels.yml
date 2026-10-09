@@ -1,0 +1,72 @@
+# Labels every pull request on this fork by purpose, from the files it changes:
+# `garnet: wiring` for the recorder, mirror, reviewer configuration and upstream
+# syncs; `garnet: test subject` for a replayed or constructed change that the
+# recorder runs against. Runs from the default branch, reads file lists through
+# the API, and never checks out or executes pull request code. When this file
+# changes on the default branch it relabels every open pull request.
+name: Garnet PR labels
+
+on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+  push:
+    branches: [main]
+    paths: [.github/workflows/garnet-pr-labels.yml]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: garnet-pr-labels-${{ github.event.pull_request.number || 'all' }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    name: Label wiring or test subject
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      WIRING_PATHS: '^(\.github/workflows/garnet-[^/]+|\.github/scripts/(garnet-[^/]+|__fixtures__/.+)|\.github/garnet-gate/.+|\.garnet/.+|\.coderabbit\.yaml|\.pr_agent\.toml|\.agents/skills/review-code/references/REVIEW_GUIDE\.md|\.husky/reject-bare-mentions\.mjs)$'
+    steps:
+      - name: Classify and label
+        shell: bash
+        run: |
+          set -euo pipefail
+          ensure_label() {
+            gh api "repos/${GITHUB_REPOSITORY}/labels/$(jq -rn --arg n "$1" '$n|@uri')" > /dev/null 2>&1 \
+              || gh api -X POST "repos/${GITHUB_REPOSITORY}/labels" -f "name=$1" -f "color=$2" -f "description=$3" > /dev/null
+          }
+          ensure_label 'garnet: wiring' 5319e7 'Garnet machinery: recorder, mirror, reviewer config, upstream syncs'
+          ensure_label 'garnet: test subject' fbca04 'A replayed or constructed change the Garnet recorder runs against'
+          label_pr() {
+            local number=$1 head_ref=$2 files others add drop
+            if [[ "${head_ref}" == garnet/sync-upstream-* ]]; then
+              others=0
+            else
+              files=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${number}/files" --jq '.[].filename')
+              if [ -z "${files}" ]; then
+                echo "#${number}: no changed files; unchanged"
+                return
+              fi
+              others=$(printf '%s\n' "${files}" | grep -cvE "${WIRING_PATHS}" || true)
+            fi
+            if [ "${others}" -eq 0 ]; then
+              add='garnet: wiring'; drop='garnet%3A%20test%20subject'
+            else
+              add='garnet: test subject'; drop='garnet%3A%20wiring'
+            fi
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${number}/labels/${drop}" > /dev/null 2>&1 || true
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${number}/labels" -f "labels[]=${add}" > /dev/null
+            echo "#${number}: ${add} (${others} file(s) outside the wiring paths)"
+          }
+          if [ -n "${PR_NUMBER}" ]; then
+            label_pr "${PR_NUMBER}" "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.ref)"
+          else
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100" --jq '.[] | "\(.number) \(.head.ref)"' \
+              | while read -r number head_ref; do label_pr "${number}" "${head_ref}"; done
+          fi
