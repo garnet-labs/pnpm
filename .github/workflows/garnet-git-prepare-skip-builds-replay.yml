@@ -1,0 +1,186 @@
+name: Garnet git prepare skipped-builds replay
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/garnet-git-prepare-skip-builds-replay.yml'
+      - 'fixtures/garnet-git-prepare-skip/**'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: garnet-git-prepare-skip-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    name: nested prepare (${{ matrix.case_name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case_name: strict-fatal
+            strict_dep_builds: 'true'
+          - case_name: nonfatal-skip
+            strict_dep_builds: 'false'
+    env:
+      PNPM_VERSION: 12.3.4
+      GARNET_PROFILE_JOB: git-prepare-skip/${{ matrix.case_name }}
+    steps:
+      - name: Checkout pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pinned pnpm
+        shell: bash
+        run: npm install --global "pnpm@$PNPM_VERSION"
+
+      - name: Materialize local git fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          specimen_root="$RUNNER_TEMP/garnet-git-prepare-skip"
+          cp -R fixtures/garnet-git-prepare-skip "$specimen_root"
+
+          unapproved_tarball="$(
+            cd "$specimen_root"
+            npm pack ./git-dependency/unapproved-build \
+              --pack-destination . \
+              --json |
+              jq -r '.[0].filename'
+          )"
+          GIT_PACKAGE_JSON="$specimen_root/git-dependency/package.json" \
+            UNAPPROVED_TARBALL="$specimen_root/$unapproved_tarball" node <<'NODE'
+          const fs = require('node:fs')
+
+          const manifest = JSON.parse(fs.readFileSync(process.env.GIT_PACKAGE_JSON, 'utf8'))
+          manifest.dependencies['garnet-unapproved-build'] = `file:${process.env.UNAPPROVED_TARBALL}`
+          fs.writeFileSync(process.env.GIT_PACKAGE_JSON, `${JSON.stringify(manifest, null, 2)}\n`)
+          NODE
+
+          git -C "$specimen_root/git-dependency" init --initial-branch=main
+          git -C "$specimen_root/git-dependency" config user.name "Garnet fixture"
+          git -C "$specimen_root/git-dependency" config user.email "fixture.invalid"
+          git -C "$specimen_root/git-dependency" add .
+          git -C "$specimen_root/git-dependency" commit -m "fixture"
+
+          commit="$(git -C "$specimen_root/git-dependency" rev-parse HEAD)"
+          git_dep_spec="git+file://$specimen_root/git-dependency#$commit"
+          SPECIMEN_PROJECT="$specimen_root/project" GIT_DEP_SPEC="$git_dep_spec" node <<'NODE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+
+          const packageJsonPath = path.join(process.env.SPECIMEN_PROJECT, 'package.json')
+          const manifest = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'))
+          manifest.dependencies['garnet-git-prepare-root'] = process.env.GIT_DEP_SPEC
+          fs.writeFileSync(packageJsonPath, `${JSON.stringify(manifest, null, 2)}\n`)
+
+          const allowBuildKey = `garnet-git-prepare-root@${process.env.GIT_DEP_SPEC}`
+          fs.writeFileSync(
+            path.join(process.env.SPECIMEN_PROJECT, 'pnpm-workspace.yaml'),
+            `packages: []\nallowBuilds:\n  ${JSON.stringify(allowBuildKey)}: true\n`,
+          )
+          NODE
+
+          marker_dir="$RUNNER_TEMP/garnet-git-prepare-markers"
+          mkdir -p "$marker_dir"
+          {
+            echo "SPECIMEN_PROJECT=$specimen_root/project"
+            echo "GARNET_SPECIMEN_MARKER_DIR=$marker_dir"
+            echo "GIT_DEP_SPEC=$git_dep_spec"
+          } >> "$GITHUB_ENV"
+
+      - name: Start Garnet recording
+        continue-on-error: true
+        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764 # action main
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.17.0
+          debug: true
+
+      - name: Install through nested git prepare
+        id: install
+        continue-on-error: true
+        shell: bash
+        env:
+          pnpm_config_strict_dep_builds: ${{ matrix.strict_dep_builds }}
+        run: |
+          set +e
+          cd "$SPECIMEN_PROJECT"
+          pnpm install --reporter=append-only 2>&1 | tee "$RUNNER_TEMP/git-prepare-install.log"
+          status="${PIPESTATUS[0]}"
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Record native oracle
+        if: always()
+        shell: bash
+        env:
+          INSTALL_EXIT: ${{ steps.install.outputs.exit_code }}
+          STRICT_DEP_BUILDS: ${{ matrix.strict_dep_builds }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/git-prepare-install.log"
+          prepare_marker="$GARNET_SPECIMEN_MARKER_DIR/git-prepare.json"
+          unapproved_marker="$GARNET_SPECIMEN_MARKER_DIR/unapproved-build.json"
+
+          prepare_result=skipped
+          prepare_cwd=not-recorded
+          if [ -f "$prepare_marker" ]; then
+            prepare_result=ran
+            prepare_cwd="$(jq -r .cwd "$prepare_marker")"
+          fi
+
+          unapproved_result=skipped
+          if [ -f "$unapproved_marker" ]; then
+            unapproved_result=ran
+          fi
+
+          ignored_diagnostic=absent
+          if [ -f "$log" ] && grep -Eiq 'ERR_PNPM_IGNORED_BUILDS|Ignored build scripts' "$log"; then
+            ignored_diagnostic=present
+          fi
+
+          expected_observation=no
+          if [ "$STRICT_DEP_BUILDS" = true ]; then
+            if [ "${INSTALL_EXIT:-missing}" != 0 ] &&
+              [ "$ignored_diagnostic" = present ] &&
+              [ "$prepare_result" = ran ] &&
+              [ "$unapproved_result" = skipped ]; then
+              expected_observation=yes
+            fi
+          elif [ "${INSTALL_EXIT:-missing}" = 0 ] &&
+            [ "$ignored_diagnostic" = present ] &&
+            [ "$prepare_result" = ran ] &&
+            [ "$unapproved_result" = skipped ]; then
+            expected_observation=yes
+          fi
+
+          {
+            echo "## Nested git prepare skipped-builds oracle"
+            echo
+            echo "A/B variable: \`pnpm_config_strict_dep_builds=$STRICT_DEP_BUILDS\`"
+            echo
+            echo "| observation | result |"
+            echo "|---|---|"
+            echo "| outer install exit code | \`${INSTALL_EXIT:-missing}\` |"
+            echo "| ignored-build diagnostic | \`$ignored_diagnostic\` |"
+            echo "| git root prepare | \`$prepare_result\` |"
+            echo "| unapproved transitive install | \`$unapproved_result\` |"
+            echo "| expected observation | \`$expected_observation\` |"
+            echo "| prepare checkout cwd | \`$prepare_cwd\` |"
+            echo
+            echo "The outer allowlist approves only the git root. The A/B environment value is inherited by the nested pnpm install; no pnpm product version changes between cells."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Let the sensor settle
+        if: always()
+        run: sleep 25
