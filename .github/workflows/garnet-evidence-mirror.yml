@@ -19,11 +19,14 @@ on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request co
 
 permissions: {}
 
-# One run at a time: several recorders and several comment edits fire for one
-# head, and the per-head lock is a comment, not an atomic write. Nothing is
-# cancelled once it started.
+# One run at a time per pull request (comment events) or per head (recorder
+# completions): several recorders and comment edits fire for one head, and the
+# per-head lock is a comment, not an atomic write. GitHub keeps only one pending
+# run per group, so a repository-wide group would drop a `/garnet rereview` that
+# arrives while another pull request's run is queued. Nothing is cancelled once
+# it started.
 concurrency:
-  group: garnet-evidence-mirror
+  group: garnet-evidence-mirror-${{ github.event.issue.number || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -83,6 +86,9 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Draft <-> ready transitions need a user token; the workflow token is
+          # refused for them and the mirror then posts a refusal receipt instead.
+          GARNET_PUBLISH_TOKEN: ${{ secrets.GARNET_REVIEW_TRIGGER_TOKEN }}
           HEAD_SHA: ${{ steps.head.outputs.sha }}
           PRS: ${{ steps.head.outputs.prs }}
         run: |

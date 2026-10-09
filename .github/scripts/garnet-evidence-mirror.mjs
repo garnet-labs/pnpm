@@ -53,11 +53,17 @@ async function github(path, init = {}) {
   return res.json()
 }
 
+// Draft <-> ready transitions are refused for the workflow token ("Resource not
+// accessible by integration"); they need a user token. GARNET_PUBLISH_TOKEN
+// carries one when the repository has it, otherwise the workflow token is used
+// and the transition is reported as refused instead of crashing the mirror.
+const publishToken = process.env.GARNET_PUBLISH_TOKEN || process.env.GITHUB_TOKEN
+
 async function graphql(query, variables) {
   const res = await fetch(`${api}/graphql`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      Authorization: `Bearer ${publishToken}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ query, variables }),
@@ -67,12 +73,20 @@ async function graphql(query, variables) {
   return payload.data
 }
 
+/** @returns {Promise<boolean>} false when the token may not change draft state */
 async function setDraft(nodeId, draft) {
   const mutation = draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview"
-  await graphql(
-    `mutation($id: ID!) { ${mutation}(input: { pullRequestId: $id }) { pullRequest { isDraft } } }`,
-    { id: nodeId },
-  )
+  try {
+    await graphql(
+      `mutation($id: ID!) { ${mutation}(input: { pullRequestId: $id }) { pullRequest { isDraft } } }`,
+      { id: nodeId },
+    )
+    return true
+  } catch (error) {
+    if (!/FORBIDDEN|Resource not accessible/.test(String(error?.message))) throw error
+    console.log(`${mutation} refused for this token: ${error.message}`)
+    return false
+  }
 }
 
 /**
@@ -296,10 +310,16 @@ async function publishForReview(pr, comment) {
     console.log(`Head ${sha7} is bound and the PR is already published; nothing to request.`)
     return
   }
-  if (!pr.draft) {
-    await setDraft(pr.node_id, true)
+  const allowed = (pr.draft || (await setDraft(pr.node_id, true))) && (await setDraft(pr.node_id, false))
+  if (!allowed) {
+    await github(`/repos/${repo}/issues/${prNumber}/comments`, {
+      method: "POST",
+      body: JSON.stringify({
+        body: `<!-- garnet:rereview refused ${headSha} -->\nRe-review not requested: a final Runtime Review record is bound to head \`${sha7}\` (comment ${comment.id}), but this workflow's token may not change the pull request's draft state. Set the \`GARNET_REVIEW_TRIGGER_TOKEN\` repository secret (a user token with pull-request write access) to let the mirror request reviews.`,
+      }),
+    })
+    return
   }
-  await setDraft(pr.node_id, false)
   await github(`/repos/${repo}/issues/${prNumber}/comments`, {
     method: "POST",
     body: JSON.stringify({
