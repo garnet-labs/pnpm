@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   resolve:
+    name: Resolve Dependabot snapshot
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.user.login == 'dependabot[bot]' &&
@@ -36,7 +37,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: read # read pull request metadata for snapshot resolution
     outputs:
       snapshot: ${{ steps.resolve.outputs.snapshot }}
       recorder_sha: ${{ steps.resolve.outputs.recorder_sha }}
@@ -160,6 +161,7 @@ jobs:
         run: node control/.github/scripts/garnet-dependabot-record.mjs images
 
   record:
+    name: Record Dependabot execution
     needs: resolve
     strategy:
       fail-fast: false
@@ -170,7 +172,7 @@ jobs:
     timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).job_minutes }}
     permissions:
       contents: read
-      id-token: write
+      id-token: write # exchange the GitHub OIDC token for Garnet access
     env:
       RECORDER_SNAPSHOT: ${{ needs.resolve.outputs.snapshot }}
       RECORDER_IMAGES: ${{ needs.resolve.outputs.images }}
@@ -209,7 +211,7 @@ jobs:
         run: node control/.github/scripts/garnet-dependabot-record.mjs prepare
       - name: Start trusted sensor using OIDC only
         timeout-minutes: ${{ fromJSON(needs.resolve.outputs.stop_budget).experiment && 2 || 45 }}
-        uses: garnet-org/action@9696f3cae14437203c56dac7d78d9449b9ba3764
+        uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
         with:
           jibril_version: v2.17.0
           stop_timeout_seconds: ${{ fromJSON(needs.resolve.outputs.stop_budget).sensor_stop_seconds }}
@@ -233,13 +235,14 @@ jobs:
           compression-level: 6
 
   verify:
+    name: Verify Dependabot evidence
     if: always() && needs.resolve.result == 'success'
     needs: [resolve, record]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
-      actions: write
+      actions: write # dispatch the trusted evidence publication workflow
     steps:
       - name: Checkout trusted verifier on a fresh runner
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
