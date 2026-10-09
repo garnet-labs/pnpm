@@ -932,7 +932,7 @@ export function validateSide(r, artifact, s, side, scriptHash, helperHashes, rev
   'receipt_run_or_recorder_hash_mismatch');
   check(r.artifact_name === artifactName(s.run_id, s.run_attempt, side) &&
     r.profile_job === `dependabot-${side}-attempt-${s.run_attempt}`, 'receipt_artifact_or_job_mismatch');
-  check(r.action_sha === ACTION && r.sensor_version === 'v2.16.0' &&
+  check(r.action_sha === ACTION && r.sensor_version === 'v2.17.0' &&
     r.native_profile_sha_is_execution_proof === false, 'receipt_policy_mismatch');
   check(r.recording_complete === true && r.workload_success === true &&
     r.workload_exit === 0 && r.status === 'recorded', 'incomplete_recording_or_failed_workload');
@@ -1148,6 +1148,41 @@ export function validateCloudReadback(c, entry, hostedURL) {
   return {state: 'matched', checked_at: c.checked_at, url: hostedURL, matched_edges: c.matched_edges.length};
 }
 
+const NOT_RECORDABLE = {
+  npm_local_file_dependency_missing: 'it depends on <code>file:</code> paths that only exist after a monorepo build',
+  npm_unsupported_local_protocol: 'it uses <code>link:</code>, <code>workspace:</code> or <code>portal:</code> dependencies, which npm cannot install',
+};
+const list = xs => xs.map(code).join(', ');
+const destinationSets = sides => ['base', 'head'].map(side =>
+  new Set(sides[side].observed.workloads.flatMap(w => w.normalizedNonDnsTcpDestinations)));
+// The first lines a reviewer reads: one outcome, the destination change or the
+// reason there is none, and what to do next. Everything else stays folded.
+export function summarize({sides, failures, recordingVerified, comparisonMatched, historical, runURL}) {
+  const title = `### Garnet install recording${historical ? ' (closed PR)' : ''}`;
+  const blocked = failures.map(f => /: not_recordable_([a-z0-9_]+)$/.exec(f)?.[1]).find(Boolean);
+  if (blocked) return [title, '', `**Not recorded:** the recorder cannot install this project on its own because ${NOT_RECORDABLE[blocked] ?? code(blocked)}.`,
+    '', 'Next: review this bump by hand. No runtime evidence exists for it.'];
+  if (!recordingVerified) {
+    const exits = ['base', 'head'].map(side => (sides[side]?.receipt?.workloads ?? []).map(x => x.exit_code).join(', ') || 'none');
+    const failed = exits.some(x => x !== 'none' && x.split(', ').some(e => e !== '0'));
+    const how = exits[0] === exits[1] ? `exit code ${code(exits[0])} on base and head` : `exit code ${code(exits[0])} on base, ${code(exits[1])} on head`;
+    return [title, '', `**Recording incomplete:** ${failed ? `the install failed (${how})` : `the recording did not pass verification (${code(failures[0] ?? 'unverified')})`}.`,
+      '', `Next: review this bump by hand, or check the [recording run](${runURL}). No runtime evidence exists for it.`];
+  }
+  if (!comparisonMatched) return [title, '', '**Not comparable:** base and head ran different install commands, so their destinations are not compared.',
+    '', 'Next: review this bump by hand. Both recordings are in the evidence below.'];
+  const [base, head] = destinationSets(sides);
+  const added = [...head].filter(x => !base.has(x)).sort(), removed = [...base].filter(x => !head.has(x)).sort();
+  const shared = [...head].filter(x => base.has(x)).length;
+  if (!added.length && !removed.length) return [title, '',
+    `**No new destinations:** the install reached the same ${shared}&nbsp;destination${shared === 1 ? '' : 's'} on base and head.`,
+    '', 'Next: review the bump as usual. Process and sensor detail is below.'];
+  return [title, '', `**Destinations changed:** ${added.length}&nbsp;new, ${removed.length}&nbsp;gone, ${shared}&nbsp;unchanged.`, '',
+    ...(added.length ? [`- New on head: ${list(added)}`] : []), ...(removed.length ? [`- Gone on head: ${list(removed)}`] : []),
+    '',
+    `Next: ${added.length ? 'confirm each new destination is expected for this bump.' : 'confirm the removal is expected for this bump.'}`];
+}
+
 export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publishable, artifacts,
   hostedReports = {}, cloudReadbacks = {}, historical = false, reviewedVersion = 0, pythonVersion = 0,
   stopVersion = 0, comparisonMatched = true, directoryVersion = 0, storageVersion = 0}) {
@@ -1160,8 +1195,9 @@ export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publ
     : 'Recording incomplete; security verdict HOLD (requires human interpretation)';
   const lines = [marker(repo, pr.number),
     `<!-- garnet-recording-run:${run.id} attempt:${run.run_attempt} head:${pr.head.sha} -->`,
-    historical ? '## Garnet Dependabot historical closed-PR recording' : '## Garnet Dependabot cold-read receipt',
-    '', `**${decision}**`, '',
+    ...summarize({sides, failures, recordingVerified, comparisonMatched, historical, runURL}),
+    '', '<details><summary>Evidence, commands and provenance</summary>', '',
+    `**${decision}**`, '',
     ...(!comparisonMatched ? ['**Comparison HOLD:** base/head command policies differ. Both executions may be recorded, but no matched-install or scope-equivalent dependency comparison is claimed.', ''] : []),
     `[Recording run ${run.id}, attempt ${run.run_attempt}](${runURL}) · ${historical ? 'Historical closed-PR' : 'Current PR'} head: ${code(pr.head.sha)}`,
     ...(historical ? ['', '**Historical, closed and unmerged PR. Comment-only recording; not a current active-PR gate. No commit status or reopening.**'] : []),
@@ -1285,7 +1321,9 @@ export function renderPreview({repo, pr, run, snapshot: s, sides, failures, publ
         'A successful commit status means the matched install/fetch workload was captured and verified, not that this dependency change is safe. ') +
       'No malicious delta is cleared; sensor detections and behavior require human interpretation.');
   if (failures.length) lines.push('', '**Incomplete / HOLD reasons:**', ...failures.map(f => `- ${code(f)}`));
+  lines.push('', '</details>');
   const body = `${lines.join('\n')}\n`;
+  check(body.indexOf('<details>') > 0 && body.indexOf('<details>') < 1200, 'comment_summary_not_concise');
   check(body.length < 60000, 'comment_exceeds_github_limit');
   return {schema: 1, repo, pr: pr.number, run: String(run.id), attempt: run.run_attempt,
     head: pr.head.sha, historical, publishable, verified, recording_verified: recordingVerified,
@@ -1399,6 +1437,10 @@ export function main(argv = process.argv.slice(2)) {
       artifacts[side] = artifact;
       check(artifact.files['receipt.json']?.length <= MB, 'receipt_missing_or_oversized');
       sides[side] = {receipt: parse(artifact.files['receipt.json'])};
+      const r = sides[side].receipt;
+      const blocked = r?.status === 'blocked-or-failed' && typeof r.failure === 'string' &&
+        /^BLOCKED: ([a-z0-9_]+)(?::|$)/.exec(r.failure)?.[1];
+      if (blocked) failures.push(`${side}: not_recordable_${blocked}`);
     } catch (e) { recordFailure(side, e); }
   }
   let verification = [], snapshot = sides.head?.receipt?.snapshot ?? sides.base?.receipt?.snapshot;
