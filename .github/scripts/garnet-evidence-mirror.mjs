@@ -315,7 +315,7 @@ async function publishForReview(pr, comment) {
     await github(`/repos/${repo}/issues/${prNumber}/comments`, {
       method: "POST",
       body: JSON.stringify({
-        body: `<!-- garnet:rereview refused ${headSha} -->\nRe-review not requested: a final Runtime Review record is bound to head \`${sha7}\` (comment ${comment.id}), but this workflow's token may not change the pull request's draft state. Set the \`GARNET_REVIEW_TRIGGER_TOKEN\` repository secret (a user token with pull-request write access) to let the mirror request reviews.`,
+        body: `<!-- garnet:rereview refused ${headSha} -->\nRe-review not requested: a final Runtime Review record is bound to head \`${sha7}\` (comment ${comment.id}), but ${process.env.GARNET_PUBLISH_TOKEN ? "the configured \`GARNET_REVIEW_TRIGGER_TOKEN\` secret lacks pull-request write access to this repository (or is not a user token)" : "the workflow token may not change a pull request's draft state and no \`GARNET_REVIEW_TRIGGER_TOKEN\` repository secret is set"}. Provide a user token with pull-request write access as that secret to let the mirror request reviews.`,
       }),
     })
     return
