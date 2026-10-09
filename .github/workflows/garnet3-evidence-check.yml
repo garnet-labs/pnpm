@@ -1,0 +1,50 @@
+# Publishes the head-bound Garnet Runtime Review record on the pull request as
+# a check: waits for a record bound to the exact head, appends the brief to the
+# step summary, annotates the changed files with the recorded delta and creates
+# the `garnet/evidence` check run. Fails the job on a workload change so the
+# failing check carries the destinations. Fork-only; reads the record, never
+# judges the pull request.
+name: Garnet evidence check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - pnpm/npm/pnpm/bin/pnpm.mjs
+      - pnpm/npm/pnpm/native-binary.mjs
+      - .garnet/bootstrap-routing/**
+      - .garnet/runtime-review/**
+      - .github/workflows/garnet3-evidence-check.yml
+
+permissions: {}
+
+concurrency:
+  group: garnet3-evidence-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  evidence:
+    name: garnet/evidence (head-bound record)
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          sparse-checkout: .garnet/runtime-review
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
+      - name: Runtime Review on the head commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          node .garnet/runtime-review/bin/garnet-runtime-review.js check "$GITHUB_REPOSITORY" "$PR" \
+            --wait 900 --fail-on workload-change --annotate --github-check
