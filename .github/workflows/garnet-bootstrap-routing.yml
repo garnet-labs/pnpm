@@ -4,7 +4,7 @@ name: Garnet Bootstrap Routing
 # pull requests that touch it. Fork-only recorder; it never runs upstream.
 on:
   push:
-    branches: [garnet/routing-base]
+    branches: [garnet/routing-base, garnet3/routing-base]
     paths:
       - pnpm/npm/pnpm/bin/pnpm.mjs
       - pnpm/npm/pnpm/native-binary.mjs
