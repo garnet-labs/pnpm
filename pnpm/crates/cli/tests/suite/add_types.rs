@@ -476,7 +476,7 @@ fn bulk_add_fetches_only_required_metadata_formats() {
                 .with_header("content-type", "application/json")
                 .with_header("etag", METADATA_ETAG)
                 .with_body(packument.to_string())
-                .expect(1 + usize::from(types_package))
+                .expect(1)
                 .create(),
         );
     }
@@ -524,7 +524,7 @@ fn jsr_sources_and_direct_jsr_registry_packages_use_their_own_metadata_policy() 
             (
                 "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
                 abbreviated,
-                2 - usize::from(direct),
+                1,
             ),
         ] {
             requests.push(

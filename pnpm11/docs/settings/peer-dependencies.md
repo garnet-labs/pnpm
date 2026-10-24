@@ -11,17 +11,17 @@ sidebar_label: "Peer dependencies"
 
 When `true`, any missing non-optional peer dependencies are automatically installed.
 
-#### Optional Peer Dependencies
+#### Optional peer dependencies
 
 pnpm installs a missing optional peer dependency only if the workspace already has a version of it that satisfies the optional peer range. In that case, pnpm resolves the optional peer to that version. That version can come from any project in the workspace, including another project's `devDependencies`. For example, if one project depends on `webpack` and another has `webpack-cli` in its `devDependencies`, both projects get the `webpack` instance that has `webpack-cli` as its optional peer.
 
 pnpm also resolves optional peers this way when [`dedupePeerDependents`](#dedupepeerdependents) is `true`. To stop it, set both `autoInstallPeers` and `dedupePeerDependents` to `false`.
 
-#### Version Conflicts
+#### Version conflicts
 
 If there are conflicting version requirements for a peer dependency from different packages, pnpm will not install any version of the conflicting peer dependency automatically. Instead, a warning is printed. For example, if one dependency requires `react@^16.0.0` and another requires `react@^17.0.0`, these requirements conflict, and no automatic installation will occur.
 
-#### Conflict Resolution
+#### Conflict resolution
 
 In case of a version conflict, you'll need to evaluate which version of the peer dependency to install yourself, or update the dependencies to align their peer dependency requirements.
 
@@ -34,7 +34,7 @@ When this setting is set to `true`, packages with peer dependencies will be dedu
 
 For instance, let's say we have a workspace with two projects and both of them have `webpack` in their dependencies. `webpack` has `esbuild` in its optional peer dependencies, and one of the projects has `esbuild` in its dependencies. In this case, pnpm will link two instances of `webpack` to the `node_modules/.pnpm` directory: one with `esbuild` and another one without it:
 
-```
+```text
 node_modules
   .pnpm
     webpack@1.0.0_esbuild@1.0.0
@@ -50,7 +50,7 @@ project2
 
 This makes sense because `webpack` is used in two projects, and one of the projects doesn't have `esbuild`, so the two projects cannot share the same instance of `webpack`. However, this is not what most developers expect, especially since in a hoisted `node_modules`, there would only be one instance of `webpack`. Therefore, you may now use the `dedupePeerDependents` setting to deduplicate `webpack` when it has no conflicting peer dependencies (explanation at the end). In this case, if we set `dedupePeerDependents` to `true`, both projects will use the same `webpack` instance, which is the one that has `esbuild` resolved:
 
-```
+```text
 node_modules
   .pnpm
     webpack@1.0.0_esbuild@1.0.0
@@ -65,7 +65,7 @@ project2
 
 **What are conflicting peer dependencies?** By conflicting peer dependencies we mean a scenario like the following one:
 
-```
+```text
 node_modules
   .pnpm
     webpack@1.0.0_react@16.0.0_esbuild@1.0.0
@@ -90,7 +90,7 @@ Added in: v10.33.0
 * Default: **false**
 * Type: **Boolean**
 
-When enabled, peer dependency suffixes use version-only identifiers (`name@version`) instead of full dep paths, eliminating nested suffixes like `(foo@1.0.0(bar@2.0.0))`. This dramatically reduces the number of package instances in projects with many recursive peer dependencies.
+When enabled, peer dependency suffixes use version-only identifiers (`name@version`) instead of full dep paths, eliminating nested suffixes like `(foo@1.0.0(bar@2.0.0))`. This reduces the number of package instances in projects with many recursive peer dependencies.
 
 This is different from [`dedupePeerDependents`](#dedupepeerdependents), which deduplicates packages that have the same peer dependencies across different workspace projects. `dedupePeers` simplifies the peer dependency suffix format itself.
 
@@ -156,7 +156,7 @@ It is also possible to suppress the warnings only for peer dependencies of speci
 ```yaml title="pnpm-workspace.yaml"
 peerDependencyRules:
   allowedVersions:
-    "button@2>react": "17",
+    "button@2>react": "17"
     "card>react": "17"
 ```
 

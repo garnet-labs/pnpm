@@ -191,7 +191,7 @@ test('importer with different peers uses correct peer', async () => {
       name: 'project2',
       dependencies: {
         '@pnpm.e2e/has-foo100-peer': 'catalog:',
-        // Note that this peer is intentionally different than the one above
+        // This peer is intentionally different than the one above
         // for project 1. (100.1.0 instead of 100.0.0).
         //
         // We want to ensure project2 resolves to the same catalog version for
@@ -247,8 +247,8 @@ test('lockfile contains catalog snapshots', async () => {
     lockfileOnly: true,
     catalogs: {
       default: {
-        '@pnpm.e2e/bar': '^100.0.0',
-        '@pnpm.e2e/foo': '^100.0.0',
+        '@pnpm.e2e/bar': '^100.1.0',
+        '@pnpm.e2e/foo': '^100.1.0',
       },
     },
   })
@@ -256,8 +256,8 @@ test('lockfile contains catalog snapshots', async () => {
   const lockfile = readLockfile()
   expect(lockfile.catalogs).toStrictEqual({
     default: {
-      '@pnpm.e2e/bar': { specifier: '^100.0.0', version: '100.1.0' },
-      '@pnpm.e2e/foo': { specifier: '^100.0.0', version: '100.1.0' },
+      '@pnpm.e2e/bar': { specifier: '^100.1.0', version: '100.1.0' },
+      '@pnpm.e2e/foo': { specifier: '^100.1.0', version: '100.1.0' },
     },
   })
 })
@@ -375,7 +375,7 @@ test('lockfile catalog snapshots retain existing entries on --filter', async () 
     lockfileOnly: true,
     catalogs: {
       default: {
-        '@pnpm.e2e/bar': '^100.0.0',
+        '@pnpm.e2e/bar': '^100.1.0',
         '@pnpm.e2e/foo': '^1.0.0',
       },
     },
@@ -383,7 +383,7 @@ test('lockfile catalog snapshots retain existing entries on --filter', async () 
 
   expect(readLockfile().catalogs).toStrictEqual({
     default: {
-      '@pnpm.e2e/bar': { specifier: '^100.0.0', version: '100.1.0' },
+      '@pnpm.e2e/bar': { specifier: '^100.1.0', version: '100.1.0' },
       '@pnpm.e2e/foo': { specifier: '^1.0.0', version: '1.3.0' },
     },
   })
@@ -394,7 +394,7 @@ test('lockfile catalog snapshots retain existing entries on --filter', async () 
     lockfileOnly: true,
     catalogs: {
       default: {
-        '@pnpm.e2e/bar': '^100.0.0',
+        '@pnpm.e2e/bar': '^100.1.0',
         '@pnpm.e2e/foo': '=100.0.0',
       },
     },
@@ -404,7 +404,7 @@ test('lockfile catalog snapshots retain existing entries on --filter', async () 
     default: {
       // The @pnpm.e2e/bar snapshot should be carried from the previous install,
       // despite the current filtered install not using it.
-      '@pnpm.e2e/bar': { specifier: '^100.0.0', version: '100.1.0' },
+      '@pnpm.e2e/bar': { specifier: '^100.1.0', version: '100.1.0' },
 
       '@pnpm.e2e/foo': { specifier: '=100.0.0', version: '100.0.0' },
     },
@@ -579,15 +579,15 @@ test('--fix-lockfile with --filter does not erase catalog snapshots', async () =
 
   const catalogs = {
     default: {
-      '@pnpm.e2e/bar': '^100.0.0',
-      '@pnpm.e2e/foo': '^100.0.0',
+      '@pnpm.e2e/bar': '^100.1.0',
+      '@pnpm.e2e/foo': '^100.1.0',
     },
   }
 
   const expectedCatalogsSnapshot: CatalogSnapshots = {
     default: {
-      '@pnpm.e2e/bar': { specifier: '^100.0.0', version: '100.1.0' },
-      '@pnpm.e2e/foo': { specifier: '^100.0.0', version: '100.1.0' },
+      '@pnpm.e2e/bar': { specifier: '^100.1.0', version: '100.1.0' },
+      '@pnpm.e2e/foo': { specifier: '^100.1.0', version: '100.1.0' },
     },
   }
 
@@ -893,9 +893,9 @@ test('catalog entry using npm alias can be reused', async () => {
 // pnpm-lock.yaml. This should happen even if the dependency is still defined in
 // a catalog under pnpm-workspace.yaml.
 //
-// Note that this behavior may not be desirable in all cases. If someone removes
+// This behavior may not be desirable in all cases. If someone removes
 // the last usage of a catalog entry, and another person adds it back later,
-// that dependency will be re-resolved to a newer version. This is probably
+// that dependency will be re-resolved to a newer version. This is likely
 // desirable most of the time, but there could be a good argument to cache the
 // older unused resolution. For now we'll remove the unused entries since that's
 // what would happen anyway if catalogs aren't used.
@@ -950,8 +950,8 @@ test('lockfile catalog snapshots should remove unused entries', async () => {
       'is-negative': { specifier: 'catalog:', version: '1.0.0' },
     })
     // Only "is-negative" should be in the catalogs section of the lockfile
-    // since all packages in the workspace no longer use is-positive. Note that
-    // this should be the case even if pnpm-workspace.yaml still has
+    // since all packages in the workspace no longer use is-positive. This
+    // should be the case even if pnpm-workspace.yaml still has
     // "is-positive" configured.
     expect(lockfile.catalogs?.default).toStrictEqual({
       'is-negative': { specifier: '=1.0.0', version: '1.0.0' },
@@ -1110,6 +1110,75 @@ test('catalogs work when inject-workspace-packages=true', async () => {
   expect(lockfile.snapshots).toStrictEqual({
     'is-positive@1.0.0': {},
     'project2@file:project2': {
+      dependencies: { 'is-positive': '1.0.0' },
+    },
+  })
+})
+
+// Regression test for https://github.com/pnpm/pnpm/issues/17280
+//
+// A relative workspace: path is claimed by the local resolver, not by the
+// workspace matching of the npm resolver. The injected package is not an
+// importer, so nothing else resolves its catalog: specifiers. Both
+// resolutions that walk the package are covered: recalculating the graph
+// over a lockfile that recorded the version the package pinned itself, and
+// a fresh lockfile.
+test('catalogs work in a package injected through a relative workspace: path', async () => {
+  expect.hasAssertions()
+
+  const { options, projects, readLockfile } = preparePackagesAndReturnObjects([
+    {
+      name: 'project1',
+      dependencies: {
+        'is-positive': 'catalog:project/common',
+        lib: 'workspace:../lib',
+      },
+    },
+  ])
+  fs.mkdirSync('lib')
+  const writeLib = (isPositiveSpecifier: string) => {
+    fs.writeFileSync('lib/package.json', JSON.stringify({
+      name: 'lib',
+      version: '1.0.0',
+      dependencies: {
+        'is-positive': isPositiveSpecifier,
+      },
+    }))
+  }
+
+  const install = () => mutateModules(installProjects(projects), {
+    ...options,
+    lockfileOnly: true,
+    injectWorkspacePackages: true,
+    preferFrozenLockfile: false,
+    catalogs: {
+      'project/common': { 'is-positive': '1.0.0' },
+    },
+  })
+
+  writeLib('1.0.0')
+  await install()
+  writeLib('catalog:project/common')
+  await expect(install()).resolves.not.toThrow()
+  fs.rmSync('pnpm-lock.yaml')
+  await expect(install()).resolves.not.toThrow()
+
+  expect(JSON.parse(fs.readFileSync('lib/package.json', 'utf8')).dependencies['is-positive']).toBe('catalog:project/common')
+
+  const lockfile = readLockfile()
+
+  expect(lockfile.importers).toEqual({
+    project1: {
+      dependencies: {
+        'is-positive': { specifier: 'catalog:project/common', version: '1.0.0' },
+        lib: { specifier: 'workspace:../lib', version: 'file:lib' },
+      },
+    },
+  })
+
+  expect(lockfile.snapshots).toStrictEqual({
+    'is-positive@1.0.0': {},
+    'lib@file:lib': {
       dependencies: { 'is-positive': '1.0.0' },
     },
   })
@@ -1416,7 +1485,7 @@ describe('add', () => {
       name: 'project1',
       dependencies: {},
     }])
-    const specifier = `http://localhost:${REGISTRY_MOCK_PORT}/is-positive/-/is-positive-1.0.0.tgz`
+    const specifier = `http://localhost:${REGISTRY_MOCK_PORT}/npm/is-positive/-/is-positive-1.0.0.tgz`
 
     const { updatedManifest, updatedCatalogs } = await addDependenciesToPackage(
       projects['project1' as ProjectId],

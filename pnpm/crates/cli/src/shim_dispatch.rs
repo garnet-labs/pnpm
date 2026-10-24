@@ -23,6 +23,7 @@
 
 pub(crate) mod native_shim;
 pub(crate) mod runtime_env;
+pub(crate) mod rust_toolchain;
 
 pub(crate) use native_shim::{
     ShimTarget, install_native_shim, is_legacy_context_aware_shim, migrate_legacy_shims,
@@ -44,8 +45,7 @@ use crate::{
 };
 use derive_more::Display;
 use identity::{local_bin_identity, provider_of_target};
-use native_shim::{dispatch_legacy_shim, try_native_dispatch};
-use pnpm_cmd_shim::{Host as CmdShimHost, ScriptRuntime, search_script_runtime};
+use native_shim::dispatch_legacy_shim;
 use pnpm_config::{
     Config, GlobalShims, GlobalShimsSetting, Host, LoadWorkspaceYamlError, ShimPolicy,
     WorkspaceSettings, default_config_dir, default_pnpm_home_dir, default_state_dir,
@@ -54,8 +54,13 @@ use pnpm_config::{
 use pnpm_crypto_hash::{create_hex_hash, create_hex_hash_bytes};
 use pnpm_engine_runtime_node_resolver::parse_node_specifier;
 use pnpm_package_manifest::is_runtime_alias;
-use run_program::{exec_program, exec_program_with_bin_dirs, run_held_program};
+use pnpm_rust_toolchain::{ToolchainRequest, rustup_settings_file};
+use run_program::{exec_program, exec_program_with_bin_dirs, run_global_target, run_held_program};
 use runtime_env::{PACKAGE_MANAGER_ENVS_DIR_NAME, trusted_runtime_config};
+use rust_toolchain::{
+    RUST_SHIM_PACKAGE, RustSelection, find_rust_candidate, overrides_toolchain, run_global_rust,
+    run_next_on_path, run_rust_toolchain,
+};
 use serde_json::Value;
 use settings::{
     is_automatic_runtime, manifest_package_manager_pin, package_manager_runs_promptless,
@@ -75,17 +80,74 @@ mod trust;
 /// sibling `node` shim included, inherit.
 const BYPASS_ENV: &str = "PNPM_SHIM_BYPASS";
 
-/// Intercept a launch under a shim name, or a legacy shim's `--shim`
-/// invocation of the dispatcher it replaced. `None` means this is pnpm
-/// itself and the regular CLI should proceed; `Some(code)` means the
-/// dispatch ran (or failed) and the process must exit with `code`. On Unix
-/// a successful dispatch never returns at all — the target is `exec`ed in
-/// place.
-pub(crate) fn try_dispatch(argv: &[OsString]) -> Option<i32> {
-    if argv.get(1).and_then(|arg| arg.to_str()) == Some("--shim") {
-        return Some(dispatch_legacy_shim(&argv[2..]));
+/// What this process was launched as, resolved once in [`crate::main`].
+///
+/// Classification reads the shim sidecar, so reading it again later in
+/// dispatch could observe a different answer when a shim install, removal,
+/// or migration lands in between: pnpm would then skip `--env-file`
+/// loading and run as the CLI, or inject the loaded environment into a
+/// newly detected shim target. Resolving once and carrying the verdict
+/// into dispatch keeps the `--env-file` gate and the dispatch consistent.
+pub(crate) enum ShimLaunch {
+    /// Plain pnpm; run the CLI.
+    Cli,
+    /// A legacy shim's `--shim` invocation.
+    Legacy,
+    /// A native shim launch with its recorded target.
+    Native { name: String, bin_dir: PathBuf, target: ShimTarget },
+    /// A shim launch whose target cannot be used. The message is already
+    /// formatted for stderr; dispatch prints it and exits 1.
+    Broken(String),
+}
+
+impl ShimLaunch {
+    /// Classify this launch: a legacy shim's `--shim` invocation, or an
+    /// executable carrying a native shim name with a recorded global
+    /// target. Anything else is pnpm itself. When the launch is a shim,
+    /// the arguments belong to the shim target and pnpm must not
+    /// interpret them (in particular, it must not load `--env-file`
+    /// files named there).
+    pub(crate) fn detect(argv: &[OsString]) -> Self {
+        if argv.get(1).and_then(|arg| arg.to_str()) == Some("--shim") {
+            return Self::Legacy;
+        }
+        match native_shim::resolve_native_launch() {
+            native_shim::NativeLaunch::Cli => Self::Cli,
+            native_shim::NativeLaunch::Dispatch { name, bin_dir, target } => {
+                Self::Native { name, bin_dir, target }
+            }
+            native_shim::NativeLaunch::Broken(message) => Self::Broken(message),
+        }
     }
-    try_native_dispatch(argv)
+
+    /// Whether this process was launched as a shim rather than as pnpm
+    /// itself.
+    pub(crate) fn is_shim(&self) -> bool {
+        !matches!(self, Self::Cli)
+    }
+
+    /// Intercept a launch under a shim name, or a legacy shim's `--shim`
+    /// invocation of the dispatcher it replaced. `None` means this is pnpm
+    /// itself and the regular CLI should proceed; `Some(code)` means the
+    /// dispatch ran (or failed) and the process must exit with `code`. On Unix
+    /// a successful dispatch never returns at all — the target is `exec`ed in
+    /// place.
+    pub(crate) fn dispatch(&self, argv: &[OsString]) -> Option<i32> {
+        match self {
+            Self::Cli => None,
+            Self::Legacy => Some(dispatch_legacy_shim(argv.get(2..).unwrap_or_default())),
+            Self::Native { name, bin_dir, target } => {
+                let invocation = ShimInvocation { name, bin_dir, target };
+                let settings = trusted_shim_settings();
+                let args = argv.get(1..).unwrap_or_default();
+                Some(dispatch_target(&invocation, args, &settings.shims, &settings.state_dir))
+            }
+            Self::Broken(message) => {
+                pnpm_diagnostics::eprintln!("{message}");
+                Some(1)
+            }
+        }
+    }
 }
 
 /// The shim being dispatched: its bin name, the directory it lives in
@@ -114,6 +176,9 @@ fn dispatch_target(
     if policy == ShimPolicy::Off {
         return run_global_target(shim, args);
     }
+    if package == RUST_SHIM_PACKAGE {
+        return dispatch_rust(shim, args, policy, state_dir);
+    }
     let candidate = std::env::current_dir()
         .ok()
         .and_then(|cwd| find_candidate(&cwd, name, &package))
@@ -135,6 +200,37 @@ fn dispatch_target(
             run_trusted_candidate(shim, candidate, args, state_dir)
         }
         _ => run_global_target(shim, args),
+    }
+}
+
+/// Run a Rust tool from the toolchain the project's toolchain file names,
+/// or step aside for the next one on `PATH` where no file applies.
+///
+/// A toolchain file selects only a release the Rust project signed, so
+/// `auto` runs it without the trust gate, as it does a signed Node.js
+/// release.
+fn dispatch_rust(
+    shim: &ShimInvocation<'_>,
+    args: &[OsString],
+    policy: ShimPolicy,
+    state_dir: &Path,
+) -> i32 {
+    if overrides_toolchain(args) {
+        return run_next_on_path(shim, args);
+    }
+    let rustup_settings = rustup_settings_file();
+    let Ok(cwd) = std::env::current_dir() else { return run_next_on_path(shim, args) };
+    match find_rust_candidate(&cwd, rustup_settings.as_deref()) {
+        RustSelection::Managed(candidate)
+            if matches!(policy, ShimPolicy::Auto | ShimPolicy::Always)
+                || is_trusted(&candidate, shim.name, state_dir) =>
+        {
+            run_trusted_candidate(shim, candidate, args, state_dir)
+        }
+        RustSelection::Unpinned => run_global_rust(shim, args, state_dir),
+        // An untrusted project file is not run, and rustup's own choices are
+        // rustup's to act on.
+        RustSelection::Managed(_) | RustSelection::Rustup => run_next_on_path(shim, args),
     }
 }
 
@@ -176,6 +272,9 @@ fn run_trusted_candidate(
         Candidate::PackageManagerPin { pm, version_spec, .. } => {
             run_package_manager_from_pin(state_dir, pm, &version_spec, name, args)
         }
+        Candidate::RustToolchain { request, .. } => {
+            run_rust_toolchain(state_dir, &request, name, args)
+        }
     }
 }
 
@@ -192,76 +291,6 @@ fn runtime_runs_promptless(policy: ShimPolicy, name: &str, version_spec: &str) -
         ShimPolicy::Auto => is_automatic_runtime(name, version_spec),
         ShimPolicy::Off | ShimPolicy::Prompt => false,
     }
-}
-
-/// Run the global target the way a direct cmd-shim would: a script runs
-/// under the interpreter its shebang names, taken from the bin dir when a
-/// sibling of that name is installed there (so a global tool runs on the
-/// global `node` shim) and from `PATH` otherwise; anything else executes
-/// as it is. A target-less shim has nothing to run and says so.
-fn run_global_target(shim: &ShimInvocation<'_>, args: &[OsString]) -> i32 {
-    let target = match shim.target {
-        ShimTarget::Installed(target) => target,
-        ShimTarget::Virtual(package) => {
-            eprintln!(
-                r#"ERR_PNPM_SHIM_NO_TARGET  Nothing provides {} in this project. Add {package} to it, or pin it with "packageManager" in package.json."#,
-                shim.name,
-            );
-            return 1;
-        }
-    };
-    match search_script_runtime::<CmdShimHost>(target) {
-        // `.cmd` and `.bat` targets go to `Command::new` directly (see
-        // `exec_program_with_path`) rather than through an explicit `cmd`.
-        Ok(Some(ScriptRuntime {
-            prog: Some(prog),
-            args: shebang_args,
-        })) if prog != "cmd" => {
-            let mut argv = split_shebang_args(&shebang_args);
-            argv.push(target.into());
-            argv.extend_from_slice(args);
-            exec_program(&interpreter_path(shim.bin_dir, &prog), &argv)
-        }
-        Ok(_) => exec_program(target, args),
-        Err(error) => {
-            eprintln!("pnpm: failed to read {}: {error}", target.display());
-            126
-        }
-    }
-}
-
-/// Where the shebang's interpreter comes from: the bin dir's own entry
-/// when there is one, else the bare name for a `PATH` lookup. An absolute
-/// interpreter path joins to itself.
-fn interpreter_path(bin_dir: &Path, prog: &str) -> PathBuf {
-    let sibling = bin_dir.join(prog);
-    if sibling.is_file() {
-        return sibling;
-    }
-    if cfg!(windows) {
-        let sibling = bin_dir.join(format!("{prog}.exe"));
-        if sibling.is_file() {
-            return sibling;
-        }
-    }
-    PathBuf::from(prog)
-}
-
-/// The interpreter arguments a shebang carries, split the way the shell
-/// running a cmd-shim would split them. A line the shell could not parse
-/// (an unbalanced quote) falls back to whitespace splitting.
-fn split_shebang_args(shebang_args: &str) -> Vec<OsString> {
-    let words = shell_words::split(shebang_args)
-        .unwrap_or_else(|_| {
-            shebang_args
-                .split_whitespace()
-                .map(str::to_string)
-                .collect()
-        });
-    words
-        .into_iter()
-        .map(OsString::from)
-        .collect()
 }
 
 fn bypass_requested() -> bool {
@@ -289,6 +318,9 @@ enum Candidate {
         manifest_hash: String,
         identity: String,
     },
+    /// A rustup toolchain file at `project_dir` names a Rust release, which
+    /// is installed into the store on demand.
+    RustToolchain { project_dir: PathBuf, request: ToolchainRequest, identity: String },
 }
 
 impl Candidate {
@@ -296,7 +328,8 @@ impl Candidate {
         match self {
             Candidate::LocalBin { project_dir, .. }
             | Candidate::RuntimePin { project_dir, .. }
-            | Candidate::PackageManagerPin { project_dir, .. } => project_dir,
+            | Candidate::PackageManagerPin { project_dir, .. }
+            | Candidate::RustToolchain { project_dir, .. } => project_dir,
         }
     }
 
@@ -304,7 +337,8 @@ impl Candidate {
         match self {
             Candidate::LocalBin { identity, .. }
             | Candidate::RuntimePin { identity, .. }
-            | Candidate::PackageManagerPin { identity, .. } => identity,
+            | Candidate::PackageManagerPin { identity, .. }
+            | Candidate::RustToolchain { identity, .. } => identity,
         }
     }
 }
@@ -403,7 +437,9 @@ fn run_runtime_from_store(
         }) => run_held_program(&bin, &[], args, vec![private_install]),
         Ok(MaterializedRuntime { bin, private_install: None }) => exec_program(&bin, args),
         Err(error) => {
-            eprintln!("pnpm: failed to prepare {name}@runtime:{version_spec}: {error:?}");
+            pnpm_diagnostics::eprintln!(
+                "pnpm: failed to prepare {name}@runtime:{version_spec}: {error:?}",
+            );
             1
         }
     }
@@ -426,7 +462,7 @@ fn run_package_manager_from_pin(
     let result = crate::block_on_runtime("pacquet-global-shim-pm", async move {
         let config = Config::leak(trusted_package_manager_config(&state_dir)?);
         let _quiet = EventFilter::All.apply();
-        provision::<CliReporter>(config, pm, &spec).await
+        Box::pin(provision::<CliReporter>(config, pm, &spec)).await
     });
     match result {
         Ok(engine) => {
@@ -443,7 +479,10 @@ fn run_package_manager_from_pin(
             }
         }
         Err(error) => {
-            eprintln!("pnpm: failed to prepare {}@{version_spec}: {error:?}", pm.name());
+            pnpm_diagnostics::eprintln!(
+                "pnpm: failed to prepare {}@{version_spec}: {error:?}",
+                pm.name(),
+            );
             1
         }
     }

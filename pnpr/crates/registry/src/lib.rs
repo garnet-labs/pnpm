@@ -212,24 +212,6 @@ impl Registries {
             })
     }
 
-    #[must_use]
-    pub fn is_only_ecosystem(&self, ecosystem: Ecosystem) -> bool {
-        self.has_ecosystem(ecosystem)
-            && Ecosystem::all()
-                .all(|candidate| candidate == ecosystem || !self.has_ecosystem(candidate))
-    }
-
-    /// The path an ecosystem's endpoints sit under: nothing when it is the
-    /// only one served, `/<ecosystem>` when it shares the server.
-    ///
-    /// Every URL pnpr writes about itself and every route it mounts starts
-    /// here, so the decision lives in one place rather than being spelled out
-    /// again at each of them.
-    #[must_use]
-    pub fn base_path(&self, ecosystem: Ecosystem) -> String {
-        if self.is_only_ecosystem(ecosystem) { String::new() } else { format!("/{ecosystem}") }
-    }
-
     fn concrete_ecosystem(&self, registry: &str) -> Ecosystem {
         self.ecosystems
             .get(registry)
@@ -342,7 +324,7 @@ impl Registries {
             }
             // Validation guarantees every source is a defined concrete
             // registry; a non-concrete entry here can only mean the graph was
-            // built without validation, and it simply never matches.
+            // built without validation, and it never matches.
             Registry::Router { sources } => sources
                 .iter()
                 .filter_map(|source| self.entries.get_key_value(source))
@@ -472,7 +454,7 @@ impl Registries {
             Registry::Router { sources } => {
                 // A router with no sources can never serve any package —
                 // every request through it is a 404. That's only ever a
-                // config mistake (a hosted/upstream registry was probably
+                // config mistake (a hosted/upstream registry was likely
                 // intended), so reject it.
                 if sources.is_empty() {
                     return Err(RegistryConfigError::EmptyRouter { router: name.to_string() });

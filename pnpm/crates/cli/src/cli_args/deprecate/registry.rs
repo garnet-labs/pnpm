@@ -1,11 +1,15 @@
 use super::{
-    BTreeMap, DEPRECATION_BODY_LIMIT, DEPRECATION_ERROR_BODY_LIMIT, DeprecateContext,
-    DeprecateError, Deserialize, LimitedBody, Response, Serialize, StatusCode,
-    parse_wanted_dependency, pick_registry_for_package, read_limited_body, redact_url_credentials,
+    BTreeMap, DEPRECATION_ERROR_BODY_LIMIT, DeprecateContext, DeprecateError, Deserialize,
+    LimitedBody, Response, Serialize, StatusCode, read_limited_body, redact_url_credentials,
     retry_async, sanitize, send_with_retry,
 };
-use crate::cli_args::registry_client::join_registry_endpoint;
-use pnpm_network::escaped_package_name;
+use crate::cli_args::{
+    package_spec::PackageSpec,
+    registry_client::{
+        PACKAGE_DOCUMENT_BODY_LIMIT, apply_auth_and_otp, auth_header_for_package,
+        package_endpoint_url, resolve_target_registry_for_package,
+    },
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PackageMeta {
@@ -59,12 +63,8 @@ async fn fetch_package_meta_once<Meta: serde::de::DeserializeOwned>(
 ) -> Result<Meta, FetchError> {
     let (_guard, response) =
         send_with_retry(&context.http_client, url, context.retry_opts, |client| {
-            let mut builder = client.get(url);
-            if let Some(auth_header) = auth_header {
-                builder = builder.header("authorization", auth_header);
-            }
             // Need full metadata for put update.
-            builder
+            apply_auth_and_otp(client.get(url), auth_header, None)
         })
         .await
         .map_err(FetchError::Request)?;
@@ -77,11 +77,12 @@ async fn fetch_package_meta_once<Meta: serde::de::DeserializeOwned>(
     }
     if response
         .content_length()
-        .is_some_and(|length| length > DEPRECATION_BODY_LIMIT as u64)
+        .is_some_and(|length| length > PACKAGE_DOCUMENT_BODY_LIMIT as u64)
     {
         return Err(FetchError::BodyTooLarge);
     }
-    let body = read_limited_body(response, DEPRECATION_BODY_LIMIT).await.map_err(FetchError::Body)?;
+    let body =
+        read_limited_body(response, PACKAGE_DOCUMENT_BODY_LIMIT).await.map_err(FetchError::Body)?;
     if body.truncated {
         return Err(FetchError::BodyTooLarge);
     }
@@ -97,7 +98,7 @@ fn map_fetch_error(error: FetchError, package_name: &str) -> miette::Report {
         }
         FetchError::BodyTooLarge => DeprecateError::RegistryResponseTooLarge {
             resource: "package metadata",
-            limit: DEPRECATION_BODY_LIMIT,
+            limit: PACKAGE_DOCUMENT_BODY_LIMIT,
         }
         .into(),
         FetchError::NotFound => {
@@ -125,17 +126,11 @@ pub(super) async fn put_package_meta(
     let body = serde_json::to_string(package_meta).expect("a struct serializes");
     let (_guard, response) =
         send_with_retry(&context.http_client, url, context.retry_opts, |client| {
-            let mut builder = client
+            let builder = client
                 .put(url)
                 .header("content-type", "application/json")
                 .body(body.clone());
-            if let Some(auth_header) = auth_header {
-                builder = builder.header("authorization", auth_header);
-            }
-            if let Some(otp) = otp {
-                builder = builder.header("npm-otp", otp);
-            }
-            builder
+            apply_auth_and_otp(builder, auth_header, otp)
         })
         .await
         .map_err(|source| {
@@ -202,7 +197,12 @@ where
 }
 
 pub(crate) fn registry_for_package(context: &DeprecateContext<'_>, package_name: &str) -> String {
-    pick_registry_for_package(&context.registries, package_name, None)
+    resolve_target_registry_for_package(
+        &context.registries,
+        context.registry_override,
+        package_name,
+        None,
+    )
 }
 
 pub(crate) fn auth_header_for_registry(
@@ -210,20 +210,17 @@ pub(crate) fn auth_header_for_registry(
     registry_url: &str,
     package_name: &str,
 ) -> Option<String> {
-    context.config.auth_headers.for_url_with_package(registry_url, Some(package_name))
+    auth_header_for_package(context.config, registry_url, package_name)
 }
 
 pub(crate) fn package_url(package_name: &str, registry_url: &str) -> miette::Result<String> {
     let package_name = package_name_for_url(package_name)?;
-    registry_endpoint_url(registry_url, &escaped_package_name(&package_name))
+    package_endpoint_url(registry_url, &package_name)
+        .map_err(|source| registry_operation_error("build registry URL", source))
 }
 
 pub(crate) fn package_name_for_url(package_name: &str) -> Result<String, DeprecateError> {
-    parse_wanted_dependency(package_name).alias
+    PackageSpec::parse(package_name)
+        .map(|spec| spec.name)
         .ok_or_else(|| DeprecateError::InvalidPackageSpec { spec: package_name.to_string() })
-}
-
-pub(crate) fn registry_endpoint_url(registry_url: &str, path: &str) -> miette::Result<String> {
-    join_registry_endpoint(registry_url, path)
-        .map_err(|source| registry_operation_error("build registry URL", source))
 }

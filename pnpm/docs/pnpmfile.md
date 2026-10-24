@@ -9,6 +9,10 @@ pnpm lets you hook directly into the installation process via special functions
 By default, `.pnpmfile.mjs` should be located in the same directory as the
 lockfile. For instance, in a [workspace](workspaces.md) with a shared lockfile,
 `.pnpmfile.mjs` should be in the root of the monorepo.
+In a workspace where each project has its own lockfile
+(`sharedWorkspaceLockfile: false`), each project runs the hooks of the
+pnpmfile in its own directory, then those of the pnpmfile in the root of the
+monorepo.
 
 ## Hooks
 
@@ -17,19 +21,22 @@ lockfile. For instance, in a [workspace](workspaces.md) with a shared lockfile,
 | Hook Function                                         | Process                                                    | Uses                                               |
 |-------------------------------------------------------|------------------------------------------------------------|----------------------------------------------------|
 | `hooks.readPackage(pkg, context): pkg`                | Called after pnpm parses the dependency's package manifest | Allows you to mutate a dependency's `package.json`. |
+| `hooks.updateConfig(config): config`                  | Called after pnpm reads its configuration                  | Allows you to change pnpm's settings.              |
+| `hooks.preResolution(options)`                        | Called before the dependencies are resolved                | Allows you to run code with access to the lockfiles. |
 | `hooks.afterAllResolved(lockfile, context): lockfile` | Called after the dependencies have been resolved.          | Allows you to mutate the lockfile.                 |
-| `hooks.beforePacking(pkg): pkg`                       | Called before creating a tarball during pack/publish       | Allows you to customize the published `package.json` |
+| `hooks.beforePacking(pkg, dir, context): pkg`         | Called before creating a tarball during pack/publish       | Allows you to customize the published `package.json` |
 | `resolvers`                                           | Called during package resolution.                          | Allows you to register custom package resolvers.  |
 | `fetchers`                                            | Called during package fetching.                            | Allows you to register custom package fetchers.   |
+| `finders`                                             | Called by `pnpm list` and `pnpm why` with `--find-by`.     | Allows you to register custom package filters.    |
 
 ### `hooks.readPackage(pkg, context): pkg | Promise<pkg>`
 
-Allows you to mutate a dependency's `package.json` after parsing and prior to
+Allows you to mutate a dependency's `package.json` after parsing and before
 resolution. These mutations are not saved to the filesystem, however, they will
 affect what gets resolved in the lockfile and therefore what gets installed.
 
-Note that you will need to delete the `pnpm-lock.yaml` if you have already
-resolved the dependency you want to modify.
+pnpm records a checksum of the pnpmfile in the lockfile. When the pnpmfile
+changes, pnpm resolves the affected dependencies again.
 
 :::tip
 
@@ -79,12 +86,10 @@ export const hooks = {
 Removing the `scripts` field from a dependency's manifest via `readPackage` will
 not prevent pnpm from building the dependency. When building a dependency, pnpm
 reads the `package.json` of the package from the package's archive, which is not
-affected by the hook. In order to ignore a package's build, use the
+affected by the hook. To ignore a package's build, use the
 [allowBuilds](settings/build.md#allowbuilds) field.
 
 ### `hooks.updateConfig(config): config | Promise<config>`
-
-Added in: v10.8.0
 
 Allows you to modify the configuration settings used by pnpm. This hook is most useful when paired with [configDependencies](config-dependencies), allowing you to share and reuse settings across different Git repositories.
 
@@ -118,8 +123,35 @@ Two entries describe registry routing and credentials:
   registry) to the registry URL packages of that scope are fetched from.
   Rewriting the map redirects those fetches, except for the routes given on
   the command line.
-* `configByUri` maps a registry URI to its credentials, the way pnpm 11
-  reports them.
+* `configByUri` maps a registry URI to its credentials.
+
+#### Registry routing
+
+Returning `registriesByScope` replaces the routing map. Scopes omitted from
+the returned map use its `default` registry, or the previously configured main
+registry if `default` is omitted. The built-in `@jsr` route remains unless
+explicitly overridden. This hook changes the fallback registry:
+
+```js title=".pnpmfile.mjs"
+export const hooks = {
+  updateConfig (config) {
+    return {
+      ...config,
+      registriesByScope: {
+        default: 'https://registry.example.com/',
+      },
+    }
+  },
+}
+```
+
+To preserve existing scope routes while changing one route, spread
+`...config.registriesByScope` into the returned map before the overrides.
+
+A returned `registries` key is the [`registries` setting](settings/dependency-resolution.md#registries),
+not the routing map. It merges per key with existing configuration. Returning
+`registries: { default: ... }` therefore changes the main registry but leaves
+scope routes from `.npmrc` in place.
 
 #### Settings given on the command line
 
@@ -162,14 +194,12 @@ export const hooks = {
 }
 ```
 
-#### Known Limitations
+#### Known limitations
 
 There are none - anything that can be done with the lockfile can be modified via
 this function, and you can even extend the lockfile's functionality.
 
-### `hooks.beforePacking(pkg): pkg | Promise<pkg>`
-
-Added in: v10.28.0
+### `hooks.beforePacking(pkg, dir, context): pkg | Promise<pkg>` {#hooksbeforepackingpkg-pkg--promisepkg}
 
 Allows you to modify the `package.json` manifest before it is packed into a tarball during `pnpm pack` or `pnpm publish`. This is useful for customizing the published package without affecting your local development `package.json`.
 
@@ -178,6 +208,9 @@ Unlike `hooks.readPackage`, which modifies how dependencies are resolved during 
 #### Arguments
 
 * `pkg` - The package manifest object that will be included in the published tarball.
+* `dir` - The directory of the project being packed.
+* `context` - Context object for the step. Method `#log(msg)` allows you to use
+a debug log for the step.
 
 #### Usage example
 
@@ -223,24 +256,16 @@ This hook is executed after reading and parsing the lockfiles of the project, bu
 * `options.storeDir` - The location of the store directory.
 * `options.registries` - A map of scopes to registry URLs.
 
-### `hooks.importPackage(destinationDir, options): Promise<string | undefined>`
+### `hooks.importPackage(destinationDir, options)`
 
-:::warning Deprecated in v11.23.0
+:::danger Removed in v12.0.0
 
-`importPackage` is deprecated and will be removed in the next major version. pnpm warns when a pnpmfile defines it, and defining it opts the installation out of the parallel package importer, making installation slower. If you rely on this hook, comment on [#14101](https://github.com/pnpm/pnpm/issues/14101).
+pnpm ignores the `importPackage` hook and warns when a pnpmfile defines it.
+Use the [`packageImportMethod`](./settings/node-modules.md#packageimportmethod)
+setting to choose how packages are written to `node_modules`. If you rely on
+this hook, comment on [#14101](https://github.com/pnpm/pnpm/issues/14101).
 
 :::
-
-This hook allows to change how packages are written to `node_modules`. The return value is optional and states what method was used for importing the dependency, e.g.: clone, hardlink.
-
-#### Arguments
-
-* `destinationDir` - The destination directory where the package should be written.
-* `options.disableRelinkLocalDirDeps`
-* `options.filesMap`
-* `options.force`
-* `options.resolvedFrom`
-* `options.keepModulesDir`
 
 ### `hooks.filterLog(log): boolean` {#hooksfilterlog}
 
@@ -264,33 +289,10 @@ choose how much pnpm reports.
 
 ## Finders
 
-Added in: v10.16.0
+A pnpmfile can export `finders`, functions that `pnpm list` and `pnpm why` use
+with the `--find-by` flag. See [Finders](./finders.md).
 
-Finder functions are used with `pnpm list` and `pnpm why` via the `--find-by` flag.
-
-Example:
-
-```js title=".pnpmfile.mjs"
-export const finders = {
-  react17: (ctx) => {
-    return ctx.readManifest().peerDependencies?.react === "^17.0.0"
-  }
-}
-```
-
-Usage:
-
-```sh
-pnpm why --find-by=react17
-```
-
-See [Finders] for more details.
-
-[Finders]: ./finders.md
-
-## Custom Resolvers and Fetchers
-
-Added in: v11.0.0
+## Custom resolvers and fetchers
 
 Custom resolvers and fetchers allow you to implement custom package resolution and fetching logic for new package identifier schemes (like `my-protocol:package-name`). They are registered as top-level exports in `.pnpmfile.cjs`:
 
@@ -301,7 +303,7 @@ module.exports = {
 }
 ```
 
-#### TypeScript Interfaces
+#### TypeScript interfaces
 
 ```typescript
 interface CustomResolver {
@@ -316,11 +318,11 @@ interface CustomFetcher {
 }
 ```
 
-### Custom Resolvers
+### Custom resolvers
 
 Custom resolvers convert package descriptors (e.g., `foo@^1.0.0`) into resolutions that are stored in the lockfile.
 
-#### Resolver Interface
+#### Resolver interface
 
 A custom resolver is an object that can implement any combination of the following methods:
 
@@ -376,11 +378,11 @@ Return `true` to trigger full resolution of all packages, skipping the "Lockfile
 
 :::
 
-### Custom Fetchers
+### Custom fetchers
 
 Custom fetchers completely handle fetching for custom package types, downloading package contents from custom sources and storing them in pnpm's content-addressable file system.
 
-#### Fetcher Interface
+#### Fetcher interface
 
 A custom fetcher is an object that can implement the following methods:
 
@@ -423,8 +425,6 @@ A fetch result is an object with:
 
 #### Delegating to the built-in fetchers
 
-Added in: v11.12.0
-
 Rather than fetching the package itself, a custom fetcher may hand the work back to pnpm. There are two ways to do this.
 
 **Return a `{ delegate }` envelope.** Instead of a fetch result, return an object with a single `delegate` key holding the resolution pnpm should fetch instead. pnpm rewrites the package's resolution to that shape and runs its built-in fetch path on it:
@@ -453,9 +453,9 @@ The `{ delegate }` envelope is the only delegation form that works in every pnpm
 
 :::
 
-#### Usage Examples
+#### Usage examples
 
-##### Basic Custom Resolver
+##### Basic custom resolver
 
 This example shows a custom resolver that resolves packages from a custom registry:
 
@@ -488,7 +488,7 @@ module.exports = {
 }
 ```
 
-##### Custom Resolver and Fetcher with `shouldRefreshResolution`
+##### Custom resolver and fetcher with `shouldRefreshResolution`
 
 This example shows a resolver and fetcher working together with a custom resolution type and time-based cache invalidation:
 
@@ -544,7 +544,7 @@ module.exports = {
 }
 ```
 
-##### Basic Custom Fetcher
+##### Basic custom fetcher
 
 This example shows a custom fetcher that fetches certain packages from a different source:
 
@@ -573,7 +573,7 @@ module.exports = {
 }
 ```
 
-##### Custom Resolution Type with Resolver and Fetcher
+##### Custom resolution type with resolver and fetcher
 
 This example shows a custom resolver and fetcher working together with a custom resolution type:
 
@@ -616,17 +616,17 @@ module.exports = {
 }
 ```
 
-#### Priority and Ordering
+#### Priority and ordering
 
 When multiple resolvers are registered, they are checked in order. The first resolver where `canResolve` returns `true` will be used for resolution. The same applies for fetchers: The first fetcher where `canFetch` returns `true` will be used during the fetch phase.
 
 Custom resolvers are tried before pnpm's built-in resolvers (npm, git, tarball, etc.), giving you full control over package resolution.
 
-#### Performance Considerations
+#### Performance considerations
 
 `canResolve()`, `canFetch()`, and `shouldRefreshResolution()` should be cheap checks (ideally synchronous), as they're called for every dependency during resolution.
 
-## Related Configuration
+## Related configuration
 
 ### ignorePnpmfile
 
@@ -638,11 +638,11 @@ want to make sure that no script gets executed during install.
 
 ### pnpmfile
 
-* Default: **['.pnpmfile.mjs']**
+* Default: **['.pnpmfile.mjs']**, or **['.pnpmfile.cjs']** if there is no `.pnpmfile.mjs`
 * Type: **path[]**
 * Example: **['.pnpm/.pnpmfile.mjs']**
 
-The location of the local pnpmfile(s).
+The location of the local pnpmfiles.
 
 ### globalPnpmfile
 

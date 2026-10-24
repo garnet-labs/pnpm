@@ -272,9 +272,12 @@ fn candidates_carry_the_metadata_file_an_index_advertises() {
     let mut legacy = wheel("demo-2.0.0-py3-none-any.whl");
     legacy["dist-info-metadata"] = serde_json::json!(true);
     let plain = wheel("demo-3.0.0-py3-none-any.whl");
+    let mut both = wheel("demo-4.0.0-py3-none-any.whl");
+    both["core-metadata"] = serde_json::json!(true);
+    both["dist-info-metadata"] = serde_json::json!({ "sha256": "d".repeat(64) });
 
     let candidates = candidates_from_page(
-        &page(&serde_json::json!([declared, legacy, plain])),
+        &page(&serde_json::json!([declared, legacy, plain, both])),
         &index_url(),
         &name("demo"),
         &target(),
@@ -292,6 +295,14 @@ fn candidates_carry_the_metadata_file_an_index_advertises() {
         "the legacy spelling declares the file without digests",
     );
     assert_eq!(candidates[&Version::from_str("3.0.0").unwrap()].core_metadata().cloned(), None);
+    assert_eq!(
+        candidates[&Version::from_str("4.0.0").unwrap()]
+            .core_metadata()
+            .and_then(|digests| digests.get("sha256"))
+            .cloned(),
+        Some("d".repeat(64)),
+        "the field that publishes a SHA-256 wins over one that only declares the file",
+    );
 }
 
 #[test]
@@ -1037,7 +1048,7 @@ fn a_source_distribution_filename_is_read_against_the_distribution_it_is_publish
 
 /// Item 5 of pnpm/pnpm#14945: an empty version set says nothing about
 /// whether the distribution exists, publishes anything installable, or
-/// simply has no version the project asked for.
+/// has no version the project asked for.
 #[test]
 fn a_resolution_failure_says_why_a_distribution_offered_nothing() {
     let target = target();

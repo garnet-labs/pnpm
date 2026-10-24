@@ -32,7 +32,7 @@ pnx shx@catalog:
 
 Added in: v12.0.0-rc.6 (pnpm v12 only)
 
-Naming one of the [package managers pnpm provisions](../package-managers.md) (`npm`, `yarn`, `bun`), or a runtime (`node`, `deno`, `bun`), provisions the real thing instead of installing the npm package that shares its name:
+Naming one of the [package managers pnpm provisions](../package-managers.md) (`pnpm`, `npm`, `yarn`, `bun`), or a runtime (`node`, `deno`, `bun`), provisions the real thing instead of installing the npm package that shares its name:
 
 ```sh
 pnx yarn@4 install
@@ -41,7 +41,7 @@ pnx bun@1.3.0 install
 pnx node@22 --version
 ```
 
-Those npm packages are either a different line of the tool or a wrapper that downloads it, so this is what naming them was always meant to do: `pnx yarn@4` used to fail with a missing version, since Yarn 4 is published as `@yarnpkg/cli-dist`, and `pnx node@22` used to run a wrapper that downloads a Node.js build rather than that release itself.
+The npm packages with those names are either a different line of the tool or a wrapper that downloads it. For example, Yarn 4 is published as `@yarnpkg/cli-dist`, so `pnx yarn@4` runs Yarn 4 itself, and `pnx node@22` runs that Node.js release.
 
 A specifier that locates a package rather than asking for a released version installs what it names, unchanged:
 
@@ -55,6 +55,18 @@ pnx yarn@yarnpkg/berry
 ```sh
 pnx --package npm@11 npx create-something
 ```
+
+### Running a Rust release
+
+Added in: v12.11.1
+
+`--package=rust@<channel>` runs a tool of that [Rust toolchain](../cargo.md#rust-toolchain) release, such as `cargo` or `rustc`. pnpm installs the release into the store first. The channel is written the way `rust-toolchain.toml` writes it, and a bare `rust` means `stable`.
+
+```sh
+pnx --package=rust@nightly-2026-01-01 cargo build --target wasm32-unknown-unknown
+```
+
+The release gets the profile, components, and targets of the `rust-toolchain.toml` that governs the current directory, plus the target of each `--target` argument.
 
 ## Options
 
@@ -77,9 +89,7 @@ pnx --package=yo --package=generator-webapp yo webapp --skip-install
 
 ### --allow-build
 
-Added in: v10.2.0
-
-A list of package names that are allowed to run postinstall scripts during installation.
+A list of package names that are allowed to run build scripts during installation.
 
 Example:
 
@@ -87,7 +97,7 @@ Example:
 pnx --allow-build=esbuild my-bundler bundle
 ```
 
-The actual packages executed by `dlx` are allowed to run postinstall scripts by default. So if in the above example `my-bundler` has to be built before execution, it will be built.
+The actual packages executed by `pnx` are allowed to run build scripts by default. So if in the above example `my-bundler` has to be built before execution, it will be built.
 
 When a dependency's build scripts are skipped, `pnx` prompts you to approve them in an interactive terminal. This also applies when reusing a cached install that still has builds awaiting approval. Approved scripts run before the requested command.
 
@@ -97,12 +107,20 @@ Without an interactive terminal, unapproved build scripts remain skipped. Use `-
 
 ### --shell-mode, -c
 
-Runs the command inside of a shell. Uses `/bin/sh` on UNIX and `\cmd.exe` on Windows.
+Runs the command inside of a shell. Uses `/bin/sh` on UNIX and `cmd.exe` on Windows.
 
 Example:
 
 ```sh
 pnx --package cowsay --package lolcatjs -c 'echo "hi pnpm" | cowsay | lolcatjs'
+```
+
+### --cpu, --os, --libc
+
+Choose which platform-tagged optional dependencies the `pnx` install keeps, by CPU architecture, operating system, and C library (`glibc` or `musl`). Repeat an option or separate values with commas:
+
+```sh
+pnx --cpu arm64,x64 --os linux some-cli
 ```
 
 ### --silent, -s
@@ -111,7 +129,7 @@ Only the output of the executed command is printed.
 
 ## Security and trust policies
 
-Since v11.0.0, `pnx` (and its `pnpm dlx` / `pnpx` aliases) honors the project-level security and trust policy settings when resolving and fetching the requested package:
+`pnx` (and its `pnpm dlx` / `pnpx` aliases) honors the project-level security and trust policy settings when resolving and fetching the requested package:
 
 * [`minimumReleaseAge`](../settings/dependency-resolution.md#minimumreleaseage), [`minimumReleaseAgeExclude`](../settings/dependency-resolution.md#minimumreleaseageexclude), [`minimumReleaseAgeStrict`](../settings/dependency-resolution.md#minimumreleaseagestrict)
 * [`trustPolicy`](../settings/dependency-resolution.md#trustpolicy), [`trustPolicyExclude`](../settings/dependency-resolution.md#trustpolicyexclude), [`trustPolicyIgnoreAfter`](../settings/dependency-resolution.md#trustpolicyignoreafter)

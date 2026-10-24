@@ -27,6 +27,49 @@ fn filter_log_is_ignored_with_a_warning() {
     drop(root);
 }
 
+#[test]
+fn import_package_is_ignored_with_a_warning() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    fs::write(workspace.join("package.json"), "{}").expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { importPackage: async () => 'hardlink' } }",
+    )
+    .expect("write importPackage hook");
+
+    let output = pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    assert_eq!(stdout.matches("importPackage hook").count(), 1, "STDOUT:\n{stdout}");
+    assert!(stdout.contains(".pnpmfile.cjs) is ignored"), "STDOUT:\n{stdout}");
+    assert!(stdout.contains("packageImportMethod"), "STDOUT:\n{stdout}");
+
+    drop(root);
+}
+
+#[test]
+fn a_pnpmfile_without_ignored_hooks_prints_no_ignored_hook_warning() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    fs::write(workspace.join("package.json"), "{}").expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { readPackage: (pkg) => pkg } }",
+    )
+    .expect("write readPackage hook");
+
+    let output = pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    assert!(!stdout.contains("importPackage"), "STDOUT:\n{stdout}");
+    assert!(!stdout.contains("filterLog"), "STDOUT:\n{stdout}");
+
+    drop(root);
+}
+
 /// The `pnpmfile` setting names the file, and Node decides its module format
 /// from the nearest `package.json`: the same `.js` pnpmfile is an ES module
 /// under `"type": "module"` and a script under `"type": "commonjs"`. Each
@@ -581,14 +624,9 @@ fn update_config_applies_to_sbom() {
     assert_runs_update_config_and_succeeds(&["sbom", "--sbom-format", "cyclonedx"]);
 }
 
-/// The mocked registry serves no audit endpoint, so the request `audit`
-/// makes after the hook has run is the first thing that fails.
 #[test]
 fn update_config_applies_to_audit() {
-    let output = run_after_install_with_marker_hook(&["audit"]);
-    assert!(!output.status.success(), "audit should fail without an audit endpoint");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS"), "STDERR:\n{stderr}");
+    assert_runs_update_config_and_succeeds(&["audit"]);
 }
 
 #[test]
@@ -1418,6 +1456,102 @@ patchedDependencies:
             );
         }
     }
+
+    drop((root, mock_instance));
+}
+
+/// A workspace whose projects keep their own lockfiles, with `root_pnpmfile`
+/// at the workspace root and `projects` as `(name, manifest)` pairs.
+fn write_own_lockfile_workspace(
+    workspace: &Path,
+    root_pnpmfile: &str,
+    projects: &[(&str, serde_json::Value)],
+) {
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\ninjectWorkspacePackages: true\ndedupeInjectedDeps: false\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "name": "root", "private": true }).to_string(),
+    )
+    .expect("write root package.json");
+    fs::write(workspace.join(".pnpmfile.cjs"), root_pnpmfile).expect("write root pnpmfile");
+    for (name, manifest) in projects {
+        let dir = workspace.join("packages").join(name);
+        fs::create_dir_all(&dir).expect("mkdir project");
+        fs::write(dir.join("package.json"), manifest.to_string()).expect("write project manifest");
+    }
+}
+
+/// pnpm loads the workspace root's pnpmfile for a project with its own
+/// lockfile too, and records its checksum there.
+#[test]
+fn root_pnpmfile_applies_to_a_project_with_its_own_lockfile() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_own_lockfile_workspace(
+        &workspace,
+        "module.exports = { hooks: { readPackage (pkg) { if (pkg.name === 'is-positive') pkg.dependencies = { ...pkg.dependencies, 'is-negative': '1.0.0' }; return pkg } } }\n",
+        &[(
+            "app",
+            serde_json::json!({ "name": "app", "version": "1.0.0", "dependencies": { "is-positive": "1.0.0" } }),
+        )],
+    );
+
+    pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let lockfile = fs::read_to_string(workspace.join("packages/app/pnpm-lock.yaml"))
+        .expect("read the project's lockfile");
+    assert!(lockfile.contains("pnpmfileChecksum"), "{lockfile}");
+    assert!(lockfile.contains("is-negative@1.0.0"), "{lockfile}");
+
+    drop((root, mock_instance));
+}
+
+/// The consumer's lockfile records an injected project as the root
+/// pnpmfile rewrote it, and the frozen install compares it with the
+/// rewritten manifest.
+#[test]
+fn frozen_install_accepts_an_injected_project_the_root_pnpmfile_rewrites() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_own_lockfile_workspace(
+        &workspace,
+        "module.exports = { hooks: { readPackage (pkg) { if (pkg.name === 'lib') pkg.dependencies['is-positive'] = '2.0.0'; return pkg } } }\n",
+        &[
+            (
+                "lib",
+                serde_json::json!({ "name": "lib", "version": "1.0.0", "dependencies": { "is-positive": "1.0.0" } }),
+            ),
+            (
+                "app",
+                serde_json::json!({ "name": "app", "version": "1.0.0", "dependencies": { "lib": "workspace:*" } }),
+            ),
+        ],
+    );
+
+    pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = fs::read_to_string(workspace.join("packages/app/pnpm-lock.yaml"))
+        .expect("read the consumer's lockfile");
+    assert!(lockfile.contains("is-positive@2.0.0"), "{lockfile}");
+
+    for dir in ["node_modules", "packages/lib/node_modules", "packages/app/node_modules"] {
+        let _ = fs::remove_dir_all(workspace.join(dir));
+    }
+    pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
 
     drop((root, mock_instance));
 }

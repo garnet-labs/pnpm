@@ -23,7 +23,6 @@ import type { InstallOptions, ProcessedInstallOptions as StrictInstallOptions } 
 
 export interface InstallMutationOptions {
   update?: boolean
-  updatePatches?: boolean
   updateToLatest?: boolean
   updateMatching?: UpdateMatchingFunction
   updatePackageManifest?: boolean
@@ -72,6 +71,8 @@ export interface InstallResult {
   ignoredBuilds: IgnoredBuilds | undefined
   /** Forwarded from {@link MutateModulesResult.newLockfile}. */
   newLockfile?: LockfileObject
+  /** Forwarded from {@link MutateModulesResult.wantedLockfile}. */
+  wantedLockfile?: LockfileObject
   /** Forwarded from {@link MutateModulesResult.resolutionPolicyViolations}. */
   resolutionPolicyViolations: ResolutionPolicyViolation[]
   /** Forwarded from {@link MutateModulesResult.dryRunResult}. */

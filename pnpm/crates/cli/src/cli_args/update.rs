@@ -2,6 +2,7 @@ use crate::{
     State,
     cli_args::{
         lockfile_dir::LockfileDirArg,
+        parse_depth_limit,
         pipelines::InstallFamilySelection,
         recursive,
         supported_architectures::SupportedArchitecturesArgs,
@@ -121,8 +122,9 @@ pub struct UpdateSelectionArgs {
     #[clap(long)]
     pub patches: bool,
     /// How deep to inspect dependencies. `0` means top-level
-    /// dependencies only. Defaults to unlimited.
-    #[clap(long)]
+    /// dependencies only. Defaults to unlimited, which `Infinity` also
+    /// selects.
+    #[clap(long, value_parser = parse_depth_limit)]
     pub depth: Option<usize>,
     /// Show outdated dependencies and select which ones to update.
     #[clap(short = 'i', long)]
@@ -151,7 +153,7 @@ pub struct UpdateSaveArgs {
     #[clap(long = "no-save")]
     pub no_save: bool,
     /// Generate a changeset file declaring a patch bump for every workspace
-    /// package whose production dependencies were changed by the update.
+    /// package whose production dependencies the update changed.
     #[clap(long, overrides_with = "no_changeset")]
     pub changeset: bool,
     /// Do not generate a changeset, even when `updateConfig.changeset` enables
@@ -383,7 +385,7 @@ impl UpdateArgs {
         let all_dependency_groups =
             [DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional];
         self.selection.patches
-            && self.selection.depth.is_none()
+            && self.selection.depth.is_none_or(|depth| depth == usize::MAX)
             && !update_actions
             && !self.dependency_options.no_optional
             && all_dependency_groups
@@ -464,4 +466,5 @@ impl UpdateArgs {
 #[cfg(test)]
 mod tests;
 
+mod config_dependencies;
 mod execution;

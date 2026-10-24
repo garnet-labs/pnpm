@@ -71,7 +71,7 @@ pub fn build_standalone_chain(
     // `preserveAbsolutePaths` isn't exposed by pacquet's `Config` yet, so
     // the local-resolver context defaults to `false` here — same as the
     // install path.
-    let local_ctx = LocalResolverContext { preserve_absolute_paths: false };
+    let local_ctx = LocalResolverContext { preserve_absolute_paths: false, ..Default::default() };
 
     Ok(DefaultResolver::new(vec![
         Box::new(Arc::clone(&npm_resolver)),
@@ -128,10 +128,10 @@ fn build_npm_resolver(
             full_metadata,
             needs_full_metadata_for: None,
             filter_metadata,
+            registry_options_by_url: std::sync::Arc::new(config.registry_options_by_url.clone()),
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: config.offline,
-            prefer_offline: config.prefer_offline,
+            network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
         },
         store_view: offline_store_view(config),
@@ -192,10 +192,10 @@ fn build_named_registry_resolver(
             full_metadata,
             needs_full_metadata_for: None,
             filter_metadata,
+            registry_options_by_url: std::sync::Arc::new(config.registry_options_by_url.clone()),
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: config.offline,
-            prefer_offline: config.prefer_offline,
+            network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
         },
         store_view: offline_store_view(config),

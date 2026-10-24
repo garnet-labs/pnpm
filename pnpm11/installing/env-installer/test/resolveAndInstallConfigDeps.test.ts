@@ -15,7 +15,7 @@ import { loadJsonFileSync } from 'load-json-file'
 
 import { bravoDepMatureUpTo101MinimumReleaseAge } from './utils/minimumReleaseAge.js'
 
-const registry = `http://localhost:${REGISTRY_MOCK_PORT}/`
+const registry = `http://localhost:${REGISTRY_MOCK_PORT}/npm/`
 
 function createOpts (registryUrl: string = registry) {
   const { storeController, storeDir } = createTempStore()
@@ -231,7 +231,7 @@ test('takes the tarball of an old-format config dep from the packument', async (
 // registry. Packuments are proxied from pnpr with their `dist.tarball` pointed
 // at a `/tarballs/` prefix, and the derivable URL is answered with a 404.
 async function withNonDerivableTarballRegistry (run: (registryUrl: string) => Promise<void>): Promise<void> {
-  const bases = { upstream: `http://localhost:${REGISTRY_MOCK_PORT}`, proxy: '' }
+  const bases = { upstream: `http://localhost:${REGISTRY_MOCK_PORT}/npm`, proxy: '' }
   const server = http.createServer((req, res) => {
     proxyToUpstream(req, res, bases).catch((err: unknown) => {
       res.writeHead(500)
@@ -562,4 +562,36 @@ test('resolves a version+integrity pin newer than minimumReleaseAge', async () =
   const opts = { ...createOpts(), minimumReleaseAge: 100 * 365 * 24 * 60 }
   await resolveAndInstallConfigDeps({ '@pnpm.e2e/foo': `100.0.0+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}` }, opts)
   expect(loadJsonFileSync<{ version: string }>('node_modules/.pnpm-config/@pnpm.e2e/foo/package.json').version).toBe('100.0.0')
+})
+
+test('removal reconciles config roots while preserving a shared package-manager graph', async () => {
+  prepareEmpty()
+  const opts = createOpts()
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/foo': '100.0.0', '@pnpm.e2e/bar': '100.0.0' }, opts)
+  const env = (await readEnvLockfile(process.cwd()))!
+  env.importers['.'].packageManagerDependencies = {
+    '@pnpm.e2e/foo': env.importers['.'].configDependencies['@pnpm.e2e/foo'],
+  }
+  await writeEnvLockfile(process.cwd(), env)
+
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/bar': '100.0.0' }, {
+    ...opts,
+    offline: true,
+    mode: 'bootstrap',
+  })
+  expect(await readEnvLockfile(process.cwd())).toEqual(env)
+
+  await resolveAndInstallConfigDeps({ '@pnpm.e2e/bar': '100.0.0' }, { ...opts, offline: true })
+  const afterPartialRemoval = (await readEnvLockfile(process.cwd()))!
+  expect(Object.keys(afterPartialRemoval.importers['.'].configDependencies)).toEqual(['@pnpm.e2e/bar'])
+  expect(fs.existsSync('node_modules/.pnpm-config/@pnpm.e2e/foo')).toBe(false)
+  expect(fs.existsSync('node_modules/.pnpm-config/@pnpm.e2e/bar/package.json')).toBe(true)
+
+  await resolveAndInstallConfigDeps({}, { ...opts, offline: true })
+  const afterRemoval = (await readEnvLockfile(process.cwd()))!
+  expect(afterRemoval.importers['.'].configDependencies).toEqual({})
+  expect(afterRemoval.importers['.'].packageManagerDependencies).toEqual(env.importers['.'].packageManagerDependencies)
+  expect(afterRemoval.packages).toEqual({ '@pnpm.e2e/foo@100.0.0': env.packages['@pnpm.e2e/foo@100.0.0'] })
+  expect(afterRemoval.snapshots).toEqual({ '@pnpm.e2e/foo@100.0.0': env.snapshots['@pnpm.e2e/foo@100.0.0'] })
+  expect(fs.existsSync('node_modules/.pnpm-config/@pnpm.e2e/bar')).toBe(false)
 })

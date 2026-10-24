@@ -7,11 +7,11 @@ Deploy a package from a workspace. During deployment, the files of the deployed 
 
 :::note
 
-Since v12.2.0, `pnpm deploy` no longer requires [`injectWorkspacePackages`](../workspaces.md#injectworkspacepackages). A linked workspace dependency is rewritten to a `file:` dependency in the dedicated deploy lockfile, and the peer dependencies it declares are bound to the deployed graph's own resolution.
+Since v12.2.0, `pnpm deploy` no longer requires [`injectWorkspacePackages`](../workspaces.md#injectworkspacepackages). A linked workspace dependency is rewritten to a `file:` dependency in the dedicated deploy lockfile. The peer dependencies it declares are bound the way an injected install binds them: to the version its parent provides. If the parent does not depend on the peer, pnpm looks further up, to the deployed project. A peer that no ancestor provides is bound to the deployed graph's own resolution.
 
-Where a peer resolves to more than one version in that graph, the binding is ambiguous, and the deploy fails with `ERR_PNPM_DEPLOY_AMBIGUOUS_PEER` naming the package, the peer, and the competing versions. Pin the peer to one version with an [`overrides`](../settings/dependency-resolution.md#overrides) entry, or turn `injectWorkspacePackages` on, which is the setting that decides between the candidates.
+The binding is ambiguous when the ancestors provide more than one package or version, or when no ancestor provides the peer and the deployed graph holds more than one version. The deploy then fails with `ERR_PNPM_DEPLOY_AMBIGUOUS_PEER`, naming the package, the peer, and the competing resolutions. Pin the peer to one version with an [`overrides`](../settings/dependency-resolution.md#overrides) entry, or turn `injectWorkspacePackages` on, which is the setting that decides between the candidates.
 
-Before those releases the command refused every non-injected workspace up front. `--legacy`, or `forceLegacyDeploy: true`, still selects the older implementation.
+Before v12.2.0, the command refused every non-injected workspace up front. `--legacy`, or `forceLegacyDeploy: true`, still selects the older implementation.
 
 :::
 
@@ -27,6 +27,8 @@ Usage:
 pnpm --filter=<deployed project name> deploy <target directory>
 ```
 
+The filter must select exactly one project. Selecting none fails with `ERR_PNPM_NOTHING_TO_DEPLOY`, and selecting several fails with `ERR_PNPM_CANNOT_DEPLOY_MANY`. A target directory that is unsafe to write, such as the workspace root, fails with `ERR_PNPM_INVALID_DEPLOY_TARGET`.
+
 In case you build your project before deployment, also use the `--prod` option to skip `devDependencies` installation.
 
 ```sh
@@ -35,9 +37,10 @@ pnpm --filter=<deployed project name> --prod deploy <target directory>
 
 Usage in a docker image. After building everything in your monorepo, do this in a second image that uses your monorepo base image as a build context or in an additional build stage:
 
-```Dockerfile title="Dockerfile"
+```dockerfile title="Dockerfile"
 # syntax=docker/dockerfile:1.4
 
+# The workspace image must use WORKDIR /app
 FROM workspace as pruned
 RUN pnpm --filter <your package name> --prod deploy pruned
 
@@ -87,25 +90,32 @@ By default, `pnpm deploy` will try creating a dedicated lockfile from a shared l
 
 Since v12.4.1, the legacy implementation prefers the versions the source workspace lockfile pins, wherever they still satisfy the deployed project's ranges.
 
+Since v12.16.0, it checks the source workspace lockfile against [`minimumReleaseAge`](../settings/dependency-resolution.md#minimumreleaseage) and the other resolution policies first, as `pnpm install` does, and fails if one of them rejects a locked version. [`trustLockfile`](../settings/dependency-resolution.md#trustlockfile) or `--trust-lockfile` skips that check.
+
 ## What the deployed project gets
 
-Since v12.7.0:
-
 * The `packageManager` and `devEngines.packageManager` fields of the workspace
-  root `package.json` are not copied into the deployed `package.json`. Versions
-  v12.7.0 through v12.8.x copied them.
+  root `package.json` are not copied into the deployed `package.json`.
 * The virtual store is placed at [`virtualStoreDir`](../settings/node-modules.md#virtualstoredir),
   resolved against the deploy directory. With the global virtual store enabled
   or an absolute `virtualStoreDir`, it stays at `node_modules/.pnpm`.
 * The `prepare` script of the deployed project is not run.
 
+## Reproducible output
+
+Since v12.15.0, when the [`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/docs/source-date-epoch/) environment variable is set, `pnpm deploy` and `pnpm install` use it as an upper bound for the timestamps in `node_modules/.modules.yaml` and `node_modules/.pnpm-workspace-state-v1.json`. With an equivalently prepared deploy target and an epoch no later than the timestamps that would otherwise be recorded, deploying the same project with the same lockfile produces identical files, so a Docker layer built from the deploy directory stays cached.
+
+The next `pnpm install` or `pnpm run` in that directory checks the installed dependencies against the lockfile instead of trusting file modification times.
+
 ## Files included in the deployed project
 
-By default, all the files of the project are copied during deployment but this can be modified in _one_ of the following ways which are resolved in order:
+By default, pnpm copies the files that `pnpm pack` would include. They are selected in _one_ of the following ways, resolved in order:
 
 1. The project's `package.json` may contain a "files" field to list the files and directories that should be copied.
 2. If there is an `.npmignore` file in the application directory then any files listed here are ignored.
 3. If there is a `.gitignore` file in the application directory then any files listed here are ignored.
+
+To copy every file of the project, set [`deployAllFiles`](../settings/other.md#deployallfiles) to `true`.
 
 ## Configuration
 

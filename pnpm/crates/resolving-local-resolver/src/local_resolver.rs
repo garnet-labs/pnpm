@@ -7,7 +7,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pnpm_lockfile::{DirectoryResolution, LockfileResolution, TarballResolution};
+use pnpm_lockfile::{DirectoryResolution, IntegrityTarget, LockfileResolution, TarballResolution};
 use pnpm_package_manifest::{
     PackageManifestError, find_parent_publish_manifest, safe_read_package_json_from_dir,
 };
@@ -30,6 +30,8 @@ pub struct LocalResolverContext {
     /// against the project / lockfile root. Backs pnpm's
     /// `preserveAbsolutePaths` config (off by default).
     pub preserve_absolute_paths: bool,
+    /// Which hash a `file:` tarball's integrity names.
+    pub integrity_target: IntegrityTarget,
 }
 
 /// Per-call options.
@@ -79,8 +81,13 @@ pub struct LocalResolveResult {
     pub manifest: Option<std::sync::Arc<serde_json::Value>>,
     pub normalized_bare_specifier: Option<String>,
     pub resolution: LockfileResolution,
-    /// `local-filesystem` — the `resolvedVia` tag this resolver stamps
-    /// on every shape it produces.
+    /// The `resolvedVia` tag: `workspace` for a `workspace:` specifier,
+    /// `local-filesystem` for every other shape. A `workspace:` specifier
+    /// gets the tag the name and range form gets in
+    /// `resolving-npm-resolver`, so the deps resolver treats the directory
+    /// as a workspace project whichever of the two claimed it: its
+    /// `catalog:` children resolve through the catalogs, and
+    /// `blockExoticSubdeps` leaves its children alone.
     pub resolved_via: &'static str,
 }
 
@@ -197,7 +204,7 @@ pub async fn resolve_from_local_scheme(
             return Err(ResolveLocalError::Spec(LocalSpecError::PathProtocolNotSupported(err)));
         }
     };
-    resolve_spec(spec, opts, None).await
+    resolve_spec(ctx, spec, opts, None).await
 }
 
 /// Resolve a wanted dep by path shape alone — no scheme prefix.
@@ -211,7 +218,7 @@ pub async fn resolve_from_local_path(
     let parse_opts =
         ParseOptions { preserve_absolute_paths: ctx.preserve_absolute_paths, ..Default::default() };
     let spec = parse_local_path(wanted_dependency, project_dir, lockfile_dir, parse_opts);
-    resolve_spec(spec, opts, Some(&wanted_dependency.bare_specifier)).await
+    resolve_spec(ctx, spec, opts, Some(&wanted_dependency.bare_specifier)).await
 }
 
 /// Latest-version companion. Claims `link:` / `file:` / `workspace:`
@@ -230,6 +237,7 @@ pub fn resolve_latest_from_local(query: &LatestQuery) -> Option<LatestInfo> {
 /// `path_shaped_specifier` is the written specifier when the spec was
 /// claimed by its path shape alone.
 async fn resolve_spec(
+    ctx: &LocalResolverContext,
     spec: Option<LocalPackageSpec>,
     opts: &LocalResolverOptions,
     path_shaped_specifier: Option<&str>,
@@ -239,7 +247,7 @@ async fn resolve_spec(
     };
 
     if matches!(spec.kind, LocalSpecKind::File) {
-        return resolve_file_spec(&spec, opts).await.map(Some);
+        return resolve_file_spec(&spec, opts, ctx.integrity_target).await.map(Some);
     }
 
     // Directory branch.
@@ -251,7 +259,7 @@ async fn resolve_spec(
             manifest: None,
             normalized_bare_specifier: Some(spec.normalized_bare_specifier),
             resolution: current.resolution.clone(),
-            resolved_via: "local-filesystem",
+            resolved_via: spec.resolved_via,
         }));
     }
 
@@ -268,15 +276,16 @@ async fn resolve_spec(
         resolution: LockfileResolution::Directory(DirectoryResolution {
             directory: spec.dependency_path,
         }),
-        resolved_via: "local-filesystem",
+        resolved_via: spec.resolved_via,
     }))
 }
 
 async fn resolve_file_spec(
     spec: &LocalPackageSpec,
     opts: &LocalResolverOptions,
+    integrity_target: IntegrityTarget,
 ) -> Result<LocalResolveResult, ResolveLocalError> {
-    match resolve_local_tarball(spec).await {
+    match resolve_local_tarball(spec, integrity_target).await {
         Ok(result) => Ok(result),
         Err(ResolveLocalError::LinkedPkgDirNotFound { .. })
             if opts.update == LocalResolverUpdate::Off
@@ -298,7 +307,7 @@ async fn resolve_file_spec(
                 manifest: current.manifest.as_ref().map(Arc::clone),
                 normalized_bare_specifier: Some(spec.normalized_bare_specifier.clone()),
                 resolution: current.resolution.clone(),
-                resolved_via: "local-filesystem",
+                resolved_via: spec.resolved_via,
             })
         }
         Err(err) => Err(err),
@@ -308,6 +317,7 @@ async fn resolve_file_spec(
 /// Resolve a `file:` specifier that names a tarball.
 async fn resolve_local_tarball(
     spec: &LocalPackageSpec,
+    integrity_target: IntegrityTarget,
 ) -> Result<LocalResolveResult, ResolveLocalError> {
     // A missing tarball file raises the same `ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND`
     // code the directory branch uses for a missing `file:` target, so both
@@ -316,7 +326,7 @@ async fn resolve_local_tarball(
         integrity,
         manifest,
         has_manifest_entry,
-    } = match read_local_tarball_metadata(&spec.fetch_spec).await {
+    } = match read_local_tarball_metadata(&spec.fetch_spec, integrity_target.into()).await {
         Ok(metadata) => metadata,
         Err(err) if is_missing_tarball(&err) => {
             return Err(ResolveLocalError::LinkedPkgDirNotFound {
@@ -339,7 +349,7 @@ async fn resolve_local_tarball(
             git_hosted: None,
             path: None,
         }),
-        resolved_via: "local-filesystem",
+        resolved_via: spec.resolved_via,
     })
 }
 

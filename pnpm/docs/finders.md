@@ -3,8 +3,6 @@ id: finders
 title: Finders
 ---
 
-Added in: v10.16.0
-
 Finder functions let you **search your dependency graph** by any property of a package, not just its name.
 They can be declared in [.pnpmfile.mjs] and used with [pnpm list] and [pnpm why].
 
@@ -14,7 +12,7 @@ They can be declared in [.pnpmfile.mjs] and used with [pnpm list] and [pnpm why]
 
 ## Defining finder functions
 
-Finder functions are declared in your project’s [.pnpmfile.mjs] file under the finders export.
+Finder functions are declared in your project's [.pnpmfile.mjs] file under the finders export.
 Each function receives a context object and must return either:
 
 * `true` → include this dependency in the results,
@@ -47,11 +45,14 @@ You can invoke a finder with the `--find-by=<functionName>` flag:
 
 ```sh
 pnpm why --find-by=react17
+pnpm list --find-by=react17
 ```
+
+`--find-by` can be repeated. A dependency is included when any of the finders matches it. Package names given as arguments add their own matches.
 
 Output:
 
-```
+```text
 @apollo/client 4.0.4
 ├── @graphql-typed-document-node/core 3.2.0
 └── graphql-tag 2.12.6
@@ -77,7 +78,7 @@ export const finders = {
 
 Output:
 
-```
+```text
 @apollo/client 4.0.4
 ├── @graphql-typed-document-node/core 3.2.0
 │   license: MIT

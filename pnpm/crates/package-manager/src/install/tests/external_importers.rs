@@ -113,7 +113,6 @@ async fn run_capsule(
     );
     Install {
         lockfile_policy: crate::InstallLockfilePolicy {
-            manifest_freshness: crate::ManifestFreshness::Content,
             frozen: !matches!(mode, Mode::Install),
             ..install.lockfile_policy
         },
@@ -134,6 +133,7 @@ async fn run_capsule(
                     selected_names: None,
                     pending_projects: Vec::new(),
                     check_lockfile_patches_only: false,
+                    skip_if_has_side_effects_cache: false,
                 })
                 .await
             }

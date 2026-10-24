@@ -353,6 +353,7 @@ pub(super) fn command_cache_dir(
 fn apply_dlx_build_policy(config: &mut Config, pkgs: &[String], allow_build: &[String]) {
     config.dangerously_allow_all_builds = false;
     config.allow_builds.clear();
+    config.disable_agent_skills();
     for spec in pkgs {
         if let Some(alias) = parse_wanted_dependency(spec).alias {
             config.allow_builds.insert(alias, true);
@@ -406,6 +407,9 @@ pub(super) fn configure_cache_install(
     // with `patchedDependencies` fail on a patch file missing under the
     // cache dir.
     config.patched_dependencies = None;
+    // pnpm's dlx resolves a version-less package to `latest` whatever the
+    // caller's `tag` setting says, and the cache key holds no tag.
+    config.tag = None;
     // Build a *fresh* allow-list for the throwaway install — the dlx
     // packages themselves plus the CLI `--allow-build` entries — rather
     // than inheriting the caller project's `allow_builds` /

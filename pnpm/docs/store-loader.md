@@ -15,7 +15,7 @@ nodeLinker:
 
 Run `pnpm install`, then use `pnpm run`, `pnpm test`, and `pnpm exec` normally. pnpm generates `node_modules/.pnpm/.store-manifest.json`, writes its bundled runtime to `node_modules/.pnpm/.store-loader.mjs`, and preloads it for scripts and commands. Node child processes inherit the preload through `NODE_OPTIONS`. Generated JavaScript bin shims also register the loader when invoked directly.
 
-`nodeLinker.excluded` contains exact package names. All installed versions and peer contexts of a selected name, plus their complete dependency trees, are materialized as normal GVS packages. Other registry packages stay in CAS. Patched packages, runtimes such as `node@runtime:`, and their dependency trees are materialized automatically. Packages needing build scripts must be selected explicitly unless scripts are disabled. The normal build approval policy still applies.
+`nodeLinker.excluded` contains exact package names. All installed versions and peer contexts of a selected name, plus their complete dependency trees, are materialized as normal GVS packages. Other registry packages stay in the content-addressable store (CAS). Patched packages, runtimes such as `node@runtime:`, and their dependency trees are materialized automatically. Packages needing build scripts must be selected explicitly unless scripts are disabled. The normal build approval policy still applies.
 
 The mode enables the global virtual store. `node_modules` holds only installation state and bin shims, not packages. GVS packages have their normal dependency links outside the application. Workspace sources remain in their project directories. The project retains its current lockfile and store registration; keep these files while using the installation.
 
@@ -25,7 +25,7 @@ The generated files are machine-local. Reinstall after moving the project. CAS i
 
 The loader is embedded in the pnpm executable and needs no separately installed runtime package. The standalone `@pnpm/esm-loader` API remains available for manual integration. Plain `node app.mjs` outside pnpm needs the explicit preload described below.
 
-`symlink: false` and `nodeExperimentalPackageMap` cannot be combined with this mode. Independent test-runner resolvers and direct filesystem reads can still require additional materialization or resolver integration.
+`symlink: false` and a `nodePackageMap.mode` other than `off` cannot be combined with this mode. Independent test-runner resolvers and direct filesystem reads can still require additional materialization or resolver integration.
 
 ## Running an application
 

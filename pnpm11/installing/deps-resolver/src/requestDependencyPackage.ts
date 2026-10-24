@@ -70,13 +70,6 @@ export async function requestDependencyPackage (request: DependencyRequest): Pro
 
 function pinBareSpecifierToCurrentVersion ({ ctx, currentPkg, options, wantedDependency }: DependencyRequest): void {
   if (!currentPkg.version) return
-  if (options.updatePatches && !hasRegistryRevisionSpecifier(wantedDependency.bareSpecifier)) {
-    wantedDependency.bareSpecifier = replaceVersionInBareSpecifier(
-      wantedDependency.bareSpecifier,
-      currentPkg.version,
-      ctx.namedRegistryPrefixes
-    )
-  }
   if (!options.update && pkgIdPinsVersion(currentPkg.pkgId, currentPkg.version) && options.currentDepth !== 0) {
     wantedDependency.bareSpecifier = replaceVersionInBareSpecifier(wantedDependency.bareSpecifier, currentPkg.version, ctx.namedRegistryPrefixes)
   }
@@ -107,12 +100,11 @@ function getRequestPackageOptions (request: DependencyRequest, preferredVersions
       getPatchInfo(ctx.patchedDependencies, manifest.name, manifest.version) != null,
     preferredVersions,
     preferWorkspacePackages: ctx.preferWorkspacePackages,
-    projectDir: (options.currentDepth > 0 && !wantedDependency.bareSpecifier.startsWith('file:'))
+    projectDir: (options.currentDepth > 0 && !isRelativeToDeclaringManifest(ctx, wantedDependency))
       ? ctx.lockfileDir
       : options.parentPkg.rootDir,
     skipFetch: ctx.dryRun,
     update: options.update,
-    updatePatches: options.updatePatches,
     updateRequested: options.updateRequested,
     updateChecksums: options.updateChecksums,
     workspacePackages: ctx.workspacePackages,
@@ -123,6 +115,13 @@ function getRequestPackageOptions (request: DependencyRequest, preferredVersions
     rangeSpecStyle: options.rangeSpecStyle,
     readPackageHook: ctx.readPackageHook,
   }
+}
+
+function isRelativeToDeclaringManifest (ctx: ResolutionContext, wantedDependency: WantedDependency): boolean {
+  const { bareSpecifier } = wantedDependency
+  if (bareSpecifier.startsWith('file:')) return true
+  // A linked workspace: path keeps its lockfile-relative id, which the linked node is registered under.
+  return bareSpecifier.startsWith('workspace:.') && (wantedDependency.injected === true || ctx.injectWorkspacePackages === true)
 }
 
 type ReleasePolicyOptions = Pick<RequestPackageOptions,
@@ -173,16 +172,6 @@ function handlePackageRequestFailure ({ ctx, options, wantedDependency }: Depend
   err.prefix = options.prefix
   err.pkgsStack = getPkgsInfoFromIds(options.parentIds, ctx.resolvedPkgsById)
   throw err
-}
-
-function hasRegistryRevisionSpecifier (specifier: string): boolean {
-  const selectorStart = Math.max(specifier.lastIndexOf(':'), specifier.lastIndexOf('@')) + 1
-  const selector = specifier.slice(selectorStart)
-  if (semver.valid(selector) == null) return false
-  const marker = selector.lastIndexOf('+r')
-  if (marker === -1) return false
-  const revision = selector.slice(marker + 2)
-  return revision.length > 0 && Array.from(revision).every((character) => character >= '0' && character <= '9')
 }
 
 /**

@@ -58,7 +58,7 @@ example will become: `"bar": "npm:foo@1.0.0"`.
 
 In a workspace with 2 packages:
 
-```
+```text
 + packages
 	+ foo
 	+ bar
@@ -113,9 +113,11 @@ semver offers.
 
 ## Release workflow
 
-Versioning packages inside a workspace is a complex task and pnpm currently does
-not provide a built-in solution for it. However, there are 2 well tested tools
-that handle versioning and support pnpm:
+pnpm versions and releases workspace packages with
+[`pnpm change`](./cli/change.md) and `pnpm version -r`. See
+[Release management](./versioning.md).
+
+These external tools also handle versioning and support pnpm:
 - [changesets](https://github.com/changesets/changesets)
 - [Rush](https://rushjs.io)
 
@@ -128,9 +130,9 @@ For using Changesets with pnpm, read [this guide][changesets-guide].
 
 ## Troubleshooting
 
-pnpm cannot guarantee that scripts will be run in topological order if there are cycles between workspace dependencies. If pnpm detects cyclic dependencies during installation, it will produce a warning. If pnpm is able to find out which dependencies are causing the cycles, it will display them too.
+pnpm cannot guarantee that scripts will be run in topological order if there are cycles between workspace dependencies. If pnpm detects cyclic dependencies during installation, it will produce a warning. If pnpm can find out which dependencies are causing the cycles, it will display them too.
 
-If you see the message `There are cyclic workspace dependencies`, please inspect workspace dependencies declared in `dependencies`, `optionalDependencies` and `devDependencies`.
+If you see the message `There are cyclic workspace dependencies`, inspect workspace dependencies declared in `dependencies`, `optionalDependencies` and `devDependencies`.
 
 ## Workspaces in the wild
 
@@ -198,7 +200,7 @@ Enables hard-linking of all local workspace dependencies instead of symlinking t
 
 :::note
 
-Even if this setting is enabled, pnpm will prefer to deduplicate injected dependencies using symlinks—unless multiple dependency graphs are required due to mismatched peer dependencies. This behaviour is controlled by the `dedupeInjectedDeps` setting.
+Even if this setting is enabled, pnpm will prefer to deduplicate injected dependencies using symlinks, unless multiple dependency graphs are required due to mismatched peer dependencies. This behaviour is controlled by the `dedupeInjectedDeps` setting.
 
 :::
 

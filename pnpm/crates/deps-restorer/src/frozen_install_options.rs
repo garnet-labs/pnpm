@@ -18,7 +18,7 @@ pub struct FrozenInstallDrivers<'a> {
 
     /// Install-scoped shared in-flight tarball cache, threaded down to
     /// [`crate::CreateVirtualStore`]'s cold-batch downloads. `Some` on
-    /// the pnpr client path so the materialization reuses the
+    /// the pnpr client path so the materialization reuses
     /// the package manager's `TarballPrefetcher` background downloads instead of
     /// re-fetching every tarball; `None` for installs without a shared
     /// prefetch in flight.
@@ -215,7 +215,7 @@ pub struct PriorMaterialization<'a> {
     /// See [`crate::PriorHoistedState::unbuilt_builds`].
     pub unbuilt_builds: &'a crate::UnbuiltBuilds,
     /// See [`crate::PruneStaleModules::prune_orphans`].
-    pub prune_orphans: bool,
+    pub prune: crate::PruneTreeOptions<'a>,
     /// Relink the bins of every slot the lockfile records, not only of the
     /// slots this install materializes. A tree that moved with its project
     /// needs it, because its other slots may hold bins naming where it was.
@@ -242,12 +242,14 @@ pub struct FrozenInstallSeed<'a> {
     /// the server's `/-/pnpr/v0/verify-lockfile` while the fetch runs locally. The
     /// same concurrent sequencing and build gate apply.
     pub lockfile_verification_override: Option<LockfileVerificationOverride<'a>>,
+    /// Pre-verified `requiresBuild` flags from `pnpr` resolution.
+    pub known_requires_build: Option<crate::RequiresBuildBySnapshot>,
 }
 
 impl<'a> PriorMaterialization<'a> {
     pub(crate) fn link_state(self) -> crate::PriorLinkState<'a> {
         crate::PriorLinkState {
-            prune_orphans: self.prune_orphans,
+            prune: self.prune,
             hoisted_dependencies: self.hoisted_dependencies,
             hoisted_locations: self.hoisted_locations,
             build_present_packages: self.rebuild.is_some() || self.allow_builds_changed,

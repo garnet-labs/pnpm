@@ -291,8 +291,10 @@ impl BinaryArchiveFetch<'_> {
                 auth_headers: &self.config.auth_headers,
                 retry_opts: self.config.retry_opts(),
                 offline: self.config.offline,
+                tar_limits: self.config.tar_limits(),
             },
             package: pnpm_tarball::TarballPackage {
+                integrity_kind: pnpm_tarball::IntegrityKind::Resource,
                 integrity: Some(&self.binary.integrity),
                 unpacked_size: None,
                 file_count: None,
@@ -333,6 +335,7 @@ impl BinaryArchiveFetch<'_> {
                 auth_headers: &self.config.auth_headers,
                 retry_opts: self.config.retry_opts(),
                 offline: self.config.offline,
+                tar_limits: self.config.tar_limits(),
             },
             package: pnpm_tarball::ZipArchivePackage {
                 max_bytes: None,

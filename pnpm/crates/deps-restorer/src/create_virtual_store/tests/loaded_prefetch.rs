@@ -52,6 +52,7 @@ fn seed_store_row(config: &Config, package_key: &PackageKey) -> String {
                 files,
                 side_effects: None,
                 remote_side_effects_quarantine: None,
+                tar_integrity: None,
             },
         )
         .expect("seed store index");
@@ -127,10 +128,13 @@ async fn loaded_materialization_reuses_the_fetch_pass_prefetch() {
             skipped: &skipped,
             include_optional: true,
             supported_architectures: None,
+            known_requires_build: None,
+            known_bins: None,
         },
         ctx: &crate::InstallContext {
             caches: crate::InstallCaches {
                 logged_methods: &logged_methods,
+                swap_lock: None,
                 git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
                 materialized_graph: Arc::default(),
                 dir_clone_cache: None,
@@ -213,7 +217,9 @@ fn fetch_pass_rows_keep_the_selection_and_its_downloads() {
     .collect();
     let fetched = CreateVirtualStoreOutput {
         package_manifests: HashMap::new(),
+        package_bins: HashMap::new(),
         side_effects_maps_by_snapshot: HashMap::new(),
+        side_effects_by_snapshot: HashMap::new(),
         requires_build_by_snapshot: HashMap::from([(key("downloaded", "1.0.0"), true)]),
         materialized_snapshots: Vec::new(),
         fetch_failed: HashSet::new(),
