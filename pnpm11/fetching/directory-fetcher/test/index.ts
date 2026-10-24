@@ -13,7 +13,7 @@ const debug = jest.fn()
 jest.unstable_mockModule('@pnpm/logger', () => {
   return ({ globalWarn: jest.fn(), debug, logger: () => ({ debug }) })
 })
-const { createDirectoryFetcher } = await import('@pnpm/fetching.directory-fetcher')
+const { createDirectoryFetcher, listFilesFromDir } = await import('@pnpm/fetching.directory-fetcher')
 
 const testFixtures = fixtures(import.meta.dirname)
 const unusedCafs = {} as Cafs
@@ -290,5 +290,53 @@ test('all-files deployment follows internal symlinks under a symlinked package r
     expect(result.filesMap.get('linked')).toBe(path.join(linkedRoot, 'linked'))
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test('listFilesFromDir rejects a directory that resolves outside the package root', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'directory-fetcher-'))
+  try {
+    fs.mkdirSync(path.join(root, 'pkg'))
+    fs.mkdirSync(path.join(root, 'outside'))
+    fs.writeFileSync(path.join(root, 'outside/secret.txt'), 'secret')
+    fs.symlinkSync(path.join(root, 'outside'), path.join(root, 'pkg/linked'), 'dir')
+    for (const includeOnlyPackageFiles of [false, true]) {
+      // eslint-disable-next-line no-await-in-loop -- one case at a time keeps the failure readable
+      await expect(listFilesFromDir(path.join(root, 'pkg/linked'), { includeOnlyPackageFiles, packageRoot: path.join(root, 'pkg') }))
+        .rejects.toThrow('outside the package directory')
+    }
+  } finally {
+    rimrafSync(root)
+  }
+})
+
+test('all-files deployment does not walk into a link back to the package', async () => {
+  const pkgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'directory-fetcher-'))
+  try {
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), '{"name":"test","version":"1.0.0"}')
+    fs.mkdirSync(path.join(pkgDir, 'lib'))
+    fs.writeFileSync(path.join(pkgDir, 'lib/index.js'), '')
+    fs.symlinkSync(pkgDir, path.join(pkgDir, 'lib/loop'), 'junction')
+    const fetcher = createDirectoryFetcher({ includeOnlyPackageFiles: false })
+    const result = await fetcher.directory(unusedCafs, { directory: pkgDir, type: 'directory' }, { lockfileDir: pkgDir })
+
+    expect(Array.from(result.filesMap.keys()).sort(lexCompare)).toStrictEqual(['lib/index.js', 'package.json'])
+  } finally {
+    rimrafSync(pkgDir)
+  }
+})
+
+test('listFilesFromDir lists a directory link as one entry when it preserves links', async () => {
+  const pkgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'directory-fetcher-'))
+  try {
+    fs.mkdirSync(path.join(pkgDir, 'files'))
+    fs.writeFileSync(path.join(pkgDir, 'files/a.txt'), 'a')
+    fs.symlinkSync(path.join(pkgDir, 'files'), path.join(pkgDir, 'linked'), 'junction')
+    const { filesMap } = await listFilesFromDir(pkgDir, { includeOnlyPackageFiles: false, preserveSymlinks: true })
+
+    expect(Array.from(filesMap.keys()).sort(lexCompare)).toStrictEqual(['files/a.txt', 'linked'])
+    expect(filesMap.get('linked')).toBe(path.join(pkgDir, 'linked'))
+  } finally {
+    rimrafSync(pkgDir)
   }
 })

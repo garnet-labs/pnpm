@@ -70,7 +70,6 @@ async fn install_rejects_invalid_minimum_release_age_exclude_pattern() {
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
             disable_optimistic_repeat: false,
-            manifest_freshness: crate::ManifestFreshness::Mtime,
         },
         execution: crate::InstallExecution {
             skip_runtimes: false,
@@ -164,7 +163,6 @@ async fn fresh_install_writes_pnpm_lock_yaml_with_expected_shape() {
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
             disable_optimistic_repeat: false,
-            manifest_freshness: crate::ManifestFreshness::Mtime,
         },
         execution: crate::InstallExecution {
             skip_runtimes: false,
@@ -274,7 +272,6 @@ async fn fresh_install_splits_dev_and_prod_dependency_sections() {
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
             disable_optimistic_repeat: false,
-            manifest_freshness: crate::ManifestFreshness::Mtime,
         },
         execution: crate::InstallExecution {
             skip_runtimes: false,
@@ -373,7 +370,6 @@ async fn fresh_install_marks_optional_snapshots_in_pnpm_lock_yaml() {
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
             disable_optimistic_repeat: false,
-            manifest_freshness: crate::ManifestFreshness::Mtime,
         },
         execution: crate::InstallExecution {
             skip_runtimes: false,
@@ -429,7 +425,7 @@ async fn fresh_install_marks_optional_snapshots_in_pnpm_lock_yaml() {
     // Look snapshots up by package name + version rather than by an
     // exact key parse: `@pnpm/xyz` declares peer deps, so the resolver
     // emits a peer-suffixed depPath that won't parse cleanly out of a
-    // literal here. Membership-by-name keeps the test robust to the
+    // literal here. Membership-by-name keeps the test independent of the
     // fixture's exact peer-suffix shape.
     let find_optional = |scope: &str, bare: &str| -> Option<bool> {
         snapshots
@@ -494,7 +490,6 @@ async fn fresh_install_skips_platform_incompatible_optional_dependency() {
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
             disable_optimistic_repeat: false,
-            manifest_freshness: crate::ManifestFreshness::Mtime,
         },
         execution: crate::InstallExecution {
             skip_runtimes: false,

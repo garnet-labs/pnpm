@@ -1,4 +1,5 @@
-use super::{inject_alias_subcommand, parse_cli_args, prepare_cli_argv, rayon_pool_size};
+use super::{inject_alias_subcommand, parse_cli_args, prepare_cli_argv};
+use pnpm_package_manager::rayon_pool_size;
 use std::ffi::OsString;
 
 fn argv(parts: &[&str]) -> Vec<OsString> {
@@ -52,4 +53,10 @@ fn rayon_pool_is_the_scaled_parallelism_between_4_and_16_threads() {
     let parallelism = [1, 2, 3, 4, 8, 9, 32, 256];
     assert_eq!(parallelism.map(|cores| rayon_pool_size(cores, 2)), [4, 4, 6, 8, 16, 16, 16, 16]);
     assert_eq!(parallelism.map(|cores| rayon_pool_size(cores, 1)), [4, 4, 4, 4, 8, 9, 16, 16]);
+}
+
+#[test]
+fn a_script_named_help_keeps_its_all_flags() {
+    let (_, prepared) = prepare_cli_argv(argv(&["pnpm", "run", "help", "-a", "--all"]));
+    assert_eq!(prepared, argv(&["pnpm", "run", "help", "-a", "--all"]));
 }

@@ -15,6 +15,8 @@ If your package or workspace defines a script named `"tasks"` in `package.json`,
 
 ## Commands
 
+A subcommand is required. `pnpm tasks` without one, or with an unknown one, fails.
+
 ### status
 
 Show running and waiting tasks in [concurrency groups](../workspace-task-orchestration.md#concurrencygroups).
@@ -23,7 +25,7 @@ Show running and waiting tasks in [concurrency groups](../workspace-task-orchest
 pnpm tasks status [groups...]
 ```
 
-Lists the running (active holders) and waiting tasks across [concurrency groups](../workspace-task-orchestration.md#concurrencygroups), including how long each task has been running or waiting, its process ID, working directory, and its [task priority](../workspace-task-orchestration.md#task-priority).
+Lists the running (active holders) and waiting tasks across [concurrency groups](../workspace-task-orchestration.md#concurrencygroups), including how long each task has been running or waiting, its process ID, and working directory. A waiting task also shows its [task priority](../workspace-task-orchestration.md#task-priority) when the priority is not 0.
 
 #### Examples
 
@@ -35,7 +37,7 @@ pnpm tasks status
 
 If no concurrency groups are currently in use, pnpm outputs:
 
-```
+```text
 No concurrency groups are in use.
 ```
 
@@ -47,7 +49,7 @@ pnpm tasks status cargo typescript
 
 When group names are specified, pnpm outputs the status of only those groups, including idle groups:
 
-```
+```text
 cargo
   running
     build:native  12s
@@ -55,26 +57,14 @@ cargo
   waiting
     1. test:native  3s  priority 2
       pid 45201 in /workspace/crates/native
-    2. bench:native  1s  priority 0
+    2. bench:native  1s
       pid 45210 in /workspace/crates/native
 
 typescript: idle
 ```
 
-#### Script precedence
-
-If your project defines a `"tasks"` script in `package.json`:
-
-```sh
-# Runs the "tasks" script from package.json
-pnpm tasks status
-
-# Runs the built-in pnpm tasks status command
-pnpm pm tasks status
-```
-
 ## See also
 
-* [Workspace task orchestration](../workspace-task-orchestration.md#concurrency-groups)
+* [Workspace task orchestration](../workspace-task-orchestration.md#concurrencygroups)
 * [Task priority](../workspace-task-orchestration.md#task-priority)
 * [pnpm pm](./pm.md)

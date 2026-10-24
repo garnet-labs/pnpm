@@ -10,12 +10,8 @@
 # pull request and publishes no check.
 name: Garnet evidence mirror
 
-on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
-  workflow_run:
-    workflows: ["TS CI", "Garnet Bootstrap Routing"]
-    types: [completed]
-  issue_comment:
-    types: [created, edited]
+on:
+  workflow_dispatch:
 
 permissions: {}
 

@@ -15,7 +15,7 @@
 //! - failure:  `{"id": N, "err": "message"}`
 
 use crate::{
-    FetcherCallback, FetcherCallbackSender, HookError,
+    FetcherCallback, FetcherCallbackSender, HookError, IgnoredHook,
     async_process::{Child, ChildStdin, ChildStdout, Command},
     process::Stdio,
 };
@@ -143,16 +143,18 @@ impl NodeWorker {
             serde_json::to_string(&pnpmfile).map_err(|err| exec_err(err.to_string()))?;
         let runner = build_runner(&file_escaped);
 
-        let mut child = Command::new("node")
+        let mut command = Command::new("node");
+        command
             .arg("--input-type")
             .arg("commonjs")
             .arg("-e")
             .arg(&runner)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|err| exec_err(err.to_string()))?;
+            .kill_on_drop(true);
+        #[cfg(target_vendor = "apple")]
+        inherited_descriptors::inherit_only_stdio(&mut command);
+        let mut child = command.spawn().map_err(|err| exec_err(err.to_string()))?;
 
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("worker stdin is piped")));
         let stdout = child.stdout.take().expect("worker stdout is piped");
@@ -209,18 +211,16 @@ impl NodeWorker {
             .unwrap_or(false)
     }
 
-    /// Whether the loaded pnpmfile exports a callable `filterLog` hook.
-    pub async fn has_filter_log(&self) -> bool {
-        self.request(
-            "hasFilterLog",
-            serde_json::json!({ "query": "hasFilterLog" }),
-            Arc::new(|_| {}),
-        )
-        .await
-        .ok()
-        .as_ref()
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    /// The [`IgnoredHook`]s the loaded pnpmfile exports as callables. A
+    /// pnpmfile that fails to load defines none.
+    pub async fn ignored_hooks(&self) -> Vec<IgnoredHook> {
+        let names = IgnoredHook::ALL.map(IgnoredHook::export_name);
+        let query = serde_json::json!({ "query": "definedHooks", "names": names });
+        let Ok(Value::Array(defined)) = self.request("definedHooks", query, Arc::new(|_| {})).await
+        else {
+            return Vec::new();
+        };
+        IgnoredHook::named_in(&defined)
     }
 
     /// Whether the loaded pnpmfile exports a callable `readPackage` hook.
@@ -525,6 +525,9 @@ fn build_runner(file_escaped: &str) -> String {
         include_str!("worker.cjs"),
     )
 }
+
+#[cfg(target_vendor = "apple")]
+mod inherited_descriptors;
 
 #[cfg(test)]
 mod tests;

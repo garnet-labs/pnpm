@@ -166,7 +166,7 @@ pub enum InstallWithFreshLockfileError {
     UnusedPatch(#[error(source)] pnpm_patching::UnusedPatchError),
 
     /// A user-defined `namedRegistries` entry mapped an alias to a
-    /// non-http(s) URL. Surfaced at resolver construction so the
+    /// URL that is not HTTP or HTTPS. Surfaced at resolver construction so the
     /// install fails fast with a specific error code instead of a
     /// downstream 404. Surfaced as
     /// `ERR_PNPM_INVALID_NAMED_REGISTRY_URL`.
@@ -253,7 +253,7 @@ impl From<crate::install_frozen_lockfile::HoistedLinkerError> for InstallWithFre
             HoistedLinkerError::WritePackageMap(error) => {
                 InstallWithFreshLockfileError::WritePackageMap(error)
             }
-            HoistedLinkerError::PruneWorkspaceHoists(error) => {
+            HoistedLinkerError::PruneStaleLinks(error) => {
                 InstallWithFreshLockfileError::PruneStaleModules(error)
             }
             HoistedLinkerError::HoistSymlink(error) => {

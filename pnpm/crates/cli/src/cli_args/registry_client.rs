@@ -1,8 +1,10 @@
 use miette::{Context, IntoDiagnostic};
 use pnpm_config::Config;
 use pnpm_network::{
-    NetworkSettings, RedirectGuard, ThrottledClient, normalize_registry_url, origins_redirect_guard,
+    NetworkSettings, RedirectGuard, ThrottledClient, escaped_package_name, normalize_registry_url,
+    origins_redirect_guard,
 };
+use pnpm_resolving_npm_resolver::pick_registry_for_package;
 use std::{collections::HashMap, time::Duration};
 
 /// The npm CLI's default `fetch-timeout`. The registry can take longer than
@@ -11,6 +13,11 @@ use std::{collections::HashMap, time::Duration};
 /// packument") while the first one is still being processed
 /// (<https://github.com/pnpm/pnpm/issues/11454>).
 const MIN_PUBLISH_FETCH_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// The cap on a buffered full package document, the registry's
+/// `/<package>` response. The documents of packages with a long publish
+/// history, such as `typescript`, exceed 15 MiB.
+pub(crate) const PACKAGE_DOCUMENT_BODY_LIMIT: usize = 50 * 1024 * 1024;
 
 /// Resolve the configured registries map, overriding the `"default"` entry
 /// when a CLI registry override is provided.
@@ -28,12 +35,73 @@ pub fn resolve_registries_with_override(
     registries
 }
 
+/// Pick and normalize the registry URL for a given package name.
+pub fn resolve_registry_for_package(
+    registries: &HashMap<String, String>,
+    package_name: &str,
+    publish_registry: Option<&str>,
+) -> String {
+    let raw = pick_registry_for_package(registries, package_name, publish_registry);
+    normalize_registry_url(&raw).into_owned()
+}
+
+/// Resolve the target registry URL for a package, giving precedence to an
+/// explicit CLI registry override when present, otherwise picking from
+/// configured registries.
+pub fn resolve_target_registry_for_package(
+    registries: &HashMap<String, String>,
+    registry_override: Option<&str>,
+    package_name: &str,
+    publish_registry: Option<&str>,
+) -> String {
+    if let Some(registry) = registry_override {
+        return normalize_registry_url(registry).into_owned();
+    }
+    resolve_registry_for_package(registries, package_name, publish_registry)
+}
+
+/// Look up the authorization header for the given package on the registry URL.
+pub fn auth_header_for_package(
+    config: &Config,
+    registry_url: &str,
+    package_name: &str,
+) -> Option<String> {
+    config.auth_headers.for_url_with_package(registry_url, Some(package_name))
+}
+
+/// Join a relative path against a normalized registry URL, preserving any
+/// path prefix in the registry URL.
+pub fn join_registry_url(registry_url: &str, path: &str) -> Result<reqwest::Url, url::ParseError> {
+    reqwest::Url::parse(&normalize_registry_url(registry_url)).and_then(|url| url.join(path))
+}
+
 /// Join a relative path against a normalized registry URL, preserving any
 /// path prefix in the registry URL.
 pub fn join_registry_endpoint(registry_url: &str, path: &str) -> Result<String, url::ParseError> {
-    reqwest::Url::parse(&normalize_registry_url(registry_url))
-        .and_then(|url| url.join(path))
-        .map(|url| url.to_string())
+    join_registry_url(registry_url, path).map(|url| url.to_string())
+}
+
+/// Join a package name onto a registry URL using the registry's package-escaping convention.
+pub fn package_endpoint_url(
+    registry_url: &str,
+    package_name: &str,
+) -> Result<String, url::ParseError> {
+    join_registry_endpoint(registry_url, &escaped_package_name(package_name))
+}
+
+/// Attach authorization and one-time password headers to a request builder when present.
+pub fn apply_auth_and_otp(
+    mut builder: reqwest::RequestBuilder,
+    auth_header: Option<&str>,
+    otp: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if let Some(auth) = auth_header {
+        builder = builder.header("authorization", auth);
+    }
+    if let Some(otp) = otp {
+        builder = builder.header("npm-otp", otp);
+    }
+    builder
 }
 
 /// Build the network client a one-off registry query makes its request through,

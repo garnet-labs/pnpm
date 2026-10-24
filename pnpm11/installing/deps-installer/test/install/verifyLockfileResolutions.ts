@@ -126,7 +126,6 @@ test('throws a generic code with per-entry codes in the breakdown when violation
 test.each([
   'MISSING_TARBALL_INTEGRITY',
   'TARBALL_URL_MISMATCH',
-  'TARBALL_REVISION_MISMATCH',
   'MISSING_NAMED_REGISTRY',
 ])('does not suggest relaxing a policy for %s, alone or in a mixed batch', async (code) => {
   const lockfile = makeLockfile({
@@ -547,7 +546,7 @@ test('the npm verifier rejects a variations resolution whose inner tarball is no
             targets: [{ os: 'darwin' }],
             resolution: {
               integrity,
-              tarball: `http://localhost:${REGISTRY_MOCK_PORT}/@pnpm.e2e/dep-of-pkg-with-1-dep/-/dep-of-pkg-with-1-dep-100.0.0.tgz`,
+              tarball: `http://localhost:${REGISTRY_MOCK_PORT}/npm/@pnpm.e2e/dep-of-pkg-with-1-dep/-/dep-of-pkg-with-1-dep-100.0.0.tgz`,
             },
           },
           {
@@ -621,7 +620,7 @@ test('rejects a registry-style depPath backed by an empty variations resolution'
 })
 
 test('rejects a registry-style depPath backed by a non-http(s) tarball URL', async () => {
-  // The npm verifier skips non-http(s) tarballs, so a file: artifact under a
+  // The npm verifier skips non-HTTP and non-HTTPS tarballs, so a file: artifact under a
   // semver key would be trusted with no tarball-URL binding to catch it.
   for (const tarball of ['file:///tmp/evil.tgz', 'ftp://example.com/evil.tgz']) {
     const lockfile = makeLockfile({

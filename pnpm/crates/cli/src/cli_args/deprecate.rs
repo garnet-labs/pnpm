@@ -1,3 +1,4 @@
+pub(crate) use super::package_spec::PackageSpec;
 pub(crate) use registry::{
     auth_header_for_registry, fetch_package_meta, package_url, registry_for_package,
     registry_operation_error, registry_operation_failed, registry_write_error,
@@ -14,15 +15,12 @@ use pnpm_network::{
     LimitedBody, RetryOpts, ThrottledClient, read_limited_body, redact_url_credentials,
     retry_async, send_with_retry,
 };
-use pnpm_resolving_npm_resolver::pick_registry_for_package;
-use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 use registry::{PackageMeta, put_package_meta};
 
 use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-const DEPRECATION_BODY_LIMIT: usize = 10 * 1024 * 1024;
 pub(crate) const DEPRECATION_ERROR_BODY_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Args)]
@@ -156,37 +154,32 @@ pub(crate) struct DeprecateContext<'a> {
     pub(crate) http_client: ThrottledClient,
     pub(crate) retry_opts: RetryOpts,
     pub(crate) registries: HashMap<String, String>,
+    pub(crate) registry_override: Option<&'a str>,
     pub(crate) otp: Option<String>,
 }
 
 impl DeprecateContext<'_> {
     pub(crate) fn new<'a>(
         config: &'a Config,
-        registry: Option<&String>,
+        registry: Option<&'a str>,
         otp: Option<String>,
     ) -> miette::Result<DeprecateContext<'a>> {
-        let registries = crate::cli_args::registry_client::resolve_registries_with_override(
-            config,
-            registry.map(String::as_str),
-        );
+        let registries =
+            crate::cli_args::registry_client::resolve_registries_with_override(config, registry);
         Ok(DeprecateContext {
             config,
             http_client: crate::cli_args::registry_client::build_registry_client(config)?,
             retry_opts: config.retry_opts(),
             registries,
+            registry_override: registry,
             otp,
         })
     }
 }
 
-pub(crate) struct PackageSpec {
-    pub(crate) name: String,
-    pub(crate) version: Option<String>,
-}
-
 impl DeprecateArgs {
     pub async fn run(self, config: &Config) -> miette::Result<Option<String>> {
-        let context = DeprecateContext::new(config, self.registry.as_ref(), self.otp)?;
+        let context = DeprecateContext::new(config, self.registry.as_deref(), self.otp)?;
 
         let spec = self.params.first().ok_or(DeprecateError::PackageRequired)?;
         let PackageSpec { name: package_name, version } = parse_package_spec(spec)?;
@@ -283,11 +276,8 @@ fn versions_matching(package_meta: &PackageMeta, version_range: Option<&str>) ->
 }
 
 pub(crate) fn parse_package_spec(spec: &str) -> Result<PackageSpec, DeprecateError> {
-    let parsed = parse_wanted_dependency(spec);
-    let name =
-        parsed.alias.ok_or_else(|| DeprecateError::InvalidPackageSpec { spec: spec.to_string() })?;
-    let version = parsed.bare_specifier.filter(|version| !version.is_empty());
-    Ok(PackageSpec { name, version })
+    PackageSpec::parse(spec)
+        .ok_or_else(|| DeprecateError::InvalidPackageSpec { spec: spec.to_string() })
 }
 
 /// Undeprecating a range with no deprecated versions is an error.

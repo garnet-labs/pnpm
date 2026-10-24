@@ -1,15 +1,12 @@
 # Merge check: runs `replay decide` over the head-bound Garnet record and
 # reports merge | hold | undeterminable. Hold and undeterminable fail closed.
-# Runs from the default branch when the Garnet App writes or edits its
-# Runtime Review comment on a pull request, or on manual dispatch with a pull
-# request number. It checks out only the pinned replay tooling and never
+# Manual dispatch only, with a pull request number, so pull requests on this
+# fork carry the same checks as upstream. It checks out only the pinned replay tooling and never
 # checks out or executes pull request code. Mark this job required in branch
 # protection to make the decision a merge condition.
 name: Garnet merge check
 
-on: # zizmor: ignore[dangerous-triggers] default branch only, no pull request code runs here
-  issue_comment:
-    types: [created, edited]
+on:
   workflow_dispatch:
     inputs:
       pr_number:

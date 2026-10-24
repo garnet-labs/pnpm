@@ -1,7 +1,8 @@
 //! The per-importer half of the walk: [`TreeCtx`], its builders, and
 //! the per-edge [`ResolveOptions`] derivations — the depth-specific
-//! pick, the project-relative cache scope, and the `file:` specifier
-//! resolved against its declaring manifest's directory.
+//! pick, the project-relative cache scope, and the `file:` and
+//! `workspace:` path specifiers resolved against their declaring
+//! manifest's directory.
 
 use chrono::{DateTime, Utc};
 use pnpm_catalogs_types::Catalogs;
@@ -17,9 +18,14 @@ use std::{
     sync::Arc,
 };
 
-use crate::resolved_tree::{DirectDep, ResolvedTree};
+use crate::{
+    peer_provider::ProviderTiers,
+    resolved_tree::{DirectDep, ResolvedTree},
+};
 
-use super::{ManifestHook, UpdateReuseScope, reuse::UpdateScope, workspace_ctx::WorkspaceTreeCtx};
+use super::{
+    ManifestHook, UpdateReuseScope, update_scope::UpdateScope, workspace_ctx::WorkspaceTreeCtx,
+};
 
 /// Whether a wanted dep's resolution is computed relative to the
 /// consuming importer's directory rather than being
@@ -75,9 +81,10 @@ pub(super) fn declaring_manifest_dir(
     Some(Arc::from(absolute))
 }
 
-/// Point a `file:` specifier at the directory of the manifest that
-/// declares it ([`declaring_manifest_dir`]) instead of the consuming
-/// importer's. Every other specifier keeps the caller's options.
+/// Point a `file:` or `workspace:` path specifier at the directory of
+/// the manifest that declares it ([`declaring_manifest_dir`]) instead
+/// of the consuming importer's. Every other specifier keeps the
+/// caller's options.
 pub(super) fn opts_relative_to_declaring_manifest<'a>(
     opts: &'a ResolveOptions,
     wanted: &WantedDependency,
@@ -87,7 +94,9 @@ pub(super) fn opts_relative_to_declaring_manifest<'a>(
         Some(parent_dir)
             if wanted.bare_specifier
                 .as_deref()
-                .is_some_and(|spec| spec.starts_with("file:")) =>
+                .is_some_and(|spec| {
+                    spec.starts_with("file:") || spec.starts_with("workspace:.")
+                }) =>
         {
             Cow::Owned(ResolveOptions {
                 project: pnpm_resolving_resolver_base::ResolverProjectOptions {
@@ -527,20 +536,20 @@ impl TreeCtx {
         out
     }
 
-    /// [`crate::hoist_peers::optional_peer_version_tiers`] for each of
+    /// [`ProviderTiers::optional`] for each of
     /// `names`, from the `locked` versions and the versions this run has
     /// resolved into the settled reachable tree.
     pub(crate) fn optional_peer_version_tiers<'name>(
         &self,
         locked: &HashMap<String, HashSet<String>>,
         names: impl Iterator<Item = &'name str>,
-    ) -> HashMap<String, Vec<HashSet<String>>> {
+    ) -> HashMap<String, ProviderTiers> {
         let names: Vec<&str> = names.collect();
         let mut resolved = self.run_resolved_versions(names.iter().copied());
         let mut out = HashMap::default();
         for name in names {
             let resolved = resolved.remove(name).unwrap_or_default();
-            let tiers = crate::hoist_peers::optional_peer_version_tiers(locked.get(name), resolved);
+            let tiers = ProviderTiers::optional(locked.get(name), resolved);
             if !tiers.is_empty() {
                 out.insert(name.to_string(), tiers);
             }

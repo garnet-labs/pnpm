@@ -231,6 +231,18 @@ export interface PeerDependency {
 
 export type PeerDependencies = Record<string, PeerDependency>
 
+/**
+ * A package's peers: every one it declares, which the lockfile records, and
+ * the ones it takes as peers. A declared peer that is also one of the
+ * package's own `dependencies` is taken only where its children owner's scope
+ * shadows that dependency, so `taken` follows that one decision while
+ * `declared` stays the same in every scope. See `getPeerSet`.
+ */
+export interface PeerSet {
+  declared: PeerDependencies
+  taken: PeerDependencies
+}
+
 export interface ResolvedPackage {
   id: PkgResolutionId
   isLeaf: boolean
@@ -250,7 +262,7 @@ export interface ResolvedPackage {
   filesIndexFile: string
   name: string
   version: string
-  peerDependencies: PeerDependencies
+  peers: PeerSet
   optionalDependencies: Set<string>
   hasBin: boolean
   hasBundledDependencies: boolean
@@ -299,7 +311,6 @@ export interface ResolvedDependenciesOptions {
   pickLowestVersion?: boolean
   resolvedDependencies?: ResolvedDependencies
   updateMatching?: UpdateMatchingFunction
-  updatePatches?: boolean
   updateDepth: number
   prefix: string
   supportedArchitectures?: SupportedArchitectures
@@ -410,7 +421,6 @@ export interface ResolveDependencyOptions {
   publishedBy?: Date
   pickLowestVersion?: boolean
   update: false | 'compatible' | 'latest'
-  updatePatches?: boolean
   updateChecksums?: boolean
   updateDepth: number
   /**

@@ -258,7 +258,7 @@ fn reject_off_allowlist_fetches_blocks_unconfigured_hosts() {
     };
     assert!(reject_off_allowlist_fetches(&ranges, &context).is_none());
 
-    // A direct http(s) tarball dependency pointing at an off-allowlist host is
+    // A direct HTTP or HTTPS tarball dependency pointing at an off-allowlist host is
     // rejected before the tarball resolver issues a HEAD/GET.
     let tarball_dep = ResolveRequest {
         registry: Some("https://registry.npmjs.org/".to_string()),
@@ -284,7 +284,7 @@ fn reject_off_allowlist_fetches_blocks_unconfigured_hosts() {
     };
     assert!(reject_off_allowlist_fetches(&scp_dep, &context).is_some());
 
-    // Every git transport is gated by origin, not just http(s)/git/ssh — and
+    // Every git transport is gated by origin, not just HTTP, HTTPS, git, and ssh — and
     // `file://` (a server-local read) nerf-darts to no host and is rejected.
     for spec in [
         "git+rsync://169.254.169.254/repo",
@@ -370,17 +370,20 @@ fn intern_config_uses_lockfile_settings_for_a_legacy_frozen_request() {
         auto_install_peers: false,
         dedupe_peers: Some(true),
         exclude_links_from_lockfile: true,
+        add_missing_peer_types: Some(true),
         ..pnpm_lockfile::LockfileSettings::default()
     };
     let adopted = intern(&request(Some(client_settings)));
     assert!(!adopted.auto_install_peers);
     assert!(adopted.dedupe_peers);
     assert!(adopted.exclude_links_from_lockfile);
+    assert!(adopted.add_missing_peer_types);
 
     let defaults = intern(&request(None));
     assert!(defaults.auto_install_peers);
     assert!(!defaults.dedupe_peers);
     assert!(!defaults.exclude_links_from_lockfile);
+    assert!(!defaults.add_missing_peer_types);
 }
 
 #[test]
@@ -678,5 +681,35 @@ fn intern_config_resolves_in_the_client_s_resolution_mode() {
             .expect("config cache")
             .len(),
         3,
+    );
+}
+
+#[test]
+fn intern_config_keys_add_missing_peer_types() {
+    use super::super::intern_config;
+    use pnpm_store_dir::StoreDir;
+
+    let configs = Mutex::new(HashMap::new());
+    let store_dir = StoreDir::new(PathBuf::from("/tmp/pnpr-peer-types-store"));
+    let cache_dir = PathBuf::from("/tmp/pnpr-peer-types-cache");
+    let intern = |add_missing_peer_types| {
+        let request = ResolveRequest {
+            registry: Some("https://a.test/".to_string()),
+            add_missing_peer_types: Some(add_missing_peer_types),
+            ..ResolveRequest::default()
+        };
+        intern_config(&configs, &store_dir, &cache_dir, &request, 10, usize::MAX)
+            .expect("intern config")
+    };
+
+    let on = intern(true);
+    let off = intern(false);
+
+    assert!(on.add_missing_peer_types);
+    assert!(!off.add_missing_peer_types);
+    let cache_request = ResolveRequest::default();
+    assert_ne!(
+        resolution_cache_key(on, &cache_request).expect("resolution cache key"),
+        resolution_cache_key(off, &cache_request).expect("resolution cache key"),
     );
 }

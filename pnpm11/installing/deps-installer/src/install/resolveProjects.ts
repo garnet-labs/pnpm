@@ -117,7 +117,7 @@ function seedPreferredVersions (ctx: PnpmContext, opts: InstallInContextOptions)
     getPreferredVersionsFromLockfileAndManifests(
       omitPackagesNamed(ctx.wantedLockfile.packages, opts.staleOverrideTargets ?? new Set()),
       Object.values(ctx.projects).map(({ manifest }) => manifest),
-      { catalogs: opts.catalogs, dedupe: opts.dedupe }
+      { catalogs: opts.catalogs }
     )
   )
   for (const [pkgName, selectors] of Object.entries(opts.preferredVersions ?? {})) {
@@ -230,6 +230,7 @@ function describeResolutionPolicies (opts: InstallInContextOptions) {
   return {
     allowedDeprecatedVersions: opts.allowedDeprecatedVersions,
     allowUnusedPatches: opts.allowUnusedPatches,
+    verifyPatches: !(opts.sharedWorkspaceLockfile === false && opts.workspaceDir != null),
     autoInstallPeers: opts.autoInstallPeers,
     autoInstallPeersFromHighestMatch: opts.autoInstallPeersFromHighestMatch,
     defaultUpdateDepth: opts.depth,

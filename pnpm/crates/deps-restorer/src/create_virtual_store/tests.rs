@@ -186,6 +186,7 @@ impl SeededStoreInstall {
                     files,
                     side_effects,
                     remote_side_effects_quarantine: None,
+                    tar_integrity: None,
                 },
             )
             .expect("seed store index");
@@ -240,10 +241,13 @@ impl SeededStoreInstall {
                 skipped: &skipped,
                 include_optional: true,
                 supported_architectures: None,
+                known_requires_build: None,
+                known_bins: None,
             },
             ctx: &crate::InstallContext {
                 caches: crate::InstallCaches {
                     logged_methods: &logged_methods,
+                    swap_lock: None,
                     git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
                     materialized_graph: std::sync::Arc::default(),
                     dir_clone_cache: None,

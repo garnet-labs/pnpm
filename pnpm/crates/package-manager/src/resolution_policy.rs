@@ -85,7 +85,7 @@ impl PickPolicy {
         // `full_metadata` wherever a registry is in hand, and a filtered
         // fetch keeps only the fields an install reads.
         self.full_metadata = true;
-        self.needs_full_metadata_for = Arc::new(|_registry| true);
+        self.needs_full_metadata_for = Arc::new(|_registry, _optional| true);
         self.filter_metadata = false;
     }
 
@@ -158,6 +158,7 @@ pub fn create_configured_registry_resolver(
             full_metadata: policy.full_metadata,
             needs_full_metadata_for: Some(Arc::clone(&policy.needs_full_metadata_for)),
             filter_metadata: policy.filter_metadata,
+            registry_options_by_url: Arc::clone(&npm.format.registry_options_by_url),
         },
         cache_policy: npm.cache_policy,
         store_view: offline_store_view(config),
@@ -195,10 +196,10 @@ fn create_configured_npm_resolver(
             full_metadata: policy.full_metadata,
             needs_full_metadata_for: Some(Arc::clone(&policy.needs_full_metadata_for)),
             filter_metadata: policy.filter_metadata,
+            registry_options_by_url: Arc::new(config.registry_options_by_url.clone()),
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: config.offline,
-            prefer_offline: config.prefer_offline,
+            network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
         },
         store_view: offline_store_view(config),
@@ -232,8 +233,7 @@ pub(crate) fn pick_package_context<'a>(
         needs_full_metadata_for: Some(policy.needs_full_metadata_for.as_ref()),
         filter_metadata: policy.filter_metadata,
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: config.offline,
-            prefer_offline: config.prefer_offline,
+            network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
         },
         store_view,

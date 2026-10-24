@@ -45,7 +45,7 @@ pub use build_graph::*;
 pub use build_modules::*;
 pub use build_options::{
     BuildCacheContext, BuildGraphInputs, BuildLayout, BuildProgress, BuildScriptOptions,
-    BuildSnapshotInputs, PatchedEngineCheck, ScriptPath,
+    BuildSnapshotInputs, CachedSideEffects, PatchedEngineCheck, ScriptPath,
 };
 pub use create_symlink_layout::*;
 pub use create_virtual_dir_by_snapshot::*;
@@ -80,11 +80,12 @@ pub use materialization_options::{
     ModuleLinkerContext, PackageImportOptions, RegistryFetchContext, SlotImportSource,
     SnapshotDependencyLinks, SnapshotFetchContext, VirtualStoreLinkOptions,
 };
+pub use modules_swap_lock::ModulesSwapLock;
 pub use package_map::*;
 pub use phase_options::{
     BuildPhaseCache, BuildPhaseDirectories, BuildPhaseGraph, BuildPhasePolicy, HoistedLinkGraph,
     HoistedProjects, LinkLockfiles, LinkPackageData, LinkProjects, PriorHoistedState,
-    PriorLinkState,
+    PriorLinkState, PruneTreeOptions,
 };
 pub use pnp::*;
 pub use pnpm_workspace_task_scheduler::{GraphSequencerResult, PathNode, graph_sequencer};
@@ -100,9 +101,17 @@ pub use virtual_store_layout::*;
 mod custom_fetcher;
 mod gvs_slot_lock;
 mod installed_hoisted_state;
+mod link_pool;
+mod prune_extraneous_deps;
 mod shared_side_effects;
 
 pub const NEEDS_BUILD_MARKER: &str = ".pnpm-needs-build";
+
+/// Cargo's checksum manifest of a vendored package directory. The Cargo
+/// installer imports it with the package's files, and
+/// [`import_indexed_dir()`] places it last, as the import's completion
+/// marker.
+pub const CARGO_CHECKSUM_FILE: &str = ".cargo-checksum.json";
 
 pub fn store_index_key_for_resolution(
     resolution: &pnpm_lockfile::LockfileResolution,
@@ -137,15 +146,21 @@ pub fn snapshot_has_patch(snapshot_key: &pnpm_lockfile::PackageKey) -> bool {
         .is_some()
 }
 
+/// Whether the calling thread is inside a multi-thread tokio runtime, the
+/// only one on which `block_in_place` works. The `current_thread` runtime
+/// that `#[tokio::test]` defaults to panics on it.
+#[must_use]
+pub fn on_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
 /// Run `work`, which blocks its thread, from inside an `async fn`. On the
 /// multi-thread runtime, `block_in_place` moves the worker's other futures
-/// to another worker so async progress continues. It panics on the
-/// `current_thread` runtime that `#[tokio::test]` defaults to, so `work`
-/// runs as a plain call there.
+/// to another worker so async progress continues. Elsewhere `work` runs
+/// as a plain call.
 pub fn block_in_place_if_multi_thread<Output>(work: impl FnOnce() -> Output) -> Output {
-    let on_multi_thread = tokio::runtime::Handle::try_current()
-        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-    if on_multi_thread { tokio::task::block_in_place(work) } else { work() }
+    if on_multi_thread_runtime() { tokio::task::block_in_place(work) } else { work() }
 }
 
 const MAX_SCRIPT_THREADS: usize = 256;
@@ -161,10 +176,6 @@ pub fn script_thread_count(child_concurrency: u32, max_work_items: usize) -> usi
 
 /// Whether this install writes `node_modules/.package-map.json`.
 ///
-/// Nothing reads the map unless `nodeExperimentalPackageMap` is set:
-/// `package_map_path_for_execution` returns `None` without it, so
-/// `pnpm run` and `pnpm exec` never hand the file to Node.
-///
 /// Hoisted installs answer the same question through
 /// [`should_write_hoisted_package_map`], because they write the map
 /// from their own linker.
@@ -173,7 +184,7 @@ pub fn should_write_package_map(
     config: &pnpm_config::Config,
     node_linker: pnpm_config::NodeLinker,
 ) -> bool {
-    config.node_experimental_package_map
+    config.node_package_map_mode.writes()
         && node_linker == pnpm_config::NodeLinker::Isolated
         && !config.virtual_store_only
 }
@@ -183,13 +194,14 @@ pub fn should_write_package_map(
 /// store and so has a writer of its own.
 #[must_use]
 pub fn should_write_hoisted_package_map(config: &pnpm_config::Config) -> bool {
-    config.node_experimental_package_map && !config.virtual_store_only
+    config.node_package_map_mode.writes() && !config.virtual_store_only
 }
 
 mod build_options;
 mod build_scope;
 
 mod materialization_options;
+mod modules_swap_lock;
 
 mod frozen_install_options;
 

@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::{
-        Condvar, Mutex,
+        Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -28,6 +28,19 @@ pub struct LinkConcurrencyProbe {
     wait_started: AtomicBool,
     mutex: Mutex<()>,
     condvar: Condvar,
+    cold_pass_gate: ColdPassGate,
+}
+
+/// Holds the first cold link pass until the drain delivered `required`
+/// captures. The pass waits for them, so a drain that a link pass stalls
+/// fails to reach the gate.
+#[derive(Default)]
+pub struct ColdPassGate {
+    /// Cold captures handed to the link thread so far.
+    delivered: AtomicUsize,
+    required: usize,
+    /// `delivered` when the first cold link pass started.
+    first_pass_delivered: OnceLock<usize>,
 }
 
 /// How long the first linker waits for a second one to join it. Only has
@@ -37,8 +50,44 @@ pub struct LinkConcurrencyProbe {
 const OVERLAP_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl LinkConcurrencyProbe {
-    pub(crate) fn waiting_for_overlap() -> Self {
-        Self { wait_for_overlap: true, ..Self::default() }
+    /// A probe whose first cold link pass waits for `required` delivered
+    /// captures.
+    pub(crate) fn gating_first_cold_pass(required: usize) -> Self {
+        Self {
+            cold_pass_gate: ColdPassGate { required, ..ColdPassGate::default() },
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn and_waiting_for_overlap(self) -> Self {
+        Self { wait_for_overlap: true, ..self }
+    }
+
+    /// How many cold captures the drain had delivered when the first
+    /// cold link pass started, after waiting for the gate.
+    pub(crate) fn first_cold_pass_delivered(&self) -> Option<usize> {
+        self.cold_pass_gate.first_pass_delivered.get().copied()
+    }
+
+    pub(crate) fn cold_capture_delivered(&self) {
+        self.cold_pass_gate.delivered.fetch_add(1, Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
+
+    /// Holds the first cold link pass at the [`ColdPassGate`] for up to
+    /// [`OVERLAP_TIMEOUT`].
+    pub(crate) fn before_cold_link_pass(&self) {
+        let gate = &self.cold_pass_gate;
+        if gate.first_pass_delivered.get().is_some() {
+            return;
+        }
+        let guard = self.mutex.lock().expect("lock link-concurrency probe");
+        let _ = self.condvar
+            .wait_timeout_while(guard, OVERLAP_TIMEOUT, |()| {
+                gate.delivered.load(Ordering::SeqCst) < gate.required
+            })
+            .expect("wait for the cold pass gate");
+        let _ = gate.first_pass_delivered.set(gate.delivered.load(Ordering::SeqCst));
     }
 
     pub(crate) fn max_concurrent(&self) -> usize {
@@ -87,6 +136,7 @@ impl Default for LinkConcurrencyProbe {
             wait_started: AtomicBool::new(false),
             mutex: Mutex::new(()),
             condvar: Condvar::new(),
+            cold_pass_gate: ColdPassGate::default(),
         }
     }
 }
@@ -169,6 +219,7 @@ async fn run_emits_imported_event_after_import_indexed_dir() {
         import: crate::PackageImportOptions {
             method: PackageImportMethod::Hardlink,
             logged_methods: &logged_methods,
+            swap_lock: None,
             requester: "/proj",
             isolate_mutable_sources: false,
         },
@@ -217,10 +268,10 @@ async fn run_emits_imported_event_after_import_indexed_dir() {
 }
 
 /// A slot whose files a lifecycle script or a patch will still write must
-/// not share inodes with its source, so it ignores `packageImportMethod`.
-/// Every other slot keeps the configured method.
+/// not share inodes with its source, so it ignores `packageImportMethod`
+/// unless that is `copy`. Every other slot keeps the configured method.
 #[test]
-fn needs_build_slots_ignore_the_configured_import_method() {
+fn needs_build_slots_never_share_inodes_with_their_source() {
     static EVENTS: Mutex<Vec<LogEvent>> = Mutex::new(Vec::new());
 
     struct RecordingReporter;
@@ -261,6 +312,7 @@ fn needs_build_slots_ignore_the_configured_import_method() {
             import: crate::PackageImportOptions {
                 method,
                 logged_methods: &logged_methods,
+                swap_lock: None,
                 requester: "/proj",
                 isolate_mutable_sources: false,
             },
@@ -303,8 +355,8 @@ fn needs_build_slots_ignore_the_configured_import_method() {
         reported_import_method(PackageImportMethod::Copy, true, false),
         WireImportMethod::Copy,
     );
-    // A package that will be built imports with `clone-or-copy` instead,
-    // whatever the configured method is.
+    // A package that will be built imports with `clone-or-copy` instead of a
+    // method that could share inodes with its source.
     assert_eq!(
         reported_import_method(PackageImportMethod::Hardlink, false, true),
         WireImportMethod::Clone,
@@ -312,6 +364,15 @@ fn needs_build_slots_ignore_the_configured_import_method() {
     assert_eq!(
         reported_import_method(PackageImportMethod::Hardlink, true, true),
         WireImportMethod::Clone,
+    );
+    // An explicit `copy` already gives the build private files, so it is kept.
+    assert_eq!(
+        reported_import_method(PackageImportMethod::Copy, false, true),
+        WireImportMethod::Copy,
+    );
+    assert_eq!(
+        reported_import_method(PackageImportMethod::Copy, true, true),
+        WireImportMethod::Copy,
     );
     // Under the default method, a `file:` package that nothing will build is
     // hard-linked, so an in-place edit of its source reaches the slot.
@@ -369,6 +430,7 @@ fn a_build_write_does_not_reach_the_import_source() {
         import: crate::PackageImportOptions {
             method: PackageImportMethod::Hardlink,
             logged_methods: &logged_methods,
+            swap_lock: None,
             requester: "/proj",
             isolate_mutable_sources: false,
         },
@@ -434,6 +496,7 @@ fn run_imports_needs_build_marker_with_a_fresh_package() {
         import: crate::PackageImportOptions {
             method: PackageImportMethod::Copy,
             logged_methods: &logged_methods,
+            swap_lock: None,
             requester: "/proj",
             isolate_mutable_sources: false,
         },
@@ -491,6 +554,7 @@ fn force_import_replaces_an_existing_package_at_the_same_snapshot_key() {
         import: crate::PackageImportOptions {
             method: PackageImportMethod::Copy,
             logged_methods: &AtomicU8::new(0),
+            swap_lock: None,
             requester: "/proj",
             isolate_mutable_sources: false,
         },
@@ -549,6 +613,7 @@ fn run_rejects_traversal_package_name() {
         import: crate::PackageImportOptions {
             method: PackageImportMethod::Hardlink,
             logged_methods: &logged_methods,
+            swap_lock: None,
             requester: "/proj",
             isolate_mutable_sources: false,
         },
@@ -640,6 +705,7 @@ fn run_rejects_uncontained_slot_before_creating_dirs() {
         import: crate::PackageImportOptions {
             method: PackageImportMethod::Hardlink,
             logged_methods: &logged_methods,
+            swap_lock: None,
             requester: "/proj",
             isolate_mutable_sources: false,
         },
@@ -728,6 +794,7 @@ async fn run_removes_obsolete_child_links() {
         import: crate::PackageImportOptions {
             method: PackageImportMethod::Hardlink,
             logged_methods: &logged_methods,
+            swap_lock: None,
             requester: "/proj",
             isolate_mutable_sources: false,
         },
@@ -823,6 +890,7 @@ fn slot_import_opts_forces_only_when_a_mutable_source_exists() {
             source_exists: false,
             force_import: false,
         },
+        None,
     );
     assert!(!missing_source.force, "a missing mutable source must not force a reimport");
 
@@ -834,6 +902,7 @@ fn slot_import_opts_forces_only_when_a_mutable_source_exists() {
             source_exists: true,
             force_import: false,
         },
+        None,
     );
     assert!(existing_source.force, "an existing mutable source must still force a reimport");
 }
@@ -858,6 +927,7 @@ fn slot_import_opts_missing_source_overrides_interrupted_build_and_force_import(
             source_exists: false,
             force_import: false,
         },
+        None,
     );
     assert!(
         !interrupted_build.force,
@@ -872,6 +942,7 @@ fn slot_import_opts_missing_source_overrides_interrupted_build_and_force_import(
             source_exists: false,
             force_import: true,
         },
+        None,
     );
     assert!(!force_import.force, "force_import must not force a reimport of a missing source");
 }

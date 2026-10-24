@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use pnpm_lockfile::registry_server_type;
+
 use pnpm_resolving_resolver_base::{
     LatestInfo, LatestQuery, ResolveError, ResolveFuture, ResolveLatestFuture, ResolveOptions,
     ResolveResult, Resolver, UpdateBehavior, WantedDependency,
@@ -54,7 +56,7 @@ pub struct NamedRegistryResolver<Cache: PackageMetaCache> {
     /// Merged map of `<alias> → <registry URL>`. Built-in entries
     /// (`gh:` → GitHub Packages) plus any user-supplied overrides
     /// from `pnpm-workspace.yaml#namedRegistries`. Already validated
-    /// — every URL parses and is http(s).
+    /// — every URL parses and is HTTP or HTTPS.
     pub registries_by_prefix: HashMap<String, String>,
     /// Precomputed key set of [`Self::registries_by_prefix`]. The parser
     /// checks aliases against this set per call, so caching it
@@ -118,6 +120,7 @@ impl<Cache: PackageMetaCache + 'static> NamedRegistryResolver<Cache> {
             resolved_via: NAMED_REGISTRY_RESOLVED_VIA,
             registry,
             registry_name: Some(registry_name.as_str()),
+            server_type: registry_server_type(&self.format.registry_options_by_url, registry),
         }
         .build_result(
             &picked,

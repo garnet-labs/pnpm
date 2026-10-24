@@ -4,7 +4,7 @@ use pnpm_lockfile::LockfileResolution;
 use pnpr_route::RouteContext;
 
 use super::{
-    json_error,
+    json_error, json_error_with_code,
     protocol::{ProjectDeps, ResolveRequest},
 };
 
@@ -57,7 +57,7 @@ pub(super) fn reject_off_allowlist_fetches(
 
 /// Every spec of the request that could name a fetch target: direct-URL
 /// dependency specs, catalog and package-extension entries, and input-lockfile
-/// tarball URLs. They reach the network only when they carry an http(s)/git
+/// tarball URLs. They reach the network only when they carry an HTTP, HTTPS, or git
 /// URL, which the caller decides.
 fn fetchable_specs<'a>(request: &'a ResolveRequest, projects: &'a [ProjectDeps]) -> Vec<&'a str> {
     let mut url_specs: Vec<&str> = Vec::new();
@@ -281,4 +281,19 @@ fn overrides_have_inline_url_auth(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(map) => map.values().any(overrides_have_inline_url_auth),
         _ => false,
     }
+}
+
+pub(super) fn reject_incompatible_lockfile_format(request: &ResolveRequest) -> Option<Response> {
+    let formats = request.accepted_lockfile_formats.as_ref()?;
+    if !formats
+        .iter()
+        .any(|format| format == "9.0" || format == "9")
+    {
+        return Some(json_error_with_code(
+            StatusCode::BAD_REQUEST,
+            "incompatible lockfile format: server supports format 9.0",
+            Some("ERR_PNPR_INCOMPATIBLE_LOCKFILE_FORMAT"),
+        ));
+    }
+    None
 }

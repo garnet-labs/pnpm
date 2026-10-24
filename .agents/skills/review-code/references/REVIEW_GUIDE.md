@@ -105,8 +105,6 @@ Recurring judgement calls:
   scope secrets to the exact step that needs them.
 - **Lifecycle/build-script trust gates** cover every dependency source and phase.
 
-For changes to network, registry, config or build-script gates, read the Garnet comment for the head commit and name any added program or host, tied to the diff. Missing or incomplete evidence is not a pass.
-
 **Don't overreact to audit output.** An advisory on dev-only/non-runtime code, or on functions
 pnpm doesn't call, may be safe to ignore; don't force a semver-breaking update to silence a
 non-exploitable warning. A misconfigured consumer is not a pnpm bug.

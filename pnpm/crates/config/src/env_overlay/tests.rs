@@ -3,6 +3,7 @@ use crate::{
     ColorMode, Config, NodeLinker, NodePackageMapType, SaveWorkspaceProtocol,
     ScriptsPrependNodePath, TrustPolicy, VirtualStoreType, api::EnvVar,
 };
+use pnpm_store_dir::StoreIndexFormat;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 
@@ -299,6 +300,34 @@ fn tri_array_env_var_parses_arrays_and_rejects_null() {
 }
 
 #[test]
+fn store_index_format_env_var_parses_its_two_values() {
+    macro_rules! env_with_store_index_format {
+        ($name:ident, $value:expr) => {
+            struct $name;
+            impl EnvVar for $name {
+                fn var(name: &str) -> Option<String> {
+                    (name == "PNPM_CONFIG_STORE_INDEX_FORMAT").then(|| $value.to_owned())
+                }
+            }
+        };
+    }
+
+    env_with_store_index_format!(EnvFiles, "files");
+    env_with_store_index_format!(EnvSqlite, "sqlite");
+    env_with_store_index_format!(EnvNonsense, "postgres");
+
+    assert_eq!(
+        WorkspaceSettings::from_pnpm_config_env::<EnvFiles>().store_index_format,
+        Some(StoreIndexFormat::Files),
+    );
+    assert_eq!(
+        WorkspaceSettings::from_pnpm_config_env::<EnvSqlite>().store_index_format,
+        Some(StoreIndexFormat::Sqlite),
+    );
+    assert_eq!(WorkspaceSettings::from_pnpm_config_env::<EnvNonsense>().store_index_format, None);
+}
+
+#[test]
 fn virtual_store_type_env_var_parses_its_two_values() {
     macro_rules! env_with_virtual_store_type {
         ($name:ident, $value:expr) => {
@@ -388,4 +417,15 @@ fn publish_wait_timeout_reads_from_environment() {
         }
     }
     assert_eq!(WorkspaceSettings::from_pnpm_config_env::<Env>().publish_wait_timeout, Some(600000));
+}
+
+#[test]
+fn tag_parses_from_env() {
+    struct EnvTag;
+    impl EnvVar for EnvTag {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_TAG").then(|| "next".to_owned())
+        }
+    }
+    assert_eq!(WorkspaceSettings::from_pnpm_config_env::<EnvTag>().tag.as_deref(), Some("next"));
 }

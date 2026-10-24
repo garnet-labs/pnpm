@@ -22,11 +22,9 @@ pnx create-vue my-app
 Unlike npm, pnpm validates all options. For example, `pnpm install --target_arch x64` will
 fail as `--target_arch` is not a valid option for `pnpm install`.
 
-However, some dependencies may use the `npm_config_` environment variable, which
-is populated from the CLI options. In this case, you have the following options:
-
-1. explicitly set the env variable: `npm_config_target_arch=x64 pnpm install`
-1. force the unknown option with `--config.`: `pnpm install --config.target_arch=x64`
+Some dependencies read an `npm_config_` environment variable during their build.
+pnpm does not set these variables from its options, so set the variable yourself:
+`npm_config_target_arch=x64 pnpm install`.
 
 ## Options
 
@@ -76,4 +74,4 @@ These environment variables may influence what directories pnpm will use for sto
 * `XDG_DATA_HOME`
 * `XDG_STATE_HOME`
 
-You can search the docs to find the settings that leverage these environment variables.
+You can search the docs to find the settings that use these environment variables.

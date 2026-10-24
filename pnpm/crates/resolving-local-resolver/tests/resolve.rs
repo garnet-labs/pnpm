@@ -105,7 +105,7 @@ async fn resolve_directory_specified_using_absolute_path_with_preserve_absolute_
         bare_specifier: format!("link:{}", linked_dir.display()),
         injected: false,
     };
-    let ctx = LocalResolverContext { preserve_absolute_paths: true };
+    let ctx = LocalResolverContext { preserve_absolute_paths: true, ..Default::default() };
     let result = resolve_from_local_scheme(&ctx, &wd, &opts(&project_dir)).await
         .expect("resolve")
         .expect("claims");
@@ -128,7 +128,7 @@ async fn resolve_directory_specified_using_absolute_path_with_preserve_absolute_
         bare_specifier: format!("file:{}", linked_dir.display()),
         injected: false,
     };
-    let ctx = LocalResolverContext { preserve_absolute_paths: true };
+    let ctx = LocalResolverContext { preserve_absolute_paths: true, ..Default::default() };
     let result = resolve_from_local_scheme(&ctx, &wd, &opts(&project_dir)).await
         .expect("resolve")
         .expect("claims");
@@ -237,6 +237,7 @@ async fn resolve_workspace_directory() {
 
     assert_eq!(result.id.as_str(), "link:..");
     assert_eq!(result.normalized_bare_specifier.as_deref(), Some("link:.."));
+    assert_eq!(result.resolved_via, "workspace");
 }
 
 #[tokio::test]
@@ -251,6 +252,7 @@ async fn resolve_workspace_directory_with_inject_workspace_packages() {
 
     assert_eq!(result.id.as_str(), "file:..");
     assert_eq!(result.normalized_bare_specifier.as_deref(), Some("file:.."));
+    assert_eq!(result.resolved_via, "workspace");
 }
 
 #[tokio::test]
@@ -265,6 +267,7 @@ async fn resolve_directory_specified_using_the_file_protocol() {
 
     assert_eq!(result.id.as_str(), "file:..");
     assert_eq!(result.normalized_bare_specifier.as_deref(), Some("file:.."));
+    assert_eq!(result.resolved_via, "local-filesystem");
     let LockfileResolution::Directory(dir) = &result.resolution else {
         panic!("expected directory resolution");
     };

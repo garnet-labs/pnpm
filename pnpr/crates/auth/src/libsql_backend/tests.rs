@@ -1,15 +1,35 @@
 use super::{
     Builder, Duration, LibsqlAuth, MaxUsers, RegistryError, Result, TokenBackend, UpsertOutcome,
-    UserBackend, params, retry_database_conflicts,
-    schema::{ensure_user_counter, is_transaction_conflict},
-    sha256_hex, with_auth_timeout,
+    UserBackend, UserCreation, UserRemoval, params, retry_database_conflicts,
+    schema::{ensure_user_counter, is_transaction_conflict, is_unique_violation},
+    with_auth_timeout,
 };
+use crate::token_store::sha256_hex;
 
-/// In-memory libsql database, exercising the same driver and SQL the
-/// networked backend uses without a server.
-async fn local_backend(max_users: MaxUsers) -> LibsqlAuth {
-    let db = Builder::new_local(":memory:").build().await.unwrap();
-    LibsqlAuth::from_database(db, max_users).await.unwrap()
+mod sync_server;
+
+/// A local libsql database, exercising the same driver and SQL the
+/// networked backend uses without a server. It is a file because each pooled
+/// connection to `:memory:` would be a database of its own.
+async fn local_backend(max_users: MaxUsers) -> LocalBackend {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Builder::new_local(dir.path().join("auth.db")).build().await.unwrap();
+    let backend = LibsqlAuth::from_database(db, max_users, 4).await.unwrap();
+    LocalBackend { backend, _dir: dir }
+}
+
+/// A backend and the directory its database lives in.
+struct LocalBackend {
+    backend: LibsqlAuth,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for LocalBackend {
+    type Target = LibsqlAuth;
+
+    fn deref(&self) -> &LibsqlAuth {
+        &self.backend
+    }
 }
 
 #[tokio::test]
@@ -54,7 +74,7 @@ async fn add_or_login_rejects_existing_user_with_wrong_password() {
 async fn max_users_disabled_rejects_registration() {
     let backend = local_backend(MaxUsers::Disabled).await;
     let err = backend.add_or_login("alice", "x").await.unwrap_err();
-    assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(err.status_code(), axum::http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -63,7 +83,9 @@ async fn add_or_login_rejects_invalid_username_before_insert() {
     let err = backend.add_or_login("alice ", "secret").await.unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
 
-    let mut rows = backend.conn
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
         .query("SELECT COUNT(*) FROM users", ())
         .await
         .unwrap();
@@ -81,7 +103,9 @@ async fn add_or_login_rejects_invalid_username_before_insert() {
 async fn add_or_login_rejects_existing_invalid_username() {
     let backend = local_backend(MaxUsers::Unlimited).await;
     let hash = bcrypt::hash("secret", 4).unwrap();
-    backend.conn
+    backend.pool
+        .connect()
+        .unwrap()
         .execute(
             "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
             params!["alice ", hash],
@@ -97,7 +121,9 @@ async fn add_or_login_rejects_existing_invalid_username() {
 #[tokio::test]
 async fn add_or_login_propagates_corrupt_hash_errors() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    backend.conn
+    backend.pool
+        .connect()
+        .unwrap()
         .execute(
             "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
             params!["alice", "not-a-bcrypt-hash"],
@@ -141,7 +167,9 @@ async fn registration_cap_is_strict_under_concurrency() {
     }
     assert_eq!(created, 1, "exactly one registration may win the cap of 1");
 
-    let mut rows = backend.conn
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
         .query("SELECT COUNT(*) FROM users", ())
         .await
         .unwrap();
@@ -162,7 +190,7 @@ async fn registration_cap_is_strict_across_backend_instances() {
     let mut backends = Vec::new();
     for _ in 0..6 {
         let db = Builder::new_local(&path).build().await.unwrap();
-        backends.push(LibsqlAuth::from_database(db, MaxUsers::Limited(1)).await.unwrap());
+        backends.push(LibsqlAuth::from_database(db, MaxUsers::Limited(1), 4).await.unwrap());
     }
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(backends.len()));
     let mut handles = Vec::new();
@@ -183,9 +211,11 @@ async fn registration_cap_is_strict_across_backend_instances() {
     }
     assert_eq!(created, 1);
     let db = Builder::new_local(&path).build().await.unwrap();
-    let backend = LibsqlAuth::from_database(db, MaxUsers::Limited(1)).await.unwrap();
+    let backend = LibsqlAuth::from_database(db, MaxUsers::Limited(1), 4).await.unwrap();
     assert_eq!(backend.user_count().await.unwrap(), 1);
-    let mut rows = backend.conn
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
         .query("SELECT value FROM auth_counters WHERE name = 'users'", ())
         .await
         .unwrap();
@@ -202,21 +232,27 @@ async fn registration_cap_is_strict_across_backend_instances() {
 #[tokio::test]
 async fn ensure_user_counter_reconciles_a_stale_counter() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    backend.conn
+    backend.pool
+        .connect()
+        .unwrap()
         .execute(
             "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
             params!["alice", "not-used-by-this-test"],
         )
         .await
         .unwrap();
-    backend.conn
+    backend.pool
+        .connect()
+        .unwrap()
         .execute("UPDATE auth_counters SET value = 0 WHERE name = ?1", params!["users"])
         .await
         .unwrap();
 
-    ensure_user_counter(&backend.conn).await.unwrap();
+    ensure_user_counter(&backend.pool.connect().unwrap()).await.unwrap();
 
-    let mut rows = backend.conn
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
         .query("SELECT value FROM auth_counters WHERE name = ?1", params!["users"])
         .await
         .unwrap();
@@ -234,7 +270,9 @@ async fn ensure_user_counter_reconciles_a_stale_counter() {
 async fn registration_cap_self_heals_an_overcounted_counter() {
     let backend = local_backend(MaxUsers::Limited(1)).await;
     backend.add_or_login("alice", "x").await.unwrap();
-    backend.conn
+    backend.pool
+        .connect()
+        .unwrap()
         .execute("DELETE FROM users WHERE username = ?1", params!["alice"])
         .await
         .unwrap();
@@ -243,7 +281,9 @@ async fn registration_cap_self_heals_an_overcounted_counter() {
         matches!(backend.add_or_login("bob", "x").await.unwrap(), (UpsertOutcome::Created, _),),
     );
 
-    let mut rows = backend.conn
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
         .query("SELECT value FROM auth_counters WHERE name = ?1", params!["users"])
         .await
         .unwrap();
@@ -260,6 +300,7 @@ async fn registration_cap_self_heals_an_overcounted_counter() {
 #[tokio::test]
 async fn tokens_round_trip_and_revoke() {
     let backend = local_backend(MaxUsers::Unlimited).await;
+    backend.create_user("alice", "x").await.unwrap();
     let token = backend.issue("alice").await.unwrap();
     assert_eq!(
         backend
@@ -310,7 +351,9 @@ async fn tokens_round_trip_and_revoke() {
 async fn tokens_store_hash_not_raw() {
     let backend = local_backend(MaxUsers::Unlimited).await;
     let raw = backend.issue("alice").await.unwrap();
-    let mut rows = backend.conn
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
         .query("SELECT token_hash FROM tokens", ())
         .await
         .unwrap();
@@ -333,7 +376,9 @@ async fn reads_propagate_a_backend_error_instead_of_swallowing_it() {
     backend.issue("alice").await.unwrap();
     // Break the store out from under the reads: a query against a
     // dropped table errors rather than returning an empty result.
-    backend.conn
+    backend.pool
+        .connect()
+        .unwrap()
         .execute("DROP TABLE tokens", ())
         .await
         .unwrap();
@@ -346,12 +391,13 @@ async fn reads_propagate_a_backend_error_instead_of_swallowing_it() {
 async fn registration_waits_for_another_database_writer() {
     let directory = tempfile::tempdir().unwrap();
     let db = Builder::new_local(directory.path().join("auth.db")).build().await.unwrap();
-    let backend = LibsqlAuth::from_database(db, MaxUsers::Limited(1)).await.unwrap();
+    let backend = LibsqlAuth::from_database(db, MaxUsers::Limited(1), 4).await.unwrap();
     let other_db = Builder::new_local(directory.path().join("auth.db")).build().await.unwrap();
     let other = other_db.connect().unwrap();
     let writer =
         other.transaction_with_behavior(libsql::TransactionBehavior::Immediate).await.unwrap();
-    let pending = begin_registration_transaction(&backend.conn);
+    let conn = backend.pool.connect().unwrap();
+    let pending = begin_registration_transaction(&conn);
     tokio::pin!(pending);
     assert!(tokio::time::timeout(Duration::from_millis(20), &mut pending).await.is_err());
     writer.rollback().await.unwrap();
@@ -376,7 +422,9 @@ async fn registration_transaction_retries_only_remote_lock_conflicts() {
             .with_state((code, Arc::clone(&attempts)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         let db = Builder::new_remote(format!("http://{address}"), String::new())
             .connector(tower::service_fn(move |_| tokio::net::TcpStream::connect(address)))
             .build()
@@ -437,6 +485,23 @@ async fn reject_remote_transaction(
     axum::Json(serde_json::json!({"baton": null, "base_url": null, "results": results}))
 }
 
+/// Turso reports a duplicate row as a Hrana stream error whose message
+/// carries the `SQLite` result code, not as a `SQLite` result code of its own.
+#[test]
+fn unique_violations_include_hrana_stream_errors() {
+    let turso_duplicate = libsql::Error::Hrana(Box::from(
+        r#"stream error: `Error { message: "SQLite error: UNIQUE constraint failed: auth_counters.name", code: "SQLITE_CONSTRAINT" }`"#,
+    ));
+    assert!(is_unique_violation(&turso_duplicate));
+    let turso_busy = libsql::Error::Hrana(Box::from(
+        r#"stream error: `Error { message: "database is locked", code: "SQLITE_BUSY" }`"#,
+    ));
+    assert!(!is_unique_violation(&turso_busy));
+    assert!(!is_unique_violation(&libsql::Error::ConnectionFailed(
+        "UNIQUE constraint failed".to_string()
+    )));
+}
+
 async fn begin_registration_transaction(conn: &libsql::Connection) -> Result<libsql::Transaction> {
     retry_database_conflicts(|| async {
         conn.transaction_with_behavior(libsql::TransactionBehavior::Immediate)
@@ -444,4 +509,146 @@ async fn begin_registration_transaction(conn: &libsql::Connection) -> Result<lib
             .map_err(RegistryError::from)
     })
     .await
+}
+
+#[tokio::test]
+async fn libsql_supports_the_admin_operations() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    crate::tests::assert_admin_round_trip(&*backend).await;
+}
+
+#[tokio::test]
+async fn admin_created_users_count_against_the_registration_cap() {
+    let backend = local_backend(MaxUsers::Limited(1)).await;
+    assert_eq!(backend.create_user("alice", "secret").await.unwrap(), UserCreation::Created);
+    let err = backend.add_or_login("bob", "secret").await.unwrap_err();
+    assert!(matches!(err, RegistryError::TooManyUsers { max: 1 }), "{err:?}");
+
+    assert_eq!(backend.delete_user("alice").await.unwrap(), UserRemoval::Removed);
+    assert!(matches!(
+        backend.add_or_login("bob", "secret").await.unwrap(),
+        (UpsertOutcome::Created, _),
+    ));
+}
+
+#[tokio::test]
+async fn a_removed_owner_disables_its_tokens_but_not_their_cleanup() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    backend.create_user("alice", "x").await.unwrap();
+    let token = backend.issue("alice").await.unwrap();
+    backend.delete_user("alice").await.unwrap();
+
+    assert!(
+        backend
+            .lookup(&token)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert!(
+        backend
+            .lookup_record(&token)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    let listed = backend.list_for_user("alice").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(
+        backend
+            .revoke_by_key(&listed[0].0)
+            .await
+            .unwrap()
+            .is_some(),
+    );
+}
+
+#[tokio::test]
+async fn sha1_user_authenticates_and_upgrades_to_bcrypt_in_libsql() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    let sha_hash = "{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=";
+    backend.pool
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
+            params!["alice", sha_hash],
+        )
+        .await
+        .unwrap();
+
+    let outcome = backend.add_or_login("alice", "test").await.unwrap();
+    assert!(matches!(outcome, (UpsertOutcome::LoggedIn, _)));
+
+    let updated = backend
+        .stored_hash("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(updated.starts_with("$2y$") || updated.starts_with("$2b$"));
+    assert_ne!(updated, sha_hash);
+}
+
+#[tokio::test]
+async fn libsql_schema_migrations_runs_and_records_version() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
+        .query("SELECT MAX(version) FROM auth_schema_migrations", ())
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("row returned");
+    let version: i64 = row.get(0).unwrap();
+    assert_eq!(version, crate::CURRENT_SCHEMA_VERSION);
+}
+
+#[tokio::test]
+async fn libsql_tokens_persist_scopes_and_kind() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    backend.add_or_login("alice", "secret").await.unwrap();
+
+    let new_token = crate::NewToken::new()
+        .with_scopes(Some(vec!["scope:read".to_string(), "scope:write".to_string()]))
+        .with_kind(Some("granular".to_string()));
+    let (raw, record) = backend.issue_token("alice", new_token).await.unwrap();
+    assert_eq!(record.scopes, Some(vec!["scope:read".to_string(), "scope:write".to_string()]));
+    assert_eq!(record.kind.as_deref(), Some("granular"));
+
+    let looked_up = backend
+        .lookup_record(&raw)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(looked_up.scopes, Some(vec!["scope:read".to_string(), "scope:write".to_string()]));
+    assert_eq!(looked_up.kind.as_deref(), Some("granular"));
+}
+
+#[tokio::test]
+async fn libsql_schema_migrations_refuses_future_version() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    backend.pool
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO auth_schema_migrations (version, applied_at) VALUES (999, 123456789)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let err = super::schema::init_schema(&backend.pool.connect().unwrap(), || async {
+        Ok::<(), RegistryError>(())
+    })
+    .await
+    .unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("newer than supported version"),
+        "expected error about newer version, got: {err_str}",
+    );
 }

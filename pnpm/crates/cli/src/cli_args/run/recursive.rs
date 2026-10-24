@@ -23,9 +23,8 @@ use super::{
 use crate::cli_args::{
     recursive::{
         AutoExcludeRoot, ExecutionStatus, Status, count_failures, discover_workspace_projects,
-        filtered_projects_dependencies, find_resume_root, no_projects_matched_message,
-        notice_workspace_dir, projects_to_verify, select_recursive_projects,
-        write_recursive_summary,
+        filtered_projects_dependencies, find_resume_root, print_no_projects_matched,
+        projects_to_verify, select_recursive_projects, write_recursive_summary,
     },
     reporter::{ReporterType, reporter_emit, suppresses_info_output},
     task_run_state::{TaskRunExecutionSettings, TaskRunStateContext, task_run_execution_settings},
@@ -36,7 +35,7 @@ use execution::{RunOutcome, RunSlots, TaskRunner};
 use indexmap::IndexMap;
 use miette::{Diagnostic, IntoDiagnostic};
 use pnpm_config::{Config, TaskSettings};
-use pnpm_executor::{ProcessTracker, ScriptOutput};
+use pnpm_executor::{ProcessTracker, ScriptExit, ScriptOutput, exit_like};
 use pnpm_package_manager::{
     make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
     pnp_path_for_execution,
@@ -53,9 +52,9 @@ use pnpm_workspace_task_scheduler::{
 use script_budget::{ScriptBudget, ScriptPermit, run_script_budget};
 use selection::{
     HiddenScriptCheck, RunReporting, a_project_has_the_script, build_run_task_graph,
-    check_a_project_has_the_script, filter_hidden_requested_scripts, print_run_dry_run,
-    print_selected_project_commands, report_run_outcome, resume_task_graph, run_concurrency,
-    run_process_tracker, run_state_settings, run_tasks,
+    check_a_project_has_the_script, check_required_script, filter_hidden_requested_scripts,
+    print_run_dry_run, print_selected_project_commands, report_run_outcome, resume_task_graph,
+    run_concurrency, run_process_tracker, run_state_settings, run_tasks,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -86,6 +85,15 @@ pub enum RecursiveRunError {
     NoSelectedScript {
         #[error(not(source))]
         script_name: String,
+    },
+
+    #[display("Missing script \"{script_name}\" in packages: {packages}")]
+    #[diagnostic(code(ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT))]
+    MissingRequiredScript {
+        #[error(not(source))]
+        script_name: String,
+        /// The comma-separated names of the projects that lack it.
+        packages: String,
     },
 
     #[display("\"pnpm recursive run\" failed in {count} packages")]
@@ -148,7 +156,7 @@ pub fn run_recursive(
     // workspace instead falls through to the no-script error below.
     if !projects.is_empty() && graph.is_empty() {
         if !args.json && !silent {
-            println!("{}", no_projects_matched_message(notice_workspace_dir(config, dir)));
+            print_no_projects_matched(config, dir);
         }
         return Ok(RecursiveRunOutcome::Done);
     }
@@ -228,6 +236,8 @@ struct RunResults {
     ran_a_command: bool,
     /// The first failed project's prefix, when `--bail` stopped the run.
     first_failure: Option<String>,
+    /// How the first script the user's interrupt ended exited.
+    interrupted: Option<ScriptExit>,
 }
 
 impl RecursiveRun<'_, '_> {
@@ -253,6 +263,12 @@ impl RecursiveRun<'_, '_> {
             self.reporter,
         )?;
         let results = self.execute(&prepared)?;
+        // The user ended the run, so pnpm ends the way the interrupted
+        // script did rather than reporting the scripts as failed
+        // (pnpm/pnpm#16964).
+        if let Some(exit) = results.interrupted {
+            exit_like(exit);
+        }
         report_run_outcome(
             &RunReporting {
                 args: self.args,
@@ -342,6 +358,13 @@ impl RecursiveRun<'_, '_> {
         task_graph: &mut TaskGraph,
         full_task_graph: &TaskGraph,
     ) -> miette::Result<()> {
+        check_required_script(
+            task_graph,
+            self.graph,
+            self.script.script_name,
+            &self.config.required_scripts,
+        )?;
+
         // Hidden scripts (names starting with `.`) can only be invoked from
         // within another script, detected by an inherited
         // `npm_lifecycle_event`. Checked only for the tasks the invocation
@@ -406,6 +429,7 @@ impl RecursiveRun<'_, '_> {
                 result: &slots.result,
                 has_command: &slots.has_command,
                 first_failure: &slots.first_failure,
+                interrupted: &slots.interrupted,
                 abort: &slots.abort,
                 process_tracker: process_tracker.as_ref(),
                 task_run_state: &prepared.task_run_state,

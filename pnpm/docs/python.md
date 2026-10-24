@@ -145,9 +145,13 @@ Selecting any member with [`--filter`](./filtering.md) installs the whole shared
 
 Sharing is decided per workspace, so a repository can share an environment where its projects agree and keep independent ones where they do not.
 
-## Faster resolution through pnpr
+## Resolution
 
-With [`pnprServer`](/pnpr/install-acceleration) set, the server resolves the Python graph, so pnpm does not have to download a wheel to find out what it requires. A server that does not answer for Python makes pnpm fall back to resolving locally.
+pnpm reads what each release requires from the metadata file the index publishes beside its wheel ([PEP 658](https://peps.python.org/pep-0658/)), and downloads the wheel only once the release is selected. For an index that publishes no metadata file, or no SHA-256 to check it against, pnpm reads the requirements out of the wheel. Index pages and metadata files are read in parallel, up to [`networkConcurrency`](./settings/network.md#networkconcurrency) at a time.
+
+### Faster resolution through pnpr
+
+With [`pnprServer`](/pnpr/install-acceleration) set, the server resolves the Python graph, so pnpm does not read the index to find out what each release requires. A server that does not answer for Python makes pnpm fall back to resolving locally.
 
 Python graphs configured with multiple indexes, overrides, constraints, or explicit target environments resolve locally. pnpr cannot represent these resolution settings.
 
@@ -169,7 +173,7 @@ An explicit interpreter to use for every project. When omitted, pnpm chooses an 
 
 ### Python indexes
 
-Since v12.5.0, declare indexes through [`registries`](./registries.md#ecosystem), with `ecosystem: pypi`. Without a declaration, pnpm uses `https://pypi.org/simple/`. `python.indexUrl` and `python.extraIndexUrls` are not supported settings in v12.5.0.
+Since v12.5.0, declare indexes through [`registries`](./registries.md#ecosystem), with `ecosystem: pypi`. Without a declaration, pnpm uses `https://pypi.org/simple/`. The `python.indexUrl` and `python.extraIndexUrls` settings were removed in v12.5.0. Use `registries`.
 
 Since v12.5.1, assign package names to each index through [`packages`](./registries.md#packages). pnpm selects one authoritative index before requesting a package, so declaration order has no effect.
 
@@ -188,13 +192,7 @@ registries:
     packages: ["*"]
 ```
 
-`packages` accepts exact distribution names, a name prefix followed by a single `*`, and `*` or `**` for the default index. Names are compared after Python name normalization: case is ignored and runs of `.`, `_`, and `-` become `-`, so `Company_Tools` and `company-tools` are one claim. Any other wildcard shape, such as `company-**` or `@scope/*`, is rejected, as is an empty list.
-
-Two patterns that can match the same name are a configuration error, whether they sit in one entry or in two: an entry that claims the default may claim nothing else, and only one index may be the default.
-
-A matched package resolves exclusively from its assigned index, including transitive dependencies and isolated build dependencies. A missing package, incompatible version, authentication error, or other registry failure stops resolution. pnpm does not retry another index. Indexes must support the Simple JSON API; HTML-only indexes are not supported. Missing pages are cached for offline resolution.
-
-Omitting `packages` claims the default too, so a single custom index needs no patterns, and two indexes that both omit it are refused as two defaults. Once any Python index is declared, PyPI is not added implicitly: a package no index claims fails with `ERR_PNPM_UNCLAIMED_PYTHON_PACKAGE` unless one index is the default. Changing the routes invalidates Python lockfiles, and a `--frozen-lockfile` install then fails with `the Python index changed`.
+The rules for `packages` patterns, conflicts, and the default index are described under [`packages`](./registries.md#packages). Indexes must support the Simple JSON API; HTML-only indexes are not supported. Missing pages are cached for offline resolution. Changing the routes invalidates Python lockfiles, and a `--frozen-lockfile` install then fails with `the Python index changed`.
 
 Configure credentials in [`.npmrc`](./npmrc.md), matched by origin, rather than putting them in a `registries` URL. Authenticated index caches use a credential fingerprint; raw credentials never appear in cache keys.
 

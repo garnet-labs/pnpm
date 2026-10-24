@@ -1,4 +1,4 @@
-mod apply;
+pub use self::package_settings::apply_config_dependency_settings;
 
 use self::apply::apply_hook_delta;
 use super::{
@@ -8,6 +8,8 @@ use super::{
     install_config_deps, is_known_setting_key, resolve_configured_state_dir,
 };
 use miette::WrapErr;
+use pnpm_hooks::IgnoredHook;
+use pnpm_network::redact_and_sanitize;
 
 /// The pnpmfile paths that contribute hooks for `root_dir`, in
 /// application order (see [`finder::find_pnpmfiles`]). Every hook applies
@@ -69,8 +71,14 @@ pub async fn prepare_config<Reporter: self::Reporter>(
     dir: &Path,
 ) -> Result<Vec<Arc<dyn PnpmfileHooks>>> {
     let config_root = config.root_project_manifest_dir(dir).to_path_buf();
-    install_config_deps::<Reporter>(config, &config_root, config.frozen_lockfile.unwrap_or(false))
-        .await?;
+    install_config_deps::<Reporter>(
+        config,
+        &config_root,
+        config.frozen_lockfile.unwrap_or(false),
+        pnpm_env_installer::ConfigDepsInstallMode::Bootstrap,
+    )
+    .await?;
+    apply_config_dependency_settings(config)?;
     run_update_config_hooks::<Reporter>(config, &config_root).await
 }
 
@@ -115,7 +123,7 @@ pub async fn run_update_config_hooks<Reporter: self::Reporter>(
 
     let prefix = root_dir.to_string_lossy().into_owned();
     let mut current = input.clone();
-    let mut has_filter_log = false;
+    let mut ignored_hooks = Vec::new();
     for (pnpmfile, hook) in pnpmfiles.iter().zip(&hooks) {
         let ctx = HookContext { log: hook_logger::<Reporter>(pnpmfile, &prefix), dir: None };
         current = hook
@@ -123,21 +131,47 @@ pub async fn run_update_config_hooks<Reporter: self::Reporter>(
             .await
             .map_err(|err| miette::miette!("{err}"))
             .wrap_err_with(|| format!("running updateConfig hook from {}", pnpmfile.display()))?;
-        has_filter_log |= hook.has_filter_log().await;
+        ignored_hooks.push((pnpmfile.as_path(), hook.ignored_hooks().await));
     }
-    if has_filter_log {
-        Reporter::emit(&LogEvent::Pnpm(PnpmLog {
-            level: LogLevel::Warn,
-            message: "The pnpmfile filterLog hook is deprecated and is not supported by pnpm v12. Remove it from the pnpmfile."
-                .to_string(),
-            prefix: prefix.clone(),
-        }));
-    }
+    warn_ignored_hooks::<Reporter>(&ignored_hooks, &prefix);
 
     adopt_hook_catalogs(config, &current)?;
 
     apply_hook_delta(config, &input, &current, &base_dir)?;
     Ok(hooks)
+}
+
+fn warn_ignored_hooks<Reporter: self::Reporter>(
+    defined_by_pnpmfile: &[(&Path, Vec<IgnoredHook>)],
+    prefix: &str,
+) {
+    for hook in IgnoredHook::ALL {
+        let pnpmfiles: Vec<String> = defined_by_pnpmfile
+            .iter()
+            .filter(|(_, hooks)| hooks.contains(&hook))
+            .map(|(pnpmfile, _)| redact_and_sanitize(&pnpmfile.to_string_lossy()))
+            .collect();
+        if pnpmfiles.is_empty() {
+            continue;
+        }
+        Reporter::emit(&LogEvent::Pnpm(PnpmLog {
+            level: LogLevel::Warn,
+            message: ignored_hook_warning(hook, &pnpmfiles.join(", ")),
+            prefix: prefix.to_string(),
+        }));
+    }
+}
+
+fn ignored_hook_warning(hook: IgnoredHook, pnpmfiles: &str) -> String {
+    match hook {
+        IgnoredHook::FilterLog => {
+            "The pnpmfile filterLog hook is deprecated and is not supported by pnpm v12. Remove it from the pnpmfile."
+                .to_string()
+        }
+        IgnoredHook::ImportPackage => format!(
+            "The pnpmfile importPackage hook (defined in {pnpmfiles}) is ignored. Use the packageImportMethod setting to choose how packages are written to node_modules.",
+        ),
+    }
 }
 
 /// The directory relative hook-output paths resolve against: the workspace
@@ -193,6 +227,13 @@ fn seed_hook_input(
     // The pnpmfiles being run, which is what the setting resolves to and
     // what pnpm reports, rather than only a pinned `pnpmfile` value.
     object.insert("pnpmfile".to_string(), serde_json::to_value(pnpmfiles).into_diagnostic()?);
+    // The hook reads only the selectors the command line gave, not the
+    // `{.}...` default a recursive-by-default command falls back to.
+    for (key, selectors) in [("filter", &config.filter), ("filterProd", &config.filter_prod)] {
+        if config.cli_settings.contains(key) {
+            object.insert(key.to_string(), serde_json::to_value(selectors).into_diagnostic()?);
+        }
+    }
     // A setting nothing set is absent, as it is on pnpm 11, so that
     // `'key' in config` answers there and a hook doesn't read a null as a
     // configured value.
@@ -318,3 +359,6 @@ fn adopt_hook_catalogs(config: &mut Config, current: &Value) -> Result<()> {
 
     Ok(())
 }
+
+mod apply;
+mod package_settings;

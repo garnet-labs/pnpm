@@ -32,10 +32,12 @@ mod dialoguer_wasm;
 mod ecosystem_add;
 mod ecosystem_install;
 mod engine_pm;
+mod env_file;
 mod executable_link;
 mod fatal_error;
 mod flag_relocation;
 mod github_actions;
+mod help_all;
 mod install_as_add;
 mod leading_separator;
 mod package_specifier;
@@ -47,6 +49,7 @@ mod shim_dispatch;
 mod shorthands;
 mod slot_lock;
 mod state;
+mod stdio_inheritance;
 mod virtual_terminal;
 mod with_current;
 
@@ -57,27 +60,64 @@ use config_overrides::ConfigOverrides;
 use flag_relocation::relocate_pre_subcommand_flags;
 use miette::set_panic_hook;
 use pnpm_diagnostics::{enable_tracing_by_env, install_report_handler};
+use pnpm_package_manager::configure_rayon_pool;
 use state::State;
 use std::{ffi::OsString, future::Future, path::Path, process::ExitCode};
 
+// Carrying the command behind the closure below hides its side effects
+// from `clippy::must_use_candidate`, which then wants this attribute.
+// It is correct anyway: dropping the code would always exit 0.
+#[must_use]
 pub fn main() -> ExitCode {
     #[cfg(target_family = "wasm")]
     if let Err(error) = initialize_wasm_paths() {
-        eprintln!("Failed to initialize pnpm host paths: {error}");
+        pnpm_diagnostics::eprintln!("Failed to initialize pnpm host paths: {error}");
         return ExitCode::FAILURE;
     }
     // Runs before anything can print, so the first styled byte already
     // reaches a console that understands it; see `virtual_terminal`.
     virtual_terminal::enable();
-    enable_tracing_by_env();
+    stdio_inheritance::disable();
     install_report_handler();
     set_panic_hook();
-    match run_on_big_stack(run_cli) {
+    // The launch verdict is resolved once and carried into the command:
+    // re-reading the shim sidecar later could observe a concurrent shim
+    // install or removal and disagree with the gate below (see
+    // `shim_dispatch::ShimLaunch`).
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let launch = shim_dispatch::ShimLaunch::detect(&argv);
+    let argv = if launch.is_shim() { argv } else { argv_with_alias_subcommand(argv) };
+    // Load `--env-file` variables here, on the main thread before the
+    // startup thread below exists: `std::env::set_var` must not run once
+    // another thread is alive (see `env_file`). A shim launch is exempt:
+    // its arguments belong to the shim target and travel there untouched.
+    if !launch.is_shim()
+        && let Err(error) = env_file::load_from_argv(&argv)
+    {
+        report_fatal_error(&error);
+        return ExitCode::FAILURE;
+    }
+    // Tracing reads `TRACE`/`TRACE_FORMAT`, which the files above may
+    // define, so it starts only after the load.
+    enable_tracing_by_env();
+    let result = run_on_big_stack(|| run_cli(&launch, &argv));
+    match result.and_then(|()| flush_stdout()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             report_fatal_error(&error);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Flush what `print!` left buffered, and fail with the first write to
+/// stdout that did not reach it.
+fn flush_stdout() -> miette::Result<()> {
+    use std::io::Write as _;
+    pnpm_diagnostics::stdout::check(std::io::stdout().flush());
+    match pnpm_diagnostics::stdout::take_write_error() {
+        Some(error) => Err(miette::miette!("failed to write to stdout: {error}")),
+        None => Ok(()),
     }
 }
 
@@ -100,7 +140,7 @@ fn report_fatal_error(error: &miette::Report) {
             cause.downcast_ref::<pnpm_package_manager::InstallError>()
         {
             if let Some(rendered) = rendered {
-                eprint!("{rendered}");
+                pnpm_diagnostics::eprint!("{rendered}");
             }
             return;
         }
@@ -111,7 +151,7 @@ fn report_fatal_error(error: &miette::Report) {
     if cli_args::reporter::selected_reporter() == cli_args::reporter::ReporterType::Ndjson {
         pnpm_reporter::NdjsonReporter::emit_fatal_error(&fatal_error::error_log(error));
     } else {
-        eprintln!("Error: {error:?}");
+        pnpm_diagnostics::eprintln!("Error: {error:?}");
     }
 }
 
@@ -127,30 +167,33 @@ fn is_reported_error(error: &miette::Report) -> bool {
 }
 
 /// Parse and execute the CLI, including shim dispatch and startup fast paths.
-fn run_cli() -> miette::Result<()> {
-    let argv: Vec<OsString> = std::env::args_os().collect();
+fn run_cli(launch: &shim_dispatch::ShimLaunch, argv: &[OsString]) -> miette::Result<()> {
+    let argv = argv.to_vec();
     // A context-aware global shim is this executable launched under the
     // shim's name, so dispatch runs on the raw argv before any rewriting
     // or clap machinery below: a shim named like an alias must not have
     // the alias subcommand injected into the arguments it forwards.
-    if let Some(exit_code) = shim_dispatch::try_dispatch(&argv) {
+    if let Some(exit_code) = launch.dispatch(&argv) {
         #[expect(
             clippy::exit,
             reason = "the shim dispatcher propagates the dispatched command's exit status"
         )]
         std::process::exit(exit_code);
     }
-    let argv_with_alias = argv_with_alias_subcommand(argv);
-    let child_argv = argv_with_alias
-        .iter()
+    // `--env-file` is this binary's own option: an older pnpm a command
+    // dispatches to would reject the unknown flag, so it never reaches the
+    // child — the variables it names travel by environment inheritance
+    // instead (see `env_file`). The strip keeps the program name in place
+    // so the passthrough boundary still computes.
+    let child_argv = env_file::strip_flags(&argv)
+        .into_iter()
         .skip(1)
-        .cloned()
         .collect::<Vec<_>>();
     // `pnpm pm <cmd>` is stripped before every other pass, so they all see
     // the command line the prefix stands for; the child argv above keeps
     // it, since a dispatched pnpm has to force the built-in too. See
     // `pm_prefix`.
-    let (argv_with_alias, builtin_command_forced) = pm_prefix::strip_prefix(argv_with_alias);
+    let (argv_with_alias, builtin_command_forced) = pm_prefix::strip_prefix(argv);
     let (config_overrides, argv) = ConfigOverrides::extract(argv_with_alias);
     // A version spec (`pnpm with 10 <cmd>`) is left for the `with`
     // subcommand to handle.
@@ -203,7 +246,10 @@ fn parse_or_answer(
 }
 
 /// Parse argv, recording whether `--dir` or `-r` came from the command line.
-fn parse_cli_args(command: clap::Command, argv: Vec<OsString>) -> Result<CliArgs, clap::Error> {
+pub(crate) fn parse_cli_args(
+    command: clap::Command,
+    argv: Vec<OsString>,
+) -> Result<CliArgs, clap::Error> {
     command
         .try_get_matches_from(argv)
         .and_then(|matches| {
@@ -239,7 +285,7 @@ fn print_version(
     if pinned_pnpm_printed_the_version(argv, child_argv, config_overrides)? {
         return Ok(());
     }
-    println!("{}", pnpm_config::PNPM_VERSION);
+    pnpm_diagnostics::println!("{}", pnpm_config::PNPM_VERSION);
     Ok(())
 }
 
@@ -376,83 +422,6 @@ fn inject_alias_subcommand(exe_name: Option<&str>, mut argv: Vec<OsString>) -> V
     argv
 }
 
-/// Size rayon's global pool with [`rayon_pool_size`].
-///
-/// Must run before anything touches rayon. The first parallel iterator
-/// builds the global pool at rayon's default size, after which this
-/// call can no longer size it, so debug builds assert that it did. The
-/// repeat-install fast path uses rayon for workspace discovery.
-///
-/// Deliberately NOT communicated via the `RAYON_NUM_THREADS`
-/// environment variable: a process-env write would leak into every
-/// child the install spawns (lifecycle scripts, `node --version`,
-/// git), and pnpm exposes no such variable to scripts. An explicit
-/// `RAYON_NUM_THREADS` from the caller is honoured by skipping the
-/// override.
-///
-/// Use [`std::thread::available_parallelism`] rather than the
-/// workspace's existing `num_cpus::get()` so cgroup / CPU-quota
-/// limits in containers and CI runners are respected — `num_cpus`
-/// reports the host's logical CPU count, which on a quota-limited
-/// runner can spin up far more rayon threads than the kernel will
-/// actually schedule onto our cores.
-fn configure_rayon_pool() {
-    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-        return;
-    }
-    let parallelism = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let built = rayon::ThreadPoolBuilder::new()
-        .num_threads(rayon_pool_size(parallelism, RAYON_THREADS_PER_CORE))
-        .build_global();
-    let configured = built.is_ok();
-    debug_assert!(configured, "rayon's global pool was built before it was configured: {built:?}");
-}
-
-/// `threads_per_core × parallelism`, kept between [`MIN_RAYON_THREADS`]
-/// and [`MAX_RAYON_THREADS`]. See [`RAYON_THREADS_PER_CORE`] for the
-/// multiplier. The link phase is dominated by clonefile /
-/// hardlink syscalls that block the calling thread on the kernel's
-/// metadata journal, not by CPU work, so oversubscribing CPUs gives
-/// more in-flight syscalls and a higher effective throughput.
-/// Empirically sweeping 4-200 threads on a 1352-package warm install
-/// on macOS APFS, 2× was the knee — fewer threads underutilize the
-/// journal, way more (100+) loses to context switching and per-thread
-/// fixed costs (`user` time scales linearly past 50 without any
-/// wall-time payoff). That knee holds up to the ceiling below. Past 16
-/// threads, 2× no longer pays off.
-///
-/// **Floor of 4 threads is intentional.** A 1-2-CPU CI runner left
-/// at `2 × parallelism` would be capped to 2-4 rayon threads, and
-/// at that point we go back to the original "one rayon thread is
-/// blocked on a `clonefile` while the next fully-ready snapshot
-/// can't even start" pattern that the 2× tuning is trying to
-/// avoid. The kernel metadata journal is the bottleneck even on
-/// small hosts, so a small intentional oversubscription
-/// (`max(4, 2 × parallelism)`) is a better trade than respecting the
-/// quota literally.
-///
-/// **Ceiling of 16 threads.** Past 16, the extra workers add system
-/// time without shortening the install. A warm-install sweep (nuxt, next, nitro
-/// fixtures) found no machine where 2× beat 16 threads: a 32-vCPU
-/// Linux runner kept its wall time and halved its system time, a
-/// 16-vCPU Windows runner got 10% faster, and a 10-core M1 Max, the
-/// one host where 2× beat 8 threads, was unchanged at 16
-/// (pnpm/tasks#51). A ceiling of 8 cut Linux system time further and
-/// sped up Windows, but cost that Mac 19%.
-fn rayon_pool_size(parallelism: usize, threads_per_core: usize) -> usize {
-    parallelism.saturating_mul(threads_per_core).clamp(MIN_RAYON_THREADS, MAX_RAYON_THREADS)
-}
-
-/// Two threads per core, except on Windows, where the sweeps mostly
-/// favoured one (pnpm/tasks#52). Warm frozen installs were 4-5% faster
-/// at 1× on 4- and 8-vCPU runners. A fresh install of the 1352-package
-/// benchmark fixture took 3.9 s at 1× and 4.5 s at 2× on a 4-vCPU
-/// runner, and was even on an 8-vCPU one. A 16-vCPU runner was fastest
-/// at 4 threads, below what this multiplier gives it.
-const RAYON_THREADS_PER_CORE: usize = if cfg!(windows) { 1 } else { 2 };
-const MIN_RAYON_THREADS: usize = 4;
-const MAX_RAYON_THREADS: usize = 16;
-
 #[cfg(test)]
 mod tests;
 
@@ -464,6 +433,7 @@ fn prepare_cli_argv(argv: Vec<OsString>) -> (clap::Command, Vec<OsString>) {
     let argv = renamed_options::drop_shadowed_aliases(&command, argv);
     let argv = relocate_pre_subcommand_flags(&command, argv);
     let argv = install_as_add::rewrite(&command, argv);
+    let argv = help_all::drop_all_flag(&command, argv);
     let argv = leading_separator::preserve_leading_separator(argv);
     (command, argv)
 }

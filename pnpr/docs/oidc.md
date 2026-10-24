@@ -39,6 +39,46 @@ subject to a pnpr username, and the registry's existing access rules and teams
 then apply. Extra `claims` are exact string matches and all of them must match.
 There is no automatic account creation, and no linking by email.
 
+### Teams from groups
+
+A signed-in session can also join teams through the groups your identity
+provider puts in the ID token:
+
+```yaml title="pnpr.yaml"
+auth:
+  oidc:
+    - name: company
+      issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
+      audience: your-client-id
+      login:
+        users:
+          - subject: 'the-users-stable-sub-claim'
+            username: alice
+        groups:
+          claim: groups
+          teams:
+            - group: 7f3c2a10-0000-0000-0000-000000000000
+              registry: private
+              team: platform
+```
+
+- `claim` names the ID-token claim that lists the groups, either as a list of
+  strings or as one string. It defaults to `groups`.
+- A session whose claim lists `group` is a member of `team` on the hosted
+  registry `registry`, as if the team listed its username. `registry` is the
+  registry's key in `registries:`.
+- The membership lasts as long as the session. Removing someone from a group
+  takes effect at their next sign-in, within an hour. It never applies to the
+  user's password logins or `npm token`s.
+- On a registry whose teams are the config's, the team must be declared in its
+  `teams:`. With [`teamsManagedBy: api`](configuration.md#managing-teams-through-the-api),
+  it may name a team the admin API creates later.
+
+Configure the provider to issue the claim, and use the values it emits as
+`group`. Entra ID emits group object IDs under `groups` once group claims are
+enabled for the application, as in the example above. Okta emits group names
+under `groups` when a groups claim is added to the authorization server.
+
 Use the issuer your provider publishes:
 
 | Provider | Issuer |
@@ -65,9 +105,16 @@ for example in your private user `.npmrc`:
 The browser session expires at the earlier of one hour or the ID token's expiry,
 and `npm logout` revokes it. Sessions live in memory and disappear on restart,
 so a multi-replica deployment needs affinity for both the login flow and the
-authenticated requests that follow. They do not appear in `npm token list`. This
-sign-in URL is separate from the npm CLI's `npm login` web protocol. An OIDC
-session cannot yet be exchanged for an [OCI scoped bearer token](container-images.md#authentication).
+authenticated requests that follow. They do not appear in `npm token list`. The
+[web UI](web-ui.md) lists these providers on its sign-in screen and returns to
+the UI after sign-in.
+
+`pnpm login` and `npm login` use this flow automatically via `/-/v1/login`. The
+CLI opens the browser to sign in and polls until authentication completes. If no
+OIDC provider declares `login:`, `/-/v1/login` returns `404` and the CLI falls back
+to username and password authentication (`/-/user/org.couchdb.user:{name}`).
+
+An OIDC session cannot yet be exchanged for an [OCI scoped bearer token](container-images.md#authentication).
 
 ## GitHub Actions keyless publishing
 
@@ -126,22 +173,37 @@ steps:
       token=$(jq -er '.value' <<< "$response")
       echo "::add-mask::$token"
       export NODE_AUTH_TOKEN="pnpr_workload_${token}"
-      npm publish --registry=https://registry.example/~private/
+      npm publish --registry=https://registry.example/npm/~private/
 ```
 
 The project's `.npmrc` holds only the environment reference:
 
 ```ini title=".npmrc"
-//registry.example/~private/:_authToken=${NODE_AUTH_TOKEN}
+//registry.example/npm/~private/:_authToken=${NODE_AUTH_TOKEN}
 ```
-
-On a server with more than one ecosystem, use `/npm/~private/` in both places.
 
 The credential permits ordinary `PUT` publications to the configured packages
 through that named registry and nothing else. It cannot read packages, unpublish,
 change dist-tags separately, manage accounts, publish batches, or reach other
 pnpr services. Request the token after building so it stays valid through the
 publish request; its issuer's expiry applies to every request.
+
+## Keys
+
+Every block rejects unknown keys.
+
+| Key | Required | Description |
+| --- | --- | --- |
+| `name` | yes | Provider name, used in the `/-/oidc/<name>/` URLs. |
+| `issuer` | yes | The provider's issuer URL. |
+| `audience` | yes | The expected `aud` claim. For browser sign-in, the client ID. |
+| `login.clientSecret` | no | Client secret for browser sign-in. Omit for public clients with PKCE. |
+| `login.users` | yes, with `login` | Bindings of `subject`, `username`, and optional `claims`. |
+| `login.groups.claim` | no | The ID-token claim that lists groups. Defaults to `groups`. |
+| `login.groups.teams` | yes, with `groups` | Grants of `group`, `registry`, and `team`. See [Teams from groups](#teams-from-groups). |
+| `workloads[].identity` | yes | A binding of `subject`, `username`, and optional `claims`. |
+| `workloads[].registry` | yes | The hosted npm registry the workload publishes to. |
+| `workloads[].packages` | yes | The exact package names the workload may publish. |
 
 ## Validation and operations
 

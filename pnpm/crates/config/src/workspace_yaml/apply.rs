@@ -1,6 +1,6 @@
 use super::{
-    Config, LockfileSetting, Path, PnpmfileSetting, ProxyKeys, ProxyValue, SideEffectsCacheSetting,
-    StoreDir, UpdateConfig, WorkspaceSettings, decided_allow_builds, no_proxy_scalar, overlay,
+    Config, LockfileSetting, NodePackageMapMode, Path, PnpmfileSetting, ProxyKeys, ProxyValue,
+    SideEffectsCacheSetting, StoreDir, UpdateConfig, WorkspaceSettings, no_proxy_scalar, overlay,
     overlay_some, overlay_tools, registries, resolve, resolve_child_concurrency,
     warn_deprecated_pairing,
 };
@@ -53,6 +53,8 @@ impl WorkspaceSettings {
         identically_named_settings!(apply);
         self.apply_lockfile(config);
 
+        self.apply_node_package_map(config);
+
         if let Some(macos_backup) = self.macos_backup.take() {
             overlay(&mut config.macos_backup.exclude_modules_dir, macos_backup.exclude_modules_dir);
             overlay(&mut config.macos_backup.exclude_store_dir, macos_backup.exclude_store_dir);
@@ -85,6 +87,19 @@ impl WorkspaceSettings {
         self.apply_policy_settings(config, audit_level_in_yaml, audit_config_in_yaml);
     }
 
+    /// The `nodePackageMap` section is applied after its deprecated
+    /// spellings so it wins when one source carries both.
+    fn apply_node_package_map(&mut self, config: &mut Config) {
+        if let Some(enabled) = self.node_experimental_package_map.take() {
+            config.node_package_map_mode = NodePackageMapMode::from_experimental_flag(enabled);
+        }
+        overlay(&mut config.node_package_map_type, self.node_package_map_type.take());
+        if let Some(section) = self.node_package_map.take() {
+            overlay(&mut config.node_package_map_mode, section.mode);
+            overlay(&mut config.node_package_map_type, section.map_type);
+        }
+    }
+
     pub(super) fn apply_update_settings(
         &mut self,
         config: &mut Config,
@@ -111,11 +126,13 @@ impl WorkspaceSettings {
 
     pub(super) fn apply_optional_settings(&mut self, config: &mut Config) {
         overlay_some(&mut config.frozen_lockfile, self.frozen_lockfile.take());
+        overlay_some(&mut config.provenance, self.provenance.take());
         overlay_some(
             &mut config.prefer_symlinked_executables,
             self.prefer_symlinked_executables.take(),
         );
         overlay_some(&mut config.save_catalog_name, self.save_catalog_name.take());
+        overlay_some(&mut config.tag, self.tag.take());
         overlay_some(&mut config.init_author_name, self.init_author_name.take());
         overlay_some(&mut config.init_author_email, self.init_author_email.take());
         overlay_some(&mut config.init_author_url, self.init_author_url.take());
@@ -158,7 +175,7 @@ impl WorkspaceSettings {
         }
         // Last of the path-valued settings: pinning the lockfile dir
         // re-resolves `modulesDir` / `virtualStoreDir` against it, so it
-        // must see whatever this layer just set.
+        // must see whatever this layer set.
         if let Some(v) = self.lockfile_dir.take() {
             config.pin_lockfile_dir(&resolve(base_dir, &v));
         }
@@ -169,6 +186,7 @@ impl WorkspaceSettings {
 
     /// Registry endpoints, their credentials, and the caches keyed by them.
     pub(super) fn apply_registry_settings(&mut self, config: &mut Config) {
+        self.apply_tls_to(&mut config.tls);
         let declared_prefixes = self.apply_registry_declarations(config);
         if let Some(v) = self.registry.take() {
             config.registry = normalize_registry_url(&v).into_owned();
@@ -180,6 +198,9 @@ impl WorkspaceSettings {
         overlay_tools(&mut config.tools, self.tools.take());
         if let Some(v) = self.remote_side_effects_cache.take() {
             config.remote_side_effects_cache.get_or_insert_default().overlay(v);
+        }
+        if let Some(remote) = self.remote_cache.take() {
+            config.remote_cache.get_or_insert_default().overlay(remote);
         }
         self.apply_side_effects_cache(config);
         self.apply_named_registries(config, declared_prefixes);
@@ -226,6 +247,7 @@ impl WorkspaceSettings {
                 if let Some(remote) = settings.remote {
                     config.remote_side_effects_cache.get_or_insert_default().overlay(remote);
                 }
+                overlay_some(&mut config.side_effects_cache_exclude, settings.exclude);
             }
             None => {}
         }
@@ -241,6 +263,7 @@ impl WorkspaceSettings {
                 config.lockfile_include_resolution_settings = settings
                     .include_resolution_settings
                     .unwrap_or(false);
+                config.lockfile_integrity_target = settings.integrity_target.unwrap_or_default();
             }
             None => {}
         }
@@ -296,9 +319,7 @@ impl WorkspaceSettings {
             );
         }
         overlay_some(&mut config.config_dependencies, self.config_dependencies.take());
-        if let Some(v) = self.allow_builds.take() {
-            config.allow_builds = decided_allow_builds(v);
-        }
+        self.apply_permissions(config);
         overlay(&mut config.dangerously_allow_all_builds, self.dangerously_allow_all_builds.take());
         overlay(&mut config.strict_dep_builds, self.strict_dep_builds.take());
         overlay(&mut config.ignore_scripts, self.ignore_scripts.take());
@@ -307,6 +328,9 @@ impl WorkspaceSettings {
         overlay(&mut config.engine_strict, self.engine_strict.take());
         overlay(&mut config.force_ignores_platform, self.force_ignores_platform.take());
         overlay_some(&mut config.node_version, self.node_version.take());
+        if let Some(runtime) = self.runtime.take() {
+            config.skip_runtimes = !runtime;
+        }
         overlay_some(&mut config.runtime_on_fail, self.runtime_on_fail.take());
         overlay(&mut config.node_download_mirrors, self.node_download_mirrors.take());
     }
@@ -365,6 +389,7 @@ impl WorkspaceSettings {
         audit_level_in_yaml: bool,
         audit_config_in_yaml: bool,
     ) {
+        overlay_some(&mut config.boot_config, self.boot_config.take().map(Box::new));
         overlay_some(&mut config.minimum_release_age, self.minimum_release_age.take());
         overlay_some(
             &mut config.minimum_release_age_exclude,
@@ -412,6 +437,15 @@ impl WorkspaceSettings {
             config.audit_config.ignore_ghsas = ignore;
         }
         overlay_some(&mut config.audit_ignore_prune, audit.ignore_prune);
+    }
+
+    /// An invalid `localAddress` clears the one a lower source set, as
+    /// it does between `.npmrc` layers.
+    fn apply_tls_to(&mut self, tls: &mut pnpm_network::TlsConfig) {
+        overlay_some(&mut tls.strict_ssl, self.strict_ssl.take());
+        if let Some(local_address) = self.local_address.take() {
+            tls.local_address = local_address.parse().ok();
+        }
     }
 
     /// Overlay this file's proxy keys onto the merged view and re-resolve.

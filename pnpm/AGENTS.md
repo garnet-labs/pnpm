@@ -53,14 +53,14 @@ Working rules:
    binary. Use the DI seam — a capability trait on the `Host`
    provider, threaded as `Sys: <Bounds>` — only for branches a real
    fixture can't reach portably: filesystem error kinds
-   (`PermissionDenied`, `ENOSPC`, …), deterministic time, shared
+   (`PermissionDenied`, `ENOSPC`, and so on), deterministic time, shared
    process-global state a test would otherwise mutate
-   (`env::set_var`, `set_current_dir`, the umask, …), or the
+   (`env::set_var`, `set_current_dir`, the umask, and so on), or the
    external-service happy paths in features like `pnpm login` (2FA)
    and `pnpm publish` (OIDC / provenance) when those land. See
    [Dependency injection for tests](./CODE_STYLE_GUIDE.md#dependency-injection-for-tests)
    in the style guide for the gating rule, the names (`Sys`, `Host`,
-   `Fs*`, `Clock`, `EnvVar`, …), the eight principles, and the
+   `Fs*`, `Clock`, `EnvVar`, and so on), the eight principles, and the
    `modules-yaml` worked example.
 
 If the intended behavior is unclear or looks wrong, stop and ask the user
@@ -269,7 +269,7 @@ fn my_test() {
 }
 ```
 
-are forbidden. If the test needs a tool, just call into it and let the
+are forbidden. If the test needs a tool, call into it and let the
 existing `.unwrap()` / `.expect(...)` panic when the tool is absent — a
 failing test in an under-provisioned environment is the correct signal.
 Tolerance defeats the purpose of testing: if the environment really
@@ -325,6 +325,13 @@ step before every handoff. See
   scalar `assert_eq!`.
 - Follow [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/naming.html)
   for naming.
+- A `bool` stays a `bool` only while every use site reads as a predicate. A
+  behavior switch, a bare `true`/`false` argument, or a `bool` in a tuple
+  becomes an enum or a struct with named fields. A `bool` named for one of
+  several alternatives becomes an enum of those alternatives. Flags that
+  constrain each other become one enum of the reachable states, not a struct of
+  named flags.
+  See [Boolean parameters and fields](./CODE_STYLE_GUIDE.md#boolean-parameters-and-fields).
 - **No star imports inside module bodies.** Write `use super::{Foo, bar}`
   instead of `use super::*;`, and the same for any other glob whose
   target is a module you control. Two forms stay allowed: external-crate

@@ -54,8 +54,7 @@ async fn offline_over_a_damaged_mirror_fragment_errors() {
         needs_full_metadata_for: None,
         filter_metadata: false,
         cache_policy: crate::MetadataCachePolicy {
-            offline: true,
-            prefer_offline: false,
+            network: pnpm_config::NetworkPolicy::Offline,
             ignore_missing_time_field: false,
         },
         store_view: None,
@@ -121,8 +120,7 @@ async fn a_damaged_fragment_behind_a_304_is_replaced_by_a_bypassing_refetch() {
         needs_full_metadata_for: None,
         filter_metadata: false,
         cache_policy: crate::MetadataCachePolicy {
-            offline: false,
-            prefer_offline: false,
+            network: pnpm_config::NetworkPolicy::Online,
             ignore_missing_time_field: false,
         },
         store_view: None,
@@ -151,7 +149,7 @@ async fn a_damaged_fragment_behind_a_304_is_replaced_by_a_bypassing_refetch() {
     assert_ne!(healed, damaged, "the bypassing refetch rewrites the damaged mirror");
     let reloaded = load_meta(&path).expect("reload the healed mirror");
     assert!(reloaded.versions.get("1.1.0").is_some());
-    assert!(!reloaded.versions.has_corrupt_mirror_fragment());
+    assert!(!reloaded.versions.corrupt_mirror_fragment_found());
 }
 
 const UNPARSABLE_VERSION_PACKAGE_BODY: &str = r#"{
@@ -205,8 +203,7 @@ async fn a_registry_version_of_the_wrong_shape_is_skipped_without_a_refetch() {
         needs_full_metadata_for: None,
         filter_metadata: false,
         cache_policy: crate::MetadataCachePolicy {
-            offline: false,
-            prefer_offline: false,
+            network: pnpm_config::NetworkPolicy::Online,
             ignore_missing_time_field: false,
         },
         store_view: None,
@@ -226,6 +223,6 @@ async fn a_registry_version_of_the_wrong_shape_is_skipped_without_a_refetch() {
         .await
         .expect("the well-formed versions stay pickable");
     assert_eq!(result.picked_package.expect("picked").version.to_string(), "1.0.0");
-    assert!(!result.meta.versions.has_corrupt_mirror_fragment());
+    assert!(!result.meta.versions.corrupt_mirror_fragment_found());
     mock.assert_async().await;
 }

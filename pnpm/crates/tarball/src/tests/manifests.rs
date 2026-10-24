@@ -29,7 +29,8 @@ fn extract_tarball_records_requires_build_from_manifest() {
     }
 
     let (_cas_paths, pkg_files_idx) =
-        extract_tarball_entries(&tar_bytes, store_path, None).expect("tarball extraction");
+        extract_tarball_entries(&tar_bytes, crate::TarLimits::default(), store_path, None)
+            .expect("tarball extraction");
 
     assert_eq!(pkg_files_idx.requires_build, Some(true));
     drop(tempdir);
@@ -58,7 +59,8 @@ fn extract_tarball_reads_a_manifest_that_starts_with_a_utf8_bom() {
     }
 
     let (_cas_paths, pkg_files_idx) =
-        extract_tarball_entries(&tar_bytes, store_path, None).expect("tarball extraction");
+        extract_tarball_entries(&tar_bytes, crate::TarLimits::default(), store_path, None)
+            .expect("tarball extraction");
 
     assert_eq!(pkg_files_idx.requires_build, Some(true));
     assert!(pkg_files_idx.manifest.is_some(), "the bundled manifest must be recorded");
@@ -91,9 +93,13 @@ fn streaming_extract_parses_manifest_larger_than_entry_buffer() {
         builder.finish().expect("finalize tar");
     }
 
-    let (_cas_paths, pkg_files_idx) =
-        stream_extract_gzipped_tarball(&gzip_bytes(&tar_bytes), store_path, None)
-            .expect("streaming extraction");
+    let (_cas_paths, pkg_files_idx) = stream_extract_gzipped_tarball(
+        &gzip_bytes(&tar_bytes),
+        crate::TarLimits::default(),
+        store_path,
+        None,
+    )
+    .expect("streaming extraction");
 
     assert_eq!(pkg_files_idx.requires_build, Some(true));
     assert!(pkg_files_idx.manifest.is_some(), "the bundled manifest must be recorded");
@@ -117,9 +123,15 @@ fn streaming_extract_rejects_manifest_beyond_prealloc_cap() {
     header.set_entry_type(tar::EntryType::Regular);
     header.set_cksum();
 
-    let err = stream_extract_gzipped_tarball(&gzip_bytes(header.as_bytes()), store_path, None)
-        .expect_err("oversized manifest must be rejected, not buffered");
+    let err = stream_extract_gzipped_tarball(
+        &gzip_bytes(header.as_bytes()),
+        crate::TarLimits::default(),
+        store_path,
+        None,
+    )
+    .expect_err("oversized manifest must be rejected, not buffered");
 
+    assert!(!super::is_transient_error(&err));
     match err {
         TarballError::ReadTarballEntries(io_err) => {
             assert_eq!(io_err.kind(), ErrorKind::InvalidData);
@@ -145,7 +157,8 @@ async fn read_local_tarball_metadata_reads_a_manifest_past_the_eager_ceiling() {
     );
     std::fs::write(&tarball_path, &archive).unwrap();
 
-    let metadata = read_local_tarball_metadata(&tarball_path).await
+    let metadata = read_local_tarball_metadata(&tarball_path, crate::IntegrityKind::Resource)
+        .await
         .expect("an archive past the eager ceiling must still resolve");
 
     let manifest = metadata.manifest.expect("bundled manifest");
@@ -163,7 +176,8 @@ async fn read_local_tarball_metadata_rejects_an_unparsable_manifest() {
     let tarball_path = local_dir.path().join("pkg.tgz");
     std::fs::write(&tarball_path, gzipped_tar(&[("package/package.json", b"{ BROKEN")])).unwrap();
 
-    let err = read_local_tarball_metadata(&tarball_path).await
+    let err = read_local_tarball_metadata(&tarball_path, crate::IntegrityKind::Resource)
+        .await
         .expect_err("an unparsable bundled manifest must fail the read");
     match err {
         TarballError::ParseBundledManifest { tarball, .. } => {
@@ -189,7 +203,8 @@ async fn read_local_tarball_metadata_lets_a_later_manifest_supersede_a_malformed
     )
     .unwrap();
 
-    let metadata = read_local_tarball_metadata(&tarball_path).await
+    let metadata = read_local_tarball_metadata(&tarball_path, crate::IntegrityKind::Resource)
+        .await
         .expect("the surviving manifest parses, so the read succeeds");
     let manifest = metadata.manifest.expect("bundled manifest");
     assert_eq!(manifest.get("name").and_then(serde_json::Value::as_str), Some("dup-pkg"));
@@ -204,7 +219,8 @@ async fn read_local_tarball_metadata_tolerates_an_archive_with_no_manifest() {
     let tarball_path = local_dir.path().join("pkg.tgz");
     std::fs::write(&tarball_path, gzipped_tar(&[("package/README.md", b"hi")])).unwrap();
 
-    let metadata = read_local_tarball_metadata(&tarball_path).await
+    let metadata = read_local_tarball_metadata(&tarball_path, crate::IntegrityKind::Resource)
+        .await
         .expect("an archive without a manifest still reads");
     assert!(metadata.manifest.is_none(), "got {:?}", metadata.manifest);
 }
@@ -225,8 +241,10 @@ async fn mem_cache_partitions_synthesized_package_manifests_by_content() {
             auth_headers: &auth_headers,
             retry_opts: test_retry_opts(),
             offline: true,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: None,
             unpacked_size: None,
             file_count: None,
@@ -291,8 +309,10 @@ async fn store_index_partitions_synthesized_package_manifests_by_content() {
                 auth_headers: &auth_headers,
                 retry_opts: test_retry_opts(),
                 offline: true,
+                tar_limits: crate::TarLimits::default(),
             },
             package: crate::TarballPackage {
+                integrity_kind: crate::IntegrityKind::Resource,
                 integrity: Some(&package_integrity),
                 unpacked_size: None,
                 file_count: None,
@@ -332,8 +352,10 @@ async fn store_index_partitions_synthesized_package_manifests_by_content() {
                 auth_headers: &auth_headers,
                 retry_opts: test_retry_opts(),
                 offline: true,
+                tar_limits: crate::TarLimits::default(),
             },
             package: crate::TarballPackage {
+                integrity_kind: crate::IntegrityKind::Resource,
                 integrity: Some(&package_integrity),
                 unpacked_size: None,
                 file_count: None,
@@ -388,8 +410,10 @@ async fn raw_archive_projection_does_not_inject_an_npm_manifest() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: true,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: None,
             unpacked_size: None,
             file_count: None,
@@ -445,9 +469,9 @@ async fn fetch_for_resolution_reads_manifest_from_subdirectory() {
 
     let resolved = FetchTarballForResolution {
         http_client: &client,
-        store_dir: store_path,
-        store_index_writer: None,
+        store: crate::ResolutionStore { dir: store_path, index_writer: None },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: None,
             unpacked_size: None,
             file_count: None,
@@ -456,6 +480,7 @@ async fn fetch_for_resolution_reads_manifest_from_subdirectory() {
         },
         auth_headers: &AuthHeaders::default(),
         retry_opts: fast_retry_opts(),
+        tar_limits: crate::TarLimits::default(),
         // Leading slash, exactly as the resolution records it.
         manifest_subdir: Some("/packages/foo"),
         revision_addressed: false,
@@ -494,9 +519,9 @@ async fn fetch_for_resolution_returns_no_manifest_for_subdirectory_without_one()
 
     let resolved = FetchTarballForResolution {
         http_client: &client,
-        store_dir: store_path,
-        store_index_writer: None,
+        store: crate::ResolutionStore { dir: store_path, index_writer: None },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: None,
             unpacked_size: None,
             file_count: None,
@@ -505,6 +530,7 @@ async fn fetch_for_resolution_returns_no_manifest_for_subdirectory_without_one()
         },
         auth_headers: &AuthHeaders::default(),
         retry_opts: fast_retry_opts(),
+        tar_limits: crate::TarLimits::default(),
         manifest_subdir: Some("/packages/foo"),
         revision_addressed: false,
     }
@@ -621,7 +647,8 @@ async fn read_local_tarball_metadata_reads_a_manifest_at_the_archive_root() {
     ]);
     std::fs::write(&tarball_path, gzip_bytes(&tar_bytes)).unwrap();
 
-    let metadata = read_local_tarball_metadata(&tarball_path).await
+    let metadata = read_local_tarball_metadata(&tarball_path, crate::IntegrityKind::Resource)
+        .await
         .expect("read the local tarball's metadata");
 
     assert!(metadata.has_manifest_entry);
@@ -632,7 +659,8 @@ async fn read_local_tarball_metadata_reads_a_manifest_at_the_archive_root() {
     // The extraction the resolve-time read has to agree with.
     let (tempdir, store_path) = tempdir_with_leaked_path();
     let (_, pkg_files_idx) =
-        extract_tarball_entries(&tar_bytes, store_path, None).expect("extract the tarball");
+        extract_tarball_entries(&tar_bytes, crate::TarLimits::default(), store_path, None)
+            .expect("extract the tarball");
     assert_eq!(
         pkg_files_idx.manifest
             .as_ref()
@@ -658,7 +686,8 @@ async fn read_local_tarball_metadata_ignores_a_manifest_below_the_package_root()
     );
     std::fs::write(&tarball_path, gzip_bytes(&tar_bytes)).unwrap();
 
-    let metadata = read_local_tarball_metadata(&tarball_path).await
+    let metadata = read_local_tarball_metadata(&tarball_path, crate::IntegrityKind::Resource)
+        .await
         .expect("read the local tarball's metadata");
 
     assert!(!metadata.has_manifest_entry);
@@ -680,11 +709,21 @@ fn tar_metadata_limits_reject_extension_headers_before_payload() {
         header.set_entry_type(entry_type);
         header.set_cksum();
         let (_directory, store_path) = tempdir_with_leaked_path();
-        let error = extract_tarball_entries(header.as_bytes(), store_path, None).unwrap_err();
+        let error = extract_tarball_entries(
+            header.as_bytes(),
+            crate::TarLimits::default(),
+            store_path,
+            None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("exceeds the"), "{error}");
-        let error =
-            stream_extract_gzipped_tarball(&gzip_bytes(header.as_bytes()), store_path, None)
-                .unwrap_err();
+        let error = stream_extract_gzipped_tarball(
+            &gzip_bytes(header.as_bytes()),
+            crate::TarLimits::default(),
+            store_path,
+            None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("exceeds the"), "{error}");
     }
 }
@@ -706,7 +745,9 @@ async fn local_tar_metadata_limits_reject_extension_headers_before_payload() {
         header.set_cksum();
         let tarball = directory.path().join("metadata.tgz");
         std::fs::write(&tarball, gzip_bytes(header.as_bytes())).unwrap();
-        let error = read_local_tarball_metadata(&tarball).await.unwrap_err();
+        let error = read_local_tarball_metadata(&tarball, crate::IntegrityKind::Resource)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("exceeds the"), "{error}");
     }
 }
@@ -731,9 +772,15 @@ fn tar_metadata_limits_preserve_long_names_and_pax_paths() {
         .unwrap();
     let tarball = builder.into_inner().unwrap();
     let (_directory, store_path) = tempdir_with_leaked_path();
-    let (_, eager) = extract_tarball_entries(&tarball, store_path, None).unwrap();
-    let (_, streamed) =
-        stream_extract_gzipped_tarball(&gzip_bytes(&tarball), store_path, None).unwrap();
+    let (_, eager) =
+        extract_tarball_entries(&tarball, crate::TarLimits::default(), store_path, None).unwrap();
+    let (_, streamed) = stream_extract_gzipped_tarball(
+        &gzip_bytes(&tarball),
+        crate::TarLimits::default(),
+        store_path,
+        None,
+    )
+    .unwrap();
     for files in [&eager.files, &streamed.files] {
         assert!(files.contains_key(long_path.strip_prefix("package/").unwrap()));
         assert!(files.contains_key(pax_path.strip_prefix("package/").unwrap()));
@@ -826,4 +873,79 @@ fn buffered_tar_entry_diagnostics_escape_terminal_controls() {
     assert!(message.contains(r"\u{9b}"));
     assert!(!message.contains('\x1b'));
     assert!(!message.contains('\u{009b}'));
+}
+
+#[test]
+fn tar_requires_build_matches_tarball_extractor_rules() {
+    let plain =
+        tar_with_entries(&[("package/package.json", br#"{"name":"plain","version":"1.0.0"}"#)]);
+    assert_eq!(crate::tar_requires_build(plain.as_slice()), Some(false));
+
+    let script = tar_with_entries(&[(
+        "package/package.json",
+        br#"{"name":"script","version":"1.0.0","scripts":{"postinstall":"node build.js"}}"#,
+    )]);
+    assert_eq!(crate::tar_requires_build(script.as_slice()), Some(true));
+
+    let gyp = tar_with_entries(&[
+        ("package/package.json", br#"{"name":"gyp","version":"1.0.0"}"#),
+        ("package/binding.gyp", b"{}"),
+    ]);
+    assert_eq!(crate::tar_requires_build(gyp.as_slice()), Some(true));
+
+    let broken = tar_with_entries(&[("package/package.json", b"{ broken")]);
+    assert_eq!(crate::tar_requires_build(broken.as_slice()), None);
+
+    let complete = tar_with_entries(&[
+        ("package/package.json", br#"{"name":"plain","version":"1.0.0"}"#),
+        ("package/index.js", b"module.exports = 1;\n"),
+    ]);
+    assert_eq!(
+        crate::inspect_tar(complete.as_slice()),
+        crate::TarInspection {
+            requires_build: Some(false),
+            file_count: Some(2),
+            unpacked_size: Some(54),
+            bins: Some(std::collections::BTreeMap::new()),
+        },
+    );
+    // Truncating at the first entry boundary (1024 bytes: 512-byte header +
+    // 512-byte padded payload) omits the second file and the end-of-archive
+    // zero blocks, so inspection must reject the partial archive.
+    assert_eq!(crate::inspect_tar(&complete[..1024]), crate::TarInspection::default());
+
+    let with_bins = tar_with_entries(&[
+        (
+            "package/package.json",
+            br#"{"name":"@scope/cli-tool","version":"1.0.0","bin":"./bin/cli.js"}"#,
+        ),
+        ("package/bin/cli.js", b"#!/usr/bin/env -S node --no-warnings\nconsole.log('ok');\n"),
+    ]);
+    let expected_bins = std::collections::BTreeMap::from([(
+        "cli-tool".to_string(),
+        pnpm_package_manifest::PackageBin {
+            path: "bin/cli.js".to_string(),
+            prog: Some("node".to_string()),
+            args: " --no-warnings".to_string(),
+        },
+    )]);
+    assert_eq!(crate::inspect_tar(with_bins.as_slice()).bins, Some(expected_bins.clone()));
+
+    let (_keep, store_path) = tempdir_with_leaked_path();
+    let (_, _, eager_bins) = crate::extract::extract_tarball_entries_with_bins(
+        &with_bins,
+        crate::TarLimits::default(),
+        store_path,
+        None,
+    )
+    .expect("eager extraction with bins");
+    let (_, _, streamed_bins, _) = crate::extract::stream_extract_gzipped_tarball_with_tar(
+        &gzip_bytes(&with_bins),
+        crate::TarLimits::default(),
+        store_path,
+        None,
+    )
+    .expect("streaming extraction with bins");
+    assert_eq!(eager_bins, Some(expected_bins.clone()));
+    assert_eq!(streamed_bins, Some(expected_bins));
 }

@@ -28,6 +28,8 @@ pub(super) struct PackageSignature {
 #[derive(Debug, Deserialize)]
 pub(super) struct Dist {
     #[serde(default)]
+    pub(super) integrity: Option<String>,
+    #[serde(default)]
     pub(super) tarball: Option<String>,
     #[serde(default)]
     pub(super) signatures: Option<serde_json::Value>,
@@ -85,7 +87,7 @@ pub(super) async fn fetch_registry_keys(
     let status = response.status.as_u16();
     let body = String::from_utf8_lossy(&response.body);
     // npm registries answer 404 (no signing) and 400 the same way: there is no
-    // trust root, so the registry's packages are simply not audited.
+    // trust root, so the registry's packages are not audited.
     if status == 404 || status == 400 {
         return Ok(Vec::new());
     }

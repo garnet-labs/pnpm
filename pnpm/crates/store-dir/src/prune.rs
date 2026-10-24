@@ -77,39 +77,58 @@ pub enum PruneError {
         error: io::Error,
     },
 
+    #[display("Failed to read cache directory {path:?}: {error}")]
+    #[diagnostic(code(ERR_PNPM_STORE_DIR_PRUNE_READ_CACHE_DIR))]
+    ReadCacheDir {
+        path: PathBuf,
+        #[error(source)]
+        error: io::Error,
+    },
+
+    #[display("Failed to remove cached metadata at {path:?}: {error}")]
+    #[diagnostic(code(ERR_PNPM_STORE_DIR_PRUNE_REMOVE_CACHED_METADATA))]
+    RemoveCachedMetadata {
+        path: PathBuf,
+        #[error(source)]
+        error: io::Error,
+    },
+
     #[diagnostic(transparent)]
     PruneCas(#[error(source)] PruneCasError),
 }
 
 impl StoreDir {
-    /// Remove unreferenced packages from the global virtual store and
-    /// content-addressable files that have no hard links outside the store.
+    /// Remove unreferenced packages from the global virtual store, the
+    /// registry metadata cached under `cache_dir`, and content-addressable
+    /// files that have no hard links outside the store. A metadata directory
+    /// that is or holds one of `protected_dirs` is kept.
     ///
     /// Pacquet doesn't yet thread the install-time reporter into
     /// store-dir, so the informational messages go to stderr via
     /// `eprintln!` until [#344] lands the proper reporter wiring.
     ///
     /// [#344]: https://github.com/pnpm/pacquet/issues/344
-    pub fn prune(&self) -> Result<(), PruneError> {
+    pub fn prune(&self, cache_dir: &Path, protected_dirs: &[&Path]) -> Result<(), PruneError> {
         let _store_lock = self.lock_for_prune().map_err(PruneError::StoreLock)?;
         let references = crate::loader_references::loader_references(self)
             .map_err(PruneError::LoaderReferences)?;
         self.prune_global_virtual_store(&references.package_roots)?;
+        self.remove_cached_metadata(cache_dir, protected_dirs)?;
         let stats = crate::prune_cas::prune_cas_with_references(self, &references.files)
             .map_err(PruneError::PruneCas)?;
-        eprintln!(
+        pnpm_diagnostics::eprintln!(
             "Removed {} file{} ({} bytes)",
             stats.files,
             if stats.files == 1 { "" } else { "s" },
             stats.bytes,
         );
-        eprintln!(
+        pnpm_diagnostics::eprintln!(
             "Removed {} package{}",
             stats.packages,
             if stats.packages == 1 { "" } else { "s" },
         );
         if stats.undecodable_packages > 0 {
-            eprintln!(
+            pnpm_diagnostics::eprintln!(
                 "Kept {} package index entr{} that could not be read",
                 stats.undecodable_packages,
                 if stats.undecodable_packages == 1 { "y" } else { "ies" },
@@ -126,10 +145,10 @@ impl StoreDir {
 
         let projects = get_registered_projects(self).map_err(PruneError::ListProjects)?;
         if projects.is_empty() {
-            eprintln!("No registered projects for global virtual store");
+            pnpm_diagnostics::eprintln!("No registered projects for global virtual store");
             return Ok(());
         }
-        eprintln!(
+        pnpm_diagnostics::eprintln!(
             "Checking {} registered project(s) for global virtual store usage",
             projects.len(),
         );
@@ -139,18 +158,18 @@ impl StoreDir {
         // from any registered project leaves the slots' users as unknown as
         // an empty registry does.
         if reachable.is_empty() {
-            eprintln!("No registered project uses the global virtual store");
+            pnpm_diagnostics::eprintln!("No registered project uses the global virtual store");
             return Ok(());
         }
         let removed = remove_unreachable_packages(&links_dir, &reachable)?;
         if removed > 0 {
-            eprintln!(
+            pnpm_diagnostics::eprintln!(
                 "Removed {} package{} from global virtual store",
                 removed,
                 if removed == 1 { "" } else { "s" },
             );
         } else {
-            eprintln!("No unused packages found in global virtual store");
+            pnpm_diagnostics::eprintln!("No unused packages found in global virtual store");
         }
         Ok(())
     }

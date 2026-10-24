@@ -50,10 +50,12 @@ use super::{
     patch_commit::PatchCommitArgs,
     patch_remove::PatchRemoveArgs,
     peers::PeersArgs,
+    permissions::{ApproveArgs, PermissionsArgs},
     ping::PingArgs,
     pipeline::PipelineArgs,
     pkg::PkgArgs,
     prefix::PrefixArgs,
+    profile::ProfileArgs,
     prune::PruneArgs,
     publish::PublishArgs,
     rebuild::RebuildArgs,
@@ -77,6 +79,7 @@ use super::{
     store::StoreCommand,
     tasks::TasksArgs,
     team::TeamArgs,
+    token::TokenArgs,
     undeprecate::UndeprecateArgs,
     unlink::UnlinkArgs,
     unpublish::UnpublishArgs,
@@ -84,6 +87,7 @@ use super::{
     update::UpdateArgs,
     version::VersionArgs,
     view::ViewArgs,
+    whoami::WhoamiArgs,
     why::WhyArgs,
     with::WithArgs,
 };
@@ -114,6 +118,21 @@ pub struct CliArgs {
     /// Automatically answer yes to prompts.
     #[clap(short = 'y', long, global = true)]
     pub yes: bool,
+    /// Load environment variables from a dotenv-style file before running.
+    /// Repeat to layer more files: later files override earlier files, and
+    /// variables already in the environment are never overridden. Relative
+    /// paths resolve against the invocation working directory. The loaded
+    /// variables are visible to config resolution (`PNPM_CONFIG_<KEY>`
+    /// overrides and `${VAR}` tokens in user-level `.npmrc` files), to
+    /// lifecycle scripts, and to any pnpm the command dispatches to.
+    //
+    // The load runs on the main thread before startup, since the process
+    // environment must not be mutated once another thread is alive. This
+    // field exists so the flag is still accepted, validated, documented,
+    // and completed — a valueless `--env-file` is reported instead of
+    // silently ignored.
+    #[clap(long = "env-file", value_name = "PATH", global = true)]
+    pub env_file: Vec<PathBuf>,
     #[clap(flatten)]
     pub paths: CliPathArgs,
     #[clap(flatten)]
@@ -148,7 +167,7 @@ pub struct CliWorkspaceArgs {
     pub execution: WorkspaceExecutionArgs,
 }
 
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct CliPathArgs {
     /// Set working directory. Accepted anywhere on the command line,
     /// before or after the subcommand, like every other rc-option.
@@ -191,7 +210,7 @@ pub struct CliPathArgs {
     pub workspace_packages: Vec<String>,
 }
 
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, clap::Args)]
 pub struct CliNetworkArgs {
     /// Base URL of the npm registry to resolve and fetch packages from.
     /// Universal rc-option: accepted on every command and layered onto
@@ -287,8 +306,13 @@ pub struct WorkspaceOrderingArgs {
     /// Process recursive workspace projects in their normal order.
     #[clap(long = "no-reverse", global = true, hide = true, overrides_with = "reverse")]
     pub no_reverse: bool,
-    /// Maximum number of workspace projects to process in parallel.
-    #[clap(long = "workspace-concurrency", global = true)]
+    /// Maximum number of workspace projects to process in parallel, or
+    /// `Infinity` for no limit.
+    #[clap(
+        long = "workspace-concurrency",
+        global = true,
+        value_parser = parse_workspace_concurrency
+    )]
     #[clap(id = "workspace_concurrency")]
     pub concurrency: Option<i32>,
     /// Run scripts in every selected workspace project concurrently,
@@ -368,6 +392,13 @@ fn parse_color_mode(value: &str) -> Result<pnpm_config::ColorMode, &'static str>
         "never" | "false" => Ok(pnpm_config::ColorMode::Never),
         _ => Err("expected one of: auto, always, never"),
     }
+}
+
+fn parse_workspace_concurrency(value: &str) -> Result<i32, std::num::ParseIntError> {
+    if value == "Infinity" {
+        return Ok(i32::MAX);
+    }
+    value.parse()
 }
 
 impl CliArgs {}
