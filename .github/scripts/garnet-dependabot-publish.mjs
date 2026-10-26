@@ -16,7 +16,7 @@ const POLICY = 'garnet-dependabot-container-v1';
 const POLICY_V2 = 'garnet-dependabot-container-v2';
 const HELPER = '.github/scripts/garnet-additional-lockfiles.mjs';
 const PUBLISH_WORKFLOW = '.github/workflows/garnet-dependabot-publish.yml';
-const ACTION = '9696f3cae14437203c56dac7d78d9449b9ba3764';
+const ACTION = '8cccc85403e4ac4e05fb7822c994d3c199f9aa57';
 const CONTEXT = 'Garnet Dependabot recording';
 const SHA = /^[a-f0-9]{40}$/;
 const IMAGE = /^[a-z0-9./_-]+@sha256:[a-f0-9]{64}$/;
@@ -1599,10 +1599,18 @@ export function main(argv = process.argv.slice(2)) {
   return preview;
 }
 
+export function assertPublishedRecordingVerified(preview) {
+  // A comparison HOLD is a complete capture, so only recording completeness controls process success.
+  check(preview?.recording_verified === true, 'published_recording_not_verified');
+}
+
 export {api, pages, read};
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { main(); } catch (e) {
+  try {
+    const preview = main();
+    if (process.argv.includes('--publish')) assertPublishedRecordingVerified(preview);
+  } catch (e) {
     console.error(`Publisher stopped: ${/^[a-z0-9_]+$/.test(e?.message ?? '') ? e.message : 'local_or_api_validation_failed'}. No approval or merge was attempted.`);
     process.exitCode = 1;
   }

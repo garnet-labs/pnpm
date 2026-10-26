@@ -6,7 +6,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {api, pages, read, authorizeCI, main as publishMain} from './garnet-dependabot-publish.mjs';
+import {api, pages, read, authorizeCI, main as publishMain,
+  assertPublishedRecordingVerified} from './garnet-dependabot-publish.mjs';
 
 const MB = 1024 * 1024;
 const assert = (ok, message) => { if (!ok) throw new Error(message); };
@@ -197,6 +198,7 @@ export function collectorMain() {
       recording_verified: preview.recording_verified === undefined ? preview.verified : preview.recording_verified,
       comparison_matched: preview.comparison_matched, security_verdict: 'HOLD',
     }, null, 2) + '\n', {mode: 0o600});
+    assertPublishedRecordingVerified(preview);
   } finally {
     for (const name of ['publisher-preview.md', 'publisher-preview.json', 'publisher-result.json']) {
       if (fs.existsSync(path.join(root, name))) fs.copyFileSync(path.join(root, name), path.join(output, name));
