@@ -168,6 +168,7 @@ export async function getRuntimeReview(request, { fetchImpl = fetch, githubToken
     record: {
       comment_url: comment?.html_url ?? null,
       bound_to_head: headBound,
+      pending,
       marker_commit: markerCommit,
       compared_with: verdict.record?.comparison?.comparedSha ?? null,
       contract: verdict.record?.contractVersion ?? null,

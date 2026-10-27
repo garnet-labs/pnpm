@@ -135,11 +135,20 @@ export function buildCheckLineFacts(result, files = null) {
   return facts;
 }
 
+/**
+ * Binding is decided from the record's summary, so when the summary names another commit that
+ * SHA is the one to show; the HTML marker can equal the head while the summary does not.
+ */
 function staleReason(result, head) {
-  if (!result.record || result.record.bound_to_head !== false) return null;
+  if (!result.record) return null;
+  if (result.record.pending === true) return `record for head ${head} is still recording, not finalized`;
+  if (result.record.bound_to_head !== false) return null;
+  const first = typeof result.reasons?.[0] === "string" ? result.reasons[0] : "";
+  const summaryCommit = short(first.match(/record is bound to ([0-9a-f]{40})/)?.[1]);
   const marker = short(result.record.marker_commit);
-  if (marker === null && typeof result.record.marker_commit !== "string") return null;
-  return marker ? `record is for commit ${marker}, not head ${head}` : `record is for another commit, not head ${head}`;
+  const bound = summaryCommit ?? (marker !== head ? marker : null);
+  if (bound === null && typeof result.record.marker_commit !== "string" && summaryCommit === null) return null;
+  return bound ? `record is for commit ${bound}, not head ${head}` : `record is for another commit, not head ${head}`;
 }
 
 function undeterminableReason(result, head) {

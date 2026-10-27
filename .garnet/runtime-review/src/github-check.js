@@ -3,7 +3,7 @@ import { checkLine, diffTouches } from "./check-line.js";
 
 export const EVIDENCE_CHECK_NAME = "garnet/evidence";
 const GITHUB_API = "https://api.github.com";
-const MAX_ANCHORED_FILES = 20;
+const MAX_ANCHORED_FILES = 1;
 const MAX_CHECK_ANNOTATIONS = 50;
 const MAX_FILE_PAGES = 30;
 const MAX_TITLE = 255;
@@ -14,9 +14,9 @@ const MAX_SUMMARY = 65535;
  * Reviewer-facing placement of a `get_runtime_review` result on the pull request head:
  * GitHub Actions workflow commands (annotations on the job's own check) and a
  * `garnet/evidence` check run with the same annotations. Both carry the head-bound
- * evidence sentence and every review-relevant destination change, anchored to the files
- * the diff touched. Anchoring is placement only: the record attributes destinations to
- * execution chains, not to lines, and the message says so.
+ * evidence sentence and every review-relevant destination change, anchored to at most
+ * the first classified changed file in PR order. Anchoring is placement only: the record
+ * attributes destinations to execution chains, not to lines, and the message says so.
  */
 
 /**
@@ -63,8 +63,9 @@ export function annotationMessage(result) {
 }
 
 /**
- * One annotation per changed file (first hunk line), or a single file-less annotation when
- * the diff has no anchorable file. Files are anchored in the order GitHub lists them.
+ * One annotation on the first classified changed file (first hunk line), or a single
+ * file-less annotation when the diff has no anchorable file. Files are considered in the
+ * order GitHub lists them.
  *
  * @param {any} result
  * @param {{filename: string, patch?: string|null}[]} files the pull request's changed files
