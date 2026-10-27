@@ -6,7 +6,8 @@ import { serveStdio } from "../src/stdio.js";
 import { createHttpHandler } from "../src/http.js";
 import { renderBrief, InputError } from "../src/runtime-review.js";
 import { renderProfileBrief, ProfileInputError } from "../src/execution-profile.js";
-import { buildAnnotations, buildCheckRun, createCheckRun, fetchPullFiles, renderWorkflowCommand, EVIDENCE_CHECK_NAME } from "../src/github-check.js";
+import { annotationsForWorkflow, buildAnnotations, buildCheckRun, createCheckRun, fetchPullFiles, renderWorkflowCommand, EVIDENCE_CHECK_NAME } from "../src/github-check.js";
+import { checkLine } from "../src/check-line.js";
 
 const WAIT_INTERVAL_MS = 20000;
 const EXIT = { ok: 0, policy: 2, error: 3, usage: 64 };
@@ -20,6 +21,9 @@ Usage:
   garnet-runtime-review check <owner/name> <pr>    Runtime Review for one pull request
   garnet-runtime-review check <pull-request-url>
       --json                 print the full JSON result instead of the brief
+      --line                 print only the check line: "nothing new", "new behaviour" with
+                             the destinations, execution chain and what the diff touches,
+                             or "capture incomplete" with the reason
       --fail-on <list>       comma-separated assessments that exit 2
                              (default: none; e.g. workload-change,undeterminable)
       --wait <seconds>       re-check every 20s while no record is bound to the
@@ -30,7 +34,8 @@ Usage:
                              $GITHUB_STEP_SUMMARY instead of stdout when that file is set
       --github-check[=name]  publish a "garnet/evidence" check run on the head SHA with
                              the delta as title, summary and file annotations; conclusion
-                             is failure when --fail-on matches, neutral otherwise
+                             is failure when --fail-on matches, success when nothing new ran
+                             (no-change/noise-only-change), neutral otherwise
                              (GITHUB_TOKEN with checks: write)
   garnet-runtime-review profile <profile-url> [--json] [--destination S] [--pr N]
 
@@ -56,7 +61,7 @@ function parseArgs(argv) {
     }
     const [key, inline] = arg.slice(2).split("=", 2);
     if (inline !== undefined) flags[key] = inline;
-    else if (["json", "help", "version", "annotate", "github-check"].includes(key)) flags[key] = true;
+    else if (["json", "line", "help", "version", "annotate", "github-check"].includes(key)) flags[key] = true;
     else flags[key] = argv[(index += 1)] ?? "";
   }
   return { positional, flags };
@@ -147,6 +152,21 @@ async function main() {
     }
     const tools = createToolset({ githubToken });
     const deadline = Date.now() + waitSeconds * 1000;
+    if (flags.json && flags.line) {
+      console.error("--json and --line both write to stdout; use one of them (the JSON result carries check_line)");
+      process.exitCode = EXIT.usage;
+      return;
+    }
+    if (flags.line && flags.annotate) {
+      console.error("--line and --annotate both write to stdout; use one of them (the check run title carries the line with --github-check)");
+      process.exitCode = EXIT.usage;
+      return;
+    }
+    if (flags.json && flags.annotate) {
+      console.error("--json and --annotate both write to stdout; use one of them (annotations stay on the check run with --github-check)");
+      process.exitCode = EXIT.usage;
+      return;
+    }
     let result;
     try {
       for (;;) {
@@ -160,20 +180,36 @@ async function main() {
       process.exitCode = error instanceof InputError ? EXIT.usage : EXIT.error;
       return;
     }
+    const publish = Boolean(flags.annotate || flags["github-check"]);
+    let files = null;
+    if (result.pull_request?.head_sha) {
+      try {
+        files = await fetchPullFiles(result.repository, result.pull_request.number, { githubToken });
+      } catch (error) {
+        if (publish) {
+          console.error(`publish failed: ${error.message}`);
+          process.exitCode = EXIT.error;
+          return;
+        }
+        console.error(`changed files not readable (${error.message}); the check line says "diff not inspected"`);
+      }
+    }
+    result.check_line = checkLine(result, files);
     const summaryFile = flags.annotate && !flags.json ? process.env.GITHUB_STEP_SUMMARY : undefined;
     if (summaryFile) appendFileSync(summaryFile, `${renderBrief(result)}\n`);
+    else if (flags.line) console.log(result.check_line.line);
     else console.log(flags.json ? JSON.stringify(result, null, 2) : renderBrief(result));
     if (!result.pull_request?.head_sha) {
       console.error(`lookup failed: ${result.reasons?.[0] ?? "pull request not readable"}`);
       process.exitCode = EXIT.error;
       return;
     }
-    if (flags.annotate || flags["github-check"]) {
+    if (publish) {
       try {
         if (flags["github-check"] && !githubToken) throw new InputError("--github-check needs GITHUB_TOKEN with checks: write");
-        const files = await fetchPullFiles(result.repository, result.pull_request.number, { githubToken });
-        const annotations = buildAnnotations(result, files, { failOn });
-        if (flags.annotate) for (const annotation of annotations) console.log(renderWorkflowCommand(annotation));
+        const annotations = buildAnnotations(result, files ?? [], { failOn });
+        const workflowAnnotations = annotationsForWorkflow(annotations, Boolean(flags["github-check"]));
+        if (flags.annotate) for (const annotation of workflowAnnotations) console.log(renderWorkflowCommand(annotation));
         if (flags["github-check"]) {
           const name = typeof flags["github-check"] === "string" ? flags["github-check"] : EVIDENCE_CHECK_NAME;
           const check = await createCheckRun(result.repository, buildCheckRun(result, { failOn, name, annotations }), { githubToken });

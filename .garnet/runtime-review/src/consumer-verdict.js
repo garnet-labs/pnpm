@@ -67,13 +67,15 @@ export function evaluateConsumerVerdict(request) {
     ]);
   }
 
+  const capture = readCaptureFields(request.body);
+  record.capture = capture;
+
   if (record.comparison.headSha !== expectedHeadSha) {
     return undeterminable(expectedHeadSha, [
       `the record is bound to ${record.comparison.headSha}, not the reviewed head ${expectedHeadSha}; a record for another commit is rejected, never reinterpreted`,
     ], record);
   }
 
-  const capture = readCaptureFields(request.body);
   if (capture.declared && !capture.complete) {
     return undeterminable(expectedHeadSha, capture.reasons, record);
   }

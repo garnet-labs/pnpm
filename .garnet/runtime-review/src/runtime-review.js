@@ -1,5 +1,6 @@
 import { evaluateConsumerVerdict } from "./consumer-verdict.js";
 import { parseRecordedJobs } from "./runtime-review-diff.js";
+import { checkLine } from "./check-line.js";
 
 const GITHUB_API = "https://api.github.com";
 const GARNET_BOT_LOGIN = "garnet-runtime-review[bot]";
@@ -158,7 +159,7 @@ export async function getRuntimeReview(request, { fetchImpl = fetch, githubToken
       : verdict.verdict === "unchanged" ? "no-change"
         : reviewRelevant.length > 0 ? "workload-change" : "noise-only-change";
 
-  return {
+  const result = {
     tool: "get_runtime_review",
     tool_version: TOOL_VERSION,
     checked_at: now().toISOString(),
@@ -172,6 +173,8 @@ export async function getRuntimeReview(request, { fetchImpl = fetch, githubToken
       contract: verdict.record?.contractVersion ?? null,
       recorded_at: verdict.record?.recordedAt ?? null,
       counts: verdict.record?.counts ?? null,
+      findings: verdict.record?.findings ?? null,
+      capture: verdict.record?.capture ?? null,
     },
     verdict: verdict.verdict,
     assessment,
@@ -189,6 +192,8 @@ export async function getRuntimeReview(request, { fetchImpl = fetch, githubToken
     workload_destinations: dedupeWorkload(workload).slice(0, MAX_WORKLOAD_ROWS),
     jobs: jobSummaries,
   };
+  result.check_line = checkLine(result);
+  return result;
 }
 
 /**
@@ -200,6 +205,7 @@ export async function getRuntimeReview(request, { fetchImpl = fetch, githubToken
 export function renderBrief(result) {
   const head = result.pull_request?.head_sha?.slice(0, 7) ?? "unknown";
   const lines = [`## Garnet Runtime Review — ${result.repository}#${result.pull_request?.number ?? "?"} (head ${head})`, ""];
+  lines.push(`- ${code(result.check_line?.line ?? checkLine(result).line)}`);
   lines.push(`- Verdict: **${result.verdict}** · assessment: **${result.assessment}**`);
   if (result.evidence_sentence) lines.push(`- ${result.evidence_sentence}`);
   for (const reason of result.reasons ?? []) lines.push(`- Reason: ${reason}`);
@@ -212,7 +218,7 @@ export function renderBrief(result) {
     }
   }
   if (result.noise?.total > 0) {
-    lines.push("", `### Noise (${result.noise.total} changed destinations, not workload)`);
+    lines.push("", `### Runner background and platform (${result.noise.total} changed ${result.noise.total === 1 ? "destination" : "destinations"}, not your workflow)`);
     for (const [reason, count] of Object.entries(result.noise.by_reason)) lines.push(`- ${count} × ${reason}`);
   }
   for (const job of result.jobs ?? []) {
@@ -296,8 +302,9 @@ function observedConnections(profile, destination) {
  * @param {string} value
  * @returns {string}
  */
-function code(value) {
-  const text = String(value).replace(/\s+/g, " ");
+export function code(value, { escapePipes = false } = {}) {
+  const raw = String(value).replace(/\s+/g, " ");
+  const text = escapePipes ? raw.replace(/\|/g, "\\|") : raw;
   const fence = "`".repeat(Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length)) + 1);
   return fence.length === 1 && !/^ | $/.test(text) ? `${fence}${text}${fence}` : `${fence} ${text} ${fence}`;
 }
@@ -357,7 +364,7 @@ function unreadableJobsReason(verdict, jobs) {
 }
 
 function unavailableResult({ repository, number, now, reason }) {
-  return {
+  const result = {
     tool: "get_runtime_review",
     tool_version: TOOL_VERSION,
     checked_at: now().toISOString(),
@@ -375,6 +382,8 @@ function unavailableResult({ repository, number, now, reason }) {
     workload_destinations: [],
     jobs: [],
   };
+  result.check_line = checkLine(result);
+  return result;
 }
 
 /**

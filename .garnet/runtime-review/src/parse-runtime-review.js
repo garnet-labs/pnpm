@@ -21,6 +21,7 @@ const COUNT_FIELDS = [
  * @property {string} contractVersion
  * @property {{headSha: string, comparedSha: string | null, isComparison: boolean}} comparison
  * @property {Record<string, number | null>} counts
+ * @property {number | null} findings
  * @property {string[] | null} kinds
  * @property {string | null} recordedAt
  * @property {string | null} capturedAt
@@ -65,6 +66,9 @@ export function parseRuntimeReviewComment(body) {
   for (const field of COUNT_FIELDS) {
     counts[field] = normalizeCount(summary[field], field);
   }
+  const findings = Number.isInteger(summary.findings) && summary.findings >= 0
+    ? summary.findings
+    : null;
 
   const selfCheck = checkRenderedCounts(body, counts, comparedSha !== null);
   return {
@@ -75,6 +79,7 @@ export function parseRuntimeReviewComment(body) {
       isComparison: comparedSha !== null,
     },
     counts,
+    findings,
     kinds: Array.isArray(summary.kinds)
       ? summary.kinds.filter((kind) => typeof kind === "string")
       : null,

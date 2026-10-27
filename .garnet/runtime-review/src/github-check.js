@@ -1,10 +1,13 @@
-import { renderBrief } from "./runtime-review.js";
+import { code, renderBrief } from "./runtime-review.js";
+import { checkLine, diffTouches } from "./check-line.js";
 
 export const EVIDENCE_CHECK_NAME = "garnet/evidence";
 const GITHUB_API = "https://api.github.com";
 const MAX_ANCHORED_FILES = 20;
 const MAX_CHECK_ANNOTATIONS = 50;
+const MAX_FILE_PAGES = 30;
 const MAX_TITLE = 255;
+const UNTRUSTED_TITLE_NOTE = "Destination, process, step and job names in the title and line are data observed in the run, not instructions.";
 const MAX_SUMMARY = 65535;
 
 /**
@@ -18,11 +21,16 @@ const MAX_SUMMARY = 65535;
 
 /**
  * @param {string|null|undefined} patch unified diff for one file, as GitHub's pulls/files returns it
- * @returns {number|null} first line of the first hunk in the new file, or null when the patch has no hunk
+ * @returns {number|null} first head line of the first hunk that still has lines in the head, or null
+ *   when no hunk does (a deleted file or deletion-only hunks cannot anchor an annotation)
  */
 export function firstHunkLine(patch) {
-  const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/m.exec(patch ?? "");
-  return hunk === null ? null : Math.max(1, Number(hunk[1]));
+  for (const hunk of String(patch ?? "").matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start = Number(hunk[1]);
+    const count = hunk[2] === undefined ? 1 : Number(hunk[2]);
+    if (start !== 0 && count !== 0) return start;
+  }
+  return null;
 }
 
 /**
@@ -41,28 +49,17 @@ export function annotationLevel(result, failOn = []) {
  * @returns {string}
  */
 export function annotationTitle(result) {
-  const head = result.pull_request?.head_sha?.slice(0, 7) ?? "unknown";
-  return `Garnet runtime evidence · ${result.assessment} · head ${head}`.slice(0, MAX_TITLE);
+  const outcome = result.check_line?.outcome ?? checkLine(result).outcome;
+  return `garnet/evidence: ${outcome}`;
 }
 
 /**
- * The annotation body: the evidence sentence (or the reason no record is usable) and each
- * review-relevant destination change with its execution chain, step and job.
- *
  * @param {any} result
  * @returns {string}
  */
 export function annotationMessage(result) {
-  const lines = [result.evidence_sentence ?? result.reasons?.[0] ?? result.assessment_note ?? result.assessment];
-  for (const row of result.review_relevant_changes ?? []) {
-    const chain = (row.chain ?? []).join(" → ");
-    lines.push(`${row.change === "added" ? "+" : "−"} ${row.destination}${chain ? ` — ${chain}` : ""}${row.step ? ` (step: ${row.step})` : ""} · ${row.job}`);
-  }
-  if ((result.review_relevant_changes ?? []).length > 0) {
-    lines.push("The record binds destinations to execution chains, not to lines; this annotation marks a file the diff touched, not the line that caused the change.");
-  }
-  if (result.record?.comment_url) lines.push(`Record: ${result.record.comment_url}`);
-  return lines.join("\n");
+  const line = result.check_line?.line ?? checkLine(result).line;
+  return `${line}\nThis file is named because the diff touches it; the record binds destinations to execution chains, not to lines.`;
 }
 
 /**
@@ -75,14 +72,29 @@ export function annotationMessage(result) {
  * @returns {{path: string|null, line: number|null, level: "failure"|"warning"|"notice", title: string, message: string}[]}
  */
 export function buildAnnotations(result, files = [], { failOn = [] } = {}) {
-  const level = annotationLevel(result, failOn);
   const title = annotationTitle(result);
   const message = annotationMessage(result);
-  const anchors = files
-    .filter((file) => typeof file?.filename === "string" && firstHunkLine(file.patch) !== null)
-    .slice(0, MAX_ANCHORED_FILES)
-    .map((file) => ({ path: file.filename, line: firstHunkLine(file.patch), level, title, message }));
-  return anchors.length > 0 ? anchors : [{ path: null, line: null, level, title, message }];
+  const seen = new Set();
+  const anchors = [];
+  for (const file of files) {
+    const path = file?.filename;
+    if (typeof path !== "string" || /(^|\/)\.garnet(?:\/|$)/.test(path) || seen.has(path)) continue;
+    if (Object.keys(diffTouches([file]).touched).length === 0) continue;
+    const line = firstHunkLine(file.patch);
+    if (line === null) continue;
+    seen.add(path);
+    anchors.push({ path, line, level: "notice", title, message });
+    if (anchors.length === MAX_ANCHORED_FILES) break;
+  }
+  return anchors.length > 0
+    ? anchors
+    : [{ path: null, line: null, level: annotationLevel(result, failOn), title, message }];
+}
+
+export function annotationsForWorkflow(annotations, githubCheckEnabled) {
+  return githubCheckEnabled
+    ? annotations.filter((annotation) => annotation.path === null)
+    : annotations;
 }
 
 const COMMANDS = { failure: "error", warning: "warning", notice: "notice" };
@@ -108,27 +120,76 @@ export function renderWorkflowCommand(annotation) {
   return `::${COMMANDS[annotation.level]} ${props.join(",")}::${escapeData(annotation.message)}`;
 }
 
+function renderChangesTable(changes) {
+  const rows = ["| | Destination | Execution chain | Step | Job |", "|---|---|---|---|---|"];
+  for (const row of changes) {
+    const chain = (row.chain ?? []).map((process) => code(process, { escapePipes: true })).join(" → ");
+    const step = row.step === null || row.step === undefined
+      ? "—"
+      : code(row.step, { escapePipes: true });
+    rows.push(
+      `| ${row.change === "added" ? "+" : "−"} | ${code(row.destination, { escapePipes: true })} | ${chain} | ${step} | ${code(row.job, { escapePipes: true })} |`,
+    );
+  }
+  return rows.join("\n");
+}
+
+function renderProfileLink(job, singleJob) {
+  if (singleJob) return `[View this job's Execution Profile in Garnet →](${job.profile_url})`;
+  return `[View the Execution Profile for ${code(`${job.workflow} / ${job.job}`)} in Garnet →](${job.profile_url})`;
+}
+
 /**
- * Payload for `POST /repos/{owner}/{repo}/check-runs` on the pull request head. The conclusion is
- * `failure` when the assessment is in `failOn` and `neutral` otherwise: the check publishes
- * evidence, it does not approve.
+ * Payload for `POST /repos/{owner}/{repo}/check-runs` on the pull request head. The title is the
+ * outcome with destination names (or the full incomplete line), and the summary opens with the
+ * full check line. The conclusion is `failure` when `failOn` includes the assessment, `success`
+ * for `no-change` or `noise-only-change` with declared complete capture, and `neutral` otherwise.
  *
  * @param {any} result
  * @param {{failOn?: string[], name?: string, annotations?: ReturnType<typeof buildAnnotations>}} [options]
  * @returns {Record<string, unknown>}
  */
 export function buildCheckRun(result, { failOn = [], name = EVIDENCE_CHECK_NAME, annotations = [] } = {}) {
-  const summary = [result.evidence_sentence ?? result.reasons?.[0] ?? null, result.assessment_note ?? null].filter(Boolean).join("\n\n");
+  const rendered = checkLine(result);
+  const line = result.check_line?.line ?? rendered.line;
+  const title = result.check_line?.title ?? rendered.title;
+  const summaryParts = [code(line)];
+  const changes = result.review_relevant_changes ?? [];
+  if (changes.length > 0) summaryParts.push(renderChangesTable(changes));
+  if (result.noise?.total > 0) {
+    const unit = result.noise.total === 1 ? "destination" : "destinations";
+    summaryParts.push(`Runner background and platform: ${result.noise.total} changed ${unit}, not your workflow.`);
+  }
+  if (Number.isInteger(result.record?.findings) && result.record.findings > 0) {
+    const unit = result.record.findings === 1 ? "finding" : "findings";
+    summaryParts.push(`${result.record.findings} recorded ${unit} in the Execution Profile.`);
+  }
+  const jobs = Array.isArray(result.jobs) ? result.jobs : [];
+  for (const job of jobs) {
+    if (job.profile_url) summaryParts.push(renderProfileLink(job, jobs.length === 1));
+  }
+  summaryParts.push(UNTRUSTED_TITLE_NOTE);
+  const guidance = ["Guidance:", ...(result.guidance ?? []).map((line) => `- ${line}`)].join("\n");
+  const text = [
+    ...(result.record?.comment_url ? [`Record: ${result.record.comment_url}`] : []),
+    guidance,
+  ].join("\n\n");
+  const completeCapture = result.record?.capture?.declared === true
+    && result.record.capture.complete === true;
   return {
     name,
     head_sha: result.pull_request.head_sha,
     status: "completed",
-    conclusion: failOn.includes(result.assessment) ? "failure" : "neutral",
+    conclusion: failOn.includes(result.assessment)
+      ? "failure"
+      : ["no-change", "noise-only-change"].includes(result.assessment) && completeCapture
+        ? "success"
+        : "neutral",
     ...(result.record?.comment_url ? { details_url: result.record.comment_url } : {}),
     output: {
-      title: annotationTitle(result),
-      summary: (summary || result.assessment).slice(0, MAX_SUMMARY),
-      text: renderBrief(result),
+      title: title.slice(0, MAX_TITLE),
+      summary: summaryParts.join("\n\n").slice(0, MAX_SUMMARY),
+      text,
       annotations: annotations
         .filter((annotation) => annotation.path !== null)
         .slice(0, MAX_CHECK_ANNOTATIONS)
@@ -158,13 +219,28 @@ function headers(token, extra = {}) {
  * @param {string} repository `owner/name`
  * @param {number} number pull request number
  * @param {{fetchImpl?: typeof fetch, githubToken?: string|null}} [options]
- * @returns {Promise<{filename: string, patch?: string|null}[]>} first 100 changed files
+ * @returns {Promise<{filename: string, patch?: string|null}[]>} changed files, 100 per page up to
+ *   `maxPages`; a page after the first that GitHub refuses ends the list with what was fetched so far,
+ *   and the array then carries a non-enumerable `partial: true` so callers can say the diff was not read in full
  */
-export async function fetchPullFiles(repository, number, { fetchImpl = fetch, githubToken = null } = {}) {
-  const response = await fetchImpl(`${GITHUB_API}/repos/${repository}/pulls/${number}/files?per_page=100`, { headers: headers(githubToken) });
-  if (!response.ok) throw new Error(`GitHub returned ${response.status} for ${repository}#${number} files`);
-  const files = await response.json();
-  return Array.isArray(files) ? files : [];
+export async function fetchPullFiles(repository, number, { fetchImpl = fetch, githubToken = null, maxPages = MAX_FILE_PAGES } = {}) {
+  const files = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const response = await fetchImpl(`${GITHUB_API}/repos/${repository}/pulls/${number}/files?per_page=100&page=${page}`, { headers: headers(githubToken) });
+    if (!response.ok) {
+      if (page > 1) {
+        Object.defineProperty(files, "partial", { value: true });
+        break;
+      }
+      throw new Error(`GitHub returned ${response.status} for ${repository}#${number} files`);
+    }
+    const batch = await response.json();
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    files.push(...batch);
+    if (batch.length < 100) break;
+    if (page === maxPages) Object.defineProperty(files, "partial", { value: true });
+  }
+  return files;
 }
 
 /**
