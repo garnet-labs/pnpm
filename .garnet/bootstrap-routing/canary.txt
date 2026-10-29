@@ -1,1 +1,1 @@
-Prod renderer canary (control). Fork-only fixture; no effect on the run.
+Prod renderer canary (no-op change). Fork-only fixture; no effect on the run.
