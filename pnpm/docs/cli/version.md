@@ -13,7 +13,7 @@ pnpm version -r [--dry-run]
 
 `<newversion>` can be any of the bump types above or an explicit semver version (e.g. `1.2.3`). Workspaces and the `workspace:` protocol are supported, so cross-references between workspace packages are updated correctly.
 
-When run inside a git repository, `pnpm version` creates a git commit and an annotated tag for the bump. The working tree must be clean (see `--no-git-checks` below) and commits/tags can be disabled with `--no-git-tag-version`. Git commits and tags are always skipped in recursive mode because multiple packages may be bumped to different versions in a single run.
+When run inside a git repository, `pnpm version` creates a git commit and an annotated tag for the bump. The working tree must be clean (see `--no-git-checks` below) and commits/tags can be disabled with `--no-git-tag-version` or `gitTagVersion: false` in `pnpm-workspace.yaml`. Git commits and tags are always skipped in recursive mode because multiple packages may be bumped to different versions in a single run.
 
 ## Usage
 
@@ -104,3 +104,7 @@ Apply the version bump to every package in the workspace (optionally narrowed wi
 ### --json
 
 Output the list of bumped packages in JSON format.
+
+### --release-notes &lt;file\>
+
+With the bare `pnpm version -r`, a file with a summary of the release, written by hand, for a registry declared with [`serverType: pnpr`](../registries.md#servertype). The summary goes above the [release notes composed from the change intents](../versioning.md#release-notes-on-pnpr): the notes of the whole release, or the package's own notes when the release has one package. `pnpm publish` then sends them as they were composed. The command fails when the file does not exist, when no release of the plan publishes to such a registry, or when [`versioning.changelog.storage`](../settings/versioning.md#versioningchangelogstorage) is not `registry`.

@@ -55,7 +55,7 @@ pub(super) struct RemoteChunk {
 
 impl RemoteUploadStore {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: &str, scratch: PathBuf) -> Self {
-        Self { store, prefix: format!("{prefix}.pnpr-uploads/"), scratch }
+        Self { store, prefix: format!("{prefix}{}/", super::UPLOADS_DIR), scratch }
     }
 
     fn key(&self, id: &str, object: &str) -> Path {
@@ -102,6 +102,7 @@ impl RemoteUploadStore {
         Ok(UpdateVersion { e_tag: result.e_tag, version: result.version })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "an upload scratch file stays owner-only")]
     async fn temp(&self) -> Result<TempPath> {
         fs::create_dir_all(&self.scratch).await?;
         Ok(tempfile::NamedTempFile::new_in(&self.scratch)?.into_temp_path())

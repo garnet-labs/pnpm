@@ -64,7 +64,7 @@ pnpm add work:@corp/lib@^2.0.0
 
 Each entry declares at most one prefix, and two entries cannot declare the same one: the prefix is the registry's identity in a lockfile package key (`foo@work:1.0.0`), so a second spelling would key the same package from the same registry twice.
 
-Prefixes declared here follow the same rules as the deprecated [`namedRegistries`](./settings/dependency-resolution.md#namedregistries) setting they replace: the built-in `gh:` and `npmjs:` aliases can be overridden by declaring their prefix on your own URL, [reserved names](./settings/dependency-resolution.md#reserved-alias-names) are rejected, and packages resolved through a prefix get [registry-qualified lockfile keys](./settings/dependency-resolution.md#named-registries-in-the-lockfile).
+Prefixes declared here follow the same rules as the deprecated [`namedRegistries`](./settings/dependency-resolution.md#namedregistries) setting they replace: the built-in `gh:` and `npmjs:` aliases can be overridden by declaring their prefix on your own URL, [reserved names](./settings/dependency-resolution.md#reserved-alias-names) are rejected, and packages resolved from a registry that declares a prefix get [registry-qualified lockfile keys](./settings/dependency-resolution.md#named-registries-in-the-lockfile), whether a dependency names the prefix or a `scopes` entry routes it there.
 
 ## Describing the server
 
@@ -77,7 +77,7 @@ Registries do not all lay out tarball URLs the way the npm registry does. pnpm o
 | *undeclared*  | Strict: a tarball URL is omitted only when it is exactly the canonical npm-layout URL (`<registry>/<name>/-/<scopeless-name>-<version>.tgz`). This is how every registry but `registry.npmjs.org` is read by default.                                                          |
 | `npm`         | The server behaves like `registry.npmjs.org`, which serves a scoped package from the percent-encoded path (`/@acme%2Fwidget/...`) as well as the unencoded one. A faithful mirror or caching proxy of the public registry is this. Built in for `registry.npmjs.org` itself.   |
 | `artifactory` | The server repeats the scope in a scoped package's tarball filename: `@acme/widget/-/@acme/widget-1.0.0.tgz`, where the npm layout strips it (`@acme/widget/-/widget-1.0.0.tgz`).                                                                                              |
-| `pnpr`        | The server serves a version's tarball at `<registry>/<name>@<version>`, such as `@acme/widget@1.0.0`. pnpr uses this layout on a [tar registry](#tar-registries), where the metadata carries no tarball URL, except for a version with [registry revisions](./registry-revisions.md). A pnpr `.tgz` registry advertises the plain npm layout instead, which the undeclared default already handles. |
+| `pnpr`        | The server serves a version's tarball at `<registry>/<name>@<version>`, such as `@acme/widget@1.0.0`. pnpr uses this layout on both `.tgz` registries and [tar registries](#tar-registries), except for a version with [registry revisions](./registry-revisions.md). pnpm also sends [release notes](./cli/publish.md#--release-notes-file) to the server and reads them from it. |
 
 For a JFrog Artifactory registry this is the difference between a lockfile that records a host-specific tarball URL for **every scoped package** and one that records none of them:
 
@@ -95,10 +95,18 @@ Values for common servers:
 | JFrog Artifactory                                     | `artifactory`                                                                                                              |
 | GitLab package registry                               | `artifactory`. It uses the same layout, repeating the scope in the filename.                                              |
 | A faithful mirror or caching proxy of the npm registry | `npm`                                                                                                                      |
-| pnpr                                                  | `pnpr` for a [tar registry](#tar-registries). Nothing for a `.tgz` registry, which advertises the npm layout.            |
+| pnpr                                                  | `pnpr`                                                                                                                     |
 | Verdaccio, Sonatype Nexus, Azure Artifacts            | None needed. They serve the exact canonical npm layout, which the strict default already reconstructs.                    |
 | GitHub Packages                                       | None. Its download URLs contain a content digest that cannot be derived from the package's identity, so they are kept in the lockfile. |
 | GitHub Enterprise Server                              | None. It serves a scoped package only from the percent-encoded path, which the strict default keeps in the lockfile and requests verbatim.  |
+
+A registry declared `serverType: pnpr` is also asked for pnpr's own package document, which is smaller than npm's and carries what only pnpr records: the selected [registry revision](./registry-revisions.md) of each version and the facts pnpr verified about each archive, such as whether it needs a build. A large document leaves out the manifests of the versions a resolution rarely picks, and pnpm fetches the manifest of such a version when it picks one. pnpm keeps these documents in `v12/metadata-pnpr` in the cache directory, apart from npm's documents.
+
+A version in pnpr's package document can carry platform variants: archives built for particular platforms, published with the version. pnpm records every variant in `pnpm-lock.yaml`, so the lockfile is the same on every machine, and links the variant that fits the host as the package itself. A host that no variant fits gets the version's own archive. A version published with variants only has no such archive: on a host that none of its variants fits, pnpm skips it as an optional dependency and otherwise fails, listing the platforms it is published for. Each variant's dependencies are recorded under `<name>@<version>/variants/<tag>` in `snapshots` when they differ from the version's, and pnpm installs only those of the variant it links.
+
+pnpr's package document supports a [`minimumReleaseAge`](./settings/dependency-resolution.md#minimumreleaseage) of at most 43200 minutes (30 days). A longer one fails the resolution with `ERR_PNPM_UNSUPPORTED_MINIMUM_RELEASE_AGE` when pnpm reads a package from a registry declared `serverType: pnpr`.
+
+A pnpr server identifies itself in its responses. When a registry that is not declared `serverType: pnpr` turns out to be pnpr, pnpm warns once and installs from npm's documents, without revisions or pnpr's facts about the archives.
 
 The layout is declared, never inferred: a virtual repository can serve both layouts at once, depending on whether each package was synced from an upstream or published locally, so there is no registry-level signal pnpm could sniff. Declaring it also keeps a wrong value a fixable misconfiguration instead of a silent breakage.
 
@@ -123,7 +131,7 @@ registries:
     serverType: pnpr
 ```
 
-The server decides which base serves tars. In pnpr's example they are at `/npm/~zstd/`, next to the usual `.tgz` base, but a registry can serve tars from its main base too; see [tar registries in pnpr](/pnpr/configuration#tar-registries). Put `serverType: pnpr` on the tar base only. A `.tgz` base from pnpr advertises the plain npm layout, so leave `serverType` out there.
+The server decides which base serves tars. In pnpr's example they are at `/npm/~zstd/`, next to the usual `.tgz` base, but a registry can serve tars from its main base too; see [tar registries in pnpr](/pnpr/configuration#tar-registries). Declare `serverType: pnpr` on any pnpr registry base so pnpm omits canonical `<name>@<version>` tarball URLs from `pnpm-lock.yaml`.
 
 pnpm tells a tar from a `.tgz` by the first bytes of the decoded response, so nothing else needs to be declared. The lockfile keeps its `integrity` field, which for packages from a tar registry holds the hash of the tar.
 
@@ -207,9 +215,9 @@ The server descriptions (`serverType` and `supportsTimeField`) are read only fro
 The [global configuration file](./cli/config.md) (`config.yaml`) may declare ecosystem indexes, the *routes* (`scopes` and `prefix`) so that a scope or an alias like `work:` applies to every project on the machine, and `networkConcurrency`, which does not affect the lockfile.
 
 Since v12.1.0, [`pnpm login --scope <scope>`](./cli/login.md#--scope-scope)
-adds that machine-wide scope route to the global `registries` setting while it
-records the credential under `_auth`. A later login for the same scope moves the
-route rather than declaring it at two registries.
+adds that machine-wide scope route to the global `registries` setting. A later
+login for the same scope moves the route rather than declaring it at two
+registries.
 
 Since v12.4.0, a registry configured in `.npmrc` outranks a route `pnpm login`
 saved in the global `config.yaml`, so logging in cannot redirect a project that

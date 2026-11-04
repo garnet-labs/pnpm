@@ -10,7 +10,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use futures_util::StreamExt;
-use npm::{publish_doc, sri_sha512};
+use npm::{npm_tgz, publish_doc, sri_sha512};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
 use pnpr::{Config, HostedStoreConfig, MaxUsers, router};
 use pnpr_fixtures::MockConfigPresets;
@@ -43,7 +43,7 @@ async fn publishes_to_and_serves_from_the_object_store() {
     let app = router(s3_config(storage.clone(), Arc::clone(&store)));
     let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
 
-    let bytes = b"fake-tarball-bytes";
+    let bytes = &npm_tgz("mypkg", "1.0.0", b"fake-tarball-bytes");
     let body = publish_doc("mypkg", "1.0.0", bytes);
     let request = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
@@ -60,7 +60,7 @@ async fn publishes_to_and_serves_from_the_object_store() {
     // The hosted store is the bucket, so nothing lands in the local
     // `storage` directory.
     assert!(
-        !local_package_dir(&storage, "", "mypkg").exists(),
+        !local_package_dir(&storage, "", pnpr_storage::Ecosystem::Npm, "mypkg").exists(),
         "hosted content must not touch local storage",
     );
 
@@ -79,7 +79,7 @@ async fn publishes_to_and_serves_from_the_object_store() {
     let served = body_json(response.into_body()).await;
     assert_eq!(
         served["versions"]["1.0.0"]["dist"]["tarball"],
-        "http://example.test/npm/mypkg/-/mypkg-1.0.0.tgz",
+        "http://example.test/npm/mypkg@1.0.0",
     );
 
     // The tarball streams back byte-for-byte out of the bucket.
@@ -92,13 +92,13 @@ async fn publishes_to_and_serves_from_the_object_store() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_bytes(response.into_body()).await, bytes);
+    assert_eq!(body_bytes(response.into_body()).await, *bytes);
 }
 
 /// Another writer in the bucket can own the tarball key a publish is about to
-/// write, and its bytes are immutable. The version is left out of the
-/// packument, and the publisher hears about it instead of a 201 for something
-/// the store does not serve.
+/// write, and its bytes are immutable. Nothing of the publish commits, and the
+/// publisher hears about it instead of a 201 for something the store does not
+/// serve.
 #[tokio::test]
 async fn a_publish_that_loses_the_tarball_key_is_refused() {
     let tmp = TempDir::new().unwrap();
@@ -109,6 +109,7 @@ async fn a_publish_that_loses_the_tarball_key_is_refused() {
             &ObjectPath::from(object_key(&local_blob_path(
                 Path::new(""),
                 "",
+                pnpr_storage::Ecosystem::Npm,
                 "mypkg",
                 "mypkg-1.0.0.tgz",
             ))),
@@ -140,11 +141,12 @@ async fn a_publish_that_loses_the_tarball_key_is_refused() {
         )
         .await
         .unwrap();
-    assert_eq!(body_json(response.into_body()).await["versions"], json!({}));
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let winner = store
         .get(&ObjectPath::from(object_key(&local_blob_path(
             Path::new(""),
             "",
+            pnpr_storage::Ecosystem::Npm,
             "mypkg",
             "mypkg-1.0.0.tgz",
         ))))
@@ -206,7 +208,7 @@ async fn unpublish_removes_the_package_from_the_bucket() {
             .status(),
         StatusCode::CREATED,
     );
-    assert_eq!(bucket_keys(&store, "mypkg").await.len(), 2, "packument + tarball uploaded");
+    assert_eq!(bucket_keys(&store, "mypkg").await.len(), 1, "the tarball uploaded");
 
     let request = Request::delete("/npm/mypkg/-rev/anything")
         .header("Authorization", format!("Bearer {token}"))
@@ -227,7 +229,12 @@ async fn unpublish_removes_the_package_from_the_bucket() {
 
 /// Every object key in the bucket under package `name`'s directory.
 async fn bucket_keys(store: &Arc<dyn ObjectStore>, name: &str) -> Vec<String> {
-    let scope = ObjectPath::from(object_key(&local_package_dir(Path::new(""), "", name)));
+    let scope = ObjectPath::from(object_key(&local_package_dir(
+        Path::new(""),
+        "",
+        pnpr_storage::Ecosystem::Npm,
+        name,
+    )));
     store
         .list(Some(&scope))
         .map(|meta| meta.expect("list entry").location.to_string())
@@ -239,7 +246,7 @@ async fn bucket_keys(store: &Arc<dyn ObjectStore>, name: &str) -> Vec<String> {
 /// subdirectory of the proxy-cache root, which `static_serve` nests
 /// under `storage`).
 fn staging_file_count(storage: &Path) -> usize {
-    let dir = storage.join(".pnpr-cache").join("pnpr-hosted-staging");
+    let dir = storage.join(".pnpr-cache").join(".staging");
     std::fs::read_dir(dir).map_or(0, std::iter::Iterator::count)
 }
 
@@ -324,7 +331,8 @@ async fn a_caller_supplied_prefix_is_normalized_before_it_reaches_the_keys() {
         .map(|entry| entry.unwrap().location.to_string())
         .collect()
         .await;
-    let package = object_key(&local_package_dir(Path::new(""), "", "mypkg"));
+    let package =
+        object_key(&local_package_dir(Path::new(""), "", pnpr_storage::Ecosystem::Npm, "mypkg"));
     assert!(
         keys.iter()
             .any(|key| key.starts_with(&format!("packages/{package}/"))),

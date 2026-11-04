@@ -67,7 +67,7 @@ async fn shared_manifest_cache_does_not_leak_across_registries() {
         let cache_dir = TempDir::new().expect("tempdir");
         let resolver = NpmResolver {
             registries,
-            registries_by_prefix: HashMap::new(),
+            declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
             metadata: crate::RegistryMetadataClient {
                 http_client: Arc::new(ThrottledClient::default()),
                 auth_headers: Arc::new(AuthHeaders::default()),
@@ -82,9 +82,10 @@ async fn shared_manifest_cache_does_not_leak_across_registries() {
                 needs_full_metadata_for: None,
                 filter_metadata: false,
                 registry_options_by_url: std::sync::Arc::default(),
+                minimum_release_age: None,
             },
             cache_policy: crate::MetadataCachePolicy {
-                network: pnpm_config::NetworkPolicy::Online,
+                network: pnpm_resolving_resolver_base::NetworkPolicy::Online,
                 ignore_missing_time_field: false,
             },
             store_view: None,
@@ -138,7 +139,7 @@ async fn shared_manifest_cache_does_not_leak_across_registries() {
 async fn revision_metadata_is_validated_and_preserved() {
     let mut server = mockito::Server::new_async().await;
     let registry = format!("{}/", server.url());
-    let tarball = format!("{}-/tarballs/sha512/{}", registry, "A".repeat(86));
+    let tarball = format!("{registry}acme@1.0.0+r2");
     let mock = server
         .mock("GET", "/acme")
         .with_status(200)
@@ -170,7 +171,7 @@ async fn malformed_revision_metadata_has_the_malformed_metadata_error() {
     {
         let mut server = mockito::Server::new_async().await;
         let registry = format!("{}/", server.url());
-        let tarball = format!("{}-/tarballs/sha512/{}", registry, "A".repeat(86));
+        let tarball = format!("{registry}acme@1.0.0+r1");
         server
             .mock("GET", "/acme")
             .with_status(200)

@@ -11,7 +11,8 @@ use install::{
 mod prepare;
 use prepare::{
     ReadPackageHook, apply_read_package_hook_to_update_manifest, prepare_manifest,
-    prepare_selected_manifests, update_read_package_hook,
+    prepare_selected_manifests, selection::selection_matches_ignored_direct,
+    update_read_package_hook,
 };
 
 mod workspace;
@@ -30,6 +31,8 @@ mod rewrite;
 use rewrite::{MatchedRewriteInputs, record_matched_direct_update};
 
 mod seed_policy;
+
+mod latest_subtree;
 
 mod selectors;
 use selectors::{parse_selectors, reject_versions_of_indirect_update_specs};
@@ -227,9 +230,21 @@ impl Update<'_> {
             )?;
         }
         let mut latest_chain = None;
-        let Some(prepared) =
-            prepare_manifest::<Reporter>(manifest, update, &owned, None, &mut latest_chain).await?
+        let importer_id =
+            pnpm_workspace::importer_id_from_root_dir(&site.workspace_root, manifest_dir(manifest));
+        let Some(prepared) = prepare_manifest::<Reporter>(
+            manifest,
+            &importer_id,
+            update,
+            &owned,
+            None,
+            &mut latest_chain,
+        )
+        .await?
         else {
+            if selection_matches_ignored_direct(manifest, update, &owned) {
+                return Ok(());
+            }
             return nothing_to_update(
                 update.selection.depth,
                 update.selection.packages,
@@ -269,7 +284,7 @@ impl Update<'_> {
             &owned,
         )
         .await?;
-        if !prepared.any_work {
+        if !prepared.has_work() {
             return Ok(());
         }
         run_prepared_selected_update::<Reporter>(

@@ -8,8 +8,19 @@
 //! `--recursive` (workspace publishing), including pnpr's batch endpoint,
 //! lives in [`recursive`].
 
-pub use arguments::{PublishGitArgs, PublishManifestArgs, PublishOutputArgs, PublishRegistryArgs};
+pub use arguments::{
+    PublishGitArgs, PublishManifestArgs, PublishOutputArgs, PublishRegistryArgs, PublishVariantArgs,
+};
+mod given_archives;
+mod notes;
 mod options;
+mod packed;
+mod variant_archives;
+
+use packed::{PackedDirectory, declares_variants, packed_directory};
+mod scope;
+
+use scope::PublishScope;
 mod recursive;
 mod wait;
 
@@ -20,11 +31,8 @@ use clap::Args;
 use miette::{Context, IntoDiagnostic};
 use pipe_trait::Pipe;
 use pnpm_config::Config;
-use pnpm_executor::{RunPostinstallHooks, ScriptsPrependNodePath, run_lifecycle_hook};
+use pnpm_executor::{RunPostinstallHooks, run_lifecycle_hook};
 use pnpm_hooks::PnpmfileHooks;
-use pnpm_pack::{
-    Host as PackHost, PackOptions, PackResult, WorkspacePackageManifest, api as pack_api,
-};
 use pnpm_publish::{
     Host, PackedPkg, PublishFailure, PublishNetwork, PublishPackedPkgOptions, PublishSummary,
     extract_publish_manifest_from_packed, is_tarball_path, publish_packed_pkg,
@@ -46,6 +54,13 @@ pub struct PublishArgs {
 
 /// Options controlling how a package is published.
 #[derive(Debug, Args)]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields are the publish command's flags, each group flattened from what it configures."
+    )
+)]
 pub struct PublishFlags {
     /// Do everything `publish` would do except uploading to the registry.
     #[clap(long)]
@@ -67,6 +82,8 @@ pub struct PublishFlags {
     pub git: PublishGitArgs,
     #[clap(flatten)]
     pub output: PublishOutputArgs,
+    #[clap(flatten)]
+    pub variants: PublishVariantArgs,
 }
 
 /// What one `publish` / `stage publish` invocation published: the single
@@ -76,28 +93,6 @@ pub struct PublishFlags {
 pub(super) enum PublishedPackages {
     Single(Box<PublishSummary>),
     Recursive(Vec<PublishSummary>),
-}
-
-struct PackedDirectory {
-    project_dir: std::path::PathBuf,
-    source_manifest: Value,
-    published_manifest: Value,
-    tarball_data: Vec<u8>,
-    tarball_path: String,
-    contents: Vec<String>,
-    unpacked_size: u64,
-}
-
-impl PackedDirectory {
-    fn packed_pkg(&self) -> PackedPkg<'_> {
-        PackedPkg {
-            published_manifest: &self.published_manifest,
-            tarball_data: &self.tarball_data,
-            tarball_path: &self.tarball_path,
-            contents: &self.contents,
-            unpacked_size: self.unpacked_size,
-        }
-    }
 }
 
 impl PublishedPackages {
@@ -121,6 +116,10 @@ impl PublishArgs {
         recursive: bool,
         before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     ) -> miette::Result<()> {
+        if !self.flags.variants.upload_variant.is_empty() {
+            return self.upload_variants::<Reporter>(dir, config, recursive, &before_packing_hooks)
+                .await;
+        }
         let published = self.publish_packages::<Reporter>(
             dir,
             config,
@@ -167,7 +166,8 @@ impl PublishArgs {
 
         // Upstream gates on `opts.gitChecks !== false`, which folds together
         // the `git-checks` config setting and the `--no-git-checks` flag.
-        let publish_branch = self.flags.git.publish_branch.as_deref();
+        let publish_branch =
+            configured_publish_branch(self.flags.git.publish_branch.as_deref(), config);
         let git_checks = config.git_checks && !self.flags.git.no_git_checks;
         run_git_checks::<Host>(dir, git_checks, publish_branch, config.ci)?;
 
@@ -176,36 +176,48 @@ impl PublishArgs {
                 self.run_recursive::<Reporter>(dir, config, stage, &before_packing_hooks).await?;
             return Ok(PublishedPackages::Recursive(published));
         }
+        let summary =
+            self.publish_single::<Reporter>(dir, config, stage, &before_packing_hooks).await?;
+        Ok(PublishedPackages::Single(Box::new(summary)))
+    }
 
+    /// Publish one package: a prebuilt tarball, or the project directory.
+    async fn publish_single<Reporter: self::Reporter>(
+        &self,
+        dir: &Path,
+        config: &Config,
+        stage: bool,
+        before_packing_hooks: &[Arc<dyn PnpmfileHooks>],
+    ) -> miette::Result<PublishSummary> {
         let otp = resolve_otp_from_env::<Host>(self.flags.registry.otp.clone());
         let opts = self.publish_options(config, otp, stage);
         let http_client = build_publish_client(config)?;
         let network = PublishNetwork { client: &http_client, auth_headers: &config.auth_headers };
+        let notes_summary = self.release_notes_text(dir)?;
+        let scope = PublishScope::Single { summary: notes_summary.as_deref() };
 
-        let summary =
-            if let Some(package) = self.package.as_deref().filter(|path| is_tarball_path(path)) {
-                self.publish_tarball::<Reporter>(package, &opts, &network).await?
-            } else {
-                // Resolved against the command directory so every path the
-                // pack derives from it — the re-anchored `file:` / `link:`
-                // catalog entries among them — can be related to the
-                // absolute workspace directory. `join` keeps an absolute
-                // argument as it is.
-                let project_dir = self.package
-                    .as_deref()
-                    .map_or_else(|| dir.to_path_buf(), |path| dir.join(path));
-                self.publish_directory::<Reporter>(
-                    &project_dir,
-                    config,
-                    &opts,
-                    &network,
-                    &before_packing_hooks,
-                    None,
-                )
-                .await
-                .map_err(|failure| failure.error)?
-            };
-        Ok(PublishedPackages::Single(Box::new(summary)))
+        if let Some(package) = self.package.as_deref().filter(|path| is_tarball_path(path)) {
+            self.publish_tarball::<Reporter>(package, config, &opts, &network, scope).await
+        } else {
+            // Resolved against the command directory so every path the
+            // pack derives from it — the re-anchored `file:` / `link:`
+            // catalog entries among them — can be related to the
+            // absolute workspace directory. `join` keeps an absolute
+            // argument as it is.
+            let project_dir = self.package
+                .as_deref()
+                .map_or_else(|| dir.to_path_buf(), |path| dir.join(path));
+            self.publish_directory::<Reporter>(
+                &project_dir,
+                config,
+                &opts,
+                &network,
+                before_packing_hooks,
+                scope,
+            )
+            .await
+            .map_err(|failure| failure.error)
+        }
     }
 
     /// Publish a pre-built tarball: extract its manifest and hand the bytes
@@ -213,13 +225,17 @@ impl PublishArgs {
     async fn publish_tarball<Reporter: self::Reporter>(
         &self,
         tarball_path: &str,
+        config: &Config,
         opts: &PublishPackedPkgOptions,
         network: &PublishNetwork<'_>,
+        scope: PublishScope<'_>,
     ) -> miette::Result<PublishSummary> {
         let manifest = extract_publish_manifest_from_packed(tarball_path)?;
         let tarball_data = std::fs::read(tarball_path)
             .into_diagnostic()
             .wrap_err_with(|| format!("read tarball {tarball_path}"))?;
+        let notes =
+            self.tarball_notes::<Reporter>(config, &manifest, &tarball_data, scope.summary())?;
         publish_packed_pkg::<Host, Reporter>(
             &PackedPkg {
                 published_manifest: &manifest,
@@ -227,6 +243,9 @@ impl PublishArgs {
                 tarball_path,
                 contents: &[],
                 unpacked_size: 0,
+                notes: notes.as_deref(),
+                variants: &[],
+                any_staged: None,
             },
             opts,
             network,
@@ -245,15 +264,12 @@ impl PublishArgs {
         opts: &PublishPackedPkgOptions,
         network: &PublishNetwork<'_>,
         before_packing_hooks: &[Arc<dyn PnpmfileHooks>],
-        workspace_packages: Option<&Arc<HashMap<String, WorkspacePackageManifest>>>,
+        scope: PublishScope<'_>,
     ) -> Result<PublishSummary, PublishFailure<miette::Report>> {
-        let packed = self.pack_directory::<Reporter>(
-            project_dir,
-            config,
-            before_packing_hooks,
-            workspace_packages,
-        )
-        .await?;
+        let mut packed =
+            self.pack_directory::<Reporter>(project_dir, config, before_packing_hooks, scope)
+                .await?;
+        packed.notes = self.version_notes::<Reporter>(config, &packed.notes_package(), scope)?;
         let summary = publish_packed_pkg::<Host, Reporter>(&packed.packed_pkg(), opts, network)
             .await
             .map_err(|failure| PublishFailure {
@@ -274,19 +290,9 @@ impl PublishArgs {
         project_dir: &Path,
         config: &Config,
         before_packing_hooks: &[Arc<dyn PnpmfileHooks>],
-        workspace_packages: Option<&Arc<HashMap<String, WorkspacePackageManifest>>>,
+        scope: PublishScope<'_>,
     ) -> miette::Result<PackedDirectory> {
-        let manifest = pnpm_package_manifest::safe_read_project_manifest_from_dir(project_dir)
-            .into_diagnostic()
-            .wrap_err("read project manifest")?
-            .ok_or_else(|| {
-                let dir = project_dir.display();
-                miette::miette!(
-                    code = "ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND",
-                    "No package.json found in {dir}",
-                )
-            })?;
-
+        let manifest = read_project_manifest(project_dir)?;
         if !self.should_ignore_scripts(config) {
             run_publish_scripts::<Reporter>(
                 project_dir,
@@ -296,29 +302,32 @@ impl PublishArgs {
             )?;
         }
 
+        if let Some(packed) = self.given_directory::<Reporter>(
+            project_dir,
+            config,
+            &manifest,
+            (before_packing_hooks, scope),
+        )
+        .await?
+        {
+            return Ok(packed);
+        }
         let pack_destination = tempfile::tempdir().into_diagnostic().wrap_err("create temp dir")?;
-        let pack_result = self.pack_for_publish::<Reporter>(
+        // `--no-variants` publishes only the archive that targets `any`.
+        let targets = if self.flags.variants.no_variants && declares_variants(&manifest) {
+            vec![pnpm_pack::variants::ANY_TARGET.to_string()]
+        } else {
+            Vec::new()
+        };
+        let packed = self.pack_for_publish::<Reporter>(
             project_dir,
             config,
             pack_destination.path(),
             before_packing_hooks,
-            workspace_packages,
+            (scope.workspace_packages(), &targets),
         )
         .await?;
-        let tarball_data = std::fs::read(&pack_result.tarball_path)
-            .into_diagnostic()
-            .wrap_err("read packed tarball")?;
-        drop(pack_destination);
-
-        Ok(PackedDirectory {
-            project_dir: project_dir.to_path_buf(),
-            source_manifest: manifest,
-            published_manifest: pack_result.published_manifest,
-            tarball_data,
-            tarball_path: pack_result.tarball_path,
-            contents: pack_result.contents,
-            unpacked_size: pack_result.unpacked_size,
-        })
+        packed_directory(project_dir, manifest, packed)
     }
 
     fn run_post_publish_scripts<Reporter: self::Reporter>(
@@ -344,56 +353,24 @@ impl PublishArgs {
     fn should_ignore_scripts(&self, config: &Config) -> bool {
         self.flags.ignore_scripts || config.ignore_scripts
     }
+}
 
-    /// Pack the project into `pack_destination` for publishing (never a dry
-    /// run; the publish itself honors `--dry-run`).
-    async fn pack_for_publish<Reporter: self::Reporter>(
-        &self,
-        dir: &Path,
-        config: &Config,
-        pack_destination: &Path,
-        before_packing_hooks: &[Arc<dyn PnpmfileHooks>],
-        workspace_packages: Option<&Arc<HashMap<String, WorkspacePackageManifest>>>,
-    ) -> miette::Result<PackResult> {
-        let workspace_packages = workspace_packages
-            .cloned()
-            .or_else(|| {
-                crate::cli_args::workspace_packages::discover_workspace_package_manifests(
-                    config.workspace_dir.as_deref(),
-                    config,
-                )
-            });
-        let manifest = crate::cli_args::workspace_packages::create_publish_pack_manifest_options(
-            &self.flags.manifest,
-            config,
-            before_packing_hooks,
-            workspace_packages,
-        )?;
-        let mut options = PackOptions {
-            dir: dir.to_path_buf(),
-            workspace_dir: config.workspace_dir.clone(),
-            scripts: pnpm_pack::PackScripts {
-                ignore: self.should_ignore_scripts(config),
-                unsafe_perm: config.unsafe_perm,
-                user_agent: config.user_agent.clone(),
-                extra_bin_paths: config.extra_bin_paths.clone(),
-                extra_env: config.extra_env.clone(),
-            },
-            manifest,
-            output: pnpm_pack::PackOutputOptions {
-                gzip_level: None,
-                dry_run: false,
-                out: None,
-                destination: Some(pack_destination.to_string_lossy().into_owned()),
-                injected_files: Vec::new(),
-                locks: None,
-            },
-        };
-        crate::cli_args::pack::set_injected_changelog(&mut options, config, dir).await?;
-        pack_api::<Reporter, PackHost>(&options).await
-            .map_err(miette::Report::new)
-            .wrap_err(crate::cli_args::pack::PACK_ERROR_CONTEXT)
-    }
+/// The `package.json` of the project at `project_dir`.
+fn read_project_manifest(project_dir: &Path) -> miette::Result<Value> {
+    pnpm_package_manifest::safe_read_project_manifest_from_dir(project_dir)
+        .into_diagnostic()
+        .wrap_err("read project manifest")?
+        .ok_or_else(|| {
+            let dir = project_dir.display();
+            miette::miette!(
+                code = "ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND",
+                "No package.json found in {dir}",
+            )
+        })
+}
+
+fn configured_publish_branch<'a>(flag: Option<&'a str>, config: &'a Config) -> Option<&'a str> {
+    flag.or(config.publish_branch.as_deref())
 }
 
 /// Run the publish-lifecycle scripts the manifest declares, in order, with
@@ -425,7 +402,6 @@ fn run_publish_scripts<Reporter: self::Reporter>(
         execution: pnpm_executor::ScriptExecutionOptions {
             extra_bin_paths: &config.extra_bin_paths,
             node_gyp_bin: pnpm_executor::bundled_node_gyp_bin(),
-            prepend_node_path: ScriptsPrependNodePath::default(),
             shell: None,
             shell_emulator: false,
             wd_bin_dir: None,

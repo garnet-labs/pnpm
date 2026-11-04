@@ -1,13 +1,15 @@
 pub(crate) mod allow_build_policy;
 pub(crate) mod build_one_snapshot;
+pub(crate) mod skills_policy;
 pub(crate) mod slots;
 pub use allow_build_policy::{
     AllowBuildPolicy, allow_build_key_from_ignored_build, is_git_hosted_dep_path,
-    normalize_build_dep_path, parse_allow_build_selector,
+    normalize_build_dep_path, parse_allow_build_selector, short_package_label,
 };
 pub(crate) use build_one_snapshot::build_one_snapshot;
 pub(crate) use build_requirements::deferred_builds;
 pub use build_requirements::{ScheduledBuilds, ScheduledBuildsInputs};
+pub use skills_policy::SkillsPolicy;
 pub use slots::parse_name_version_from_key;
 pub(crate) use slots::{
     PkgRoots, bin_dirs_in_all_parent_dirs, discard_skipped_optional_dependency,
@@ -28,7 +30,7 @@ use crate::{
     find_root_runtime_node_key, import_indexed_dir, store_index_key_for_resolution,
     version_policy::{
         PackageVersionPolicy, PolicyMatch, VersionPolicyError, create_package_version_policy,
-        expand_package_version_specs,
+        expand_package_version_spec, expand_package_version_specs,
     },
 };
 
@@ -36,9 +38,7 @@ use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_config::Config;
 use pnpm_deps_path::{get_pkg_id_with_patch_hash, index_of_dep_path_suffix, remove_suffix};
-use pnpm_executor::{
-    LifecycleScriptError, RunPostinstallHooks, ScriptsPrependNodePath, run_postinstall_hooks,
-};
+use pnpm_executor::{LifecycleScriptError, RunPostinstallHooks, run_postinstall_hooks};
 use pnpm_lockfile::{PackageKey, SnapshotEntry};
 use pnpm_patching::{PatchApplyError, apply_patch_to_dir};
 use pnpm_reporter::{
@@ -536,11 +536,7 @@ impl BuildModules<'_> {
         let graph = cache_gate_active.then(|| {
             // Every requires-build snapshot is a root, including the ones
             // the install's dependency-group filter keeps out of the build
-            // graph. Narrowing the roots to what will actually build would
-            // make a package inside a dependency cycle hash differently
-            // under `--prod` than under a full install, because
-            // `warm_deps_state_cache` below resolves such a cycle by
-            // whichever walk reaches it first.
+            // graph.
             let roots = requires_build_map
                 .iter()
                 .filter(|&(_, &requires_build)| requires_build)
@@ -552,20 +548,6 @@ impl BuildModules<'_> {
             )
         });
         let cache = Mutex::new(pnpm_graph_hasher::DepsStateCache::new());
-        // Prime it in lockfile key order before any build runs. The
-        // ready nodes race for the mutex, and a snapshot inside a
-        // dependency cycle takes the digest of whichever walk reached
-        // it first — so an unprimed cache would hand the same install
-        // a different side-effects-cache key on every run, and every
-        // repeat install would re-run the build it already has cached.
-        if let Some(graph) = &graph {
-            let mut cache_guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            pnpm_graph_hasher::warm_deps_state_cache(
-                graph,
-                &mut cache_guard,
-                crate::deps_graph::in_lockfile_order(graph).into_iter().map(|(key, _)| key),
-            );
-        }
         DepStates { graph, cache }
     }
 }
@@ -621,14 +603,3 @@ fn schedule_builds<Reporter: self::Reporter>(
 
 #[cfg(test)]
 mod tests;
-
-/// The executor's canonical `scriptsPrependNodePath`. Config's mirror
-/// enum carries the yaml-deserialize impl; the executor's stays free of
-/// serde wiring.
-pub fn exec_scripts_prepend_node_path(config: &Config) -> ScriptsPrependNodePath {
-    match config.scripts_prepend_node_path {
-        pnpm_config::ScriptsPrependNodePath::Always => ScriptsPrependNodePath::Always,
-        pnpm_config::ScriptsPrependNodePath::Never => ScriptsPrependNodePath::Never,
-        pnpm_config::ScriptsPrependNodePath::WarnOnly => ScriptsPrependNodePath::WarnOnly,
-    }
-}

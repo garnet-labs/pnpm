@@ -1,5 +1,6 @@
 use crate::cli_args::{
     catalogs::configured_catalogs,
+    global::GlobalError,
     recursive::{AutoExcludeRoot, discover_workspace_projects, select_recursive_projects},
 };
 use clap::{Args, CommandFactory};
@@ -8,10 +9,16 @@ use pnpm_config::Config;
 use pnpm_deps_inspection_peers::{
     IssuesByProjects, check_peer_dependencies_from_lockfile, filter_peer_issues, render_peer_issues,
 };
+use pnpm_global::scan_global_packages;
 use pnpm_lockfile::Lockfile;
+use std::{collections::BTreeSet, path::Path};
 
 #[derive(Debug, Args)]
 pub struct PeersArgs {
+    /// Check each globally installed package group separately.
+    #[clap(short = 'g', long)]
+    pub global: bool,
+
     #[clap(long)]
     pub json: bool,
 
@@ -47,45 +54,72 @@ impl PeersArgs {
             return Ok(PeersOutcome::UnknownSubcommand);
         }
 
-        let lockfile_dir = config.lockfile_dir_for(dir);
-        let project_dirs = checked_project_dirs(config, dir, recursive)?;
-        let lockfile = self
-            .load_lockfile(config, lockfile_dir)
-            .into_diagnostic()
-            .wrap_err("load lockfile")?;
-        let catalogs = configured_catalogs(config)?;
-        let catalogs =
-            (config.workspace_dir.is_some() || config.catalogs.is_some()).then_some(&catalogs);
-
-        // A missing lockfile yields empty issues, mirroring pnpm's
-        // `checkPeerDependencies`, so both output modes stay on the common
-        // path (`{}` for `--json`, "No peer dependency issues found" otherwise).
-        let issues = match &lockfile {
-            Some(lockfile) => check_peer_dependencies_from_lockfile(
-                lockfile,
-                lockfile_dir,
-                &project_dirs,
-                catalogs,
-                config.resolve_peers_from_workspace_root,
-            )?,
-            None => IssuesByProjects::new(),
+        let (issues, undeclared) = if self.global {
+            (self.global_issues(config)?, std::collections::BTreeMap::new())
+        } else {
+            let lockfile_dir = config.lockfile_dir_for(dir);
+            let project_dirs = checked_project_dirs(config, dir, recursive)?;
+            let lockfile = self.load_lockfile(&config.install_state_dir, lockfile_dir)?;
+            let issues = checked_issues(config, lockfile_dir, &project_dirs, lockfile.as_ref())?;
+            let undeclared =
+                undeclared_warnings(config, lockfile_dir, &project_dirs, lockfile.as_ref());
+            (issues, undeclared)
         };
-        let issues = filter_peer_issues(issues, &config.peer_dependency_rules);
+        self.print_issues(&issues, &undeclared)
+    }
 
+    fn global_issues(&self, config: &Config) -> miette::Result<IssuesByProjects> {
+        let global_dir =
+            config.global_pkg_dir.as_deref().ok_or(GlobalError::MissingGlobalPackageDir)?;
+        let groups = scan_global_packages(global_dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("read global packages in {}", global_dir.display()))?;
+        // Each group installs without catalogs and as its own workspace root
+        // (see `global_group_config`), so the home's catalogs must not
+        // resolve its peer ranges either.
+        let mut group_config = config.clone();
+        group_config.catalogs = None;
+        group_config.workspace_dir = None;
+        let mut checked_dirs = BTreeSet::new();
+        let mut issues = IssuesByProjects::new();
+        for group in groups {
+            if !checked_dirs.insert(group.install_dir.clone()) {
+                continue;
+            }
+            let install_state_dir = group.install_dir.join("node_modules").join(".pnpm");
+            let lockfile = self.load_lockfile(&install_state_dir, &group.install_dir)?;
+            let mut group_issues = checked_issues(
+                &group_config,
+                &group.install_dir,
+                std::slice::from_ref(&group.install_dir),
+                lockfile.as_ref(),
+            )?;
+            if let Some(root_issues) = group_issues.remove(".") {
+                let mut aliases = group.aliases();
+                aliases.sort();
+                let mut key = aliases.join(", ");
+                if issues.contains_key(&key) {
+                    key = format!("{key} ({})", group.hash);
+                }
+                issues.insert(key, root_issues);
+            }
+        }
+        Ok(issues)
+    }
+
+    fn print_issues(
+        &self,
+        issues: &IssuesByProjects,
+        undeclared: &UndeclaredWarnings,
+    ) -> miette::Result<PeersOutcome> {
         let no_issues = issues
             .values()
             .all(|pi| pi.bad.is_empty() && pi.missing.is_empty());
 
         if self.json {
-            let output = serde_json::to_string_pretty(&issues)
-                .into_diagnostic()
-                .wrap_err("serialize issues to JSON")?;
-            pnpm_diagnostics::println!("{output}");
-        } else if no_issues {
-            pnpm_diagnostics::println!("No peer dependency issues found");
+            print_json_issues(issues, undeclared)?;
         } else {
-            pnpm_diagnostics::println!("Issues with peer dependencies found\n");
-            pnpm_diagnostics::println!("{}", render_peer_issues(&issues));
+            print_text_issues(issues, undeclared, no_issues);
         }
 
         Ok(if no_issues { PeersOutcome::NoIssues } else { PeersOutcome::IssuesFound })
@@ -95,15 +129,23 @@ impl PeersArgs {
     /// `--lockfile-only` reads the wanted lockfile outright.
     fn load_lockfile(
         &self,
-        config: &Config,
-        lockfile_dir: &std::path::Path,
-    ) -> Result<Option<Lockfile>, pnpm_lockfile::LoadLockfileError> {
-        if self.lockfile_only {
-            return Lockfile::load_wanted_from_dir(lockfile_dir);
-        }
-        match Lockfile::load_current_from_install_state_dir(&config.install_state_dir)? {
+        install_state_dir: &Path,
+        lockfile_dir: &Path,
+    ) -> miette::Result<Option<Lockfile>> {
+        let current = if self.lockfile_only {
+            None
+        } else {
+            Lockfile::load_current_from_install_state_dir(install_state_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("load current lockfile in {}", install_state_dir.display())
+                })?
+        };
+        match current {
             Some(lockfile) => Ok(Some(lockfile)),
-            None => Lockfile::load_wanted_from_dir(lockfile_dir),
+            None => Lockfile::load_wanted_from_dir(lockfile_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("load lockfile in {}", lockfile_dir.display())),
         }
     }
 }
@@ -134,4 +176,94 @@ fn checked_project_dirs(
         .keys()
         .cloned()
         .collect())
+}
+
+fn checked_issues(
+    config: &Config,
+    lockfile_dir: &Path,
+    project_dirs: &[std::path::PathBuf],
+    lockfile: Option<&Lockfile>,
+) -> miette::Result<IssuesByProjects> {
+    let catalogs = configured_catalogs(config)?;
+    let catalogs =
+        (config.workspace_dir.is_some() || config.catalogs.is_some()).then_some(&catalogs);
+    let issues = match lockfile {
+        Some(lockfile) => check_peer_dependencies_from_lockfile(
+            lockfile,
+            lockfile_dir,
+            project_dirs,
+            catalogs,
+            config.resolve_peers_from_workspace_root,
+        )?,
+        None => IssuesByProjects::new(),
+    };
+    Ok(filter_peer_issues(issues, &config.peer_dependency_rules))
+}
+
+type UndeclaredWarnings =
+    std::collections::BTreeMap<String, Vec<pnpm_deps_inspection_peers::UndeclaredPeer>>;
+
+fn undeclared_warnings(
+    config: &Config,
+    lockfile_dir: &Path,
+    project_dirs: &[std::path::PathBuf],
+    lockfile: Option<&Lockfile>,
+) -> UndeclaredWarnings {
+    if config.auto_install_peers || !config.dedupe_peer_dependents {
+        return UndeclaredWarnings::new();
+    }
+    let Some(lockfile) = lockfile else { return UndeclaredWarnings::new() };
+    let mut inspector =
+        pnpm_deps_inspection_peers::UndeclaredPeerInspector::new(lockfile, lockfile_dir);
+    project_dirs
+        .iter()
+        .filter_map(|dir| {
+            let importer = pnpm_workspace::importer_id_from_root_dir(lockfile_dir, dir);
+            let peers = inspector.check(&importer, config.resolve_peers_from_workspace_root.into());
+            (!peers.is_empty()).then_some((importer, peers))
+        })
+        .collect()
+}
+
+fn print_undeclared_warnings(warnings: &UndeclaredWarnings) {
+    for (project, peers) in warnings {
+        for peer in peers {
+            pnpm_diagnostics::println!(
+                "WARN {}: required peer {}@{} of {} is resolved but is not declared by this project or provided by its dependency ancestors. Declare the peer directly if this project's scripts use it.",
+                pnpm_text_sanitize::sanitize_inline(project),
+                pnpm_text_sanitize::sanitize_inline(&peer.peer),
+                pnpm_text_sanitize::sanitize_inline(&peer.found_version),
+                pnpm_text_sanitize::sanitize_inline(&peer.package),
+            );
+        }
+    }
+}
+
+fn print_json_issues(
+    issues: &IssuesByProjects,
+    undeclared: &UndeclaredWarnings,
+) -> miette::Result<()> {
+    let mut report = serde_json::to_value(issues).into_diagnostic()?;
+    for (project, peers) in undeclared {
+        report[project]["undeclared"] = serde_json::to_value(peers).into_diagnostic()?;
+    }
+    let output = serde_json::to_string_pretty(&report)
+        .into_diagnostic()
+        .wrap_err("serialize issues to JSON")?;
+    pnpm_diagnostics::println!("{output}");
+    Ok(())
+}
+
+fn print_text_issues(issues: &IssuesByProjects, undeclared: &UndeclaredWarnings, no_issues: bool) {
+    match (no_issues, undeclared.is_empty()) {
+        (true, true) => pnpm_diagnostics::println!("No peer dependency issues found"),
+        (true, false) => pnpm_diagnostics::println!(
+            "Peer dependencies are satisfied. Declaration warnings follow.",
+        ),
+        (false, _) => {
+            pnpm_diagnostics::println!("Issues with peer dependencies found\n");
+            pnpm_diagnostics::println!("{}", render_peer_issues(issues));
+        }
+    }
+    print_undeclared_warnings(undeclared);
 }

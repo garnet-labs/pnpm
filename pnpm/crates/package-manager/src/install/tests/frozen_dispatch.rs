@@ -113,6 +113,7 @@ async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -226,7 +227,8 @@ supported_architectures: None,
 catalogs_override: None,
 pnpmfile_hook_override: None,
 workspace_projects_override: None,
-dedicated: None
+dedicated: None,
+discovered_workspace: None
 },
 }
     .run::<SilentReporter>()
@@ -365,6 +367,7 @@ async fn frozen_lockfile_gate_rejects_under_huge_minimum_release_age() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -464,6 +467,7 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -526,6 +530,7 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -625,6 +630,7 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -733,6 +739,7 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -834,7 +841,7 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
         included,
         None,
         &Default::default(),
-        &[(dirs.project_root.clone(), &manifest)],
+        crate::DeclaredManifests::new(&[(dirs.project_root.clone(), &manifest)]),
         None,
     );
     update_workspace_state(&dirs.project_root, &seed_state).expect("seed workspace state");
@@ -902,6 +909,7 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -951,14 +959,14 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
     let written = load_workspace_state(&dirs.project_root)
         .expect("read workspace state")
         .expect("workspace state must be written");
-    let manifest_mtime = crate::optimistic_repeat_install::file_mtime(manifest.path())
-        .expect("manifest should have an mtime");
+    let manifest_mtime =
+        crate::install_state::file_mtime(manifest.path()).expect("manifest should have an mtime");
     assert_eq!(
         manifest_mtime.ns, 1_700_000_000_000_500_000,
         "the short-circuit must leave the manifest untouched",
     );
     assert!(
-        !crate::optimistic_repeat_install::modified_at_or_after(
+        !crate::install_state::modified_at_or_after(
             manifest_mtime,
             written.last_validated_timestamp,
         ),

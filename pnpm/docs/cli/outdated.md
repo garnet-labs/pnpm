@@ -3,9 +3,16 @@ id: outdated
 title: pnpm outdated
 ---
 
-Checks for outdated packages. The check can be limited to a subset of the
-installed packages by providing arguments. Patterns support `*` wildcards, and a
-leading `!` excludes matching packages.
+Checks for outdated packages, runtimes (`node`, `deno`, `bun` declared in
+`devEngines.runtime`, `engines.runtime`, or through the `runtime:` / `tool:`
+protocol), package managers (`pnpm`, `npm`, `yarn`, `bun` declared in
+`devEngines.packageManager` or `packageManager`), Cargo crates (`Cargo.toml`
+when [`cargo.enabled`](../cargo.md#cargoenabled) is `true`), and Python packages
+(`pyproject.toml` when [`python.enabled`](../python.md#pythonenabled) is
+`true`). The check can be limited to a subset of the declared dependencies,
+runtimes, or package managers by providing arguments, including `crate:<name>`
+for Cargo crates and `pypi:<name>` for Python packages. Patterns support `*`
+wildcards, and a leading `!` excludes matching names.
 
 `pnpm outdated` exits with code 1 when any dependency is outdated.
 
@@ -72,6 +79,10 @@ Checks `optionalDependencies`.
 ### --sort-by
 
 Specifies the order in which the output results are sorted. Currently only the value `name` is accepted. By default, results are sorted by the size of the version change, then by name.
+
+### --notes
+
+Print the release notes between the current and the latest version below each outdated package. Notes are read from registries declared with [`serverType: pnpr`](../registries.md#servertype). The notes of a release that published several packages are printed once, above the notes of the versions it published. Between two stable versions, the notes of prereleases are left out. With `--json`, each entry gets a `releaseNotes` field.
 
 ### --include-github-actions
 

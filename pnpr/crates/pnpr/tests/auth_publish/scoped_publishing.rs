@@ -1,10 +1,10 @@
 use super::{
     BASE64, Body, Request, ServiceExt, StatusCode, TempDir, Value, add_user_and_get_token,
-    body_bytes, body_json, json, publish_doc, router, sha1_hex, sri_sha512, static_config,
+    body_bytes, body_json, json, npm_tgz, publish_doc, router, sha1_hex, sri_sha512, static_config,
     static_config_with_packages,
 };
 use base64::Engine;
-use pnpr_storage::layout::{local_blob_path, local_document_path, local_package_dir};
+use pnpr_storage::layout::{local_blob_path, local_package_dir};
 
 /// `libnpmpublish` (the library `pnpm publish` / `npm publish` use under
 /// the hood) names the `_attachments` key by the full package name —
@@ -20,7 +20,7 @@ async fn publish_accepts_libnpmpublish_scoped_attachment_filename() {
     let app = router(static_config(storage.clone()));
     let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
 
-    let bytes = b"libnpmpublish-form";
+    let bytes = &npm_tgz("@pnpmtest/lib-pub-form", "1.0.0", b"libnpmpublish-form");
     let pkg = "@pnpmtest/lib-pub-form";
     let version = "1.0.0";
     // _attachments key is the FULL scoped name + version, NOT the basename.
@@ -62,9 +62,15 @@ async fn publish_accepts_libnpmpublish_scoped_attachment_filename() {
 
     // On disk: canonical `<basename>-<version>.tgz` path, NOT the
     // scoped form. That's where serve_tarball looks.
-    let on_disk = local_blob_path(&storage, "", "@pnpmtest/lib-pub-form", "lib-pub-form-1.0.0.tgz");
+    let on_disk = local_blob_path(
+        &storage,
+        "",
+        pnpr_storage::Ecosystem::Npm,
+        "@pnpmtest/lib-pub-form",
+        "lib-pub-form-1.0.0.tgz",
+    );
     assert!(on_disk.exists(), "tarball should be persisted at canonical path");
-    assert_eq!(std::fs::read(&on_disk).unwrap(), bytes);
+    assert_eq!(std::fs::read(&on_disk).unwrap(), *bytes);
 
     // And it serves back via the spec URL form.
     let served = app
@@ -77,7 +83,7 @@ async fn publish_accepts_libnpmpublish_scoped_attachment_filename() {
         .unwrap();
     assert_eq!(served.status(), StatusCode::OK);
     let served_bytes = body_bytes(served.into_body()).await;
-    assert_eq!(served_bytes, bytes);
+    assert_eq!(served_bytes, *bytes);
 }
 
 #[tokio::test]
@@ -102,16 +108,33 @@ async fn unpublish_partial_writes_modified_packument() {
             .unwrap();
     }
 
-    let modified = json!({
-        "name": "unpub-partial",
-        "_rev": "ignored",
-        "dist-tags": { "latest": "2.0.0" },
-        "versions": {
-            "2.0.0": { "name": "unpub-partial", "version": "2.0.0", "dist": {
-                "tarball": "http://example.test/unpub-partial/-/unpub-partial-2.0.0.tgz"
-            }},
-        },
-    });
+    // As npm does: read the packument for writing, and put it back without
+    // the version. The retained version comes back without its integrity.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/npm/unpub-partial?write=true")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut modified: Value =
+        serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
+    modified["versions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("1.0.0");
+    modified["time"]
+        .as_object_mut()
+        .unwrap()
+        .remove("1.0.0");
+    modified["versions"]["2.0.0"]["dist"]
+        .as_object_mut()
+        .unwrap()
+        .remove("integrity");
     let request = Request::put("/npm/unpub-partial/-rev/anything")
         .header("content-type", "application/json")
         .header("Authorization", format!("Bearer {token}"))
@@ -149,7 +172,7 @@ async fn unpublish_partial_writes_modified_packument() {
     // corrupt a published version's integrity.
     assert_eq!(
         served["versions"]["2.0.0"]["dist"]["integrity"],
-        json!(sri_sha512(b"2.0.0")),
+        json!(sri_sha512(&npm_tgz("unpub-partial", "2.0.0", b"2.0.0"))),
         "the original published integrity must be restored, unchanged",
     );
 
@@ -164,8 +187,26 @@ async fn unpublish_partial_writes_modified_packument() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert!(!local_blob_path(&storage, "", "unpub-partial", "unpub-partial-1.0.0.tgz").exists());
-    assert!(local_blob_path(&storage, "", "unpub-partial", "unpub-partial-2.0.0.tgz").exists());
+    assert!(
+        !local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "unpub-partial",
+            "unpub-partial-1.0.0.tgz"
+        )
+        .exists(),
+    );
+    assert!(
+        local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "unpub-partial",
+            "unpub-partial-2.0.0.tgz"
+        )
+        .exists(),
+    );
 
     // Second DELETE of the same tarball is a no-op — verdaccio
     // returns 201 here too (idempotent). The pnpm unpublish flow
@@ -223,7 +264,16 @@ async fn unpublish_tarball_preserves_cache_subsystems_and_cached_entries() {
         StatusCode::CREATED,
     );
 
-    assert!(!local_blob_path(&storage, "", "blend-pkg", "blend-pkg-1.0.0.tgz").exists());
+    assert!(
+        !local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "blend-pkg",
+            "blend-pkg-1.0.0.tgz"
+        )
+        .exists(),
+    );
     assert!(
         cached_package_dir.join("cached.tgz").exists(),
         "cached package directory must remain intact",
@@ -261,7 +311,15 @@ async fn unpublish_force_removes_entire_package() {
         .oneshot(request)
         .await
         .unwrap();
-    assert!(local_document_path(&storage, "", "unpub-force").exists());
+    assert!(
+        pnpr_fixtures::read_hosted_document(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "unpub-force"
+        )
+        .is_some(),
+    );
 
     let request = Request::delete("/npm/unpub-force/-rev/anything")
         .header("Authorization", format!("Bearer {token}"))
@@ -273,7 +331,7 @@ async fn unpublish_force_removes_entire_package() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert!(!local_package_dir(&storage, "", "unpub-force").exists());
+    assert!(!local_package_dir(&storage, "", pnpr_storage::Ecosystem::Npm, "unpub-force").exists());
 
     // Re-fetch returns 404 (static mode + no on-disk packument).
     let response = app
@@ -285,6 +343,51 @@ async fn unpublish_force_removes_entire_package() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unpublish_package_without_rev_suffix() {
+    let tmp = TempDir::new().unwrap();
+    let storage = tmp.path().to_path_buf();
+    let app = router(static_config(storage.clone()));
+    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+
+    for (pkg, path) in
+        [("unpub-clean", "/npm/unpub-clean"), ("@scope/unpub-clean", "/npm/@scope/unpub-clean")]
+    {
+        let body = publish_doc(pkg, "1.0.0", b"contents");
+        let publish = Request::put(path)
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(publish)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED,
+        );
+        assert!(
+            pnpr_fixtures::read_hosted_document(&storage, "", pnpr_storage::Ecosystem::Npm, pkg)
+                .is_some(),
+        );
+
+        let delete = Request::delete(path)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(delete)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED,
+        );
+        assert!(!local_package_dir(&storage, "", pnpr_storage::Ecosystem::Npm, pkg).exists());
+    }
 }
 
 #[tokio::test]
@@ -304,7 +407,16 @@ async fn unpublish_scoped_tarball_via_six_segment_route() {
         .oneshot(request)
         .await
         .unwrap();
-    assert!(local_blob_path(&storage, "", "@scope/unpub", "unpub-1.0.0.tgz").exists());
+    assert!(
+        local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "@scope/unpub",
+            "unpub-1.0.0.tgz"
+        )
+        .exists(),
+    );
 
     // pnpm reconstructs the DELETE URL from the rewritten tarball URL
     // in the packument, which uses literal `/` for the scope segment
@@ -315,7 +427,133 @@ async fn unpublish_scoped_tarball_via_six_segment_route() {
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert!(!local_blob_path(&storage, "", "@scope/unpub", "unpub-1.0.0.tgz").exists());
+    assert!(
+        !local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "@scope/unpub",
+            "unpub-1.0.0.tgz"
+        )
+        .exists(),
+    );
+}
+
+#[tokio::test]
+async fn unpublish_tarball_via_version_route_url() {
+    let tmp = TempDir::new().unwrap();
+    let storage = tmp.path().to_path_buf();
+    let app = router(static_config(storage.clone()));
+    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+
+    for (pkg, put_path, delete_path, blob_name) in [
+        (
+            "unpub-ver",
+            "/npm/unpub-ver",
+            "/npm/unpub-ver@1.0.0/-rev/anything",
+            "unpub-ver-1.0.0.tgz",
+        ),
+        (
+            "unpub-ver-clean",
+            "/npm/unpub-ver-clean",
+            "/npm/unpub-ver-clean@1.0.0",
+            "unpub-ver-clean-1.0.0.tgz",
+        ),
+        (
+            "unpub-tar-clean",
+            "/npm/unpub-tar-clean",
+            "/npm/unpub-tar-clean/-/unpub-tar-clean-1.0.0.tgz",
+            "unpub-tar-clean-1.0.0.tgz",
+        ),
+        (
+            "@scope/unpub-ver",
+            "/npm/@scope/unpub-ver",
+            "/npm/@scope/unpub-ver@1.0.0/-rev/anything",
+            "unpub-ver-1.0.0.tgz",
+        ),
+        (
+            "@scope/unpub-ver-clean",
+            "/npm/@scope/unpub-ver-clean",
+            "/npm/@scope/unpub-ver-clean@1.0.0",
+            "unpub-ver-clean-1.0.0.tgz",
+        ),
+        (
+            "@scope/unpub-tar-clean",
+            "/npm/@scope/unpub-tar-clean",
+            "/npm/@scope/unpub-tar-clean/-/unpub-tar-clean-1.0.0.tgz",
+            "unpub-tar-clean-1.0.0.tgz",
+        ),
+    ] {
+        let body = publish_doc(pkg, "1.0.0", b"bytes");
+        let request = Request::put(put_path)
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let publish = app
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(publish.status(), StatusCode::CREATED);
+        assert!(
+            local_blob_path(&storage, "", pnpr_storage::Ecosystem::Npm, pkg, blob_name).exists(),
+        );
+
+        let request = Request::delete(delete_path)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(
+            !local_blob_path(&storage, "", pnpr_storage::Ecosystem::Npm, pkg, blob_name).exists(),
+        );
+    }
+
+    // A version cannot be published with the reserved `+r<digits>` build
+    // metadata, and a reserved revision identifier must not delete the hosted
+    // `.tgz` blob of the version it names.
+    for (version, status) in [("1.0.0+r0", StatusCode::BAD_REQUEST), ("1.0.0", StatusCode::CREATED)]
+    {
+        let body = publish_doc("unpub-rev", version, b"bytes");
+        let request = Request::put("/npm/unpub-rev")
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            status,
+            "{version}",
+        );
+    }
+    let hosted_blob = || {
+        local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "unpub-rev",
+            "unpub-rev-1.0.0.tgz",
+        )
+    };
+    assert!(hosted_blob().exists());
+
+    let request = Request::delete("/npm/unpub-rev@1.0.0+r0/-rev/anything")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(hosted_blob().exists());
 }
 
 #[tokio::test]
@@ -357,7 +595,15 @@ async fn missing_unpublish_policy_denies_destructive_writes() {
             .status(),
         StatusCode::FORBIDDEN,
     );
-    assert!(local_document_path(&storage, "", "missing-unpublish").exists());
+    assert!(
+        pnpr_fixtures::read_hosted_document(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "missing-unpublish"
+        )
+        .is_some(),
+    );
 }
 
 #[tokio::test]
@@ -389,9 +635,16 @@ async fn packument_replacement_requires_publish_and_unpublish_policy() {
         StatusCode::CREATED,
     );
 
-    let packument_path = local_document_path(&storage, "", "replace-policy");
-    let mut replacement: Value =
-        serde_json::from_slice(&std::fs::read(&packument_path).unwrap()).unwrap();
+    let mut replacement: Value = serde_json::from_slice(
+        &pnpr_fixtures::read_hosted_document(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "replace-policy",
+        )
+        .unwrap(),
+    )
+    .unwrap();
     replacement["owner"] = json!("admin");
 
     let request = Request::put("/npm/replace-policy/-rev/anything")
@@ -407,7 +660,16 @@ async fn packument_replacement_requires_publish_and_unpublish_policy() {
             .status(),
         StatusCode::FORBIDDEN,
     );
-    let on_disk: Value = serde_json::from_slice(&std::fs::read(&packument_path).unwrap()).unwrap();
+    let on_disk: Value = serde_json::from_slice(
+        &pnpr_fixtures::read_hosted_document(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "replace-policy",
+        )
+        .unwrap(),
+    )
+    .unwrap();
     assert!(on_disk.get("owner").is_none());
 
     let request = Request::put("/npm/replace-policy/-rev/anything")
@@ -423,7 +685,16 @@ async fn packument_replacement_requires_publish_and_unpublish_policy() {
             .status(),
         StatusCode::CREATED,
     );
-    let on_disk: Value = serde_json::from_slice(&std::fs::read(&packument_path).unwrap()).unwrap();
+    let on_disk: Value = serde_json::from_slice(
+        &pnpr_fixtures::read_hosted_document(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "replace-policy",
+        )
+        .unwrap(),
+    )
+    .unwrap();
     assert_eq!(on_disk["owner"], "admin");
 }
 
@@ -465,7 +736,9 @@ async fn concurrent_publishes_of_distinct_versions_all_survive() {
     assert_eq!(second, StatusCode::CREATED);
 
     let on_disk =
-        std::fs::read(local_document_path(&storage, "", "racer")).expect("packument written");
+        pnpr_fixtures::read_hosted_document(&storage, "", pnpr_storage::Ecosystem::Npm, "racer")
+            .ok_or("no hosted document")
+            .expect("packument written");
     let packument: Value = serde_json::from_slice(&on_disk).unwrap();
     assert_eq!(packument["versions"]["1.0.0"]["version"], "1.0.0", "1.0.0 must survive");
     assert_eq!(packument["versions"]["2.0.0"]["version"], "2.0.0", "2.0.0 must survive");

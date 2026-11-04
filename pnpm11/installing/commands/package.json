@@ -1,6 +1,6 @@
 {
   "name": "@pnpm/installing.commands",
-  "version": "1101.4.7",
+  "version": "1101.4.9",
   "description": "Commands for installation",
   "keywords": [
     "pnpm",
@@ -43,6 +43,7 @@
     "@pnpm/cli.utils": "workspace:*",
     "@pnpm/colorize-semver-diff": "catalog:",
     "@pnpm/config.matcher": "workspace:*",
+    "@pnpm/config.normalize-registries": "workspace:*",
     "@pnpm/config.pick-registry-for-package": "workspace:*",
     "@pnpm/config.reader": "workspace:*",
     "@pnpm/config.version-policy": "workspace:*",
@@ -64,6 +65,7 @@
     "@pnpm/installing.dedupe.check": "workspace:*",
     "@pnpm/installing.dedupe.issues-renderer": "workspace:*",
     "@pnpm/installing.deps-installer": "workspace:*",
+    "@pnpm/installing.deps-resolver": "workspace:*",
     "@pnpm/installing.env-installer": "workspace:*",
     "@pnpm/installing.modules-yaml": "workspace:*",
     "@pnpm/lockfile.fs": "workspace:*",

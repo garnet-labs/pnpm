@@ -11,9 +11,10 @@ pub(crate) use std::process;
 pub(crate) use tokio::process as async_process;
 
 pub use bundled_node_gyp::{bundled_node_gyp_bin, bundled_node_gyp_entry};
-pub use extend_path::{ScriptsPrependNodePath, extend_path};
+pub use exit::{before_exit, exit};
+pub use extend_path::extend_path;
 pub use interrupt::{exit_like, interrupt_count};
-pub use job_control::{JobGuard, arm_process_tree_cleanup};
+pub use job_control::arm_process_tree_cleanup;
 pub use lifecycle::{
     DEV_PREINSTALL_ALREADY_RAN_ENV, DEV_PREINSTALL_STAGE, LifecycleScriptError,
     PROJECT_INSTALL_STAGES, PROJECT_LIFECYCLE_STAGES, PROJECT_POST_UNINSTALL_STAGES,
@@ -35,6 +36,7 @@ pub use shell::{ScriptShellError, SelectedShell, select_shell};
 pub use shell_emulator::{EmulatedOutput, ShellEmulatorError, execute_emulated};
 
 mod bundled_node_gyp;
+mod exit;
 mod extend_path;
 mod interrupt;
 mod job_control;
@@ -91,7 +93,7 @@ fn spawn_shell(command: &str, current_dir: Option<&Path>) -> Result<ExitStatus, 
     if let Some(current_dir) = current_dir {
         cmd.current_dir(current_dir);
     }
-    let mut child = cmd.spawn().map_err(ExecutorError::SpawnCommand)?;
+    let mut child = process_tracker::spawn(&mut cmd).map_err(ExecutorError::SpawnCommand)?;
     child.wait().map_err(ExecutorError::WaitProcess)
 }
 

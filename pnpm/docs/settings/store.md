@@ -33,7 +33,7 @@ only possible on the same filesystem.
 If no directory above the project accepts a hard link at all (an agent sandbox
 that grants write access only to the project, or a container with just the
 project bind-mounted writable), the store is created inside the project instead:
-at `node_modules/.pnpm-store`.
+at `node_modules/.pnpm-store`. In a workspace, that is the workspace root's `node_modules/.pnpm-store`.
 Putting it in the home directory there would either fail on a read-only home or
 land on another volume, which copies every package instead of hard-linking it
 ([#13525](https://github.com/pnpm/pnpm/issues/13525)).
@@ -86,7 +86,7 @@ Pair it with `--offline` and `--frozen-lockfile` against a fully-populated store
 pnpm install --frozen-store --offline --frozen-lockfile
 ```
 
-The store must already contain everything the install needs, including the build output of any package whose lifecycle scripts are approved (or that has a patch applied). Under the [global virtual store](./node-modules.md#enableglobalvirtualstore), those package directories live inside the store, so if a required build is missing the install fails up front with `ERR_PNPM_FROZEN_STORE_NEEDS_BUILD`. Seed the store with those builds first. If the store is missing its content directory entirely, the install fails fast with `ERR_PNPM_FROZEN_STORE_INCOMPLETE` rather than trying to initialize it.
+The store must already contain everything the install needs, including the build output of any package whose lifecycle scripts are approved (or that has a patch applied). Under the [global virtual store](./node-modules.md#enableglobalvirtualstore), those package directories live inside the store, so if a required build is missing the install fails up front with `ERR_PNPM_FROZEN_STORE_NEEDS_BUILD`. Seed the store with those builds first.
 
 `frozenStore` is incompatible with `--force` and with a configured pnpr server, since both write into the store. The [side effects cache](./build.md#sideeffectscache) is not written either.
 
@@ -169,6 +169,24 @@ still recorded.
 * Type: **Boolean**
 
 Add the full URL to the package's tarball to every entry in `pnpm-lock.yaml`.
+
+### symlinkedLockfileTargetDirs
+
+Added in: v12.16.0
+
+* Default: **[]**
+* Type: **string[]**
+
+When `pnpm-lock.yaml` is a symlink, pnpm reads it through the link but refuses to write changes to it. List the directories that the lockfile may link into, and pnpm writes the updated lockfile to the file the symlink points to if that file is inside one of them. pnpm follows the whole chain of links, keeps every link in place, and keeps the target file's permissions. A lockfile that does not change is never written.
+
+```yaml title="config.yaml"
+symlinkedLockfileTargetDirs:
+  - ~/build/src
+```
+
+Each entry must be an absolute path or start with `~/`. pnpm ignores any other entry.
+
+Set it in the [global configuration file](../cli/config.md) or with `PNPM_CONFIG_SYMLINKED_LOCKFILE_TARGET_DIRS='["/path/to/src"]'`. pnpm ignores the setting in `pnpm-workspace.yaml`, because the repository that commits the symlink must not be the one that allows writing through it.
 
 ### lockfile.includeResolutionSettings
 

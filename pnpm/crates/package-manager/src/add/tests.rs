@@ -19,6 +19,7 @@ use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::SilentReporter;
+use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 use pnpm_workspace::Project;
 use serde_json::json;
 use std::sync::Arc;
@@ -57,11 +58,59 @@ fn test_add<'a>(
 }
 
 async fn add_npm_selector(selector: &str) -> Option<String> {
+    add_npm_selector_with_ranges(selector, None, None).await
+}
+
+async fn add_npm_selector_with_ranges(
+    selector: &str,
+    workspace_range: Option<&str>,
+    override_range: Option<&str>,
+) -> Option<String> {
+    add_npm_selector_in_workspace(selector, (workspace_range, override_range), true).await
+}
+
+/// `configure_workspace_dir: false` leaves `Config::workspace_dir` unset, so
+/// the add has to discover the workspace it runs in.
+async fn add_npm_selector_in_workspace(
+    selector: &str,
+    (workspace_range, override_range): (Option<&str>, Option<&str>),
+    configure_workspace_dir: bool,
+) -> Option<String> {
     let dir = tempdir().unwrap();
     let project_root = dir.path().join("project");
     let modules_dir = project_root.join("node_modules");
     let virtual_store_dir = modules_dir.join(".pacquet");
     std::fs::create_dir_all(&project_root).unwrap();
+    if let Some(workspace_range) = workspace_range {
+        let sibling_root = dir.path().join("sibling");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        std::fs::write(
+            sibling_root.join("package.json"),
+            json!({
+                "name": "sibling",
+                "version": "1.0.0",
+                "dependencies": { "foo": workspace_range },
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    if workspace_range.is_some() || override_range.is_some() {
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - project\n  - sibling\n",
+        )
+        .unwrap();
+    }
+    if override_range.is_some() {
+        let vendored_root = dir.path().join("vendor/foo");
+        std::fs::create_dir_all(&vendored_root).unwrap();
+        std::fs::write(
+            vendored_root.join("package.json"),
+            json!({ "name": "foo", "version": "1.0.0" }).to_string(),
+        )
+        .unwrap();
+    }
 
     let mut manifest = PackageManifest::create_if_needed(project_root.join("package.json"))
         .expect("create manifest");
@@ -89,6 +138,14 @@ async fn add_npm_selector(selector: &str) -> Option<String> {
     config.install_state_dir = virtual_store_dir;
     config.registry = registry_url;
     config.minimum_release_age = None;
+    if configure_workspace_dir && (workspace_range.is_some() || override_range.is_some()) {
+        config.workspace_dir = Some(dir.path().to_path_buf());
+    }
+    if let Some(override_range) = override_range {
+        config.overrides
+            .get_or_insert_default()
+            .insert("foo".to_string(), override_range.to_string());
+    }
     let config = config.leak();
 
     let http_client = ThrottledClient::default();
@@ -119,7 +176,8 @@ async fn add_npm_selector(selector: &str) -> Option<String> {
     .await
     .unwrap_or_else(|error| panic!("add {selector} should succeed: {error}"));
 
-    saved_dependency_specifier(&manifest, "foo")
+    let alias = parse_wanted_dependency(selector).alias.unwrap_or_else(|| "foo".to_string());
+    saved_dependency_specifier(&manifest, &alias)
 }
 
 /// Run `pacquet add <selector>` against a mocked `@jsr` registry and report

@@ -16,7 +16,7 @@ use std::{
 /// [`pnpm_store_dir::PackageFilesIndex::files`] payload the warm
 /// prefetch on a future install reads to skip re-fetching.
 pub(crate) struct ImportedFiles {
-    pub cas_paths: HashMap<String, PathBuf>,
+    pub cas_paths: pnpm_fs::CasPaths,
     pub files_index: HashMap<String, CafsFileInfo>,
 }
 
@@ -66,10 +66,10 @@ fn join_checked(root: &Path, rel: &str) -> Result<PathBuf, GitFetcherError> {
 /// the prepare phase needs raw filesystem semantics for scripts to
 /// run.
 pub(crate) fn materialize_into(
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     target_dir: &Path,
 ) -> Result<(), GitFetcherError> {
-    for (rel, cas_path) in cas_paths {
+    for (rel, pnpm_fs::StoreFile { path: cas_path, .. }) in cas_paths {
         // `rel` uses forward slashes regardless of host platform.
         // `Path::components()` (called inside `join_checked`)
         // recognises both `/` and `\` as separators on Windows, so we
@@ -102,7 +102,12 @@ pub(crate) fn import_into_cas(
         // See the matching note in `materialize_into`: `join_checked`
         // accepts forward-slash relative paths verbatim on every host.
         let source = join_checked(pkg_dir, rel)?;
-        let metadata = fs::metadata(&source).map_err(GitFetcherError::Io)?;
+        let metadata = match fs::metadata(&source) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(GitFetcherError::Io(err)),
+        };
         let mode = file_mode_from(&metadata);
         // `add_files_from_dir` reads the full POSIX mode and routes
         // the executable bit through `is_executable(mode)`. Match
@@ -110,25 +115,15 @@ pub(crate) fn import_into_cas(
         // round-trips through pacquet's read side at
         // `cas_file_path_by_mode` exactly like a tarball entry would.
         let bytes = fs::read(&source).map_err(GitFetcherError::Io)?;
-        let size = bytes.len() as u64;
-        let executable = is_executable(mode);
-        let (cas_path, hash) =
-            store_dir.write_cas_file(&bytes, executable).map_err(map_write_cas)?;
-        cas_paths.insert(rel.clone(), cas_path);
-        files_index.insert(
-            rel.clone(),
-            CafsFileInfo {
-                digest: format!("{hash:x}"),
-                mode,
-                size,
-                // `None` matches `add_files_from_dir`: the first
-                // integrity-check pass populates this. Staying
-                // consistent with the existing CAFS write path means
-                // the warm prefetch's verify logic exercises the
-                // same code path it does for tarball entries.
-                checked_at: None,
-            },
-        );
+        let written = store_dir
+            .write_cas_file(&bytes, is_executable(mode))
+            .map_err(map_write_cas)?;
+        // `checked_at: None` matches `add_files_from_dir`: the first
+        // integrity-check pass populates it, so the warm prefetch's
+        // verify logic exercises the same code path it does for
+        // tarball entries.
+        files_index.insert(rel.clone(), written.index_entry(mode, None));
+        cas_paths.insert(rel.clone(), written.file);
     }
     Ok(ImportedFiles { cas_paths, files_index })
 }
@@ -164,10 +159,10 @@ fn file_mode_from(_meta: &fs::Metadata) -> u32 {
 /// `size` still requires a `fs::metadata` stat, but that's two syscalls
 /// per file rather than a full read + sha512.
 pub(crate) fn synthesize_files_index(
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
 ) -> Result<HashMap<String, CafsFileInfo>, GitFetcherError> {
     let mut out = HashMap::with_capacity(cas_paths.len());
-    for (rel, cas_path) in cas_paths {
+    for (rel, pnpm_fs::StoreFile { path: cas_path, .. }) in cas_paths {
         let digest = cas_path_digest(cas_path)
             .ok_or_else(|| {
                 GitFetcherError::Io(io::Error::new(

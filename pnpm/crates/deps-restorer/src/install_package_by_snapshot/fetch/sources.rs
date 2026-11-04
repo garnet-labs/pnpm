@@ -3,17 +3,18 @@ use super::{
         InstallPackageBySnapshot, InstallPackageBySnapshotError, PNPM_EXECPATH,
         runtime::{archive_filter_for, fetch_binary_resolution_to_cas},
         tarball_resolution::{local_file_tarball_install_url, tarball_url_and_integrity},
+        variant_fetch::ArchiveSource,
     },
     CustomFetched, ExtractedPackageMetadata, SnapshotFetch, TarballFetch, download_tarball,
 };
-use crate::{build_modules::exec_scripts_prepend_node_path, custom_fetcher::CustomFetchOutcome};
+use crate::custom_fetcher::CustomFetchOutcome;
 use pnpm_config::PmOnFail;
 use pnpm_git_fetcher::{GitFetchOutput, GitFetcher, GitHostedTarballFetcher};
 use pnpm_lockfile::{BinaryResolution, LockfileResolution, PackageKey, PackageMetadata};
 use pnpm_reporter::Reporter;
 use pnpm_store_dir::git_hosted_store_index_key;
 use pnpm_tarball::IngestTarballToStore;
-use std::{collections::HashMap, path::PathBuf};
+use std::{path::Path, sync::Arc};
 
 fn is_revision_addressed(resolution: &LockfileResolution) -> bool {
     match resolution {
@@ -21,6 +22,30 @@ fn is_revision_addressed(resolution: &LockfileResolution) -> bool {
         LockfileResolution::Registry(registry) => registry.revision.is_some(),
         _ => false,
     }
+}
+
+fn custom_fetch_options(
+    package_key: &PackageKey,
+    metadata: &PackageMetadata,
+    package_id: &str,
+    config: &pnpm_config::Config,
+    workspace_root: &Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pkg": {
+            "name": package_key.name.to_string(),
+            "version": metadata.version.clone()
+                .unwrap_or_else(|| package_key.suffix.version().to_string()),
+        },
+        "lockfileDir": workspace_root,
+        "readManifest": true,
+        "filesIndexFile": pnpm_store_dir::pick_store_index_key(
+            metadata.resolution.checkable_integrity().map(ToString::to_string).as_deref(),
+            matches!(&metadata.resolution, LockfileResolution::Tarball(tarball) if tarball.is_git_hosted()),
+            package_id,
+            !config.ignore_scripts,
+        ),
+    })
 }
 
 impl InstallPackageBySnapshot<'_> {
@@ -32,42 +57,95 @@ impl InstallPackageBySnapshot<'_> {
         download: &IngestTarballToStore<'_>,
     ) -> Result<CustomFetched, InstallPackageBySnapshotError> {
         let Some(session) = self.fetching.custom_fetcher_session else {
-            return Ok(CustomFetched { resolution: None, cas_paths: None });
+            return Ok(CustomFetched {
+                resolution: None,
+                cas_paths: None,
+                extracted: ExtractedPackageMetadata::default(),
+                source_exists: true,
+            });
         };
-        let config = self.ctx.config;
-        let opts = serde_json::json!({
-            "pkg": {
-                "name": package_key.name.to_string(),
-                "version": metadata.version.clone()
-                    .unwrap_or_else(|| package_key.suffix.version().to_string()),
-            },
-            "lockfileDir": self.ctx.workspace_root,
-            "readManifest": true,
-            "filesIndexFile": pnpm_store_dir::pick_store_index_key(
-                metadata.resolution.checkable_integrity().map(ToString::to_string).as_deref(),
-                false, package_id, !config.ignore_scripts,
-            ),
-        });
-        Ok(match session.fetch::<Reporter>(download.clone(), &metadata.resolution, opts).await? {
+        let opts = custom_fetch_options(
+            package_key,
+            metadata,
+            package_id,
+            self.ctx.config,
+            self.ctx.workspace_root,
+        );
+        let outcome =
+            session.fetch::<Reporter>(download.clone(), &metadata.resolution, opts).await?;
+        self.resolve_custom_fetch::<Reporter>(outcome, package_key, package_id, download).await
+    }
+
+    async fn resolve_custom_fetch<Reporter: self::Reporter>(
+        &self,
+        outcome: CustomFetchOutcome,
+        package_key: &PackageKey,
+        package_id: &str,
+        download: &IngestTarballToStore<'_>,
+    ) -> Result<CustomFetched, InstallPackageBySnapshotError> {
+        match outcome {
             CustomFetchOutcome::Declined(resolution)
-            | CustomFetchOutcome::Delegate { delegate: resolution, .. } => {
-                CustomFetched { resolution: Some(resolution), cas_paths: None }
-            }
+            | CustomFetchOutcome::Delegate { delegate: resolution, .. } => Ok(CustomFetched {
+                resolution: Some(resolution),
+                cas_paths: None,
+                extracted: ExtractedPackageMetadata::default(),
+                source_exists: true,
+            }),
+            CustomFetchOutcome::Walked { directory, .. } => Ok(CustomFetched {
+                resolution: Some(directory.resolution()),
+                source_exists: directory.exists,
+                cas_paths: Some(Arc::new(pnpm_fs::cas_paths_from_paths(directory.files_map))),
+                extracted: ExtractedPackageMetadata::default(),
+            }),
             CustomFetchOutcome::Fetched { resolution, tarball } => {
-                let cas_paths = self.prepare_custom_tarball::<Reporter>(
-                    SnapshotFetch { package_key, package_id, resolution: &resolution, download },
-                    tarball.files_map.clone(),
+                self.resolve_fetched_tarball::<Reporter>(
+                    resolution,
+                    tarball,
+                    package_key,
+                    package_id,
+                    download,
                 )
-                .await?;
-                CustomFetched { resolution: Some(resolution), cas_paths: Some(cas_paths) }
+                .await
             }
+            CustomFetchOutcome::FetchedFiles { resolution, package } => Ok(CustomFetched {
+                resolution: Some(resolution),
+                cas_paths: Some(package.files_map),
+                source_exists: true,
+                extracted: ExtractedPackageMetadata {
+                    manifest: package.manifest,
+                    requires_build: Some(package.requires_build),
+                    bins: package.bins,
+                },
+            }),
+        }
+    }
+
+    async fn resolve_fetched_tarball<Reporter: self::Reporter>(
+        &self,
+        resolution: LockfileResolution,
+        tarball: Arc<pnpm_tarball::FetchedTarball>,
+        package_key: &PackageKey,
+        package_id: &str,
+        download: &IngestTarballToStore<'_>,
+    ) -> Result<CustomFetched, InstallPackageBySnapshotError> {
+        let cas_paths = self.prepare_custom_tarball::<Reporter>(
+            SnapshotFetch { package_key, package_id, resolution: &resolution, download },
+            tarball.files_map.clone(),
+        )
+        .await?;
+        Ok(CustomFetched {
+            resolution: Some(resolution),
+            cas_paths: Some(Arc::new(cas_paths)),
+            source_exists: true,
+            extracted: ExtractedPackageMetadata::default(),
         })
     }
+
     async fn prepare_custom_tarball<Reporter: self::Reporter>(
         &self,
         fetch: SnapshotFetch<'_>,
-        cas_paths: HashMap<String, PathBuf>,
-    ) -> Result<HashMap<String, PathBuf>, InstallPackageBySnapshotError> {
+        cas_paths: pnpm_fs::CasPaths,
+    ) -> Result<pnpm_fs::CasPaths, InstallPackageBySnapshotError> {
         let LockfileResolution::Tarball(tarball) = fetch.resolution else { return Ok(cas_paths) };
         if !tarball.is_git_hosted() {
             return Ok(cas_paths);
@@ -80,7 +158,7 @@ impl InstallPackageBySnapshot<'_> {
                 package_key: fetch.package_key,
                 package_id: fetch.package_id,
                 allow_build: &allow_build,
-                scripts_prepend_node_path: exec_scripts_prepend_node_path(self.ctx.config),
+                source: ArchiveSource::Any,
             },
             tarball,
             cas_paths,
@@ -92,17 +170,13 @@ impl InstallPackageBySnapshot<'_> {
         &self,
         binary: &BinaryResolution,
         package_key: &PackageKey,
-    ) -> Result<HashMap<String, PathBuf>, InstallPackageBySnapshotError> {
+    ) -> Result<pnpm_fs::CasPaths, InstallPackageBySnapshotError> {
+        let package_id = package_key.pkg_id();
+        let download = self.empty_ingest(&package_id);
         fetch_binary_resolution_to_cas::<Reporter>(
             binary,
-            self.fetching.http_client,
-            self.ctx.config,
-            self.fetching.store_index,
-            self.fetching.store_index_writer,
-            self.fetching.verified_files_cache,
-            self.fetching.prefetched_cas_paths,
+            &download,
             package_key,
-            self.ctx.requester,
             archive_filter_for(package_key),
         )
         .await
@@ -112,14 +186,14 @@ impl InstallPackageBySnapshot<'_> {
         fetch: &SnapshotFetch<'_>,
         git_resolution: &pnpm_lockfile::GitResolution,
         allow_build: &(impl Fn(&str) -> Option<bool> + Send + Sync),
-    ) -> Result<HashMap<String, PathBuf>, InstallPackageBySnapshotError> {
+    ) -> Result<pnpm_fs::CasPaths, InstallPackageBySnapshotError> {
         let config = self.ctx.config;
         let built = !config.ignore_scripts
             && allow_build(&fetch.package_key.without_peer().to_string()) != Some(false);
         let files_index_file = git_hosted_store_index_key(fetch.package_id, built);
         let package_name = fetch.package_key.name.to_string();
         let GitFetchOutput { cas_paths, built: _built } = GitFetcher {
-            scripts: prepare_script_options(config, exec_scripts_prepend_node_path(config)),
+            scripts: prepare_script_options(config),
             source: pnpm_git_fetcher::GitSource {
                 cache: self.ctx.caches.git_source_cache,
                 repo: &git_resolution.repo,
@@ -153,10 +227,11 @@ impl InstallPackageBySnapshot<'_> {
     pub(super) async fn tarball_cas_paths<Reporter: self::Reporter>(
         &self,
         fetch: TarballFetch<'_, impl Fn(&str) -> Option<bool> + Send + Sync>,
-    ) -> Result<(HashMap<String, PathBuf>, ExtractedPackageMetadata), InstallPackageBySnapshotError>
+    ) -> Result<(Arc<pnpm_fs::CasPaths>, ExtractedPackageMetadata), InstallPackageBySnapshotError>
     {
         let config = self.ctx.config;
-        let revision_addressed = is_revision_addressed(fetch.resolution);
+        let revision_addressed =
+            is_revision_addressed(fetch.resolution) || fetch.source == ArchiveSource::Variant;
         let (tarball_url, integrity) =
             tarball_url_and_integrity(fetch.resolution, fetch.package_key, config)?;
         let tarball_url = local_file_tarball_install_url(tarball_url, self.ctx.workspace_root);
@@ -185,9 +260,13 @@ impl InstallPackageBySnapshot<'_> {
                 .map_err(InstallPackageBySnapshotError::DownloadTarball)?;
         match fetch.resolution {
             LockfileResolution::Tarball(tarball) if tarball.is_git_hosted() => self
-                .prepare_git_hosted::<Reporter>(&fetch, tarball, raw_cas_paths)
+                .prepare_git_hosted::<Reporter>(
+                    &fetch,
+                    tarball,
+                    Arc::unwrap_or_clone(raw_cas_paths),
+                )
                 .await
-                .map(|cas_paths| (cas_paths, ExtractedPackageMetadata::default())),
+                .map(|cas_paths| (Arc::new(cas_paths), ExtractedPackageMetadata::default())),
             _ => Ok((raw_cas_paths, extracted)),
         }
     }
@@ -201,8 +280,8 @@ impl InstallPackageBySnapshot<'_> {
         &self,
         fetch: &TarballFetch<'_, impl Fn(&str) -> Option<bool> + Send + Sync>,
         tarball: &pnpm_lockfile::TarballResolution,
-        cas_paths: HashMap<String, PathBuf>,
-    ) -> Result<HashMap<String, PathBuf>, InstallPackageBySnapshotError> {
+        cas_paths: pnpm_fs::CasPaths,
+    ) -> Result<pnpm_fs::CasPaths, InstallPackageBySnapshotError> {
         let config = self.ctx.config;
         let files_index_file = git_hosted_store_index_key(
             fetch.package_id,
@@ -211,7 +290,7 @@ impl InstallPackageBySnapshot<'_> {
                     != Some(false),
         );
         let GitFetchOutput { cas_paths, built: _built } = GitHostedTarballFetcher {
-            scripts: prepare_script_options(config, fetch.scripts_prepend_node_path),
+            scripts: prepare_script_options(config),
             store: pnpm_git_fetcher::GitStoreContext {
                 dir: &config.store_dir,
                 index_writer: self.fetching.store_index_writer,
@@ -234,13 +313,11 @@ impl InstallPackageBySnapshot<'_> {
 /// How a git-hosted dependency's prepare scripts run for this install.
 fn prepare_script_options(
     config: &pnpm_config::Config,
-    prepend_node_path: pnpm_executor::ScriptsPrependNodePath,
 ) -> pnpm_git_fetcher::PrepareScriptOptions<'_> {
     pnpm_git_fetcher::PrepareScriptOptions {
         ignore: config.ignore_scripts,
         unsafe_perm: config.unsafe_perm,
         user_agent: Some(&config.user_agent),
-        prepend_node_path,
         shell: None,
         node_execpath: None,
         npm_execpath: None,

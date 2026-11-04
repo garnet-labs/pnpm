@@ -1,8 +1,8 @@
 use super::{
     AccessList, AuthState, Body, PackageRules, Request, ServiceExt, StatusCode, TempDir, Value,
     access_rule, body_bytes, body_json, config_for, enable_osv, foo_packument, header, json,
-    mock_packument_for_tarball, osv_database, public_cache_blobs, router, router_with_auth,
-    sha512_integrity, upstream_endpoint_config,
+    mock_packument_for_tarball, osv_database, public_cache_blob, public_cache_blobs, router,
+    router_with_auth, sha512_integrity, upstream_endpoint_config,
 };
 use crate::tokens::issue_token;
 
@@ -189,7 +189,7 @@ async fn upstream_endpoint_serves_packument_with_endpoint_rewritten_tarballs() {
     // URL is canonical for the client's configured registry (integrity-only).
     assert_eq!(
         body["versions"]["1.0.0"]["dist"]["tarball"],
-        "http://example.test/npm/~npmjs/foo/-/foo-1.0.0.tgz",
+        "http://example.test/npm/~npmjs/foo@1.0.0",
     );
     mock.assert_async().await;
 }
@@ -629,7 +629,7 @@ async fn osv_refuses_vulnerable_cached_tarball_under_noncanonical_name() {
     // The warm-up must have written the tarball to the proxy cache, so the
     // screened request below genuinely exercises the cache-hit path rather than
     // silently falling back to a miss that would be refused anyway.
-    let cached_tarball = public_cache_blobs(&cache_dir, "foo").join("foo-0.0.1.tgz");
+    let cached_tarball = public_cache_blob(&cache_dir, "foo", "foo-0.0.1.tgz");
     assert!(
         cached_tarball.is_file(),
         "warm-up must populate the proxy cache at {cached_tarball:?}",
@@ -812,7 +812,7 @@ async fn non_canonical_upstream_tarball_basename_is_served() {
     let tmp = TempDir::new().unwrap();
     let app = router(config_for(&upstream.url(), tmp.path().to_path_buf()));
 
-    // The served packument advertises the preserved basename on this server.
+    // The served packument advertises the `<name>@<version>` route on this server.
     let served = app
         .clone()
         .oneshot(
@@ -824,9 +824,22 @@ async fn non_canonical_upstream_tarball_basename_is_served() {
         .unwrap();
     let doc = body_json(served.into_body()).await;
     let advertised = doc["versions"]["3001.1.0-exotic"]["dist"]["tarball"].as_str().unwrap();
-    assert!(advertised.ends_with(&format!("/npm/foo/-/{exotic}")), "got {advertised}");
+    assert!(advertised.ends_with("/npm/foo@3001.1.0-exotic"), "got {advertised}");
 
-    // And fetching that URL back serves the verified bytes.
+    // Fetching `<name>@<version>` or `/-/<exotic>` resolves the upstream
+    // packument's declared filename and serves the verified bytes.
+    let version_response = app
+        .clone()
+        .oneshot(
+            Request::get("/npm/foo@3001.1.0-exotic")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(version_response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(version_response.into_body()).await, bytes);
+
     let response = app
         .oneshot(
             Request::get(format!("/npm/foo/-/{exotic}").as_str())
@@ -910,8 +923,87 @@ async fn scoped_tarball_filename_is_canonicalized_before_fetch_and_cache() {
         .unwrap();
     assert_eq!(canonical.status(), StatusCode::OK);
     assert_eq!(body_bytes(canonical.into_body()).await, bytes);
-    assert!(public_cache_blobs(&storage, "@types/node").join("node-20.0.0.tgz").exists());
+    assert!(public_cache_blob(&storage, "@types/node", "node-20.0.0.tgz").exists());
     assert!(!public_cache_blobs(&storage, "@types/node").join("@types").exists());
     packument_mock.assert_async().await;
     mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn upstream_pnpr_version_route_tarball_is_proxied() {
+    let mut upstream = mockito::Server::new_async().await;
+    let bytes = b"chained-pnpr-tarball";
+    let packument = json!({
+        "name": "@scope/foo",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "@scope/foo",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!("{}/@scope/foo@1.0.0", upstream.url()),
+                    "integrity": sha512_integrity(bytes),
+                },
+            },
+        },
+    });
+    let packument_mock = upstream
+        .mock("GET", "/@scope/foo")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(packument.to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let tarball_mock = upstream
+        .mock("GET", "/@scope/foo@1.0.0")
+        .with_status(200)
+        .with_body(bytes)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let app = router(config_for(&upstream.url(), tmp.path().to_path_buf()));
+
+    let served = app
+        .clone()
+        .oneshot(
+            Request::get("/npm/@scope/foo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let doc = body_json(served.into_body()).await;
+    assert_eq!(
+        doc["versions"]["1.0.0"]["dist"]["tarball"],
+        "http://example.test/npm/@scope/foo@1.0.0",
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/npm/@scope/foo@1.0.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response.into_body()).await, bytes);
+
+    let filename_response = app
+        .oneshot(
+            Request::get("/npm/@scope/foo/-/foo-1.0.0.tgz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filename_response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(filename_response.into_body()).await, bytes);
+
+    packument_mock.assert_async().await;
+    tarball_mock.assert_async().await;
 }

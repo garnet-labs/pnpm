@@ -8,7 +8,6 @@ use derive_more::{Display, Error};
 use miette::Diagnostic;
 use node_semver::{Range, Version};
 use pnpm_config::{Config, PackageImportMethod};
-use pnpm_deps_restorer::build_modules::exec_scripts_prepend_node_path;
 use pnpm_git_fetcher::{GitFetchOutput, GitFetcherError, GitHostedTarballFetcher};
 use pnpm_lockfile::{Lockfile, LockfileResolution, PackageKey};
 use pnpm_network::ThrottledClient;
@@ -287,7 +286,7 @@ impl WritePackageForPatch<'_> {
         package: pnpm_tarball::TarballPackage<'_>,
         store_index: Option<pnpm_store_dir::SharedReadonlyStoreIndex>,
         store_index_writer: &Arc<StoreIndexWriter>,
-    ) -> Result<Arc<std::collections::HashMap<String, PathBuf>>, WritePackageForPatchError> {
+    ) -> Result<Arc<pnpm_fs::CasPaths>, WritePackageForPatchError> {
         IngestTarballToStore {
             fetching: pnpm_tarball::ArchiveFetchOptions {
                 http_client: self.http_client,
@@ -328,10 +327,10 @@ impl WritePackageForPatch<'_> {
 async fn git_hosted_cas_paths<Reporter: self::Reporter>(
     config: &Config,
     resolution: &LockfileResolution,
-    cas_paths: std::collections::HashMap<String, std::path::PathBuf>,
+    cas_paths: pnpm_fs::CasPaths,
     package_id: &str,
     store_index_writer: &Arc<StoreIndexWriter>,
-) -> Result<std::collections::HashMap<String, std::path::PathBuf>, WritePackageForPatchError> {
+) -> Result<pnpm_fs::CasPaths, WritePackageForPatchError> {
     let LockfileResolution::Tarball(tarball) = resolution else { return Ok(cas_paths) };
     if git_tarball_url(resolution).is_none() {
         return Ok(cas_paths);
@@ -343,7 +342,6 @@ async fn git_hosted_cas_paths<Reporter: self::Reporter>(
             ignore: config.ignore_scripts,
             unsafe_perm: config.unsafe_perm,
             user_agent: Some(&config.user_agent),
-            prepend_node_path: exec_scripts_prepend_node_path(config),
             shell: None,
             node_execpath: None,
             npm_execpath: None,

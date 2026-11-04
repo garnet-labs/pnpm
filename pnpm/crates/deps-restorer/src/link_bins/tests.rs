@@ -68,7 +68,7 @@ fn writes_child_bins_into_slot_own_package_node_modules() {
     assert!(shim_path.exists(), "expected shim at {shim_path:?}");
     let body = read_to_string(&shim_path).unwrap();
     assert!(
-        body.contains(r#""$basedir_abs/../../../child/cli.js""#),
+        body.contains(r#""$basedir_abs"/'../../../child/cli.js'"#),
         "shim must reference the sibling child via the right number of `..`s, got:\n{body}",
     );
 }
@@ -719,12 +719,14 @@ fn build_has_bin_set_includes_resolutions_with_implicit_bin_metadata() {
         runtime_variations.clone(),
         metadata_with_resolution(
             LockfileResolution::Variations(VariationsResolution {
+                revision: None,
                 variants: vec![PlatformAssetResolution {
                     resolution: LockfileResolution::Binary(dummy_binary_resolution()),
                     targets: vec![PlatformAssetTarget {
                         os: "linux".into(),
                         cpu: "x64".into(),
                         libc: Some("glibc".into()),
+                        ..PlatformAssetTarget::default()
                     }],
                 }],
             }),

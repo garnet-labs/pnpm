@@ -311,7 +311,7 @@ impl CliCommand {
 
     /// Whether `--global` was passed. pnpm parses it as one CLI-wide
     /// option; pacquet declares it per subcommand.
-    pub(super) fn is_global(&self) -> bool {
+    pub(crate) fn is_global(&self) -> bool {
         match self {
             CliCommand::Add(args) => args.target.global,
             CliCommand::ApproveBuilds(args) => args.global,
@@ -322,6 +322,7 @@ impl CliCommand {
             CliCommand::Set(args) => args.flags.is_global(),
             CliCommand::List(args) | CliCommand::Ll(args) => args.global,
             CliCommand::Outdated(args) => args.global,
+            CliCommand::Peers(args) => args.global,
             CliCommand::Prefix(args) => args.global,
             CliCommand::Remove(args) => args.global,
             CliCommand::Root(args) => args.global,
@@ -419,7 +420,13 @@ impl CliCommand {
                 | CliCommand::Prefix(_)
                 | CliCommand::Root(_)
                 | CliCommand::Bin(_),
-        )
+        ) || self.prints_upload_values()
+    }
+
+    /// `publish --upload-variant` prints the values a later publish takes,
+    /// which a CI job captures from stdout.
+    fn prints_upload_values(&self) -> bool {
+        matches!(self, CliCommand::Publish(args) if !args.flags.variants.upload_variant.is_empty())
     }
 
     pub(crate) fn default_reporter_summary_scope(&self) -> SummaryScope {

@@ -3,7 +3,7 @@ pub use bins::{
     MAX_PRECALCULATED_BINS, MAX_PRECALCULATED_BINS_BYTES, PackageBin, ScriptRuntime,
     declared_bin_entries, extension_program, infer_script_runtime_from_head,
     infer_script_runtime_from_shebang, is_safe_bin_name, is_within_precalculated_bins_budget,
-    manifest_declares_bins, normalize_package_relative_path, parse_shebang,
+    manifest_declares_bins, normalize_bin_path, normalize_package_relative_path, parse_shebang,
     parse_shebang_from_bytes, resolve_package_bins, resolve_package_bins_from_cas_paths,
     resolve_package_bins_with, serialize_precalculated_bins, unscoped_bin_name,
     verify_package_bins,
@@ -11,10 +11,16 @@ pub use bins::{
 pub use build_triggers::{
     BINDING_GYP, BuildTriggers, files_build_triggers, files_include_install_scripts,
     manifest_opts_out_of_gyp_build, manifest_requires_build, pkg_build_triggers,
-    pkg_requires_build, requires_build_from_cas_paths, stored_requires_build_needs_manifest_check,
+    pkg_requires_build, read_package_json_from_cas_paths, requires_build_from_cas_paths,
+    requires_build_from_files, stored_requires_build_needs_manifest_check,
 };
+pub use bundled_manifest::normalize_bundled_manifest;
 pub use error::PackageManifestError;
 pub use initialization::{InitAuthor, InitOptions};
+pub use install_manifest::{
+    ArchiveFacts, INSTALL_MANIFEST_FIELDS, INSTALL_MANIFEST_PROFILE, InstallManifest,
+    ManifestComparison, NODE_GYP_REBUILD,
+};
 pub use metadata::{extract_author, extract_homepage, extract_license};
 pub use project::{
     PROJECT_MANIFEST_BASENAMES, find_parent_publish_manifest, project_manifest_path,
@@ -41,13 +47,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use serialization::{empty_dependency_fields, normalize_dependency_fields, serialize_with_indent};
 use strum::IntoStaticStr;
-#[cfg(not(target_os = "wasi"))]
-use tempfile::NamedTempFile;
 mod bins;
 mod blank_lines;
 mod build_triggers;
+mod bundled_manifest;
 mod error;
 mod initialization;
+mod install_manifest;
 mod json5;
 mod metadata;
 mod project;

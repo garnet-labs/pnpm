@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { expect, test } from '@jest/globals'
+import { STORE_VERSION } from '@pnpm/constants'
 import { prepare } from '@pnpm/prepare'
 import type { ProjectManifest } from '@pnpm/types'
 import { loadWorkspaceState } from '@pnpm/workspace.state'
@@ -188,6 +189,27 @@ test('no dependencies', async () => {
   }
 })
 
+// https://github.com/pnpm/pnpm/issues/17560
+test('a version bump of the project runs the script without an install', async () => {
+  const manifest: ProjectManifest = {
+    name: 'root',
+    version: '1.0.0',
+    private: true,
+    scripts: {
+      start: 'echo hello from script',
+    },
+  }
+
+  const project = prepare(manifest)
+  writeYamlFileSync('pnpm-workspace.yaml', { verifyDepsBeforeRun: 'error' })
+  await execPnpm(['install'])
+
+  project.writePackageJson({ ...manifest, version: '1.0.1' })
+
+  const { stdout } = execPnpmSync([...CONFIG, 'start'], { expectSuccess: true })
+  expect(stdout.toString()).toContain('hello from script')
+})
+
 test('nested `pnpm run` should not check for mutated manifest', async () => {
   const manifest: ProjectManifest = {
     name: 'root',
@@ -304,4 +326,24 @@ test('the install started before a script writes the lockfile to a --config.lock
   expect(stdout.toString()).toContain('hello from script')
   expect(fs.existsSync('pnpm-lock.yaml')).toBe(true)
   expect(fs.existsSync(path.join(projectDir, 'pnpm-lock.yaml'))).toBe(false)
+})
+
+test('a script runs after a storeDir change, and the next install recreates node_modules', async () => {
+  prepare({
+    name: 'root',
+    private: true,
+    dependencies: { '@pnpm.e2e/foo': '100.0.0' },
+    scripts: { start: 'echo hello from script' },
+  })
+  await execPnpm(['install'])
+  const recordedStoreDir = loadWorkspaceState(process.cwd())?.settings.storeDir
+  expect(recordedStoreDir).toBeDefined()
+
+  const { stdout } = execPnpmSync([...CONFIG, '--store-dir=../other-store', 'start'], { expectSuccess: true })
+  expect(stdout.toString()).toContain('hello from script')
+  expect(loadWorkspaceState(process.cwd())?.settings.storeDir).toBe(recordedStoreDir)
+
+  await execPnpm(['install', '--store-dir=../other-store', '--config.confirm-modules-purge=false'])
+  const modules = JSON.parse(fs.readFileSync('node_modules/.modules.yaml', 'utf8')) as { storeDir: string }
+  expect(modules.storeDir).toBe(path.resolve('../other-store', STORE_VERSION))
 })

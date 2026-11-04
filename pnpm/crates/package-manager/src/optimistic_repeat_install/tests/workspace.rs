@@ -1,16 +1,14 @@
 #[cfg(unix)]
 use super::FOO_LOCKFILE;
 use super::{
-    super::{
-        Decision, OptimisticRepeatInstallCheck, check_optimistic_repeat_install,
-        settings::current_settings,
-    },
+    super::{Decision, OptimisticRepeatInstallCheck, check_optimistic_repeat_install},
     FOO_MANIFEST, RunDepsStatus, assert_content_check_converges_after_collision,
     backdate_validated_files, check, check_with_lockfile, collide_mtimes_with_recorded_state,
     content_check_decision, isolated_included, linked_sibling_decision_for_spec,
     setup_content_check_project, setup_fresh_install, setup_fresh_install_with_config,
     validate_existing_files, workspace_deps_status, write_local_tarball_lockfile, write_state,
 };
+use crate::install_state::settings::current_settings;
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_modules_yaml::IncludedDependencies;
@@ -292,6 +290,94 @@ fn install_and_run_refuse_a_changed_workspace_project_set() {
     let state = load_workspace_state(dir.path()).unwrap().unwrap();
     assert_eq!(state.projects.len(), 2, "a rejected project set must not refresh the state");
 }
+/// [pnpm/pnpm#17560](https://github.com/pnpm/pnpm/issues/17560)
+#[test]
+fn install_and_run_accept_a_version_bump_of_a_lone_project() {
+    let (dir, config, manifest) =
+        bump_lone_project_version(pnpm_config::LinkWorkspacePackages::DirectOnly);
+    let projects = [(dir.path().to_path_buf(), &manifest)];
+    let recorded = load_workspace_state(dir.path()).unwrap().unwrap();
+
+    let decision = check(dir.path(), config, pnpm_config::NodeLinker::Isolated, &projects);
+    assert_eq!(decision, Decision::UpToDate);
+    update_workspace_state(dir.path(), &recorded).unwrap();
+    let status = workspace_deps_status(&dir, config, &projects);
+    assert_eq!(status, RunDepsStatus::UpToDate);
+}
+/// Under `linkWorkspacePackages: deep` a transitive dependency may resolve to
+/// the lone project by its version.
+#[test]
+fn install_and_run_refuse_a_version_bump_of_a_lone_project_under_deep_linking() {
+    let (dir, config, manifest) =
+        bump_lone_project_version(pnpm_config::LinkWorkspacePackages::Deep);
+    let projects = [(dir.path().to_path_buf(), &manifest)];
+
+    let decision = check(dir.path(), config, pnpm_config::NodeLinker::Isolated, &projects);
+    assert!(matches!(decision, Decision::Skipped { reason } if reason.contains("project list")));
+    let status = workspace_deps_status(&dir, config, &projects);
+    assert_eq!(
+        status,
+        RunDepsStatus::Outdated {
+            issue: "The workspace structure has changed since last install".to_string(),
+            install_args: Vec::new(),
+        },
+    );
+}
+/// A project installed as `root@1.0.0` whose manifest now says `1.0.1`. The
+/// new manifest is recorded as validated, so only the project-structure check
+/// can tell the two apart.
+fn bump_lone_project_version(
+    link_workspace_packages: pnpm_config::LinkWorkspacePackages,
+) -> (tempfile::TempDir, &'static Config, PackageManifest) {
+    let (dir, config, _) = setup_fresh_install_with_config(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        "",
+        |config| config.link_workspace_packages = link_workspace_packages,
+    );
+    let manifest_path = dir.path().join("package.json");
+    fs::write(&manifest_path, r#"{"name":"root","version":"1.0.1"}"#).unwrap();
+    validate_existing_files(dir.path());
+    (dir, config, PackageManifest::from_path(manifest_path).unwrap())
+}
+/// Another project's dependency may resolve to a workspace project by its
+/// version, so bumping the version of a project that one depends on is drift.
+#[test]
+fn install_and_run_refuse_a_version_bump_of_a_depended_on_workspace_project() {
+    let (dir, config, root) = setup_fresh_install(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        r#""dependencies":{"pkg-a":"workspace:*"}"#,
+    );
+    let pkg_dir = dir.path().join("pkg-a");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(pkg_dir.join("package.json"), r#"{"name":"pkg-a","version":"1.0.1"}"#).unwrap();
+    let pkg = PackageManifest::from_path(pkg_dir.join("package.json")).unwrap();
+    let mut state = load_workspace_state(dir.path()).unwrap().unwrap();
+    state.projects.insert(
+        pkg_dir.to_string_lossy().into_owned(),
+        ProjectEntry {
+            name: Some("pkg-a".into()),
+            version: Some("1.0.0".into()),
+            has_modules_dir: false,
+        },
+    );
+    update_workspace_state(dir.path(), &state).unwrap();
+    let projects = [(dir.path().to_path_buf(), &root), (pkg_dir, &pkg)];
+
+    let decision = check(dir.path(), config, pnpm_config::NodeLinker::Isolated, &projects);
+    assert!(matches!(decision, Decision::Skipped { reason } if reason.contains("project list")));
+    let status = workspace_deps_status(&dir, config, &projects);
+    assert_eq!(
+        status,
+        RunDepsStatus::Outdated {
+            issue: "The workspace structure has changed since last install".to_string(),
+            install_args: Vec::new(),
+        },
+    );
+}
 /// Record the only project under a sibling of `workspace_root`, as a tree
 /// copied from there carries it. Returns the recorded dir.
 fn record_projects_elsewhere(workspace_root: &std::path::Path) -> String {
@@ -495,7 +581,10 @@ fn a_moved_production_install_passes_the_run_gate() {
         &crate::SkippedSnapshots::new(),
     );
     current
-        .save_to_path(&config.install_state_dir.join(Lockfile::CURRENT_FILE_NAME))
+        .save_to_path(
+            &config.install_state_dir.join(Lockfile::CURRENT_FILE_NAME),
+            pnpm_lockfile::SymlinkedLockfile::Refuse,
+        )
         .unwrap();
     record_projects_elsewhere(dir.path());
     let mut state = load_workspace_state(dir.path()).unwrap().unwrap();
@@ -651,10 +740,10 @@ fn returns_skipped_when_sibling_node_modules_missing_for_project_with_deps() {
     let decision = check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root: dir.path(),
         config,
-        project_manifests: &[
+        project_manifests: crate::DeclaredManifests::new(&[
             (dir.path().to_path_buf(), &root_manifest),
             (sibling_dir, &sibling_manifest),
-        ],
+        ]),
         is_workspace_install: true,
         lockfile: MaybeLazyLockfile::Loaded(None),
         catalogs: &BTreeMap::default(),
@@ -1036,10 +1125,10 @@ fn deduped_sibling_decision_in(sibling: DedupedSibling<'_>) -> Decision {
     check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root: dir.path(),
         config,
-        project_manifests: &[
+        project_manifests: crate::DeclaredManifests::new(&[
             (dir.path().to_path_buf(), &root_manifest),
             (sibling_dir, &sibling_manifest),
-        ],
+        ]),
         is_workspace_install: true,
         lockfile: MaybeLazyLockfile::Loaded(Some(&lockfile)),
         catalogs: &BTreeMap::default(),

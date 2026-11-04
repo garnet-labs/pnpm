@@ -10,6 +10,24 @@ use super::{
     wanted_lockfile_file_has_content,
 };
 
+/// The workspace-state settings the run check does not compare. Scripts always
+/// run with the default dependency groups, and with the runtime the last
+/// install linked or skipped. A script runs the same from
+/// whichever store and virtual store `node_modules` was linked from, and
+/// whatever keys the lockfile records. Only an install has to act on a store
+/// location change or re-key the lockfile.
+const RUN_IGNORED_SETTINGS: &[&str] = &[
+    "dev",
+    "optional",
+    "production",
+    "registryPrefixes",
+    "runtime",
+    "storeDir",
+    "virtualStoreDir",
+    "virtualStoreDirMaxLength",
+    "globalVirtualStoreDir",
+];
+
 /// Outcome of [`check_deps_status_before_run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunDepsStatus {
@@ -58,7 +76,13 @@ pub fn check_deps_status_before_run(
     if check.layout.node_linker == NodeLinker::Pnp {
         return RunDepsStatus::SkippedPnp;
     }
-    let relocated = relocated_state(state, check.workspace_root, check.project_manifests);
+    let relocated = relocated_state(
+        state,
+        check.workspace_root,
+        check.project_manifests.as_slice(),
+        check.config,
+        check.catalogs,
+    );
     let moved = relocated.is_some();
     let state = relocated.as_ref().unwrap_or(state);
     let config = check.config;
@@ -67,7 +91,7 @@ pub fn check_deps_status_before_run(
     } else {
         Scope::Selected(selected_project_dirs)
     };
-    let mut ignored_settings = vec!["dev", "optional", "production"];
+    let mut ignored_settings = RUN_IGNORED_SETTINGS.to_vec();
     if install_would_run_frozen(check) {
         ignored_settings.push("autoDedupe");
     }
@@ -78,10 +102,6 @@ pub fn check_deps_status_before_run(
         check_dangling_direct_links: false,
         missing_wanted_lockfile: MissingWantedLockfile::RequireStandIn,
         newer_patch: NewerPatch::CompareHash,
-        // The TypeScript run/exec handler does not forward `dedupePeers`
-        // into `checkDepsStatus`, so its pre-run lockfile check uses the
-        // false default even when the workspace setting is true.
-        dedupe_peers: false,
         recorded_groups: RecordedGroups::Kept,
     };
     match check_freshness(check, state, moved, &policy, scope) {
@@ -110,7 +130,7 @@ fn stale_issue(check: &OptimisticRepeatInstallCheck<'_>, stale: Stale) -> String
             format!("Workspace package {id} has dependencies but does not have a modules directory")
         }
         Stale::DanglingDirectLink => {
-            "a direct dependency link points to a missing target".to_string()
+            "a direct dependency link is missing or points to a missing target".to_string()
         }
         Stale::MissingBranchLockfile | Stale::NoLockfile => {
             format!("Cannot find a lockfile in {}", check.workspace_root.display())

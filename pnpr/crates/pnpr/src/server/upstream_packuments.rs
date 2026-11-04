@@ -26,7 +26,10 @@ pub(super) async fn read_source_packument(
         }
         RegistrySource::Hosted(source) => {
             let org = hosted_read_namespace(state, identity, source, name.as_str())?;
-            state.inner.storage.for_hosted(&org).read_hosted_document(name).await
+            state.inner.storage
+                .for_hosted(&org, pnpr_registry::Ecosystem::Npm)
+                .read_hosted_document(name)
+                .await
         }
         RegistrySource::Unclaimed | RegistrySource::NotFound => Ok(None),
     }
@@ -263,7 +266,10 @@ pub(super) async fn load_packument_for_read(
                 HostedGate::MaskNotFound => return Ok(None),
                 HostedGate::Denied(err) => return Err(err),
             };
-            state.inner.storage.for_hosted(&org).read_hosted_document(name).await
+            state.inner.storage
+                .for_hosted(&org, pnpr_registry::Ecosystem::Npm)
+                .read_hosted_document(name)
+                .await
         }
         RegistrySource::Unclaimed | RegistrySource::NotFound => Ok(None),
     }
@@ -287,15 +293,7 @@ pub(super) async fn serve_packument_via_upstream(
         Ok(None) => return not_found(),
         Err(err) => return err.into_response(),
     };
-    match packument_response(
-        name,
-        &bytes,
-        tarball_base,
-        view,
-        state.inner.osv_index.as_ref(),
-        headers,
-        ttl.as_secs(),
-    ) {
+    match packument_response(name, &bytes, tarball_base, view, state, headers, ttl.as_secs()) {
         Ok(response) => response,
         Err(err) => err.into_response(),
     }

@@ -13,7 +13,7 @@ use std::{
 };
 use tempfile::TempDir;
 
-struct RuntimeFixture {
+pub(crate) struct RuntimeFixture {
     name: &'static str,
     version: &'static str,
     archive_mock: mockito::Mock,
@@ -344,6 +344,64 @@ fn update_moves_a_channel_qualified_devengines_runtime_range() {
         lockfile.contains("specifier: runtime:24.0.0-rc.4"),
         "the lockfile specifier agrees with the manifest: {lockfile}",
     );
+}
+
+#[test]
+fn update_latest_moves_a_devengines_runtime_to_the_newest_major_version() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new();
+    let initial_mocks = mock_node_releases(&mut server, &["22.0.0"], None);
+    let workspace = prepare_workspace(
+        &root,
+        format!("nodeDownloadMirrors:\n  rc: '{}/'\n", server.url()).as_str(),
+    );
+    write_devengines_manifest(&workspace, "rc/^22.0.0", Some("download"));
+
+    command(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    drop(initial_mocks);
+    let _mocks = mock_node_releases(&mut server, &["24.1.0", "22.5.0", "22.0.0"], None);
+
+    let outdated = command(&workspace)
+        .with_args(["outdated", "--format", "json"])
+        .output()
+        .expect("run outdated");
+    assert_eq!(outdated.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&outdated.stdout).unwrap();
+    assert_eq!(report["node"]["current"], "22.0.0");
+    assert_eq!(report["node"]["latest"], "24.1.0");
+
+    let compat_outdated = command(&workspace)
+        .with_args(["outdated", "--compatible", "--format", "json"])
+        .output()
+        .expect("run outdated --compatible");
+    assert_eq!(compat_outdated.status.code(), Some(1));
+    let compat_report: Value = serde_json::from_slice(&compat_outdated.stdout).unwrap();
+    assert_eq!(compat_report["node"]["current"], "22.0.0");
+    assert_eq!(compat_report["node"]["latest"], "22.5.0");
+
+    command(&workspace)
+        .with_args(["update", "--latest"])
+        .assert()
+        .success();
+
+    let manifest = fs::read_to_string(workspace.join("package.json")).unwrap();
+    assert!(
+        manifest.contains(r#""version":"^24.1.0""#),
+        "the declared runtime range moved onto the latest major: {manifest}",
+    );
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lockfile.contains("specifier: runtime:^24.1.0")
+            && lockfile.contains("version: runtime:24.1.0"),
+        "the lockfile specifier and version agree with the manifest: {lockfile}",
+    );
+    command(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
 }
 
 /// `devEngines.runtime` stores no protocol, so its lockfile specifier stays
@@ -963,7 +1021,7 @@ fn assert_runtime_bad_integrity(name: &'static str, version: &'static str) {
     assert!(stderr.contains("Integrity check failed"), "stderr was:\n{stderr}");
 }
 
-fn prepare_workspace(root: &TempDir, extra_yaml: &str) -> PathBuf {
+pub(crate) fn prepare_workspace(root: &TempDir, extra_yaml: &str) -> PathBuf {
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
     fs::write(
@@ -976,7 +1034,7 @@ fn prepare_workspace(root: &TempDir, extra_yaml: &str) -> PathBuf {
     workspace
 }
 
-fn runtime_fixture(
+pub(crate) fn runtime_fixture(
     server: &mut mockito::Server,
     name: &'static str,
     version: &'static str,
@@ -1027,7 +1085,7 @@ fn runtime_fixture(
     }
 }
 
-fn write_runtime_manifest(workspace: &Path, fixtures: &[RuntimeFixture]) {
+pub(crate) fn write_runtime_manifest(workspace: &Path, fixtures: &[RuntimeFixture]) {
     let dependencies = fixtures
         .iter()
         .map(|fixture| {
@@ -1038,7 +1096,7 @@ fn write_runtime_manifest(workspace: &Path, fixtures: &[RuntimeFixture]) {
         .unwrap();
 }
 
-fn write_runtime_lockfile(workspace: &Path, fixtures: &[RuntimeFixture]) {
+pub(crate) fn write_runtime_lockfile(workspace: &Path, fixtures: &[RuntimeFixture]) {
     write_runtime_lockfile_for_group(workspace, fixtures, "dependencies");
 }
 

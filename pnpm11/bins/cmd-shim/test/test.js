@@ -12,6 +12,7 @@ import {
   cmdShimIfExists,
   isShimBasedirAnchorCurrent,
   isShimForMissingTarget,
+  isShimMsysCmdSwitchDoubled,
   isShimNodePath,
   isShimPointingAt,
   readShNodePath,
@@ -73,7 +74,7 @@ describe('missing source', () => {
   test('infers the runtime from the extension', async () => {
     const src = path.resolve(fixtures, 'dist', 'missing.js')
     await cmdShim(src, to, { createCmdFile: true, fs })
-    assert.match(fs.readFileSync(to, 'utf8'), /\n +exec node +"\$basedir_abs\/dist\/missing\.js" "\$@"\n/)
+    assert.match(fs.readFileSync(to, 'utf8'), /\n +exec node +"\$basedir_abs"\/'dist\/missing\.js' "\$@"\n/)
     assert.match(fs.readFileSync(`${to}${cmdExtension}`, 'utf8'), /\n +node +"%~dp0\\dist\\missing\.js" %\*/)
   })
 
@@ -81,7 +82,7 @@ describe('missing source', () => {
     const src = path.resolve(fixtures, 'missing')
     await cmdShim(src, to, { createCmdFile: false, fs })
     const content = fs.readFileSync(to, 'utf8')
-    assert.match(content, /\nexec "\$basedir_abs\/missing" +"\$@"\n/)
+    assert.match(content, /\nexec "\$basedir_abs"\/'missing' +"\$@"\n/)
     assert.doesNotMatch(content, /exec node/)
   })
 
@@ -364,9 +365,41 @@ describe('batch script', () => {
     await testFile(t, `${to}${cmdExtension}`, '\r\n')
     await testFile(t, `${to}.ps1`)
   })
+
+  test('isShimMsysCmdSwitchDoubled detects a shim that doubles the cmd switch', async () => {
+    const content = await fs.promises.readFile(to, 'utf8')
+    assert.equal(isShimMsysCmdSwitchDoubled(content), false)
+    assert.equal(isShimMsysCmdSwitchDoubled(content.replace('exec cmd /C ', 'exec cmd //C ')), true)
+  })
+
+  // A `/c` entry in MSYS2_ARG_CONV_EXCL would keep a drive path such as
+  // `/c/Users` from being converted. The `/c` after the switch is part of the
+  // command cmd.exe runs.
+  test('excludes only the upper-cased switch from MSYS conversion', async () => {
+    const lowerCaseSrc = path.resolve(fixtures, 'lower-case-switch.bat')
+    const lowerCaseTo = path.resolve(fixtures, 'lower-case-switch.shim')
+    await fs.promises.writeFile(lowerCaseSrc, '#!/usr/bin/env cmd /c echo /c\n')
+    await cmdShim(lowerCaseSrc, lowerCaseTo, { createCmdFile: false, fs })
+    const content = await fs.promises.readFile(lowerCaseTo, 'utf8')
+    assert.ok(content.includes('  export MSYS2_ARG_CONV_EXCL="/C${MSYS2_ARG_CONV_EXCL:+;$MSYS2_ARG_CONV_EXCL}"\n'), content)
+    assert.match(content, /exec cmd +\/C echo \/c "/, content)
+  })
 })
 
 describe('readShNodePath & isShimNodePath', () => {
+  test('extracts a multiline single-quoted POSIX path with embedded quotes', () => {
+    const shim = `
+if [ -z "$NODE_PATH" ]; then
+  export NODE_PATH='/tmp/a'\\''b
+c'
+else
+  export NODE_PATH='/tmp/a'\\''b
+c':"$NODE_PATH"
+fi
+`
+    assert.equal(readShNodePath(shim), "/tmp/a'b\nc")
+  })
+
   test('extracts posix new_node_path with single quote escapes from Windows shim', () => {
     const shim = `
 case \`command -p uname -a\` in
@@ -401,6 +434,14 @@ basedir_win="$basedir"
 exec "$basedir/node" "$basedir_abs/../foo/bin/cli.js" "$@"
 `
     assert.equal(readShRelativeTarget(shim), '../foo/bin/cli.js')
+  })
+
+  test('extracts a single-quoted relative target anchored on basedir_abs', () => {
+    const shim = `
+basedir_abs=$(CDPATH= cd -P -- "$basedir" && pwd -P) || exit $?
+exec "$basedir_abs"/'../$(touch marker)/cli.js' "$@"
+`
+    assert.equal(readShRelativeTarget(shim), '../$(touch marker)/cli.js')
   })
 
   test('returns undefined when shim has no basedir_abs anchor', () => {

@@ -1,6 +1,6 @@
 {
   "name": "@pnpm/lockfile.utils",
-  "version": "1102.1.7",
+  "version": "1102.1.9",
   "description": "Utils for dealing with pnpm-lock.yaml",
   "keywords": [
     "pnpm",
@@ -34,6 +34,7 @@
   },
   "dependencies": {
     "@pnpm/config.normalize-registries": "workspace:*",
+    "@pnpm/config.pick-registry-for-package": "workspace:*",
     "@pnpm/constants": "workspace:*",
     "@pnpm/deps.path": "workspace:*",
     "@pnpm/error": "workspace:*",

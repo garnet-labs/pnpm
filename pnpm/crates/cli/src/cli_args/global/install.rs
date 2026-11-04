@@ -1,10 +1,11 @@
 use super::{
     AddGroups, CatalogMode, Config, Context, DependencyGroup, GlobalPackageBinSnapshot,
     GlobalPackageInfo, HashMap, HashSet, ImporterDepVersion, Lockfile, PackageBinSource, Path,
-    RangeSpecStyle, Reporter, State, SupportedArchitectures, Version, WorkspaceSettings,
+    PathBuf, RangeSpecStyle, Reporter, State, SupportedArchitectures, Version, WorkspaceSettings,
     add_packages, apply_allow_build, infer_local_package_alias, installed_versions,
     prompt_approve_install_builds, update_selectors,
 };
+use pnpm_config::Host;
 
 /// The pnpm home a global group installs into.
 pub(super) struct GlobalInstallTarget<'a> {
@@ -183,6 +184,12 @@ pub(super) async fn run_group_install<Reporter: self::Reporter + 'static>(
     Ok(config)
 }
 
+/// The virtual store dir a group's install keeps its hidden hoisted modules
+/// under, `install_dir` being the group's install dir or its hash link.
+pub(super) fn group_install_state_dir(install_dir: &Path) -> PathBuf {
+    install_dir.join("node_modules").join(".pnpm")
+}
+
 pub(super) fn global_group_config(
     base_config: &Config,
     install_dir: &Path,
@@ -191,10 +198,8 @@ pub(super) fn global_group_config(
 ) -> miette::Result<Config> {
     let mut cfg = base_config.clone();
     cfg.modules_dir = install_dir.join("node_modules");
-    cfg.install_state_dir = install_dir.join("node_modules").join(".pnpm");
-    // Each global group is self-contained, so the virtual store lives
-    // inside its install dir (never the shared global one).
-    cfg.enable_global_virtual_store = false;
+    cfg.install_state_dir = group_install_state_dir(install_dir);
+    use_global_virtual_store_by_default(&mut cfg);
     // Persist a `pnpm-lock.yaml` in the group's install dir (pnpm sets
     // `lockfileDir = installDir`). `outdated -g` / `update -g` read these
     // pins to determine the currently-installed versions. A `lockfileDir`
@@ -229,12 +234,11 @@ pub(super) fn global_group_config(
     cfg.package_extensions = None;
     cfg.patched_dependencies = None;
     // The GVS resolution env injected by `Config::current` points at the
-    // *caller's* node_modules; the group's own virtual store is
-    // project-local (GVS forced off above), so inheriting it would let
-    // the group's lifecycle scripts resolve phantom deps from the
-    // caller's tree.
+    // *caller's* node_modules, which would let the group's lifecycle
+    // scripts resolve phantom deps from the caller's tree.
     cfg.extra_env.remove("NODE_PATH");
     cfg.extra_env.remove("NODE_OPTIONS");
+    cfg.apply_global_virtual_store_node_path::<Host>();
 
     // Build-script policy for global installs comes from the global packages
     // directory, never the caller's repo — otherwise a repo-controlled
@@ -262,6 +266,24 @@ pub(super) fn global_group_config(
     cfg.strict_dep_builds = false;
 
     Ok(cfg)
+}
+
+/// Global groups use the global virtual store unless `virtualStoreType` (or
+/// `enableGlobalVirtualStore`) is set explicitly.
+fn use_global_virtual_store_by_default(cfg: &mut Config) {
+    cfg.enable_global_virtual_store = cfg.explicit_settings
+        .get("enableGlobalVirtualStore")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if cfg.enable_global_virtual_store {
+        let virtual_store_dir_explicit = cfg.explicit_settings.contains_key("virtualStoreDir");
+        let global_virtual_store_dir_explicit =
+            cfg.explicit_settings.contains_key("globalVirtualStoreDir");
+        cfg.apply_global_virtual_store_derivation(
+            virtual_store_dir_explicit,
+            global_virtual_store_dir_explicit,
+        );
+    }
 }
 
 fn merge_persisted_minimum_release_age_excludes(

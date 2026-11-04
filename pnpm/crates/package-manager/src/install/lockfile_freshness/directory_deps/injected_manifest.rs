@@ -1,12 +1,9 @@
+use crate::install_state::ProjectManifestsByDir;
 use pnpm_package_manifest::PackageManifest;
 use std::{
     borrow::Cow,
-    collections::HashMap,
     path::{Path, PathBuf},
 };
-
-/// Project manifests keyed by their lexically normalized project directory.
-pub type ProjectManifestsByDir<'a> = HashMap<PathBuf, &'a PackageManifest>;
 
 /// Each project's manifest as another importer's injected dependency reads
 /// it: the project's entry in `dependency_manifests` when it has one, else
@@ -272,10 +269,19 @@ pub(in crate::install::lockfile_freshness) fn is_deploy_file_url_key(
     directory: &str,
 ) -> bool {
     matches!(dep_spec.version, pnpm_lockfile::ImporterDepVersion::Alias(_))
-        && matches!(
-            key.suffix.version(),
-            pnpm_lockfile::VersionPart::File(path)
-                if !pnpm_lockfile::is_local_tarball_path(path)
-                    && (path.starts_with("///") || (path.starts_with("//") && path != directory)),
-        )
+        && is_deploy_file_url(key, directory)
+}
+
+/// The key half of [`is_deploy_file_url_key`], for a directory package whose
+/// parent is a package, which records it by key alone.
+pub(in crate::install::lockfile_freshness) fn is_deploy_file_url(
+    key: &pnpm_lockfile::PackageKey,
+    directory: &str,
+) -> bool {
+    matches!(
+        key.suffix.version(),
+        pnpm_lockfile::VersionPart::File(path)
+            if !pnpm_lockfile::is_local_tarball_path(path)
+                && (path.starts_with("///") || (path.starts_with("//") && path != directory)),
+    )
 }

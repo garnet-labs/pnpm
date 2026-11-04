@@ -92,6 +92,7 @@ jobs:
               - '.config/pnpm/**'
               - 'rust-toolchain.toml'
               - 'rustfmt.toml'
+              - 'crate-layers.toml'
               - 'deny.toml'
               - 'dylint.toml'
               - '.taplo.toml'
@@ -168,7 +169,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pnpm
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
       - name: Validate changeset files
@@ -236,7 +237,7 @@ jobs:
           save-cache: ${{ github.ref_name == 'main' }}
 
       - name: Install pnpm (for compatibility check)
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
 
@@ -257,7 +258,7 @@ jobs:
         continue-on-error: true
 
       - name: Install just
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: just
 
@@ -276,7 +277,7 @@ jobs:
           just install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest,sccache@0.17.0
 
@@ -312,6 +313,55 @@ jobs:
             sccache-test-v1-${{ runner.os }}-main-
         timeout-minutes: 2
         continue-on-error: true
+
+      # Windows test processes intermittently die with 0xc0000409, the code a
+      # C `abort()` or `__fastfail` exits with, and print nothing first
+      # (pnpm/tasks#239). It has not reproduced on demand, so have Windows
+      # Error Reporting write a minidump of any crashing process; the upload
+      # step below keeps it with the binary it came from.
+      #
+      # WER writes no dump for a process whose error mode has
+      # SEM_NOGPFAULTERRORBOX, and Node sets that flag at startup, which
+      # every child inherits. The tests run under Node (measure-command.mjs,
+      # run-rust-tests.mjs), so test binaries run through a cargo target
+      # runner that clears the error mode first.
+      - name: Capture crash dumps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dumps = Join-Path $env:RUNNER_TEMP crash-dumps
+          New-Item -ItemType Directory -Force $dumps | Out-Null
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Force $key | Out-Null
+          New-ItemProperty -Force $key -Name DumpFolder -PropertyType ExpandString -Value $dumps | Out-Null
+          New-ItemProperty -Force $key -Name DumpType -PropertyType DWord -Value 1 | Out-Null
+          New-ItemProperty -Force $key -Name DumpCount -PropertyType DWord -Value 10 | Out-Null
+
+          $tools = Join-Path $env:RUNNER_TEMP error-mode-tools
+          New-Item -ItemType Directory -Force $tools | Out-Null
+          $runner = Join-Path $tools reset-error-mode.exe
+          $abortCheck = Join-Path $tools abort-check.exe
+          rustc --edition 2024 -O -o $runner .github/scripts/reset-error-mode.rs
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to build reset-error-mode' }
+          'fn main() { std::process::abort() }' | rustc -o $abortCheck -
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to build abort-check' }
+
+          # Prove a process that aborts under Node, as a test binary does,
+          # leaves a dump when started through the runner: a configured
+          # automatic debugger, for one, would take the crash instead.
+          # Bounded, in case something keeps the aborted process open, such
+          # as a debugger dialog.
+          node -e 'const r = require(`node:child_process`).spawnSync(process.argv[1], [process.argv[2]], { stdio: `ignore`, timeout: 60000 }); if (r.error) { console.error(r.error.message); process.exit(1) }' $runner $abortCheck
+          if ($LASTEXITCODE -ne 0) { throw 'abort-check did not run to its end through the runner' }
+          $deadline = (Get-Date).AddSeconds(30)
+          while (-not (Get-ChildItem $dumps -Filter 'abort-check.exe.*.dmp') -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 1
+          }
+          if (-not (Get-ChildItem $dumps -Filter 'abort-check.exe.*.dmp')) {
+            throw "Windows Error Reporting wrote no dump to $dumps"
+          }
+          Remove-Item (Join-Path $dumps 'abort-check.exe.*.dmp')
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$runner" >> $env:GITHUB_ENV
 
       - name: Install Python for ecosystem tests
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 #v7.1.0  v6
@@ -351,6 +401,35 @@ jobs:
             --name tests.all \
             --output .bench/pnpr-tests-all.json \
             -- pnpm pipeline pnpr-test --include-workspace-root --full --no-cache
+
+      # A minidump needs the exact executable and PDB that crashed for
+      # symbols, and a rebuild would not match them, so stage those next to
+      # each dump. WER names a dump `<image>.<pid>.dmp`.
+      - name: Stage crash dumps
+        if: failure() && runner.os == 'Windows'
+        id: crash-dumps
+        shell: pwsh
+        run: |
+          $dumps = Join-Path $env:RUNNER_TEMP crash-dumps
+          $found = Get-ChildItem $dumps -Filter *.dmp -ErrorAction SilentlyContinue
+          if (-not $found) { exit 0 }
+          foreach ($dump in $found) {
+            $image = $dump.Name -replace '\.\d+\.dmp$', ''
+            $stem = [IO.Path]::GetFileNameWithoutExtension($image)
+            Get-ChildItem target\debug, target\debug\deps -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq $image -or $_.Name -eq "$stem.pdb" } |
+              Copy-Item -Destination $dumps -Force
+          }
+          Get-ChildItem $dumps | Format-Table Name, Length
+          "path=$dumps" >> $env:GITHUB_OUTPUT
+
+      - name: Upload crash dumps
+        if: failure() && steps.crash-dumps.outputs.path != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crash-dumps-${{ matrix.os_label }}
+          path: ${{ steps.crash-dumps.outputs.path }}
+          retention-days: 7
 
       - name: Stop sccache
         if: ${{ !cancelled() && runner.os != 'Windows' }}
@@ -428,7 +507,7 @@ jobs:
         uses: $/.github/actions/rustup
 
       - name: Install pnpm
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
 
@@ -436,7 +515,7 @@ jobs:
         run: pnpm runtime set node 22 --global
 
       - name: Install just
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: just,cargo-nextest
 
@@ -495,7 +574,7 @@ jobs:
           clippy: true
 
       - name: Install pnpm
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
 
@@ -538,7 +617,7 @@ jobs:
           docs: true
 
       - name: Install pnpm
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
 
@@ -584,17 +663,26 @@ jobs:
         with:
           restore-cache: false
 
-      - name: Install pnpm
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+      # A Node.js of its own: the filtered install below leaves out the root
+      # project, which is what pins the repository's runtime, and get-pnpm's
+      # TypeScript tests need 22.18 or newer.
+      - name: Install pnpm and Node
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
+          runtime: node@24
           install: false
 
-      # Only the wrapper's own dependencies: get-pnpm, which the published
+      # Only the wrapper and what it depends on: get-pnpm, which the published
       # package carries in its dist/ payload and the tests stand in for. The
       # filter does not narrow the Cargo half of the install, which is why the
       # step above provisions Rust.
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter pacquet
+        run: pnpm install --frozen-lockfile --filter "pacquet..."
+
+      # Builds get-pnpm before running its tests, and leaves the build output
+      # the wrapper's tests bundle.
+      - name: Test get-pnpm
+        run: pnpm --filter=get-pnpm test
 
       # bash on both platforms: the shell has to expand the glob, because
       # `--test` only takes patterns itself on Node.js >=22.
@@ -621,6 +709,21 @@ jobs:
           pnpm runtime set node 18
           ./node_modules/.bin/node --version
           ./node_modules/.bin/node --test "$GITHUB_WORKSPACE"/pnpm/npm/pnpm/test/*.test.mjs
+
+      # get-pnpm's `engines` floor, on the latest release of that line. Its
+      # tests are TypeScript, which Node.js runs without a flag from 22.18.
+      - name: Test get-pnpm on its oldest supported Node.js line
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/get-pnpm-node"
+          cd "$RUNNER_TEMP/get-pnpm-node"
+          echo '{"name":"get-pnpm-node","version":"0.0.0"}' > package.json
+          pnpm runtime set node 22
+          node_bin="$PWD/node_modules/.bin/node"
+          "$node_bin" --version
+          cd "$GITHUB_WORKSPACE/pnpm/npm/get-pnpm"
+          "$node_bin" --test test/*.test.ts
 
   typos:
     name: Rust CI / Spell Check
@@ -666,18 +769,50 @@ jobs:
 
       - name: Install pnpm
         if: github.event_name == 'merge_group' || steps.filter.outputs.src == 'true'
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
 
       - name: Install cargo-deny
         if: github.event_name == 'merge_group' || steps.filter.outputs.src == 'true'
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-deny
 
       - if: github.event_name == 'merge_group' || steps.filter.outputs.src == 'true'
         run: pnpm pipeline rust-deny --include-workspace-root --full --no-cache
+
+  layers:
+    name: Rust CI / Crate Layers
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: $/.github/actions/rustup
+        with:
+          restore-cache: false
+
+      - name: Install pnpm
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        with:
+          install: false
+
+      - run: pnpm pipeline rust-layers --include-workspace-root --full --no-cache
+
+      # Lists the crate dependency edges the pull request adds or removes, so
+      # a review sees a new coupling even when it points downward.
+      - name: Summarize crate graph changes
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          cargo run --locked --quiet -p pnpm-crate-layers -- diff "$BASE_SHA" >> "$GITHUB_STEP_SUMMARY"
 
   format:
     name: Rust CI / Format
@@ -700,7 +835,7 @@ jobs:
           packages: taplo-cli@0.8.1
 
       - name: Install pnpm
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
 
@@ -797,13 +932,16 @@ jobs:
       - name: Install cargo-dylint and dylint-link
         uses: $/.github/actions/binstall
         with:
-          # Keep in step with the `dylint_linting` version the pinned
-          # perfectionist revision builds against: cargo-dylint refuses
-          # a library built by a newer one.
-          packages: cargo-dylint@6.0.4 dylint-link@6.0.4
+          # At least the `dylint_linting` version the pinned perfectionist
+          # revision builds against (6.0.4): cargo-dylint refuses a library
+          # built by a newer one. 6.3.0 is the first release whose driver
+          # build clones rust-clippy's `main` branch. The repository renamed
+          # its default branch from `master`, so an older driver build fails
+          # whenever the driver cache misses.
+          packages: cargo-dylint@6.3.0 dylint-link@6.3.0
 
       - name: Install pnpm
-        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
         with:
           install: false
 
@@ -838,6 +976,7 @@ jobs:
       - doc
       - typos
       - deny
+      - layers
       - format
       - dylint
     runs-on: blacksmith-4vcpu-ubuntu-2404

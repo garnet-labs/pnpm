@@ -1,20 +1,22 @@
 pub(super) mod exact;
 pub(super) mod symlinks;
 
-use super::{ImportIndexedDirError, Placement, remove_non_dir_dirent, staging::import_atomic};
+use super::{
+    ImportIndexedDirError, Placement, SymlinkTargets, remove_non_dir_dirent, staging::import_atomic,
+};
 use crate::{import_into_fresh_target, link_pool::in_link_pool};
 use pnpm_config::PackageImportMethod;
-use pnpm_fs::Host;
+use pnpm_fs::{Host, StoreFile};
 use pnpm_reporter::Reporter;
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::AtomicU8,
 };
 use symlinks::{
-    SymlinkRoots, imported_paths, is_symlink, place_symlink_entry, symlink_matches_store_entry,
+    SymlinkRoots, imported_paths, place_symlink_or_resolve_file, symlink_matches_store_entry,
 };
 
 /// Make the parent dir set, then import the entries of `cas_paths`, one
@@ -26,16 +28,17 @@ use symlinks::{
 /// up.
 ///
 /// `symlinks_final_dir` is `None` to import every entry as a file. With
-/// `Some`, an entry whose source is a symlink is recreated as one, and
-/// the value names the directory `dir_path` is finally moved to, which a
-/// staged import writes elsewhere first.
+/// `Some`, an entry whose source is a symlink is recreated as one when
+/// the [`SymlinkTargets`] policy selects it, and the path names the
+/// directory `dir_path` is finally moved to, which a staged import
+/// writes elsewhere first.
 pub(super) fn populate_dir<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     placement: Placement,
-    symlinks_final_dir: Option<&Path>,
+    symlinks_final_dir: Option<(&Path, SymlinkTargets)>,
 ) -> Result<(), ImportIndexedDirError> {
     // Creating the directories and placing the marker are metadata writes
     // like the entries, so the whole import runs on the link pool.
@@ -55,15 +58,20 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     placement: Placement,
-    symlinks_final_dir: Option<&Path>,
+    symlinks_final_dir: Option<(&Path, SymlinkTargets)>,
 ) -> Result<(), ImportIndexedDirError> {
     create_indexed_dirs(dir_path, cas_paths, placement)?;
     let imported = symlinks_final_dir.map(|_| imported_paths(cas_paths));
     let symlinks = symlinks_final_dir
         .zip(imported.as_ref())
-        .map(|(final_dir, imported)| SymlinkRoots { written_dir: dir_path, final_dir, imported });
+        .map(|((final_dir, policy), imported)| SymlinkRoots {
+            written_dir: dir_path,
+            final_dir,
+            imported,
+            policy,
+        });
 
     // Link every other file first, then place the marker last, so an
     // interrupted import leaves a directory the next install recognises
@@ -113,10 +121,10 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
 /// Directories are independent, so a package spread over many of them
 /// still imports in parallel.
 fn entries_by_target_dir<'a>(
-    cas_paths: &'a HashMap<String, PathBuf>,
+    cas_paths: &'a pnpm_fs::CasPaths,
     marker: Option<&str>,
-) -> Vec<Vec<(&'a str, &'a Path)>> {
-    let mut groups: HashMap<Option<&Path>, Vec<(&str, &Path)>> = HashMap::new();
+) -> Vec<Vec<(&'a str, &'a StoreFile)>> {
+    let mut groups: HashMap<Option<&Path>, Vec<(&str, &StoreFile)>> = HashMap::new();
     for (cleaned_entry, store_path) in cas_paths {
         if Some(cleaned_entry.as_str()) == marker {
             continue;
@@ -130,7 +138,7 @@ fn entries_by_target_dir<'a>(
 }
 pub(super) fn create_indexed_dirs(
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     placement: Placement,
 ) -> Result<(), ImportIndexedDirError> {
     let mut rel_dirs: HashSet<&str> = HashSet::new();
@@ -181,23 +189,21 @@ fn place_entry<Reporter: self::Reporter>(
     placement: Placement,
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
-    store_path: &Path,
+    source: &StoreFile,
     target: &Path,
     symlinks: Option<SymlinkRoots<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
-    if let Some(roots) = symlinks
-        && is_symlink(store_path)
-        && place_symlink_entry(placement, store_path, target, roots)?
-    {
+    let Some(source) = place_symlink_or_resolve_file(placement, source, target, symlinks)? else {
         return Ok(());
-    }
+    };
+    let store_path = source.as_ref();
     match placement {
         Placement::Fresh => {
             import_into_fresh_target::<Reporter>(logged_methods, import_method, store_path, target)
                 .map_err(ImportIndexedDirError::LinkFile)
         }
         Placement::Repair => {
-            if file_matches_store_entry(target, store_path) {
+            if file_matches_store_entry(target, &store_path.path) {
                 return Ok(());
             }
             clear_dir_blocking_file::<Host>(target)?;
@@ -214,20 +220,18 @@ fn place_marker<Reporter: self::Reporter>(
     placement: Placement,
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
-    store_path: &Path,
+    source: &StoreFile,
     target: &Path,
     symlinks: Option<SymlinkRoots<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
-    if let Some(roots) = symlinks
-        && is_symlink(store_path)
-        && place_symlink_entry(placement, store_path, target, roots)?
-    {
+    let Some(store_path) = place_symlink_or_resolve_file(placement, source, target, symlinks)?
+    else {
         return Ok(());
-    }
+    };
     if placement == Placement::Repair {
         clear_dir_blocking_file::<Host>(target)?;
     }
-    import_atomic::<Reporter>(logged_methods, import_method, store_path, target)
+    import_atomic::<Reporter>(logged_methods, import_method, &store_path, target)
 }
 
 /// Remove a directory tree standing where a package file belongs, as
@@ -349,7 +353,7 @@ pub(super) fn clear_dirent_blocking_dir<Sys: FsRemoveNonDirDirent>(
 /// so we pick the lexicographically smallest non-build-marker entry
 /// instead — deterministic, which is all the gate and the write need.
 /// `None` only when no package file is present.
-pub(super) fn marker_file(cas_paths: &HashMap<String, PathBuf>) -> Option<&str> {
+pub(super) fn marker_file(cas_paths: &pnpm_fs::CasPaths) -> Option<&str> {
     const PACKAGE_JSON: &str = "package.json";
     if let Some(marker) = [crate::CARGO_CHECKSUM_FILE, PACKAGE_JSON]
         .into_iter()
@@ -374,12 +378,12 @@ pub(super) fn marker_file(cas_paths: &HashMap<String, PathBuf>) -> Option<&str> 
 /// particular order: a slot another importer is still filling is the
 /// common case here, and one `stat` settles it without comparing the
 /// files that did land.
-pub(super) fn all_files_match(dir_path: &Path, cas_paths: &HashMap<String, PathBuf>) -> bool {
+pub(super) fn all_files_match(dir_path: &Path, cas_paths: &pnpm_fs::CasPaths) -> bool {
     marker_present(dir_path, cas_paths)
         && cas_paths
             .iter()
             .filter(|(entry, _)| entry.as_str() != crate::NEEDS_BUILD_MARKER)
-            .all(|(entry, store_path)| file_matches_store_entry(&dir_path.join(entry), store_path))
+            .all(|(entry, source)| file_matches_store_entry(&dir_path.join(entry), &source.path))
 }
 
 /// Whether `target` already carries `store_path`'s content. Imports that
@@ -472,7 +476,7 @@ pub(super) fn files_have_equal_contents(left: &Path, right: &Path) -> io::Result
 /// Whether `dir_path` holds the completion marker. An empty map has no
 /// marker, so it counts as present — there is nothing to import.
 #[must_use]
-pub fn marker_present(dir_path: &Path, cas_paths: &HashMap<String, PathBuf>) -> bool {
+pub fn marker_present(dir_path: &Path, cas_paths: &pnpm_fs::CasPaths) -> bool {
     match marker_file(cas_paths) {
         Some(marker) => dir_path.join(marker).exists(),
         None => true,

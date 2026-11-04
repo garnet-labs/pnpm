@@ -14,12 +14,22 @@ pub(crate) struct StateWrite<'a> {
     pub(crate) config: &'a Config,
     pub(crate) layout: crate::RepeatInstallLayout<'a>,
     pub(crate) catalogs: &'a Catalogs,
-    pub(crate) project_manifests: &'a [(PathBuf, &'a PackageManifest)],
+    pub(crate) projects: StateProjects<'a>,
     /// The filesystem time, probed before the writer read what it validated,
     /// per [`build_workspace_state`].
     pub(crate) filesystem_now_ms: Option<i64>,
     pub(crate) carried: CarriedSettings<'a>,
-    pub(crate) vouched: &'a crate::optimistic_repeat_install::validation::Vouched<'a>,
+    pub(crate) vouched: &'a crate::install_state::validation::Vouched<'a>,
+}
+
+/// The projects a write records.
+#[derive(Clone, Copy)]
+pub(crate) struct StateProjects<'a> {
+    pub(crate) manifests: crate::DeclaredManifests<'a>,
+    /// See [`crate::RepeatInstallManifests::workspace_projects`].
+    pub(crate) workspace_projects: Option<&'a [(PathBuf, &'a PackageManifest)]>,
+    /// See [`RecordValidation::lockfile`](crate::install_state::validation::RecordValidation::lockfile).
+    pub(crate) lockfile: Option<&'a pnpm_lockfile::Lockfile>,
 }
 
 /// The settings a write takes from what earlier runs established rather than
@@ -27,9 +37,18 @@ pub(crate) struct StateWrite<'a> {
 pub(crate) struct CarriedSettings<'a> {
     /// The dedupe baseline this write knows of, per [`recorded_auto_dedupe`].
     pub(crate) established_auto_dedupe: Option<bool>,
-    /// The recorded dependency groups to keep instead of the run's, for a
-    /// writer that ignored group drift.
-    pub(crate) kept_groups: Option<&'a pnpm_workspace_state::WorkspaceStateSettings>,
+    /// Whether the lockfile this run leaves behind has the keys the declared
+    /// registry prefixes call for (see [`super::registry_keys_current`]). Only
+    /// then does the state record the prefixes (see
+    /// [`WorkspaceStateSettings::registry_prefixes`](pnpm_workspace_state::WorkspaceStateSettings::registry_prefixes)).
+    pub(crate) registry_keys_verified: bool,
+    /// The `registryRoutes` to record, per
+    /// [`recorded_registry_routes_after_install`](crate::install_state::recorded_registry_routes_after_install)
+    /// for an install and the recorded ones for a passing check.
+    pub(crate) registry_routes: Option<std::collections::BTreeMap<String, String>>,
+    /// The recorded dependency groups, runtime setting and store location to
+    /// keep instead of the run's, for a writer that ignored their drift.
+    pub(crate) kept_settings: Option<&'a pnpm_workspace_state::WorkspaceStateSettings>,
 }
 
 /// The workspace state `write` records. Every writer goes through here, so a
@@ -42,23 +61,35 @@ pub(crate) fn recorded_workspace_state(write: &StateWrite<'_>) -> WorkspaceState
         write.layout.included,
         write.layout.supported_architectures,
         write.catalogs,
-        write.project_manifests,
+        write.projects.manifests,
         write.filesystem_now_ms,
     );
     state.settings.auto_dedupe =
         recorded_auto_dedupe(write.config, write.carried.established_auto_dedupe);
-    if let Some(kept) = write.carried.kept_groups {
+    if write.carried.registry_keys_verified {
+        state.settings.registry_prefixes =
+            crate::install_state::recorded_registry_prefixes(write.config);
+        state.settings.default_registry =
+            crate::install_state::recorded_default_registry(write.config);
+    }
+    state.settings.registry_routes.clone_from(&write.carried.registry_routes);
+    if let Some(kept) = write.carried.kept_settings {
         state.settings.dev = kept.dev;
         state.settings.optional = kept.optional;
         state.settings.production = kept.production;
+        state.settings.runtime = kept.runtime;
+        state.settings.store_dir.clone_from(&kept.store_dir);
+        state.settings.virtual_store_dir.clone_from(&kept.virtual_store_dir);
     }
-    crate::optimistic_repeat_install::validation::record_validation(
+    crate::install_state::validation::record_validation(
         &mut state,
-        &crate::optimistic_repeat_install::validation::RecordValidation {
+        &crate::install_state::validation::RecordValidation {
             workspace_root: write.workspace_root,
             config: write.config,
-            project_manifests: write.project_manifests,
+            project_manifests: write.projects.manifests,
+            workspace_projects: write.projects.workspace_projects,
             vouched: write.vouched,
+            lockfile: write.projects.lockfile,
         },
     );
     state

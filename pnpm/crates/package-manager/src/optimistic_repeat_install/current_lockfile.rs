@@ -68,38 +68,6 @@ pub(crate) fn assert_loaded_current_lockfile_records(
     }
 }
 
-/// Whether `current` already records what materializing `wanted` would
-/// produce.
-///
-/// The current lockfile keeps only what the importers reach
-/// ([`crate::filter_lockfile_for_current`]) and none of the top-level keys
-/// pnpm does not define, so a wanted lockfile carrying a snapshot no
-/// importer reaches any more, or an embedder's extension block, can never
-/// equal it. Comparing the same shape both sides is what lets such a tree
-/// settle instead of re-materializing on every run.
-///
-/// The equal case is the common one and answers without building the
-/// filtered shape at all.
-pub(crate) fn materialized_shape_matches(
-    wanted: &Lockfile,
-    current: &Lockfile,
-    included: IncludedDependencies,
-    peer_edges: pnpm_lockfile::PeerEdgeOptions,
-) -> bool {
-    if wanted == current {
-        return true;
-    }
-    // A transient skip (a failed optional fetch) prunes the current lockfile
-    // further, and its set is not known here. Such a tree falls
-    // through to materialization, which retries the fetch anyway.
-    current
-        == &crate::filter_lockfile_for_current(
-            wanted,
-            &crate::GroupSelection::classify(wanted, included, peer_edges),
-            &crate::SkippedSnapshots::new(),
-        )
-}
-
 /// Whether `current` records exactly what `wanted` materializes for
 /// `importer_ids` in the dependency groups `state` recorded. Every group
 /// `current` records counts, so a tree that still holds a group the install

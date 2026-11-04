@@ -9,7 +9,6 @@ use super::{
 use super::{create_failing_postinstall_fixture, create_postinstall_modifies_source_fixture};
 use crate::{RequiresBuildBySnapshot, SkippedSnapshots, VirtualStoreLayout};
 use pnpm_config::{Config, PackageImportMethod};
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_lockfile::SnapshotEntry;
 use pnpm_reporter::SilentReporter;
 #[cfg(unix)]
@@ -158,11 +157,7 @@ fn build_modules_collects_ignored_builds() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -243,11 +238,7 @@ fn mutated_slots_is_false_when_every_build_is_ignored() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -328,11 +319,7 @@ fn mutated_slots_is_true_when_a_script_runs() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -412,11 +399,7 @@ fn ignore_scripts_skips_build_without_collecting_ignored() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -492,11 +475,7 @@ fn cached_requires_build_false_skips_package_dir_probe() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -587,11 +566,7 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -679,11 +654,7 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -816,8 +787,8 @@ fn using_side_effects_cache_skips_rebuild() {
     overlay.insert(
         expected_cache_key,
         std::collections::HashMap::from([
-            ("package.json".to_string(), pkg_dir.join("package.json")),
-            ("generated-by-postinstall.js".to_string(), side_effect_blob),
+            ("package.json".to_string(), pkg_dir.join("package.json").into()),
+            ("generated-by-postinstall.js".to_string(), side_effect_blob.into()),
         ])
         .into(),
     );
@@ -863,11 +834,7 @@ fn using_side_effects_cache_skips_rebuild() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
@@ -971,9 +938,15 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
     // The overlay points `generated.txt` at a CAS path that doesn't
     // exist, so `materialize_side_effects` fails — standing in for a
     // store whose side-effects blob went missing.
-    let overlay = std::collections::HashMap::from([
-        ("package.json".to_string(), pkg_dir.join("package.json")),
-        ("generated.txt".to_string(), virtual_store_dir.path().join("missing-cas-blob")),
+    let overlay = pnpm_fs::CasPaths::from([
+        ("package.json".to_string(), pkg_dir.join("package.json").into()),
+        (
+            "generated.txt".to_string(),
+            virtual_store_dir
+                .path()
+                .join("missing-cas-blob")
+                .into(),
+        ),
     ]);
     let mut side_effects_maps = std::collections::HashMap::new();
     side_effects_maps.insert(
@@ -1020,11 +993,7 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            path: crate::ScriptPath {
-                prepend_node_path: ScriptsPrependNodePath::Never,
-                extra_bin_paths: &[],
-                private_hoisting: false,
-            },
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,

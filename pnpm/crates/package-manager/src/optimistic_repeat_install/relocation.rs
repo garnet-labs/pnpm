@@ -3,12 +3,13 @@
 //! tree still works where it is now.
 
 use super::{
-    Host, Lockfile, OptimisticRepeatInstallCheck, PackageManifest, Path, PathBuf, WorkspaceState,
+    Catalogs, Config, Host, Lockfile, OptimisticRepeatInstallCheck, PackageManifest, Path, PathBuf,
+    WorkspaceState,
     current_lockfile::assert_loaded_current_lockfile_records,
     current_pnpmfiles,
     freshness::{InputDrift, validation_now},
     manifest_agreement::check_projects_content,
-    project_structure_matches,
+    project_structure_matches, recorded_elsewhere,
 };
 use std::{collections::BTreeSet, path::Component};
 
@@ -20,6 +21,8 @@ pub(super) fn relocated_state(
     state: &WorkspaceState,
     workspace_root: &Path,
     project_manifests: &[(PathBuf, &PackageManifest)],
+    config: &Config,
+    catalogs: &Catalogs,
 ) -> Option<WorkspaceState> {
     if !recorded_elsewhere(state, project_manifests) {
         return None;
@@ -39,17 +42,7 @@ pub(super) fn relocated_state(
         .collect();
     // The validation records name the files where they were.
     let relocated = WorkspaceState { projects, pnpmfiles, validation: None, ..state.clone() };
-    project_structure_matches(&relocated, project_manifests).then_some(relocated)
-}
-
-/// Whether no current project dir is a key of `state`.
-pub(crate) fn recorded_elsewhere(
-    state: &WorkspaceState,
-    project_manifests: &[(PathBuf, &PackageManifest)],
-) -> bool {
-    !project_manifests
-        .iter()
-        .any(|(root_dir, _)| state.projects.contains_key(root_dir.to_string_lossy().as_ref()))
+    project_structure_matches(&relocated, project_manifests, config, catalogs).then_some(relocated)
 }
 
 /// The unique old root reproducing every current workspace-relative project
@@ -147,13 +140,13 @@ pub(super) fn prove_move(
     // spent for nothing: it parses while this thread does the rest.
     check.lockfile.prefetch();
     let wanted = validated_moved_lockfile(check)?;
-    check_projects_content(
-        check,
+    check_projects_content(check, wanted, &drift.stats.iter().collect::<Vec<_>>())?;
+    if !crate::install::moved_tree_is_reusable(
+        config,
+        node_linker,
+        project_manifests.as_slice(),
         wanted,
-        &drift.stats.iter().collect::<Vec<_>>(),
-        config.dedupe_peers,
-    )?;
-    if !crate::install::moved_tree_is_reusable(config, node_linker, project_manifests, wanted) {
+    ) {
         return Err("a bin in the moved tree names a path outside it");
     }
     Ok(())
@@ -185,12 +178,7 @@ fn validated_moved_lockfile<'a>(
         .map_err(|_| "the wanted lockfile cannot be read or parsed")?
         .ok_or("a moved tree has no wanted lockfile to compare against")?;
     assert_loaded_current_lockfile_records(wanted, current.as_ref(), |current| {
-        super::materialized_shape_matches(
-            wanted,
-            current,
-            modules.included,
-            config.peer_edge_options(),
-        )
+        super::materialized_shape_matches(wanted, current, modules.included, config)
     })?;
     if let Some(current) = current.as_ref()
         && !crate::install::frozen_tree_intact(

@@ -1,3 +1,6 @@
+pub(super) mod selection;
+use selection::should_reject_unmatched_selection;
+
 use super::{
     UpdateError, UpdateOptions, UpdateResources, UpdateSeed,
     catalogs::{
@@ -5,10 +8,7 @@ use super::{
         reconcile_catalog_rewrites,
     },
     latest::{LatestResolverChain, LatestRewriteCtx},
-    seed_policy::{
-        OverriddenDirect, UpdatePlan, UpdateScope, importer_seed_policy, select_seed_policy,
-        selected_seed_policy,
-    },
+    seed_policy::{LockedImporter, OverriddenDirect, UpdatePlan, UpdateScope, select_seed_policy},
     selectors::{
         ParsedSelector, parse_selectors, reject_versioned_latest_selectors,
         reject_versions_of_indirect_update_specs,
@@ -65,48 +65,14 @@ pub(super) struct SelectedUpdatePreparation {
     pub(super) updated_catalogs: Catalogs,
     pub(super) catalogs_override: Option<Catalogs>,
     pub(super) workspace_dir_for_catalogs: Option<PathBuf>,
-    pub(super) any_work: bool,
+    work: SelectedUpdateWork,
 }
-impl SelectedUpdatePreparation {
-    pub(super) fn take_seed(&mut self, update: UpdateOptions<'_>) -> UpdateSeed {
-        UpdateSeed {
-            policy: selected_seed_policy(
-                update.version.patches,
-                std::mem::take(&mut self.seed_policies),
-                update.selection.depth,
-            ),
-            preferred_versions_override: std::mem::take(&mut self.preferred_versions_override),
-            catalogs_override: self.catalogs_override.take(),
-        }
-    }
-
-    /// Fold one project's preparation in, under the importer id it was
-    /// prepared for.
-    fn merge(&mut self, index: usize, importer_id: String, prepared: UpdatePreparation) {
-        self.any_work = true;
-        for (name, selectors) in prepared.preferred_versions_override {
-            self.preferred_versions_override
-                .entry(name)
-                .or_default()
-                .extend(selectors);
-        }
-        if !prepared.bump_targets.is_empty() {
-            self.bump_targets.insert(importer_id.clone(), prepared.bump_targets);
-        }
-        if let Some(policy) = importer_seed_policy(prepared.seed_policy) {
-            self.seed_policies.insert(importer_id, policy);
-        }
-        if prepared.persist_manifest {
-            self.persist_indices.push(index);
-        }
-        merge_catalogs(&mut self.updated_catalogs, &prepared.updated_catalogs);
-        if let Some(complete_catalogs) = prepared.catalogs_override {
-            self.catalogs_override = Some(complete_catalogs);
-        }
-        if self.workspace_dir_for_catalogs.is_none() {
-            self.workspace_dir_for_catalogs = prepared.workspace_dir_for_catalogs;
-        }
-    }
+#[derive(Default, PartialEq, Eq)]
+enum SelectedUpdateWork {
+    #[default]
+    None,
+    IgnoredDirectMatch,
+    Prepared,
 }
 /// A loaded `readPackage` hook paired with the log sink its `context.log`
 /// calls are forwarded to.
@@ -146,13 +112,21 @@ pub(super) async fn apply_read_package_hook_to_update_manifest(
 }
 pub(super) async fn prepare_manifest<Reporter: self::Reporter>(
     manifest: &mut PackageManifest,
+    importer_id: &str,
     update: UpdateOptions<'_>,
     owned: &UpdateResources,
     catalogs_seed: Option<&Catalogs>,
     latest_chain: &mut Option<LatestResolverChain>,
 ) -> Result<Option<UpdatePreparation>, UpdateError> {
-    let Some(decision) =
-        decide_update::<Reporter>(manifest, update, owned, catalogs_seed, latest_chain).await?
+    let Some(decision) = decide_update::<Reporter>(
+        manifest,
+        importer_id,
+        update,
+        owned,
+        catalogs_seed,
+        latest_chain,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -168,6 +142,7 @@ pub(super) struct UpdateDecision {
 }
 pub(super) async fn decide_update<Reporter: self::Reporter>(
     manifest: &PackageManifest,
+    importer_id: &str,
     update: UpdateOptions<'_>,
     owned: &UpdateResources,
     catalogs_seed: Option<&Catalogs>,
@@ -187,7 +162,7 @@ pub(super) async fn decide_update<Reporter: self::Reporter>(
         .transpose()?;
     let overridden_direct =
         overridden_direct(manifest, update, &selectors, &direct, &mut catalog_ctx)?;
-    let scope = update_scope(update, owned, &selectors, &direct, &overridden_direct);
+    let scope = update_scope(update, owned, importer_id, &selectors, &direct, &overridden_direct);
     let mut plan = UpdatePlan::default();
     let Some(seed_policy) = select_seed_policy::<Reporter>(
         &scope,
@@ -213,6 +188,7 @@ pub(super) async fn decide_update<Reporter: self::Reporter>(
 pub(super) fn update_scope<'a>(
     update: UpdateOptions<'a>,
     owned: &UpdateResources,
+    importer_id: &'a str,
     selectors: &'a [ParsedSelector],
     direct: &'a [(String, DependencyGroup, String)],
     overridden_direct: &'a [OverriddenDirect],
@@ -221,7 +197,7 @@ pub(super) fn update_scope<'a>(
         selectors,
         direct,
         overridden_direct,
-        lockfile: update.lockfile.document,
+        lockfile: LockedImporter { document: update.lockfile.document, id: importer_id },
         config: update.config,
         version: update.version,
         selection: update.selection,
@@ -261,7 +237,7 @@ fn collect_overridden_direct(
     let matcher = overrider.dependency_matcher(manifest.value());
     let matched = direct
         .iter()
-        .filter(|(name, _, previous)| matcher.matches(name, previous))
+        .filter(|(name, group, previous)| matcher.matches(*group, name, previous))
         .map(|(name, group, _)| (name.clone(), *group))
         .collect::<Vec<_>>();
     if matched.is_empty() {
@@ -393,8 +369,11 @@ pub(super) async fn prepare_selected_manifests<Reporter: self::Reporter>(
     }
 
     for &index in selected_indices {
+        let importer_id =
+            pnpm_workspace::importer_id_from_root_dir(workspace_root, &projects[index].root_dir);
         let Some(prepared) = prepare_manifest::<Reporter>(
             &mut projects[index].manifest,
+            &importer_id,
             update,
             owned,
             prepared_all.catalogs_override.as_ref(),
@@ -402,20 +381,16 @@ pub(super) async fn prepare_selected_manifests<Reporter: self::Reporter>(
         )
         .await?
         else {
+            prepared_all.record_ignored_match(&projects[index].manifest, update, owned);
             continue;
         };
-        let importer_id =
-            pnpm_workspace::importer_id_from_root_dir(workspace_root, &projects[index].root_dir);
         prepared_all.merge(index, importer_id, prepared);
     }
 
     // A recursive `--latest` that matches nothing is an error, unlike the
     // single-project one that quietly returns: with no project left to
     // mutate there is nothing for the run to have meant.
-    if update.selection.depth == 0
-        && !update.selection.packages.is_empty()
-        && !prepared_all.any_work
-    {
+    if should_reject_unmatched_selection(update, &prepared_all) {
         return Err(UpdateError::NoPackageInDependencies);
     }
 

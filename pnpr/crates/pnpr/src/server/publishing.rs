@@ -1,22 +1,30 @@
-pub(super) use attachments::{
-    StagedPublish, ValidatedPublish, stage_publish, validate_publish_doc,
+pub(super) mod variants;
+
+pub(super) use atomic::{
+    PublishReceipt, add_npm_notices, commit_publication, publication_name, publication_request,
+    publish_committed_response, replayed_outcome, single_catalog,
 };
+pub(super) use attachments::{
+    StagedBase, StagedPublish, ValidatedPublish, Verification, stage_publish, validate_publish_doc,
+};
+pub(super) use notes::{refuse_notes_of_published_python_versions, take_note, take_version_note};
 pub(super) use tombstones::check_publish_tombstone;
 
+mod atomic;
 mod attachments;
+mod generated_archive;
 mod manifest;
+mod notes;
+mod provenance;
+mod rebase;
+mod release_records;
 mod tombstones;
+mod verification;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
-use axum::{
-    body::Body,
-    extract::State,
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-};
-use pnpm_crypto_hash::{create_hex_hash, integrity_addressed_tarball_path};
-use serde_json::{Value, json};
+use axum::response::{IntoResponse, Response};
+use serde_json::Value;
 use ssri::Integrity;
 
 use pnpr_error::RegistryError;
@@ -25,18 +33,18 @@ use pnpr_policy::Identity;
 use pnpr_registry::{Ecosystem, Registry};
 use pnpr_storage::{
     HostedDocumentVersion, Storage,
-    journal::{CommitOutcome, JournaledPublish, JournaledRevisionRef},
+    metadata::{PublicationRequest, PublishNotes},
     publish::{
         PendingAttachment, extract_attachments, now_iso, stream_decode_verify_and_write,
-        write_sigstore_bundle,
+        verify_and_write, write_sigstore_bundle,
     },
 };
 
 use super::{
-    Action, AppState, AuthedCaller, HostedGate, HostedOriginalRef, RegistrySource, WriteTarget,
-    authorize_package, authorized_upstream, default_registry_target, documents::RegistryDocuments,
-    hosted_gate, hosted_storage, resolve_ecosystem_source, resolve_write_target,
-    restore_tgz_integrities, tar_integrity_of, tgz_integrity_key,
+    Action, AppState, HostedGate, RegistrySource, WriteTarget, authorize_package,
+    authorized_upstream, default_registry_target, hosted_gate, hosted_storage,
+    resolve_ecosystem_source, resolve_write_target, restore_tgz_integrities,
+    staged_archives::StagedReferences, tar_integrity_of, tgz_integrity_key,
 };
 
 /// Where a publish of `package` writes, given an optional explicit `/~<name>/`.
@@ -117,6 +125,23 @@ pub(super) fn resolve_publish_target_for(
     }
 }
 
+/// Whether `package` routes to an upstream registry through the registry a
+/// request addresses.
+pub(super) fn routes_to_upstream(
+    state: &AppState,
+    registry: Option<&str>,
+    ecosystem: Ecosystem,
+    package: &str,
+) -> bool {
+    addressed_publish_target(state, registry, ecosystem)
+        .is_some_and(|(target, _)| {
+            matches!(
+                resolve_ecosystem_source(state, &target, ecosystem, package),
+                RegistrySource::Upstream(_),
+            )
+        })
+}
+
 /// The registry a publish addresses, with how to name it in a refusal.
 fn addressed_publish_target(
     state: &AppState,
@@ -175,26 +200,19 @@ pub(super) async fn publish_package(
         Err(err) => return err.into_response(),
     };
 
-    let incoming: Value = match serde_json::from_slice(&body) {
+    let mut incoming: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => return RegistryError::Json(err).into_response(),
     };
-
-    // Reject a publish whose body name disagrees with the URL.
-    // npm/verdaccio return 400 here too; without this check a
-    // misrouted PUT silently overwrites the wrong on-disk
-    // package.json with another package's manifest.
-    let body_name = incoming.get("name").and_then(Value::as_str);
-    if body_name.is_some_and(|body_name| body_name != name.as_str()) {
-        return RegistryError::BadRequest {
-            reason: format!(
-                "package in URL ({:?}) does not match body ({:?})",
-                name.as_str(),
-                body_name.unwrap_or(""),
-            ),
-        }
-        .into_response();
+    if let Err(err) = check_body_name(&name, &incoming) {
+        return err.into_response();
     }
+
+    let request = publication_request(identity, &incoming, None, None, Some(&name));
+    let notes = match single_publish_notes(&mut incoming) {
+        Ok(notes) => notes,
+        Err(err) => return err.into_response(),
+    };
 
     // Routing, masking, and the publish rule all run inside
     // `validate_publish_doc`: the write resolves to a hosted registry (or
@@ -204,208 +222,75 @@ pub(super) async fn publish_package(
             Ok(validated) => validated,
             Err(err) => return err.into_response(),
         };
-
     // Serialize the read-merge-write against other writers of this same
     // package on this instance, so a concurrent publish can't read the
     // same `existing`, merge a different version, and overwrite ours.
     // Held until this function returns, past the packument write below.
     let _packument_guard = state.inner.locks.packages.lock(validated.name.as_str()).await;
-
-    let staged = match stage_publish(state, validated, &now_iso(), Some(&target.org)).await {
-        Ok(staged) => staged,
+    // A retry is authorized like any publish, so only a caller still allowed
+    // to make it gets the outcome of the request it repeats. It is looked up
+    // under the lock, so a retry that waited for the original sees its commit.
+    match replayed_outcome(state, &target.org, request.as_ref()).await {
+        Ok(Some(replayed)) => return replayed,
+        Ok(None) => {}
         Err(err) => return err.into_response(),
-    };
-    match commit_publishes(state, vec![staged]).await.and_then(report_unrecorded) {
-        Ok(()) => publish_created_response(),
-        Err(err) => err.into_response(),
     }
+
+    stage_and_commit(state, identity, validated, &target.org, (notes, request))
+        .await
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
-/// `PUT /-/pnpm/v1/publish` — publish several packages with one
-/// request. The body is `{"packages": [<publish doc>, ...]}` where
-/// each entry is exactly the JSON body that `PUT /:pkg` takes
-/// (packument with `_attachments`). `pnpm publish --batch` sends
-/// this; the endpoint is not part of the standard npm registry API.
-///
-/// The batch is all-or-nothing up to the commit point: every
-/// document is validated (name, publish policy, attachment
-/// integrity) and every tarball of every package is fully written
-/// to a tmp slot before anything becomes visible to readers, so a
-/// batch that fails validation or staging leaves no new versions
-/// behind.
-pub(super) async fn serve_batch_publish(
-    State(state): State<AppState>,
-    AuthedCaller(identity): AuthedCaller,
-    body: axum::body::Bytes,
-) -> Response {
-    let incoming: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(err) => return RegistryError::Json(err).into_response(),
-    };
-    let Value::Object(mut incoming) = incoming else {
-        return RegistryError::BadRequest { reason: "body must be a JSON object".to_string() }
-            .into_response();
-    };
-    let Some(Value::Array(docs)) = incoming.remove("packages") else {
-        return RegistryError::BadRequest {
-            reason: "body must have a `packages` array".to_string(),
-        }
-        .into_response();
-    };
-    if docs.is_empty() {
-        return RegistryError::BadRequest { reason: "`packages` must not be empty".to_string() }
-            .into_response();
-    }
-
-    let validated = match validate_batch_docs(&state, &identity, docs).await {
-        Ok(validated) => validated,
-        Err(err) => return err.into_response(),
-    };
-
-    // Hold every affected package's lock across the whole
-    // stage-and-commit, so concurrent writers of any package in the
-    // batch serialize with us just like with a single publish.
-    let names: Vec<&str> = validated
-        .iter()
-        .map(|(doc, _)| doc.name.as_str())
-        .collect();
-    let _guards = state.inner.locks.packages.lock_many(&names).await;
-
-    let staged = match stage_batch(&state, validated).await {
-        Ok(staged) => staged,
-        Err(err) => return err.into_response(),
-    };
-    match commit_publishes(&state, staged).await.and_then(report_unrecorded) {
-        Ok(()) => publish_created_response(),
-        Err(err) => err.into_response(),
-    }
-}
-
-/// Validate every document of a batch publish, refusing a package named twice.
-///
-/// One packument read-merge-write happens per package: with the same package
-/// twice in a batch, the second entry's merge would depend on the first's
-/// uncommitted result. Senders carry multiple versions of one package as
-/// several `versions` entries in a single document instead.
-///
-/// The batch endpoint is path-less, so each package routes via the default
-/// target; validation resolves that route and checks the resolved hosted
-/// registry's publish rule per document.
-async fn validate_batch_docs(
+/// Stage one validated publish into `org` and commit it, then give back the
+/// staged archives it claimed.
+async fn stage_and_commit(
     state: &AppState,
     identity: &Identity,
-    docs: Vec<Value>,
-) -> Result<Vec<(ValidatedPublish, WriteTarget)>, RegistryError> {
-    let mut validated = Vec::with_capacity(docs.len());
-    let mut seen_names = std::collections::BTreeSet::new();
-    for doc in docs {
-        let Some(doc_name) = doc.get("name").and_then(Value::as_str) else {
-            return Err(RegistryError::BadRequest {
-                reason: "every entry in `packages` must have a string `name`".to_string(),
-            });
-        };
-        let name = CanonicalPackageName::parse(doc_name, pnpr_package_name::Ecosystem::Npm)?;
-        if !seen_names.insert(name.as_str().to_string()) {
-            return Err(RegistryError::BadRequest {
-                reason: format!("duplicate package {:?} in `packages`", name.as_str()),
-            });
-        }
-        validated.push(validate_publish_doc(state, identity, None, name, doc).await?);
-    }
-    Ok(validated)
+    validated: ValidatedPublish,
+    org: &str,
+    (notes, request): (PublishNotes, Option<PublicationRequest>),
+) -> Result<Response, RegistryError> {
+    let storage = &state.inner.storage;
+    let references =
+        StagedReferences::check(storage, identity, validated.staged_integrities()).await?;
+    let staged = stage_publish(state, validated, &now_iso(), Some(org)).await?;
+    let receipt = commit_publication(state, vec![staged], notes, request).await?;
+    references.release(storage).await;
+    Ok(publish_committed_response(&receipt))
 }
 
-/// Stage every document of a batch, cleaning up what already landed if one
-/// fails.
-///
-/// Each document's write target was resolved during validation, so a routing
-/// failure surfaced before any tarball was staged.
-async fn stage_batch(
-    state: &AppState,
-    validated: Vec<(ValidatedPublish, WriteTarget)>,
-) -> Result<Vec<StagedPublish>, RegistryError> {
-    let now = now_iso();
-    let mut staged: Vec<StagedPublish> = Vec::with_capacity(validated.len());
-    for (doc, target) in validated {
-        match stage_publish(state, doc, &now, Some(&target.org)).await {
-            Ok(stage) => staged.push(stage),
-            Err(err) => {
-                for stage in staged {
-                    cleanup_tmp_slots(stage.slots).await;
-                }
-                return Err(err);
-            }
-        }
+/// Reject a publish whose body name disagrees with the URL. npm and verdaccio
+/// answer 400 here too; without this check a misrouted `PUT` would overwrite
+/// another package's document.
+fn check_body_name(name: &CanonicalPackageName, incoming: &Value) -> Result<(), RegistryError> {
+    let body_name = incoming.get("name").and_then(Value::as_str);
+    if body_name.is_none_or(|body_name| body_name == name.as_str()) {
+        return Ok(());
     }
-    Ok(staged)
+    Err(RegistryError::BadRequest {
+        reason: format!(
+            "package in URL ({:?}) does not match body ({:?})",
+            name.as_str(),
+            body_name.unwrap_or(""),
+        ),
+    })
 }
 
-/// Make every staged publish visible, as one journaled transaction: a crash
-/// or I/O failure mid-apply can never leave the batch partially published,
-/// because startup recovery applies whatever the seal committed. The batch
-/// may mix ecosystems; each package's document is merged by the rule its own
-/// surface owns.
-///
-/// A version whose blob lost its immutable slot to another replica is dropped
-/// from the document the transaction writes, which keeps the store consistent
-/// with the blob that won; the caller reads that out of the outcome. One that
-/// could not claim a digest-reference slot is dropped the same way, and
-/// reported here: the publisher asked for a version that is not there.
+/// The version note at the top of a single npm publish document.
+fn single_publish_notes(incoming: &mut Value) -> Result<PublishNotes, RegistryError> {
+    let versions = take_version_note(incoming, Ecosystem::Npm)?.into_iter().collect();
+    Ok(PublishNotes { publication: None, versions })
+}
+
+/// Make every staged publish visible in one metadata commit: every archive
+/// is promoted first, then every document commits, or none does. The batch
+/// may mix ecosystems.
 pub(super) async fn commit_publishes(
     state: &AppState,
     staged: Vec<StagedPublish>,
-) -> Result<CommitOutcome, RegistryError> {
-    let entries: Vec<JournaledPublish<'_>> = staged
-        .iter()
-        .map(|stage| JournaledPublish {
-            name: &stage.name,
-            org: stage.org.as_deref(),
-            ecosystem: stage.ecosystem,
-            document: &stage.document,
-            base_version: stage.base_version.as_ref(),
-            slots: &stage.slots,
-            revision_refs: &stage.revision_refs,
-        })
-        .collect();
-    let outcome = state.inner.storage
-        .publish_journal()
-        .commit(&state.inner.storage, &entries, &RegistryDocuments)
-        .await?;
-    match outcome.reference_limit {
-        Some(limit) => Err(RegistryError::RevisionReferenceLimit { limit }),
-        None => Ok(outcome),
-    }
-}
-
-/// The packages a commit could not record, as the error a publisher gets
-/// instead of a success it did not earn: another writer owns the blob their
-/// version described, so that version is not the one the store serves. Each
-/// is named with its ecosystem, since the same name in two of them is two
-/// packages.
-pub(super) fn report_unrecorded(outcome: CommitOutcome) -> Result<(), RegistryError> {
-    let mut missing: BTreeSet<String> = outcome.unrecorded
-        .into_iter()
-        .chain(outcome.lost_blobs.into_iter().map(|lost| lost.package))
-        .map(|package| format!("{} {}", package.ecosystem, package.name))
-        .collect();
-    let Some(first) = missing.pop_first() else {
-        return Ok(());
-    };
-    let packages = std::iter::once(first)
-        .chain(missing)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(RegistryError::PublishNotRecorded { packages })
-}
-
-pub(super) fn publish_created_response() -> Response {
-    let body = json!({ "ok": true, "success": true });
-    let bytes = serde_json::to_vec(&body).expect("static-shape JSON serializes");
-    Response::builder()
-        .status(StatusCode::CREATED)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(bytes))
-        .expect("static-shape response always builds")
+) -> Result<(), RegistryError> {
+    commit_publication(state, staged, PublishNotes::default(), None).await?;
+    Ok(())
 }
 
 /// Remove every tmp tarball file that a partially-completed publish

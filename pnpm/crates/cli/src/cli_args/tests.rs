@@ -7,7 +7,7 @@ use super::{
     install::{InstallArgs, resolve_bool_override},
     list::RecursionLimit,
     package_manager::{
-        current_source_pnpm_version, package_manager_to_sync, parse_package_manager,
+        current_source_pnpm_version, package_manager_to_sync_for_version, parse_package_manager,
         read_manifest_json,
     },
     parse_depth_limit,
@@ -19,10 +19,18 @@ use super::{
     version::VersionArgs,
 };
 use clap::Parser;
-use pnpm_config::ColorMode;
+use pnpm_config::{ColorMode, PNPM_VERSION, PmOnFail};
 use pnpm_default_reporter::SummaryScope;
 use std::path::Path;
 use tempfile::TempDir;
+
+fn package_manager_to_sync(
+    manifest: &serde_json::Value,
+    root_dir: &Path,
+    on_fail: Option<PmOnFail>,
+) -> Option<super::package_manager::PackageManagerToSync> {
+    package_manager_to_sync_for_version(manifest, root_dir, on_fail, PNPM_VERSION)
+}
 
 fn install_args(argv: &[&str]) -> InstallArgs {
     match CliArgs::try_parse_from(argv).expect("parses").command {
@@ -53,6 +61,14 @@ fn version_args(argv: &[&str]) -> VersionArgs {
     match CliArgs::try_parse_from(argv).expect("parses").command {
         CliCommand::Version(version) => version,
         other => panic!("expected version, got {other:?}"),
+    }
+}
+
+#[test]
+fn setup_accepts_no_modify_path() {
+    match CliArgs::try_parse_from(["pnpm", "setup", "--no-modify-path"]).expect("parses").command {
+        CliCommand::Setup(setup) => assert!(setup.no_modify_path),
+        other => panic!("expected setup, got {other:?}"),
     }
 }
 
@@ -376,7 +392,7 @@ fn workspace_fixture() -> (TempDir, std::path::PathBuf) {
 
 /// Every subcommand declaring `--global`. A new one added without wiring
 /// it into [`CliCommand::is_global`] slips past the conflict check.
-const GLOBAL_SUBCOMMAND_ARGV: [&[&str]; 12] = [
+const GLOBAL_SUBCOMMAND_ARGV: [&[&str]; 13] = [
     &["add", "foo"],
     &["approve-builds"],
     &["bin"],
@@ -384,6 +400,7 @@ const GLOBAL_SUBCOMMAND_ARGV: [&[&str]; 12] = [
     &["list"],
     &["ll"],
     &["outdated"],
+    &["peers", "check"],
     &["prefix"],
     &["remove", "foo"],
     &["root"],
@@ -858,3 +875,5 @@ fn update_and_why_accept_depth_infinity() {
 }
 
 mod global_options;
+
+mod docs_command_pages;

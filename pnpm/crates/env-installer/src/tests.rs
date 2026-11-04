@@ -83,7 +83,7 @@ fn build_resolver(registry: &str) -> (NpmResolver<InMemoryPackageMetaCache>, Tem
     registries.insert("default".to_string(), registry.to_string());
     let resolver = NpmResolver {
         registries,
-        registries_by_prefix: std::collections::HashMap::new(),
+        declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client: Arc::new(ThrottledClient::default()),
             auth_headers: Arc::new(AuthHeaders::default()),
@@ -98,6 +98,7 @@ fn build_resolver(registry: &str) -> (NpmResolver<InMemoryPackageMetaCache>, Tem
             needs_full_metadata_for: None,
             filter_metadata: false,
             registry_options_by_url: std::sync::Arc::default(),
+            minimum_release_age: None,
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
             network: pnpm_config::NetworkPolicy::Online,
@@ -186,7 +187,10 @@ fn options<'a>(
         store_index: crate::ConfigDependencyStoreIndex::default(),
         root_dir,
 
-        frozen_lockfile: frozen,
+        lockfile: crate::EnvLockfileOptions {
+            frozen,
+            symlinked: pnpm_lockfile::SymlinkedLockfile::Refuse,
+        },
     }
 }
 

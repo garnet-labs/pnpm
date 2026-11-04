@@ -20,6 +20,7 @@ use std::{
     ffi::OsStr,
     fmt::Write as _,
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output},
     thread,
@@ -493,6 +494,22 @@ fn insert_dependency_group(manifest: &mut Map<String, Value>, group: &str, deps:
 }
 
 #[must_use]
+/// A gzipped tar holding `entries`, each a `(path, contents)` pair.
+pub fn gzipped_tarball(entries: &[(&str, &str)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, contents) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, contents.as_bytes()).expect("append tar entry");
+    }
+    let tar = builder.into_inner().expect("finish the tar archive");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).expect("gzip the tarball");
+    encoder.finish().expect("finish the gzip stream")
+}
+
 pub fn read_manifest(project: &Path) -> Value {
     serde_json::from_str(
         &fs::read_to_string(project.join("package.json")).expect("read package.json"),
@@ -582,7 +599,9 @@ pub fn repin_snapshot_dependency(
         .get_mut(&dependency.parse().expect("parse the dependency name"))
         .unwrap_or_else(|| panic!("snapshot {snapshot_key} does not pin {dependency}"));
     *pin = serde_saphyr::from_str(new_ref).expect("parse the new dependency ref");
-    lockfile.save_to_path(lockfile_path).expect("write the rewritten lockfile");
+    lockfile
+        .save_to_path(lockfile_path, pnpm_lockfile::SymlinkedLockfile::Refuse)
+        .expect("write the rewritten lockfile");
 }
 
 /// A package script that creates `relative_path` as an empty file: the
@@ -972,6 +991,9 @@ fn read_normalized_modules_manifest(modules_dir: &Path) -> Modules {
     if manifest.allow_builds.as_ref().is_some_and(BTreeMap::is_empty) {
         manifest.allow_builds = None;
     }
+    if manifest.ignored_builds.as_ref().is_some_and(indexmap::IndexSet::is_empty) {
+        manifest.ignored_builds = None;
+    }
     if let Some(hoisted_locations) = &mut manifest.hoisted_locations {
         normalize_dir_map(hoisted_locations);
     }
@@ -1080,6 +1102,26 @@ impl TreeView {
         self.memo.insert(real, described.clone());
         described
     }
+}
+
+/// Where Node.js finds each dependency `project_dir` declares from the
+/// registry, every group included. Workspace dependencies are left out.
+#[must_use]
+pub fn registry_dependency_dirs(project_dir: &Path) -> Vec<(String, Option<PathBuf>)> {
+    let manifest = read_manifest_or_null(project_dir);
+    declared_dependencies(&manifest, &["dependencies", "optionalDependencies", "devDependencies"])
+        .into_iter()
+        .filter(|name| {
+            ["dependencies", "optionalDependencies", "devDependencies"]
+                .iter()
+                .filter_map(|group| manifest[*group][name].as_str())
+                .all(|spec| !spec.starts_with("workspace:"))
+        })
+        .map(|name| {
+            let dir = resolve_node_modules_package(project_dir, &name);
+            (name, dir)
+        })
+        .collect()
 }
 
 fn read_manifest_or_null(dir: &Path) -> Value {

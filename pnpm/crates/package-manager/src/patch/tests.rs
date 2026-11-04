@@ -506,7 +506,10 @@ fn resolution_kind_names_non_patchable_resolution_shapes() {
     });
     assert_eq!(resolution_kind(&binary), "binary");
 
-    let variations = LockfileResolution::Variations(VariationsResolution { variants: Vec::new() });
+    let variations = LockfileResolution::Variations(VariationsResolution {
+        variants: Vec::new(),
+        revision: None,
+    });
     assert_eq!(resolution_kind(&variations), "variations");
 }
 
@@ -539,7 +542,7 @@ impl PatchExtractFixture {
         git_hosted_flag: bool,
     ) -> Self {
         use pnpm_tarball::{CacheValue, CachedTarball};
-        use std::{collections::HashMap, path::PathBuf, sync::Arc};
+        use std::{collections::HashMap, sync::Arc};
 
         let tmp = tempfile::tempdir().expect("temp dir");
         let store_dir = tmp.path().join("store");
@@ -579,10 +582,10 @@ impl PatchExtractFixture {
         } else {
             format!("https://registry.test/{name}/-/{name}-{version}.tgz")
         };
-        let seeded: HashMap<String, PathBuf> = HashMap::from([
-            ("package.json".to_string(), pkg_json),
-            ("index.js".to_string(), index),
-            ("ignore.txt".to_string(), ignored),
+        let seeded: pnpm_fs::CasPaths = HashMap::from([
+            ("package.json".to_string(), pkg_json.into()),
+            ("index.js".to_string(), index.into()),
+            ("ignore.txt".to_string(), ignored.into()),
         ]);
         let mem_cache = pnpm_tarball::MemCache::default();
         mem_cache.insert(
@@ -618,7 +621,7 @@ async fn resolve_registry_fixture(
     registries.insert("default".to_string(), registry.to_string());
     let resolver = NpmResolver {
         registries,
-        registries_by_prefix: HashMap::new(),
+        declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client,
             auth_headers: Arc::default(),
@@ -633,6 +636,7 @@ async fn resolve_registry_fixture(
             needs_full_metadata_for: None,
             filter_metadata: false,
             registry_options_by_url: std::sync::Arc::default(),
+            minimum_release_age: None,
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
             network: pnpm_config::NetworkPolicy::Online,

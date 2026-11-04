@@ -1,14 +1,13 @@
 pub(super) use super::{
     Action, AppInner, AppState, AuthedCaller, CanonicalPackageName, MAX_PUBLISH_BODY_BYTES,
-    MAX_TEAM_BODY_BYTES, RegistrySource, TargetRegistry, addressed_registry, authenticate,
-    authorize_package, batch, caller_scoped, cargo, check_publish_tombstone, delete_package,
-    delete_tarball, get_dist_tags, get_org_teams, get_team_members,
+    MAX_TEAM_BODY_BYTES, RegistrySource, TargetRegistry, authenticate, authorize_package, batch,
+    caller_scoped, cargo, check_publish_tombstone, delete_package, delete_tarball, get_dist_tags,
+    get_org_teams, get_team_members,
     health::{serve_live, serve_ping, serve_ready},
     hosted_storage, not_found, oci, pnpr_protocols_disabled, private_no_cache, publish_package,
-    pypi, remove_dist_tag, resolve_write_target, serve_batch_publish, serve_metrics,
-    serve_org_packages, serve_package_tarball, serve_packument, serve_pnpr_handshake,
-    serve_revision_tarball, serve_search, serve_tarball, serve_version_manifest, set_dist_tag,
-    split_package_identifier, staged,
+    pypi, remove_dist_tag, resolve_write_target, serve_metrics, serve_org_packages,
+    serve_package_tarball, serve_packument, serve_pnpr_handshake, serve_search, serve_tarball,
+    serve_version_manifest, set_dist_tag, split_package_identifier, staged,
     team_access::{grant_team_access, list_team_packages, revoke_team_access},
     team_mutations::{TeamScope, add_team_member, create_team, destroy_team, remove_team_member},
     update_packument,
@@ -18,19 +17,26 @@ mod account_handlers;
 use account_handlers::account_routes;
 
 mod protocol_routes;
-use protocol_routes::{artifacts_routes, pipeline_routes, resolver_routes};
+use protocol_routes::{
+    artifacts_routes, pipeline_routes, resolver_routes, staged_archive_routes,
+    staged_archive_routes_under,
+};
 
 mod team_handlers;
 use team_handlers::team_routes;
 
+mod note_handlers;
 mod npm_handlers;
 use npm_handlers::{
-    delete_package_dist_tag, get_package_dist_tags, get_packument,
-    get_packument_or_version_manifest, get_revision_tarball, get_scoped_tarball,
-    get_scoped_version_manifest, get_search, get_tarball, put_package, put_package_dist_tag,
-    put_packument_revision, put_scoped_package, put_scoped_packument_revision, unpublish_package,
-    unpublish_scoped_package, unpublish_scoped_tarball, unpublish_tarball,
+    delete_package_dist_tag, delete_scoped_package, get_package_dist_tags, get_packument,
+    get_packument_or_version_manifest, get_scoped_tarball, get_search, get_tarball, put_package,
+    put_package_dist_tag, put_packument_revision, put_scoped_package,
+    put_scoped_packument_revision, unpublish_package, unpublish_scoped_package,
+    unpublish_scoped_tarball, unpublish_tarball,
 };
+
+mod variant_handlers;
+use variant_handlers::get_scoped_variant_tarball;
 
 mod observability;
 use observability::with_observability_layers;
@@ -44,6 +50,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, delete, get, post, put},
 };
+use pnpr_storage::metadata::MAX_NOTE_BYTES;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use pnpr_auth::AuthState;
@@ -56,6 +63,16 @@ pub(super) fn router_with_auth_and_osv(
     auth: AuthState,
     osv_index: Option<Arc<pnpr_osv::OsvIndex>>,
 ) -> pnpr_error::Result<Router> {
+    state_and_router(config, auth, osv_index).map(|(_, router)| router)
+}
+
+/// The main router and the state it serves, which [`metrics_listener_router`]
+/// shares.
+pub(super) fn state_and_router(
+    config: Config,
+    auth: AuthState,
+    osv_index: Option<Arc<pnpr_osv::OsvIndex>>,
+) -> pnpr_error::Result<(AppState, Router)> {
     let cors_origins = cors_origins(&config)?;
     let surfaces = EnabledSurfaces {
         resolver: config.features.resolver.enabled,
@@ -65,7 +82,11 @@ pub(super) fn router_with_auth_and_osv(
     };
     let ui_dir = if surfaces.registry { super::web_ui::locate(&config.http.ui)? } else { None };
     let state = AppState { inner: Arc::new(AppInner::new(config, auth, osv_index)?) };
-    finish_router(state, surfaces, cors_origins, ui_dir.as_deref())
+    let router = finish_router(state.clone(), surfaces, cors_origins, ui_dir.as_deref())?;
+    // Every router, also one an embedder builds directly, picks up what an
+    // interrupted integration of the release record logs left.
+    super::release_record_logs::integrate_sequenced_logs(&state);
+    Ok((state, router))
 }
 
 fn finish_router(
@@ -86,7 +107,8 @@ fn finish_router(
         // restricted token is rejected before a write handler buffers its
         // up-to-100-MiB body), and stash the identity for handlers to read.
         // Inside the trace layer below, so a rejection is still one record.
-        .layer(axum::middleware::from_fn_with_state(state.clone(), authenticate));
+        .layer(axum::middleware::from_fn_with_state(state.clone(), authenticate))
+        .merge(main_listener_metrics_routes(&state));
     let mut router = apply_request_timeout(router, state.inner.config.http.request_timeout);
     if !cors_origins.is_empty() {
         router = router.layer(
@@ -110,6 +132,47 @@ fn finish_router(
         );
     }
     Ok(with_observability_layers(router, state.clone()).with_state(state))
+}
+
+/// Health probes, each with a `/~<name>/`-addressed twin.
+fn probe_routes() -> Router<AppState> {
+    let mut router: Router<AppState> = Router::new();
+    for base in ["", "/~{registry}"] {
+        let path = |tail: &str| format!("{base}{tail}");
+        router = router
+            .route(&path("/-/ping"), get(serve_ping))
+            .route(&path("/-/ready"), get(serve_ready))
+            .route(&path("/-/live"), get(serve_live));
+    }
+    router
+}
+
+/// The main listener's metrics routes, each with a `/~<name>/`-addressed twin.
+/// It serves them only to a scraper that sends `metrics.token`, and never when
+/// `metrics.listen` gives them their own listener. They sit outside
+/// [`authenticate`], so a scrape never looks its token up as a user token and
+/// still answers while the auth backend is down.
+fn main_listener_metrics_routes(state: &AppState) -> Router<AppState> {
+    let served = state.inner.config.http.metrics
+        .as_ref()
+        .is_some_and(|metrics| metrics.token.is_some() && metrics.listen.is_none());
+    let mut router: Router<AppState> = Router::new();
+    if served {
+        for base in ["", "/~{registry}"] {
+            router = router
+                .route(&format!("{base}/-/metrics"), get(serve_metrics))
+                .route(&format!("{base}/metrics"), get(serve_metrics));
+        }
+    }
+    router
+}
+
+/// The router for `metrics.listen`, sharing `state` with the main router so
+/// both report the same counters, with the main router's access log and
+/// request IDs.
+pub(super) fn metrics_listener_router(state: AppState) -> Router {
+    let router = Router::new().route("/metrics", get(serve_metrics));
+    with_observability_layers(router, state.clone()).with_state(state)
 }
 
 fn apply_request_timeout(
@@ -167,16 +230,7 @@ fn surface_routes(
     // The configurable surfaces are mounted only when their feature is enabled,
     // so resolver, registry, and artifacts can be deployed independently.
     // The config guarantees at least one is enabled.
-    let mut router: Router<AppState> = Router::new();
-    for base in ["", "/~{registry}"] {
-        let path = |tail: &str| format!("{base}{tail}");
-        router = router
-            .route(&path("/-/ping"), get(serve_ping))
-            .route(&path("/-/ready"), get(serve_ready))
-            .route(&path("/-/live"), get(serve_live))
-            .route(&path("/-/metrics"), get(serve_metrics))
-            .route(&path("/metrics"), get(serve_metrics));
-    }
+    let mut router = probe_routes();
     router = router
         .merge(super::oidc::routes(ui_served))
         .merge(account_routes())
@@ -206,6 +260,8 @@ fn surface_routes(
     }
     if surfaces.artifacts {
         router = artifacts_routes(state, router);
+    } else if surfaces.registry {
+        router = staged_archive_routes(router);
     }
     if surfaces.pipeline {
         router = pipeline_routes(state, router);
@@ -226,7 +282,16 @@ fn registry_routes(state: &AppState, router: Router<AppState>) -> Router<AppStat
     // rather than inside the npm surface.
     let mut router = router
         .route("/-/pnpr/v0/publish", put(batch::serve_ecosystem_publish))
-        .route("/-/pnpr/v0/registries", get(super::registry_directory::serve));
+        .route("/-/pnpr/v0/registries", get(super::registry_directory::serve))
+        .route("/-/publications/{org}", get(super::publications::serve_member_publication))
+        .route("/-/publications/{org}/{publication}", get(super::publications::serve_publication))
+        .route(
+            "/-/publications/{org}/{publication}/notes",
+            get(super::publications::serve_publication_note)
+                .put(super::publications::serve_publication_note)
+                .delete(super::publications::serve_publication_note)
+                .route_layer(DefaultBodyLimit::max(MAX_NOTE_BYTES)),
+        );
     if registries.has_ecosystem(Ecosystem::Npm) {
         router = router.nest(&Ecosystem::Npm.base_path(), account_routes().merge(npm));
     }
@@ -253,53 +318,93 @@ fn registry_routes(state: &AppState, router: Router<AppState>) -> Router<AppStat
 /// was reached through.
 fn npm_registry_routes() -> Router<AppState> {
     // Batch publish: one request carrying many packages' publish documents.
-    // Not part of the standard npm registry API — `pnpm publish --batch` opts
-    // into it explicitly, and only against the path-less base.
-    let mut router = Router::new().route("/-/pnpm/v1/publish", put(serve_batch_publish));
+    // Mounted at the server root (`registry_routes`), the path-less npm base
+    // (`/npm/-/pnpr/v0/publish`), and a named registry's base, so `pnpm
+    // publish --batch` can resolve it relative to the configured npm
+    // registry URL; under a named registry, its npm entries are addressed
+    // through that registry. The archives a publish references are staged
+    // beside it, under the same base.
+    let mut router = staged_archive_routes(
+        Router::new()
+            .route("/-/pnpr/v0/publish", put(batch::serve_ecosystem_publish))
+            .route("/~{registry}/-/pnpr/v0/publish", put(batch::serve_registry_publish)),
+    );
+    router = staged_archive_routes_under(router, "/~{registry}");
     for base in ["", "/~{registry}"] {
         let path = |tail: &str| format!("{base}{tail}");
         let with_teams = team_routes(staged_routes(ping_route(router, base), base), base);
-        router = super::security_audit::routes(with_teams, base)
+        let with_audit = super::security_audit::routes(with_teams, base)
             .route(&path("/-/v1/search"), get(get_search))
             .route(&path("/-/npm/v1/keys"), get(super::attestations::get_keys))
+            .route(&path("/-/log/{*resource}"), get(super::log_routes::get_log_resource))
             .route(
                 &path("/-/npm/v1/attestations/{*spec}"),
                 get(super::attestations::get_attestations),
             )
-            .route(&path("/-/tarballs/sha512/{digest}"), get(get_revision_tarball))
             .route(&path("/-/package/{name}/dist-tags"), get(get_package_dist_tags))
             .route(
                 &path("/-/package/{name}/dist-tags/{tag}"),
                 put(put_package_dist_tag).delete(delete_package_dist_tag),
-            )
-            // Package addresses. npm spells a scoped name either as two
-            // literal segments (`/@scope/name`) or as one percent-encoded
-            // segment (`/@scope%2Fname`), so a path's segment count never says
-            // on its own which resource it names. The `-` and `-rev` markers
-            // do: whatever stands to their left is the package.
-            .route(&path("/{name}"), get(get_packument).put(put_package))
-            .route(
-                &path("/{first}/{second}"),
-                get(get_packument_or_version_manifest).put(put_scoped_package),
-            )
-            .route(&path("/{name}/-/{filename}"), get(get_tarball))
-            .route(
-                &path("/{name}/-rev/{rev}"),
-                put(put_packument_revision).delete(unpublish_package),
-            )
-            .route(
-                &path("/{scope}/{name}/-rev/{rev}"),
-                put(put_scoped_packument_revision).delete(unpublish_scoped_package),
-            )
-            .route(&path("/{scope}/{name}/{version}"), get(get_scoped_version_manifest))
-            .route(&path("/{scope}/{name}/-/{filename}"), get(get_scoped_tarball))
-            .route(&path("/{name}/-/{filename}/-rev/{rev}"), delete(unpublish_tarball))
-            .route(
-                &path("/{scope}/{name}/-/{filename}/-rev/{rev}"),
-                delete(unpublish_scoped_tarball),
             );
+        router = npm_package_routes(with_audit, base);
     }
     router
+}
+
+/// Package addresses. npm spells a scoped name either as two literal segments
+/// (`/@scope/name`) or as one percent-encoded segment (`/@scope%2Fname`), so a
+/// path's segment count never says on its own which resource it names. The `-`
+/// and `-rev` markers do: whatever stands to their left is the package.
+fn npm_package_routes(router: Router<AppState>, base: &str) -> Router<AppState> {
+    let path = |tail: &str| format!("{base}{tail}");
+    npm_version_routes(router, base)
+        .route(&path("/{name}"), get(get_packument).put(put_package).delete(unpublish_package))
+        .route(
+            &path("/{first}/{second}"),
+            get(get_packument_or_version_manifest)
+                .put(put_scoped_package)
+                .delete(delete_scoped_package),
+        )
+        .route(&path("/{name}/-/{filename}"), get(get_tarball).delete(unpublish_tarball))
+        .route(&path("/{name}/-rev/{rev}"), put(put_packument_revision).delete(unpublish_package))
+        .route(
+            &path("/{scope}/{name}/-rev/{rev}"),
+            put(put_scoped_packument_revision).delete(unpublish_scoped_package),
+        )
+        .route(
+            &path("/{scope}/{name}/{version}"),
+            get(note_handlers::three_segments)
+                .put(note_handlers::three_segments)
+                .delete(note_handlers::three_segments)
+                .route_layer(DefaultBodyLimit::max(MAX_NOTE_BYTES)),
+        )
+        .route(&path("/{name}/-/notes"), get(note_handlers::package_notes))
+        .route(&path("/{scope}/{name}/-/notes"), get(note_handlers::scoped_package_notes))
+        .route(&path("/{scope}/{name}/variants/{tag}"), get(get_scoped_variant_tarball))
+        .route(
+            &path("/{scope}/{name}/-/{filename}"),
+            get(get_scoped_tarball).delete(unpublish_scoped_tarball),
+        )
+        .route(&path("/{name}/-/{filename}/-rev/{rev}"), delete(unpublish_tarball))
+        .route(&path("/{scope}/{name}/-/{filename}/-rev/{rev}"), delete(unpublish_scoped_tarball))
+}
+
+/// What a scoped version address of two literal segments is followed by:
+/// its release record's evidence and its note.
+fn npm_version_routes(router: Router<AppState>, base: &str) -> Router<AppState> {
+    let path = |tail: &str| format!("{base}{tail}");
+    router
+        .route(
+            &path("/{scope}/{name}/{version}/evidence"),
+            get(note_handlers::scoped_record_evidence),
+        )
+        .route(
+            &path("/{scope}/{name}/{version}/notes"),
+            get(note_handlers::scoped_version_note)
+                .put(note_handlers::scoped_version_note)
+                .delete(note_handlers::scoped_version_note)
+                .route_layer(DefaultBodyLimit::max(MAX_NOTE_BYTES)),
+        )
 }
 
 /// `npm ping` asks the registry URL, not the server root.

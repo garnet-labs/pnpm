@@ -4,9 +4,13 @@
 
 use chrono::{DateTime, Utc};
 use pnpm_config::{
-    Config, NeedsFullMetadataFor, ResolutionMode,
+    Config, NeedsFullMetadataFor, ResolutionMode, Tool,
     version_policy::{PackageVersionPolicy, VersionPolicyError, create_package_version_policy},
 };
+use pnpm_engine_pm_yarn_resolver::YarnResolver;
+use pnpm_engine_runtime_bun_resolver::BunResolver;
+use pnpm_engine_runtime_deno_resolver::DenoResolver;
+use pnpm_engine_runtime_node_resolver::NodeResolver;
 use pnpm_network::ThrottledClient;
 use pnpm_resolving_default_resolver::DefaultResolver;
 use pnpm_resolving_npm_resolver::{
@@ -14,6 +18,7 @@ use pnpm_resolving_npm_resolver::{
     OfflineStoreView, PackumentFetchLocker, PickPackageContext, merge_named_registries,
     shared_packument_fetch_locker, shared_picked_manifest_cache,
 };
+use pnpm_resolving_resolver_base::Resolver;
 use std::sync::Arc;
 
 /// The version-pick knobs derived purely from [`Config`]. Computed once per
@@ -138,13 +143,42 @@ pub fn create_configured_registry_resolver(
     http_client: Arc<ThrottledClient>,
     policy: &PickPolicy,
 ) -> Result<DefaultResolver, MergeNamedRegistriesError> {
-    let npm = create_configured_npm_resolver(config, http_client, policy)?;
-    let named = NamedRegistryResolver {
-        registry_names: npm.registries_by_prefix
+    let npm = create_configured_npm_resolver(config, Arc::clone(&http_client), policy)?;
+    let named = create_configured_named_registry_resolver(config, &npm, policy)?;
+    let registry_resolver: Arc<dyn Resolver> =
+        Arc::new(DefaultResolver::new(vec![Box::new(npm), Box::new(named)]));
+    let node_resolver = create_configured_node_resolver(config, Arc::clone(&http_client));
+    Ok(DefaultResolver::new(vec![
+        Box::new(Arc::clone(&registry_resolver)) as Box<dyn Resolver>,
+        Box::new(node_resolver),
+        Box::new(DenoResolver::new(Arc::clone(&http_client), Arc::clone(&registry_resolver))),
+        Box::new(
+            BunResolver::new(Arc::clone(&http_client), Arc::clone(&registry_resolver))
+                .with_mirror(config.tool_mirror(Tool::Bun)),
+        ),
+        Box::new(YarnResolver::new(http_client, config.tls.strict_ssl.unwrap_or(true))),
+    ]))
+}
+
+fn create_configured_named_registry_resolver(
+    config: &Config,
+    npm: &NpmResolver<InMemoryPackageMetaCache>,
+    policy: &PickPolicy,
+) -> Result<NamedRegistryResolver<InMemoryPackageMetaCache>, MergeNamedRegistriesError> {
+    let registries_by_prefix = merge_named_registries(
+        &config.registries_by_prefix
+            .clone()
+            .into_iter()
+            .collect(),
+    )?;
+    Ok(NamedRegistryResolver {
+        registry_names: registries_by_prefix
             .keys()
             .cloned()
             .collect(),
-        registries_by_prefix: npm.registries_by_prefix.clone(),
+        registries_by_prefix,
+        registries: npm.registries.clone(),
+        declared_prefixes: npm.declared_prefixes.clone(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client: Arc::clone(&npm.metadata.http_client),
             auth_headers: Arc::clone(&npm.metadata.auth_headers),
@@ -159,11 +193,25 @@ pub fn create_configured_registry_resolver(
             needs_full_metadata_for: Some(Arc::clone(&policy.needs_full_metadata_for)),
             filter_metadata: policy.filter_metadata,
             registry_options_by_url: Arc::clone(&npm.format.registry_options_by_url),
+            minimum_release_age: npm.format.minimum_release_age,
         },
         cache_policy: npm.cache_policy,
         store_view: offline_store_view(config),
-    };
-    Ok(DefaultResolver::new(vec![Box::new(npm), Box::new(named)]))
+    })
+}
+
+fn create_configured_node_resolver(
+    config: &Config,
+    http_client: Arc<ThrottledClient>,
+) -> NodeResolver {
+    let mut node_resolver =
+        NodeResolver::new_with_auth(http_client, Arc::clone(&config.auth_headers));
+    node_resolver.node_download_mirrors.clone_from(&config.node_download_mirrors);
+    node_resolver.mirror = config.tool_mirror(Tool::Node).map(ToString::to_string);
+    node_resolver.channel_mirrors = config.tool_channel_mirrors(Tool::Node);
+    node_resolver.offline = config.offline;
+    node_resolver.cache_dir = Some(config.cache_dir.clone());
+    node_resolver
 }
 
 fn create_configured_npm_resolver(
@@ -171,18 +219,12 @@ fn create_configured_npm_resolver(
     http_client: Arc<ThrottledClient>,
     policy: &PickPolicy,
 ) -> Result<NpmResolver<InMemoryPackageMetaCache>, MergeNamedRegistriesError> {
-    let registries_by_prefix = merge_named_registries(
-        &config.registries_by_prefix
-            .clone()
-            .into_iter()
-            .collect(),
-    )?;
     Ok(NpmResolver {
         registries: config
             .resolved_registries()
             .into_iter()
             .collect(),
-        registries_by_prefix,
+        declared_prefixes: config.declared_registry_prefixes(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client,
             auth_headers: Arc::clone(&config.auth_headers),
@@ -197,6 +239,7 @@ fn create_configured_npm_resolver(
             needs_full_metadata_for: Some(Arc::clone(&policy.needs_full_metadata_for)),
             filter_metadata: policy.filter_metadata,
             registry_options_by_url: Arc::new(config.registry_options_by_url.clone()),
+            minimum_release_age: config.resolved_minimum_release_age(),
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
             network: config.network_policy(),
@@ -229,6 +272,10 @@ pub(crate) fn pick_package_context<'a>(
     store_view: Option<&'a OfflineStoreView>,
 ) -> PickPackageContext<'a, InMemoryPackageMetaCache> {
     PickPackageContext {
+        pnpr_format: Some(pnpm_resolving_npm_resolver::PnprFormatPolicy {
+            registry_options: &config.registry_options_by_url,
+            minimum_release_age: config.resolved_minimum_release_age(),
+        }),
         full_metadata: policy.full_metadata,
         needs_full_metadata_for: Some(policy.needs_full_metadata_for.as_ref()),
         filter_metadata: policy.filter_metadata,

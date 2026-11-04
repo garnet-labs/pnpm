@@ -1,6 +1,11 @@
+use std::future::IntoFuture;
+
+use axum::Router;
+use futures_util::FutureExt as _;
+
 use super::{
-    Arc, AuthState, Config, Ecosystem, NodelayTcpListener, PeerAddr, RegistryDocuments, Storage,
-    router_with_auth_and_osv, shutdown_signal,
+    AppState, Arc, AuthState, Config, Ecosystem, NodelayTcpListener, PeerAddr, Storage,
+    metrics_listener_router, shutdown_signal, state_and_router,
 };
 
 /// Load the OSV index only for surfaces that consult it. An artifacts-only
@@ -15,20 +20,14 @@ pub(super) fn load_active_osv_index(
     }
 }
 
-/// Check the hosted store's layout, then bring the publish journal to a
-/// consistent state: apply every sealed transaction, discard every unsealed
-/// one. [`serve`] and [`serve_listener`] call this before binding; an embedder
-/// that builds a router directly should call it itself on startup, before
-/// serving requests.
-pub async fn recover_publish_journal(config: &Config) -> pnpr_error::Result<()> {
-    let storage = Storage::new(
-        &config.storage.hosted_backend,
-        config.storage.hosted_dir.clone(),
-        config.storage.cache_dir.clone(),
-    )?;
+/// Check the hosted store's layout, and empty a proxy cache in another
+/// layout. [`serve`] and [`serve_listener`] call this before binding; an
+/// embedder that builds a router directly should call it itself on startup,
+/// before serving requests.
+pub async fn prepare_storage(config: &Config) -> pnpr_error::Result<()> {
+    let storage = Storage::from_config(&config.storage)?;
     storage.ensure_hosted_layout().await?;
-    storage.reset_cache_from_other_layout().await?;
-    pnpr_storage::journal::recover_publish_journal(config, &RegistryDocuments).await
+    storage.reset_cache_from_other_layout().await
 }
 
 /// Reclaim blob uploads abandoned before an unclean shutdown, and any left
@@ -38,23 +37,20 @@ async fn sweep_abandoned_uploads(config: &Config) -> pnpr_error::Result<()> {
     if !config.routing.registries.has_ecosystem(Ecosystem::Oci) {
         return Ok(());
     }
-    let storage = Storage::new(
-        &config.storage.hosted_backend,
-        config.storage.hosted_dir.clone(),
-        config.storage.cache_dir.clone(),
-    )?;
+    let storage = Storage::from_config(&config.storage)?;
     // Shared sessions live in their hosted namespace. Local scratch can be
     // shared by those namespaces and is safe to sweep more than once.
     let mut namespaces: Vec<&str> = config.routing.hosted
-        .values()
-        .map(|hosted| hosted.org.as_str())
+        .iter()
+        .filter(|(name, _)| config.routing.registries.ecosystem(name) == Some(Ecosystem::Oci))
+        .map(|(_, hosted)| hosted.org.as_str())
         .collect();
     namespaces.push("");
     namespaces.sort_unstable();
     namespaces.dedup();
     for namespace in namespaces {
         let swept = storage
-            .for_hosted(namespace)
+            .for_hosted(namespace, Ecosystem::Oci)
             .sweep_blob_uploads(pnpr_storage::upload::UPLOAD_MAX_AGE)
             .await?;
         if swept > 0 {
@@ -64,14 +60,40 @@ async fn sweep_abandoned_uploads(config: &Config) -> pnpr_error::Result<()> {
     Ok(())
 }
 
+/// Remove release archives staged for a publish that never claimed them
+/// before they expired, now and then every hour while the server runs.
+async fn sweep_expired_staged_archives(config: &Config) -> pnpr_error::Result<()> {
+    let storage = Storage::from_config(&config.storage)?;
+    report_staged_archive_sweep(storage.sweep_staged_archives().await?);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_hours(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match storage.sweep_staged_archives().await {
+                Ok(swept) => report_staged_archive_sweep(swept),
+                Err(err) => tracing::warn!(error = %err, "sweeping staged release archives failed"),
+            }
+        }
+    });
+    Ok(())
+}
+
+fn report_staged_archive_sweep(swept: usize) {
+    if swept > 0 {
+        tracing::info!(swept, "reclaimed expired staged release archives");
+    }
+}
+
 /// Run startup side effects and load the auth backends. The registry
-/// needs publish-journal recovery; auth loads on every tier because the
+/// prepares its storage; auth loads on every tier because the
 /// account endpoints (which mint and manage tokens) are always served,
 /// and every mounted surface consults caller identity.
 async fn load_startup_auth(config: &Config) -> pnpr_error::Result<AuthState> {
     if config.features.registry.enabled {
-        recover_publish_journal(config).await?;
+        prepare_storage(config).await?;
         sweep_abandoned_uploads(config).await?;
+        sweep_expired_staged_archives(config).await?;
         crate::cache_maintenance::prune_orphaned_namespaces_startup(config).await?;
     }
     AuthState::load(&config.identity.auth, &config.identity.backend).await
@@ -79,8 +101,7 @@ async fn load_startup_auth(config: &Config) -> pnpr_error::Result<AuthState> {
 
 /// Bind to `config.http.listen` and serve forever. Loads auth state before
 /// binding so a startup-time auth error surfaces before we accept any
-/// client connections. Registry startup additionally recovers the publish
-/// journal.
+/// client connections. Registry startup additionally prepares the storage.
 pub async fn serve(mut config: Config) -> pnpr_error::Result<()> {
     // Enforce the "at least one surface" invariant here too, not only at
     // YAML load / CLI: embedders build `Config` programmatically and call
@@ -88,6 +109,7 @@ pub async fn serve(mut config: Config) -> pnpr_error::Result<()> {
     // rather than start a server that only answers `/-/ping`.
     config.features.ensure_a_feature_is_enabled()?;
     config.routing.ensure_valid_registry_graph(config.features.registry.enabled)?;
+    config.http.ensure_valid_metrics()?;
     log_enabled_surfaces(&config);
     let osv_index = load_active_osv_index(&config)?;
     let auth = load_startup_auth(&config).await?;
@@ -96,12 +118,52 @@ pub async fn serve(mut config: Config) -> pnpr_error::Result<()> {
     // should not leave a bound socket behind or put a `pnpr listening` line
     // immediately above the error saying it is not.
     crate::cache_maintenance::spawn_periodic_cache_eviction(&config);
-    let app = router_with_auth_and_osv(config, auth, osv_index)?;
-    let listener = NodelayTcpListener(tokio::net::TcpListener::bind(listen).await?);
+    let (state, app) = state_and_router(config, auth, osv_index)?;
+    let metrics = bind_metrics_listener(state).await?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "pnpr listening");
-    axum::serve(listener, app.into_make_service_with_connect_info::<PeerAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    serve_until_shutdown(listener, app, metrics).await
+}
+
+/// The listener `metrics.listen` names, with the router it serves.
+struct MetricsListener {
+    listener: tokio::net::TcpListener,
+    router: Router,
+}
+
+async fn bind_metrics_listener(state: AppState) -> pnpr_error::Result<Option<MetricsListener>> {
+    let Some(listen) = state.inner.config.http.metrics.as_ref().and_then(|metrics| metrics.listen)
+    else {
+        return Ok(None);
+    };
+    let listener = tokio::net::TcpListener::bind(listen).await
+        .map_err(|err| {
+            std::io::Error::new(err.kind(), format!("cannot bind metrics.listen {listen}: {err}"))
+        })?;
+    tracing::info!(listen = %listener.local_addr()?, "pnpr serving metrics");
+    Ok(Some(MetricsListener { listener, router: metrics_listener_router(state) }))
+}
+
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    metrics: Option<MetricsListener>,
+) -> pnpr_error::Result<()> {
+    let shutdown = shutdown_signal().shared();
+    let main = axum::serve(
+        NodelayTcpListener(listener),
+        app.into_make_service_with_connect_info::<PeerAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.clone())
+    .into_future();
+    match metrics {
+        None => main.await?,
+        Some(MetricsListener { listener, router }) => {
+            let metrics =
+                axum::serve(listener, router).with_graceful_shutdown(shutdown).into_future();
+            tokio::try_join!(main, metrics)?;
+        }
+    }
     Ok(())
 }
 
@@ -133,19 +195,15 @@ pub async fn serve_listener(
     let listen = listener.local_addr()?;
     config.features.ensure_a_feature_is_enabled()?;
     config.routing.ensure_valid_registry_graph(config.features.registry.enabled)?;
+    config.http.ensure_valid_metrics()?;
     log_enabled_surfaces(&config);
     let osv_index = load_active_osv_index(&config)?;
     // Load the configured auth backends here too — going through `router`
     // would silently fall back to in-memory auth and ignore a persisted
     // htpasswd / SQLite store or a configured `backend:`.
     let auth = load_startup_auth(&config).await?;
-    let app = router_with_auth_and_osv(config, auth, osv_index)?;
+    let (state, app) = state_and_router(config, auth, osv_index)?;
+    let metrics = bind_metrics_listener(state).await?;
     tracing::info!(%listen, "pnpr listening");
-    axum::serve(
-        NodelayTcpListener(listener),
-        app.into_make_service_with_connect_info::<PeerAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
-    Ok(())
+    serve_until_shutdown(listener, app, metrics).await
 }

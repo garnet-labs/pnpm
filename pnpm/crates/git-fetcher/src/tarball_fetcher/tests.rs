@@ -3,10 +3,9 @@ use crate::{
     error::{GitFetcherError, PreparePackageError},
     prepare_package::AllowBuildRef,
 };
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_reporter::SilentReporter;
 use pnpm_store_dir::{StoreDir, StoreIndex, StoreIndexWriter};
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, fs, sync::Arc};
 use tempfile::tempdir;
 
 fn deny_all_builds<'a>() -> AllowBuildRef<'a> {
@@ -20,10 +19,10 @@ fn allow_all_builds<'a>() -> AllowBuildRef<'a> {
 /// Build the `cas_paths` map the dispatcher would hand the fetcher
 /// after `IngestTarballToStore` finishes: a fresh `StoreDir`, a few
 /// files written via `write_cas_file`, and a `path → cas_path` map.
-fn write_to_cas(store_dir: &StoreDir, files: &[(&str, &[u8], bool)]) -> HashMap<String, PathBuf> {
+fn write_to_cas(store_dir: &StoreDir, files: &[(&str, &[u8], bool)]) -> pnpm_fs::CasPaths {
     let mut out = HashMap::new();
     for &(rel, bytes, executable) in files {
-        let (cas_path, _hash) = store_dir.write_cas_file(bytes, executable).unwrap();
+        let cas_path = store_dir.write_cas_file(bytes, executable).unwrap().file;
         out.insert(rel.to_string(), cas_path);
     }
     out
@@ -51,7 +50,6 @@ async fn passes_through_package_without_scripts() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -106,7 +104,6 @@ async fn filters_files_outside_files_field() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -160,7 +157,6 @@ async fn rejects_build_when_not_allowed() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -209,7 +205,6 @@ async fn surfaces_prepare_script_failure() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -271,7 +266,6 @@ async fn path_field_packs_only_subdirectory() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -335,7 +329,6 @@ async fn materialized_temp_dir_does_not_corrupt_cas() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -388,7 +381,6 @@ async fn writes_index_row_when_writer_provided() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -423,6 +415,7 @@ async fn writes_index_row_when_writer_provided() {
         .expect("row must exist at the git-hosted key");
     assert_eq!(row.algo, "sha512");
     assert_eq!(row.requires_build, Some(false));
+    assert_eq!(row.manifest, Some(serde_json::json!({ "name": "x", "version": "1.0.0" })));
     let keys: Vec<&str> = row.files
         .keys()
         .map(String::as_str)
@@ -482,7 +475,6 @@ async fn fast_path_returns_input_cas_paths_when_no_build_needed() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -541,7 +533,6 @@ async fn fast_path_queues_synthesized_index_row() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -588,7 +579,10 @@ async fn fast_path_queues_synthesized_index_row() {
     assert_eq!(bin_entry.mode & 0o111, 0o111, "executable bit must survive the synthesis");
     let resolved =
         store_dir.cas_file_path_by_mode(&bin_entry.digest, bin_entry.mode).expect("valid digest");
-    assert_eq!(resolved, bin_cas_path, "synthesized digest must round-trip to the input CAS path");
+    assert_eq!(
+        resolved, bin_cas_path.path,
+        "synthesized digest must round-trip to the input CAS path",
+    );
 }
 
 /// Sub-path resolutions never qualify for the fast path: even when
@@ -630,7 +624,6 @@ async fn sub_path_never_takes_fast_path() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -717,7 +710,6 @@ async fn fast_path_skipped_preparation_caches_only_explicit_denials() {
                 ignore,
                 unsafe_perm: true,
                 user_agent: None,
-                prepend_node_path: ScriptsPrependNodePath::Never,
                 shell: None,
                 node_execpath: None,
                 npm_execpath: None,
@@ -774,7 +766,6 @@ async fn tarball_path_traversal_attack_is_rejected() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -831,7 +822,6 @@ async fn tarball_path_to_missing_subdir_is_rejected() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
@@ -896,7 +886,6 @@ async fn row_requires_build_for_install_scripts_without_prepare() {
                 ignore: false,
                 unsafe_perm: true,
                 user_agent: None,
-                prepend_node_path: ScriptsPrependNodePath::Never,
                 shell: None,
                 node_execpath: None,
                 npm_execpath: None,

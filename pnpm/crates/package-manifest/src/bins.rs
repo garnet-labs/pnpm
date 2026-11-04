@@ -1,7 +1,11 @@
+pub use paths::{normalize_bin_path, normalize_package_relative_path};
+
 use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+mod paths;
 
 /// Maximum number of commands precalculated in `dist.pnpr.bins`. Packages
 /// declaring more commands fall back to on-disk bin discovery at link time.
@@ -241,27 +245,6 @@ pub fn is_safe_bin_name(name: &str) -> bool {
         })
 }
 
-/// Normalize a package-relative path using `/` separators, rejecting paths
-/// that start with `/`, contain `\` or `:`, or climb above the package root
-/// via `..`.
-#[must_use]
-pub fn normalize_package_relative_path(raw: &str) -> Option<String> {
-    if raw.starts_with('/') || raw.contains(['\\', ':']) {
-        return None;
-    }
-    let mut stack = Vec::new();
-    for segment in raw.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                stack.pop()?;
-            }
-            normal => stack.push(normal),
-        }
-    }
-    Some(stack.join("/"))
-}
-
 /// Whether `manifest` declares any bins via `"bin"` or `"directories.bin"`.
 #[must_use]
 pub fn manifest_declares_bins(manifest: &Value) -> bool {
@@ -330,9 +313,9 @@ pub fn resolve_package_bins_with<'files>(
 /// from its `package.json` and `{relative_path -> cas_path}` map by reading
 /// up to the first 512 bytes of each resolved bin target from disk.
 #[must_use]
-pub fn resolve_package_bins_from_cas_paths<Hasher: std::hash::BuildHasher>(
+pub fn resolve_package_bins_from_cas_paths<CasPath: AsRef<Path>, Hasher: std::hash::BuildHasher>(
     manifest: &Value,
-    cas_paths: &std::collections::HashMap<String, std::path::PathBuf, Hasher>,
+    cas_paths: &std::collections::HashMap<String, CasPath, Hasher>,
 ) -> Option<BTreeMap<String, PackageBin>> {
     if !manifest_declares_bins(manifest) {
         return Some(BTreeMap::new());
@@ -346,7 +329,7 @@ pub fn resolve_package_bins_from_cas_paths<Hasher: std::hash::BuildHasher>(
     let mut head = [0u8; 512];
     for (bin_name, normalized) in bin_paths {
         let cas_path = cas_paths.get(&normalized)?;
-        let filled = read_file_head(cas_path, &mut head)?;
+        let filled = read_file_head(cas_path.as_ref(), &mut head)?;
         let runtime = infer_script_runtime_from_head(Path::new(&normalized), &head[..filled]);
         let pkg_bin = PackageBin::from_path_and_runtime(normalized, runtime);
         if !pkg_bin.is_valid() {
@@ -402,10 +385,10 @@ fn read_file_head(path: &Path, buf: &mut [u8]) -> Option<usize> {
 /// file paths, and shebang/extension runtimes declared by `manifest` and
 /// the CAS files in `cas_paths`.
 #[must_use]
-pub fn verify_package_bins<Hasher: std::hash::BuildHasher>(
+pub fn verify_package_bins<CasPath: AsRef<Path>, Hasher: std::hash::BuildHasher>(
     bins: &BTreeMap<String, PackageBin>,
     manifest: &Value,
-    cas_paths: &std::collections::HashMap<String, std::path::PathBuf, Hasher>,
+    cas_paths: &std::collections::HashMap<String, CasPath, Hasher>,
 ) -> bool {
     resolve_package_bins_from_cas_paths(manifest, cas_paths).as_ref() == Some(bins)
 }
@@ -443,7 +426,7 @@ fn resolve_paths_from_bin_field(
         if !is_safe_bin_name(&bin_name) {
             continue;
         }
-        let normalized = normalize_package_relative_path(&bin_relative_path)?;
+        let normalized = normalize_bin_path(&bin_relative_path)?;
         if normalized.is_empty() || !has_file(&normalized) || paths.contains_key(&bin_name) {
             return None;
         }

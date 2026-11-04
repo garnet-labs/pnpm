@@ -97,12 +97,7 @@ fn build_npm_resolver(
     opts: &StandaloneChainOptions<'_>,
     retry_opts: RetryOpts,
 ) -> NpmResolver<InMemoryPackageMetaCache> {
-    let &StandaloneChainOptions {
-        config,
-        http_client,
-        full_metadata,
-        filter_metadata,
-    } = opts;
+    let &StandaloneChainOptions { config, http_client, .. } = opts;
     NpmResolver {
         // `resolved_registries` inserts the `default` route from
         // `config.registry`; `config.registries` alone omits it, which
@@ -111,10 +106,7 @@ fn build_npm_resolver(
             .resolved_registries()
             .into_iter()
             .collect(),
-        registries_by_prefix: config.registries_by_prefix
-            .clone()
-            .into_iter()
-            .collect(),
+        declared_prefixes: config.declared_registry_prefixes(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client: Arc::clone(http_client),
             auth_headers: Arc::clone(&config.auth_headers),
@@ -124,17 +116,25 @@ fn build_npm_resolver(
             cache_dir: Some(config.cache_dir.clone()),
             retry_opts,
         },
-        format: pnpm_resolving_npm_resolver::RegistryMetadataFormat {
-            full_metadata,
-            needs_full_metadata_for: None,
-            filter_metadata,
-            registry_options_by_url: std::sync::Arc::new(config.registry_options_by_url.clone()),
-        },
+        format: metadata_format(opts),
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
             network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
         },
         store_view: offline_store_view(config),
+    }
+}
+
+fn metadata_format(
+    opts: &StandaloneChainOptions<'_>,
+) -> pnpm_resolving_npm_resolver::RegistryMetadataFormat {
+    let config = opts.config;
+    pnpm_resolving_npm_resolver::RegistryMetadataFormat {
+        full_metadata: opts.full_metadata,
+        needs_full_metadata_for: None,
+        filter_metadata: opts.filter_metadata,
+        registry_options_by_url: Arc::new(config.registry_options_by_url.clone()),
+        minimum_release_age: config.resolved_minimum_release_age(),
     }
 }
 
@@ -161,12 +161,7 @@ fn build_named_registry_resolver(
     opts: &StandaloneChainOptions<'_>,
     retry_opts: RetryOpts,
 ) -> Result<NamedRegistryResolver<InMemoryPackageMetaCache>, MergeNamedRegistriesError> {
-    let &StandaloneChainOptions {
-        config,
-        http_client,
-        full_metadata,
-        filter_metadata,
-    } = opts;
+    let &StandaloneChainOptions { config, http_client, .. } = opts;
     let user_registries_by_prefix: HashMap<String, String> = config
         .registries_by_prefix
         .iter()
@@ -179,6 +174,11 @@ fn build_named_registry_resolver(
             .cloned()
             .collect(),
         registries_by_prefix: merged_registries_by_prefix,
+        registries: config
+            .resolved_registries()
+            .into_iter()
+            .collect(),
+        declared_prefixes: config.declared_registry_prefixes(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client: Arc::clone(http_client),
             auth_headers: Arc::clone(&config.auth_headers),
@@ -188,12 +188,7 @@ fn build_named_registry_resolver(
             cache_dir: Some(config.cache_dir.clone()),
             retry_opts,
         },
-        format: pnpm_resolving_npm_resolver::RegistryMetadataFormat {
-            full_metadata,
-            needs_full_metadata_for: None,
-            filter_metadata,
-            registry_options_by_url: std::sync::Arc::new(config.registry_options_by_url.clone()),
-        },
+        format: metadata_format(opts),
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
             network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,

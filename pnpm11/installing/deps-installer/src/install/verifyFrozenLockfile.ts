@@ -1,5 +1,6 @@
 import path from 'node:path'
 
+import { pickRegistryContext } from '@pnpm/config.normalize-registries'
 import { installabilityUnderForce } from '@pnpm/config.package-is-installable'
 import { MANIFEST_BASE_NAMES, WANTED_LOCKFILE } from '@pnpm/constants'
 import { PnpmError } from '@pnpm/error'
@@ -14,6 +15,7 @@ import {
   satisfiesPackageManifest,
   unresolvedOptionalDependencies,
 } from '@pnpm/lockfile.verification'
+import type { WorkspacePackages } from '@pnpm/resolving.resolver-base'
 import type { ProjectId, ProjectManifest, ProjectRootDir } from '@pnpm/types'
 import { TarballIntegrityError } from '@pnpm/worker'
 import pLimit from 'p-limit'
@@ -143,35 +145,21 @@ async function isDirectoryWithoutManifest (projectDir: string): Promise<boolean>
 }
 
 async function checkEachProjectAgainstLockfile ({ ctx, opts }: MutationRun, frozenLockfile: boolean): Promise<ProjectCheck[]> {
-  const manifestsByDir = ctx.workspacePackages ? getWorkspacePackagesByDirectory(ctx.workspacePackages) : {}
-  const checkLinkedPackages: CheckLinkedPackages = checkLinkedPackagesAreUpToDate.bind(null, {
-    linkWorkspacePackages: opts.linkWorkspacePackagesDepth >= 0,
-    manifestsByDir,
-    workspacePackages: ctx.workspacePackages,
-    lockfilePackages: ctx.wantedLockfile.packages,
-    lockfileDir: opts.lockfileDir,
-    workspaceDir: opts.workspaceDir,
-    injectWorkspacePackages: opts.injectWorkspacePackages ?? ctx.wantedLockfile.settings?.injectWorkspacePackages,
-    skipLocalDirectoryDependencies: opts.deploy,
-    resolution: {
-      autoInstallPeers: opts.autoInstallPeers,
-      catalogs: opts.catalogs,
-      readPackageHook: opts.readPackageHook,
-      frozenLockfile,
-    },
-    hookedManifests: new Map(),
-  })
+  const workspacePackages = opts.linkWorkspacePackagesDepth >= 0 ? ctx.workspacePackages : undefined
+  const checkLinkedPackages = bindCheckLinkedPackages({ ctx, opts }, frozenLockfile)
   const checkManifest = satisfiesPackageManifest.bind(null, {
     autoInstallPeers: opts.autoInstallPeers,
     excludeLinksFromLockfile: opts.excludeLinksFromLockfile,
     ignoredOptionalDependencies: opts.ignoredOptionalDependencies,
     allowUnresolvedOptionalDependencies: frozenLockfile,
+    workspacePackages,
+    catalogs: opts.catalogs,
   })
   return Promise.all(Object.values(ctx.projects).map(async ({ id, manifest, rootDir }) => {
     const importer = ctx.wantedLockfile.importers[id]
     const { satisfies, detailedReason } = checkManifest(importer, manifest)
     const skipped = satisfies && frozenLockfile && importer != null
-      ? findUnresolvedOptionalDependencies(opts, { importer, manifest })
+      ? findUnresolvedOptionalDependencies(opts, { importer, manifest, workspacePackages })
       : undefined
     if (!satisfies || importer == null) return { satisfies, detailedReason, rootDir, skipped }
     return {
@@ -182,13 +170,40 @@ async function checkEachProjectAgainstLockfile ({ ctx, opts }: MutationRun, froz
   }))
 }
 
+function bindCheckLinkedPackages ({ ctx, opts }: Pick<MutationRun, 'ctx' | 'opts'>, frozenLockfile: boolean): CheckLinkedPackages {
+  const manifestsByDir = ctx.workspacePackages ? getWorkspacePackagesByDirectory(ctx.workspacePackages) : {}
+  return checkLinkedPackagesAreUpToDate.bind(null, {
+    linkWorkspacePackages: opts.linkWorkspacePackagesDepth >= 0,
+    manifestsByDir,
+    workspacePackages: ctx.workspacePackages,
+    lockfilePackages: ctx.wantedLockfile.packages,
+    lockfileDir: opts.lockfileDir,
+    workspaceDir: opts.workspaceDir,
+    injectWorkspacePackages: opts.injectWorkspacePackages ?? ctx.wantedLockfile.settings?.injectWorkspacePackages,
+    skipLocalDirectoryDependencies: opts.deploy,
+    includedDependencies: opts.include,
+    resolution: {
+      autoInstallPeers: opts.autoInstallPeers,
+      catalogs: opts.catalogs,
+      readPackageHook: opts.readPackageHook,
+      frozenLockfile,
+      // A frozen install keeps the lockfile as recorded, so its plain keys
+      // read as resolved through the current routes.
+      registries: { ...pickRegistryContext(opts), lockedRegistriesByScope: undefined },
+    },
+    hookedManifests: new Map(),
+  })
+}
+
 function findUnresolvedOptionalDependencies (
   opts: StrictInstallOptions,
-  { importer, manifest }: { importer: ProjectSnapshot, manifest: ProjectManifest }
+  { importer, manifest, workspacePackages }: { importer: ProjectSnapshot, manifest: ProjectManifest, workspacePackages?: WorkspacePackages }
 ): Record<string, string> | undefined {
   const unresolved = unresolvedOptionalDependencies({
     excludeLinksFromLockfile: opts.excludeLinksFromLockfile,
     ignoredOptionalDependencies: opts.ignoredOptionalDependencies,
+    workspacePackages,
+    catalogs: opts.catalogs,
   }, importer, manifest)
   return Object.keys(unresolved).length > 0 ? unresolved : undefined
 }

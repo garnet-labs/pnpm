@@ -17,25 +17,6 @@ mod behavior;
 
 mod version_selection;
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
-use pnpm_config::{TrustPolicy, version_policy::create_package_version_policy};
-use pnpm_lockfile::{LockfileResolution, RegistryResolution, TarballRevision};
-use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
-use pnpm_resolving_resolver_base::{
-    CurrentPkg, GuardExhaustionPolicy, LatestQuery, PackageVersionGuard,
-    PackageVersionGuardDecision, PackageVersionGuardFuture, PkgResolutionId, ResolveOptions,
-    UpdateBehavior, WantedDependency, WorkspacePackage, WorkspacePackages,
-    WorkspacePackagesByVersion,
-};
-use pretty_assertions::assert_eq;
-use serde_json::json;
-use tempfile::TempDir;
-
 use crate::{
     errors::{
         InvalidRevisionSpecifierError, InvalidTarballIntegrityError, MalformedRevisionHistoryError,
@@ -48,6 +29,23 @@ use crate::{
     resolve_from_workspace::ResolveFromWorkspaceError,
     violation_codes::MINIMUM_RELEASE_AGE_VIOLATION_CODE,
 };
+use pnpm_lockfile::{LockfileResolution, RegistryResolution, TarballRevision};
+use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
+use pnpm_resolving_resolver_base::{
+    CurrentPkg, GuardExhaustionPolicy, LatestQuery, PackageVersionGuard,
+    PackageVersionGuardDecision, PackageVersionGuardFuture, PkgResolutionId, ResolveOptions,
+    TrustPolicy, UpdateBehavior, WantedDependency, WorkspacePackage, WorkspacePackages,
+    WorkspacePackagesByVersion,
+};
+use pnpm_version_policy::create_package_version_policy;
+use pretty_assertions::assert_eq;
+use serde_json::json;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tempfile::TempDir;
 
 const PACKAGE_BODY: &str = r#"{
     "name": "acme",
@@ -101,7 +99,7 @@ fn build_resolver_with_registries(
     let cache_dir = TempDir::new().expect("tempdir");
     let resolver = NpmResolver {
         registries,
-        registries_by_prefix: HashMap::new(),
+        declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
         metadata: crate::RegistryMetadataClient {
             http_client: Arc::new(ThrottledClient::default()),
             auth_headers: Arc::new(AuthHeaders::default()),
@@ -116,9 +114,10 @@ fn build_resolver_with_registries(
             needs_full_metadata_for: None,
             filter_metadata: false,
             registry_options_by_url: std::sync::Arc::default(),
+            minimum_release_age: None,
         },
         cache_policy: crate::MetadataCachePolicy {
-            network: pnpm_config::NetworkPolicy::Online,
+            network: pnpm_resolving_resolver_base::NetworkPolicy::Online,
             ignore_missing_time_field: false,
         },
         store_view: None,
@@ -360,7 +359,7 @@ fn workspace_resolve_options(packages: WorkspacePackages) -> ResolveOptions {
             project_dir: Path::new("/repo/packages/consumer").to_path_buf(),
             lockfile_dir: Path::new("/repo").to_path_buf(),
             workspace_packages: Some(std::sync::Arc::new(packages)),
-            link_workspace_packages: pnpm_config::LinkWorkspacePackages::Deep,
+            link_workspace_packages: pnpm_resolving_resolver_base::LinkWorkspacePackages::Deep,
             ..Default::default()
         },
         ..ResolveOptions::default()
@@ -412,10 +411,13 @@ fn shasum_only_package_body(shasum: &str) -> String {
 fn revision_package_body(tarball: &str, revision: &serde_json::Value) -> String {
     let original_digest =
         "H0D8ktokFpR1CXnubPWC8tXX0o4YM13gWrxU0FYOD1MChgxlK_CNVgJSql50IQVG82n7u86MEs_HlXsmUv6adQ";
+    let original_tarball = tarball
+        .rsplit_once("+r")
+        .map_or_else(|| tarball.to_string(), |(base, _)| format!("{base}+r0"));
     let original = json!({
         "revision": 0,
         "integrity": format!("sha512-{}==", original_digest.replace('_', "/").replace('-', "+")),
-        "tarball": tarball.replace(&"A".repeat(86), original_digest),
+        "tarball": original_tarball,
         "manifest": {},
     });
     let selected = json!({
@@ -467,19 +469,19 @@ fn revision_history_package_body(registry: &str) -> String {
                 "optionalDependencies": { "removed": "1.0.0" },
                 "dist": {
                     "integrity": integrity_c,
-                    "tarball": format!("{registry}-/tarballs/sha512/{digest_c}"),
+                    "tarball": format!("{registry}acme@1.0.0+r2"),
                     "revision": 2,
                     "revisions": [
                         {
                             "revision": 0,
                             "integrity": integrity_a,
-                            "tarball": format!("{registry}-/tarballs/sha512/{digest_a}"),
+                            "tarball": format!("{registry}acme@1.0.0+r0"),
                             "manifest": { "dependencies": { "original": "1.0.0" } },
                         },
                         {
                             "revision": 1,
                             "integrity": integrity_b,
-                            "tarball": format!("{registry}-/tarballs/sha512/{digest_b}"),
+                            "tarball": format!("{registry}acme@1.0.0+r1"),
                             "manifest": {
                                 "name": "not-acme",
                                 "version": "9.0.0",
@@ -491,7 +493,7 @@ fn revision_history_package_body(registry: &str) -> String {
                         {
                             "revision": 2,
                             "integrity": integrity_c,
-                            "tarball": format!("{registry}-/tarballs/sha512/{digest_c}"),
+                            "tarball": format!("{registry}acme@1.0.0+r2"),
                             "manifest": { "dependencies": { "selected-current": "1.0.0" } },
                         },
                     ],

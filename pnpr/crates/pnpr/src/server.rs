@@ -1,5 +1,5 @@
 pub(crate) use client_ip::{ClientIp, resolve_client_ip};
-pub use lifecycle::{recover_publish_journal, serve, serve_listener};
+pub use lifecycle::{prepare_storage, serve, serve_listener};
 pub(crate) use metrics::{ServerMetrics, serve_metrics};
 pub(crate) use request_access::compute_upstream_cache_namespace;
 pub(crate) use request_id::{RequestId, generate_request_id, is_valid_request_id};
@@ -9,6 +9,8 @@ pub(crate) use tcp_listener::PeerAddr;
 pub(crate) use self::striped_locks::StripedLocks;
 
 mod lifecycle;
+mod log_routes;
+mod release_record_logs;
 use lifecycle::load_active_osv_index;
 
 mod tcp_listener;
@@ -42,14 +44,14 @@ use osv_filtering::{
 
 mod tar_registry;
 use tar_registry::{
-    DistView, describe_tar, describe_tars, dist_view, is_tar_registry, restore_tgz_integrities,
-    split_package_identifier, tar_integrities_of, tgz_integrity_key,
+    DistView, describe_tar, describe_tars, dist_view, has_settled_tar_facts, is_tar_registry,
+    restore_tgz_integrities, split_package_identifier, tar_integrities_of, tgz_integrity_key,
 };
 
 mod tar_responses;
 use tar_responses::{
-    CachedTgz, MAX_CONCURRENT_TAR_DECODES, TarSource, TgzTrust, tar_decode_limit, tar_integrity_of,
-    tar_integrity_within, tar_resource_integrity, tar_response,
+    CachedTgz, MAX_CONCURRENT_TAR_DECODES, TarSource, TgzTrust, stored_tar_response,
+    tar_decode_limit, tar_integrity_of, tar_integrity_within, tar_resource_integrity, tar_response,
 };
 
 mod version_tarballs;
@@ -59,30 +61,25 @@ mod tar_variants;
 use tar_variants::{TarCopy, TarVariantQueue, open_variant};
 
 mod package_responses;
+mod split_packuments;
 use package_responses::{
-    DistBlock, PackumentDists, TarballDist, expected_tarball_dist, packument_bytes_response,
-    packument_response, tarball_integrity_error, tarball_response, tarball_stream_error,
-    tarball_stream_error_for_package,
+    DistBlock, PackumentDists, TarballDist, declared_tarball_integrity, expected_tarball_dist,
+    packument_bytes_response, packument_response, tarball_integrity_error, tarball_response,
+    tarball_stream_error, tarball_stream_error_for_package, with_generation,
 };
 
 mod package_reads;
 use package_reads::{
     HostedGate, RegistrySource, default_registry_target, hosted_gate, hosted_read_namespace,
-    resolve_ecosystem_source, resolve_registry_source, resolves_to_private_source, serve_packument,
-    serve_registry_tarball, serve_tarball, serve_version_manifest,
-};
-
-mod revision_refs;
-use revision_refs::{
-    RevisionScan, RevisionSource, hosted_revision_refs, hosted_revision_sources,
-    serve_private_revision_refs, serve_revision_refs,
+    resolve_ecosystem_source, resolve_registry_source, resolves_to_private_source,
+    serve_hosted_version_blob, serve_packument, serve_registry_tarball, serve_tarball,
+    serve_version_manifest,
 };
 
 mod revision_tarballs;
-use revision_tarballs::{
-    HostedOriginal, declared_tarball_integrity, hosted_original, open_hosted_revision_tarball,
-    serve_revision_tarball,
-};
+use revision_tarballs::serve_revision_tarball;
+
+mod variant_tarballs;
 
 mod upstream_tarballs;
 use upstream_tarballs::{
@@ -99,9 +96,9 @@ use upstream_packuments::{
 
 mod request_access;
 use request_access::{
-    authorized_revision_upstream, authorized_upstream, require_admin, require_artifact_caller,
-    require_caller, require_pipeline_caller, require_resolver_caller, revision_registry_is_private,
-    revision_source_registry, single_authorization_header, upstream_cache_namespace,
+    authorized_upstream, require_admin, require_artifact_caller, require_caller,
+    require_pipeline_caller, require_resolver_caller, revision_source_registry,
+    single_authorization_header, upstream_cache_namespace,
 };
 
 mod restrictions;
@@ -122,10 +119,12 @@ mod health;
 use health::shutdown_signal;
 mod managed_state;
 mod metrics;
+mod notes;
 mod oci;
 mod oidc;
 mod oidc_groups;
 mod package_mutation;
+mod publications;
 mod publishing;
 mod pypi;
 mod rate_limit;
@@ -140,6 +139,7 @@ mod security_audit;
 mod singleflight;
 use singleflight::Singleflight;
 mod staged;
+mod staged_archives;
 mod striped_locks;
 mod team_access;
 mod team_mutations;
@@ -153,7 +153,6 @@ mod tests;
 
 use self::{
     authentication::{Action, AuthedCaller, authenticate, authorize, authorize_package},
-    documents::RegistryDocuments,
     ecosystem::{addressed_registry, caller_scoped, registry_endpoint},
     package_mutation::{
         delete_package, delete_tarball, get_dist_tags, remove_dist_tag, set_dist_tag,
@@ -161,9 +160,9 @@ use self::{
     },
     publishing::{
         PublishTarget, check_publish_tombstone, commit_publishes, publish_package,
-        resolve_publish_target_for, serve_batch_publish, stage_publish, validate_publish_doc,
+        resolve_publish_target_for, routes_to_upstream, stage_publish, validate_publish_doc,
     },
-    routing::router_with_auth_and_osv,
+    routing::{metrics_listener_router, router_with_auth_and_osv, state_and_router},
 };
 
 use axum::{
@@ -180,7 +179,6 @@ use axum::{
 };
 use chrono::Utc;
 use indexmap::IndexMap;
-use pnpm_crypto_hash::{integrity_addressed_tarball_integrity, integrity_addressed_tarball_path};
 use pnpr_auth::{AuthState, UpsertOutcome, identify};
 use pnpr_config::{Config, HostedConfig};
 use pnpr_error::RegistryError;
@@ -195,8 +193,9 @@ use pnpr_storage::{
 
 use pnpr_upstream::{
     CacheValidators, FetchOutcome, PackumentFetch, Upstream, abbreviate_packument,
-    extract_upstream_version_manifest, extract_version_manifest, rewrite_tarball_urls,
-    rewrite_upstream_tarball_urls, tarball_basename,
+    extract_upstream_revision_integrity, extract_upstream_version_manifest,
+    extract_version_manifest, rewrite_tarball_urls, rewrite_upstream_tarball_urls,
+    tarball_basename_for_package, version_route_tarball_version,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -210,6 +209,12 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 /// full document instead bloats the wire by 2–10× on packuments with
 /// long version histories.
 const ABBREVIATED_CONTENT_TYPE: &str = "application/vnd.npm.install-v1+json";
+
+/// The response header that carries the catalog generation a hosted package
+/// view was rendered from, or that a mutation committed, as
+/// `<catalog>:<generation>`. Only a metadata backend that tracks generations
+/// sends it.
+const GENERATION_HEADER: &str = "pnpr-generation";
 
 /// Cap tarballs at 100 MiB while pnpr has to spool them to disk for SRI
 /// verification. This bounds per-request temporary disk usage for
@@ -248,12 +253,6 @@ use state::AppInner;
 #[derive(Clone)]
 pub(super) struct AppState {
     pub(super) inner: Arc<AppInner>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct HostedOriginalRef {
-    package: String,
-    version: String,
 }
 
 /// Build the axum [`Router`] with in-memory auth state. Convenient
@@ -298,6 +297,7 @@ pub fn try_router_with_auth(mut config: Config, auth: AuthState) -> pnpr_error::
     // `serve`/`serve_listener`.
     config.features.ensure_a_feature_is_enabled()?;
     config.routing.ensure_valid_registry_graph(config.features.registry.enabled)?;
+    config.http.ensure_valid_metrics()?;
     let osv_index = load_active_osv_index(&config)?;
     router_with_auth_and_osv(config, auth, osv_index)
 }
@@ -451,13 +451,10 @@ fn private_no_cache(mut response: Response) -> Response {
     response
 }
 
-/// The hosted storage view a publish writes to: a hosted namespace, or
-/// the flat (path-less) store when `org` is `None`.
+/// The npm hosted storage view for `org`, or the default npm namespace when
+/// `org` is `None`.
 fn hosted_storage(state: &AppState, org: Option<&str>) -> Storage {
-    match org {
-        Some(org) => state.inner.storage.for_hosted(org),
-        None => state.inner.storage.clone(),
-    }
+    state.inner.storage.for_hosted(org.unwrap_or(""), pnpr_registry::Ecosystem::Npm)
 }
 
 // --------------------------------------------------------------------

@@ -1,7 +1,7 @@
 use super::{
     Algorithm, Arc, ArchiveStoreProjection, AtomicU8, AuthHeaders, BTreeMap, CARGO_CHECKSUM_FILE,
-    CafsFileInfo, Config, Deserialize, HashMap, ImportIndexedDirOpts, IngestTarballToStore,
-    Integrity, IntoDiagnostic, LockedCrate, Path, PathBuf, Reporter, Result, RetryOpts, Serialize,
+    CafsFileInfo, Config, Deserialize, ImportIndexedDirOpts, IngestTarballToStore, Integrity,
+    IntoDiagnostic, LockedCrate, Path, PathBuf, Reporter, Result, RetryOpts, Serialize,
     SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreDir, StoreIndex, StoreIndexWriter,
     StreamExt, ThrottledClient, checksum_cache, import_indexed_dir, registry_download_config,
     stream,
@@ -206,14 +206,14 @@ pub(super) async fn materialize<Reporter: self::Reporter + 'static>(
 
 pub(super) fn add_cargo_checksum(
     store_dir: &StoreDir,
-    cas_paths: &mut HashMap<String, PathBuf>,
+    cas_paths: &mut pnpm_fs::CasPaths,
     package_checksum: Option<&str>,
 ) -> Result<CafsFileInfo> {
     cas_paths.remove(CARGO_CHECKSUM_FILE);
     let files = cas_paths
         .iter()
         .map(|(path, cas_path)| {
-            pnpm_crypto_hash::create_hex_hash_from_file(cas_path)
+            pnpm_crypto_hash::create_hex_hash_from_file(&cas_path.path)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("hash cargo package file {path}"))
                 .map(|checksum| (path.clone(), checksum))
@@ -222,22 +222,18 @@ pub(super) fn add_cargo_checksum(
     let checksum = serde_json::to_vec(&CargoChecksum { files, package: package_checksum })
         .into_diagnostic()
         .wrap_err("serialize .cargo-checksum.json")?;
-    let (cas_path, hash) = store_dir
+    let written = store_dir
         .write_cas_file(&checksum, false)
         .into_diagnostic()
         .wrap_err("store .cargo-checksum.json")?;
-    cas_paths.insert(CARGO_CHECKSUM_FILE.to_string(), cas_path);
-    Ok(CafsFileInfo {
-        digest: format!("{hash:x}"),
-        mode: 0o644,
-        size: checksum.len() as u64,
-        checked_at: None,
-    })
+    let info = written.index_entry(0o644, None);
+    cas_paths.insert(CARGO_CHECKSUM_FILE.to_string(), written.file);
+    Ok(info)
 }
 
 async fn ingest_crate<Reporter: self::Reporter + 'static>(
     options: &MaterializeOptions,
-) -> Result<HashMap<String, PathBuf>> {
+) -> Result<pnpm_fs::CasPaths> {
     let package_url = pnpm_cargo_resolver::download_url(
         &options.fetching.download_template,
         &options.package.name,

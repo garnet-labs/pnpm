@@ -9,17 +9,16 @@ pub mod property_path;
 pub mod protected_settings;
 pub mod proxy_keys;
 pub mod refused_keys;
-pub mod version_policy;
 pub use crate::{
     api::{EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, Host, LinkProbe},
     ci_detection::{CI_ENV_VARS, is_ci},
     defaults::{
-        BUILTIN_REGISTRIES_BY_PREFIX, DEFAULT_JSR_REGISTRY, GLOBAL_LAYOUT_VERSION, PNPM_VERSION,
-        available_parallelism, default_cache_dir, default_config_dir, default_git_shallow_hosts,
-        default_peers_suffix_max_length, default_pnpm_home_dir, default_registry,
-        default_state_dir, default_unsafe_perm, default_virtual_store_dir_max_length,
-        default_workspace_concurrency, install_command_for, is_unsafe_perm_posix,
-        resolve_child_concurrency, resolve_configured_state_dir, standalone_install_command,
+        GLOBAL_LAYOUT_VERSION, PNPM_VERSION, available_parallelism, default_cache_dir,
+        default_config_dir, default_git_shallow_hosts, default_peers_suffix_max_length,
+        default_pnpm_home_dir, default_registry, default_state_dir, default_unsafe_perm,
+        default_virtual_store_dir_max_length, default_workspace_concurrency, install_command_for,
+        is_unsafe_perm_posix, resolve_child_concurrency, resolve_configured_state_dir,
+        standalone_install_command,
     },
     global_bin_check::{CheckGlobalBinDirError, check_global_bin_dir},
     npmrc_auth::{BasicAuth, RegistryCreds, is_json_auth_scope, validate_json_auth_registry},
@@ -33,17 +32,21 @@ pub use boot_config::BootConfig;
 pub use cas::{CAS_LOADER_FILENAME, CAS_MANIFEST_FILENAME};
 pub use cli_layer::CliLayer;
 pub use loading::ConfigLoadFailure;
-pub use network_policy::NetworkPolicy;
+pub use macos_backup::MacosBackupConfig;
 pub use node_linker::{NodeLinkerOptions, NodeLinkerSetting};
 pub use pnpm_matcher as matcher;
+pub use pnpm_resolving_resolver_base::{
+    BUILTIN_REGISTRIES_BY_PREFIX, DEFAULT_JSR_REGISTRY, NeedsFullMetadataFn, NeedsFullMetadataFor,
+    NetworkPolicy,
+};
+pub use pnpm_version_policy as version_policy;
 pub use setting_types::{
     AuditConfig, AuditLevel, CatalogMode, ColorMode, HoistingLimits, InitType,
     LinkWorkspacePackages, LogLevel, NodeLinker, NodePackageMapMode, NodePackageMapType,
     PackageImportMethod, PmOnFail, ReporterType, ResolutionMode, RuntimeOnFail,
-    SaveWorkspaceProtocol, ScriptsPrependNodePath, TrustPolicy, VerifyDepsBeforeRun,
-    VirtualStoreType,
+    SaveWorkspaceProtocol, TrustPolicy, VerifyDepsBeforeRun, VirtualStoreType,
 };
-pub use settings::{Config, HoistPatterns, MacosBackupConfig};
+pub use settings::{Config, HoistPatterns};
 pub use settings_read::{PIN_DECISION_SETTINGS, SettingsRead};
 pub use shim_policy::{
     GlobalShims, GlobalShimsSetting, NamedShimPolicy, ShimPolicy, ShimPolicyValue,
@@ -51,16 +54,17 @@ pub use shim_policy::{
 pub use workspace_yaml::{
     AllowBuild, AuditSettings, CargoSettings, DEFAULT_CARGO_INDEX_URL, DEFAULT_PYPI_INDEX_URL,
     DEFAULT_PYTHON_DOWNLOAD_URL, DEFAULT_RUST_DIST_SERVER, GLOBAL_CONFIG_YAML_FILENAME,
-    LoadWorkspaceYamlError, MacosBackupSettings, NAMED_UNRECOGNIZED_SETTINGS,
+    LoadWorkspaceYamlError, MachineSettings, MacosBackupSettings, NAMED_UNRECOGNIZED_SETTINGS,
     NodePackageMapSettings, PackageExtension, PackagePermissions, PeerDependencyMeta,
     PeerDependencyRules, PermissionCapability, PnpmfileSetting, PythonSettings,
-    RemoteCacheSettings, RemoteSideEffectsCacheSettings, SkillsSettings, TaskSettings, Tool,
-    ToolSettings, UnrecognizedSettings, UpdateConfig, UpdateSettings, WORKSPACE_MANIFEST_FILENAME,
-    WorkspaceKeyIssues, WorkspaceSettings, decided_allow_builds, decided_permissions,
+    RemoteCacheSettings, RemoteSideEffectsCacheSettings, SkillsPermission, SkillsSettings,
+    TaskSettings, Tool, ToolSettings, TrustedSettings, UnrecognizedSettings, UpdateConfig,
+    UpdateSettings, WORKSPACE_MANIFEST_FILENAME, WorkspaceKeyIssues, WorkspaceSettings,
+    decided_allow_builds, decided_permissions,
     package_configs::{self, PackageConfigsSetting, ProjectConfig, ProjectConfigMultiMatch},
     registries::{
         self, Ecosystem, EcosystemIndex, PythonRegistryRoute, RegistryDeclaration, RegistryEntry,
-        RegistryLookups,
+        RegistryLookups, RegistryPrefixes,
     },
     workspace_root_or,
 };
@@ -96,7 +100,7 @@ use crate::{
 use indexmap::IndexMap;
 use pipe_trait::Pipe;
 use pnpm_git_utils::{Host as GitHost, get_branches_containing_head, get_current_branch};
-use pnpm_lockfile::{Lockfile, RegistryOptions, WantedLockfileSelection};
+use pnpm_lockfile::{Lockfile, RegistryOptions, SymlinkedLockfile, WantedLockfileSelection};
 use pnpm_matcher::create_matcher;
 use pnpm_patching::{
     CalcPatchHashError, PatchGroupRecord, PatchInput, ResolvePatchedDependenciesError,
@@ -193,9 +197,17 @@ fn mirror_node_package_map(
     }
 }
 
-fn collect_explicit_settings(
+fn collect_explicit_trusted_settings(
     target: &mut serde_json::Map<String, serde_json::Value>,
-    settings: &WorkspaceSettings,
+    settings: &TrustedSettings,
+) {
+    collect_explicit_settings(target, &settings.settings);
+    insert_set_fields(target, &settings.machine);
+}
+
+fn insert_set_fields(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    settings: &impl serde::Serialize,
 ) {
     let Ok(serde_json::Value::Object(map)) = serde_json::to_value(settings) else {
         return;
@@ -206,6 +218,13 @@ fn collect_explicit_settings(
         }
         target.insert(key, value);
     }
+}
+
+fn collect_explicit_settings(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    settings: &WorkspaceSettings,
+) {
+    insert_set_fields(target, settings);
     let virtual_store_type = settings.virtual_store_type.or_else(|| {
         settings.enable_global_virtual_store.map(VirtualStoreType::from_enable_global)
     });
@@ -312,14 +331,6 @@ mod pnpm_default_parity;
 #[cfg(test)]
 mod tests;
 
-/// Whether the resolution has to read full packument metadata from a given
-/// registry (and whether the dependency is optional), as
-/// [`Config::requires_full_metadata_for_registry_fn`] answers it.
-pub type NeedsFullMetadataFn = dyn Fn(&str, bool) -> bool + Send + Sync;
-
-/// Shared handle to a [`NeedsFullMetadataFn`].
-pub type NeedsFullMetadataFor = Arc<NeedsFullMetadataFn>;
-
 /// Whether a resolution has to read full packument metadata: optional
 /// dependencies (`libc`) and trust evidence (`_npmUser`, `dist.attestations`)
 /// are omitted from standard npm abbreviated metadata (though included by
@@ -375,6 +386,7 @@ mod workspace_settings;
 
 mod auth_sources;
 
+mod macos_backup;
 mod settings;
 
 use auth_sources::{AuthSources, note_declared_registries};

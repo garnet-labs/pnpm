@@ -21,7 +21,6 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
     use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
     use std::{
         collections::HashMap,
-        path::PathBuf,
         sync::{Arc, atomic::AtomicU8},
     };
 
@@ -33,18 +32,18 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
     // the seeded mem-cache key matches what the installer looks up.
     let tarball_url = "https://registry.test/foo/-/foo-1.0.0.tgz".to_string();
 
-    let seeded: HashMap<String, PathBuf> =
-        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob"))]);
+    let seeded: pnpm_fs::CasPaths =
+        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob").into())]);
     let mem_cache = Arc::new(MemCache::default());
+    let cached = CachedTarball::from_files(seeded.clone());
+    let shared = Arc::clone(&cached.files);
     mem_cache.insert(
         package_mem_cache_key(
             &tarball_url,
             Some(&DUMMY_SHA512.parse().expect("parse integrity")),
             false,
         ),
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(CachedTarball::from_files(
-            seeded.clone(),
-        )))),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(cached))),
     );
 
     let layout = crate::VirtualStoreLayout::legacy(store_tmp.path().join("vstore"), 120);
@@ -104,7 +103,11 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
     .await
     .expect("cold batch must reuse the prefetched download instead of fetching");
 
-    assert_eq!(cas_paths.cas_paths, seeded);
+    assert_eq!(*cas_paths.cas_paths, seeded);
+    assert!(
+        Arc::ptr_eq(&cas_paths.cas_paths, &shared),
+        "every snapshot of the package imports from the cached map, not a copy",
+    );
 
     drop(store_tmp);
 }
@@ -120,7 +123,6 @@ async fn without_mem_cache_skips_coordination_and_downloads() {
     use pnpm_tarball::{CacheValue, CachedTarball, MemCache, TarballError, package_mem_cache_key};
     use std::{
         collections::HashMap,
-        path::PathBuf,
         sync::{Arc, atomic::AtomicU8},
     };
 
@@ -130,8 +132,8 @@ async fn without_mem_cache_skips_coordination_and_downloads() {
     let package_key: PackageKey = "foo@1.0.0".parse().expect("parse key");
 
     // A populated mem cache that the `None` path must ignore.
-    let seeded: HashMap<String, PathBuf> =
-        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob"))]);
+    let seeded: pnpm_fs::CasPaths =
+        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob").into())]);
     let mem_cache = Arc::new(MemCache::default());
     mem_cache.insert(
         package_mem_cache_key(

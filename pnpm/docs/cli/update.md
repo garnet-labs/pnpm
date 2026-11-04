@@ -28,6 +28,9 @@ Besides moving `pnpm-lock.yaml` to the newly resolved versions, `pnpm update` wr
 * A dependency declared through the [`jsr:` protocol](../package-sources.md) keeps its `jsr:` prefix, and its range moves like an npm range.
 * A dependency declared through a dist-tag, such as `"foo": "latest"`, keeps tracking the tag. The tag stays in `package.json` and only the lockfile moves to the version behind it, with `--latest` as well.
 * Since v12.12.0, a [config dependency](../config-dependencies.md#how-to-update-config-dependencies) is updated too, and its new range is written to `pnpm-workspace.yaml`.
+* A runtime (`node`, `deno`, `bun` declared in `devEngines.runtime`, `engines.runtime`, or through the `runtime:` / `tool:` protocol) and a package manager (`pnpm`, `npm`, `yarn`, `bun` declared in `devEngines.packageManager` or `packageManager`) are updated too, and their new versions or ranges are written back to `package.json` (and `pnpm-lock.yaml` when the pin is recorded there).
+* When [`cargo.enabled`](../cargo.md#cargoenabled) is `true`, Cargo dependencies in `Cargo.toml` and `Cargo.lock` are updated too. Pass `crate:<name>` (or `crate:<name>@<req>`) to target specific crates.
+* When [`python.enabled`](../python.md#pythonenabled) is `true`, Python dependencies in `pyproject.toml` and `pylock.toml` are updated too. Pass `pypi:<name>` (or `pypi:<requirement>`) to target specific Python distributions.
 * Since v12.6.0, a dependency whose specifier comes from a [`packageExtensions`](../settings/dependency-resolution.md#packageextensions) entry, a [`readPackage`](../pnpmfile.md#hooks) hook, or an [`override`](../settings/dependency-resolution.md#overrides) is not written to `package.json`. The lockfile keeps that specifier. `pnpm update` and `pnpm audit --fix=update` still move it inside the range.
 
 An exact pin from one of those sources is left as it is. When that pin is a vulnerable version, `pnpm audit --fix=update` warns and points at `pnpm audit --fix`, which writes an override. An override is applied after `packageExtensions` and `readPackage`, so it replaces a specifier those supply.
@@ -113,6 +116,21 @@ Update the dependencies to their latest stable version as determined by their `l
 
 Since v12.6.0, `--latest` does not move a dependency past a specifier supplied by `packageExtensions`, a `readPackage` hook, or an override. The lockfile stays inside that specifier.
 
+A Cargo requirement keeps its operator when updated, so `~1.0` becomes `~1.1`
+and `=1.0.0` stays exact. A requirement with only an upper bound, such as `<2`,
+is kept while the new version matches it, and becomes a caret requirement, such
+as `^2.0.0`, when `--latest` moves past it. A requirement in the selector, as in
+`pnpm update crate:foo@^2`, replaces it. `savePrefix` and `saveExact` apply only
+to new Cargo dependencies. Saved Cargo requirements omit build metadata.
+
+A Python requirement keeps its operator and precision too, so `~=1.0` becomes
+`~=2.0` and `==1.*` becomes `==2.*`. A requirement with only an upper bound,
+such as `<2`, or with several clauses, such as `>=1.0,<2`, becomes `>=2.0` when
+`--latest` moves past it. A selected pre-release that the requirement does not
+name, such as `1.4rc1` for `==1.*`, adds a clause that names it, as in
+`==1.*,>=1.4rc1`. `savePrefix` and `saveExact` do not apply to Python
+requirements.
+
 ### --patches
 
 Added in: v12.0.0
@@ -186,6 +204,8 @@ The directory in which `pnpm-lock.yaml` is created. It cannot be combined with `
 ### --interactive, -i
 
 Show outdated dependencies and select which ones to update.
+
+For a package from a registry declared with [`serverType: pnpr`](../registries.md#servertype), the release notes between the installed and the offered version are shown below the list while the package is under the cursor.
 
 Combined with `--global`, each [isolated install group](../global-packages.md#isolated-installations) is presented as one selectable item: packages that share a global installation update together as a unit.
 

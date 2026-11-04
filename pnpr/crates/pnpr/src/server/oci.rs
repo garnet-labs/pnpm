@@ -10,8 +10,8 @@
 //! that do accept a path in their registry configuration.
 //!
 //! A push is many requests: every blob, then the manifest that references
-//! them. The manifest write is the commit point, and the only part that goes
-//! through the publish journal. A blob nothing references is invisible rather
+//! them. The manifest write is the commit point, and the only part that
+//! commits metadata. A blob nothing references is invisible rather
 //! than half-published, which is what makes the split safe, and why
 //! collecting unreferenced blobs is a job of its own.
 
@@ -367,7 +367,7 @@ impl Request {
         let (key, source) = self.hosted_source(name)?;
         let org = hosted_read_namespace(&self.state, &self.identity, &source, key.as_str())
             .map_err(Refusal::from)?;
-        let storage = self.state.inner.storage.for_hosted(&org);
+        let storage = self.state.inner.storage.for_hosted(&org, ECOSYSTEM);
         Ok(HostedRepo { key, source, storage })
     }
 

@@ -1,5 +1,5 @@
 pub(crate) use configuration::{
-    apply_install_cli_config, derive_config_root, warn_about_config_root,
+    apply_install_cli_config, derive_config_root, record_no_runtime_flag, warn_about_config_root,
 };
 pub(crate) use install::InstallPipeline;
 pub(in crate::cli_args) use install::run_dedicated_lockfile_workspace_install;
@@ -40,7 +40,9 @@ use install::init_shared_state;
 use miette::Context;
 
 use pnpm_config::{Config, Host};
-use pnpm_injected_deps_syncer::{injected_source_dirs, sync_injected_deps_of_modules_dir};
+use pnpm_injected_deps_syncer::{
+    CopyFiles, injected_source_dirs, sync_injected_deps_of_modules_dir,
+};
 use pnpm_network::ThrottledClient;
 use pnpm_package_manager::{PathNode, graph_sequencer};
 use pnpm_reporter::Reporter;
@@ -278,7 +280,7 @@ fn sync_dedicated_injected_deps(
             project_dir,
             &modules_dir,
             sync.source_dirs,
-            !config.deploy_all_files,
+            CopyFiles::from_deploy_all_files(config.deploy_all_files),
         )?;
     }
     Ok(())

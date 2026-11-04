@@ -286,6 +286,36 @@ fn a_scim_token_must_be_long_and_stays_out_of_debug_output() {
 }
 
 #[test]
+fn metrics_are_off_by_default_and_need_a_long_token_or_a_listener() {
+    let load = |yaml: &str| Config::from_yaml_str(yaml, Path::new("/x"), listen(), None);
+    assert!(load("storage: ./s\n").unwrap().http.metrics.is_none());
+    for (yaml, field) in [
+        ("metrics: {}\n", "metrics needs"),
+        ("metrics:\n  token: short\n", "metrics.token"),
+        (format!("metrics:\n  token: '{}x'\n", " ".repeat(40)).as_str(), "metrics.token"),
+        (format!("metrics:\n  listen: {}\n", listen()).as_str(), "metrics.listen"),
+        (format!("metrics:\n  listen: 0.0.0.0:{}\n", listen().port()).as_str(), "metrics.listen"),
+        (format!("metrics:\n  token: {}\n", "é".repeat(16)).as_str(), "metrics.token"),
+    ] {
+        let err = load(yaml).expect_err(yaml);
+        assert!(
+            matches!(&err, RegistryError::InvalidConfig { reason } if reason.contains(field)),
+            "{err}",
+        );
+    }
+    let config = load("metrics:\n  listen: 127.0.0.1:9464\n").unwrap();
+    let metrics = config.http.metrics.expect("metrics is set");
+    assert_eq!(metrics.listen, Some("127.0.0.1:9464".parse().unwrap()));
+    assert_eq!(metrics.token, None);
+
+    let token = "a".repeat(crate::MetricsConfig::MIN_TOKEN_LEN);
+    let config = load(&format!("metrics:\n  token: {token}\n")).unwrap();
+    let metrics = config.http.metrics.expect("metrics is set");
+    assert_eq!(metrics.token.as_deref(), Some(token.as_str()));
+    assert!(!format!("{metrics:?}").contains(&token));
+}
+
+#[test]
 fn the_retired_per_surface_policies_are_refused() {
     for yaml in [
         "artifacts:\n  compilerCaches:\n    acme: { access: ci, publish: ci }\n",
@@ -381,4 +411,79 @@ fn request_timeout_defaults_and_overrides() {
         matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("requestTimeout")),
         "expected InvalidConfig with requestTimeout, got {err:?}",
     );
+}
+
+#[test]
+fn package_documents_default_to_a_64_kib_threshold_and_a_30_day_window() {
+    let config = Config::from_yaml_str("", Path::new("/config"), listen(), None).unwrap();
+    assert_eq!(config.http.package_documents, crate::PackageDocumentsConfig::default());
+    assert_eq!(config.http.package_documents.split_threshold, 64 * 1024);
+    assert_eq!(
+        config.http.package_documents.publish_time_window,
+        std::time::Duration::from_hours(30 * 24),
+    );
+}
+
+#[test]
+fn package_documents_accept_a_threshold_and_a_longer_window() {
+    let config = Config::from_yaml_str(
+        "packageDocuments:\n  splitThreshold: 1MiB\n  publishTimeWindow: 60d\n",
+        Path::new("/config"),
+        listen(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(config.http.package_documents.split_threshold, 1024 * 1024);
+    assert_eq!(
+        config.http.package_documents.publish_time_window,
+        std::time::Duration::from_hours(60 * 24),
+    );
+}
+
+#[test]
+fn package_documents_reject_a_window_shorter_than_30_days() {
+    for yaml in [
+        "packageDocuments:\n  publishTimeWindow: 29d\n",
+        "packageDocuments:\n  publishTimeWindow: soon\n",
+        "packageDocuments:\n  splitThreshold: big\n",
+    ] {
+        let result = Config::from_yaml_str(yaml, Path::new("/config"), listen(), None);
+        assert!(matches!(result, Err(RegistryError::InvalidConfig { .. })), "accepted {yaml:?}");
+    }
+}
+
+/// Go's `note` test key, as `note.GenerateKey` writes it.
+const LOG_SIGNING_KEY: &str =
+    "PRIVATE+KEY+PeterNeumann+c74f20a3+AYEKFALVFGyNhPJEMzD1QIDr+Y7hfZx09iUvxdXHKDFz";
+
+#[test]
+fn release_records_publish_no_logs_without_a_signing_key() {
+    let config = Config::from_yaml_str("", Path::new("/config"), listen(), None).unwrap();
+    assert!(config.release_records.log_signing_key.is_none());
+}
+
+#[test]
+fn release_records_read_the_log_signing_key() {
+    let yaml = format!("releaseRecords:\n  logSigningKey: {LOG_SIGNING_KEY}\n");
+    let config = Config::from_yaml_str(&yaml, Path::new("/config"), listen(), None).unwrap();
+    let signer = config.release_records.log_signing_key.clone().unwrap();
+    assert_eq!(signer.verifier_key().key_name(), "PeterNeumann+c74f20a3");
+    assert!(!format!("{:?}", config.release_records).contains("AYEKFALV"));
+
+    let mangled = format!("releaseRecords:\n  logSigningKey: {}x\n", &LOG_SIGNING_KEY[..60]);
+    let err = Config::from_yaml_str(&mangled, Path::new("/config"), listen(), None).unwrap_err();
+    assert!(
+        matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("logSigningKey")),
+        "{err:?}",
+    );
+}
+
+#[test]
+fn release_records_read_the_statement_signing_key() {
+    let yaml = format!("releaseRecords:\n  statementSigningKey: {LOG_SIGNING_KEY}\n");
+    let config = Config::from_yaml_str(&yaml, Path::new("/config"), listen(), None).unwrap();
+    assert!(config.release_records.log_signing_key.is_none());
+    let signer = config.release_records.statement_signing_key.clone().unwrap();
+    assert_eq!(signer.verifier_key().key_name(), "PeterNeumann+c74f20a3");
+    assert!(!format!("{:?}", config.release_records).contains("AYEKFALV"));
 }

@@ -15,7 +15,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
@@ -24,7 +24,8 @@ use crate::{
 };
 
 use super::{
-    ManifestHook, UpdateReuseScope, update_scope::UpdateScope, workspace_ctx::WorkspaceTreeCtx,
+    ManifestHook, UpdateReuseScope, reuse::TargetDistances, update_scope::UpdateScope,
+    workspace_ctx::WorkspaceTreeCtx,
 };
 
 /// Whether a wanted dep's resolution is computed relative to the
@@ -62,8 +63,8 @@ pub(super) fn project_relative_cache_scope(
 /// (the local resolver). Nothing asks for a linked node's directory:
 /// a linked project resolves its own dependencies as a separate
 /// importer, so the walk never descends into one.
-pub(super) fn declaring_manifest_dir(
-    ctx: &TreeCtx,
+pub(crate) fn declaring_manifest_dir(
+    lockfile_dir: &Path,
     result: &pnpm_resolving_resolver_base::ResolveResult,
 ) -> Option<Arc<Path>> {
     let pnpm_lockfile::LockfileResolution::Directory(resolution) = &result.resolution else {
@@ -76,7 +77,7 @@ pub(super) fn declaring_manifest_dir(
     let absolute = if directory.is_absolute() {
         pnpm_fs::lexical_normalize(directory)
     } else {
-        pnpm_fs::lexical_normalize(&ctx.importer.lockfile_dir.join(directory))
+        pnpm_fs::lexical_normalize(&lockfile_dir.join(directory))
     };
     Some(Arc::from(absolute))
 }
@@ -180,6 +181,9 @@ pub(super) struct TreeImporterContext {
     /// computed from, kept separate so the cache changes no behavior
     /// even when the two lockfile-dir spellings differ.
     pub(super) base_link_anchor: crate::link_target::ImporterAnchor,
+    /// The [`TargetDistances`] of this importer's update scope, fetched
+    /// from the workspace on first use. See [`TreeCtx::target_distances`].
+    target_distances: OnceLock<Arc<TargetDistances>>,
 }
 
 impl TreeCtx {
@@ -212,6 +216,7 @@ impl TreeCtx {
                     &base_opts.project.project_dir,
                     &base_opts.project.lockfile_dir,
                 ),
+                target_distances: OnceLock::new(),
                 lockfile_dir,
                 id: pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY.to_string(),
                 order: 0,
@@ -252,6 +257,7 @@ impl TreeCtx {
                     &base_opts.project.project_dir,
                     &base_opts.project.lockfile_dir,
                 ),
+                target_distances: OnceLock::new(),
                 lockfile_dir,
                 id: pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY.to_string(),
                 order: 0,
@@ -358,6 +364,14 @@ impl TreeCtx {
         UpdateScope { reuse: self.update_reuse_scope(), max_depth: self.workspace.reuse.depth }
     }
 
+    /// The [`TargetDistances`] of this importer's update scope, looked up
+    /// in the workspace once per importer.
+    pub(super) fn target_distances(&self) -> &TargetDistances {
+        self.importer.target_distances.get_or_init(|| {
+            self.workspace.target_distances_for(&self.importer.id)
+        })
+    }
+
     pub(super) fn update_cache_scope(&self) -> Option<String> {
         (!matches!(self.update_reuse_scope(), UpdateReuseScope::All)).then(|| {
             self.importer.id.clone()
@@ -369,6 +383,7 @@ impl TreeCtx {
     #[must_use]
     pub fn with_importer_id(mut self, importer_id: &str) -> Self {
         self.importer.id = importer_id.to_string();
+        self.importer.target_distances = OnceLock::new();
         self
     }
 

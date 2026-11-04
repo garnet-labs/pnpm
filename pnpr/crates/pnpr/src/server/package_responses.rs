@@ -1,8 +1,11 @@
+use pnpr_config::PackageDocumentsConfig;
+
 use super::{
-    ABBREVIATED_CONTENT_TYPE, Arc, Body, CanonicalPackageName, DistView, HeaderMap, IndexMap,
+    ABBREVIATED_CONTENT_TYPE, AppState, Body, CanonicalPackageName, DistView, HeaderMap, IndexMap,
     Integrity, RegistryError, Response, StatusCode, Utc, Value, abbreviate_packument,
-    declared_tarball_integrity, describe_tars, filter_osv_vulnerable_versions, header,
-    rewrite_tarball_urls, rewrite_upstream_tarball_urls, streaming, tarball_basename,
+    describe_tars, filter_osv_vulnerable_versions, header, rewrite_tarball_urls,
+    rewrite_upstream_tarball_urls, streaming, tarball_basename_for_package,
+    version_route_tarball_version,
 };
 
 /// The version a tarball request resolves to, plus that version's declared
@@ -12,6 +15,7 @@ use super::{
 /// resolves to the right version, integrity, and OSV identity.
 pub(super) struct TarballDist {
     pub(super) version: String,
+    pub(super) version_route: Option<String>,
     pub(super) integrity: Integrity,
     pub(super) unpacked_size: Option<u64>,
 }
@@ -58,7 +62,7 @@ pub(super) fn expected_tarball_dist(
             let dist = manifest.dist.as_ref()?;
             dist.tarball
                 .as_deref()
-                .and_then(tarball_basename)
+                .and_then(|url| tarball_basename_for_package(url, name))
                 .is_some_and(|basename| basename == filename)
                 .then_some((version, dist))
         });
@@ -77,7 +81,54 @@ pub(super) fn expected_tarball_dist(
         ));
     }
     let integrity = declared_tarball_integrity(dist, name, filename, version)?;
-    Ok(Some(TarballDist { version: version.clone(), integrity, unpacked_size: dist.unpacked_size }))
+    let version_route = dist.tarball
+        .as_deref()
+        .and_then(|url| version_route_tarball_version(url, name))
+        .map(str::to_string);
+    Ok(Some(TarballDist {
+        version: version.clone(),
+        version_route,
+        integrity,
+        unpacked_size: dist.unpacked_size,
+    }))
+}
+
+/// Prefer SRI and fall back to legacy SHA-1, while refusing unverified bytes.
+pub(super) fn declared_tarball_integrity(
+    dist: &DistBlock,
+    name: &CanonicalPackageName,
+    filename: &str,
+    version: &str,
+) -> Result<Integrity, RegistryError> {
+    let integrity = if let Some(declared) = dist.integrity.as_deref() {
+        streaming::parse_integrity(declared)
+            .map_err(|err| {
+                tarball_integrity_error(
+                    name.as_str(),
+                    filename,
+                    format!("malformed dist.integrity: {err}"),
+                )
+            })?
+    } else {
+        let shasum = dist.shasum
+            .as_deref()
+            .ok_or_else(|| {
+                tarball_integrity_error(
+                    name.as_str(),
+                    filename,
+                    format!("packument has no dist.integrity or dist.shasum for {version:?}"),
+                )
+            })?;
+        Integrity::from_hex(shasum, ssri::Algorithm::Sha1)
+            .map_err(|err| {
+                tarball_integrity_error(
+                    name.as_str(),
+                    filename,
+                    format!("malformed dist.shasum: {err}"),
+                )
+            })?
+    };
+    Ok(integrity)
 }
 
 pub(super) fn tarball_stream_error(
@@ -145,10 +196,11 @@ pub(super) fn packument_response(
     bytes: &[u8],
     tarball_base: &str,
     view: DistView<'_>,
-    osv_index: Option<&Arc<pnpr_osv::OsvIndex>>,
+    state: &AppState,
     headers: &HeaderMap,
     max_age: u64,
 ) -> Result<Response, RegistryError> {
+    let osv_index = state.inner.osv_index.as_ref();
     let mut doc: Value = serde_json::from_slice(bytes)?;
     filter_osv_vulnerable_versions(&mut doc, name, osv_index);
     match view.revision_registry {
@@ -160,23 +212,65 @@ pub(super) fn packument_response(
     if let Some(table) = view.tar_integrities {
         describe_tars(&mut doc, table, view.tar_registry);
     }
-    let abbreviated = wants_abbreviated(headers);
-    let (body, content_type) = if abbreviated {
-        let trimmed = abbreviate_packument(&doc, Utc::now());
-        (serde_json::to_vec(&trimmed)?, ABBREVIATED_CONTENT_TYPE)
-    } else {
-        (serde_json::to_vec(&doc)?, "application/json")
-    };
+    let representation = Representation::requested(headers);
+    let last_modified_source = packument_last_modified(&doc);
+    let documents = &state.inner.config.http.package_documents;
+    let (body, content_type) = representation.render(doc, documents)?;
+    let abbreviated = representation != Representation::Full;
     let etag = format!(r#""{}""#, super::ecosystem::sha256_hex(&body));
     // Per RFC 9110 Section 8.8.2, Last-Modified is omitted when the representation
     // is dynamically generated or subject to content negotiation (such as OSV
     // filtering or abbreviation) and can vary independently of modification time.
     let last_modified =
-        if osv_index.is_some() || abbreviated { None } else { packument_last_modified(&doc) };
+        if osv_index.is_some() || abbreviated { None } else { last_modified_source };
     if is_not_modified(headers, &etag, last_modified.as_deref()) {
         return Ok(packument_not_modified_response(&etag, last_modified, max_age));
     }
     Ok(packument_ok_response(body, content_type, &etag, last_modified, max_age))
+}
+
+/// The form of a package document a client asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Representation {
+    Full,
+    Abbreviated,
+    /// pnpr's own format (see [`super::split_packuments`]).
+    InstallV2,
+}
+
+impl Representation {
+    fn requested(headers: &HeaderMap) -> Self {
+        if super::split_packuments::wants_install_v2(headers) {
+            Representation::InstallV2
+        } else if wants_abbreviated(headers) {
+            Representation::Abbreviated
+        } else {
+            Representation::Full
+        }
+    }
+
+    /// The document's body and content type. pnpr's facts about the archives
+    /// and the revision protocol's fields are only in pnpr's format: npm's
+    /// documents keep the versions as npm clients read them.
+    fn render(
+        self,
+        mut doc: Value,
+        documents: &PackageDocumentsConfig,
+    ) -> Result<(Vec<u8>, &'static str), RegistryError> {
+        if self == Representation::InstallV2 {
+            super::publishing::variants::describe_variants(&mut doc);
+            let anchor = super::split_packuments::document_anchor(&doc).unwrap_or_else(Utc::now);
+            let trimmed = abbreviate_packument(&doc, anchor);
+            let body = super::split_packuments::install_v2_body(&trimmed, documents)?;
+            return Ok((body, super::split_packuments::INSTALL_V2_CONTENT_TYPE));
+        }
+        super::split_packuments::without_pnpr_facts_in(&mut doc);
+        if self == Representation::Abbreviated {
+            let trimmed = abbreviate_packument(&doc, Utc::now());
+            return Ok((serde_json::to_vec(&trimmed)?, ABBREVIATED_CONTENT_TYPE));
+        }
+        Ok((serde_json::to_vec(&doc)?, "application/json"))
+    }
 }
 
 fn is_not_modified(headers: &HeaderMap, etag: &str, last_modified: Option<&str>) -> bool {
@@ -232,6 +326,12 @@ fn if_modified_since_matches(if_modified_since: &str, last_modified: &str) -> bo
     lm_time <= ims_time
 }
 
+/// The response header that tells a client a package document comes from
+/// pnpr, so pnpm can warn about a registry not declared `serverType: pnpr`.
+/// Its value names no build, which would only help fingerprint the server.
+const PNPR_REGISTRY_HEADER: &str = "pnpr-registry";
+const PNPR_REGISTRY_HEADER_VALUE: &str = "1";
+
 fn packument_not_modified_response(
     etag: &str,
     last_modified: Option<String>,
@@ -241,7 +341,8 @@ fn packument_not_modified_response(
         .status(StatusCode::NOT_MODIFIED)
         .header(header::ETAG, etag)
         .header(header::VARY, "Accept")
-        .header(header::CACHE_CONTROL, format!("public, max-age={max_age}"));
+        .header(header::CACHE_CONTROL, format!("public, max-age={max_age}"))
+        .header(PNPR_REGISTRY_HEADER, PNPR_REGISTRY_HEADER_VALUE);
     if let Some(last_modified) = last_modified {
         builder = builder.header(header::LAST_MODIFIED, last_modified);
     }
@@ -262,7 +363,8 @@ fn packument_ok_response(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ETAG, etag)
         .header(header::VARY, "Accept")
-        .header(header::CACHE_CONTROL, format!("public, max-age={max_age}"));
+        .header(header::CACHE_CONTROL, format!("public, max-age={max_age}"))
+        .header(PNPR_REGISTRY_HEADER, PNPR_REGISTRY_HEADER_VALUE);
     if let Some(last_modified) = last_modified {
         builder = builder.header(header::LAST_MODIFIED, last_modified);
     }
@@ -317,4 +419,18 @@ pub(super) fn tarball_response(body: Body, content_length: Option<u64>) -> Respo
         builder = builder.header(header::CONTENT_LENGTH, len);
     }
     builder.body(body).expect("static-shape response always builds")
+}
+
+/// `response` with the generation its package view was rendered from.
+pub(super) fn with_generation(
+    mut response: Response,
+    generation: Option<&pnpr_storage::metadata::Generation>,
+) -> Response {
+    let value = generation.and_then(|generation| {
+        axum::http::HeaderValue::from_str(&generation.to_string()).ok()
+    });
+    if let Some(value) = value {
+        response.headers_mut().insert(super::GENERATION_HEADER, value);
+    }
+    response
 }

@@ -12,9 +12,8 @@ pub(super) use direct_versions::{
     higher_direct_dep_version, node_depends_on_changed_direct_dep, record_direct_dep_versions,
 };
 
-pub(super) use snapshot_children::{
-    PendingReusedNode, reuse_key_matches_peer_scope, reuse_matches_peer_scope,
-};
+pub(super) use snapshot_children::PendingReusedNode;
+pub(super) use subtree::{SubtreeReuseCache, TargetDistances};
 
 mod direct_versions;
 mod snapshot_children;
@@ -24,20 +23,18 @@ use subtree::subtree_fully_reusable;
 
 use async_recursion::async_recursion;
 use pnpm_lockfile::{
-    BoundProviders, PkgName, PkgNameVerPeer, ProjectSnapshot, ResolvedDependencyMap,
-    SnapshotDepRef, SnapshotEntry,
+    PkgName, PkgNameVerPeer, ProjectSnapshot, ResolvedDependencyMap, SnapshotDepRef, SnapshotEntry,
 };
 use pnpm_resolving_resolver_base::{Resolver, WantedDependency};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use crate::{
-    lockfile_reuse::{reusable_importer_dep, synthesize_reused_result},
+    lockfile_reuse::{locked_key_is_current, reusable_importer_dep, synthesize_reused_result},
     node_id::NodeId,
-    parent_pkg_aliases::{ParentPkgAliases, declared_peer_dependencies},
+    parent_pkg_aliases::ParentPkgAliases,
     resolved_tree::{
-        AncestorPkgIds, DirectDep, PeerDep, PeerSet, ResolvedPackage, ResolvedPackageInput,
-        TreeChildren,
+        AncestorPkgIds, DirectDep, PeerSet, ResolvedPackage, ResolvedPackageInput, TreeChildren,
     },
 };
 
@@ -50,10 +47,9 @@ use super::{
         resolve_node_seed, walk_from_seeds,
     },
     workspace_ctx::{
-        ChildrenOwnerClaim, ChildrenRecording, DirectDepVersions, PackageRegistration,
-        RecordedChildrenContext, claim_children_owner, insert_tree_node, is_current_children_owner,
-        make_non_owner_nodes_lazy, record_children, register_peer_dep_names,
-        register_shadowable_dep_names,
+        ChildrenOwnerClaim, ChildrenRecording, DirectDepVersion, DirectDepVersions,
+        PackageRegistration, RecordedChildrenContext, claim_children_owner, insert_tree_node,
+        is_current_children_owner, make_non_owner_nodes_lazy, record_children,
     },
 };
 
@@ -95,6 +91,7 @@ impl ReuseSource {
         wanted: &WantedDependency,
     ) -> Option<PkgNameVerPeer> {
         let lockfile = ctx.workspace.reuse.lockfile.as_ref()?;
+        let registries = &ctx.workspace.cache.registry_context;
         match self {
             ReuseSource::Importer { importer_id } => {
                 let alias = wanted.alias.as_deref()?;
@@ -106,6 +103,7 @@ impl ReuseSource {
                     importer_id,
                     alias,
                     wanted.bare_specifier.as_deref()?,
+                    registries,
                 )
             }
             ReuseSource::Transitive { key } => key.clone(),
@@ -149,6 +147,16 @@ pub(super) fn try_reuse_node(
     }
     let alias = wanted.alias.as_deref()?;
     let key = prior_key?;
+    // The pin stands, but a subtree recorded under a key the configuration
+    // no longer writes is resolved again, which records the current key.
+    if !locked_key_is_current(
+        &alias.parse().ok()?,
+        key,
+        wanted.bare_specifier.as_deref()?,
+        &ctx.workspace.cache.registry_context,
+    ) {
+        return None;
+    }
     if !subtree_fully_reusable(ctx, lockfile, key, depth) {
         return None;
     }
@@ -166,20 +174,25 @@ pub(super) fn try_reuse_node(
 /// inputs and leaving frozen installs on other hosts with nothing to
 /// link (<https://github.com/pnpm/pnpm/issues/12853>).
 ///
-/// Only plain semver specifiers are checked; exotic specifiers (git,
-/// catalogs, tags, URLs) keep the skip-on-failure behavior.
+/// Only semver ranges, plain or behind a named-registry prefix
+/// (`work:^1.0.0`), are checked; other specifiers (git, catalogs, tags,
+/// URLs) keep the skip-on-failure behavior.
 ///
-/// The check is deliberately by package name and range rather than by
-/// the current edge's locked snapshot ref: a satisfying entry locked
+/// The check is deliberately by package name, registry, and range (see
+/// [`crate::lockfile_reuse::locked_child_admits`]) rather than by the
+/// current edge's locked snapshot ref: a satisfying entry locked
 /// via any edge means the registry served this package in-range
 /// before, so failing loudly instead of skipping is the right outcome
 /// even when the failing edge itself was never locked. This matches
 /// the TypeScript resolver's `wantedLockfileContainsSatisfyingEntry`.
 pub(super) fn wanted_lockfile_contains_satisfying_entry(
-    lockfile: Option<&pnpm_lockfile::Lockfile>,
+    ctx: &TreeCtx,
     wanted: &WantedDependency,
 ) -> bool {
-    let Some(packages) = lockfile.and_then(|lockfile| lockfile.packages.as_ref()) else {
+    let Some(packages) = ctx.workspace.reuse.lockfile
+        .as_deref()
+        .and_then(|lockfile| lockfile.packages.as_ref())
+    else {
         return false;
     };
     let Some(alias) = wanted.alias
@@ -190,20 +203,15 @@ pub(super) fn wanted_lockfile_contains_satisfying_entry(
     };
     let (pkg_name, range) =
         unwrap_package_name(alias, wanted.bare_specifier.as_deref().unwrap_or_default());
-    let Ok(range) = range.parse::<node_semver::Range>() else {
-        return false;
-    };
     let Ok(pkg_name) = PkgName::parse(pkg_name) else {
         return false;
     };
-    packages
-        .keys()
-        .any(|key| {
-            key.name == pkg_name
-                && key.suffix
-                    .version_semver()
-                    .is_some_and(|version| range.satisfies(version))
-        })
+    crate::lockfile_reuse::any_locked_key_admits(
+        &pkg_name,
+        packages.keys(),
+        range,
+        &ctx.workspace.cache.registry_context,
+    )
 }
 
 /// Normalize an `npm:` alias specifier into the real package name and
@@ -291,15 +299,9 @@ pub(super) async fn seed_reused_node(
         return Ok(NodeSeed::Done(None));
     }
     let alias = node_alias(&wanted, &result, &id);
-    let identity = reused_identity(ctx, &id, &result, &reused.key, edge.parent_pkg_aliases);
-    let registration = register_reused_package(
-        ctx,
-        id,
-        &result,
-        identity.peer_set.clone(),
-        current_is_optional,
-        identity.is_leaf,
-    );
+    let identity = reused_identity(ctx, &id, &reused.key);
+    let registration =
+        register_reused_package(ctx, id, &result, current_is_optional, identity.is_leaf);
     let id = match registration {
         PackageRegistration::Created(id) => {
             emit_deprecation_if_needed(ctx, &result, &id, edge.depth);
@@ -312,8 +314,6 @@ pub(super) async fn seed_reused_node(
         dep: DirectDep { alias, node_id: identity.node_id, id },
         key: reused.key,
         child_refs: identity.child_refs,
-        peer_set: identity.peer_set,
-        peer_shadowed: identity.peer_shadowed,
         ancestry,
     })))
 }
@@ -325,24 +325,19 @@ pub(super) async fn seed_reused_node(
 pub(super) async fn finish_reused_node<Chain>(
     ctx: &TreeCtx,
     resolver: &Chain,
-    mut reused: PendingReusedNode,
+    reused: PendingReusedNode,
     children_pkg_aliases: &Arc<ParentPkgAliases>,
 ) -> Result<(), ResolveDependencyTreeError>
 where
     Chain: Resolver + ?Sized,
 {
-    let peer_shadowed = std::mem::take(&mut reused.peer_shadowed);
-    let peer_set = std::mem::take(&mut reused.peer_set);
     let children_owner = claim_children_owner(
         ctx,
         &reused.dep.id,
         reused.ancestry.depth,
         &reused.ancestry.parent_ancestors,
-        peer_shadowed,
+        HashSet::default(),
     );
-    if children_owner.owns_children {
-        install_reused_owner_peer_set(ctx, &reused.dep.id, &peer_set);
-    }
     let (children, _recording) =
         reused_children(ctx, resolver, &children_owner, &reused, children_pkg_aliases).await?;
     let depth = reused.ancestry.depth;
@@ -355,25 +350,12 @@ where
     Ok(())
 }
 
-fn install_reused_owner_peer_set(ctx: &TreeCtx, id: &Arc<str>, peer_set: &PeerSet) {
-    let mut packages = lock_recoverable(&ctx.workspace.tree.packages);
-    let Some(existing) = packages.get_mut(id) else { return };
-    if &existing.peer_set == peer_set {
-        return;
-    }
-    existing.peer_set = peer_set.clone();
-    drop(packages);
-    register_peer_dep_names(ctx, peer_set.taken());
-    ctx.workspace.record_package_write(id);
-}
-
 /// Insert a reused package into the workspace's package table, answering
 /// with the table's `Arc` of the id as a created or an existing entry.
 fn register_reused_package(
     ctx: &TreeCtx,
     id: String,
     result: &Arc<pnpm_resolving_resolver_base::ResolveResult>,
-    peer_set: PeerSet,
     current_is_optional: bool,
     is_leaf: bool,
 ) -> PackageRegistration {
@@ -382,7 +364,6 @@ fn register_reused_package(
         existing.optional = existing.optional && current_is_optional;
         return PackageRegistration::Existing(Arc::clone(&existing.id));
     }
-    register_peer_dep_names(ctx, peer_set.taken());
     ctx.workspace.record_package_write(&id);
     let shared_id: Arc<str> = Arc::from(id);
     packages.insert(
@@ -390,7 +371,7 @@ fn register_reused_package(
         ResolvedPackage::new(ResolvedPackageInput {
             id: Arc::<str>::clone(&shared_id),
             result: Arc::clone(result),
-            peer_set,
+            peer_set: PeerSet::default(),
             optional: current_is_optional,
             is_leaf,
         }),

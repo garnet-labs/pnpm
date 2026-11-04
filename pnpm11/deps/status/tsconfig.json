@@ -19,6 +19,9 @@
       "path": "../../catalogs/types"
     },
     {
+      "path": "../../config/normalize-registries"
+    },
+    {
       "path": "../../config/parse-overrides"
     },
     {
@@ -49,7 +52,13 @@
       "path": "../../lockfile/settings-checker"
     },
     {
+      "path": "../../lockfile/utils"
+    },
+    {
       "path": "../../lockfile/verification"
+    },
+    {
+      "path": "../../resolving/local-resolver"
     },
     {
       "path": "../../resolving/resolver-base"
@@ -59,6 +68,9 @@
     },
     {
       "path": "../../workspace/projects-reader"
+    },
+    {
+      "path": "../../workspace/spec-parser"
     },
     {
       "path": "../../workspace/state"

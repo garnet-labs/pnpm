@@ -1,9 +1,11 @@
 use super::{
-    COMPLETE_FILE, build_storage_at, build_storage_at_with_substitutions, discard_unusable_storage,
-    ensure_storage, latest_version, packages_dir, publish_storage, remove_tree,
-    restore_claimed_storage, set_dist_tag,
+    COMPLETE_FILE, RemovedVersionField, build_storage_at, build_storage_at_with_edits,
+    build_storage_at_with_substitutions, deprecate_version, discard_unusable_storage,
+    ensure_storage, latest_version, metadata::read_packument, packages_dir, publish_storage,
+    remove_tree, remove_version, restore_claimed_storage, set_dist_tag,
 };
-use pnpr_storage::layout::{local_blob_path, local_document_path};
+use pnpr_registry::Ecosystem;
+use pnpr_storage::layout::local_blob_path;
 use std::{collections::BTreeSet, fs, path::Path};
 use tempfile::TempDir;
 
@@ -50,8 +52,11 @@ fn latest_version_uses_semver_prerelease_order() {
 fn ensure_storage_generates_packuments_and_tarballs() {
     let storage = ensure_storage();
     assert!(packages_dir().join("@pnpm.e2e/abc/1.0.0/package.json").exists());
-    assert!(local_document_path(storage, "", "@pnpm.e2e/abc").exists());
-    assert!(local_blob_path(storage, "", "@pnpm.e2e/abc", "abc-1.0.0.tgz").exists());
+    assert!(pnpr_config::default_metadata_path(storage).is_file());
+    assert_eq!(read_packument(storage, "@pnpm.e2e/abc")["name"], "@pnpm.e2e/abc");
+    assert!(
+        local_blob_path(storage, "", Ecosystem::Npm, "@pnpm.e2e/abc", "abc-1.0.0.tgz").exists(),
+    );
     assert!(storage.join(pnpr_storage::layout::LAYOUT_FILE).exists());
 }
 
@@ -67,15 +72,12 @@ fn per_run_substitutions_update_packuments_and_tarballs() {
         )],
     );
     let name = "@pnpm.e2e/has-aliased-git-dependency";
-    let packument: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(local_document_path(out.path(), "", name))
-            .expect("read substituted packument"),
-    )
-    .expect("parse substituted packument");
+    let packument = read_packument(out.path(), name);
     assert_eq!(packument["versions"]["1.0.0"]["dependencies"]["say-hi"], "git+file:///tmp/hi#main");
     let manifest = tarball_package_manifest(&local_blob_path(
         out.path(),
         "",
+        Ecosystem::Npm,
         name,
         "has-aliased-git-dependency-1.0.0.tgz",
     ));
@@ -90,6 +92,7 @@ fn case_colliding_files_are_composed_in_memory() {
     let entries = tarball_entries(&local_blob_path(
         storage,
         "",
+        Ecosystem::Npm,
         "@pnpm.e2e/with-same-file-in-different-cases",
         "with-same-file-in-different-cases-1.0.0.tgz",
     ));
@@ -106,6 +109,7 @@ fn bundle_dependencies_embed_node_modules() {
     let bundled = tarball_entries(&local_blob_path(
         storage,
         "",
+        Ecosystem::Npm,
         "@pnpm.e2e/pkg-with-bundle-dependencies",
         "pkg-with-bundle-dependencies-1.0.0.tgz",
     ));
@@ -117,6 +121,7 @@ fn bundle_dependencies_embed_node_modules() {
     let not_bundled = tarball_entries(&local_blob_path(
         storage,
         "",
+        Ecosystem::Npm,
         "@pnpm.e2e/pkg-with-bundle-dependencies-false",
         "pkg-with-bundle-dependencies-false-1.0.0.tgz",
     ));
@@ -133,12 +138,19 @@ fn bundle_dependencies_embed_node_modules() {
 #[test]
 fn root_license_is_injected_except_for_self_contained_workspaces() {
     let storage = ensure_storage();
-    let abc = tarball_entries(&local_blob_path(storage, "", "@pnpm.e2e/abc", "abc-1.0.0.tgz"));
+    let abc = tarball_entries(&local_blob_path(
+        storage,
+        "",
+        Ecosystem::Npm,
+        "@pnpm.e2e/abc",
+        "abc-1.0.0.tgz",
+    ));
     assert!(abc.contains("package/LICENSE"), "{abc:?}");
 
     let bundled = tarball_entries(&local_blob_path(
         storage,
         "",
+        Ecosystem::Npm,
         "@pnpm.e2e/pkg-with-bundled-dependencies",
         "pkg-with-bundled-dependencies-1.0.0.tgz",
     ));
@@ -258,11 +270,7 @@ fn discarding_does_nothing_when_the_path_is_already_free() {
 fn a_moved_dist_tag_replaces_the_highest_published_version() {
     let out = tempfile::tempdir().expect("create output directory");
     build_storage_at(&packages_dir(), out.path());
-    let packument_path = local_document_path(out.path(), "", "@pnpm.e2e/foo");
-    let read = || -> serde_json::Value {
-        serde_json::from_slice(&fs::read(&packument_path).expect("read packument"))
-            .expect("parse packument")
-    };
+    let read = || read_packument(out.path(), "@pnpm.e2e/foo");
     assert_eq!(read()["dist-tags"]["latest"], "100.1.0");
 
     set_dist_tag(out.path(), "@pnpm.e2e/foo", "1.0.0", "latest");
@@ -280,6 +288,46 @@ fn tagging_an_unpublished_version_fails_loudly() {
     build_storage_at(&packages_dir(), out.path());
 
     set_dist_tag(out.path(), "@pnpm.e2e/foo", "999.0.0", "latest");
+}
+
+#[test]
+fn a_removed_version_leaves_the_metadata_and_takes_its_tags_along() {
+    let out = tempfile::tempdir().expect("create output directory");
+    build_storage_at(&packages_dir(), out.path());
+
+    remove_version(out.path(), "@pnpm.e2e/foo", "100.1.0");
+
+    let packument = read_packument(out.path(), "@pnpm.e2e/foo");
+    assert!(packument["versions"].get("100.1.0").is_none(), "{packument}");
+    assert!(packument["time"].get("100.1.0").is_none(), "{packument}");
+    assert_eq!(packument["dist-tags"]["latest"], "100.0.0");
+}
+
+#[test]
+fn a_removed_field_leaves_the_metadata_but_not_the_tarball() {
+    let out = tempfile::tempdir().expect("create output directory");
+    let removed = RemovedVersionField {
+        package: "@pnpm.e2e/deprecated",
+        version: "1.0.0",
+        field: "deprecated",
+    };
+    build_storage_at_with_edits(&packages_dir(), out.path(), &[], &[removed]);
+
+    let packument = read_packument(out.path(), "@pnpm.e2e/deprecated");
+    assert!(packument["versions"]["1.0.0"].get("deprecated").is_none(), "{packument}");
+    let manifest = tarball_package_manifest(&local_blob_path(
+        out.path(),
+        "",
+        Ecosystem::Npm,
+        "@pnpm.e2e/deprecated",
+        "deprecated-1.0.0.tgz",
+    ));
+    assert!(manifest.get("deprecated").is_some(), "{manifest}");
+
+    deprecate_version(out.path(), "@pnpm.e2e/deprecated", "1.0.0", "Gone.");
+
+    let packument = read_packument(out.path(), "@pnpm.e2e/deprecated");
+    assert_eq!(packument["versions"]["1.0.0"]["deprecated"], "Gone.");
 }
 
 #[test]

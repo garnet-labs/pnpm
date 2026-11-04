@@ -114,8 +114,10 @@ importers:
             workspace: super::WorkspaceProjects {
                 packages: None,
                 manifests_by_dir: Box::leak(Box::default()),
+                directory_manifests: crate::install::DirectoryManifests::none(),
                 catalogs: Box::leak(Box::default()),
                 canonical_paths: Box::leak(Box::default()),
+                registries: Box::leak(Box::default()),
             },
             optional_exclusions: super::OptionalDependencyExclusions { ignored, frozen_lockfile },
             parsed_overrides: None,

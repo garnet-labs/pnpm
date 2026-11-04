@@ -2,7 +2,7 @@ use super::{
     AddMockedRegistry, CONFLICTED_DEPENDENCY, CommandExtra, CommandTempCwd, IS_POSITIVE_PATCH,
     Path, assert_merged_conflicted_lockfile, configure_pnpr_auth, fs, get_all_files,
     is_symlink_or_junction, pacquet_at, point_npmrc_registry_at, read_workspace_lockfile,
-    start_pnpr, workspace_importer_version, write_conflicted_lockfile_fixture,
+    start_pnpr, start_pnpr_for, workspace_importer_version, write_conflicted_lockfile_fixture,
 };
 use assert_cmd::assert::OutputAssertExt;
 
@@ -726,5 +726,181 @@ fn import_ignores_the_pnpr_server_and_resolves_locally() {
         .collect();
     assert!(cas_blobs.is_empty(), "import must not fetch package content: {cas_blobs:?}");
 
+    drop((root, mock_instance));
+}
+
+/// `registry` under another host name, which pnpm counts as another
+/// registry: the default registry's packages keep plain keys whatever prefix
+/// names it.
+fn other_host(registry: &str) -> String {
+    registry.replace("127.0.0.1", "localhost")
+}
+
+#[test]
+fn delegated_install_resolves_a_secondary_registry_alias() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) =
+        start_pnpr_for(&[mock_instance.url(), &other_host(mock_instance.url())]);
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"@foo/no-deps":"zeta:1.0.0"}}"#)
+        .unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "registry: {default}\nnamedRegistries:\n  zeta: {registry}\n  work: {registry}\n",
+            default = other_host(mock_instance.url()),
+            registry = mock_instance.url(),
+        ),
+    )
+    .unwrap();
+    pacquet
+        .with_arg("install")
+        .with_arg("--pnpr-server")
+        .with_arg(&pnpr_url)
+        .assert()
+        .success();
+    let lockfile = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&lockfile, ".", "@foo/no-deps"), "work:1.0.0");
+    assert_eq!(
+        lockfile.packages
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert_eq!(
+        lockfile.snapshots
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert!(workspace.join("node_modules/@foo/no-deps/package.json").exists());
+    drop((root, mock_instance));
+}
+
+/// <https://github.com/pnpm/pnpm/issues/17575>
+#[test]
+fn delegated_install_keeps_plain_keys_for_a_prefix_of_the_default_registry() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"dependencies":{"@foo/no-deps":"zeta:1.0.0","@pnpm.e2e/foo":"100.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!("namedRegistries:\n  zeta: {}\n", mock_instance.url()),
+    )
+    .unwrap();
+    pacquet
+        .with_arg("install")
+        .with_arg("--pnpr-server")
+        .with_arg(&pnpr_url)
+        .assert()
+        .success();
+    let lockfile = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&lockfile, ".", "@foo/no-deps"), "1.0.0");
+    let mut keys: Vec<String> = lockfile.packages
+        .as_ref()
+        .unwrap()
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["@foo/no-deps@1.0.0", "@pnpm.e2e/foo@100.0.0"]);
+    drop((root, mock_instance));
+}
+
+#[test]
+fn delegated_install_rekeys_an_existing_secondary_registry_alias() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) =
+        start_pnpr_for(&[mock_instance.url(), &other_host(mock_instance.url())]);
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"@foo/no-deps":"zeta:1.0.0"}}"#)
+        .unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "registry: {}\nnamedRegistries:\n  zeta: {}\n",
+            other_host(mock_instance.url()),
+            mock_instance.url(),
+        ),
+    )
+    .unwrap();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    assert_eq!(
+        workspace_importer_version(&read_workspace_lockfile(&workspace), ".", "@foo/no-deps"),
+        "zeta:1.0.0",
+    );
+    fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "registry: {default}\nnamedRegistries:\n  zeta: {registry}\n  work: {registry}\n",
+            default = other_host(mock_instance.url()),
+            registry = mock_instance.url(),
+        ),
+    )
+    .unwrap();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .with_arg("--no-frozen-lockfile")
+        .with_arg("--pnpr-server")
+        .with_arg(&pnpr_url)
+        .assert()
+        .success();
+    let lockfile = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&lockfile, ".", "@foo/no-deps"), "work:1.0.0");
+    assert_eq!(
+        lockfile.packages
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert_eq!(
+        lockfile.snapshots
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert!(workspace.join("node_modules/@foo/no-deps/package.json").exists());
     drop((root, mock_instance));
 }

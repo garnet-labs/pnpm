@@ -82,21 +82,23 @@ fn shard_cache_populates_on_first_write_and_skips_mkdir_thereafter() {
     let tempdir = tempdir().unwrap();
     let store_dir = StoreDir::new(tempdir.path());
 
-    let (path_a, hash_a) = store_dir.write_cas_file(b"hello world", false).unwrap();
+    let crate::WrittenFile { file: path_a, hash: hash_a, .. } =
+        store_dir.write_cas_file(b"hello world", false).unwrap();
     assert!(store_dir.shard_already_ensured(hash_a[0]));
     assert!(path_a.is_file());
 
     // Second write of identical content — same hash, same path.
-    let (path_b, hash_b) = store_dir.write_cas_file(b"hello world", false).unwrap();
+    let crate::WrittenFile { file: path_b, hash: hash_b, .. } =
+        store_dir.write_cas_file(b"hello world", false).unwrap();
     assert_eq!(hash_a, hash_b);
-    assert_eq!(path_a, path_b);
+    assert_eq!(path_a.path, path_b.path);
     assert!(store_dir.shard_already_ensured(hash_b[0]));
 
     // Different content: either lands in a fresh shard (cache
     // grows by one) or happens to share the same first digest byte
     // as "hello world" (cache stays put). Either way the write
     // must succeed and materialize the file on disk.
-    let (path_c, _) = store_dir.write_cas_file(b"goodbye world", false).unwrap();
+    let path_c = store_dir.write_cas_file(b"goodbye world", false).unwrap().file;
     assert!(path_c.is_file());
 }
 
@@ -116,12 +118,20 @@ fn write_cas_file_from_reader_matches_write_cas_file() {
         eprintln!("CASE: executable = {executable:?}");
         let buffered_dir = tempdir().unwrap();
         let buffered_store = StoreDir::new(buffered_dir.path());
-        let (buffered_path, buffered_hash) =
-            buffered_store.write_cas_file(&content, executable).unwrap();
+        let crate::WrittenFile {
+            file: buffered_path,
+            hash: buffered_hash,
+            ..
+        } = buffered_store.write_cas_file(&content, executable).unwrap();
 
         let streamed_dir = tempdir().unwrap();
         let streamed_store = StoreDir::new(streamed_dir.path());
-        let (streamed_path, streamed_hash, streamed_size) = streamed_store
+        let crate::WrittenFile {
+            file: streamed_path,
+            hash: streamed_hash,
+            size: streamed_size,
+            ..
+        } = streamed_store
             .write_cas_file_from_reader(
                 &mut content.as_slice(),
                 executable,
@@ -163,14 +173,19 @@ fn write_cas_file_from_reader_keeps_existing_live_entry_and_removes_temp() {
     let store_dir = StoreDir::new(dir.path());
     let content = b"streamed twice";
 
-    let (first_path, _, _) = store_dir
+    let first_path = store_dir
         .write_cas_file_from_reader(&mut content.as_slice(), false, Some(content.len() as u64))
-        .unwrap();
-    let (second_path, _, second_size) = store_dir
+        .unwrap()
+        .file;
+    let crate::WrittenFile {
+        file: second_path,
+        size: second_size,
+        ..
+    } = store_dir
         .write_cas_file_from_reader(&mut content.as_slice(), false, Some(content.len() as u64))
         .unwrap();
 
-    assert_eq!(first_path, second_path);
+    assert_eq!(first_path.path, second_path.path);
     assert_eq!(second_size, content.len() as u64);
     assert_eq!(std::fs::read(&second_path).unwrap(), content);
 
@@ -196,16 +211,18 @@ fn write_cas_file_from_reader_replaces_same_length_corrupt_entry() {
     let store_dir = StoreDir::new(dir.path());
     let content = b"authentic cas payload";
 
-    let (file_path, _, _) = store_dir
+    let file_path = store_dir
         .write_cas_file_from_reader(&mut content.as_slice(), false, Some(content.len() as u64))
-        .unwrap();
+        .unwrap()
+        .file;
     std::fs::write(&file_path, vec![b'X'; content.len()]).unwrap();
 
-    let (second_path, _, _) = store_dir
+    let second_path = store_dir
         .write_cas_file_from_reader(&mut content.as_slice(), false, Some(content.len() as u64))
-        .unwrap();
+        .unwrap()
+        .file;
 
-    assert_eq!(second_path, file_path);
+    assert_eq!(second_path.path, file_path.path);
     assert_eq!(std::fs::read(&file_path).unwrap(), content, "corrupt blob must be healed");
 }
 
@@ -223,9 +240,10 @@ fn write_cas_file_from_reader_preserves_inode_when_repairing() {
     let store_dir = StoreDir::new(dir.path());
     let content = b"authentic cas payload";
 
-    let (file_path, _, _) = store_dir
+    let file_path = store_dir
         .write_cas_file_from_reader(&mut content.as_slice(), false, Some(content.len() as u64))
-        .unwrap();
+        .unwrap()
+        .file;
     let linked = dir.path().join("linked_copy");
     std::fs::hard_link(&file_path, &linked).unwrap();
     let ino_before = std::fs::metadata(&file_path).unwrap().ino();
@@ -233,11 +251,12 @@ fn write_cas_file_from_reader_preserves_inode_when_repairing() {
     // Editing through the hard link corrupts the store blob in place.
     std::fs::write(&linked, b"tampered").unwrap();
 
-    let (second_path, _, _) = store_dir
+    let second_path = store_dir
         .write_cas_file_from_reader(&mut content.as_slice(), false, Some(content.len() as u64))
-        .unwrap();
+        .unwrap()
+        .file;
 
-    assert_eq!(second_path, file_path);
+    assert_eq!(second_path.path, file_path.path);
     assert_eq!(
         std::fs::metadata(&file_path).unwrap().ino(),
         ino_before,
@@ -357,4 +376,49 @@ fn cas_file_path_by_mode_rejects_invalid_hex() {
     assert_eq!(store_dir.cas_file_path_by_mode("Ab\tcd", 0o644), None);
     assert!(store_dir.cas_file_path_by_mode("abc", 0o644).is_some());
     assert!(store_dir.cas_file_path_by_mode("abcdef", 0o755).is_some());
+}
+
+/// pnpm/pnpm#17543: every write reports the blob's mode, which it read
+/// anyway, so the importer does not `stat` the blob again: the mode of a
+/// blob found already present, or of the inode the write created.
+#[test]
+#[cfg(unix)]
+fn a_cas_write_reports_the_mode_of_the_blob() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let store_dir = StoreDir::new(dir.path());
+    let on_disk_mode =
+        |file: &pnpm_fs::StoreFile| std::fs::metadata(&file.path).unwrap().mode() & 0o777;
+
+    let content = b"written twice";
+    let first = store_dir.write_cas_file(content, false).unwrap().file;
+    assert_eq!(first.mode(), Some(on_disk_mode(&first)));
+    let streamed_content = b"streamed once";
+    let first_streamed = store_dir
+        .write_cas_file_from_reader(&mut streamed_content.as_slice(), true, None)
+        .unwrap()
+        .file;
+    assert_eq!(first_streamed.mode(), Some(on_disk_mode(&first_streamed)));
+
+    std::fs::set_permissions(&first.path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let buffered = store_dir.write_cas_file(content, false).unwrap().file;
+    let streamed = store_dir
+        .write_cas_file_from_reader(&mut content.as_slice(), false, Some(content.len() as u64))
+        .unwrap()
+        .file;
+
+    assert_eq!(
+        buffered
+            .mode()
+            .map(|mode| mode & 0o7777),
+        Some(0o640),
+    );
+    assert_eq!(
+        streamed
+            .mode()
+            .map(|mode| mode & 0o7777),
+        Some(0o640),
+    );
 }

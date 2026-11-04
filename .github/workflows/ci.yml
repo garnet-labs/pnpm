@@ -50,11 +50,15 @@ jobs:
         if: github.event_name != 'merge_group'
         id: filter
         with:
+          predicate-quantifier: some-with-excludes
           # The TypeScript pnpm stack lives under pnpm11/, plus the
-          # workspace-root tooling that drives its build/lint/test.
+          # pnpr registry its tests use and workspace-root build/lint/test tooling.
           filters: |
             ts:
+              # Matches the pnpr/docs/ exemption in ts-test-scope.mjs.
+              - '!pnpr/docs/**'
               - 'pnpm11/**'
+              - 'pnpr/**'
               - '.meta-updater/**'
               - '.config/pnpm/**'
               - 'package.json'
@@ -99,7 +103,7 @@ jobs:
       with:
         restore-cache: false
     - name: Install pnpm
-      uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
+      uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
       with:
         install: false
     - name: Test CI and release publication scripts
@@ -109,7 +113,7 @@ jobs:
         .github/scripts/issue-fix-intent.test.sh
         .github/scripts/docker-image-tags.test.sh
         .agents/skills/pull-requests/scripts/resolve-pr-conflicts.test.sh
-        node --test .github/scripts/ts-test-scope.test.mjs .github/scripts/ts-test-chunks.test.mjs .github/scripts/assert-windows-crt-static.test.mjs .github/scripts/wait-for-pnpr.test.mjs
+        node --test .github/scripts/ts-test-scope.test.mjs .github/scripts/ts-test-chunks.test.mjs .github/scripts/assert-windows-crt-static.test.mjs .github/scripts/wait-for-pnpr.test.mjs .github/scripts/update-npm-signing-keys.test.mjs
     - name: Compile and lint TypeScript
       run: pn pipeline ts-check --include-workspace-root --full --no-cache
     - name: Package compiled artifacts
@@ -160,7 +164,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['22.13.0', '24.0.0', '26.12.1']
+        node: ['22.13.0', '24.0.0', '26.13.0']
         test_chunk: ['1', '2', '3']
         include:
           - node: '22.13.0'
@@ -172,7 +176,7 @@ jobs:
           - node: '24.0.0'
             test_chunk: '2'
             garnet: true
-          - node: '26.12.1'
+          - node: '26.13.0'
             node_major: '26'
     uses: $/.github/workflows/test.yml
     with:

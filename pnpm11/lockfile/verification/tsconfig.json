@@ -25,6 +25,9 @@
       "path": "../../config/matcher"
     },
     {
+      "path": "../../config/normalize-registries"
+    },
+    {
       "path": "../../core/constants"
     },
     {
@@ -53,6 +56,9 @@
     },
     {
       "path": "../../resolving/git-resolver"
+    },
+    {
+      "path": "../../resolving/npm-resolver"
     },
     {
       "path": "../../resolving/resolver-base"

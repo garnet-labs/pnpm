@@ -1,10 +1,10 @@
 use super::{
     BASE64, Body, Request, ServiceExt, StatusCode, TempDir, Value, add_user_and_get_token,
-    body_json, common, json, publish_doc, put_json, router, static_config,
+    body_json, common, json, npm_tgz, publish_doc, put_json, router, static_config,
     static_config_with_packages,
 };
 use base64::Engine;
-use pnpr_storage::layout::{local_blob_path, local_document_path, local_package_dir};
+use pnpr_storage::layout::{local_blob_path, local_package_dir};
 
 #[tokio::test]
 async fn adduser_creates_user_and_returns_token() {
@@ -91,7 +91,7 @@ async fn authenticated_publish_writes_manifest_and_tarball() {
     let app = router(static_config(storage.clone()));
     let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
 
-    let bytes = b"fake-tarball-bytes";
+    let bytes = &npm_tgz("mypkg", "1.0.0", b"fake-tarball-bytes");
     let body = publish_doc("mypkg", "1.0.0", bytes);
     let request = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
@@ -108,7 +108,9 @@ async fn authenticated_publish_writes_manifest_and_tarball() {
 
     // Packument on disk
     let on_disk_packument =
-        std::fs::read(local_document_path(&storage, "", "mypkg")).expect("packument written");
+        pnpr_fixtures::read_hosted_document(&storage, "", pnpr_storage::Ecosystem::Npm, "mypkg")
+            .ok_or("no hosted document")
+            .expect("packument written");
     let packument: Value = serde_json::from_slice(&on_disk_packument).unwrap();
     assert_eq!(packument["name"], "mypkg");
     assert_eq!(packument["versions"]["1.0.0"]["version"], "1.0.0");
@@ -116,9 +118,15 @@ async fn authenticated_publish_writes_manifest_and_tarball() {
     assert!(packument.get("_attachments").is_none(), "_attachments should not be persisted");
 
     // Tarball on disk
-    let on_disk_tarball = std::fs::read(local_blob_path(&storage, "", "mypkg", "mypkg-1.0.0.tgz"))
-        .expect("tarball written");
-    assert_eq!(on_disk_tarball, bytes);
+    let on_disk_tarball = std::fs::read(local_blob_path(
+        &storage,
+        "",
+        pnpr_storage::Ecosystem::Npm,
+        "mypkg",
+        "mypkg-1.0.0.tgz",
+    ))
+    .expect("tarball written");
+    assert_eq!(on_disk_tarball, *bytes);
 
     // Subsequent GET serves it back with the public URL rewritten.
     let response = app
@@ -133,7 +141,7 @@ async fn authenticated_publish_writes_manifest_and_tarball() {
     let served = body_json(response.into_body()).await;
     assert_eq!(
         served["versions"]["1.0.0"]["dist"]["tarball"],
-        "http://example.test/npm/mypkg/-/mypkg-1.0.0.tgz",
+        "http://example.test/npm/mypkg@1.0.0",
     );
 }
 
@@ -177,7 +185,15 @@ async fn unpublish_policy_denies_publish_authorized_package_delete() {
             .status(),
         StatusCode::CREATED,
     );
-    assert!(local_document_path(&storage, "", "unpub-policy").exists());
+    assert!(
+        pnpr_fixtures::read_hosted_document(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "unpub-policy"
+        )
+        .is_some(),
+    );
 
     let request = Request::delete("/npm/unpub-policy/-rev/anything")
         .header("Authorization", format!("Bearer {alice}"))
@@ -191,7 +207,15 @@ async fn unpublish_policy_denies_publish_authorized_package_delete() {
             .status(),
         StatusCode::FORBIDDEN,
     );
-    assert!(local_document_path(&storage, "", "unpub-policy").exists());
+    assert!(
+        pnpr_fixtures::read_hosted_document(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "unpub-policy"
+        )
+        .is_some(),
+    );
 
     let request = Request::delete("/npm/unpub-policy/-rev/anything")
         .header("Authorization", format!("Bearer {admin}"))
@@ -205,7 +229,9 @@ async fn unpublish_policy_denies_publish_authorized_package_delete() {
             .status(),
         StatusCode::CREATED,
     );
-    assert!(!local_package_dir(&storage, "", "unpub-policy").exists());
+    assert!(
+        !local_package_dir(&storage, "", pnpr_storage::Ecosystem::Npm, "unpub-policy").exists(),
+    );
 }
 
 #[tokio::test]
@@ -236,7 +262,16 @@ async fn unpublish_policy_denies_publish_authorized_tarball_delete() {
             .status(),
         StatusCode::CREATED,
     );
-    assert!(local_blob_path(&storage, "", "tarball-policy", "tarball-policy-1.0.0.tgz").exists());
+    assert!(
+        local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "tarball-policy",
+            "tarball-policy-1.0.0.tgz"
+        )
+        .exists(),
+    );
 
     let request = Request::delete("/npm/tarball-policy/-/tarball-policy-1.0.0.tgz/-rev/anything")
         .header("Authorization", format!("Bearer {alice}"))
@@ -250,7 +285,16 @@ async fn unpublish_policy_denies_publish_authorized_tarball_delete() {
             .status(),
         StatusCode::FORBIDDEN,
     );
-    assert!(local_blob_path(&storage, "", "tarball-policy", "tarball-policy-1.0.0.tgz").exists());
+    assert!(
+        local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "tarball-policy",
+            "tarball-policy-1.0.0.tgz"
+        )
+        .exists(),
+    );
 
     let request = Request::delete("/npm/tarball-policy/-/tarball-policy-1.0.0.tgz/-rev/anything")
         .header("Authorization", format!("Bearer {admin}"))
@@ -264,5 +308,14 @@ async fn unpublish_policy_denies_publish_authorized_tarball_delete() {
             .status(),
         StatusCode::CREATED,
     );
-    assert!(!local_blob_path(&storage, "", "tarball-policy", "tarball-policy-1.0.0.tgz").exists());
+    assert!(
+        !local_blob_path(
+            &storage,
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "tarball-policy",
+            "tarball-policy-1.0.0.tgz"
+        )
+        .exists(),
+    );
 }

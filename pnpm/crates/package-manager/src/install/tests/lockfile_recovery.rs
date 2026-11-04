@@ -1,12 +1,10 @@
 use super::{
-    super::{
-        Install, InstallError, ProjectMutation, UpToDateFastPathCheck, install_already_up_to_date,
-    },
+    super::{Install, InstallError, ProjectMutation},
     InstallDirs, PARTIAL_INSTALL_LOCKFILE, assert_package_absent, assert_package_present,
     fresh_lockfile_only_with_overrides, install_then_go_offline, install_with_pnpmfile,
     touch_manifest,
 };
-use crate::PolicyExcludes;
+use crate::{PolicyExcludes, UpToDateFastPathCheck, install_already_up_to_date};
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, write_modules_manifest};
@@ -106,6 +104,7 @@ async fn stale_lockfile_under_no_flag_falls_through_to_fresh_resolve() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -131,6 +130,10 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
     std::fs::create_dir_all(&project_root).expect("create workspace member");
     std::fs::create_dir_all(project_root.join("node_modules"))
         .expect("create member modules directory");
+    // The member's `link:` dependency is linked on every install, so the
+    // recorded state has to see the entry.
+    std::fs::create_dir_all(project_root.join("node_modules").join("sibling"))
+        .expect("create the member's link entry");
     std::fs::create_dir_all(&virtual_store_dir).expect("create virtual store");
     std::fs::write(workspace_root.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
         .expect("write workspace manifest");
@@ -193,7 +196,7 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
             filtered_install: false,
             config_dependencies: None,
             validation: None,
-            settings: crate::optimistic_repeat_install::settings::current_settings(
+            settings: crate::install_state::settings::current_settings(
                 config,
                 pnpm_config::NodeLinker::Isolated,
                 included,
@@ -325,7 +328,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
             has_modules_dir: false,
         },
     );
-    let settings = crate::optimistic_repeat_install::settings::current_settings(
+    let settings = crate::install_state::settings::current_settings(
         config,
         pnpm_config::NodeLinker::Isolated,
         included,
@@ -398,6 +401,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -493,6 +497,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -578,6 +583,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -689,6 +695,7 @@ async fn optimistic_repeat_install_restores_missing_lockfile_offline() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()

@@ -5,7 +5,9 @@ use super::{
     super::{
         ManifestStat, OptimisticRepeatInstallCheck, Path, PathBuf, WorkspaceState,
         current_lockfile::CurrentLockfile,
-        validation::{FileDigest, FileDigests},
+        validation::{
+            FileDigest, FileDigests, project_bins_digest, project_bins_match, workspace_bins_digest,
+        },
     },
     Scope,
 };
@@ -165,9 +167,7 @@ fn patch_drift(
     digests: &FileDigests<'_>,
 ) -> PatchDrift {
     let mut drift = PatchDrift { modified: false, rehashed: false };
-    for patch in
-        super::super::validation::shared_input_paths(check.workspace_root, check.config, &[])
-    {
+    for patch in super::super::validation::shared_input_paths(check.config, &[]) {
         match (digests.of(&patch), recorded_signature(state.validation.as_ref(), &patch)) {
             (FileDigest::Present(now), Some(then)) => {
                 drift.modified |= now.digest != then.digest;
@@ -195,9 +195,11 @@ fn project_stats<'a>(
     recorded: Option<&Validation>,
     lockfile_digest: Option<&str>,
 ) -> Vec<ManifestStat<'a>> {
+    let bins =
+        super::super::validation::workspace_bins_digest(check.workspace_root, check.bin_projects());
     let mut stats = super::super::manifest_agreement::manifest_stats(
         check.project_manifests,
-        |root_dir, digest| {
+        |root_dir, manifest, digest| {
             let importer_id = importer_id_from_root_dir(check.workspace_root, root_dir);
             let Some(record) = recorded.and_then(|validation| validation.project(&importer_id))
             else {
@@ -207,7 +209,17 @@ fn project_stats<'a>(
             // and more.
             if record.lockfile != lockfile_digest {
                 ProjectStatus::LockfileChanged
-            } else if record.manifest != digest {
+            } else if record.manifest != digest
+                || !project_bins_match(
+                    recorded,
+                    &importer_id,
+                    super::super::validation::project_bins_digest(
+                        &importer_id,
+                        manifest,
+                        bins.as_deref(),
+                    ),
+                )
+            {
                 ProjectStatus::ManifestChanged
             } else {
                 ProjectStatus::Proven
@@ -365,3 +377,23 @@ fn reached_importers(
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn held_workspace_bins_match(
+    check: &OptimisticRepeatInstallCheck<'_>,
+    state: &WorkspaceState,
+    held: &[&ManifestStat<'_>],
+) -> bool {
+    if held.is_empty() || state.validation.is_none() {
+        return true;
+    }
+    let bins = workspace_bins_digest(check.workspace_root, check.bin_projects());
+    held.iter()
+        .all(|stat| {
+            let id = importer_id_from_root_dir(check.workspace_root, stat.root_dir);
+            project_bins_match(
+                state.validation.as_ref(),
+                &id,
+                project_bins_digest(&id, stat.manifest, bins.as_deref()),
+            )
+        })
+}

@@ -376,16 +376,15 @@ fn streaming_extract_matches_eager_extract() {
     )
     .expect("streaming extraction");
 
-    let relative =
-        |cas_paths: &HashMap<String, PathBuf>, store: &StoreDir| -> HashMap<String, PathBuf> {
-            cas_paths
-                .iter()
-                .map(|(key, path)| {
-                    let path = path.strip_prefix(store.root()).expect("path within store");
-                    (key.clone(), path.to_path_buf())
-                })
-                .collect()
-        };
+    let relative = |cas_paths: &pnpm_fs::CasPaths, store: &StoreDir| -> HashMap<String, PathBuf> {
+        cas_paths
+            .iter()
+            .map(|(key, path)| {
+                let path = path.strip_prefix(store.root()).expect("path within store");
+                (key.clone(), path.to_path_buf())
+            })
+            .collect()
+    };
     assert_eq!(
         relative(&streaming_cas_paths, streaming_store),
         relative(&eager_cas_paths, eager_store),
@@ -746,9 +745,9 @@ async fn revision_addressed_tarball_does_not_retry_a_transient_failure() {
     let (store_dir_keep, store_path) = tempdir_with_leaked_path();
     let mut server = mockito::Server::new_async().await;
     let digest = "A".repeat(86);
-    let path = format!("/-/tarballs/sha512/{digest}");
+    let path = "/test-pkg@1.0.0+r1";
     let mock = server
-        .mock("GET", path.as_str())
+        .mock("GET", path)
         .with_status(503)
         .expect(1)
         .create_async()
@@ -788,9 +787,9 @@ async fn revision_addressed_tarball_does_not_follow_a_redirect() {
     let (store_dir_keep, store_path) = tempdir_with_leaked_path();
     let mut server = mockito::Server::new_async().await;
     let digest = "A".repeat(86);
-    let path = format!("/-/tarballs/sha512/{digest}");
+    let path = "/test-pkg@1.0.0+r1";
     let redirect = server
-        .mock("GET", path.as_str())
+        .mock("GET", path)
         .with_status(302)
         .with_header("location", "/redirected.tgz")
         .expect(1)

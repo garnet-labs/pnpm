@@ -22,6 +22,7 @@ pnpm-fs = { workspace = true }
 pnpm-hooks = { workspace = true }
 pnpm-local-spec = { workspace = true }
 pnpm-lockfile = { workspace = true }
+pnpm-platform-variants = { workspace = true }
 pnpm-package-manifest = { workspace = true }
 pnpm-patching = { workspace = true }
 pnpm-resolving-npm-resolver = { workspace = true }
@@ -47,7 +48,6 @@ tokio = { workspace = true, features = ["sync"] }
 async-trait = { workspace = true }
 node-semver = { workspace = true }
 pretty_assertions = { workspace = true }
-proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 

@@ -62,8 +62,7 @@ impl<'a> InstallFrozenLockfile<'a> {
                 policy: install.build_policy(ctx.allow_build_policy),
                 extra_env: &build_extra_env,
                 skipped: phase.skipped,
-                held_back_bins_dirs: &phase.linked.held_back_bins_dirs,
-                hoisted_bin_sources: Some(&phase.linked.hoisted_bin_sources),
+                pending_bins: Some(&phase.linked.pending_bins),
             })
             .map_err(InstallFrozenLockfileError::BuildPhase)
         }
@@ -132,7 +131,8 @@ impl<'a> InstallFrozenLockfile<'a> {
             let progress_reported = SharedReportedProgressKeys::default();
 
             let custom_fetcher_session =
-                load_custom_fetcher_session(install.drivers.pnpmfile_hook).await?;
+                load_custom_fetcher_session(install.drivers.pnpmfile_hook, install.drivers.config)
+                    .await?;
             // Timed from here: a pnpmfile's fetcher setup is hook work, not
             // materialization, and the integrated benchmark reads this phase.
             let phase_start = std::time::Instant::now();

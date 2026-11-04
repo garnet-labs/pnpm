@@ -2,13 +2,15 @@ use super::{
     super::{
         Decision, OptimisticRepeatInstallCheck, check_optimistic_repeat_install,
         deps_status::install_args_from_state,
-        settings::current_settings,
-        timestamps::{FileMtime, modified_at_or_after},
     },
     assert_deps_status_converges_after_collision, backdate_validated_files, check,
     check_with_lockfile, content_check_decision, isolated_included, setup_content_check_project,
     setup_fresh_install, setup_fresh_install_with_config, validate_existing_files,
     write_empty_lockfile, write_registry_lockfile, write_state,
+};
+use crate::install_state::{
+    settings::current_settings,
+    timestamps::{FileMtime, modified_at_or_after},
 };
 use indexmap::IndexMap;
 use pnpm_config::Config;
@@ -120,7 +122,7 @@ fn returns_up_to_date_when_the_local_file_dependency_is_in_an_excluded_group() {
     let decision = check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root: dir.path(),
         config,
-        project_manifests: &[(dir.path().to_path_buf(), &manifest)],
+        project_manifests: crate::DeclaredManifests::new(&[(dir.path().to_path_buf(), &manifest)]),
         is_workspace_install: false,
         lockfile: MaybeLazyLockfile::Loaded(None),
         catalogs: &BTreeMap::default(),
@@ -166,7 +168,7 @@ fn returns_skipped_when_the_local_file_dependency_is_in_an_included_group() {
     let decision = check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root: dir.path(),
         config,
-        project_manifests: &[(dir.path().to_path_buf(), &manifest)],
+        project_manifests: crate::DeclaredManifests::new(&[(dir.path().to_path_buf(), &manifest)]),
         is_workspace_install: false,
         lockfile: MaybeLazyLockfile::Loaded(None),
         catalogs: &BTreeMap::default(),
@@ -262,7 +264,7 @@ fn returns_up_to_date_when_a_package_extension_optional_dependency_is_excluded()
     let decision = check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root: dir.path(),
         config,
-        project_manifests: &[(dir.path().to_path_buf(), &manifest)],
+        project_manifests: crate::DeclaredManifests::new(&[(dir.path().to_path_buf(), &manifest)]),
         is_workspace_install: false,
         lockfile: MaybeLazyLockfile::Loaded(None),
         catalogs: &BTreeMap::default(),
@@ -437,6 +439,113 @@ fn returns_skipped_when_minimum_release_age_drifts() {
         &[(workspace_root.to_path_buf(), &manifest)],
     );
     assert!(matches!(decision, Decision::Skipped { reason } if reason.contains("settings")));
+}
+/// A state written before a registry prefix was declared, or by a pnpm that
+/// did not key lockfile entries by it, proves nothing about the lockfile's
+/// keys, so the install resolves and re-keys them.
+#[test]
+fn returns_skipped_when_the_declared_registry_prefixes_drift() {
+    let dir = tempdir().unwrap();
+    let workspace_root = dir.path();
+    let manifest_path = workspace_root.join("package.json");
+    fs::write(&manifest_path, r#"{"name":"root","version":"1.0.0"}"#).unwrap();
+    let manifest = PackageManifest::from_path(manifest_path).unwrap();
+
+    let mut config = Config::new();
+    config.modules_dir = workspace_root.join("node_modules");
+    fs::create_dir_all(&config.modules_dir).unwrap();
+    config.registries_by_prefix.insert("work".to_string(), "https://npm.example.test/".to_string());
+    let config = config.leak();
+
+    let mut stale_config = Config::new();
+    stale_config.modules_dir = config.modules_dir.clone();
+    let stale_settings = current_settings(
+        &stale_config,
+        pnpm_config::NodeLinker::Isolated,
+        isolated_included(),
+        None,
+    );
+    let mut projects = BTreeMap::new();
+    projects.insert(
+        workspace_root.to_string_lossy().into_owned(),
+        ProjectEntry {
+            name: Some("root".into()),
+            version: Some("1.0.0".into()),
+            has_modules_dir: false,
+        },
+    );
+    write_state(workspace_root, backdate_validated_files(workspace_root), stale_settings, projects);
+
+    let decision = check(
+        workspace_root,
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        &[(workspace_root.to_path_buf(), &manifest)],
+    );
+    assert!(matches!(decision, Decision::Skipped { reason } if reason.contains("settings")));
+}
+/// A script runs the same whatever keys the lockfile records, so the run
+/// gate leaves re-keying to the next install, which the state still asks
+/// for.
+#[test]
+fn run_gate_passes_on_unverified_registry_prefixes() {
+    let (dir, recorded_config, manifest) = setup_fresh_install_with_config(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        "",
+        |_| {},
+    );
+    let project_manifests = [(dir.path().to_path_buf(), &manifest)];
+    let mut declared = recorded_config.clone();
+    declared.registries_by_prefix.insert("work".to_string(), declared.registry.clone());
+    let declared = declared.leak();
+
+    let status = super::single_project_deps_status(&dir, declared, &project_manifests);
+
+    assert_eq!(status, super::RunDepsStatus::UpToDate);
+    let state = pnpm_workspace_state::load_workspace_state(dir.path())
+        .expect("read the workspace state")
+        .expect("a workspace state");
+    assert_eq!(state.settings.registry_prefixes, None);
+    assert!(matches!(
+        check(dir.path(), declared, pnpm_config::NodeLinker::Isolated, &project_manifests),
+        Decision::Skipped { reason } if reason.contains("settings"),
+    ));
+}
+/// A scope routed to another registry leaves the lockfile's plain keys from
+/// the old one, so the state recorded under the old routing calls for the
+/// install that resolves them again, whether or not the registry declares a
+/// prefix.
+#[test]
+fn returns_skipped_when_a_scope_moves_to_another_registry() {
+    let work = "https://npm.work.test/";
+    let (dir, recorded_config, manifest) = setup_fresh_install_with_config(
+        pnpm_config::NodeLinker::Isolated,
+        "root",
+        "1.0.0",
+        "",
+        |config| {
+            config.registries_by_prefix.insert("work".to_string(), work.to_string());
+        },
+    );
+    let project_manifests = [(dir.path().to_path_buf(), &manifest)];
+    let recorded = crate::install_state::recorded_registry_prefixes(recorded_config);
+    assert_eq!(recorded, Some(BTreeMap::from([("work".to_string(), work.to_string())])));
+
+    let mut routed = recorded_config.clone();
+    routed.registries_by_scope.insert("@corp".to_string(), work.to_string());
+    let routed = routed.leak();
+
+    assert_eq!(crate::install_state::recorded_registry_prefixes(routed), recorded);
+    assert_eq!(
+        crate::install_state::settings::recorded_registry_routes(routed).get("@corp"),
+        Some(&work.to_string()),
+    );
+    assert!(matches!(
+        check(dir.path(), routed, pnpm_config::NodeLinker::Isolated, &project_manifests),
+        Decision::Skipped { reason } if reason.contains("settings"),
+    ));
 }
 /// Drift in `minimumReleaseAgeIgnoreMissingTime` invalidates the cached
 /// state. pnpm resolves it to a concrete `true` default and records it,
@@ -809,7 +918,7 @@ fn install_args_reproduce_the_recorded_dependency_groups() {
 
 #[test]
 fn install_already_up_to_date_bails_before_walking_projects_when_workspace_state_is_missing() {
-    use crate::install::{UpToDateFastPathCheck, install_already_up_to_date};
+    use crate::{UpToDateFastPathCheck, install_already_up_to_date};
     use pnpm_package_manifest::DependencyGroup;
 
     let dir = tempdir().unwrap();

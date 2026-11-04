@@ -1,4 +1,5 @@
 pub use placement::marker_present;
+pub use pnpm_fs::SymlinkTargets;
 
 mod hardlinks;
 mod placement;
@@ -19,7 +20,6 @@ use miette::Diagnostic;
 use pnpm_config::PackageImportMethod;
 use pnpm_reporter::Reporter;
 use std::{
-    collections::HashMap,
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
@@ -54,9 +54,9 @@ pub struct ImportIndexedDirOpts<'a> {
     ///
     /// Callers must ensure that the target path uniquely identifies its contents.
     pub safe_to_skip: bool,
-    /// When `true`, preserve safe symlinks in the imported package instead of
-    /// assuming all entries are regular files.
-    pub preserve_symlinks: bool,
+    /// Which source symlinks are recreated as symlinks. `None` imports
+    /// every entry as a file.
+    pub symlink_targets: Option<SymlinkTargets>,
     /// The install's [`ModulesSwapLock`], which serializes this install's
     /// forced replacements of private targets with those of the other
     /// installs under the same modules directory. `None` replaces
@@ -189,7 +189,7 @@ pub fn import_indexed_dir<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     opts: ImportIndexedDirOpts,
 ) -> Result<(), ImportIndexedDirError> {
     let result = import_indexed_dir_once::<Reporter>(
@@ -221,7 +221,7 @@ fn import_indexed_dir_once<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     opts: ImportIndexedDirOpts,
     repair_sanitized: bool,
 ) -> Result<(), ImportIndexedDirError> {
@@ -251,7 +251,7 @@ fn import_indexed_dir_once<Reporter: self::Reporter>(
             import_method,
             dir_path,
             cas_paths,
-            opts.preserve_symlinks,
+            opts.symlink_targets,
         )
         .inspect(|()| unquarantine()),
         // Short-circuit only when the completion marker is present
@@ -291,7 +291,7 @@ fn force_import_existing_dir<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     file_type: fs::FileType,
     opts: ImportIndexedDirOpts,
 ) -> Result<(), ImportIndexedDirError> {
@@ -313,7 +313,7 @@ fn force_import_existing_dir<Reporter: self::Reporter>(
             import_method,
             dir_path,
             cas_paths,
-            opts.preserve_symlinks,
+            opts.symlink_targets,
         );
     }
     let swap_target =
@@ -354,8 +354,8 @@ pub(super) fn import_into_shared_dir<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
-    preserve_symlinks: bool,
+    cas_paths: &pnpm_fs::CasPaths,
+    symlink_targets: Option<SymlinkTargets>,
 ) -> Result<(), ImportIndexedDirError> {
     if claim_dir(dir_path)? {
         return populate_dir::<Reporter>(
@@ -364,7 +364,7 @@ pub(super) fn import_into_shared_dir<Reporter: self::Reporter>(
             dir_path,
             cas_paths,
             Placement::Fresh,
-            preserve_symlinks.then_some(dir_path),
+            symlink_targets.map(|policy| (dir_path, policy)),
         );
     }
     if all_files_match(dir_path, cas_paths) {
@@ -376,7 +376,7 @@ pub(super) fn import_into_shared_dir<Reporter: self::Reporter>(
         dir_path,
         cas_paths,
         Placement::Repair,
-        preserve_symlinks.then_some(dir_path),
+        symlink_targets.map(|policy| (dir_path, policy)),
     )
 }
 
@@ -404,7 +404,7 @@ fn repair_existing_dir<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
     opts: ImportIndexedDirOpts,
     repair_sanitized: bool,
 ) -> Result<(), ImportIndexedDirError> {
@@ -426,7 +426,7 @@ fn repair_existing_dir<Reporter: self::Reporter>(
         dir_path,
         cas_paths,
         Placement::for_target(opts.safe_to_skip || repair_sanitized),
-        opts.preserve_symlinks.then_some(dir_path),
+        opts.symlink_targets.map(|policy| (dir_path, policy)),
     )
     .inspect(|()| remove_quarantine_from_native_binaries(dir_path, cas_paths))
 }

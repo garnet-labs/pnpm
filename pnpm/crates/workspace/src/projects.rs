@@ -72,6 +72,41 @@ pub struct FindWorkspaceProjectsOpts {
     pub ignored_directories: Vec<PathBuf>,
 }
 
+impl FindWorkspaceProjectsOpts {
+    /// What decides which projects [`find_workspace_projects`] finds under
+    /// `workspace_root` with these options. Ignored directories the walk
+    /// skips by name anyway are left out, unless an include pattern names
+    /// such a directory itself.
+    #[must_use]
+    pub fn discovery_key(&self, workspace_root: &Path) -> DiscoveryKey {
+        let ignored_directories = if self.patterns_name_skipped_directories() {
+            resolve_ignored_directories(workspace_root, &self.ignored_directories)
+        } else {
+            ignored_directories_beyond_the_walk(workspace_root, &self.ignored_directories)
+        };
+        DiscoveryKey { patterns: self.patterns.clone(), ignored_directories }
+    }
+
+    fn patterns_name_skipped_directories(&self) -> bool {
+        self.patterns
+            .iter()
+            .flatten()
+            .filter(|pattern| !pattern.starts_with('!'))
+            .any(|pattern| {
+                let pattern = pattern.to_ascii_lowercase();
+                pattern.contains("node_modules") || pattern.contains("bower_components")
+            })
+    }
+}
+
+/// Equal for two sets of options with which [`find_workspace_projects`]
+/// finds the same projects. See [`FindWorkspaceProjectsOpts::discovery_key`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct DiscoveryKey {
+    patterns: Option<Vec<String>>,
+    ignored_directories: Vec<PathBuf>,
+}
+
 /// Error type of the public entry points.
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
@@ -115,6 +150,29 @@ pub fn find_workspace_projects_no_check(
     workspace_root: &Path,
     opts: &FindWorkspaceProjectsOpts,
 ) -> Result<Vec<Project>, FindWorkspaceProjectsError> {
+    read_workspace_projects(find_workspace_project_manifests(workspace_root, opts)?)
+}
+
+/// A directory [`find_workspace_project_manifests`] found, before any
+/// manifest is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectManifestPaths {
+    pub root_dir: PathBuf,
+    /// The manifest paths in precedence order, never empty.
+    /// [`find_workspace_projects`] reads the first one that exists, and
+    /// skips the directory when none does.
+    pub candidates: Vec<PathBuf>,
+}
+
+/// The directories [`find_workspace_projects`] reads projects from, in
+/// `root_dir` order, without opening any manifest.
+///
+/// A candidate may not exist: a directory that a `<dir>/*` pattern matches
+/// lists every manifest basename without a check.
+pub fn find_workspace_project_manifests(
+    workspace_root: &Path,
+    opts: &FindWorkspaceProjectsOpts,
+) -> Result<Vec<ProjectManifestPaths>, FindWorkspaceProjectsError> {
     // When no patterns were configured, search the workspace root
     // non-recursively *and* recursively. The two-pattern fallback fires
     // only on `None`, not on `Some(vec![])` — an explicit empty array
@@ -152,15 +210,18 @@ pub fn find_workspace_projects_no_check(
         }
     }
 
-    read_projects(group_manifests_by_root(manifest_paths, workspace_root))
+    Ok(group_manifests_by_root(manifest_paths, workspace_root))
 }
 
-fn read_projects(
-    root_groups: Vec<(PathBuf, Vec<PathBuf>)>,
+/// The projects [`find_workspace_project_manifests`] listed, each read from
+/// its first existing manifest, in listing order. A directory without one is
+/// skipped.
+pub fn read_workspace_projects(
+    root_groups: Vec<ProjectManifestPaths>,
 ) -> Result<Vec<Project>, FindWorkspaceProjectsError> {
     let read_results: Vec<Result<Option<Project>, FindWorkspaceProjectsError>> = root_groups
         .into_par_iter()
-        .map(|(root_dir, candidates)| read_first_project_manifest(root_dir, candidates))
+        .map(read_first_project_manifest)
         .collect();
     let mut projects = Vec::with_capacity(read_results.len());
     for result in read_results {
@@ -264,24 +325,27 @@ fn merge_pattern_manifests(
 fn group_manifests_by_root(
     manifest_paths: BTreeSet<PathBuf>,
     workspace_root: &Path,
-) -> Vec<(PathBuf, Vec<PathBuf>)> {
+) -> Vec<ProjectManifestPaths> {
     let mut sorted: Vec<PathBuf> = manifest_paths.into_iter().collect();
     sorted.sort_by(|left, right| {
         let dir_left = left.parent().unwrap_or_else(|| Path::new(""));
         let dir_right = right.parent().unwrap_or_else(|| Path::new(""));
         dir_left.cmp(dir_right)
     });
-    let mut root_groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    let mut root_groups: Vec<ProjectManifestPaths> = Vec::new();
     for manifest_path in sorted {
         let root_dir = manifest_path
             .parent()
             .unwrap_or(workspace_root)
             .to_path_buf();
         match root_groups.last_mut() {
-            Some((last_root, candidates)) if *last_root == root_dir => {
-                candidates.push(manifest_path);
+            Some(last) if last.root_dir == root_dir => last.candidates.push(manifest_path),
+            _ => {
+                root_groups.push(ProjectManifestPaths {
+                    root_dir,
+                    candidates: vec![manifest_path],
+                });
             }
-            _ => root_groups.push((root_dir, vec![manifest_path])),
         }
     }
     root_groups
@@ -326,8 +390,7 @@ fn collect_pattern_manifests(
 /// `Ok(None)` when every candidate is gone or names no importer
 /// manifest — the root then isn't a project.
 fn read_first_project_manifest(
-    root_dir: PathBuf,
-    candidates: Vec<PathBuf>,
+    ProjectManifestPaths { root_dir, candidates }: ProjectManifestPaths,
 ) -> Result<Option<Project>, FindWorkspaceProjectsError> {
     for manifest_path in candidates {
         let manifest = match read_exact_project_manifest(&manifest_path) {
@@ -355,7 +418,7 @@ struct WorkspacePattern<'source> {
 }
 
 mod managed;
-use managed::resolve_ignored_directories;
+use managed::{ignored_directories_beyond_the_walk, resolve_ignored_directories};
 
 mod membership;
 mod negations;

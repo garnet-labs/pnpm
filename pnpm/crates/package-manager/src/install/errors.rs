@@ -68,9 +68,9 @@ pub enum InstallError {
         #[error(source)] crate::package_extender::InvalidPackageExtensionSelector,
     ),
 
-    // The `*_DIFF` errors below mirror pnpm's `validateModules`:
-    // a non-plain-install mutation refuses to touch a modules directory
-    // whose persisted layout settings disagree with the current config.
+    // The errors below mirror pnpm's `validateModules`: a
+    // non-plain-install mutation refuses to touch a modules directory
+    // whose recorded layout disagrees with the current config.
     #[display(
         r#"This modules directory was created using a different hoist-pattern value. Run "pnpm install" to recreate the modules directory."#
     )]
@@ -88,6 +88,44 @@ pub enum InstallError {
     )]
     #[diagnostic(code(ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF))]
     VirtualStoreDirMaxLengthDiff,
+
+    /// pnpm-only: upstream keeps such a tree on a mutation and leaves the
+    /// previous linker's packages behind.
+    #[display(
+        r#"This modules directory was created using a different node-linker value. Run "pnpm install" to recreate the modules directory."#
+    )]
+    #[diagnostic(code(ERR_PNPM_NODE_LINKER_DIFF))]
+    NodeLinkerDiff,
+
+    #[display(
+        "The current version of pnpm is not compatible with the available node_modules structure"
+    )]
+    #[diagnostic(
+        code(ERR_PNPM_MODULES_BREAKING_CHANGE),
+        help("node_modules path: {modules_dir}\n\nRun pnpm install to recreate node_modules.")
+    )]
+    ModulesBreakingChange {
+        #[error(not(source))]
+        modules_dir: String,
+    },
+
+    #[display("Unexpected store location")]
+    #[diagnostic(
+        code(ERR_PNPM_UNEXPECTED_STORE),
+        help(
+            "The dependencies at \"{modules_dir}\" are currently linked from the store at \"{expected_store_path}\".\n\npnpm now wants to use the store at \"{actual_store_path}\" to link dependencies.\n\nIf you want to use the new store location, reinstall your dependencies with \"pnpm install\".\n\nYou may change the global store location by running \"pnpm config set store-dir <dir> --global\".\n(This error may happen if the node_modules was installed with a different major version of pnpm)"
+        )
+    )]
+    UnexpectedStore { expected_store_path: String, actual_store_path: String, modules_dir: String },
+
+    #[display("Unexpected virtual store location")]
+    #[diagnostic(
+        code(ERR_PNPM_UNEXPECTED_VIRTUAL_STORE),
+        help(
+            "The dependencies at \"{modules_dir}\" are currently symlinked from the virtual store directory at \"{expected}\".\n\npnpm now wants to use the virtual store at \"{actual}\" to link dependencies from the store.\n\nIf you want to use the new virtual store location, reinstall your dependencies with \"pnpm install\".\n\nYou may change the virtual store location by changing the value of the virtual-store-dir config."
+        )
+    )]
+    UnexpectedVirtualStore { expected: String, actual: String, modules_dir: String },
 
     #[diagnostic(transparent)]
     WithFreshLockfile(#[error(source)] InstallWithFreshLockfileError),
@@ -153,6 +191,25 @@ pub enum InstallError {
 
     #[diagnostic(code(ERR_PNPM_BAD_READ_PACKAGE_HOOK_RESULT))]
     BadReadPackageHookResult(#[error(not(source))] pnpm_hooks::HookError),
+
+    #[diagnostic(code(ERR_PNPM_PNPMFILE_FAIL))]
+    PreResolutionHook(#[error(not(source))] pnpm_hooks::HookError),
+
+    #[display("Failed to serialize a lockfile for the preResolution hook: {_0}")]
+    #[diagnostic(code(ERR_PNPM_PRE_RESOLUTION_SERIALIZE))]
+    PreResolutionSerialize(#[error(source)] serde_json::Error),
+
+    /// The `preResolution` hook changed a lockfile object into something
+    /// that is not a lockfile.
+    #[display(
+        "The preResolution hook left {field} in a shape that is not a valid lockfile: {error}"
+    )]
+    #[diagnostic(code(ERR_PNPM_BAD_PRE_RESOLUTION_HOOK_RESULT))]
+    BadPreResolutionHookResult {
+        field: &'static str,
+        #[error(source)]
+        error: serde_json::Error,
+    },
 
     #[diagnostic(transparent)]
     FrozenLockfile(#[error(source)] InstallFrozenLockfileError),
@@ -263,12 +320,6 @@ pub enum InstallError {
         #[error(source)]
         error: std::io::Error,
     },
-
-    #[display(
-        "Cannot safely repair the filtered install because the modules directory at {modules_dir:?} is outside the workspace root at {workspace_root:?}"
-    )]
-    #[diagnostic(code(pnpm_package_manager::unsafe_filtered_modules_dir))]
-    UnsafeFilteredModulesDir { modules_dir: PathBuf, workspace_root: PathBuf },
 
     /// Surfaces a failure while removing the direct-dep links an
     /// `included` drift excluded — the non-destructive counterpart of

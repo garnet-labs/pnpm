@@ -6,7 +6,11 @@ use super::super::{
     moved_tree_is_reusable, recorded_allow_builds_differ, unapproved_recorded_ignored_builds,
     update_workspace_state_or_warn, verify_lockfile_eagerly,
 };
-use crate::optimistic_repeat_install::{filesystem_now_ms_in_modules, materialized_shape_matches};
+use crate::install_state::{
+    filesystem_now_ms_in_modules, materialized_shape_matches,
+    validation::{project_bins_digest, project_bins_match, workspace_bins_digest},
+};
+use pnpm_workspace::importer_id_from_root_dir;
 
 /// Whether any package in the lockfile resolves to a local directory.
 ///
@@ -45,7 +49,9 @@ pub(super) fn frozen_tree_up_to_date<'a>(
     {
         return None;
     }
-    context.recorded.state?;
+    if !workspace_bins_unchanged(context) {
+        return None;
+    }
     let wanted_lockfile = context.lockfile?;
     let current = context.current_lockfile?;
     // Past this gate `current` is the graph this install would
@@ -60,23 +66,23 @@ pub(super) fn frozen_tree_up_to_date<'a>(
     // has to be retaken; the TypeScript CLI has no gate at this level at
     // all and instead forces every directory dep through materialization
     // in `lockfileToDepGraph`.
-    if !materialized_shape_matches(
-        wanted_lockfile,
-        current,
-        context.tree.included,
-        config.peer_edge_options(),
-    ) || has_directory_snapshot(current)
+    if !materialized_shape_matches(wanted_lockfile, current, context.tree.included, config)
+        || has_directory_snapshot(current)
     {
         return None;
     }
     let modules = context.modules_manifest?;
-    // A `supportedArchitectures` change alters the skip set without
-    // touching the lockfile or `.modules.yaml`, so the unchanged-layout
-    // premise doesn't hold and the platform packages must be re-evaluated.
+    // A `supportedArchitectures` change alters the skip set, and an
+    // `extendNodePath` change the bin shims, without touching the lockfile or
+    // `.modules.yaml`, so the unchanged-layout premise doesn't hold.
     if !modules_consistent_with(modules, config, context.tree.node_linker, context.tree.included)
-        || !crate::optimistic_repeat_install::recorded_supported_architectures_match(
+        || !crate::install_state::recorded_supported_architectures_match(
             context.recorded.state,
             context.repeat.supported_architectures,
+        )
+        || !crate::install_state::recorded_extend_node_path_matches(
+            context.recorded.state,
+            config.extend_node_path,
         )
         || !build_state_unchanged(context, current, modules)
     {
@@ -89,6 +95,18 @@ pub(super) fn frozen_tree_up_to_date<'a>(
         && tree_contents_intact(context, current, modules)
         && bins_resolve_where_the_tree_is(context, current);
     tree_intact.then_some((wanted_lockfile, modules))
+}
+
+fn workspace_bins_unchanged(context: &FrozenTreeUpToDate<'_>) -> bool {
+    let Some(state) = context.recorded.state else { return false };
+    let bins = workspace_bins_digest(context.tree.workspace_root, context.recorded.bin_projects);
+    context.recorded.projects
+        .iter()
+        .all(|(dir, manifest)| {
+            let id = importer_id_from_root_dir(context.tree.workspace_root, dir);
+            let digest = project_bins_digest(&id, manifest, bins.as_deref());
+            project_bins_match(state.validation.as_ref(), &id, digest)
+        })
 }
 
 fn tree_contents_intact(
@@ -198,6 +216,9 @@ pub(super) struct UpToDateInstall<'a, 'install> {
 pub(super) struct CarriedWorkspaceState {
     /// The previous run's `autoDedupe`; only a resolving install sets it.
     pub(super) recorded_auto_dedupe: Option<bool>,
+    /// The previous run's `registryRoutes`, which an up-to-date tree, having
+    /// resolved nothing, keeps while a plain key sits under a moved route.
+    pub(super) recorded_registry_routes: Option<std::collections::BTreeMap<String, String>>,
 }
 /// Up-to-date installs still enforce dependency-name verification and recorded build policy.
 pub(super) async fn report_up_to_date<Reporter: self::Reporter + 'static>(
@@ -262,15 +283,29 @@ pub(super) fn refresh_up_to_date_workspace<Reporter: self::Reporter>(
             supported_architectures: context.supported_architectures,
         },
         catalogs: context.projects.catalogs,
-        project_manifests: context.projects.manifests,
+        projects: crate::install::StateProjects {
+            manifests: context.projects.declared_manifests,
+            workspace_projects: context.projects.workspace_projects,
+            lockfile: Some(context.wanted_lockfile),
+        },
         filesystem_now_ms: filesystem_now_ms_in_modules(
             &context.tree.config.workspace_state_modules_dir(context.tree.workspace_root),
         ),
         carried: crate::install::CarriedSettings {
             established_auto_dedupe: context.carried_state.recorded_auto_dedupe,
-            kept_groups: None,
+            registry_keys_verified: crate::install::registry_keys_current(
+                context.tree.config,
+                Some(context.wanted_lockfile),
+            ),
+            registry_routes: Some(crate::install_state::recorded_registry_routes_after_install(
+                context.tree.config,
+                context.carried_state.recorded_registry_routes.as_ref(),
+                Some(context.wanted_lockfile),
+                crate::install_state::ResolvedImporters::None,
+            )),
+            kept_settings: None,
         },
-        vouched: &crate::optimistic_repeat_install::validation::Vouched::All,
+        vouched: &crate::install_state::validation::Vouched::All,
     });
     update_workspace_state_or_warn::<Reporter>(
         context.tree.workspace_root,
@@ -312,7 +347,10 @@ pub(super) fn save_merged_wanted_lockfile(
         && save_lockfile
     {
         wanted_lockfile
-            .save_to_path(&workspace_root.join(config.wanted_lockfile_name()))
+            .save_to_path(
+                &workspace_root.join(config.wanted_lockfile_name()),
+                config.symlinked_lockfile(),
+            )
             .map_err(InstallError::SaveWantedLockfile)?;
     }
     Ok(())

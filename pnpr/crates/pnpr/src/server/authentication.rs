@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     extract::{ConnectInfo, FromRequestParts, Request, State},
-    http::{Method, request::Parts},
+    http::{HeaderMap, Method, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -17,9 +17,24 @@ use pnpr_error::RegistryError;
 use pnpr_policy::{Identity, PackageRules};
 
 use super::{
-    AppState, PeerAddr, RegistrySource, restrictions::check_token_restrictions,
-    single_authorization_header,
+    AppState, PeerAddr, RegistrySource, oidc::WorkloadScope,
+    restrictions::check_token_restrictions, single_authorization_header,
 };
+
+/// Whether `headers` carry `Authorization: Bearer <expected>`, for an
+/// endpoint authenticated by a configured secret instead of a user token.
+/// Comparing digests keeps the comparison time independent of how much of
+/// the secret a guess gets right.
+pub(super) fn carries_bearer_secret(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|sent| {
+            super::ecosystem::sha256_hex(expected.as_bytes())
+                == super::ecosystem::sha256_hex(sent.trim().as_bytes())
+        })
+}
 
 /// What the caller is trying to do with a package. Drives which
 /// rule from the access policy applies.
@@ -119,19 +134,30 @@ pub(super) async fn authenticate(
     }
 
     let resolved = resolve_caller(&state, header.as_deref(), &method, &path, client_ip).await;
-    let identity = match resolved.and_then(|identity| {
-        refuse_deprovisioned(&state, &identity)?;
-        Ok(identity)
+    let caller = match resolved.and_then(|resolved| {
+        refuse_deprovisioned(&state, &resolved.0)?;
+        Ok(resolved)
     }) {
-        Ok(identity) => identity,
+        Ok(resolved) => attach_caller(&mut request, resolved),
         Err(err) => return err.into_response(),
     };
-    let caller = AuthedCaller(identity);
-    record_user_on_span(&caller.0);
-    request.extensions_mut().insert(caller.clone());
     let mut response = next.run(request).await;
     response.extensions_mut().insert(caller);
     response
+}
+
+/// Record the resolved caller, and a workload's scope, on `request`.
+fn attach_caller(
+    request: &mut Request,
+    (identity, workload): (Identity, Option<WorkloadScope>),
+) -> AuthedCaller {
+    let caller = AuthedCaller(identity);
+    record_user_on_span(&caller.0);
+    request.extensions_mut().insert(caller.clone());
+    if let Some(workload) = workload {
+        request.extensions_mut().insert(workload);
+    }
+    caller
 }
 
 fn record_user_on_span(identity: &Identity) {
@@ -241,17 +267,18 @@ async fn owned_parent(state: &AppState, key: &str) -> Result<Option<TokenRecord>
 /// error); an unknown token, any other credential shape, and a missing
 /// header all resolve to [`Identity::Anonymous`]. `Err` is a backing-store
 /// failure, surfaced as a 5xx so an outage isn't mistaken for "not
-/// authenticated".
+/// authenticated". Workload credentials also give the [`WorkloadScope`] a
+/// batch commit checks its entries against.
 async fn resolve_caller(
     state: &AppState,
     header: Option<&str>,
     method: &Method,
     path: &str,
     client_ip: Option<IpAddr>,
-) -> Result<Identity, RegistryError> {
+) -> Result<(Identity, Option<WorkloadScope>), RegistryError> {
     if let Some(raw_token) = header.and_then(token_credentials) {
         if let Some(user) = state.inner.identity.oidc.session(&raw_token)? {
-            return Ok(super::oidc_groups::session_identity(&state.inner.config, user));
+            return Ok((super::oidc_groups::session_identity(&state.inner.config, user), None));
         }
         if let Some(jwt) = raw_token.strip_prefix("pnpr_workload_") {
             let workload = state.inner.identity.oidc
@@ -261,19 +288,20 @@ async fn resolve_caller(
                     resource: "OIDC workload credentials".to_string(),
                 })?;
             super::oidc::check_workload_request(&workload, method, path)?;
-            return Ok(Identity::user(workload.identity.username));
+            let scope = WorkloadScope::new(&state.inner.config, &workload);
+            return Ok((Identity::user(workload.identity.username), Some(scope)));
         }
         if let Some(record) = state.inner.identity.auth.tokens.lookup_record(&raw_token).await? {
             check_token_restrictions(&record, method, path, client_ip)?;
             state.inner.identity.last_used.record_raw(&raw_token, record.last_used_at);
-            return Ok(Identity::user(record.username));
+            return Ok((Identity::user(record.username), None));
         }
     }
     // Anything that is not a pnpr token — a user:password Basic pair, another
     // scheme, or no credentials — carries no request identity. Going through
     // `identify` here would re-run the token lookup and bypass the
     // restriction checks above, so resolve straight to anonymous.
-    Ok(Identity::Anonymous)
+    Ok((Identity::Anonymous, None))
 }
 
 /// The pnpr token an `Authorization` header carries, in any of the shapes
@@ -382,7 +410,10 @@ pub(super) async fn is_package_owner(
         return Ok(false);
     };
     let storage = super::hosted_storage(state, org);
-    if let Some(bytes) = storage.read_hosted_document(&canonical).await? {
+    // An authorization check reads the current document, never a replica's
+    // copy that may predate a maintainer's removal.
+    if let Some(stored) = storage.read_hosted_document_for_update(&canonical).await? {
+        let bytes = stored.bytes;
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
             && let Some(maintainers) = val.get("maintainers").and_then(serde_json::Value::as_array)
         {

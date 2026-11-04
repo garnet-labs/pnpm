@@ -36,7 +36,7 @@ Since v12.7.0, the same applies to [`userAgent`](./settings/network.md#useragent
 
 :::note
 
-A project's `pnpm-workspace.yaml` cannot choose where pnpm keeps its credentials, its own installation, or other machine-level state: `bin`, `configDir`, `dir`, `globalBinDir`, `globalDir`, `macosBackup`, `npmrcAuthFile`, `pnpmHomeDir`, `scope`, `stateDir`, `userconfig`, and `workspaceDir` are ignored there, with a warning. [`ci`](./settings/other.md#ci) and [`tools`](./settings/cli.md#tools) are ignored there too, and [`globalShims`](./settings/other.md#globalshims) is read only from a `pnpm-workspace.yaml` in the pnpm home directory. Set them in the [global configuration file](./configuring.md#global-configuration) or on the command line instead. `cacheDir` and `storeDir` are unaffected.
+A project's `pnpm-workspace.yaml` cannot choose where pnpm keeps its credentials, its own installation, or other machine-level state: `bin`, `configDir`, `dir`, `globalBinDir`, `globalDir`, `macosBackup`, `npmrcAuthFile`, `pnpmHomeDir`, `scope`, `stateDir`, `userconfig`, and `workspaceDir` are ignored there, with a warning. So are [`ci`](./settings/other.md#ci), [`globalShims`](./settings/other.md#globalshims), [`symlinkedLockfileTargetDirs`](./settings/store.md#symlinkedlockfiletargetdirs), and [`tools`](./settings/cli.md#tools). Of these, only `globalShims` may also be set in a `pnpm-workspace.yaml` in the pnpm home directory. Set them in the [global configuration file](./configuring.md#global-configuration) or on the command line instead. `cacheDir` and `storeDir` are unaffected.
 
 :::
 
@@ -228,6 +228,7 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
 * [preferFrozenLockfile](./settings/store.md#preferfrozenlockfile)
 * [excludeLinksFromLockfile](./settings/store.md#excludelinksfromlockfile)
 * [lockfileIncludeTarballUrl](./settings/store.md#lockfileincludetarballurl)
+* [symlinkedLockfileTargetDirs](./settings/store.md#symlinkedlockfiletargetdirs)
 * [lockfile.includeResolutionSettings](./settings/store.md#lockfileincluderesolutionsettings)
 * [lockfile.integrityTarget](./settings/store.md#lockfileintegritytarget)
 * [gitBranchLockfile](./settings/store.md#gitbranchlockfile)
@@ -299,6 +300,7 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
 [Full reference →](./settings/cli.md#nodejs-settings)
 
 * [nodeVersion](./settings/cli.md#nodeversion)
+* [runtime](./settings/cli.md#runtime)
 * [runtimeOnFail](./settings/cli.md#runtimeonfail)
 * [nodeDownloadMirrors](./settings/cli.md#nodedownloadmirrors)
 * [tools](./settings/cli.md#tools)
@@ -365,7 +367,6 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
 * [enablePrePostScripts](./settings/other.md#enableprepostscripts)
 * [scriptShell](./settings/other.md#scriptshell)
 * [shellEmulator](./settings/other.md#shellemulator)
-* [scriptsPrependNodePath](./settings/other.md#scriptsprependnodepath)
 * [catalogMode](./settings/other.md#catalogmode)
 * [ci](./settings/other.md#ci)
 * [catalogPrune](./settings/other.md#catalogprune)
@@ -394,7 +395,7 @@ These settings are configured in `pnpm-workspace.yaml` as well, but are document
 
 ### Settings documented elsewhere
 
-* [publishWaitTimeout](./cli/publish.md#publishwaittimeout)
+* [publishBranch](./cli/publish.md#publishbranch) and [publishWaitTimeout](./cli/publish.md#publishwaittimeout)
 * [patchedDependencies](./cli/patch.md#patcheddependencies)
 * [pnpmfile](./pnpmfile.md#pnpmfile), [globalPnpmfile](./pnpmfile.md#globalpnpmfile) and [ignorePnpmfile](./pnpmfile.md#ignorepnpmfile)
 * [audit.level](./cli/audit.md#auditlevel), [audit.ignore](./cli/audit.md#auditignore) and [audit.ignorePrune](./cli/audit.md#auditignoreprune)

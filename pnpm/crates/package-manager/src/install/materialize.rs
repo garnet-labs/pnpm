@@ -103,6 +103,8 @@ pub(super) struct MaterializationLockfiles<'a, 'install> {
     pub(super) wanted_shared: Option<Arc<Lockfile>>,
     pub(super) merge_wanted: Option<&'a Lockfile>,
     pub(super) current: Option<&'a Lockfile>,
+    /// See `LoadedWorkspace::locked_registry_routes`.
+    pub(super) locked_registries: Option<&'a std::collections::BTreeMap<String, String>>,
     pub(super) verification_override: Option<super::LockfileVerificationOverride<'install>>,
     pub(super) verification: super::run::Verification,
 }
@@ -112,6 +114,7 @@ pub(super) struct MaterializationResolution<'a> {
     pub(super) deploy_manifest_hook: bool,
     pub(super) manifest_spec_bumps: Option<&'a crate::ManifestSpecBumps>,
     pub(super) known_requires_build: Option<pnpm_deps_restorer::RequiresBuildBySnapshot>,
+    pub(super) lockfile_check_sink: Option<crate::LockfileCheckSink>,
     pub(super) inputs: crate::install::run::ResolutionInputs,
 }
 
@@ -249,15 +252,7 @@ impl<'a> MaterializationInputs<'a, '_> {
                 }),
                 selected_ids: self.workspace.requested_importer_ids,
             },
-            execution: crate::install_with_fresh_lockfile::FreshInstallExecution {
-                node_linker: self.install.execution.node_linker,
-                resolve_only: self.execution.resolve_only,
-                skip_runtimes: self.install.execution.skip_runtimes,
-                dry_run: self.install.execution.dry_run,
-                can_prompt: self.execution.can_prompt,
-                policy_excludes: self.install.lockfile_policy.excludes,
-                save_lockfile: self.execution.save_lockfile,
-            },
+            execution: self.fresh_execution(),
             manifests: crate::install_with_fresh_lockfile::FreshManifestOptions {
                 deploy_hook: self.resolution.deploy_manifest_hook,
                 spec_bumps: self.resolution.manifest_spec_bumps,
@@ -266,7 +261,25 @@ impl<'a> MaterializationInputs<'a, '_> {
             lockfiles: crate::install_with_fresh_lockfile::FreshLockfileSeeds {
                 wanted: self.lockfiles.wanted,
                 merge_wanted: self.lockfiles.merge_wanted,
+                locked_registries: self.lockfiles.locked_registries,
             },
+        }
+    }
+
+    fn fresh_execution(&self) -> crate::install_with_fresh_lockfile::FreshInstallExecution {
+        crate::install_with_fresh_lockfile::FreshInstallExecution {
+            locked_package_policy: if self.install.lockfile_policy.trust {
+                pnpm_resolving_resolver_base::LockedPackagePolicy::Trust
+            } else {
+                pnpm_resolving_resolver_base::LockedPackagePolicy::Verify
+            },
+            node_linker: self.install.execution.node_linker,
+            resolve_only: self.execution.resolve_only,
+            skip_runtimes: self.install.execution.skip_runtimes,
+            dry_run: self.install.execution.dry_run,
+            can_prompt: self.execution.can_prompt,
+            policy_excludes: self.install.lockfile_policy.excludes,
+            save_lockfile: self.execution.save_lockfile,
         }
     }
 
@@ -279,7 +292,10 @@ impl<'a> MaterializationInputs<'a, '_> {
             node_version: self.execution.effective_node_version,
             early_host_detection: self.execution.early_host_detection,
             pnpmfile_hook_override: self.resolution.pnpmfile_hook,
-            lockfile_verification_gate,
+            lockfile: crate::install_with_fresh_lockfile::WantedLockfileHandles {
+                verification_gate: lockfile_verification_gate,
+                check_sink: self.resolution.lockfile_check_sink,
+            },
             resolution: crate::ResolutionInputs {
                 update_seed_policy: self.resolution.inputs.update_seed_policy,
                 preferred_versions_override: self.resolution.inputs.preferred_versions_override,
