@@ -48,7 +48,7 @@ use crate::{
     safe_join_modules_dir::safe_join_modules_dir,
 };
 use pnpm_config::{Config, NodeLinker, PackageImportMethod};
-use pnpm_lockfile::{PackageKey, PackageMetadata, SnapshotEntry};
+use pnpm_lockfile::{PackageKey, PackageMetadata, PlatformSelector, SnapshotEntry};
 use pnpm_reporter::Reporter;
 use std::{
     collections::HashMap,
@@ -155,6 +155,7 @@ impl<'install> DirCloneCache<'install> {
                 packages,
                 allow_build_policy,
                 lockfile_dir,
+                platform: crate::virtual_store_layout::selected_platform(config),
             },
             layout: OnceLock::new(),
 
@@ -191,7 +192,7 @@ impl<'install> DirCloneCache<'install> {
         import_method: PackageImportMethod,
         package_key: &PackageKey,
         save_path: &Path,
-        cas_paths: &HashMap<String, PathBuf>,
+        cas_paths: &pnpm_fs::CasPaths,
     ) -> bool {
         if self.disabled.load(Ordering::Relaxed) {
             return false;
@@ -250,7 +251,7 @@ impl<'install> DirCloneCache<'install> {
         import_method: PackageImportMethod,
         package_key: &PackageKey,
         canonical: &Path,
-        cas_paths: &HashMap<String, PathBuf>,
+        cas_paths: &pnpm_fs::CasPaths,
     ) -> bool {
         if self.frozen_store {
             return marker_present(canonical, cas_paths);
@@ -366,6 +367,7 @@ struct CanonicalLayoutInputs<'install> {
     packages: Option<&'install HashMap<PackageKey, PackageMetadata>>,
     allow_build_policy: Option<&'install AllowBuildPolicy>,
     lockfile_dir: Option<&'install Path>,
+    platform: PlatformSelector,
 }
 
 impl CanonicalLayoutInputs<'_> {
@@ -382,6 +384,7 @@ impl CanonicalLayoutInputs<'_> {
             self.packages,
             self.allow_build_policy,
             self.lockfile_dir,
+            &self.platform,
         )
     }
 }

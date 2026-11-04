@@ -327,26 +327,25 @@ fn install_with_config<'a>(
 }
 
 pub(super) fn ci<'a>(ctx: &RunCtx<'a>, args: CiArgs) -> miette::Result<CommandFuture<'a>> {
-    let clean_args = args.clean_args;
     let mut install_args = args.install_args;
     install_args.lockfile.frozen = true;
 
     // Run clean eagerly before the async future so errors surface
     // immediately. `ci` is not an overridable command, so this is always
     // the built-in clean, never a `clean` script the project declares.
-    clean_builtin(ctx, (ctx.loaders.config)()?, clean_args.lockfile)?;
+    clean_builtin(ctx, (ctx.loaders.config)()?, false)?;
 
     install_with_update_check(ctx, install_args, UpdateCheckPolicy::Skip)
 }
 
 pub(super) fn dlx<'a>(ctx: &RunCtx<'a>, args: DlxArgs) -> miette::Result<CommandFuture<'a>> {
-    let dir = ctx.locations.dir;
+    let dir = ctx.locations.cli_dir;
     let config = (ctx.loaders.config)()?;
     Ok(Box::pin(args.run::<CliReporter>(dir, config)))
 }
 
 pub(super) fn create<'a>(ctx: &RunCtx<'a>, args: CreateArgs) -> miette::Result<CommandFuture<'a>> {
-    let dir = ctx.locations.dir;
+    let dir = ctx.locations.cli_dir;
     let config = (ctx.loaders.config)()?;
     Ok(Box::pin(args.run::<CliReporter>(dir, config)))
 }

@@ -18,7 +18,7 @@ use pnpm_testing_utils::{
 };
 use std::{fs, path::Path};
 
-const IS_POSITIVE_PATCH: &str = include_str!(
+pub(crate) const IS_POSITIVE_PATCH: &str = include_str!(
     "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0.patch"
 );
 
@@ -1285,4 +1285,355 @@ fn repeat_hoisted_install_reports_nothing_broken() {
     assert!(hoisted_manifest.is_file(), "the hoisted dep must still be in place");
 
     drop((root, mock_instance));
+}
+
+/// Install `dependencies`, change one setting in `pnpm-workspace.yaml`, and
+/// install again. The second install must act on the change instead of
+/// reporting the tree up to date
+/// ([pnpm/tasks#219](https://github.com/pnpm/tasks/issues/219)).
+fn install_then_change_setting(
+    dependencies: &serde_json::Value,
+    before: impl FnOnce(&Path),
+    change: impl FnOnce(&Path),
+) -> (CommandTempCwd<AddMockedRegistry>, String) {
+    let harness = CommandTempCwd::init().add_mocked_registry();
+    let workspace = harness.workspace.clone();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": dependencies }).to_string(),
+    )
+    .expect("write package.json");
+    before(&workspace);
+    pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    change(&workspace);
+    let output = pacquet_in(&workspace)
+        .with_arg("install")
+        .output()
+        .expect("run the repeat install");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "{stdout}");
+    (harness, stdout)
+}
+
+#[test]
+fn repeat_install_renames_slots_after_a_virtual_store_dir_max_length_change() {
+    let (harness, _) = install_then_change_setting(
+        &serde_json::json!({ "is-positive": "1.0.0" }),
+        |_| {},
+        |workspace| append_workspace_yaml_key(workspace, "virtualStoreDirMaxLength", 10),
+    );
+    let workspace = &harness.workspace;
+    assert_eq!(version_of(workspace, "node_modules/is-positive"), "1.0.0");
+    let target = workspace
+        .join("node_modules/is-positive")
+        .canonicalize()
+        .expect("resolve the direct dependency");
+    let slot = target
+        .ancestors()
+        .nth(2)
+        .and_then(Path::file_name)
+        .expect("the dependency sits in a virtual store slot")
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(slot, "is-positive@1.0.0", "the slot must be renamed to fit the new length");
+    drop(harness);
+}
+
+#[test]
+fn repeat_install_runs_ignored_builds_after_dangerously_allow_all_builds_is_turned_on() {
+    const MARKER: &str = "node_modules/.pnpm/@pnpm.e2e+pre-and-postinstall-scripts-example@1.0.0\
+         /node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example/generated-by-postinstall.js";
+    let (harness, _) = install_then_change_setting(
+        &serde_json::json!({ "@pnpm.e2e/pre-and-postinstall-scripts-example": "1.0.0" }),
+        |workspace| append_workspace_yaml_key(workspace, "strictDepBuilds", false),
+        |workspace| {
+            assert!(!workspace.join(MARKER).exists(), "the first install must ignore the build");
+            append_workspace_yaml_key(workspace, "dangerouslyAllowAllBuilds", true);
+        },
+    );
+    assert!(harness.workspace.join(MARKER).exists(), "the newly allowed build must run");
+    drop(harness);
+}
+
+#[test]
+fn repeat_install_relinks_after_a_global_virtual_store_dir_change() {
+    let (harness, _) = install_then_change_setting(
+        &serde_json::json!({ "is-positive": "1.0.0" }),
+        |workspace| enable_gvs_in_workspace_yaml(workspace, ""),
+        |workspace| append_workspace_yaml_key(workspace, "globalVirtualStoreDir", "../moved-links"),
+    );
+    let target = harness.workspace
+        .join("node_modules/is-positive")
+        .canonicalize()
+        .expect("resolve the direct dependency");
+    let moved = harness.workspace
+        .join("../moved-links")
+        .canonicalize()
+        .expect("the new global virtual store exists");
+    assert!(target.starts_with(&moved), "{target:?} must be linked from {moved:?}");
+    drop(harness);
+}
+
+#[test]
+fn repeat_install_verifies_the_lockfile_after_trust_lockfile_is_turned_off() {
+    let harness = CommandTempCwd::init().add_mocked_registry();
+    let workspace = harness.workspace.clone();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "is-positive": "1.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    append_workspace_yaml_key(&workspace, "trustLockfile", true);
+    pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    fs::write(&yaml_path, yaml.replace("trustLockfile: true", "trustLockfile: false"))
+        .expect("turn trustLockfile off");
+    let output = pacquet_in(&workspace)
+        .with_args(["install", "--reporter=ndjson"])
+        .output()
+        .expect("run the repeat install");
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.status.success(), "{logs}");
+    assert!(
+        logs.contains(r#""name":"pnpm:lockfile-verification""#),
+        "the lockfile no install verified must be verified: {logs}",
+    );
+    drop(harness);
+}
+
+/// No project manifest describes an injected directory outside the workspace
+/// patterns, so the fast path cannot vouch for it: an install after an edit
+/// to it resolves again
+/// ([pnpm/pnpm#17476](https://github.com/pnpm/pnpm/issues/17476)).
+#[test]
+fn repeat_install_sees_a_changed_injected_directory_outside_the_patterns() {
+    assert_repeat_install_sees_a_changed_injected_directory(|fixture| {
+        fixture.write_root_manifest(
+            "app",
+            _utils::ManifestDeps {
+                prod: &[("lib", "workspace:../lib")],
+                .._utils::ManifestDeps::default()
+            },
+        );
+    });
+}
+
+/// The injected directory enters through `overrides`, so no manifest names
+/// it.
+#[test]
+fn repeat_install_sees_a_changed_injected_directory_added_by_an_override() {
+    assert_repeat_install_sees_a_changed_injected_directory(|fixture| {
+        fixture.write_root_manifest(
+            "app",
+            _utils::ManifestDeps { prod: &[("lib", "^1.0.0")], .._utils::ManifestDeps::default() },
+        );
+        fixture.append_workspace_yaml("overrides:\n  lib: workspace:../lib\n");
+    });
+}
+
+/// The injected directory enters through `packageExtensions`, so no
+/// manifest names it.
+#[test]
+fn repeat_install_sees_a_changed_injected_directory_added_by_a_package_extension() {
+    assert_repeat_install_sees_a_changed_injected_directory(|fixture| {
+        fixture.write_root_manifest("app", _utils::ManifestDeps::default());
+        fixture.append_workspace_yaml(
+            "packageExtensions:\n  app:\n    dependencies:\n      lib: workspace:../lib\n",
+        );
+    });
+}
+
+/// `declare` makes the root project depend on `lib`, a directory beside the
+/// workspace, as `workspace:../lib`.
+fn assert_repeat_install_sees_a_changed_injected_directory(
+    declare: impl FnOnce(&_utils::WorkspaceFixture),
+) {
+    let fixture = _utils::WorkspaceFixture::new();
+    fixture.append_workspace_yaml("injectWorkspacePackages: true\n");
+    let outside = fixture.workspace
+        .parent()
+        .expect("the workspace has a parent")
+        .join("lib");
+    fs::create_dir_all(&outside).expect("create the directory outside the workspace");
+    fs::write(
+        outside.join("package.json"),
+        r#"{ "name": "lib", "version": "1.0.0", "dependencies": { "@pnpm.e2e/foo": "100.0.0" } }"#,
+    )
+    .expect("write the manifest");
+    declare(&fixture);
+    let install = |args: &[&str]| {
+        let output =
+            fixture.command_at(&fixture.workspace, std::iter::once(&"install").chain(args));
+        _utils::assert_success(&output);
+    };
+    install(&[]);
+
+    _utils::set_dependency(&outside, "dependencies", "@pnpm.e2e/foo", "100.1.0");
+    install(&[]);
+
+    let lockfile = _utils::read_lockfile(&fixture.workspace.join("pnpm-lock.yaml"));
+    let key: pnpm_lockfile::PackageKey = "lib@file:../lib".parse().expect("parse the package key");
+    let snapshot = &lockfile.snapshots.as_ref().expect("the lockfile has snapshots")[&key];
+    let child: pnpm_lockfile::PkgName = "@pnpm.e2e/foo".parse().expect("parse the name");
+    let recorded = snapshot.dependencies.as_ref().expect("lib's dependencies are recorded")[&child]
+        .to_string();
+    assert_eq!(recorded, "100.1.0", "the install resolved the edited directory again");
+    install(&["--frozen-lockfile"]);
+}
+
+/// A directory that an override or a package extension gives a registry
+/// package hangs beneath that package, where no importer's walk of its
+/// directory dependencies reaches it. After an edit to it, a frozen install
+/// rejects the lockfile and an install resolves it again
+/// ([pnpm/pnpm#17486](https://github.com/pnpm/pnpm/issues/17486)).
+#[test]
+fn an_edited_injected_directory_beneath_a_registry_package_is_resolved_again() {
+    let declarations = [
+        "overrides:\n  '@pnpm.e2e/pkg-with-1-dep>@pnpm.e2e/dep-of-pkg-with-1-dep': workspace:../lib\n",
+        "packageExtensions:\n  '@pnpm.e2e/pkg-with-1-dep':\n    dependencies:\n      lib: workspace:../lib\n",
+    ];
+    for declaration in declarations {
+        let fixture = _utils::WorkspaceFixture::new();
+        fixture.append_workspace_yaml(&format!("injectWorkspacePackages: true\n{declaration}"));
+        let outside = fixture.workspace
+            .parent()
+            .expect("the workspace has a parent")
+            .join("lib");
+        fs::create_dir_all(&outside).expect("create the directory outside the workspace");
+        fs::write(
+            outside.join("package.json"),
+            r#"{ "name": "lib", "version": "1.0.0", "dependencies": { "@pnpm.e2e/foo": "100.0.0" } }"#,
+        )
+        .expect("write the manifest");
+        fixture.write_root_manifest(
+            "app",
+            _utils::ManifestDeps {
+                prod: &[("@pnpm.e2e/pkg-with-1-dep", "100.0.0")],
+                .._utils::ManifestDeps::default()
+            },
+        );
+        let install = |args: &[&str]| {
+            fixture.command_at(&fixture.workspace, std::iter::once(&"install").chain(args))
+        };
+        _utils::assert_success(&install(&[]));
+
+        _utils::set_dependency(&outside, "dependencies", "@pnpm.e2e/foo", "100.1.0");
+        let frozen = install(&["--frozen-lockfile"]);
+        let stderr = String::from_utf8_lossy(&frozen.stderr);
+        assert!(
+            !frozen.status.success() && stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"),
+            "{declaration}: the frozen install must reject the stale lockfile: {stderr}",
+        );
+        _utils::assert_success(&install(&[]));
+
+        let lockfile = _utils::read_lockfile(&fixture.workspace.join("pnpm-lock.yaml"));
+        let key: pnpm_lockfile::PackageKey =
+            "lib@file:../lib".parse().expect("parse the package key");
+        let snapshot = &lockfile.snapshots.as_ref().expect("the lockfile has snapshots")[&key];
+        let child: pnpm_lockfile::PkgName = "@pnpm.e2e/foo".parse().expect("parse the name");
+        let recorded = snapshot.dependencies.as_ref().expect("lib's dependencies are recorded")
+            [&child]
+            .to_string();
+        assert_eq!(recorded, "100.1.0", "{declaration}: the install resolved the edited directory");
+        _utils::assert_success(&install(&["--frozen-lockfile"]));
+    }
+}
+
+/// An install with `optional: false` leaves out a directory reached only
+/// through an optional edge, so an edit to it does not make that frozen
+/// install reject the lockfile.
+#[test]
+fn an_edited_directory_beneath_an_excluded_optional_dependency_passes_frozen_install() {
+    let fixture = _utils::WorkspaceFixture::new();
+    fixture.append_workspace_yaml(
+        "injectWorkspacePackages: true\noverrides:\n  \
+         '@pnpm.e2e/pkg-with-1-dep>@pnpm.e2e/dep-of-pkg-with-1-dep': workspace:../lib\n",
+    );
+    let outside = fixture.workspace
+        .parent()
+        .expect("the workspace has a parent")
+        .join("lib");
+    fs::create_dir_all(&outside).expect("create the directory outside the workspace");
+    fs::write(
+        outside.join("package.json"),
+        r#"{ "name": "lib", "version": "1.0.0", "dependencies": { "@pnpm.e2e/foo": "100.0.0" } }"#,
+    )
+    .expect("write the manifest");
+    fixture.write_root_manifest(
+        "app",
+        _utils::ManifestDeps {
+            optional: &[("@pnpm.e2e/pkg-with-1-dep", "100.0.0")],
+            .._utils::ManifestDeps::default()
+        },
+    );
+    let install = |args: &[&str]| {
+        fixture.command_at(&fixture.workspace, std::iter::once(&"install").chain(args))
+    };
+    _utils::assert_success(&install(&[]));
+
+    _utils::set_dependency(&outside, "dependencies", "@pnpm.e2e/foo", "100.1.0");
+    fixture.append_workspace_yaml("optional: false\n");
+    _utils::assert_success(&install(&["--frozen-lockfile"]));
+}
+
+/// A workspace project that publishes from `dist` reads differently through
+/// `file:` (its `dist/package.json`) and `workspace:` (the project
+/// manifest). The lockfile does not record which one the override used, so
+/// an edit to `dist/package.json` alone makes the frozen install reject the
+/// lockfile.
+#[test]
+fn an_edited_publish_directory_beneath_a_registry_package_fails_frozen_install() {
+    let fixture = _utils::WorkspaceFixture::new();
+    fixture.append_workspace_yaml(
+        "overrides:\n  \
+         '@pnpm.e2e/pkg-with-1-dep>@pnpm.e2e/dep-of-pkg-with-1-dep': file:./packages/lib/dist\n",
+    );
+    let lib = fixture.workspace.join("packages/lib");
+    let manifest = |foo_version: &str| {
+        format!(
+            r#"{{ "name": "lib", "version": "1.0.0", "dependencies": {{ "@pnpm.e2e/foo": "{foo_version}" }}, "publishConfig": {{ "directory": "dist" }} }}"#,
+        )
+    };
+    fs::create_dir_all(lib.join("dist")).expect("create the publish directory");
+    fs::write(lib.join("package.json"), manifest("100.0.0")).expect("write the project manifest");
+    fs::write(lib.join("dist/package.json"), manifest("100.0.0"))
+        .expect("write the published manifest");
+    fixture.write_root_manifest(
+        "app",
+        _utils::ManifestDeps {
+            prod: &[("@pnpm.e2e/pkg-with-1-dep", "100.0.0")],
+            .._utils::ManifestDeps::default()
+        },
+    );
+    let install = |args: &[&str]| {
+        fixture.command_at(&fixture.workspace, std::iter::once(&"install").chain(args))
+    };
+    _utils::assert_success(&install(&[]));
+    let lockfile =
+        fs::read_to_string(fixture.workspace.join("pnpm-lock.yaml")).expect("read the lockfile");
+    assert!(
+        lockfile.contains("lib@file:packages/lib/dist"),
+        "lib is beneath the registry package:\n{lockfile}",
+    );
+
+    fs::write(lib.join("dist/package.json"), manifest("100.1.0"))
+        .expect("edit the published manifest");
+    let frozen = install(&["--frozen-lockfile"]);
+    let stderr = String::from_utf8_lossy(&frozen.stderr);
+    assert!(
+        !frozen.status.success() && stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"),
+        "the frozen install must reject the stale lockfile: {stderr}",
+    );
 }

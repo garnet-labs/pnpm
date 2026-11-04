@@ -9,13 +9,15 @@ use super::{
     package_manager::read_root_manifest,
     reporter::{ReporterType, quiet_loglevel_arg},
 };
-use crate::process::{Command, exit};
+use crate::process::Command;
 use derive_more::{Display, Error};
 use miette::{Diagnostic, IntoDiagnostic};
 use pnpm_config::{Config, VerifyDepsBeforeRun};
 use pnpm_default_reporter::colors::Colors;
 use pnpm_fs::DirLock;
-use pnpm_package_manager::{RunDepsStatus, check_deps_status_before_run_at, deps_install_root};
+use pnpm_package_manager::{
+    GateWorkspace, RunDepsStatus, check_deps_status_before_run_at, deps_install_root,
+};
 use std::{
     collections::HashSet,
     io::{self, IsTerminal},
@@ -76,7 +78,22 @@ pub(crate) fn verify_deps_before_run(
     if !config.verify_deps_before_run.is_enabled() {
         return Ok(());
     }
-    let Some(status) = check_deps_status_before_run_at(dir, config, selected_project_dirs) else {
+    verify_deps_before_run_in(dir, (selected_project_dirs, None), config, reporter)
+}
+
+/// [`verify_deps_before_run`] with the workspace projects a recursive
+/// command discovered once for the gates of all its projects. The gate
+/// forgets them when it finds the dependencies out of date. The caller
+/// checks that `verifyDepsBeforeRun` is enabled.
+fn verify_deps_before_run_in(
+    dir: &Path,
+    (selected_project_dirs, workspace): (&[&Path], Option<&mut GateWorkspace>),
+    config: &Config,
+    reporter: ReporterType,
+) -> miette::Result<()> {
+    let Some(status) =
+        check_deps_status_before_run_at(dir, config, selected_project_dirs, workspace.as_deref())
+    else {
         return Ok(());
     };
     let (issue, mut install_args) = match status {
@@ -88,7 +105,12 @@ pub(crate) fn verify_deps_before_run(
             );
             return Ok(());
         }
-        RunDepsStatus::Outdated { issue, install_args } => (issue, install_args),
+        RunDepsStatus::Outdated { issue, install_args } => {
+            if let Some(workspace) = workspace {
+                workspace.forget_projects();
+            }
+            (issue, install_args)
+        }
     };
     // A filtered `run` or `exec` only selected some of the workspace's
     // projects, so its install has to select the same ones.
@@ -147,9 +169,15 @@ pub(crate) fn verify_deps_before_recursive_run<ProjectPath: AsRef<Path>>(
             .collect();
         verify_deps_before_run(workspace_root, &selected, config, reporter)
     } else {
+        let mut workspace = GateWorkspace::of(workspace_root, config);
         for project_dir in &project_dirs {
             let project_dir = project_dir.as_ref();
-            verify_deps_before_run(project_dir, &[project_dir], config, reporter)?;
+            verify_deps_before_run_in(
+                project_dir,
+                (&[project_dir], workspace.as_mut()),
+                config,
+                reporter,
+            )?;
         }
         Ok(())
     }
@@ -198,7 +226,7 @@ fn locked_install(
         (None, false)
     });
     let install_args = if waited {
-        match check_deps_status_before_run_at(dir, config, selected_project_dirs) {
+        match check_deps_status_before_run_at(dir, config, selected_project_dirs, None) {
             Some(RunDepsStatus::Outdated { mut install_args, .. }) => {
                 install_args.extend(install_selection_args(config));
                 install_args
@@ -223,7 +251,7 @@ fn warn_if_still_outdated(
     reporter: ReporterType,
 ) {
     if let Some(RunDepsStatus::Outdated { issue, .. }) =
-        check_deps_status_before_run_at(dir, config, selected_project_dirs)
+        check_deps_status_before_run_at(dir, config, selected_project_dirs, None)
     {
         warn(
             matches!(reporter, ReporterType::Silent),
@@ -260,7 +288,6 @@ fn acquire_install_lock(root: &Path) -> io::Result<(Option<DirLock>, bool)> {
 /// An install that exits with an error only warns, so a sandbox with a
 /// read-only store or no network can still run its scripts. An interrupted
 /// install aborts the command. Returns whether the install succeeded.
-#[expect(clippy::exit, reason = "an interrupted spawned install must stop the command")]
 fn spawn_install(
     dir: &Path,
     config: &Config,
@@ -295,7 +322,7 @@ fn spawn_install(
     }
     // The child already reported its own failure.
     if is_interrupted(status) {
-        exit(1);
+        pnpm_executor::exit(1);
     }
     warn(matches!(reporter, ReporterType::Silent), FAILED_INSTALL_WARNING);
     Ok(false)
@@ -331,7 +358,6 @@ fn warn(silent: bool, message: &str) {
     pnpm_diagnostics::eprintln!("{} {message}", colors.warn_label());
 }
 
-#[expect(clippy::exit, reason = "an interrupted prompt exits 1, like pnpm's ExitPromptError")]
 fn prompt_install(
     dir: &Path,
     selected_project_dirs: &[&Path],
@@ -356,7 +382,7 @@ fn prompt_install(
         Ok(false) => Ok(()),
         // The prompt was interrupted (Esc / Ctrl-C); exit like
         // pnpm's ExitPromptError handler.
-        Err(_) => exit(1),
+        Err(_) => pnpm_executor::exit(1),
     }
 }
 
@@ -401,7 +427,7 @@ pub(crate) fn with_dependencies(selector: &str) -> String {
 /// The command line's setting overrides, which the install inherits.
 /// They stay out of the prompt, which could otherwise print a credential
 /// such as `--config.//registry.example/:_authToken=...`.
-fn install_config_args(config: &Config) -> impl Iterator<Item = String> {
+pub(crate) fn install_config_args(config: &Config) -> impl Iterator<Item = String> {
     let raw = config.cli.npmrc_tokens
         .iter()
         .map(|(key, value)| {

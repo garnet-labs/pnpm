@@ -142,8 +142,10 @@ impl SeededStoreInstall {
             ("package.json", br#"{"name":"seeded","version":"1.0.0"}"#.as_slice()),
             ("index.js", b"module.exports = true\n".as_slice()),
         ] {
-            let (blob, digest) =
-                config.store_dir.write_cas_file(content, false).expect("write package file");
+            let pnpm_store_dir::WrittenFile { file: blob, hash: digest, .. } = config
+                .store_dir
+                .write_cas_file(content, false)
+                .expect("write package file");
             if path == "index.js" {
                 body_blob = Some(blob);
             }
@@ -158,8 +160,8 @@ impl SeededStoreInstall {
             );
         }
         let side_effects = build_output.map(|content| {
-            let (_, digest) =
-                config.store_dir.write_cas_file(content, false).expect("write build output");
+            let digest =
+                config.store_dir.write_cas_file(content, false).expect("write build output").hash;
             let added = HashMap::from([(
                 "build/output.js".to_string(),
                 CafsFileInfo {
@@ -201,7 +203,7 @@ impl SeededStoreInstall {
                 metadata_with_integrity(DUMMY_SHA512),
             )]),
             package_key,
-            body_blob: body_blob.expect("index.js blob"),
+            body_blob: body_blob.expect("index.js blob").path,
         }
     }
 
@@ -407,7 +409,7 @@ fn directory_metadata(directory: &str) -> PackageMetadata {
 fn slot_link<'a>(
     snapshot_key: &'a PackageKey,
     snapshot: &'a SnapshotEntry,
-    cas_paths: &'a HashMap<String, std::path::PathBuf>,
+    cas_paths: &'a pnpm_fs::CasPaths,
     removed_aliases: &'a [PkgName],
 ) -> crate::create_virtual_store::slot_linking::SlotLink<'a> {
     crate::create_virtual_store::slot_linking::SlotLink {

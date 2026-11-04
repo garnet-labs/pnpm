@@ -11,11 +11,7 @@ use pnpm_package_manifest::PackageBin;
 use pnpm_reporter::Reporter;
 use pnpm_store_dir::PackageFilesIndex;
 use ssri::Integrity;
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ArchiveFormat<'a> {
@@ -45,8 +41,8 @@ pub(crate) struct ArchiveIngestion<'a> {
 impl ArchiveIngestion<'_> {
     pub(crate) async fn run<Reporter: self::Reporter>(
         &self,
-    ) -> Result<HashMap<String, PathBuf>, TarballError> {
-        self.load_or_fetch::<Reporter>().await.map(|cached| cached.files)
+    ) -> Result<pnpm_fs::CasPaths, TarballError> {
+        self.load_or_fetch::<Reporter>().await.map(|cached| Arc::unwrap_or_clone(cached.files))
     }
 
     pub(crate) async fn load_or_fetch<Reporter: self::Reporter>(
@@ -57,7 +53,7 @@ impl ArchiveIngestion<'_> {
         }
         self.fetch::<Reporter>(false).await
             .map(|result| CachedCasPaths {
-                files: result.files_map,
+                files: Arc::new(result.files_map),
                 manifest: result.manifest,
                 requires_build: Some(result.requires_build),
                 bins: result.bins,
@@ -83,7 +79,7 @@ impl ArchiveIngestion<'_> {
                 "Reusing prefetched CAFS entry — skipping download",
             );
             emit_progress_found_in_store::<Reporter>(self.package.id, self.requester, progress_key);
-            return Ok(Some(CachedCasPaths::files_only((**cas_paths).clone())));
+            return Ok(Some(CachedCasPaths::files_only(Arc::clone(cas_paths))));
         }
         if let Some(cached) = load_cached_cas_paths::<Reporter>(
             self.store.index.clone(),
@@ -99,13 +95,16 @@ impl ArchiveIngestion<'_> {
             emit_progress_found_in_store::<Reporter>(self.package.id, self.requester, progress_key);
             return Ok(Some(cached));
         }
-        Ok(self.load_legacy_cache::<Reporter>(progress_key).await?.map(CachedCasPaths::files_only))
+        Ok(self
+            .load_legacy_cache::<Reporter>(progress_key)
+            .await?
+            .map(|files| CachedCasPaths::files_only(Arc::new(files))))
     }
 
     pub(crate) async fn ingest_zip_buffer(
         &self,
         buffer: Vec<u8>,
-    ) -> Result<HashMap<String, PathBuf>, TarballError> {
+    ) -> Result<pnpm_fs::CasPaths, TarballError> {
         let ArchiveFormat::Zip { integrity, prefix, max_bytes } = self.format else {
             unreachable!("ZIP buffers require ZIP ingestion")
         };
@@ -130,7 +129,7 @@ impl ArchiveIngestion<'_> {
     async fn load_legacy_cache<Reporter: self::Reporter>(
         &self,
         progress_key: Option<(&SharedReportedProgressKeys, &str)>,
-    ) -> Result<Option<HashMap<String, PathBuf>>, TarballError> {
+    ) -> Result<Option<pnpm_fs::CasPaths>, TarballError> {
         if let (
             Some(package_integrity),
             ArchiveStoreProjection::Package { append_manifest: Some(_) },
@@ -228,7 +227,7 @@ impl ArchiveIngestion<'_> {
     ) -> Result<
         (
             ArchiveIntegrity,
-            HashMap<String, PathBuf>,
+            pnpm_fs::CasPaths,
             PackageFilesIndex,
             Option<BTreeMap<String, PackageBin>>,
         ),
@@ -276,7 +275,7 @@ impl ArchiveIngestion<'_> {
         integrity: &Integrity,
         prefix: Option<&str>,
         max_bytes: Option<usize>,
-    ) -> Result<(Integrity, HashMap<String, PathBuf>, PackageFilesIndex), TarballError> {
+    ) -> Result<(Integrity, pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
         let (paths, index) = fetch_and_extract_zip_with_retry::<Reporter>(
             self.fetching.http_client,
             self.package.url,
@@ -297,7 +296,7 @@ impl ArchiveIngestion<'_> {
 
     fn project_files(
         &self,
-        cas_paths: &mut HashMap<String, PathBuf>,
+        cas_paths: &mut pnpm_fs::CasPaths,
         pkg_files_idx: &mut PackageFilesIndex,
     ) -> Result<(), TarballError> {
         match self.store_projection {

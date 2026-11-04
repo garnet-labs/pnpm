@@ -14,9 +14,7 @@ use super::{
     Config, Host, InstallError, Lockfile, Modules, NodeLinker, PackageManifest, PathBuf, Reporter,
     WorkspaceState, modules_layout_consistent_with, tree_may_move,
 };
-use crate::{
-    install::state_options::RecordedWorkspace, optimistic_repeat_install::recorded_elsewhere,
-};
+use crate::{install::state_options::RecordedWorkspace, install_state::recorded_elsewhere};
 use pnpm_workspace_state::load_workspace_state_in_modules;
 
 pub(super) struct PrepareModulesStateInputs<'a, 'install> {
@@ -65,9 +63,8 @@ pub(super) async fn prepare_modules_state<'install, Reporter: self::Reporter + '
         inputs.repeat.filtered,
         inputs.tree.config,
     )?;
-    let is_inconsistent = modules_layout_drifted(modules_manifest, &inputs);
-
-    prepare_modules_layout(&inputs, modules_manifest, is_inconsistent)?;
+    let drifted = modules_layout_drifted(modules_manifest, &inputs);
+    let is_inconsistent = prepare_modules_layout(&inputs, modules_manifest, drifted)?;
 
     let recorded_state = load_recorded_workspace_state(&inputs);
     let recorded = recorded_workspace(
@@ -79,15 +76,16 @@ pub(super) async fn prepare_modules_state<'install, Reporter: self::Reporter + '
     );
     let up_to_date = frozen_tree_inputs(&inputs, modules_manifest, recorded);
     if let Some((wanted_lockfile, modules)) = frozen_tree_up_to_date(&up_to_date) {
-        let recorded_auto_dedupe =
-            up_to_date.recorded.state.and_then(|state| state.settings.auto_dedupe);
-        report_prepared_up_to_date::<Reporter>(
-            inputs,
-            wanted_lockfile,
-            modules,
-            recorded_auto_dedupe,
-        )
-        .await?;
+        let carried_state = CarriedWorkspaceState {
+            recorded_auto_dedupe: up_to_date.recorded.state.and_then(|state| {
+                state.settings.auto_dedupe
+            }),
+            recorded_registry_routes: up_to_date.recorded.state.and_then(|state| {
+                state.settings.registry_routes.clone()
+            }),
+        };
+        report_prepared_up_to_date::<Reporter>(inputs, wanted_lockfile, modules, carried_state)
+            .await?;
         return Ok(None);
     }
 
@@ -116,23 +114,28 @@ fn recorded_workspace<'a>(
         moved: tree_may_move(config, node_linker)
             && state.map_or(existing_tree, |state| recorded_elsewhere(state, projects)),
         projects,
+        bin_projects: projects,
     }
 }
 
+/// Returns `is_inconsistent` as [`purge_inconsistent_modules_dir`] leaves it.
 fn prepare_modules_layout(
     inputs: &PrepareModulesStateInputs<'_, '_>,
     modules_manifest: Option<&pnpm_modules_yaml::ModulesLayout>,
     is_inconsistent: bool,
-) -> Result<(), InstallError> {
-    if !inputs.resolve_only && is_inconsistent {
+) -> Result<bool, InstallError> {
+    let is_inconsistent = if !inputs.resolve_only && is_inconsistent {
         purge_inconsistent_modules_dir(&InconsistentModulesDir {
             config: inputs.tree.config,
             workspace_root: inputs.tree.workspace_root,
             modules_manifest,
+            node_linker: inputs.tree.node_linker,
             installs_only: inputs.installs_only,
             filtered_install: inputs.repeat.filtered,
-        })?;
-    }
+        })?
+    } else {
+        is_inconsistent
+    };
 
     prune_excluded_direct_deps(&ExcludedGroupPrune {
         eligibility: crate::install::state_options::PruneEligibility {
@@ -149,11 +152,13 @@ fn prepare_modules_layout(
         requested_importer_ids: inputs.lockfiles.importer_ids,
         manifest_links: purge::ManifestLinkProjects {
             manifests: inputs.projects.manifests,
-            workspace_packages: inputs.projects.workspace_packages,
+            workspace_links: inputs.projects.workspace_packages.map(|packages| {
+                crate::WorkspaceLinks { packages, catalogs: inputs.projects.catalogs }
+            }),
         },
     })?;
 
-    Ok(())
+    Ok(is_inconsistent)
 }
 
 /// An up-to-date tree skips the materialization that links agent skills,
@@ -185,7 +190,7 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
     inputs: PrepareModulesStateInputs<'_, '_>,
     wanted_lockfile: &Lockfile,
     modules: &pnpm_modules_yaml::ModulesLayout,
-    recorded_auto_dedupe: Option<bool>,
+    carried_state: CarriedWorkspaceState,
 ) -> Result<(), InstallError> {
     resync_agent_skills_when_up_to_date::<Reporter>(&inputs, modules)?;
     report_up_to_date::<Reporter>(UpToDateInstall {
@@ -198,6 +203,8 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
         projects: crate::install::state_options::InstallProjectMetadata {
             catalogs: inputs.projects.catalogs,
             manifests: inputs.projects.manifests,
+            declared_manifests: inputs.projects.declared_manifests,
+            workspace_projects: inputs.projects.workspace_projects,
             prefix: inputs.projects.prefix,
             workspace_packages: inputs.projects.workspace_packages,
         },
@@ -216,7 +223,7 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
         modules,
         supported_architectures: inputs.repeat.supported_architectures,
 
-        carried_state: CarriedWorkspaceState { recorded_auto_dedupe },
+        carried_state,
     })
     .await
 }
@@ -245,7 +252,10 @@ fn frozen_tree_inputs<'a>(
         lockfile: inputs.lockfiles.wanted,
         current_lockfile: inputs.lockfiles.current,
         modules_manifest,
-        recorded,
+        recorded: RecordedWorkspace {
+            bin_projects: inputs.projects.workspace_projects.unwrap_or(recorded.projects),
+            ..recorded
+        },
     }
 }
 

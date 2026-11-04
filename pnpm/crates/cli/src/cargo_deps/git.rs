@@ -268,7 +268,7 @@ fn import_package(
     root: &Path,
     package: &CheckoutPackage,
     package_dirs: &BTreeSet<&Path>,
-) -> Result<HashMap<String, PathBuf>> {
+) -> Result<pnpm_fs::CasPaths> {
     let context = ImportContext {
         store_dir,
         root,
@@ -289,7 +289,7 @@ fn import_directory(
     context: &ImportContext<'_>,
     dir: &Path,
     prefix: &str,
-    cas_paths: &mut HashMap<String, PathBuf>,
+    cas_paths: &mut pnpm_fs::CasPaths,
 ) -> Result<()> {
     for entry in read_directory(dir)? {
         // A lossy name would key one file's contents under another's, and
@@ -334,12 +334,12 @@ fn import_file(
     path: &Path,
     relative: &str,
     executable: bool,
-) -> Result<PathBuf> {
+) -> Result<pnpm_fs::StoreFile> {
     if relative == "Cargo.toml" {
         return context.store_dir
             .write_cas_file(context.manifest.as_bytes(), executable)
             .into_diagnostic()
-            .map(|(cas_path, _)| cas_path)
+            .map(|written| written.file)
             .wrap_err_with(|| format!("store {}", path.display()));
     }
     // Streamed rather than read whole: a repository is free to carry a
@@ -350,7 +350,7 @@ fn import_file(
     context.store_dir
         .write_cas_file_from_reader(&mut file, executable, None)
         .into_diagnostic()
-        .map(|(cas_path, _, _)| cas_path)
+        .map(|written| written.file)
         .wrap_err_with(|| format!("store {}", path.display()))
 }
 

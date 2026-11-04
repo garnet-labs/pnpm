@@ -1,6 +1,6 @@
-pub use workspace::{
-    CatalogMode, LinkWorkspacePackages, PackageImportMethod, ResolutionMode, SaveWorkspaceProtocol,
-};
+pub use workspace::{CatalogMode, PackageImportMethod, ResolutionMode};
+
+pub use pnpm_resolving_resolver_base::{LinkWorkspacePackages, SaveWorkspaceProtocol, TrustPolicy};
 
 use super::{Deserialize, Serialize};
 
@@ -173,22 +173,6 @@ pub enum HoistingLimits {
     None,
     Workspaces,
     Dependencies,
-}
-
-/// Supply-chain trust policy applied to lockfile entries.
-///
-/// The setting is `'no-downgrade' | 'off'` and drives the
-/// `pnpm-resolving-npm-resolver` verifier: under
-/// [`TrustPolicy::NoDowngrade`] the verifier rejects any version
-/// whose trust evidence (`_npmUser.trustedPublisher` or
-/// `dist.attestations.provenance`) is weaker than an earlier-published
-/// version's.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TrustPolicy {
-    #[default]
-    Off,
-    NoDowngrade,
 }
 
 /// What to do when the project's `packageManager` /
@@ -375,72 +359,6 @@ pub struct AuditConfig {
     /// GHSA identifiers that `pnpm audit` should suppress in the rendered
     /// report.
     pub ignore_ghsas: Vec<String>,
-}
-
-/// Tri-state mirror of `pnpm_executor::ScriptsPrependNodePath`
-/// with serde wiring. The executor crate keeps its own enum free of
-/// serde so config concerns don't leak into the spawn-path. No `From`
-/// impl exists because neither crate depends on the other, and adding
-/// such a dep just for the conversion would invert the layering.
-///
-/// Deserializes the `scriptsPrependNodePath: boolean | 'warn-only'`
-/// yaml shape.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum ScriptsPrependNodePath {
-    /// `scriptsPrependNodePath: true` — always prepend.
-    Always,
-    /// `scriptsPrependNodePath: false` — never prepend.
-    #[default]
-    Never,
-    /// `scriptsPrependNodePath: 'warn-only'` — emit a warning if the
-    /// node in PATH differs from the running interpreter, do not
-    /// prepend.
-    WarnOnly,
-}
-
-impl serde::Serialize for ScriptsPrependNodePath {
-    fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
-        match self {
-            ScriptsPrependNodePath::Always => serializer.serialize_bool(true),
-            ScriptsPrependNodePath::Never => serializer.serialize_bool(false),
-            ScriptsPrependNodePath::WarnOnly => serializer.serialize_str("warn-only"),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ScriptsPrependNodePath {
-    fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
-    where
-        De: serde::Deserializer<'de>,
-    {
-        use serde::de::{self, Visitor};
-        use std::fmt;
-
-        struct V;
-        impl Visitor<'_> for V {
-            type Value = ScriptsPrependNodePath;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(r#"a boolean or the string "warn-only""#)
-            }
-            fn visit_bool<DeError: de::Error>(self, value: bool) -> Result<Self::Value, DeError> {
-                Ok(if value {
-                    ScriptsPrependNodePath::Always
-                } else {
-                    ScriptsPrependNodePath::Never
-                })
-            }
-            fn visit_str<DeError: de::Error>(self, value: &str) -> Result<Self::Value, DeError> {
-                match value {
-                    "warn-only" => Ok(ScriptsPrependNodePath::WarnOnly),
-                    other => Err(DeError::invalid_value(
-                        de::Unexpected::Str(other),
-                        &r#"true, false, or "warn-only""#,
-                    )),
-                }
-            }
-        }
-        deserializer.deserialize_any(V)
-    }
 }
 
 mod workspace;

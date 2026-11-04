@@ -1,6 +1,8 @@
 use super::{
-    Connection, Duration, LibsqlError, RegistryError, Result, TransactionBehavior, params,
+    Connection, Duration, RegistryError, Result, TransactionBehavior, first_row,
+    is_unique_violation, params,
 };
+use pnpr_libsql::is_transaction_conflict;
 
 /// Take one slot of the capped user counter, reporting whether the cap left
 /// one to take.
@@ -33,11 +35,10 @@ where
 }
 
 pub(super) async fn ensure_user_counter(conn: &Connection) -> Result<()> {
-    let mut rows = conn.query("SELECT COUNT(*) FROM users", ()).await?;
-    let Some(row) = rows.next().await? else {
+    let rows = conn.query("SELECT COUNT(*) FROM users", ()).await?;
+    let Some(count) = first_row(rows, |row| Ok(row.get::<i64>(0)?)).await? else {
         return Err(missing_count_row());
     };
-    let count: i64 = row.get(0)?;
     let tx = conn.transaction().await?;
     let inserted = tx.execute(
         "INSERT INTO auth_counters (name, value) VALUES (?1, ?2)",
@@ -65,21 +66,16 @@ pub(super) async fn ensure_user_counter(conn: &Connection) -> Result<()> {
 
 pub(super) async fn reconcile_user_counter_overcount(conn: &Connection) -> Result<bool> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).await?;
-    let mut counter_rows =
+    let counter_rows =
         tx.query("SELECT value FROM auth_counters WHERE name = ?1", params!["users"]).await?;
-    let Some(counter_row) = counter_rows.next().await? else {
-        drop(counter_rows);
+    let Some(counter) = first_row(counter_rows, |row| Ok(row.get::<i64>(0)?)).await? else {
         tx.commit().await?;
         return Ok(false);
     };
-    let counter: i64 = counter_row.get(0)?;
-    drop(counter_rows);
-    let mut count_rows = tx.query("SELECT COUNT(*) FROM users", ()).await?;
-    let Some(count_row) = count_rows.next().await? else {
+    let count_rows = tx.query("SELECT COUNT(*) FROM users", ()).await?;
+    let Some(count) = first_row(count_rows, |row| Ok(row.get::<i64>(0)?)).await? else {
         return Err(missing_count_row());
     };
-    let count: i64 = count_row.get(0)?;
-    drop(count_rows);
     if counter <= count {
         tx.commit().await?;
         return Ok(false);
@@ -111,50 +107,6 @@ where
             Err(error) => return Err(error),
         }
     }
-}
-
-pub(super) fn is_transaction_conflict(error: &LibsqlError) -> bool {
-    match error {
-        LibsqlError::SqliteFailure(code, _) | LibsqlError::RemoteSqliteFailure(_, code, _) => {
-            matches!(code & 0xff, 5 | 6)
-        }
-        LibsqlError::Hrana(error) => {
-            let message = error.to_string();
-            hrana_result_code(&message)
-                .is_some_and(|code| {
-                    matches!(code, "SQLITE_BUSY" | "SQLITE_LOCKED")
-                        || code.starts_with("SQLITE_BUSY_")
-                        || code.starts_with("SQLITE_LOCKED_")
-                })
-        }
-        _ => false,
-    }
-}
-
-pub(super) fn is_unique_violation(err: &LibsqlError) -> bool {
-    match err {
-        LibsqlError::SqliteFailure(code, message)
-        | LibsqlError::RemoteSqliteFailure(_, code, message) => {
-            *code == 19 || *code == 2067 || message.contains("UNIQUE constraint failed")
-        }
-        LibsqlError::Hrana(error) => {
-            let message = error.to_string();
-            message.contains("UNIQUE constraint failed")
-                || hrana_result_code(&message)
-                    .is_some_and(|code| {
-                        matches!(code, "SQLITE_CONSTRAINT" | "SQLITE_CONSTRAINT_UNIQUE")
-                    })
-        }
-        _ => false,
-    }
-}
-
-/// The `SQLite` result code name a Hrana error carries. libsql does not expose
-/// Hrana's structured error type publicly, so it is read from the message.
-fn hrana_result_code(message: &str) -> Option<&str> {
-    let (_, code) = message.rsplit_once(r#"code: ""#)?;
-    let (code, _) = code.split_once('"')?;
-    Some(code)
 }
 
 pub(super) fn missing_count_row() -> RegistryError {

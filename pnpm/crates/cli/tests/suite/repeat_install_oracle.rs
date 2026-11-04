@@ -30,7 +30,8 @@ use std::{
 };
 
 use pnpm_lockfile::{PackageKey, ProjectSnapshot, SnapshotEntry};
-use pnpm_testing_utils::command_env::CommandTestExt;
+use pnpm_package_manager::prune_unreachable_packages;
+use pnpm_testing_utils::{command_env::CommandTestExt, registry::TestRegistry};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
@@ -79,32 +80,51 @@ impl Layout {
 
 const PROJECTS: [&str; 3] = ["a", "b", "c"];
 
+/// The gate a check lets refuse a tree that a full install leaves as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowedRefusal {
+    None,
+    Install,
+    /// The run gate compares workspace-wide inputs, so an edit to one refuses
+    /// every selection, the ones it leaves as they are included
+    /// (pnpm/tasks#219).
+    Run,
+}
+
 struct Scenario {
     driver: Driver,
     fixture: WorkspaceFixture,
     layout: Layout,
     oracle_runs: usize,
+    /// A project depends on a local tarball or directory.
+    local_file_dependency: bool,
 }
 
 /// What an install leaves behind that a user can observe: where every
-/// dependency resolves from each project, every lockfile, and every
-/// `.modules.yaml` manifest.
+/// dependency resolves from each project, the commands each project's
+/// `node_modules/.bin` offers, the files of every registry dependency a
+/// project declares, every lockfile, and every `.modules.yaml` manifest.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     tree: BTreeMap<String, String>,
+    bins: BTreeMap<String, Vec<String>>,
+    dependency_files: BTreeMap<String, BTreeMap<String, String>>,
     lockfiles: BTreeMap<String, String>,
     modules: BTreeMap<String, pnpm_modules_yaml::Modules>,
 }
 
-/// What a lockfile records for one project: its importer entry, and for a
-/// dedicated lockfile its package snapshots (including injected workspace
-/// packages).
+/// What a lockfile records for one project: its importer entry and the
+/// package snapshots it reaches, injected workspace packages included.
 type ProjectLockfileEntry = (ProjectSnapshot, Option<HashMap<PackageKey, SnapshotEntry>>);
 
-/// Where the selected projects' dependencies resolve from, and the entries
-/// that record them in the wanted and the current lockfiles.
-type SelectionView =
-    (BTreeMap<String, String>, BTreeMap<String, [Option<ProjectLockfileEntry>; 2]>);
+/// Where the selected projects' dependencies resolve from, the commands their
+/// `node_modules/.bin` offers, and the entries that record them in the wanted
+/// and the current lockfiles.
+type SelectionView = (
+    BTreeMap<String, String>,
+    BTreeMap<String, Vec<String>>,
+    BTreeMap<String, [Option<ProjectLockfileEntry>; 2]>,
+);
 
 impl Scenario {
     /// A workspace whose `c` depends on its sibling `a`, so a selection reaches
@@ -114,7 +134,8 @@ impl Scenario {
         let fixture = WorkspaceFixture::new();
         fixture.append_workspace_yaml(&layout.workspace_yaml());
         fixture.write_root_manifest("root", ManifestDeps::default());
-        let scenario = Self { driver, fixture, layout, oracle_runs: 0 };
+        let scenario =
+            Self { driver, fixture, layout, oracle_runs: 0, local_file_dependency: false };
         scenario.set_dependencies("a", &json!({ "@pnpm.e2e/foo": "100.0.0" }));
         scenario.write_manifest(
             "b",
@@ -137,18 +158,7 @@ impl Scenario {
         Args: IntoIterator<Item = Arg>,
         Arg: AsRef<OsStr>,
     {
-        if let Some(bundle) = v11_bundle {
-            return self.fixture.v11_command_at(bundle, cwd, args);
-        }
-        pacquet_in(cwd)
-            .without_ambient_pnpm_config()
-            .current_dir(cwd)
-            .env("PNPM_CONFIG_REGISTRY", self.fixture.registry.mock_instance.url())
-            .env("XDG_CONFIG_HOME", self.fixture.workspace.with_file_name("xdg-config"))
-            .arg("--reporter=ndjson")
-            .args(args)
-            .output()
-            .expect("run pnpm")
+        pnpm_at(&self.fixture, v11_bundle, cwd, args)
     }
 
     fn command_at<Args, Arg>(&self, cwd: &Path, args: Args) -> Output
@@ -156,15 +166,7 @@ impl Scenario {
         Args: IntoIterator<Item = Arg>,
         Arg: AsRef<OsStr>,
     {
-        match &self.driver {
-            Driver::V12 => self.command_at_with(None, cwd, args),
-            Driver::V11(bundle) => self.command_at_with(Some(bundle), cwd, args),
-            Driver::Mixed { bundle, next_v11 } => {
-                let use_v11 = next_v11.get();
-                next_v11.set(!use_v11);
-                self.command_at_with(use_v11.then_some(bundle.as_os_str()), cwd, args)
-            }
-        }
+        driver_command_at(&self.driver, &self.fixture, cwd, args)
     }
 
     fn workspace(&self) -> &Path {
@@ -207,6 +209,21 @@ impl Scenario {
             .expect("write package.json");
     }
 
+    /// Set the top-level `key` of `pnpm-workspace.yaml` to the flow-style
+    /// `value`, or remove it.
+    fn set_workspace_setting(&self, key: &str, value: Option<&str>) {
+        let path = self.workspace().join("pnpm-workspace.yaml");
+        let yaml = fs::read_to_string(&path).expect("read pnpm-workspace.yaml");
+        let prefix = format!("{key}:");
+        let mut lines = yaml
+            .lines()
+            .filter(|line| !line.starts_with(&prefix))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        lines.extend(value.map(|value| format!("{key}: {value}")));
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write pnpm-workspace.yaml");
+    }
+
     /// Whether the CLI that runs the next `pnpm install` offers its fast path
     /// in this layout.
     ///
@@ -214,16 +231,23 @@ impl Scenario {
     /// `file:` snapshot, which the install fast path does not compare, so both
     /// CLIs refuse it (pnpm/tasks#145). With a shared lockfile, v11 also
     /// refuses the install fast path to refresh injected copies (pnpm/pnpm#15679).
+    /// v11 refuses it over any local file dependency, unchanged or not.
     fn offers_next_install_fast_path(&self) -> bool {
+        if self.local_file_dependency && self.next_is_v11() {
+            return false;
+        }
         if !self.layout.inject_workspace_packages {
             return true;
         }
-        let next_is_v11 = match &self.driver {
+        self.layout.shared_lockfile && !self.next_is_v11()
+    }
+
+    fn next_is_v11(&self) -> bool {
+        match &self.driver {
             Driver::V12 => false,
             Driver::V11(_) => true,
             Driver::Mixed { next_v11, .. } => next_v11.get(),
-        };
-        self.layout.shared_lockfile && !next_is_v11
+        }
     }
 
     /// Runs `pnpm install` with `args` and tells whether it took the fast
@@ -241,15 +265,7 @@ impl Scenario {
             self.workspace(),
             ["install", "--no-frozen-lockfile"].iter().chain(args),
         );
-        assert_success(&output);
-        let records = ndjson_records(&output);
-        let up_to_date = records
-            .iter()
-            .any(|record| record["message"] == "Already up to date");
-        let staged = records
-            .iter()
-            .any(|record| record["name"] == "pnpm:stage");
-        up_to_date && !staged
+        took_install_fast_path(&output)
     }
 
     /// Run `node -e ""` through `exec` for `selection` under
@@ -359,6 +375,8 @@ impl Scenario {
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             tree: Self::tree(self.workspace(), &PROJECTS, true),
+            bins: workspace_bins(self.workspace()),
+            dependency_files: dependency_files(self.workspace()),
             lockfiles: workspace_lockfiles(self.workspace()),
             modules: workspace_modules_manifests(self.workspace()),
         }
@@ -371,18 +389,6 @@ impl Scenario {
         workspace: &Path,
         projects: &[&str],
     ) -> BTreeMap<String, [Option<ProjectLockfileEntry>; 2]> {
-        let dedicated = !self.layout.shared_lockfile;
-        let entry = |lockfile: PathBuf, importer_id: &str| {
-            lockfile
-                .is_file()
-                .then(|| read_lockfile(&lockfile))
-                .and_then(|lockfile| {
-                    Some((
-                        lockfile.importers.get(importer_id)?.clone(),
-                        dedicated.then_some(lockfile.snapshots).flatten(),
-                    ))
-                })
-        };
         projects
             .iter()
             .map(|project| {
@@ -391,15 +397,19 @@ impl Scenario {
                 } else {
                     (workspace.join("packages").join(project), ".".into())
                 };
-                let wanted = entry(dir.join("pnpm-lock.yaml"), &importer_id);
-                let current = entry(dir.join("node_modules/.pnpm/lock.yaml"), &importer_id);
-                ((*project).to_string(), [wanted, current])
+                ((*project).to_string(), lockfile_entries(&dir, &importer_id))
             })
             .collect()
     }
 
     fn selection_view(&self, workspace: &Path, selection: &[&str]) -> SelectionView {
-        (Self::tree(workspace, selection, false), self.importers(workspace, selection))
+        let mut bins = workspace_bins(workspace);
+        bins.retain(|importer, _| {
+            selection
+                .iter()
+                .any(|project| *importer == format!("packages/{project}"))
+        });
+        (Self::tree(workspace, selection, false), bins, self.importers(workspace, selection))
     }
 
     /// Clean-installed copy of the sources.
@@ -439,7 +449,7 @@ impl Scenario {
     /// The run gate for `selection` lets the command through exactly when
     /// the selection already is what a clean install makes it.
     #[track_caller]
-    fn assert_run_gate(&self, oracle: &Path, selection: &[&str]) {
+    fn assert_run_gate(&self, oracle: &Path, selection: &[&str], allowed: AllowedRefusal) {
         let passed = self.exec(selection, "error");
         let actual = self.selection_view(self.workspace(), selection);
         let expected = self.selection_view(oracle, selection);
@@ -452,7 +462,7 @@ impl Scenario {
             self.driver,
         );
         assert!(
-            passed || !current,
+            passed || !current || allowed == AllowedRefusal::Run,
             "{:?} ({:?}): the run gate for {selection:?} refused, but a clean install changes nothing \
              for it",
             self.layout,
@@ -461,10 +471,9 @@ impl Scenario {
     }
 
     /// `pnpm install` takes its fast path exactly when a full install changes
-    /// nothing, and takes it on the next run. `conservative` allows a refusal
-    /// for a tree a full install leaves as it is.
+    /// nothing, and takes it on the next run.
     #[track_caller]
-    fn assert_install_gate(&self, conservative: bool) {
+    fn assert_install_gate(&self, allowed: AllowedRefusal) {
         let before = self.snapshot();
         let offered = self.offers_next_install_fast_path();
         if self.install(&[]) {
@@ -483,7 +492,7 @@ impl Scenario {
                 self.layout,
                 self.driver,
             );
-        } else if !conservative && offered {
+        } else if allowed != AllowedRefusal::Install && offered {
             assert_ne!(
                 self.snapshot(),
                 before,
@@ -561,16 +570,22 @@ impl Scenario {
     /// Every gate over the workspace, then the convergence the install leaves.
     #[track_caller]
     fn check_gates(&mut self) {
-        self.check_gates_allowing(false);
+        self.check_gates_allowing(AllowedRefusal::None);
+    }
+
+    /// [`Self::check_gates`] after an edit to an input outside the manifests.
+    #[track_caller]
+    fn check_gates_after_a_workspace_input_edit(&mut self) {
+        self.check_gates_allowing(AllowedRefusal::Run);
     }
 
     #[track_caller]
-    fn check_gates_allowing(&mut self, conservative: bool) {
+    fn check_gates_allowing(&mut self, allowed: AllowedRefusal) {
         let oracle = self.oracle_workspace();
         for selection in [&["a"][..], &["b"], &["c"], &PROJECTS] {
-            self.assert_run_gate(&oracle, selection);
+            self.assert_run_gate(&oracle, selection, allowed);
         }
-        self.assert_install_gate(conservative);
+        self.assert_install_gate(allowed);
         for selection in [&["a"][..], &["b"], &["c"], &PROJECTS] {
             assert!(
                 self.exec(selection, "error"),
@@ -606,6 +621,144 @@ impl Scenario {
             );
         }
     }
+}
+
+/// `pnpm` at `cwd`: the v11 bundle when one is given, v12 otherwise.
+fn pnpm_at<Args, Arg>(
+    fixture: &WorkspaceFixture,
+    v11_bundle: Option<&OsStr>,
+    cwd: &Path,
+    args: Args,
+) -> Output
+where
+    Args: IntoIterator<Item = Arg>,
+    Arg: AsRef<OsStr>,
+{
+    if let Some(bundle) = v11_bundle {
+        return fixture.v11_command_at(bundle, cwd, args);
+    }
+    pacquet_in(cwd)
+        .without_ambient_pnpm_config()
+        .current_dir(cwd)
+        .env("PNPM_CONFIG_REGISTRY", fixture.registry.mock_instance.url())
+        .env("XDG_CONFIG_HOME", fixture.workspace.with_file_name("xdg-config"))
+        .arg("--reporter=ndjson")
+        .args(args)
+        .output()
+        .expect("run pnpm")
+}
+
+/// `pnpm` at `cwd` through the CLI `driver` picks next.
+fn driver_command_at<Args, Arg>(
+    driver: &Driver,
+    fixture: &WorkspaceFixture,
+    cwd: &Path,
+    args: Args,
+) -> Output
+where
+    Args: IntoIterator<Item = Arg>,
+    Arg: AsRef<OsStr>,
+{
+    match driver {
+        Driver::V12 => pnpm_at(fixture, None, cwd, args),
+        Driver::V11(bundle) => pnpm_at(fixture, Some(bundle), cwd, args),
+        Driver::Mixed { bundle, next_v11 } => {
+            let use_v11 = next_v11.get();
+            next_v11.set(!use_v11);
+            pnpm_at(fixture, use_v11.then_some(bundle.as_os_str()), cwd, args)
+        }
+    }
+}
+
+/// Whether a successful `pnpm install` took the fast path: it said "Already
+/// up to date" without starting a resolution or an import.
+fn took_install_fast_path(output: &Output) -> bool {
+    assert_success(output);
+    let records = ndjson_records(output);
+    let up_to_date = records
+        .iter()
+        .any(|record| record["message"] == "Already up to date");
+    let staged = records
+        .iter()
+        .any(|record| record["name"] == "pnpm:stage");
+    up_to_date && !staged
+}
+
+/// What the wanted and the current lockfile under `dir` record for
+/// `importer_id`.
+fn lockfile_entries(dir: &Path, importer_id: &str) -> [Option<ProjectLockfileEntry>; 2] {
+    let entry = |lockfile: PathBuf| {
+        let mut lockfile = lockfile.is_file().then(|| read_lockfile(&lockfile))?;
+        lockfile.importers.retain(|id, _| id == importer_id);
+        let importer = lockfile.importers.get(importer_id)?.clone();
+        prune_unreachable_packages(&mut lockfile);
+        Some((importer, lockfile.snapshots))
+    };
+    [entry(dir.join("pnpm-lock.yaml")), entry(dir.join("node_modules/.pnpm/lock.yaml"))]
+}
+
+/// The directories whose `node_modules` an install links: the root and every
+/// project.
+fn importer_dirs() -> impl Iterator<Item = String> {
+    std::iter::once(".".to_string()).chain(PROJECTS.map(|project| format!("packages/{project}")))
+}
+
+/// The entries of every importer's `node_modules/.bin`. An importer without
+/// any is left out, so an empty directory counts as a missing one.
+fn workspace_bins(workspace: &Path) -> BTreeMap<String, Vec<String>> {
+    importer_dirs()
+        .filter_map(|importer| {
+            let mut names = fs::read_dir(workspace.join(&importer).join("node_modules/.bin"))
+                .ok()?
+                .map(|entry| {
+                    entry
+                        .expect("read a .bin entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            (!names.is_empty()).then_some((importer, names))
+        })
+        .collect()
+}
+
+/// The files of every registry dependency each project declares, keyed by
+/// `<project>/<dependency>`: a patch changes them and leaves the version as
+/// it was.
+fn dependency_files(workspace: &Path) -> BTreeMap<String, BTreeMap<String, String>> {
+    PROJECTS
+        .iter()
+        .flat_map(|project| {
+            registry_dependency_dirs(&workspace.join("packages").join(project))
+                .into_iter()
+                .filter_map(move |(name, dir)| Some((format!("{project}/{name}"), dir?)))
+        })
+        .map(|(key, dir)| {
+            let real = fs::canonicalize(&dir).expect("canonicalize a dependency");
+            let files = walkdir::WalkDir::new(&real)
+                .into_iter()
+                .filter_entry(|entry| entry.file_name() != "node_modules")
+                .map(|entry| entry.expect("walk a dependency"))
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(&real)
+                        .expect("under the dependency")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let text = String::from_utf8_lossy(
+                        &fs::read(entry.path()).expect("read a dependency file"),
+                    )
+                    .into_owned();
+                    (relative, text)
+                })
+                .collect();
+            (key, files)
+        })
+        .collect()
 }
 
 fn exec_args(selection: &[&str], action: &str) -> Vec<String> {
@@ -800,7 +953,7 @@ fn a_state_without_validation_records(layout: Layout) {
     scenario.set_dependencies("b", &json!({ "@pnpm.e2e/bar": "100.0.0" }));
     scenario.install(&["--filter", "a"]);
     scenario.strip_validation();
-    scenario.check_gates_allowing(true);
+    scenario.check_gates_allowing(AllowedRefusal::Install);
 }
 
 /// A production install leaves the dev dependencies out, and an install of
@@ -820,6 +973,269 @@ fn a_workspace_without_a_root_manifest(layout: Layout) {
     scenario.set_dependencies("b", &json!({ "@pnpm.e2e/bar": "100.0.0" }));
     scenario.check_gates();
 }
+
+/// `overrides` added, changed, and removed.
+fn overrides_edited(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.install(&[]);
+    for overrides in [
+        Some("{ '@pnpm.e2e/dep-of-pkg-with-1-dep': '100.1.0' }"),
+        Some("{ '@pnpm.e2e/dep-of-pkg-with-1-dep': '101.0.0' }"),
+        None,
+    ] {
+        scenario.set_workspace_setting("overrides", overrides);
+        scenario.check_gates_after_a_workspace_input_edit();
+    }
+}
+
+/// A `readPackage` hook that adds a dependency at `{version}` to
+/// `@pnpm.e2e/foo`.
+const PNPMFILE_ADDING_A_DEPENDENCY: &str = "module.exports = { hooks: { readPackage (pkg) {
+  if (pkg.name === '@pnpm.e2e/foo') {
+    pkg.dependencies = { ...pkg.dependencies, '@pnpm.e2e/dep-of-pkg-with-1-dep': '{version}' }
+  }
+  return pkg
+} } }
+";
+
+/// A `readPackage` hook added, changed, and removed.
+fn a_pnpmfile_hook_edited(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.install(&[]);
+    let pnpmfile = scenario.workspace().join(".pnpmfile.cjs");
+    for added_version in ["100.0.0", "101.0.0"] {
+        fs::write(&pnpmfile, PNPMFILE_ADDING_A_DEPENDENCY.replace("{version}", added_version))
+            .expect("write the pnpmfile");
+        scenario.check_gates_after_a_workspace_input_edit();
+    }
+    fs::remove_file(&pnpmfile).expect("remove the pnpmfile");
+    scenario.check_gates_after_a_workspace_input_edit();
+}
+
+/// A `readPackage` hook that rewrites a workspace project's own specifier of
+/// `a`. It maps `workspace:*` too, so a manifest can declare the specifier the
+/// lockfile records while the hook resolves another one.
+const PNPMFILE_REWRITING_A_PROJECT_SPECIFIER: &str =
+    "module.exports = { hooks: { readPackage (pkg) {
+  const rewritten = { '*': 'workspace:*', 'workspace:*': 'workspace:^' }[pkg.dependencies?.a]
+  if (rewritten) pkg.dependencies.a = rewritten
+  return pkg
+} } }
+";
+
+/// A `readPackage` hook that rewrites `c`'s specifier of its sibling `a`, then
+/// edits to that specifier, then an edit to `c` that leaves its dependencies
+/// alone.
+fn a_pnpmfile_hook_rewriting_a_project_specifier(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.install(&[]);
+    fs::write(scenario.workspace().join(".pnpmfile.cjs"), PNPMFILE_REWRITING_A_PROJECT_SPECIFIER)
+        .expect("write the pnpmfile");
+    scenario.check_gates_after_a_workspace_input_edit();
+    let dependencies = |specifier| json!({ "a": specifier, "@pnpm.e2e/bar": "100.0.0" });
+    for specifier in ["*", "workspace:*"] {
+        scenario.set_dependencies("c", &dependencies(specifier));
+        scenario.check_gates();
+    }
+    scenario.write_manifest(
+        "c",
+        json!({ "description": "edited", "dependencies": dependencies("workspace:*") }),
+    );
+    scenario.check_gates();
+}
+
+/// A `packageExtensions` entry that adds a dependency to the workspace project
+/// `c`, then an edit to `c` that leaves its dependencies alone.
+fn a_package_extension_of_a_project_then_an_edit(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.install(&[]);
+    scenario.set_workspace_setting(
+        "packageExtensions",
+        Some("{ c: { dependencies: { '@pnpm.e2e/foo': '100.0.0' } } }"),
+    );
+    scenario.check_gates_after_a_workspace_input_edit();
+    scenario.write_manifest(
+        "c",
+        json!({
+            "description": "edited",
+            "dependencies": { "a": "workspace:*", "@pnpm.e2e/bar": "100.0.0" },
+        }),
+    );
+    scenario.check_gates();
+}
+
+/// A `readPackage` hook that gives `a` a dependency on a local tarball no
+/// manifest declares.
+const PNPMFILE_ADDING_A_LOCAL_TARBALL: &str = "module.exports = { hooks: { readPackage (pkg) {
+  if (pkg.name === 'a') pkg.dependencies = { ...pkg.dependencies, 'local-pkg': 'file:../../vendor/local-pkg.tgz' }
+  return pkg
+} } }
+";
+
+/// A local tarball that only a `readPackage` hook depends on, replaced with
+/// other contents.
+fn a_local_tarball_a_hook_adds_then_replaced(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    let tarball = scenario.workspace().join("vendor/local-pkg.tgz");
+    let write_tarball = |version: &str| {
+        fs::create_dir_all(tarball.parent().expect("vendor dir")).expect("create vendor dir");
+        fs::write(
+            &tarball,
+            pnpm_testing_utils::fixtures::tarball_with_manifest(
+                &json!({ "name": "local-pkg", "version": version }),
+            ),
+        )
+        .expect("write the local tarball");
+    };
+    write_tarball("1.0.0");
+    fs::write(scenario.workspace().join(".pnpmfile.cjs"), PNPMFILE_ADDING_A_LOCAL_TARBALL)
+        .expect("write the pnpmfile");
+    scenario.install(&[]);
+    scenario.local_file_dependency = true;
+    scenario.check_gates();
+    write_tarball("1.0.1");
+    scenario.check_gates_after_a_workspace_input_edit();
+}
+
+/// `patchedDependencies` added, its patch file edited, and the entry removed.
+fn a_patch_added_edited_and_removed(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.set_dependencies("a", &json!({ "@pnpm.e2e/foo": "100.0.0", "is-positive": "1.0.0" }));
+    scenario.install(&[]);
+    let patch = scenario.workspace().join("patches/is-positive@1.0.0.patch");
+    fs::create_dir_all(patch.parent().expect("patches dir")).expect("create the patches dir");
+    fs::write(&patch, crate::repeat_install::IS_POSITIVE_PATCH).expect("write the patch");
+    scenario.set_workspace_setting(
+        "patchedDependencies",
+        Some("{ 'is-positive@1.0.0': 'patches/is-positive@1.0.0.patch' }"),
+    );
+    scenario.check_gates_after_a_workspace_input_edit();
+    let edited = crate::repeat_install::IS_POSITIVE_PATCH.replace("// patched", "// patched again");
+    fs::write(&patch, edited).expect("edit the patch");
+    scenario.check_gates_after_a_workspace_input_edit();
+    scenario.set_workspace_setting("patchedDependencies", None);
+    scenario.check_gates_after_a_workspace_input_edit();
+}
+
+/// `dedupePeers` turned on and off with a peer dependency in the tree.
+fn dedupe_peers_toggled(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.write_manifest(
+        "b",
+        json!({
+            "dependencies": {
+                "@pnpm.e2e/abc-parent-with-ab": "1.0.0",
+                "@pnpm.e2e/peer-c": "1.0.0",
+            },
+            "devDependencies": { "@pnpm.e2e/bar": "100.0.0" },
+        }),
+    );
+    scenario.install(&[]);
+    for dedupe_peers in [Some("true"), None] {
+        scenario.set_workspace_setting("dedupePeers", dedupe_peers);
+        scenario.check_gates_after_a_workspace_input_edit();
+    }
+}
+
+/// A workspace project's command renamed, which its dependent `c` links.
+fn a_workspace_bin_renamed(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    fs::create_dir_all(scenario.workspace().join("packages/a")).expect("create project a");
+    fs::write(scenario.workspace().join("packages/a/tool.js"), "#!/usr/bin/env node\n")
+        .expect("write the command");
+    let declare_command = |scenario: &Scenario, command: &str| {
+        scenario.write_manifest(
+            "a",
+            json!({
+                "dependencies": { "@pnpm.e2e/foo": "100.0.0" },
+                "bin": { command: "tool.js" },
+            }),
+        );
+    };
+    let links = |scenario: &Scenario, command: &str| {
+        workspace_bins(scenario.workspace())
+            .get("packages/c")
+            .is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| name.starts_with(command))
+            })
+    };
+    declare_command(&scenario, "a-tool");
+    scenario.install(&[]);
+    assert!(links(&scenario, "a-tool"), "{layout:?}: c links the command of its dependency a");
+    declare_command(&scenario, "a-cli");
+    // The gate holds a changed command to the project that declares it, so
+    // the run gate for `a` refuses too.
+    scenario.check_gates_allowing(AllowedRefusal::Run);
+    assert!(links(&scenario, "a-cli"), "{layout:?}: c links the renamed command");
+    assert!(!links(&scenario, "a-tool"), "{layout:?}: c no longer links the old command");
+}
+
+/// The `@pnpm.e2e` scope routed to a registry that does not serve the
+/// version `b` locked.
+///
+/// The routes a lockfile was resolved through live in the workspace state,
+/// which the run gate's oracle, a copy without `node_modules`, does not have.
+/// So the install in place is the oracle here.
+fn a_scope_route_moved(layout: Layout) {
+    let scenario = Scenario::new(layout);
+    let old_registry = scenario.fixture.registry.mock_instance.url().to_string();
+    scenario.set_workspace_setting(
+        "registries",
+        Some(&format!("{{ '@pnpm.e2e': '{old_registry}' }}")),
+    );
+    scenario.install(&[]);
+    let locked_version = read_lockfile(&scenario.lockfile_of("b")).packages
+        .into_iter()
+        .flatten()
+        .find(|(key, _)| key.name.to_string() == "@pnpm.e2e/dep-of-pkg-with-1-dep")
+        .map(|(key, _)| key.suffix.to_string())
+        .expect("b locks @pnpm.e2e/dep-of-pkg-with-1-dep");
+    let new_registry = TestRegistry::start_with_own_storage(
+        scenario
+            .workspace()
+            .parent()
+            .expect("the fixture root"),
+    );
+    new_registry.remove_version("@pnpm.e2e/dep-of-pkg-with-1-dep", &locked_version);
+    scenario.set_workspace_setting(
+        "registries",
+        Some(&format!("{{ '@pnpm.e2e': '{}' }}", new_registry.url())),
+    );
+    assert!(
+        !scenario.exec(&["b"], "error"),
+        "{layout:?}: b's locked dependency is not served by the registry its scope moved to",
+    );
+    scenario.assert_install_gate(AllowedRefusal::None);
+    for selection in [&["a"][..], &["b"], &["c"], &PROJECTS] {
+        assert!(
+            scenario.exec(selection, "error"),
+            "{layout:?}: the run gate for {selection:?} must pass right after a full install",
+        );
+    }
+}
+
+/// Edits to `b` that change none of its dependencies, each kept by the next.
+fn manifest_edits_that_change_no_dependency(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.install(&[]);
+    let mut manifest = json!({
+        "dependencies": { "@pnpm.e2e/pkg-with-1-dep": "100.0.0" },
+        "devDependencies": { "@pnpm.e2e/bar": "100.0.0" },
+    });
+    for (field, value, allowed) in [
+        ("description", json!("edited"), AllowedRefusal::None),
+        ("scripts", json!({ "build": r#"node -e """# }), AllowedRefusal::None),
+        ("version", json!("1.0.1"), AllowedRefusal::None),
+    ] {
+        manifest[field] = value;
+        scenario.write_manifest("b", manifest.clone());
+        scenario.check_gates_allowing(allowed);
+    }
+}
+
+mod lone_project;
 
 macro_rules! matrix {
     ($($module:ident: $layout:expr,)*) => {
@@ -844,6 +1260,16 @@ macro_rules! matrix {
                     a_state_without_validation_records,
                     a_production_install_then_every_group,
                     a_workspace_without_a_root_manifest,
+                    overrides_edited,
+                    a_pnpmfile_hook_edited,
+                    a_pnpmfile_hook_rewriting_a_project_specifier,
+                    a_package_extension_of_a_project_then_an_edit,
+                    a_local_tarball_a_hook_adds_then_replaced,
+                    a_patch_added_edited_and_removed,
+                    dedupe_peers_toggled,
+                    a_workspace_bin_renamed,
+                    a_scope_route_moved,
+                    manifest_edits_that_change_no_dependency,
                 );
             }
         )*

@@ -1,8 +1,8 @@
 use super::{
-    super::{Decision, settings::current_settings_with_catalogs},
-    backdate_validated_files, check, check_with_catalogs, isolated_included,
+    super::Decision, backdate_validated_files, check, check_with_catalogs, isolated_included,
     setup_fresh_install_with_config, write_state,
 };
+use crate::install_state::settings::current_settings_with_catalogs;
 use indexmap::IndexMap;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_lockfile::Lockfile;
@@ -260,7 +260,7 @@ fn returns_up_to_date_when_a_linked_workspace_dependency_is_overridden_and_manif
     let sibling_manifest =
         pnpm_package_manifest::PackageManifest::from_path(sibling_dir.join("package.json"))
             .unwrap();
-    let settings = super::super::settings::current_settings(
+    let settings = crate::install_state::settings::current_settings(
         config,
         pnpm_config::NodeLinker::Isolated,
         isolated_included(),
@@ -299,10 +299,10 @@ fn returns_up_to_date_when_a_linked_workspace_dependency_is_overridden_and_manif
         &super::super::OptimisticRepeatInstallCheck {
             workspace_root,
             config,
-            project_manifests: &[
+            project_manifests: crate::DeclaredManifests::new(&[
                 (workspace_root.to_path_buf(), &root_manifest_edited),
                 (sibling_dir, &sibling_manifest),
-            ],
+            ]),
             is_workspace_install: true,
             lockfile: pnpm_lockfile::MaybeLazyLockfile::Loaded(lockfile.as_ref()),
             catalogs: &BTreeMap::default(),

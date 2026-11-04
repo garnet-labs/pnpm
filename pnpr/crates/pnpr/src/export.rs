@@ -29,7 +29,7 @@ pub async fn export_storage(
 
     let namespaces = configured_hosted_namespaces(config);
     for org in namespaces {
-        let org_storage = if org.is_empty() { storage.clone() } else { storage.for_hosted(&org) };
+        let org_storage = storage.for_hosted(&org, Ecosystem::Npm);
         let base_out = if org.is_empty() { out.to_path_buf() } else { out.join(&org) };
 
         let package_names = org_storage
@@ -51,12 +51,8 @@ pub async fn export_storage(
 
 /// The configured hosted store, once its layout is one this pnpr reads.
 pub(crate) async fn open_hosted_storage(config: &Config) -> miette::Result<Storage> {
-    let storage = Storage::new(
-        &config.storage.hosted_backend,
-        config.storage.hosted_dir.clone(),
-        config.storage.cache_dir.clone(),
-    )
-    .map_err(|err| miette::miette!("failed to initialize storage: {err}"))?;
+    let storage = Storage::from_config(&config.storage)
+        .map_err(|err| miette::miette!("failed to initialize storage: {err}"))?;
     storage
         .check_hosted_layout()
         .await
@@ -131,6 +127,9 @@ async fn export_version_blobs(
     {
         export_single_blob(storage, canonical, filename, pkg_dir, report).await?;
     }
+    // A hosted tar registry stores the version's tar in place of its `.tgz`.
+    let tar = canonical.tar_name_for_version(ver);
+    export_single_blob(storage, canonical, &tar, pkg_dir, report).await?;
     if dist
         .get("attestations")
         .and_then(|a| a.get("url"))

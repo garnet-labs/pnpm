@@ -1,3 +1,4 @@
+use super::null_default::deserialize_null_default;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -8,14 +9,14 @@ pub struct OidcProvider {
     pub issuer: String,
     pub audience: String,
     pub login: Option<OidcLogin>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub workloads: Vec<OidcWorkload>,
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OidcLogin {
-    #[serde(default, rename = "clientSecret", alias = "client_secret")]
+    #[serde(default)]
     pub client_secret: Option<String>,
     pub users: Vec<OidcBinding>,
     /// Team memberships a signed-in session gets from the groups its ID token
@@ -64,7 +65,7 @@ impl std::fmt::Debug for OidcLogin {
 pub struct OidcBinding {
     pub subject: String,
     pub username: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub claims: BTreeMap<String, String>,
 }
 

@@ -1,5 +1,5 @@
 use super::{
-    BTreeMap, Config, HashMap, Host, IntoDiagnostic, Path, PathBuf, Result, Value,
+    BTreeMap, Config, HashMap, Host, IntoDiagnostic, Path, PathBuf, Result, TrustedSettings, Value,
     WorkspaceSettings, apply_store_dir_override, config_delta, default_state_dir,
     is_known_setting_key, resolve_configured_state_dir,
 };
@@ -31,7 +31,9 @@ fn hook_execution_changes(delta: &Value) -> Result<HookExecutionChanges> {
 
 fn filter_hook_delta(config: &Config, mut delta: Value) -> Value {
     if let Some(delta) = delta.as_object_mut() {
-        delta.remove("macosBackup");
+        for key in super::HIDDEN_FROM_HOOKS {
+            delta.remove(key);
+        }
         delta.retain(|key, _| {
             !config.cli_settings.contains(key)
                 && !config.cli_settings.contains(&pnpm_config::naming_cases::to_camel_case(key))
@@ -80,7 +82,7 @@ pub(super) fn apply_hook_delta(
     let execution_changes = hook_execution_changes(&delta)?;
     apply_registry_routing_changes(config, &delta)?;
 
-    let delta_settings: WorkspaceSettings = serde_json::from_value(delta.clone())
+    let delta_settings = TrustedSettings::from_json(&delta)
         .into_diagnostic()
         .wrap_err("deserialize the updateConfig hook result")?;
     record_explicit_setting_changes(config, &delta, &delta_settings);
@@ -136,7 +138,7 @@ fn hook_registry_routes(delta: &Value, key: &str) -> Result<Option<BTreeMap<Stri
 fn record_explicit_setting_changes(
     config: &mut Config,
     delta: &Value,
-    delta_settings: &WorkspaceSettings,
+    delta_settings: &TrustedSettings,
 ) {
     config.record_explicit_settings(delta_settings);
     let Some(delta) = delta.as_object() else { return };

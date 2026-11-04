@@ -1,7 +1,7 @@
 use super::{
     Config, EnvVar, GetCurrentDir, GetHomeDir, GitHost, HashMap, HoistPatterns, LinkProbe,
-    Lockfile, NodeLinker, Path, StoreDir, StoreRelocation, WantedLockfileSelection,
-    WorkspaceSettings, collect_explicit_settings, create_matcher, default_store_dir,
+    Lockfile, NodeLinker, Path, StoreDir, StoreRelocation, SymlinkedLockfile, TrustedSettings,
+    WantedLockfileSelection, collect_explicit_trusted_settings, create_matcher, default_store_dir,
     get_branches_containing_head, get_current_branch, store_path,
 };
 
@@ -376,6 +376,12 @@ impl Config {
         }
     }
 
+    /// How a write that changes a symlinked wanted lockfile behaves.
+    #[must_use]
+    pub fn symlinked_lockfile(&self) -> SymlinkedLockfile<'_> {
+        SymlinkedLockfile::allowing(&self.symlinked_lockfile_target_dirs)
+    }
+
     /// [`Self::wanted_lockfile_name`] paired with the merge flag, as the
     /// lockfile loader wants them.
     #[must_use]
@@ -441,8 +447,8 @@ impl Config {
     /// Record the settings `settings` sets in [`Self::explicit_settings`],
     /// as loading a settings file does, so the derivations that read whether
     /// a setting was set at all see them.
-    pub fn record_explicit_settings(&mut self, settings: &WorkspaceSettings) {
-        collect_explicit_settings(&mut self.explicit_settings, settings);
+    pub fn record_explicit_settings(&mut self, settings: &TrustedSettings) {
+        collect_explicit_trusted_settings(&mut self.explicit_settings, settings);
     }
 
     /// Apply the legacy `shamefullyHoist` setting to the public hoist pattern.
@@ -562,7 +568,7 @@ impl Config {
         let resolved = StoreDir::from(store_path::resolve_store_dir::<Sys>(
             store_root.clone(),
             &pnpm_home_dir,
-            start_dir,
+            self.workspace_dir.as_deref().unwrap_or(start_dir),
         ));
         let home_store_dir = StoreDir::from(store_root);
         self.store_relocation = (resolved != home_store_dir).then(|| {
@@ -588,7 +594,7 @@ impl Config {
     /// [`Self::install_state_dir`]. This is the `virtualStoreDir` pnpm
     /// records in `.modules.yaml` and emits in the `pnpm:context` event, so
     /// reading the install state directory instead makes the next install
-    /// fail with `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE_DIR`.
+    /// fail with `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE`.
     pub fn virtual_store_dir(&self) -> &Path {
         if self.enable_global_virtual_store {
             &self.global_virtual_store_dir

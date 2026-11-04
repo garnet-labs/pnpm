@@ -1,5 +1,6 @@
 pub use errors::InstallWithFreshLockfileError;
 pub(crate) use lockfile_build::compute_package_extensions_checksum;
+pub(crate) use manifest_transforms::resolver_manifest_hooks;
 pub(crate) use seed_policy::prefer_requested_version;
 pub use seed_policy::{ImporterUpdateSeedPolicy, PreferredVersionsOverride, UpdateSeedPolicy};
 
@@ -159,6 +160,7 @@ pub(crate) struct FreshInstallProjects<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct FreshInstallExecution {
+    pub(crate) locked_package_policy: pnpm_resolving_resolver_base::LockedPackagePolicy,
     /// Resolved [`pnpm_config::Config::node_linker`]. Selects the
     /// materialization shape after the virtual store is populated:
     /// under [`NodeLinker::Hoisted`] the freshly-built lockfile is
@@ -254,6 +256,10 @@ pub(crate) struct FreshLockfileSeeds<'a> {
     /// Intact prior lockfile used to restore unselected projects after a
     /// filtered repair resolves against a sanitized seed.
     pub(crate) merge_wanted: Option<&'a Lockfile>,
+    /// The routes [`Self::wanted`]'s plain keys resolved through, when the
+    /// workspace state recorded them. See
+    /// [`pnpm_lockfile::RegistryContext::locked_registries`].
+    pub(crate) locked_registries: Option<&'a BTreeMap<String, String>>,
 }
 
 impl FreshInputs<'_> {
@@ -317,13 +323,22 @@ pub(crate) struct OwnedInputs {
     /// disk lookup entirely; `None` (every CLI install) falls back to
     /// [`load_pnpmfile`][pnpm_hooks::finder::load_pnpmfile]. See [`crate::InstallProjects::pnpmfile_hook_override`].
     pub(crate) pnpmfile_hook_override: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
-    /// The pre-resolve verification of the existing lockfile, running in
-    /// the background while this install resolves and materializes. See
-    /// [`crate::LockfileVerificationGate`].
-    pub(crate) lockfile_verification_gate: Option<crate::LockfileVerificationGate>,
+    pub(crate) lockfile: WantedLockfileHandles,
     pub(crate) resolution: crate::ResolutionInputs,
     pub(crate) fetching: crate::install_with_fresh_lockfile::FreshFetchingInputs,
     pub(crate) projects: crate::install_with_fresh_lockfile::FreshProjectInputs,
+}
+
+/// The install's handles on the wanted lockfile: the background verification
+/// of the one on disk, and where a check run sends the one it would write.
+pub(crate) struct WantedLockfileHandles {
+    /// The pre-resolve verification of the existing lockfile, running in
+    /// the background while this install resolves and materializes. See
+    /// [`crate::LockfileVerificationGate`].
+    pub(crate) verification_gate: Option<crate::LockfileVerificationGate>,
+    /// Where a `lockfileCheck` run delivers the wanted lockfile instead of
+    /// writing it. See [`crate::Install::run_lockfile_check`].
+    pub(crate) check_sink: Option<crate::LockfileCheckSink>,
 }
 
 pub(crate) struct FreshFetchingInputs {
@@ -514,27 +529,6 @@ fn deprecation_log_fn<Reporter: self::Reporter>() -> pnpm_resolving_deps_resolve
                     outside_declared_range: alt.outside_declared_range,
                 }
             }),
-        }));
-    })
-}
-
-/// Build one side of the `preResolution` hook's `logger`: each
-/// `logger.info(...)` / `logger.warn(...)` call emits a `pnpm:hook` event at
-/// the given level. `from` is the literal `"pnpmfile"` — pnpm's
-/// `createPreResolutionHookLogger` hardcodes it rather than passing the
-/// pnpmfile path.
-fn pre_resolution_log_fn<Reporter: self::Reporter>(
-    prefix: &Path,
-    level: LogLevel,
-) -> pnpm_hooks::LogFn {
-    let prefix = prefix.to_string_lossy().into_owned();
-    Arc::new(move |message: String| {
-        Reporter::emit(&LogEvent::Hook(HookLog {
-            level,
-            from: "pnpmfile".to_string(),
-            hook: "preResolution".to_string(),
-            message,
-            prefix: prefix.clone(),
         }));
     })
 }

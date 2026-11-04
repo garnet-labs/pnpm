@@ -188,6 +188,7 @@ async fn fresh_install_persists_loose_minimum_release_age_picks_to_workspace_man
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run_with_prompt_eligibility::<SilentReporter>(false)
@@ -291,6 +292,7 @@ async fn install_writes_workspace_state() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -306,13 +308,10 @@ async fn install_writes_workspace_state() {
         "lastValidatedTimestamp should be populated, got {}",
         state.last_validated_timestamp,
     );
-    let manifest_mtime = crate::optimistic_repeat_install::file_mtime(manifest.path())
-        .expect("manifest should have an mtime");
+    let manifest_mtime =
+        crate::install_state::file_mtime(manifest.path()).expect("manifest should have an mtime");
     assert!(
-        !crate::optimistic_repeat_install::modified_at_or_after(
-            manifest_mtime,
-            state.last_validated_timestamp,
-        ),
+        !crate::install_state::modified_at_or_after(manifest_mtime, state.last_validated_timestamp,),
         "fresh install state should cover the validated manifest mtime",
     );
 
@@ -615,6 +614,7 @@ async fn optimistic_repeat_install_round_trips_on_single_project_install() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -698,6 +698,7 @@ async fn optimistic_repeat_install_round_trips_on_single_project_install() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -1018,6 +1019,7 @@ async fn install_succeeds_even_when_workspace_state_write_fails() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

@@ -22,17 +22,59 @@ use std::sync::Mutex;
 /// — the install isn't a workspace install, so the caller should use
 /// the top-level `Install.manifest` as its only importer and pass
 /// `None` for the `workspace:`-spec lookup.
-pub(super) fn load_workspace_projects(
+pub(crate) fn load_workspace_projects(
     workspace_root: &std::path::Path,
     workspace_manifest: Option<&pnpm_workspace::WorkspaceManifest>,
     ignored_directories: &[std::path::PathBuf],
 ) -> Result<Option<Vec<pnpm_workspace::Project>>, pnpm_workspace::FindWorkspaceProjectsError> {
     let Some(manifest) = workspace_manifest else { return Ok(None) };
-    let opts = pnpm_workspace::FindWorkspaceProjectsOpts {
-        patterns: Some(pnpm_workspace::workspace_package_patterns(manifest)),
+    pnpm_workspace::find_workspace_projects(
+        workspace_root,
+        &workspace_projects_opts(manifest, ignored_directories),
+    )
+    .map(Some)
+}
+
+/// How [`load_workspace_projects`] discovers the projects of the workspace
+/// `workspace_manifest` declares.
+pub(super) fn workspace_projects_opts(
+    workspace_manifest: &pnpm_workspace::WorkspaceManifest,
+    ignored_directories: &[std::path::PathBuf],
+) -> pnpm_workspace::FindWorkspaceProjectsOpts {
+    pnpm_workspace::FindWorkspaceProjectsOpts {
+        patterns: Some(pnpm_workspace::workspace_package_patterns(workspace_manifest)),
         ignored_directories: ignored_directories.to_vec(),
-    };
-    pnpm_workspace::find_workspace_projects(workspace_root, &opts).map(Some)
+    }
+}
+
+/// [`load_workspace_projects`] for the repeat-install checks, which read the
+/// projects the install itself would read: the `--workspace-packages`
+/// patterns when given, else the ones `workspace_manifest` declares.
+pub(crate) fn load_checked_workspace_projects(
+    config: &Config,
+    workspace_root: &std::path::Path,
+    workspace_manifest: Option<&pnpm_workspace::WorkspaceManifest>,
+) -> Result<Option<Vec<pnpm_workspace::Project>>, pnpm_workspace::FindWorkspaceProjectsError> {
+    let Some(manifest) = workspace_manifest else { return Ok(None) };
+    pnpm_workspace::find_workspace_projects(
+        workspace_root,
+        &checked_projects_opts(config, manifest),
+    )
+    .map(Some)
+}
+
+/// The discovery options of [`load_checked_workspace_projects`].
+pub(crate) fn checked_projects_opts(
+    config: &Config,
+    workspace_manifest: &pnpm_workspace::WorkspaceManifest,
+) -> pnpm_workspace::FindWorkspaceProjectsOpts {
+    let patterns = config.workspace_package_patterns
+        .clone()
+        .unwrap_or_else(|| pnpm_workspace::workspace_package_patterns(workspace_manifest));
+    pnpm_workspace::FindWorkspaceProjectsOpts {
+        patterns: Some(patterns),
+        ignored_directories: config.managed_directories(),
+    }
 }
 
 /// [`Config::extra_env_with_node_options`] plus the `NODE_OPTIONS` entry for

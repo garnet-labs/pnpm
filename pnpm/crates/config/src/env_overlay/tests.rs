@@ -1,7 +1,7 @@
-use super::{WorkspaceSettings, parse_json_or_string, parse_tri_array};
+use super::{TrustedSettings, WorkspaceSettings, parse_json_or_string, parse_tri_array};
 use crate::{
-    ColorMode, Config, NodeLinker, NodePackageMapType, SaveWorkspaceProtocol,
-    ScriptsPrependNodePath, TrustPolicy, VirtualStoreType, api::EnvVar,
+    ColorMode, Config, LinkWorkspacePackages, NodeLinker, NodePackageMapType,
+    SaveWorkspaceProtocol, TrustPolicy, VirtualStoreType, api::EnvVar,
 };
 use pnpm_store_dir::StoreIndexFormat;
 use pretty_assertions::assert_eq;
@@ -15,7 +15,7 @@ fn bool_env_var_only_accepts_lowercase_true_false() {
             (name == "PNPM_CONFIG_ENABLE_GLOBAL_VIRTUAL_STORE").then(|| "yes".to_owned())
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvBadBool>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvBadBool>().settings;
     assert_eq!(settings.enable_global_virtual_store, None);
 }
 
@@ -31,7 +31,7 @@ fn materialization_settings_read_from_the_environment() {
             }
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvMaterialization>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvMaterialization>().settings;
     assert_eq!(settings.virtual_store_only, Some(true));
     assert_eq!(settings.enable_modules_dir, Some(false));
 }
@@ -44,7 +44,7 @@ fn allow_unused_patches_reads_from_the_environment() {
             (name == "PNPM_CONFIG_ALLOW_UNUSED_PATCHES").then(|| "true".to_owned())
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvAllowUnusedPatches>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvAllowUnusedPatches>().settings;
     assert_eq!(settings.allow_unused_patches, Some(true));
 }
 
@@ -72,7 +72,7 @@ fn parity_settings_read_from_the_environment() {
         }
     }
 
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvParity>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvParity>().settings;
     assert_eq!(settings.bail, Some(false));
     assert_eq!(settings.color, Some(ColorMode::Always));
     assert_eq!(settings.embed_readme, Some(true));
@@ -96,7 +96,7 @@ fn progress_reads_from_the_environment() {
             (name == "PNPM_CONFIG_PROGRESS").then(|| "false".to_owned())
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvProgress>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvProgress>().settings;
     assert_eq!(settings.progress, Some(false));
 }
 
@@ -110,7 +110,7 @@ fn empty_env_var_is_treated_as_unset() {
             (name == "PNPM_CONFIG_STORE_DIR").then(String::new)
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvEmpty>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvEmpty>().settings;
     assert_eq!(settings.store_dir, None);
 }
 
@@ -130,8 +130,8 @@ fn empty_node_options_env_vars_override_lower_layers() {
     }
 
     for settings in [
-        WorkspaceSettings::from_pnpm_config_env::<UppercaseEmptyNodeOptions>(),
-        WorkspaceSettings::from_pnpm_config_env::<LowercaseEmptyNodeOptions>(),
+        TrustedSettings::from_pnpm_config_env::<UppercaseEmptyNodeOptions>().settings,
+        TrustedSettings::from_pnpm_config_env::<LowercaseEmptyNodeOptions>().settings,
     ] {
         assert_eq!(settings.node_options.as_ref().map(Option::as_deref), Some(Some("")));
         let mut config =
@@ -155,7 +155,7 @@ fn empty_save_prefix_env_var_survives() {
             (name == "PNPM_CONFIG_SAVE_PREFIX").then(String::new)
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvEmptySavePrefix>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvEmptySavePrefix>().settings;
     assert_eq!(settings.save_prefix.as_deref(), Some(""));
 }
 
@@ -183,8 +183,32 @@ fn save_workspace_protocol_reads_from_the_environment() {
             (name == "PNPM_CONFIG_SAVE_WORKSPACE_PROTOCOL").then(|| "true".to_owned())
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvPinned>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvPinned>().settings;
     assert_eq!(settings.save_workspace_protocol, Some(SaveWorkspaceProtocol::On));
+}
+
+#[test]
+fn resolution_settings_read_from_the_environment() {
+    struct EnvResolution;
+    impl EnvVar for EnvResolution {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "PNPM_CONFIG_LINK_WORKSPACE_PACKAGES"
+                | "PNPM_CONFIG_INJECT_WORKSPACE_PACKAGES"
+                | "PNPM_CONFIG_FROZEN_STORE" => Some("true".to_owned()),
+                "PNPM_CONFIG_EXTEND_NODE_PATH" | "PNPM_CONFIG_OPTIMISTIC_REPEAT_INSTALL" => {
+                    Some("false".to_owned())
+                }
+                _ => None,
+            }
+        }
+    }
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvResolution>().settings;
+    assert_eq!(settings.link_workspace_packages, Some(LinkWorkspacePackages::DirectOnly));
+    assert_eq!(settings.inject_workspace_packages, Some(true));
+    assert_eq!(settings.frozen_store, Some(true));
+    assert_eq!(settings.extend_node_path, Some(false));
+    assert_eq!(settings.optimistic_repeat_install, Some(false));
 }
 
 #[test]
@@ -198,22 +222,6 @@ fn enum_env_var_accepts_bare_identifier() {
 }
 
 #[test]
-fn scripts_prepend_node_path_env_var_round_trips_all_three_shapes() {
-    assert_eq!(
-        parse_json_or_string::<ScriptsPrependNodePath>("true"),
-        Some(ScriptsPrependNodePath::Always),
-    );
-    assert_eq!(
-        parse_json_or_string::<ScriptsPrependNodePath>("false"),
-        Some(ScriptsPrependNodePath::Never),
-    );
-    assert_eq!(
-        parse_json_or_string::<ScriptsPrependNodePath>("warn-only"),
-        Some(ScriptsPrependNodePath::WarnOnly),
-    );
-}
-
-#[test]
 fn workspace_concurrency_env_var_parses_signed_number() {
     struct EnvPositive;
     impl EnvVar for EnvPositive {
@@ -222,7 +230,7 @@ fn workspace_concurrency_env_var_parses_signed_number() {
         }
     }
     assert_eq!(
-        WorkspaceSettings::from_pnpm_config_env::<EnvPositive>().workspace_concurrency,
+        TrustedSettings::from_pnpm_config_env::<EnvPositive>().settings.workspace_concurrency,
         Some(6),
     );
 
@@ -233,7 +241,7 @@ fn workspace_concurrency_env_var_parses_signed_number() {
         }
     }
     assert_eq!(
-        WorkspaceSettings::from_pnpm_config_env::<EnvNegative>().workspace_concurrency,
+        TrustedSettings::from_pnpm_config_env::<EnvNegative>().settings.workspace_concurrency,
         Some(-2),
     );
 }
@@ -253,7 +261,7 @@ fn network_settings_parse_from_env() {
             }
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvNetwork>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvNetwork>().settings;
     assert_eq!(settings.network_concurrency, Some(12));
     assert_eq!(settings.fetch_timeout, Some(90_000));
     assert_eq!(settings.fetch_warn_timeout_ms, Some(15_000));
@@ -270,7 +278,7 @@ fn scope_parses_from_env() {
         }
     }
     assert_eq!(
-        WorkspaceSettings::from_pnpm_config_env::<EnvScope>().scope.as_deref(),
+        TrustedSettings::from_pnpm_config_env::<EnvScope>().machine.scope.as_deref(),
         Some("@my-org"),
     );
 }
@@ -288,7 +296,7 @@ fn empty_scope_env_var_survives_to_clobber_lower_layers() {
             (name == "PNPM_CONFIG_SCOPE").then(String::new)
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvEmptyScope>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvEmptyScope>().machine;
     assert_eq!(settings.scope.as_deref(), Some(""));
 }
 
@@ -317,14 +325,17 @@ fn store_index_format_env_var_parses_its_two_values() {
     env_with_store_index_format!(EnvNonsense, "postgres");
 
     assert_eq!(
-        WorkspaceSettings::from_pnpm_config_env::<EnvFiles>().store_index_format,
+        TrustedSettings::from_pnpm_config_env::<EnvFiles>().settings.store_index_format,
         Some(StoreIndexFormat::Files),
     );
     assert_eq!(
-        WorkspaceSettings::from_pnpm_config_env::<EnvSqlite>().store_index_format,
+        TrustedSettings::from_pnpm_config_env::<EnvSqlite>().settings.store_index_format,
         Some(StoreIndexFormat::Sqlite),
     );
-    assert_eq!(WorkspaceSettings::from_pnpm_config_env::<EnvNonsense>().store_index_format, None);
+    assert_eq!(
+        TrustedSettings::from_pnpm_config_env::<EnvNonsense>().settings.store_index_format,
+        None,
+    );
 }
 
 #[test]
@@ -345,14 +356,17 @@ fn virtual_store_type_env_var_parses_its_two_values() {
     env_with_virtual_store_type!(EnvNonsense, "shared");
 
     assert_eq!(
-        WorkspaceSettings::from_pnpm_config_env::<EnvGlobal>().virtual_store_type,
+        TrustedSettings::from_pnpm_config_env::<EnvGlobal>().settings.virtual_store_type,
         Some(VirtualStoreType::Global),
     );
     assert_eq!(
-        WorkspaceSettings::from_pnpm_config_env::<EnvProject>().virtual_store_type,
+        TrustedSettings::from_pnpm_config_env::<EnvProject>().settings.virtual_store_type,
         Some(VirtualStoreType::Project),
     );
-    assert_eq!(WorkspaceSettings::from_pnpm_config_env::<EnvNonsense>().virtual_store_type, None);
+    assert_eq!(
+        TrustedSettings::from_pnpm_config_env::<EnvNonsense>().settings.virtual_store_type,
+        None,
+    );
 }
 
 /// The environment can only spell the boolean, so it reaches the same
@@ -379,7 +393,7 @@ sideEffectsCache:
 
     let mut config = Config::new();
     declared.apply_to(&mut config, Path::new("/workspace"));
-    WorkspaceSettings::from_pnpm_config_env::<EnvSideEffectsCacheOff>()
+    TrustedSettings::from_pnpm_config_env::<EnvSideEffectsCacheOff>().settings
         .apply_to(&mut config, Path::new("/workspace"));
 
     assert!(!config.side_effects_cache_read());
@@ -395,7 +409,7 @@ fn tag_version_prefix_reads_from_the_environment() {
             (name == "PNPM_CONFIG_TAG_VERSION_PREFIX").then(|| "release-".to_owned())
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvPrefix>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvPrefix>().settings;
     assert_eq!(settings.tag_version_prefix.as_deref(), Some("release-"));
 
     struct EnvEmptyPrefix;
@@ -404,8 +418,32 @@ fn tag_version_prefix_reads_from_the_environment() {
             (name == "PNPM_CONFIG_TAG_VERSION_PREFIX").then(String::new)
         }
     }
-    let settings = WorkspaceSettings::from_pnpm_config_env::<EnvEmptyPrefix>();
+    let settings = TrustedSettings::from_pnpm_config_env::<EnvEmptyPrefix>().settings;
     assert_eq!(settings.tag_version_prefix.as_deref(), Some(""));
+}
+
+#[test]
+fn git_tag_version_reads_from_the_environment() {
+    struct Env;
+    impl EnvVar for Env {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_GIT_TAG_VERSION").then(|| "false".to_owned())
+        }
+    }
+    let settings = TrustedSettings::from_pnpm_config_env::<Env>().settings;
+    assert_eq!(settings.git_tag_version, Some(false));
+}
+
+#[test]
+fn publish_branch_reads_from_environment() {
+    struct Env;
+    impl EnvVar for Env {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_PUBLISH_BRANCH").then(|| "production".to_owned())
+        }
+    }
+    let settings = TrustedSettings::from_pnpm_config_env::<Env>().settings;
+    assert_eq!(settings.publish_branch.as_deref(), Some("production"));
 }
 
 #[test]
@@ -416,7 +454,10 @@ fn publish_wait_timeout_reads_from_environment() {
             (name == "PNPM_CONFIG_PUBLISH_WAIT_TIMEOUT").then(|| "600000".to_owned())
         }
     }
-    assert_eq!(WorkspaceSettings::from_pnpm_config_env::<Env>().publish_wait_timeout, Some(600000));
+    assert_eq!(
+        TrustedSettings::from_pnpm_config_env::<Env>().settings.publish_wait_timeout,
+        Some(600000),
+    );
 }
 
 #[test]
@@ -427,5 +468,80 @@ fn tag_parses_from_env() {
             (name == "PNPM_CONFIG_TAG").then(|| "next".to_owned())
         }
     }
-    assert_eq!(WorkspaceSettings::from_pnpm_config_env::<EnvTag>().tag.as_deref(), Some("next"));
+    assert_eq!(
+        TrustedSettings::from_pnpm_config_env::<EnvTag>().settings.tag.as_deref(),
+        Some("next"),
+    );
 }
+
+/// Every setting has a `PNPM_CONFIG_*` read or is listed in
+/// [`SETTINGS_NOT_READ_FROM_ENV`] with the reason it has none.
+#[test]
+fn every_setting_is_read_from_the_environment() {
+    let requested = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let record = |suffix: &str| {
+        requested
+            .borrow_mut()
+            .insert(crate::naming_cases::to_camel_case(&suffix.to_lowercase()));
+        None
+    };
+    TrustedSettings::from_reader(&super::StringReader { read: &record, read_allow_empty: &record });
+    let requested = requested.into_inner();
+
+    let Ok(serde_json::Value::Object(settings)) =
+        TrustedSettings::from_resolved(&Config::default()).to_json()
+    else {
+        panic!("the projected settings serialize to a JSON object");
+    };
+    let unread: Vec<&str> = settings
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !requested.contains(*key) && !SETTINGS_NOT_READ_FROM_ENV.contains(key))
+        .collect();
+    assert_eq!(unread, Vec::<&str>::new(), "settings with no PNPM_CONFIG_* read");
+
+    let stale: Vec<&str> = SETTINGS_NOT_READ_FROM_ENV
+        .iter()
+        .copied()
+        .filter(|key| requested.contains(*key) || !settings.contains_key(*key))
+        .collect();
+    assert_eq!(stale, Vec::<&str>::new(), "listed settings that are read or no longer exist");
+}
+
+const SETTINGS_NOT_READ_FROM_ENV: &[&str] = &[
+    // Read under the nested key's suffix, such as `NODE_PACKAGE_MAP_MODE`.
+    "nodePackageMap",
+    "macosBackup",
+    // Read with the auth files, not through the overlay.
+    "_auth",
+    "npmrcAuthFile",
+    // Not in the schema pnpm v11 reads `PNPM_CONFIG_*` against.
+    "audit",
+    "bootConfig",
+    "cargo",
+    "catalog",
+    "catalogPrune",
+    "catalogs",
+    "cleanupUnusedCatalogs",
+    "configDependencies",
+    "ignoredBuiltDependencies",
+    "minimumReleaseAgeExcludePrune",
+    "namedRegistries",
+    "neverBuiltDependencies",
+    "onlyBuiltDependencies",
+    "packageConfigs",
+    "packages",
+    "permissions",
+    "pipelineBase",
+    "pipelines",
+    "python",
+    "registries",
+    "remoteCache",
+    "remoteSideEffectsCache",
+    "requiredScripts",
+    "skills",
+    "tasks",
+    "trustPolicyExcludePrune",
+    "update",
+    "versioning",
+];

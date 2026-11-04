@@ -22,6 +22,9 @@
       "path": "../../config/normalize-registries"
     },
     {
+      "path": "../../config/pick-registry-for-package"
+    },
+    {
       "path": "../../config/version-policy"
     },
     {
@@ -41,6 +44,9 @@
     },
     {
       "path": "../../deps/graph-hasher"
+    },
+    {
+      "path": "../../deps/graph-sequencer"
     },
     {
       "path": "../../deps/path"
@@ -83,6 +89,9 @@
     },
     {
       "path": "../../pkg-manifest/utils"
+    },
+    {
+      "path": "../../resolving/jsr-specifier-parser"
     },
     {
       "path": "../../resolving/npm-resolver"

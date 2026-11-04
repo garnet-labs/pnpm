@@ -19,7 +19,7 @@
     "ci:test-branch": "pn prepare-fixtures && pn test-pkgs-branch",
     "test-pkgs-branch": "pn remove-temp-dir && pn --workspace-concurrency=2 --filter=...[origin/main] --no-sort --if-present .test",
     "compile-only": "pn typecheck-all && pn -F=pnpm compile",
-    "typecheck-all": "tsgo --build pnpm11/workspace/workspace-manifest-reader pnpm11/workspace/projects-reader && pnx node@runtime:26.12.1 pnpm11/__utils__/scripts/src/typecheck-only.ts",
+    "typecheck-all": "tsgo --build pnpm11/workspace/workspace-manifest-reader pnpm11/workspace/projects-reader && pnx node@runtime:26.13.0 pnpm11/__utils__/scripts/src/typecheck-only.ts",
     "compile": "pn compile-only && pn update-manifests",
     "build:pnpm": "cargo build --release --bin pnpm",
     "build:pnpm:wasm": "node pnpm/wasm/build.mjs",
@@ -40,8 +40,8 @@
     "check:versioning": "pnpm change check",
     "copy-artifacts": "node pnpm11/__utils__/scripts/src/copy-artifacts.ts",
     "make-release-description": "pn --filter=@pnpm/get-release-text run write-release-text",
-    "check:npm-signing-keys": "node pnpm11/deps/security/signatures/scripts/update-npm-signing-keys.mjs",
-    "update:npm-signing-keys": "node pnpm11/deps/security/signatures/scripts/update-npm-signing-keys.mjs --update",
+    "check:npm-signing-keys": "node .github/scripts/update-npm-signing-keys.mjs",
+    "update:npm-signing-keys": "node .github/scripts/update-npm-signing-keys.mjs --update",
     "check:node-release-keys": "node pnpm11/crypto/shasums-file/scripts/update-node-release-keys.mjs",
     "update:node-release-keys": "node pnpm11/crypto/shasums-file/scripts/update-node-release-keys.mjs --update",
     "release": "pn --filter=@pnpm/exe run build-artifacts && pn --filter=@pnpm/exe publish --tag=next-11 --access=public --provenance && pn publish --filter=!pnpm --filter=!@pnpm/exe --access=public --provenance && pn publish --filter=pnpm --tag=next-11 --access=public --provenance",
@@ -52,8 +52,10 @@
     "ci:rust-test": "just test-pacquet",
     "ci:pnpr-test": "just test-pnpr",
     "ci:rust-clippy": "cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "ci:pnpr-auth-clippy": "cargo clippy --locked -p pnpr-auth --all-targets --all-features -- -D warnings",
     "ci:rust-doc": "cargo doc --no-deps --workspace --document-private-items",
     "ci:rust-deny": "cargo deny check",
+    "ci:rust-layers": "cargo run --locked --quiet -p pnpm-crate-layers -- check",
     "ci:rust-fmt": "node pnpm/scripts/rustfmt.mjs --all -- --check",
     "ci:toml-fmt": "taplo format --check",
     "ci:rust-dylint": "node pnpm/scripts/cargo-dylint.mjs --all -- --all-targets --workspace",
@@ -85,16 +87,16 @@
     "shx": "catalog:",
     "typescript": "catalog:"
   },
-  "packageManager": "pnpm@12.15.0",
+  "packageManager": "pnpm@12.16.1",
   "devEngines": {
     "packageManager": {
       "name": "pnpm",
-      "version": "12.15.0",
+      "version": "12.16.1",
       "onFail": "download"
     },
     "runtime": {
       "name": "node",
-      "version": "26.12.1",
+      "version": "26.13.0",
       "onFail": "download"
     }
   }

@@ -5,7 +5,7 @@ use super::{
     StoreIndex, StoreIndexWriter, TarballError, ThrottledClient, UNREACHABLE_URL,
     VerifyChecksumError, assert_eq, fast_fail_client, fast_fail_client_with_connect_timeout,
     fast_retry_opts, fetch_and_extract_with_retry, gzipped_tar, integrity, is_transient_error,
-    seed_row_holding_another_package, store_index_cache_key, store_index_key, tempdir,
+    seed_row_holding_another_package, store_index_cache_key, store_index_key, store_paths, tempdir,
     tempdir_with_leaked_path, test_retry_opts,
 };
 
@@ -386,8 +386,8 @@ async fn synthesized_projection_reuses_only_a_matching_legacy_row_offline() {
     );
     let manifest = br#"{"name":"artifact","version":"1.0.0"}"#;
     let readme = b"legacy runtime archive";
-    let (_, manifest_hash) = store_path.write_cas_file(manifest, false).unwrap();
-    let (_, readme_hash) = store_path.write_cas_file(readme, false).unwrap();
+    let manifest_hash = store_path.write_cas_file(manifest, false).unwrap().hash;
+    let readme_hash = store_path.write_cas_file(readme, false).unwrap().hash;
     let legacy_key = store_index_key(&package_integrity.to_string(), package_id);
     StoreIndex::open_in(store_path)
         .unwrap()
@@ -484,7 +484,8 @@ async fn raw_archive_projection_skips_npm_identity_checks_on_store_hits() {
     let (store_dir, store_path) = tempdir_with_leaked_path();
     store_path.init().unwrap();
     let contents = b"raw artifact";
-    let (cas_path, file_hash) = store_path.write_cas_file(contents, false).unwrap();
+    let pnpm_store_dir::WrittenFile { file: cas_path, hash: file_hash, .. } =
+        store_path.write_cas_file(contents, false).unwrap();
     let integrity = integrity("sha256-q80k8iD1xuGM3a48ipTFD+P7KQnhs4e5Blnos+dQpJM=");
     let package_id = "crate:artifact@1.0.0";
     StoreIndex::open_in(store_path)
@@ -554,7 +555,7 @@ async fn raw_archive_projection_skips_npm_identity_checks_on_store_hits() {
     .await
     .expect("raw archive cache hits must not use npm package identity semantics");
 
-    assert_eq!(cas_paths, HashMap::from([("README.md".to_string(), cas_path)]));
+    assert_eq!(store_paths(&cas_paths), HashMap::from([("README.md", cas_path.path.as_path())]));
     drop(store_dir);
 }
 
@@ -677,9 +678,9 @@ async fn revision_addressed_mem_cache_does_not_retry_a_failed_prefetch() {
     let (store_dir_keep, store_path) = tempdir_with_leaked_path();
     let mut server = mockito::Server::new_async().await;
     let digest = "A".repeat(86);
-    let path = format!("/-/tarballs/sha512/{digest}");
+    let path = "/test-pkg@1.0.0+r1";
     let mock = server
-        .mock("GET", path.as_str())
+        .mock("GET", path)
         .with_status(503)
         .expect(1)
         .create_async()
@@ -754,7 +755,7 @@ async fn revision_addressed_mem_cache_does_not_reuse_a_redirect_permitting_fetch
     let (store_dir_keep, store_path) = tempdir_with_leaked_path();
     let mut server = mockito::Server::new_async().await;
     let redirect = server
-        .mock("GET", "/-/tarballs/sha512/digest")
+        .mock("GET", "/test-pkg@1.0.0+r1")
         .with_status(302)
         .with_header("location", "/redirected.tgz")
         .expect(2)
@@ -767,7 +768,7 @@ async fn revision_addressed_mem_cache_does_not_reuse_a_redirect_permitting_fetch
         .expect(1)
         .create_async()
         .await;
-    let url = format!("{}/-/tarballs/sha512/digest", server.url());
+    let url = format!("{}/test-pkg@1.0.0+r1", server.url());
     let expected = integrity(FASTIFY_ERROR_INTEGRITY);
     let client = ThrottledClient::default();
     let mem_cache = MemCache::default();

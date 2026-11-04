@@ -260,27 +260,6 @@ pub fn default_registry() -> String {
     "https://registry.npmjs.org/".to_string()
 }
 
-/// The registry the built-in `@jsr` scope routes to when the user has not
-/// pointed it elsewhere.
-pub const DEFAULT_JSR_REGISTRY: &str = "https://npm.jsr.io/";
-
-/// Built-in named-registry aliases the resolver recognizes
-/// out of the box.
-///
-/// `npmjs` is here so a dependency can be pinned to the public
-/// registry even when `registry` points somewhere else, such as an
-/// internal proxy. The `npm` prefix cannot serve that purpose: it is
-/// reserved for the alias protocol (`npm:<name>@<range>`), which
-/// resolves through the default registry.
-///
-/// These URLs are also the prefixes the npm verifier's
-/// `named_registry_tarball_prefixes` matches a recorded tarball URL
-/// against, so an org that proxies
-/// npmjs should point `npmjs` at their proxy to keep verification
-/// going there rather than to the public host.
-pub const BUILTIN_REGISTRIES_BY_PREFIX: &[(&str, &str)] =
-    &[("gh", "https://npm.pkg.github.com/"), ("npmjs", "https://registry.npmjs.org/")];
-
 pub fn default_modules_cache_max_age() -> u64 {
     10080
 }
@@ -333,7 +312,7 @@ pub fn default_fetch_retry_maxtimeout() -> u64 {
 /// can't drift apart. `pnpm bump` keeps this constant in sync with the
 /// version of the npm wrapper package (`pnpm/npm/pnpm/package.json`);
 /// the release workflow verifies the two match before building.
-pub const PNPM_VERSION: &str = "12.15.0";
+pub const PNPM_VERSION: &str = "12.17.0";
 
 /// The command that installs pnpm with the standalone script, as documented
 /// at <https://pnpm.io/installation>: the PowerShell form on Windows, the

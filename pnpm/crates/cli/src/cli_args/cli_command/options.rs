@@ -2,7 +2,10 @@ use super::{
     CliArgs, CliCommand, CommandFactory, Diagnostic, Display, Error, ErrorKind, Pipe, ReporterType,
 };
 
-use crate::cli_args::reporter::ReporterFlags;
+use crate::{
+    cli_args::reporter::ReporterFlags,
+    config_overrides::{ConfigOverrides, GlobalConflict},
+};
 use std::path::{Path, PathBuf};
 
 /// Error type of [`CliArgs::apply_workspace_root`].
@@ -40,7 +43,24 @@ impl CliArgs {
         self.reporter_flags().resolve(config_loglevel, config_reporter)
     }
 
+    /// Reject the command-line settings a `--global` command cannot honour.
+    /// The `config` commands read `--global` as `--location=global`, so
+    /// pnpm does not check them.
+    pub(crate) fn check_global_conflicts(
+        &self,
+        config_overrides: &ConfigOverrides,
+    ) -> Result<(), GlobalConflict> {
+        match self.command {
+            CliCommand::Config(_) | CliCommand::Get(_) | CliCommand::Set(_) => Ok(()),
+            _ if self.command.is_global() => config_overrides.check_global_conflicts(),
+            _ => Ok(()),
+        }
+    }
+
     pub fn validate_command_scoped_global_options(&self) -> Result<(), clap::Error> {
+        if matches!(&self.command, CliCommand::Add(args) if args.save.hidden_ambiguous_t) {
+            return Err(Self::ambiguous_add_short_option_error());
+        }
         if self.workspace.ordering.resume_from.is_some() {
             self.validate_run_scoped_global_option("--resume-from")?;
         }
@@ -220,6 +240,14 @@ impl CliArgs {
             .error(ErrorKind::UnknownArgument, format!("unexpected argument '{option}' found"))
     }
 
+    fn ambiguous_add_short_option_error() -> clap::Error {
+        Self::command()
+            .error(
+                ErrorKind::UnknownArgument,
+                "short option '-T' is ambiguous, use '--save-types' or '--tilde'",
+            )
+    }
+
     fn validate_report_summary_global_option(&self) -> Result<(), clap::Error> {
         if matches!(self.command, CliCommand::Publish(_) | CliCommand::Stage(_)) {
             return Ok(());
@@ -262,21 +290,33 @@ impl super::CliNetworkArgs {
         );
         if let Some(https_proxy) = &self.https_proxy {
             config.cli_settings.insert("httpsProxy".to_string());
-            config.cli.npmrc_tokens.push(("https-proxy".to_string(), https_proxy.clone()));
+            push_cli_token(config, "https-proxy", https_proxy);
         }
         if let Some(http_proxy) = &self.http_proxy {
             config.cli_settings.insert("httpProxy".to_string());
-            config.cli.npmrc_tokens.push(("http-proxy".to_string(), http_proxy.clone()));
+            push_cli_token(config, "http-proxy", http_proxy);
         }
         if let Some(no_proxy) = &self.no_proxy {
             config.cli_settings.insert("noProxy".to_string());
             config.cli_settings.insert("noproxy".to_string());
-            config.cli.npmrc_tokens.push(("no-proxy".to_string(), no_proxy.clone()));
+            push_cli_token(config, "no-proxy", no_proxy);
         }
         if let Some(registry) = self.registry.as_deref() {
-            config.cli.npmrc_tokens.push(("registry".to_string(), registry.to_string()));
+            push_cli_token(config, "registry", registry);
         }
     }
+}
+
+pub(in crate::cli_args) fn push_cli_token(
+    config: &mut pnpm_config::Config,
+    key: &str,
+    value: &str,
+) {
+    config.cli.npmrc_tokens.retain(|(existing, _)| {
+        let normalized = pnpm_config::naming_cases::to_kebab_case(existing);
+        normalized != key && !(key == "no-proxy" && normalized == "noproxy")
+    });
+    config.cli.npmrc_tokens.push((key.to_string(), value.to_string()));
 }
 
 pub(crate) fn find_workspace_root_dir(dir: &Path) -> Result<PathBuf, WorkspaceRootError> {

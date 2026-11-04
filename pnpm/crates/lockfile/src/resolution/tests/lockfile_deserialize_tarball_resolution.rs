@@ -457,6 +457,7 @@ fn deserialize_variations_resolution() {
 #[test]
 fn serialize_variations_resolution() {
     let resolution = LockfileResolution::Variations(VariationsResolution {
+        revision: None,
         variants: vec![PlatformAssetResolution {
             resolution: LockfileResolution::Binary(BinaryResolution {
                 url: "https://nodejs.org/dist/v22.0.0/node-v22.0.0-darwin-arm64.tar.gz".to_string(),
@@ -471,6 +472,7 @@ fn serialize_variations_resolution() {
                 os: "darwin".to_string(),
                 cpu: "arm64".to_string(),
                 libc: None,
+                ..PlatformAssetTarget::default()
             }],
         }],
     });
@@ -496,7 +498,7 @@ fn serialize_variations_resolution() {
 #[test]
 fn to_lockfile_form_rejects_a_revision_with_a_mismatched_url() {
     let resolution = LockfileResolution::Tarball(TarballResolution {
-        tarball: format!("https://attacker.example/-/tarballs/sha512/{}", "A".repeat(86)),
+        tarball: "https://attacker.example/foo@1.0.0+r3".to_string(),
         integrity: Some(integrity(REVISION_SHA512)),
         revision: Some(TarballRevision::try_from(3).unwrap()),
         git_hosted: None,

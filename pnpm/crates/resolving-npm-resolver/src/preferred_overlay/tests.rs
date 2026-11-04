@@ -5,7 +5,6 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use node_semver::Version;
-use pnpm_config::version_policy::create_package_version_policy;
 use pnpm_lockfile::{LockfileResolution, RegistryResolution};
 use pnpm_registry::{DerivedPackuments, Package, PackageDistribution, PackageVersion};
 use pnpm_resolving_resolver_base::{
@@ -13,6 +12,7 @@ use pnpm_resolving_resolver_base::{
     RESOLVED_VERSION_SELECTOR_WEIGHT, ResolveOptions, VersionSelectorEntry, VersionSelectorType,
     VersionSelectorWithWeight, VersionSelectors,
 };
+use pnpm_version_policy::create_package_version_policy;
 use pretty_assertions::assert_eq;
 
 use super::{held_back_preferred, overlay_merged_selectors, preferred_selectors};
@@ -386,6 +386,64 @@ fn overlay_duplicate_version_across_layers_retains_maximum_weight() {
             selector_type: VersionSelectorType::Version,
             weight: DIRECT_DEP_SELECTOR_WEIGHT,
         }),
+    );
+}
+
+#[test]
+fn overlay_manifest_specifiers_preserves_ranges_and_bumps_matching_direct_versions() {
+    let manifest_layer =
+        PreferredVersionsOverlay::manifest_specifiers(PreferredVersions::from([(
+            "foo".to_string(),
+            VersionSelectors::from([
+                (
+                    "100.0.0".to_string(),
+                    VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+                        selector_type: VersionSelectorType::Version,
+                        weight: DIRECT_DEP_SELECTOR_WEIGHT,
+                    }),
+                ),
+                (
+                    "~100.0.0".to_string(),
+                    VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+                        selector_type: VersionSelectorType::Range,
+                        weight: DIRECT_DEP_SELECTOR_WEIGHT,
+                    }),
+                ),
+            ]),
+        )]));
+    let direct_layer = PreferredVersionsOverlay::layer_direct(
+        manifest_layer,
+        BTreeMap::from([("foo".to_string(), vec!["100.0.0".to_string(), "100.1.0".to_string()])]),
+    );
+    let opts = ResolveOptions {
+        version: pnpm_resolving_resolver_base::VersionSelectionOptions {
+            preferred_versions_overlay: direct_layer,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let merged = overlay_merged_selectors(&opts, "foo").expect("overlay merged foo");
+    assert_eq!(
+        merged.get("100.0.0"),
+        Some(&VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+            selector_type: VersionSelectorType::Version,
+            weight: 2 * DIRECT_DEP_SELECTOR_WEIGHT,
+        })),
+    );
+    assert_eq!(
+        merged.get("100.1.0"),
+        Some(&VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+            selector_type: VersionSelectorType::Version,
+            weight: DIRECT_DEP_SELECTOR_WEIGHT,
+        })),
+    );
+    assert_eq!(
+        merged.get("~100.0.0"),
+        Some(&VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+            selector_type: VersionSelectorType::Range,
+            weight: DIRECT_DEP_SELECTOR_WEIGHT,
+        })),
     );
 }
 

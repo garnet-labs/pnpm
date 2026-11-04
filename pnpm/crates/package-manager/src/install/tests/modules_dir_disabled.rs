@@ -32,6 +32,13 @@ fn project(registry: &TestRegistry) -> Project {
     config.install_state_dir = modules_dir.join(".pacquet");
     config.modules_dir = modules_dir;
     config.registry = registry.url().to_string();
+    config.registry_options_by_url.insert(
+        registry.url().to_string(),
+        pnpm_lockfile::RegistryOptions {
+            server_type: Some(pnpm_lockfile::RegistryServerType::Pnpr),
+            ..Default::default()
+        },
+    );
     config.enable_modules_dir = false;
     Project { dir, config: config.leak(), manifest }
 }
@@ -102,6 +109,7 @@ async fn install(
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

@@ -48,7 +48,7 @@ fn empty_project_list_produces_empty_projects_map() {
         IncludedDependencies::default(),
         None,
         &BTreeMap::default(),
-        &[],
+        crate::DeclaredManifests::new(&[]),
         None,
     );
     assert!(state.projects.is_empty());
@@ -69,7 +69,7 @@ fn prefers_the_manifest_mtime_over_the_clock() {
         IncludedDependencies::default(),
         None,
         &BTreeMap::default(),
-        &[(dir.path().to_path_buf(), &manifest)],
+        crate::DeclaredManifests::new(&[(dir.path().to_path_buf(), &manifest)]),
         None,
     );
     assert_eq!(state.last_validated_timestamp, pnpm_testing_utils::fs::mtime_ms(manifest.path()));
@@ -96,7 +96,7 @@ fn raises_the_manifest_mtime_baseline_to_the_filesystem_now() {
             IncludedDependencies::default(),
             None,
             &BTreeMap::default(),
-            &[(dir.path().to_path_buf(), &manifest)],
+            crate::DeclaredManifests::new(&[(dir.path().to_path_buf(), &manifest)]),
             filesystem_now_ms,
         )
     };
@@ -124,7 +124,7 @@ fn source_date_epoch_lowers_the_timestamp_but_never_raises_it() {
             IncludedDependencies::default(),
             None,
             &BTreeMap::default(),
-            &[(dir.path().to_path_buf(), &manifest)],
+            crate::DeclaredManifests::new(&[(dir.path().to_path_buf(), &manifest)]),
             Some(1_600_000_001_000),
         )
         .last_validated_timestamp
@@ -165,7 +165,7 @@ fn records_every_workspace_project_keyed_by_root_dir() {
         IncludedDependencies::default(),
         None,
         &BTreeMap::default(),
-        &project_manifests,
+        crate::DeclaredManifests::new(&project_manifests),
         None,
     );
 
@@ -201,8 +201,94 @@ fn records_config_dependencies_from_config() {
         IncludedDependencies::default(),
         None,
         &BTreeMap::default(),
-        &[],
+        crate::DeclaredManifests::new(&[]),
         None,
     );
     assert_eq!(state.config_dependencies, config.config_dependencies);
+}
+
+/// `@corp/foo` under a plain key, resolved through the `@corp` route.
+fn corp_lockfile() -> pnpm_lockfile::Lockfile {
+    pnpm_lockfile::Lockfile::parse(
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      '@corp/foo':\n        specifier: ^1.0.0\n        version: 1.0.0\npackages:\n  '@corp/foo@1.0.0':\n    resolution: {integrity: sha512-gf6ZldcfCDyNXPRiW3lQjEP1Z9rrUM/4Cn7BZbv3SdTA82zxWRP8OmLwvGR974uuENhGCFgFdN11z3n1Ofpprg==}\nsnapshots:\n  '@corp/foo@1.0.0': {}\n",
+        std::path::Path::new("pnpm-lock.yaml"),
+    )
+    .expect("parse lockfile")
+    .expect("a lockfile")
+}
+
+/// The routes an install records: its own after resolving the whole
+/// lockfile, and the previous record while a frozen or filtered install
+/// leaves a plain key under a route that moved since.
+#[test]
+fn recorded_registry_routes_follow_the_install_that_resolved_the_plain_keys() {
+    use crate::install_state::{ResolvedImporters, recorded_registry_routes_after_install};
+    let old = "https://old.example.test/";
+    let new = "https://new.example.test/";
+    let mut config = Config::new();
+    config.registries_by_scope.insert("@corp".to_string(), new.to_string());
+    let current = crate::install_state::settings::recorded_registry_routes(&config);
+    let mut previous = current.clone();
+    previous.insert("@corp".to_string(), old.to_string());
+    let lockfile = corp_lockfile();
+
+    // No record, or the install resolved everything: the current routes.
+    assert_eq!(
+        recorded_registry_routes_after_install(
+            &config,
+            None,
+            Some(&lockfile),
+            ResolvedImporters::None
+        ),
+        current,
+    );
+    assert_eq!(
+        recorded_registry_routes_after_install(
+            &config,
+            Some(&previous),
+            Some(&lockfile),
+            ResolvedImporters::All
+        ),
+        current,
+    );
+    // A frozen or a filtered install left `@corp/foo@1.0.0` from the old registry.
+    assert_eq!(
+        recorded_registry_routes_after_install(
+            &config,
+            Some(&previous),
+            Some(&lockfile),
+            ResolvedImporters::None
+        ),
+        previous,
+    );
+    assert_eq!(
+        recorded_registry_routes_after_install(
+            &config,
+            Some(&previous),
+            Some(&lockfile),
+            ResolvedImporters::Selected
+        ),
+        previous,
+    );
+    // A moved route no plain key sits under changes nothing about the lockfile.
+    let mut other_scope = current.clone();
+    other_scope.insert("@other".to_string(), old.to_string());
+    assert_eq!(
+        recorded_registry_routes_after_install(
+            &config,
+            Some(&other_scope),
+            Some(&lockfile),
+            ResolvedImporters::None
+        ),
+        current,
+    );
+    assert_eq!(
+        recorded_registry_routes_after_install(
+            &config,
+            Some(&previous),
+            None,
+            ResolvedImporters::None
+        ),
+        current,
+    );
 }

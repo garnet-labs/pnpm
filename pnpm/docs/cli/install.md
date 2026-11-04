@@ -20,6 +20,10 @@ When a workspace project changes, unchanged direct dependencies in other project
 keep their locked versions if those versions still satisfy their declared ranges.
 Use [`pnpm update`](update.md) to request dependency updates.
 
+Changes to a workspace package's `bin` field are linked into its dependents'
+`node_modules/.bin` on the next install, even with `--frozen-lockfile` and an
+unchanged lockfile.
+
 ![](/img/demos/pnpm-install.svg)
 
 [workspace]: ../workspaces.md
@@ -68,7 +72,7 @@ Install `optionalDependencies` even when the [`optional`](../settings/dependency
 
 ### --no-runtime
 
-Skip installing runtime entries (e.g. Node.js downloaded via [`devEngines.runtime`](../package_json.md#devenginesruntime)). The lockfile is left untouched, so frozen installs still validate; only the runtime fetch and bin-linking are skipped.
+Skip installing runtime entries (e.g. Node.js downloaded via [`devEngines.runtime`](../package_json.md#devenginesruntime)). The lockfile is left untouched, so frozen installs still validate; only the runtime fetch and bin-linking are skipped. A runtime that an earlier install linked is removed from `node_modules`.
 
 This is useful in CI matrices where the runtime is provisioned externally (e.g. via `pnpm runtime -g set node <version>`) before `pnpm install` runs.
 

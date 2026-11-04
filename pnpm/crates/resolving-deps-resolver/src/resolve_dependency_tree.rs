@@ -7,6 +7,7 @@ pub use update_scope::{UpdateDepth, UpdateReuseScope, UpdateTargets, VersionLine
 pub use reuse::real_package_name_of;
 
 pub use tree_ctx::TreeCtx;
+pub(crate) use tree_ctx::declaring_manifest_dir;
 
 pub use workspace_ctx::WorkspaceTreeCtx;
 
@@ -59,7 +60,9 @@ mod workspace_ctx;
 #[cfg(test)]
 mod test_support;
 
-use importer::{importer_injected_dependency_names, importer_optional_dependency_names};
+use importer::{
+    describe_importer, importer_injected_dependency_names, importer_optional_dependency_names,
+};
 use reuse::{ReuseSource, record_direct_dep_versions};
 use walk::{
     ChildEdge, NodeSeed, level_aliases, level_versions, resolve_node_seed, walk_from_seeds,
@@ -462,7 +465,7 @@ where
                     injected: injected_names.contains(name),
                 })
                 .ok_or_else(|| ResolveDependencyTreeError::InvalidDependencyName {
-                    parent: "The current package".to_string(),
+                    parent: describe_importer(manifest),
                     alias: name.to_string(),
                 })
         })

@@ -1,15 +1,18 @@
+mod callbacks;
 mod metadata;
+mod outcomes;
 
 use crate::{
     InstallPackageBySnapshotError, install_package_by_snapshot::local_file_tarball_install_url,
 };
-use pnpm_hooks::{
-    CustomFetcher, FetcherCallback, FetcherMethod, custom_fetcher_adapter::CustomFetcherPicker,
-};
+use callbacks::{NativeCallbacks, NativeFetcherResult, Verified, WalkedDirectory, drive_fetcher};
+use outcomes::{decode_fetch_outcome, decode_resolution};
+use pnpm_config::Config;
+use pnpm_directory_fetcher::CopyFiles;
+use pnpm_hooks::{CustomFetcher, custom_fetcher_adapter::CustomFetcherPicker};
 use pnpm_lockfile::LockfileResolution;
 use pnpm_reporter::Reporter;
-use pnpm_tarball::{FetchErrorDetails, FetchedTarball, IngestTarballToStore, TarballError};
-use serde::Deserialize;
+use pnpm_tarball::{FetchedTarball, IngestTarballToStore, TarballError};
 use serde_json::Value;
 use ssri::Integrity;
 use std::{
@@ -18,10 +21,40 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[derive(serde::Deserialize)]
+struct TarballLocation {
+    tarball: String,
+    integrity: Option<Integrity>,
+}
+
+fn failure(package_id: &str, error: impl std::fmt::Display) -> InstallPackageBySnapshotError {
+    InstallPackageBySnapshotError::CustomFetcher(format!("{package_id}: {error}"))
+}
+
 pub(crate) enum CustomFetchOutcome {
     Declined(LockfileResolution),
-    Delegate { resolution: LockfileResolution, delegate: LockfileResolution },
-    Fetched { resolution: LockfileResolution, tarball: Arc<FetchedTarball> },
+    Delegate {
+        resolution: LockfileResolution,
+        delegate: LockfileResolution,
+    },
+    Fetched {
+        resolution: LockfileResolution,
+        tarball: Arc<FetchedTarball>,
+    },
+    FetchedFiles {
+        resolution: LockfileResolution,
+        package: NativeFetcherResult,
+    },
+    /// The hook returned the result of `fetchers.directory` unchanged.
+    Walked {
+        resolution: LockfileResolution,
+        directory: WalkedDirectory,
+    },
+}
+
+enum CompletedFetch {
+    Tarball(Arc<FetchedTarball>),
+    Package(NativeFetcherResult),
 }
 
 /// What a resolve-time archive fetch settles for a tarball-shaped
@@ -30,21 +63,44 @@ pub(crate) enum CustomFetchOutcome {
 #[derive(Debug, Clone)]
 pub struct ResolvedTarballMetadata {
     pub resolution: LockfileResolution,
-    /// `None` when no archive was fetched, or when the archive ships no
-    /// readable `package.json`.
+    /// `None` when the fetch produced neither an archive nor a
+    /// `fetchers.directory` walk, or when what it produced has no readable
+    /// `package.json`.
     pub manifest: Option<Arc<Value>>,
 }
 
 /// Shares verified custom fetches between fresh resolution and materialization.
 pub struct CustomFetcherSession {
     picker: CustomFetcherPicker,
-    completed: Mutex<HashMap<(String, String), Arc<FetchedTarball>>>,
+    completed: Mutex<HashMap<(String, String), CompletedFetch>>,
+    settings: Option<callbacks::NativeFetcherSettings>,
+    git_source_cache: pnpm_git_fetcher::GitSourceCache,
+    files: CopyFiles,
 }
 
 impl CustomFetcherSession {
     #[must_use]
     pub fn new(fetchers: Vec<Arc<dyn CustomFetcher>>) -> Self {
-        Self { picker: CustomFetcherPicker::new(fetchers), completed: Mutex::new(HashMap::new()) }
+        Self {
+            picker: CustomFetcherPicker::new(fetchers),
+            completed: Mutex::new(HashMap::new()),
+            settings: None,
+            git_source_cache: pnpm_git_fetcher::GitSourceCache::default(),
+            files: CopyFiles::default(),
+        }
+    }
+
+    /// A session whose `fetchers.directory` lists a directory as the
+    /// install pass does under `config`.
+    pub fn with_config(
+        fetchers: Vec<Arc<dyn CustomFetcher>>,
+        config: &Config,
+    ) -> Result<Self, crate::VersionPolicyError> {
+        Ok(Self {
+            files: CopyFiles::from_deploy_all_files(config.deploy_all_files),
+            settings: Some(callbacks::NativeFetcherSettings::from_config(config)?),
+            ..Self::new(fetchers)
+        })
     }
 
     pub(crate) async fn fetch<Reporter: self::Reporter>(
@@ -59,15 +115,27 @@ impl CustomFetcherSession {
             package: pnpm_tarball::TarballPackage { integrity: locked, ..download.package },
             ..download
         };
-        if let Some(identity) = fetch_identity(original, locked)
-            && let Some(tarball) = self.completed
-                .lock()
-                .unwrap()
-                .get(&(package_id.to_owned(), identity))
-                .cloned()
-        {
-            return Ok(CustomFetchOutcome::Fetched { resolution: original.clone(), tarball });
+        if let Some(completed) = self.completed_fetch(package_id, original, locked) {
+            return Ok(match completed {
+                CompletedFetch::Tarball(tarball) => {
+                    CustomFetchOutcome::Fetched { resolution: original.clone(), tarball }
+                }
+                CompletedFetch::Package(package) => {
+                    CustomFetchOutcome::FetchedFiles { resolution: original.clone(), package }
+                }
+            });
         }
+        self.fetch_uncached::<Reporter>(&download, original, locked, package_id, opts).await
+    }
+
+    async fn fetch_uncached<Reporter: self::Reporter>(
+        &self,
+        download: &IngestTarballToStore<'_>,
+        original: &LockfileResolution,
+        locked: Option<&Integrity>,
+        package_id: &str,
+        opts: Value,
+    ) -> Result<CustomFetchOutcome, InstallPackageBySnapshotError> {
         let selection = self.picker
             .pick_fetcher(package_id, &serde_json::json!(original))
             .await
@@ -84,177 +152,82 @@ impl CustomFetcherSession {
         );
         let (result, verified) = drive_fetcher::<Reporter>(
             fetcher,
-            &download,
-            &lockfile_dir,
+            &NativeCallbacks {
+                download,
+                lockfile_dir: &lockfile_dir,
+                files: self.files,
+                settings: self.settings.as_ref(),
+                git_source_cache: &self.git_source_cache,
+            },
             selected_resolution.clone(),
             opts,
         )
         .await?;
         decode_fetch_outcome(result, verified, selected_resolution, locked, package_id)
     }
+
+    fn completed_fetch(
+        &self,
+        package_id: &str,
+        resolution: &LockfileResolution,
+        integrity: Option<&Integrity>,
+    ) -> Option<CompletedFetch> {
+        let identity = fetch_identity(resolution, integrity)?;
+        self.completed
+            .lock()
+            .unwrap()
+            .get(&(package_id.to_owned(), identity))
+            .map(|fetch| match fetch {
+                CompletedFetch::Tarball(tarball) => CompletedFetch::Tarball(Arc::clone(tarball)),
+                CompletedFetch::Package(package) => CompletedFetch::Package(package.clone()),
+            })
+    }
+
+    pub(crate) fn cache_package(
+        &self,
+        package_id: &str,
+        resolution: &LockfileResolution,
+        package: &NativeFetcherResult,
+    ) {
+        let Some(identity) = fetch_identity(resolution, resolution.checkable_integrity()) else {
+            return;
+        };
+        self.completed
+            .lock()
+            .unwrap()
+            .insert(
+                (package_id.to_owned(), identity.clone()),
+                CompletedFetch::Package(package.clone()),
+            );
+        let Some(manifest) = &package.manifest else { return };
+        let (Some(name), Some(version)) = (
+            manifest.get("name").and_then(Value::as_str),
+            manifest.get("version").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let name_ver = format!("{name}@{version}");
+        if name_ver != package_id {
+            self.completed
+                .lock()
+                .unwrap()
+                .insert((name_ver, identity), CompletedFetch::Package(package.clone()));
+        }
+    }
 }
 
 /// What a completed fetch of `resolution` is filed under besides its package
-/// id: the integrity its archive was checked against, or for a custom
-/// resolution, which carries none pacquet can check, the resolution itself.
+/// id: the integrity its archive was checked against, or the resolution
+/// itself for a custom resolution, which carries none pacquet can check, and
+/// for a resolution that pins none.
 fn fetch_identity(
     resolution: &LockfileResolution,
     integrity: Option<&Integrity>,
 ) -> Option<String> {
-    match resolution {
-        LockfileResolution::Custom(_) => serde_json::to_string(resolution).ok(),
-        _ => integrity.map(ToString::to_string),
+    match (resolution, integrity) {
+        (LockfileResolution::Custom(_), _) | (_, None) => serde_json::to_string(resolution).ok(),
+        (_, Some(integrity)) => Some(integrity.to_string()),
     }
-}
-
-/// Run the hook's fetch to completion, servicing the native-fetch
-/// callbacks it makes along the way. The tarballs those callbacks
-/// verified come back with the response so the caller can match the
-/// files the hook claims against archives pacquet itself hashed.
-async fn drive_fetcher<Reporter: self::Reporter>(
-    fetcher: &dyn CustomFetcher,
-    download: &IngestTarballToStore<'_>,
-    lockfile_dir: &Path,
-    selected_resolution: Value,
-    opts: Value,
-) -> Result<(Value, Vec<Arc<FetchedTarball>>), InstallPackageBySnapshotError> {
-    let package_id = download.package.id;
-    let (callbacks, mut requests) = tokio::sync::mpsc::unbounded_channel();
-    let fetch = fetcher.fetch_with_callbacks(package_id, selected_resolution, opts, callbacks);
-    tokio::pin!(fetch);
-    let mut verified = Vec::new();
-    let result = loop {
-        tokio::select! {
-            result = &mut fetch => break result.map_err(|error| failure(package_id, error))?,
-            Some(callback) = requests.recv() => {
-                let result = run_callback::<Reporter>(download, lockfile_dir, &callback, &mut verified)
-                    .await.map_err(|error| serde_json::json!(error));
-                let _ = callback.response.send(result);
-            }
-        }
-    };
-    Ok((result, verified))
-}
-
-fn decode_fetch_outcome(
-    result: Value,
-    verified: Vec<Arc<FetchedTarball>>,
-    selected_resolution: Value,
-    locked: Option<&Integrity>,
-    package_id: &str,
-) -> Result<CustomFetchOutcome, InstallPackageBySnapshotError> {
-    if result.get("filesMap").is_some() {
-        let returned: ReturnedFiles =
-            serde_json::from_value(result).map_err(|error| failure(package_id, error))?;
-        let tarball = verified_tarball(&returned, verified, package_id)?;
-        let resolution = decode_resolution(selected_resolution, None, package_id)?;
-        return Ok(CustomFetchOutcome::Fetched { resolution, tarball });
-    }
-    let Some(delegate) = result.get("delegate") else {
-        return Err(failure(
-            package_id,
-            "unhandled response: expected a delegate or native fetched files",
-        ));
-    };
-    if !["type", "tarball", "integrity"]
-        .iter()
-        .any(|key| delegate.get(key).is_some())
-    {
-        return Err(failure(package_id, "invalid delegate resolution"));
-    }
-    Ok(CustomFetchOutcome::Delegate {
-        resolution: decode_resolution(selected_resolution, None, package_id)?,
-        delegate: decode_resolution(delegate.clone(), locked, package_id)
-            .map_err(|error| match error {
-                InstallPackageBySnapshotError::CustomFetcher(message) => {
-                    InstallPackageBySnapshotError::CustomFetcher(format!(
-                        "invalid delegate resolution: {message}",
-                    ))
-                }
-                error => error,
-            })?,
-    })
-}
-
-/// The archive pacquet hashed itself that carries the files the hook
-/// returned. A hook may only hand back files a native fetch verified,
-/// and every verified archive matching those files must agree on the
-/// integrity, or the fetch is ambiguous.
-fn verified_tarball(
-    returned: &ReturnedFiles,
-    verified: Vec<Arc<FetchedTarball>>,
-    package_id: &str,
-) -> Result<Arc<FetchedTarball>, InstallPackageBySnapshotError> {
-    let mut matches = verified
-        .into_iter()
-        .filter(|verified: &Arc<FetchedTarball>| {
-            verified.files_map == returned.files_map
-                && returned.integrity
-                    .as_ref()
-                    .is_none_or(|integrity| integrity == &verified.integrity.to_string())
-        });
-    let tarball = matches
-        .next()
-        .ok_or_else(|| {
-            failure(
-                package_id,
-                "custom fetcher returned files not verified by a native tarball fetcher",
-            )
-        })?;
-    if matches.any(|other| other.integrity != tarball.integrity) {
-        return Err(failure(package_id, "custom fetcher returned an ambiguous archive integrity"));
-    }
-    Ok(tarball)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReturnedFiles {
-    files_map: HashMap<String, PathBuf>,
-    integrity: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TarballLocation {
-    tarball: String,
-    integrity: Option<Integrity>,
-}
-
-fn failure(package_id: &str, error: impl std::fmt::Display) -> InstallPackageBySnapshotError {
-    InstallPackageBySnapshotError::CustomFetcher(format!("{package_id}: {error}"))
-}
-
-fn callback_error(message: impl Into<String>, code: &str) -> FetchErrorDetails {
-    FetchErrorDetails { message: message.into(), code: Some(code.to_owned()), status: None }
-}
-
-fn decode_resolution(
-    mut value: Value,
-    locked: Option<&Integrity>,
-    package_id: &str,
-) -> Result<LockfileResolution, InstallPackageBySnapshotError> {
-    if let Some(integrity) = locked {
-        if !value
-            .get("type")
-            .is_none_or(|kind| kind.is_null() || kind == "binary")
-        {
-            return Err(InstallPackageBySnapshotError::CustomFetcherIntegrityMismatch {
-                package_id: package_id.to_owned(),
-            });
-        }
-        let object =
-            value.as_object_mut().ok_or_else(|| failure(package_id, "invalid resolution"))?;
-        object.insert("integrity".to_owned(), serde_json::json!(integrity.to_string()));
-    }
-    // Hook-local fields may pass between canFetch calls, but are not lockfile fields.
-    if value.get("type").is_none_or(Value::is_null)
-        && let Some(object) = value.as_object_mut()
-    {
-        object.retain(|key, _| {
-            matches!(key.as_str(), "tarball" | "integrity" | "gitHosted" | "path")
-        });
-    }
-    serde_json::from_value(value).map_err(|error| failure(package_id, error))
 }
 
 /// `None` when the hook pointed the package at a source that carries no archive
@@ -331,97 +304,4 @@ async fn fetch_location<Reporter: self::Reporter>(
     .fetch_and_extract::<Reporter>()
     .await
     .map(Arc::new)
-}
-
-async fn run_callback<Reporter: self::Reporter>(
-    download: &IngestTarballToStore<'_>,
-    lockfile_dir: &Path,
-    callback: &FetcherCallback,
-    verified: &mut Vec<Arc<FetchedTarball>>,
-) -> Result<Value, FetchErrorDetails> {
-    let expects_local_archive = match callback.method {
-        FetcherMethod::CafsInfo => {
-            return Ok(serde_json::json!({ "storeDir": download.store.dir.root() }));
-        }
-        FetcherMethod::TempDir => return temp_dir(download).await,
-        FetcherMethod::LocalTarball => true,
-        FetcherMethod::RemoteTarball => false,
-    };
-    for option in ["ignoreFilePattern", "appendManifest"] {
-        if callback.options
-            .get(option)
-            .is_some_and(|value| !value.is_null())
-        {
-            return Err(callback_error(
-                format!("native custom-fetcher callbacks do not support {option}"),
-                "ERR_PNPM_UNSUPPORTED_FETCHER_OPTION",
-            ));
-        }
-    }
-    let location = callback_location(callback, download, expects_local_archive)?;
-    let lockfile_dir = callback.options
-        .get("lockfileDir")
-        .and_then(Value::as_str)
-        .map_or(lockfile_dir, Path::new);
-    let tarball = fetch_location::<Reporter>(download, location, lockfile_dir)
-        .await
-        .map_err(|error| error.fetch_error_details())?;
-    let result = serde_json::json!({
-        "filesMap": tarball.files_map,
-        "integrity": tarball.integrity.to_string(),
-        "manifest": tarball.manifest,
-        "requiresBuild": tarball.requires_build,
-    });
-    verified.push(tarball);
-    Ok(result)
-}
-
-/// A fresh directory under the store's temp root, kept for the fetcher.
-async fn temp_dir(download: &IngestTarballToStore<'_>) -> Result<Value, FetchErrorDetails> {
-    let root = download.store.dir.tmp();
-    tokio::fs::create_dir_all(&root).await
-        .map_err(|error| callback_error(error.to_string(), "ERR_PNPM_FETCHER_TEMP_DIR"))?;
-    let directory = tempfile::Builder::new()
-        .prefix("fetcher-")
-        .tempdir_in(root)
-        .map_err(|error| callback_error(error.to_string(), "ERR_PNPM_FETCHER_TEMP_DIR"))?
-        .keep();
-    Ok(serde_json::json!(directory))
-}
-
-/// The callback's resolution as a tarball location, carrying the
-/// download's integrity when the callback named none.
-///
-/// Each callback answers for one transport, so the URL has to name that
-/// transport and no other. Without the positive test on the remote
-/// side, a scheme neither fetcher handles — `ftp:`, `data:`, a bare
-/// path — counts as remote and fails deep in the HTTP client instead of
-/// here.
-fn callback_location(
-    callback: &FetcherCallback,
-    download: &IngestTarballToStore<'_>,
-    expects_local_archive: bool,
-) -> Result<TarballLocation, FetchErrorDetails> {
-    let mut location = callback.resolution.clone();
-    if let Some(integrity) = download.package.integrity
-        && let Some(object) = location.as_object_mut()
-    {
-        object.insert("integrity".to_owned(), serde_json::json!(integrity.to_string()));
-    }
-    let location: TarballLocation = serde_json::from_value(location)
-        .map_err(|error| {
-            callback_error(error.to_string(), "ERR_PNPM_INVALID_FETCHER_RESOLUTION")
-        })?;
-    let scheme_matches_callback = if expects_local_archive {
-        location.tarball.starts_with("file:")
-    } else {
-        location.tarball.starts_with("https:") || location.tarball.starts_with("http:")
-    };
-    if !scheme_matches_callback {
-        return Err(callback_error(
-            "native tarball callback received an incompatible URL",
-            "ERR_PNPM_INVALID_FETCHER_RESOLUTION",
-        ));
-    }
-    Ok(location)
 }

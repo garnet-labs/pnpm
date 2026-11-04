@@ -1,6 +1,7 @@
-pub(super) use fast_path::{
+pub(crate) use fast_path::{
     check_strict_dep_builds_for_fast_path, gvs_build_markers_complete, register_workspace_in_store,
 };
+pub(crate) use manifests::hook_one_manifest;
 
 mod fast_path;
 use fast_path::{
@@ -9,7 +10,7 @@ use fast_path::{
 };
 
 mod dispatch;
-use dispatch::{Dispatched, dispatch};
+use dispatch::Dispatched;
 
 mod manifests;
 use manifests::{HookedManifests, manifest_freshness_inputs, resolve_pnpmfile_hook};
@@ -35,6 +36,7 @@ use mode::{RunMode, WorkspaceManifestRollbackGuard};
 mod frozen_local_tarballs;
 mod owned;
 use owned::InstallOwned;
+mod pre_resolution;
 mod settled;
 mod time_machine_capture;
 mod uninstall_hooks;
@@ -68,7 +70,7 @@ where
     /// Both live out here because every success path of
     /// [`Self::run_inner_impl`] — including the short-circuits that do
     /// nothing but rewrite the lockfile — has to run them.
-    pub(super) async fn run_inner<Reporter: self::Reporter + 'static>(
+    pub(crate) async fn run_inner<Reporter: self::Reporter + 'static>(
         self,
         options: InstallRunOptions<'a, '_>,
     ) -> Result<(), InstallError> {
@@ -77,12 +79,11 @@ where
         // The branch lockfiles become disposable only once the merge has
         // been written for good. An install that neither reads nor saves a
         // lockfile never merged them, and one that only reports what it
-        // would do has its lockfile taken back afterwards — deleting them
-        // in either case drops resolutions no file is left holding.
+        // would do never writes it — deleting them in either case drops
+        // resolutions no file is left holding.
         let merge_will_be_saved = self.context.config.merge_git_branch_lockfiles
             && self.context.config.lockfile
-            && options.save.lockfile
-            && !options.lockfile_check
+            && options.save.writes_lockfile()
             && !self.execution.dry_run;
         let branch_lockfiles_to_clean = merge_will_be_saved
             .then(|| {
@@ -136,14 +137,13 @@ where
     /// are persisted; the whole-workspace commands (`install`, `dedupe`)
     /// have only this run to do it. It reads the lockfile back from disk,
     /// so the gates of the branch-lockfile cleanup apply: a run that
-    /// leaves the lockfile untouched, has it restored afterwards, or only
-    /// reports gives it nothing new to see.
+    /// leaves the lockfile untouched or only reports gives it nothing new
+    /// to see.
     fn prunes_workspace_excludes(&self, options: &InstallRunOptions<'_, '_>) -> bool {
         self.lockfile_policy.excludes == PolicyExcludes::Persist
             && matches!(self.execution.mutation, ProjectMutation::InstallWorkspace)
             && self.context.config.lockfile
-            && options.save.lockfile
-            && !options.lockfile_check
+            && options.save.writes_lockfile()
             && !self.execution.dry_run
             && (self.context.config.minimum_release_age_exclude_prune
                 || self.context.config.trust_policy_exclude_prune)
@@ -167,6 +167,7 @@ where
                     pnpmfile_hook_override: self.projects.pnpmfile_hook_override,
                     workspace_projects_override: self.projects.workspace_projects_override,
                     dedicated: self.projects.dedicated,
+                    discovered_workspace: self.projects.discovered_workspace,
                 },
                 resolution: self.resolution,
             },
@@ -253,8 +254,7 @@ pub(super) struct InstallView<'a> {
 impl InstallView<'_> {
     fn should_prune_catalogs(&self, options: &InstallRunOptions<'_, '_>) -> bool {
         self.context.config.catalog_prune
-            && options.save.lockfile
-            && !options.lockfile_check
+            && options.save.writes_lockfile()
             && !self.execution.dry_run
             && self.execution.mutation.is_full_install()
     }

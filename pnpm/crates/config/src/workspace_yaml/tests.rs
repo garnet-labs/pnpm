@@ -8,8 +8,8 @@ use super::{
 use crate::{
     AuditLevel, CatalogMode, ColorMode, Config, GlobalShims, GlobalShimsSetting, HoistingLimits,
     LinkWorkspacePackages, LogLevel, NodeLinker, NodePackageMapMode, NodePackageMapSettings,
-    NodePackageMapType, PmOnFail, ReporterType, ResolutionMode, RuntimeOnFail,
-    ScriptsPrependNodePath, ShimPolicy, TrustPolicy,
+    NodePackageMapType, PmOnFail, ReporterType, ResolutionMode, RuntimeOnFail, ShimPolicy,
+    TrustPolicy,
     api::{EnvVar, GetHomeDir},
 };
 use indexmap::IndexMap;
@@ -87,6 +87,8 @@ mod lockfile;
 
 mod authorization;
 
+mod registry_aliases;
+
 mod registry_ecosystems;
 
 mod registry_network_concurrency;
@@ -94,6 +96,8 @@ mod registry_network_concurrency;
 mod provenance;
 
 mod publish_wait_timeout;
+
+mod publish_branch;
 
 mod env_placeholders;
 

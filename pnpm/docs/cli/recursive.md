@@ -41,9 +41,7 @@ dependencies.
 
 ## Options
 
-### --link-workspace-packages
-
-Overrides the [`linkWorkspacePackages`](../workspaces.md#linkworkspacepackages) setting for this install.
+To link workspace packages, set [`linkWorkspacePackages`](../workspaces.md#linkworkspacepackages) or pass `--link-workspace-packages` to the install.
 
 ### --workspace-concurrency
 
@@ -53,20 +51,27 @@ Overrides the [`linkWorkspacePackages`](../workspaces.md#linkworkspacepackages) 
 Set the maximum number of tasks to run simultaneously. For unlimited concurrency
 use `Infinity`.
 
-A value of `0` or less means the number of CPU cores minus its absolute value, and at least `1`. The matching setting is `workspaceConcurrency`.
+In a container with a CPU quota, such as a Kubernetes CPU limit, the quota is the
+number of available CPU cores when it is smaller than the number of CPUs the
+container may run on. A fractional quota is rounded down, to at least 1.
+
+A value of `0` or less means the number of available CPU cores minus its absolute value, and at least `1`. The matching setting is `workspaceConcurrency`.
 
 ### --[no-]bail
 
 * Default: **true**
 * Type: **Boolean**
 
-If true, stops when a task throws an error.
+If true, stops when a task throws an error. The tasks that are still running
+are stopped too. On Unix they receive `SIGTERM`, and those still running two
+seconds later receive `SIGKILL`. On Windows they are ended at once, together
+with every process they started.
 
 `--no-bail` is accepted only by `run`, `exec`, `test`, `start`, `stop`, `rebuild`, `install-test`, and the `pnpm <script>` shorthand. Other commands reject it.
 
-This config does not affect the exit code.
-Even if `--no-bail` is used, all tasks will finish but if any of the tasks fail,
-the command will exit with a non-zero code.
+With `--no-bail`, tasks that depend on a failed task are skipped and independent tasks keep running.
+This config does not affect the exit code: if any task fails, the command exits with a non-zero code.
+See [`--no-bail`](../workspace-task-orchestration.md#--no-bail).
 
 Example (run tests in every package, continue if tests fail in one of them):
 ```sh

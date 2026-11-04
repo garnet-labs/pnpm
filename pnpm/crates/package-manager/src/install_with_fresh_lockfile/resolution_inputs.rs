@@ -3,7 +3,7 @@ use pnpm_config::{Config, NeedsFullMetadataFor};
 use pnpm_lockfile::Lockfile;
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use pnpm_resolving_npm_resolver::InMemoryPackageMetaCache;
-use pnpm_resolving_resolver_base::PreferredVersions;
+use pnpm_resolving_resolver_base::{PreferredVersions, PreferredVersionsOverlay};
 use pnpm_store_dir::{
     SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreDir, StoreIndexWriter,
 };
@@ -22,9 +22,16 @@ pub(crate) struct WorkspaceLifecycleHooks {
     pub finalized_package: Option<pnpm_resolving_deps_resolver::FinalizedPackageFn>,
 }
 
+/// Each importer's root preference layer of the specifiers its manifest
+/// declares, keyed by importer id.
+pub(crate) type OwnManifestSpecifiers = BTreeMap<String, Arc<PreferredVersionsOverlay>>;
+
 pub(crate) struct ImporterVersionSeeds<'a> {
     pub shared: &'a Arc<PreferredVersions>,
     pub by_importer: &'a BTreeMap<String, Arc<PreferredVersions>>,
+    /// Each importer's own manifest specifiers, when the seeds leave out other
+    /// projects' specifiers. `None` when those steer every project.
+    pub own_manifest_specifiers: Option<&'a OwnManifestSpecifiers>,
     /// See [`crate::resolution_policy::PickPolicy`].
     pub pick_lowest: bool,
     pub published_by: Option<chrono::DateTime<chrono::Utc>>,
@@ -54,6 +61,7 @@ pub(crate) struct ResolverFetchContext<'a> {
 pub(crate) struct ResolverRegistryContext<'a> {
     pub named: &'a HashMap<String, String>,
     pub by_prefix: &'a HashMap<String, String>,
+    pub declared: &'a pnpm_lockfile::DeclaredRegistryPrefixes,
     pub cache: &'a Arc<InMemoryPackageMetaCache>,
     /// See `NpmResolver::full_metadata` — forced on when `time-based`
     /// resolution or the `no-downgrade` trust policy needs the
@@ -103,6 +111,13 @@ impl<'a> ImporterVersionSeeds<'a> {
     pub(super) fn for_importer(&self, id: &str) -> &'a Arc<PreferredVersions> {
         self.by_importer.get(id).unwrap_or(self.shared)
     }
+
+    pub(super) fn own_manifest_specifiers_of(
+        &self,
+        id: &str,
+    ) -> Option<Arc<PreferredVersionsOverlay>> {
+        self.own_manifest_specifiers?.get(id).map(Arc::clone)
+    }
 }
 
 pub(crate) struct FreshLockfilePrior<'a> {
@@ -128,6 +143,9 @@ pub(crate) struct LockfilePersistenceOptions<'a> {
     pub dir: &'a Path,
     pub dry_run: bool,
     pub save: bool,
+    /// Receives the wanted lockfile's text in place of the file. See
+    /// [`crate::Install::run_lockfile_check`].
+    pub check_sink: Option<&'a crate::LockfileCheckSink>,
     pub hook: Option<&'a Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     pub log: Option<pnpm_hooks::LogFn>,
 }

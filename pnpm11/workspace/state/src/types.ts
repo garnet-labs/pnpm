@@ -61,6 +61,26 @@ export interface Validation {
    * importer id, where it is not `lockfile`. `null` when there was none.
    */
   lockfiles?: Record<string, string | null>
+  /**
+   * The digest of every workspace package's bin declarations, keyed by the
+   * importer id of each project that was proven installed with them. Only
+   * the root and the projects with dependencies link workspace bins, so only
+   * they have an entry.
+   */
+  workspaceBins?: Record<string, string>
+  /**
+   * The local dependencies each recorded lockfile resolves, keyed by the
+   * lockfile's digest. Their contents can change with no manifest or lockfile
+   * moving. Each tarball's signature is in `files`.
+   */
+  localDependencies?: Record<string, LocalDependencies>
+}
+
+/** The local dependencies one lockfile resolves, as absolute paths. */
+export interface LocalDependencies {
+  tarballs?: string[]
+  /** The directories that are not workspace projects. */
+  directories?: string[]
 }
 
 export interface FileSignature {
@@ -76,12 +96,16 @@ export const WORKSPACE_STATE_SETTING_KEYS = [
   'allowBuilds',
   'autoInstallPeers',
   'catalogs',
+  // Turned on, it allows builds the last install ignored.
+  'dangerouslyAllowAllBuilds',
   'dedupeDirectDeps',
   'dedupeInjectedDeps',
   'dedupePeerDependents',
   'dedupePeers',
   'dev',
   'excludeLinksFromLockfile',
+  // It decides the `NODE_PATH` the bin shims set.
+  'extendNodePath',
   'hoistPattern',
   'hoistWorkspacePackages',
   'ignoredOptionalDependencies',
@@ -105,21 +129,67 @@ export const WORKSPACE_STATE_SETTING_KEYS = [
   'preferWorkspacePackages',
   'production',
   'publicHoistPattern',
+  // Turned back on, it links the runtime the last install skipped.
+  'runtime',
+  // `node_modules` is linked from the store and virtual store it was
+  // installed with, so a change to either must reach the install, which
+  // recreates it. Recorded as resolved by `resolveStoreLocationSettings`.
+  'storeDir',
   // A `supportedArchitectures` change alters which platform-specific
   // optional dependencies are installed without touching the lockfile,
   // so it must invalidate the up-to-date fast path.
   'supportedArchitectures',
+  // Turned off, the lockfile that no install verified has to be verified.
+  'trustLockfile',
   'trustPolicy',
   'trustPolicyExclude',
   'trustPolicyIgnoreAfter',
+  'virtualStoreDir',
+  // The virtual store's slot names are cut to it.
+  'virtualStoreDirMaxLength',
   'workspacePackagePatterns',
 ] as const satisfies ReadonlyArray<keyof Config>
 
-export type WorkspaceStateSettings = Pick<Config, typeof WORKSPACE_STATE_SETTING_KEYS[number]> & {
+/** Settings a state may leave out. Unset reads as the default. */
+type OptionalSettingKey = 'dangerouslyAllowAllBuilds' | 'extendNodePath' | 'runtime' | 'virtualStoreDirMaxLength'
+
+export type WorkspaceStateSettings = Pick<Config, Exclude<typeof WORKSPACE_STATE_SETTING_KEYS[number], OptionalSettingKey>> &
+Partial<Pick<Config, OptionalSettingKey>> & {
   /**
    * Recorded by pnpm v12; v11 carries it forward when rewriting the
    * workspace state so a v11 write does not make the next v12 command see
    * a setting change.
    */
   autoDedupe?: boolean
+  /**
+   * What decides the lockfile keys of registry packages: each prefix
+   * `registries` and `namedRegistries` declare, mapped to its URL. Recorded
+   * only when a prefix is declared, and only by an install that verified the
+   * keys of the lockfile it left behind, so a state written under other
+   * registries, by a frozen install of an older lockfile, or by an older pnpm
+   * proves nothing about the lockfile's keys.
+   */
+  registryPrefixes?: Record<string, string>
+  /**
+   * The default registry, as `normalizeRegistryKey` spells it, recorded with
+   * `registryPrefixes`. Its packages keep plain keys whatever prefix names it,
+   * so a state verified under another default registry, or by a pnpm that
+   * keyed them by prefix, proves nothing about the lockfile's keys.
+   */
+  defaultRegistry?: string
+  /**
+   * The registries the lockfile's plain `packages:` keys resolved from: each
+   * scope route (`@<scope>`) in force when an install last resolved them,
+   * mapped to its URL. A plain key names no registry, so this record is what
+   * tells a key's package came from a registry its scope no longer routes to.
+   * An install that resolves the whole lockfile records the routes it ran
+   * under; one that keeps part of the lockfile as recorded, a frozen or a
+   * filtered install, keeps the previous record while a plain key still sits
+   * under a moved route. Left out by a pnpm that did not record them.
+   *
+   * The default registry is not recorded: switching it is routinely a switch
+   * between mirrors of one registry, and tracking it would resolve every
+   * unscoped package again on each switch.
+   */
+  registryRoutes?: Record<string, string>
 }

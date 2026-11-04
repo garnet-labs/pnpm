@@ -2,8 +2,8 @@ use super::{
     super::{
         Arc, FastUpdateLockfileOptions, FreshnessScope, InstallError, Lockfile, PackageManifest,
         Path, PathBuf, Reporter, check_lockfile_freshness,
-        lockfile_freshness::LockfileFreshnessInputs, prune_merged_branch_lockfile,
-        try_fast_update_lockfile,
+        lockfile_freshness::{DependencyManifestSources, LockfileFreshnessInputs},
+        prune_merged_branch_lockfile, try_fast_update_lockfile,
     },
     InstallView, RunMode,
     lockfile_load::Loaded,
@@ -13,19 +13,22 @@ use super::{
 use pnpm_config::Config;
 
 /// The wanted lockfile as the run resolves against it: the loaded one, or
-/// what synthesis, the branch fold and the fast update made of it. Each
-/// later layer stands in for the ones below when it applied.
+/// what synthesis, the branch fold, the fast update and the `preResolution`
+/// hook made of it. Each later layer stands in for the ones below when it
+/// applied.
 pub(super) struct WantedLockfile<'a> {
     /// The on-disk `pnpm-lock.yaml`, the dry-run diff's baseline.
     pub(super) loaded: Option<&'a Lockfile>,
     synthesized: Option<Lockfile>,
     merged_branch: Option<Lockfile>,
     fast_updated: Option<Lockfile>,
+    hooked: Option<Lockfile>,
 }
 impl WantedLockfile<'_> {
     pub(super) fn get(&self) -> Option<&Lockfile> {
-        self.fast_updated
+        self.hooked
             .as_ref()
+            .or(self.fast_updated.as_ref())
             .or(self.merged_branch.as_ref())
             .or(self.synthesized.as_ref())
             .or(self.loaded)
@@ -36,9 +39,8 @@ impl WantedLockfile<'_> {
     }
 
     /// The loader's `Arc` handle, forwarded only while the loaded document
-    /// still is the wanted lockfile: synthesis, the branch fold and the
-    /// fast update each replace it, and a consumer must never seed from
-    /// a superseded document.
+    /// still is the wanted lockfile: every other layer replaces it, and a
+    /// consumer must never seed from a superseded document.
     pub(super) fn loader_handle(&self, shared: Option<Arc<Lockfile>>) -> Option<Arc<Lockfile>> {
         shared.filter(|shared| {
             self.get()
@@ -48,6 +50,10 @@ impl WantedLockfile<'_> {
 
     pub(super) fn was_fast_updated(&self) -> bool {
         self.fast_updated.is_some()
+    }
+
+    pub(super) fn set_hooked(&mut self, lockfile: Lockfile) {
+        self.hooked = Some(lockfile);
     }
 }
 /// The wanted lockfile settled, with the manifests the freshness gates
@@ -69,6 +75,7 @@ impl<'a> Lockfiles<'a> {
                 synthesized: None,
                 merged_branch: None,
                 fast_updated: None,
+                hooked: None,
             },
             manifest_freshness_inputs: manifest_freshness_inputs(
                 workspace_root,
@@ -131,7 +138,10 @@ pub(super) fn freshness_inputs<'r>(
         lockfile_dir: &workspace.dirs.workspace_root,
         manifests,
         workspace_packages: workspace.workspace_packages.as_deref(),
-        dependency_manifests: scope.dependency_manifests.as_ref(),
+        dependency_manifests: DependencyManifestSources {
+            declared: scope.declared_manifests().as_slice(),
+            injected: scope.dependency_manifests.as_ref(),
+        },
         config: install.context.config,
         catalogs: &workspace.catalogs,
         pnpmfile_hook: loaded.pnpmfile_hook.as_ref(),
@@ -141,6 +151,7 @@ pub(super) fn freshness_inputs<'r>(
             allow_missing_dependency_free_importers: true,
             frozen_lockfile: false,
             patches_only: false,
+            locked_registries: workspace.loaded_workspace.locked_registry_routes.as_ref(),
         },
     }
 }
@@ -215,7 +226,9 @@ pub(super) async fn synthesize_lockfile_from_current(
 /// the lockfile records a `pnpmfileChecksum`: the freshness gates leave
 /// that checksum uncompared, so the rewrite would keep it over edits the
 /// pnpmfile never saw. Such a run resolves instead, and records no
-/// checksum (<https://github.com/pnpm/pnpm/issues/10944>).
+/// checksum (<https://github.com/pnpm/pnpm/issues/10944>). A
+/// `preResolution` hook also rules it out, as in pnpm: the hook may change
+/// the lockfile the update would start from.
 async fn may_fast_update_with_hooks(
     install: InstallView<'_>,
     mode: &RunMode,
@@ -230,6 +243,11 @@ async fn may_fast_update_with_hooks(
     if install.context.config.ignore_pnpmfile
         && loaded.pnpmfile_hook.is_none()
         && lockfile.pnpmfile_checksum.is_some()
+    {
+        return Ok(false);
+    }
+    if let Some(hook) = loaded.pnpmfile_hook.as_ref()
+        && hook.has_pre_resolution().await.map_err(InstallError::PreResolutionHook)?
     {
         return Ok(false);
     }

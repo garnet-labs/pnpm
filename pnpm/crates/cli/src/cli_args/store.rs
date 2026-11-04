@@ -7,6 +7,7 @@
 //! any project.
 
 mod add;
+mod in_use_files;
 mod status;
 
 use crate::{
@@ -39,7 +40,8 @@ pub enum StoreCommand {
 
 #[derive(Debug, Args)]
 pub struct StoreAddArgs {
-    /// The packages to fetch into the store, e.g. `express@4`.
+    /// The packages to fetch into the store, e.g. `express@4`, or package
+    /// tarballs on disk, e.g. `./express-4.22.1.tgz`.
     pub packages: Vec<String>,
 }
 
@@ -80,7 +82,11 @@ fn prune(config: &Config) -> miette::Result<()> {
     .into_iter()
     .flatten()
     .collect();
-    config.store_dir.prune(&config.cache_dir, &protected_dirs).wrap_err("pruning store")?;
+    config.store_dir
+        .prune_keeping(&config.cache_dir, &protected_dirs, || {
+            in_use_files::in_use(&config.store_dir)
+        })
+        .wrap_err("pruning store")?;
     remove_orphaned_private_engine_installs(config)?;
     Ok(())
 }

@@ -1,7 +1,7 @@
 use super::{Body, ObjectStore, S3Store};
-use crate::{DocumentWrite, HostedRevisionRefWrite};
+use crate::DocumentWrite;
 use futures_util::TryStreamExt;
-use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path as ObjectPath};
+use object_store::{PutPayload, memory::InMemory};
 use pnpr_config::S3Settings;
 use pnpr_package_name::CanonicalPackageName;
 use std::sync::Arc;
@@ -154,8 +154,8 @@ async fn concurrent_blob_finalize_does_not_overwrite() {
     tokio::fs::write(&tmp, b"tarball A").await.unwrap();
     assert_eq!(store.upload_blob(&tmp, &name, file).await.unwrap(), BlobFinalize::Written);
 
-    // Re-promoting byte-identical content is a tolerated no-op, so idempotent
-    // journal roll-forward and concurrent identical publishes don't conflict.
+    // Re-promoting byte-identical content is a tolerated no-op, so a retried
+    // publish and concurrent identical publishes don't conflict.
     let tmp = store.staging_tmp_path(&name, file).await.unwrap();
     tokio::fs::write(&tmp, b"tarball A").await.unwrap();
     assert_eq!(store.upload_blob(&tmp, &name, file).await.unwrap(), BlobFinalize::AlreadyIdentical);
@@ -249,178 +249,6 @@ async fn remove_blob_then_package() {
     );
 }
 
-#[tokio::test]
-async fn lists_hosted_package_names() {
-    for prefix in ["", "packages", "npm~internal"] {
-        let (store, _staging) = store_with_prefix(prefix);
-        write_document(&store, &pkg("is-positive"), b"{}").await;
-        write_document(&store, &pkg("@scope/thing"), b"{}").await;
-        // A stray blob-only key must not be mistaken for a package.
-        upload(&store, &pkg("is-positive"), "is-positive-1.0.0.tgz", b"x").await;
-
-        let mut names = store.list_package_names().await.unwrap();
-        names.sort();
-        assert_eq!(names, vec!["@scope/thing".to_string(), "is-positive".to_string()]);
-    }
-}
-
-#[tokio::test]
-async fn revision_refs_roundtrip_under_the_configured_prefix() {
-    for prefix in ["", "packages"] {
-        let (store, _staging) = store_with_prefix(prefix);
-        let digest = "A".repeat(86);
-        assert_eq!(store.read_revision_refs(&digest).await.unwrap(), Vec::<Vec<u8>>::new());
-
-        store
-            .write_revision_ref(&digest, &"a".repeat(64), "owner-a", b"first")
-            .await
-            .unwrap();
-        store
-            .write_revision_ref(&digest, &"b".repeat(64), "owner-a", b"second")
-            .await
-            .unwrap();
-        let mut refs = store.read_revision_refs(&digest).await.unwrap();
-        refs.sort();
-        assert_eq!(refs, vec![b"first".to_vec(), b"second".to_vec()]);
-    }
-}
-
-#[tokio::test]
-async fn revision_ref_removal_is_scoped_to_its_owner() {
-    let (store, _staging) = store_with_prefix("packages");
-    let digest = "A".repeat(86);
-    let ref_id = "a".repeat(64);
-    assert_eq!(
-        store.write_revision_ref(&digest, &ref_id, "owner-a", b"record").await.unwrap(),
-        HostedRevisionRefWrite::Claimed,
-    );
-    assert_eq!(
-        store.write_revision_ref(&digest, &ref_id, "owner-b", b"record").await.unwrap(),
-        HostedRevisionRefWrite::Claimed,
-    );
-
-    store.remove_revision_ref(&digest, &ref_id, "owner-a").await.unwrap();
-    assert_eq!(store.read_revision_refs(&digest).await.unwrap(), vec![b"record".to_vec()]);
-
-    store.remove_revision_ref(&digest, &ref_id, "owner-a").await.unwrap();
-    assert_eq!(store.read_revision_refs(&digest).await.unwrap(), vec![b"record".to_vec()]);
-
-    store.commit_revision_ref(&digest, &ref_id, "owner-b").await.unwrap();
-    store.remove_revision_ref(&digest, &ref_id, "owner-b").await.unwrap();
-    assert_eq!(store.read_revision_refs(&digest).await.unwrap(), vec![b"record".to_vec()]);
-
-    assert_eq!(
-        store.write_revision_ref(&digest, &ref_id, "owner-a", b"record").await.unwrap(),
-        HostedRevisionRefWrite::Committed,
-    );
-}
-
-#[tokio::test]
-async fn concurrent_revision_ref_claims_survive_other_owner_removal() {
-    let (store, _staging) = store_with_prefix("packages");
-    let digest = "A".repeat(86);
-    let ref_id = "a".repeat(64);
-    let first = {
-        let store = store.clone();
-        let digest = digest.clone();
-        let ref_id = ref_id.clone();
-        tokio::spawn(async move {
-            store.write_revision_ref(&digest, &ref_id, "owner-a", b"record").await
-        })
-    };
-    let second = {
-        let store = store.clone();
-        let digest = digest.clone();
-        let ref_id = ref_id.clone();
-        tokio::spawn(async move {
-            store.write_revision_ref(&digest, &ref_id, "owner-b", b"record").await
-        })
-    };
-
-    assert_eq!(first.await.unwrap().unwrap(), HostedRevisionRefWrite::Claimed);
-    assert_eq!(second.await.unwrap().unwrap(), HostedRevisionRefWrite::Claimed);
-    store.remove_revision_ref(&digest, &ref_id, "owner-a").await.unwrap();
-    assert_eq!(store.read_revision_refs(&digest).await.unwrap(), vec![b"record".to_vec()]);
-    store.remove_revision_ref(&digest, &ref_id, "owner-b").await.unwrap();
-    assert_eq!(store.read_revision_refs(&digest).await.unwrap(), Vec::<Vec<u8>>::new());
-}
-
-#[tokio::test]
-async fn revision_ref_writes_enforce_the_read_bound() {
-    let (store, _staging) = store_with_prefix("packages");
-    let digest = "A".repeat(86);
-    for index in 0..crate::MAX_HOSTED_REVISION_REFS {
-        store
-            .write_revision_ref(&digest, &format!("{index:064x}"), "owner-a", b"{}")
-            .await
-            .unwrap();
-    }
-
-    let overflow = crate::MAX_HOSTED_REVISION_REFS;
-    let err = store
-        .write_revision_ref(&digest, &format!("{overflow:064x}"), "owner-a", b"{}")
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        pnpr_error::RegistryError::RevisionReferenceLimit { limit }
-            if limit == crate::MAX_HOSTED_REVISION_REFS
-    ));
-
-    assert_eq!(
-        store
-            .write_revision_ref(&digest, &"0".repeat(64), "owner-a", b"{}")
-            .await
-            .unwrap(),
-        HostedRevisionRefWrite::AlreadyClaimed,
-    );
-    store.store
-        .put(
-            &ObjectPath::from(format!("packages/.revisions/sha512/{digest}/not-a-reference.json")),
-            PutPayload::from_static(b"stray"),
-        )
-        .await
-        .unwrap();
-    let refs = store.read_revision_refs(&digest).await.unwrap();
-    assert_eq!(refs.len(), crate::MAX_HOSTED_REVISION_REFS);
-    assert!(refs.iter().all(|bytes| bytes == b"{}"));
-}
-
-#[tokio::test]
-async fn concurrent_revision_ref_writes_cannot_exceed_the_limit() {
-    let (store, _staging) = store_with_prefix("packages");
-    let digest = "A".repeat(86);
-    let mut writes = Vec::new();
-    for index in 0..crate::MAX_HOSTED_REVISION_REFS * 2 {
-        let store = store.clone();
-        let digest = digest.clone();
-        writes.push(tokio::spawn(async move {
-            store.write_revision_ref(&digest, &format!("{index:064x}"), "owner-a", b"{}").await
-        }));
-    }
-
-    let mut written = 0;
-    let mut rejected = 0;
-    for write in writes {
-        match write.await.unwrap() {
-            Ok(HostedRevisionRefWrite::Claimed) => written += 1,
-            Ok(outcome) => panic!("unexpected revision-reference write outcome: {outcome:?}"),
-            Err(pnpr_error::RegistryError::RevisionReferenceLimit { .. }) => rejected += 1,
-            Err(err) => panic!("unexpected revision-reference write error: {err}"),
-        }
-    }
-    assert_eq!(written, crate::MAX_HOSTED_REVISION_REFS);
-    assert_eq!(rejected, crate::MAX_HOSTED_REVISION_REFS);
-    assert_eq!(
-        store
-            .read_revision_refs(&digest)
-            .await
-            .unwrap()
-            .len(),
-        crate::MAX_HOSTED_REVISION_REFS,
-    );
-}
-
 #[test]
 fn prefix_normalizes() {
     let normalized = |prefix: Option<&str>| {
@@ -507,21 +335,32 @@ async fn multipart_streams_large_files_in_bounded_parts_and_aborts_failures() {
 #[tokio::test]
 async fn maintenance_inventory_includes_nested_and_unmanifested_repositories() {
     let (store, _staging) = store_with_prefix("images");
+    let store = store.with_ecosystem(pnpr_package_name::Ecosystem::Oci);
     let parent =
         CanonicalPackageName::parse("acme/app", pnpr_package_name::Ecosystem::Oci).unwrap();
     let child =
         CanonicalPackageName::parse("acme/app/tool", pnpr_package_name::Ecosystem::Oci).unwrap();
+    let blobs_repo =
+        CanonicalPackageName::parse("acme/blobs", pnpr_package_name::Ecosystem::Oci).unwrap();
     upload(&store, &parent, "sha256-parent", b"parent").await;
     upload(&store, &child, "sha256-child", b"child").await;
+    upload(&store, &blobs_repo, "sha256-blobs-repo", b"blobs-repo").await;
     write_document(&store, &parent, b"{}").await;
+    write_document(&store, &blobs_repo, b"{}").await;
     let files =
         crate::HostedBackend::list_blob_files(&store).try_collect::<Vec<_>>().await.unwrap();
-    assert_eq!(files.len(), 3);
+    assert_eq!(files.len(), 5);
     assert!(
         files
             .iter()
             .any(|file| file.package == "acme/app/tool"
                 && file.blob.as_deref() == Some("sha256-child")),
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| file.package == "acme/blobs"
+                && file.blob.as_deref() == Some("sha256-blobs-repo")),
     );
 
     let (store, _staging) = store_with_prefix("npm~internal");
@@ -627,11 +466,11 @@ async fn creating_a_record_twice_leaves_the_first_one() {
 #[tokio::test]
 async fn record_keys_are_listed_relative_to_their_namespace() {
     let (store, _staging) = store_with_prefix("bucket-prefix/");
-    store.create_record(".pipeline-runs/v0", "demo/100.json", b"{}").await.unwrap();
-    store.create_record(".pipeline-runs/v0", "other/200.json", b"{}").await.unwrap();
+    store.create_record(".pipeline-runs", "demo/100.json", b"{}").await.unwrap();
+    store.create_record(".pipeline-runs", "other/200.json", b"{}").await.unwrap();
     store.create_record(".staged", "stage.json", b"{}").await.unwrap();
 
-    let mut keys = store.list_record_keys(".pipeline-runs/v0").await.unwrap();
+    let mut keys = store.list_record_keys(".pipeline-runs").await.unwrap();
     keys.sort();
     assert_eq!(keys, ["demo/100.json", "other/200.json"]);
     assert_eq!(store.list_record_keys(".staged").await.unwrap(), ["stage.json"]);
@@ -656,142 +495,5 @@ async fn empty_records_can_be_created_read_replaced_and_listed() {
             .unwrap()
             .as_deref(),
         Some(&b"non-empty"[..]),
-    );
-}
-
-#[tokio::test]
-async fn remove_record_if_current_requires_matching_content() {
-    let (store, _staging) = store_with_prefix("");
-    store.create_record(".staged", "stage.json", br#"{"id":"stage"}"#).await.unwrap();
-
-    let removed = store
-        .remove_record_if_current(".staged", "stage.json", br#"{"id":"wrong"}"#)
-        .await
-        .unwrap();
-    assert!(!removed);
-    assert_eq!(
-        store
-            .read_record(".staged", "stage.json")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(&br#"{"id":"stage"}"#[..]),
-    );
-
-    let removed = store
-        .remove_record_if_current(".staged", "stage.json", br#"{"id":"stage"}"#)
-        .await
-        .unwrap();
-    assert!(removed);
-    assert_eq!(store.read_record(".staged", "stage.json").await.unwrap(), None);
-}
-
-#[derive(Debug)]
-struct ReplaceOnGetStore {
-    inner: Arc<dyn ObjectStore>,
-    target_path: ObjectPath,
-    replacement: Vec<u8>,
-    replaced: std::sync::atomic::AtomicBool,
-}
-
-impl std::fmt::Display for ReplaceOnGetStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ReplaceOnGetStore")
-    }
-}
-
-#[async_trait::async_trait]
-impl ObjectStore for ReplaceOnGetStore {
-    async fn put_opts(
-        &self,
-        location: &ObjectPath,
-        payload: PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &ObjectPath,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &ObjectPath,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        let result = self.inner.get_opts(location, options).await?;
-        if location == &self.target_path
-            && !self.replaced.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.inner.put(location, PutPayload::from(self.replacement.clone())).await?;
-        }
-        Ok(result)
-    }
-
-    fn delete_stream(
-        &self,
-        locations: futures_util::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
-    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-    {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&ObjectPath>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &ObjectPath,
-        to: &ObjectPath,
-        options: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-}
-
-#[tokio::test]
-async fn remove_record_if_current_preserves_concurrent_replacement() {
-    let staging = tempdir().expect("tempdir");
-    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let target_path = ObjectPath::from(".staged/stage.json");
-    let hook_store = Arc::new(ReplaceOnGetStore {
-        inner: Arc::clone(&inner),
-        target_path,
-        replacement: br#"{"id":"stage","v":2}"#.to_vec(),
-        replaced: std::sync::atomic::AtomicBool::new(false),
-    });
-    let store = S3Store::new(hook_store, String::new(), staging.path().to_path_buf());
-
-    store.create_record(".staged", "stage.json", br#"{"id":"stage"}"#).await.unwrap();
-
-    let removed = store
-        .remove_record_if_current(".staged", "stage.json", br#"{"id":"stage"}"#)
-        .await
-        .unwrap();
-    assert!(!removed);
-
-    assert_eq!(
-        store
-            .read_record(".staged", "stage.json")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(&br#"{"id":"stage","v":2}"#[..]),
     );
 }

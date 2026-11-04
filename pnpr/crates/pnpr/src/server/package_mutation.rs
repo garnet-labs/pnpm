@@ -6,9 +6,6 @@ mod immutability;
 mod maintainers;
 mod unpublish;
 
-#[cfg(test)]
-mod tests;
-
 use axum::{
     body::Body,
     http::{StatusCode, header},
@@ -128,6 +125,7 @@ fn prepare_packument_rewrite(
         return Err(err.into_response());
     }
     preserve_existing_maintainers(&hosted, packument);
+    super::publishing::variants::restore_server_fields(&hosted, packument);
     if let Some(packument_obj) = packument.as_object_mut() {
         packument_obj.insert(
             "formatVersion".to_string(),
@@ -136,21 +134,6 @@ fn prepare_packument_rewrite(
     }
     let removed = detect_removed_versions(&hosted, packument);
     Ok((hosted, removed))
-}
-
-async fn rollback_hosted_packument(
-    storage: &pnpr_storage::Storage,
-    name: &CanonicalPackageName,
-    written_bytes: &[u8],
-    fallback_bytes: &[u8],
-) {
-    if let Ok(Some(current)) = storage.read_hosted_document_for_update(name).await
-        && current.bytes == written_bytes
-    {
-        let _ =
-            storage.write_hosted_document_if_current(name, fallback_bytes, Some(&current.version))
-                .await;
-    }
 }
 
 /// Serialize against other same-package writers so the rewrite cannot
@@ -179,17 +162,18 @@ async fn rewrite_packument(
         Ok(bytes) => bytes,
         Err(err) => return RegistryError::Json(err).into_response(),
     };
-    match storage.write_hosted_document_if_current(name, &bytes, Some(&hosted_packument.version))
-        .await
+    // The tombstone names the removed versions before the rewrite removes
+    // them: the metadata store may refuse a removed version for good, so a
+    // rewrite could not be undone if recording them failed after it.
+    if let Err(err) =
+        record_removed_versions_in_tombstone(storage, identity, name, &hosted, &removed).await
+    {
+        return err.into_response();
+    }
+    let version = Some(&hosted_packument.version);
+    match storage.write_hosted_document_if_current(name, &bytes, version, identity.username()).await
     {
         Ok(DocumentWrite::Written) => {
-            if let Err(err) =
-                record_removed_versions_in_tombstone(storage, identity, name, &hosted, &removed)
-                    .await
-            {
-                rollback_hosted_packument(storage, name, &bytes, &hosted_packument.bytes).await;
-                return err.into_response();
-            }
             remove_unpublished_blobs(storage, name, &removed).await;
             log_packument_update(identity, name, source);
             ok_created()
@@ -267,7 +251,11 @@ async fn remove_unpublished_blobs(
     let blobs = removed_versions
         .iter()
         .flat_map(|version| {
-            [name.tarball_name_for_version(version), name.sigstore_name_for_version(version)]
+            [
+                name.tarball_name_for_version(version),
+                name.tar_name_for_version(version),
+                name.sigstore_name_for_version(version),
+            ]
         });
     futures_util::stream::iter(blobs)
         .for_each_concurrent(BLOB_REMOVALS_IN_FLIGHT, |blob| async move {

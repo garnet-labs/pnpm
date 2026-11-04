@@ -19,7 +19,7 @@ impl EnvironmentNetwork {
     pub(super) fn resolver(&self, config: &Config) -> NpmResolver<InMemoryPackageMetaCache> {
         NpmResolver {
             registries: self.registries.clone(),
-            registries_by_prefix: HashMap::new(),
+            declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
             metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
                 http_client: Arc::clone(&self.http_client),
                 auth_headers: Arc::clone(&self.auth_headers),
@@ -38,6 +38,7 @@ impl EnvironmentNetwork {
                 registry_options_by_url: std::sync::Arc::new(
                     config.registry_options_by_url.clone(),
                 ),
+                minimum_release_age: config.resolved_minimum_release_age(),
             },
             cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
                 network: NetworkPolicy::from_settings(self.offline, config.prefer_offline),

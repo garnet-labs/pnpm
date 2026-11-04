@@ -33,6 +33,7 @@ pnpm-executor = { workspace = true }
 pnpm-fs = { workspace = true }
 pnpm-git-fetcher = { workspace = true }
 pnpm-lockfile = { workspace = true }
+pnpm-platform-variants = { workspace = true }
 pnpm-lockfile-preferred-versions = { workspace = true }
 pnpm-lockfile-verification = { workspace = true }
 pnpm-modules-yaml = { workspace = true }
@@ -69,6 +70,7 @@ pnpm-workspace-spec = { workspace = true }
 pnpm-workspace-state = { workspace = true }
 pnpm-workspace-task-scheduler = { workspace = true }
 pnpm-text-sanitize = { workspace = true }
+pnpm-text-section = { workspace = true }
 
 async-recursion = { workspace = true }
 chrono = { workspace = true }
@@ -95,6 +97,7 @@ tracing = { workspace = true }
 miette = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 pnpm-testing-utils = { workspace = true }
 
 async-trait = { workspace = true }
@@ -112,7 +115,7 @@ walkdir = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 home = { workspace = true }
-tokio = { workspace = true, features = ["net", "signal"] }
+tokio = { workspace = true, features = ["net", "signal", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

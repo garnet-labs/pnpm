@@ -49,6 +49,9 @@
       "path": "../../config/matcher"
     },
     {
+      "path": "../../config/normalize-registries"
+    },
+    {
       "path": "../../config/pick-registry-for-package"
     },
     {
@@ -212,6 +215,9 @@
     },
     {
       "path": "../deps-installer"
+    },
+    {
+      "path": "../deps-resolver"
     },
     {
       "path": "../env-installer"

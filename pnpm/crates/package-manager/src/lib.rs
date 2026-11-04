@@ -3,7 +3,8 @@
 pub use add::*;
 pub use agent_skills::{
     AGENT_SKILL_LINK_PREFIX, AgentSkillsError, AgentSkillsState, ResyncAgentSkillsError,
-    SyncAgentSkills, agent_skills_dir_from_env, resync_installed_agent_skills, sync_agent_skills,
+    SkillApprovalError, SkillApprovalOptions, SyncAgentSkills, agent_skills_dir_from_env,
+    detected_agent_dirs, resync_installed_agent_skills, skill_approval_options, sync_agent_skills,
 };
 pub use build_resolution_verifiers::*;
 pub use build_snapshot::*;
@@ -16,6 +17,7 @@ pub(crate) use hoisted_selection::{
     selected_materialization_closure, selected_materialization_ids,
 };
 pub use install::*;
+pub use install_state::*;
 pub use install_with_fresh_lockfile::*;
 pub use link_manifest_link_deps::*;
 pub use linked_peer_dependencies::linked_peer_dependencies_warning;
@@ -69,6 +71,8 @@ mod fast_update_patched_dependencies;
 mod fast_update_settings;
 mod hoisted_selection;
 mod install;
+mod install_entry;
+mod install_state;
 mod install_with_fresh_lockfile;
 mod link_manifest_link_deps;
 mod linked_peer_dependencies;

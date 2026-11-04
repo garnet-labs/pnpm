@@ -95,6 +95,7 @@ async fn fresh_partial_install_preserves_optional_link_in_warm_gvs_slot() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -175,6 +176,7 @@ async fn fresh_partial_install_preserves_optional_link_in_warm_gvs_slot() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -194,7 +196,7 @@ async fn fresh_partial_install_preserves_optional_link_in_warm_gvs_slot() {
 /// path pacquet keeps in [`Config::install_state_dir`]. If
 /// they diverge, the next `pnpm install` reads the manifest, recomputes
 /// `ctx.virtualStoreDir` from the GVS-on path, and trips its
-/// `checkCompatibility` with `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE_DIR`
+/// `checkCompatibility` with `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE`
 /// for every project, forcing the "modules directories will be
 /// reinstalled from scratch" prompt on every invocation. The same
 /// value is also emitted on the `pnpm:context` channel that
@@ -295,6 +297,7 @@ async fn gvs_persists_global_virtual_store_dir_in_modules_yaml_and_context_log()
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()

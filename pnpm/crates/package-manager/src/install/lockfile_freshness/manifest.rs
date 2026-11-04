@@ -35,9 +35,14 @@ pub(crate) struct WorkspaceProjects<'a> {
     /// hold only in memory. An injected project is read from here before its
     /// directory on disk.
     pub(crate) manifests_by_dir: &'a super::ProjectManifestsByDir<'a>,
+    /// The directory packages no project describes, as the resolver read
+    /// them. A package missing here is read from its directory.
+    pub(crate) directory_manifests: &'a super::DirectoryManifests,
     pub(crate) catalogs: &'a pnpm_catalogs_types::Catalogs,
     /// Shared by every importer of one check, which link the same targets.
     pub(crate) canonical_paths: &'a pnpm_fs::CanonicalPaths,
+    /// How a locked child's registry is decided, shared the same way.
+    pub(crate) registries: &'a pnpm_lockfile::RegistryContext,
 }
 
 /// Which of the project's `optionalDependencies` the comparison leaves out.
@@ -68,7 +73,10 @@ pub(crate) fn check_importer_satisfies(
     let normalized_manifest = normalized_freshness_manifest(
         check.manifest,
         check.config,
-        check.workspace.packages,
+        check.workspace.packages.map(|packages| crate::WorkspaceLinks {
+            packages,
+            catalogs: check.workspace.catalogs,
+        }),
         importer,
         check.parsed_overrides,
         check.lockfile_dir,
@@ -175,7 +183,7 @@ pub(in super::super) fn manifest_has_effective_dependencies(
 }
 pub(in super::super) fn exclude_linked_dependencies(
     manifest: &mut PackageManifest,
-    workspace_packages: Option<&pnpm_resolving_resolver_base::WorkspacePackages>,
+    workspace_links: Option<crate::WorkspaceLinks<'_>>,
     importer: Option<&pnpm_lockfile::ProjectSnapshot>,
 ) {
     let Some(manifest) = manifest.value_mut().as_object_mut() else {
@@ -188,12 +196,12 @@ pub(in super::super) fn exclude_linked_dependencies(
             continue;
         };
         dependencies.retain(|alias, specifier| {
-            retain_in_freshness_manifest(workspace_packages, importer, alias, specifier)
+            retain_in_freshness_manifest(workspace_links, importer, alias, specifier)
         });
     }
 }
 fn retain_in_freshness_manifest(
-    workspace_packages: Option<&pnpm_resolving_resolver_base::WorkspacePackages>,
+    workspace_links: Option<crate::WorkspaceLinks<'_>>,
     importer: Option<&pnpm_lockfile::ProjectSnapshot>,
     alias: &str,
     specifier: &serde_json::Value,
@@ -204,18 +212,18 @@ fn retain_in_freshness_manifest(
     if specifier.starts_with("link:") {
         return false;
     }
-    let Some(workspace_packages) = workspace_packages else {
+    let Some(workspace_links) = workspace_links else {
         return true;
     };
     specifier.starts_with("workspace:")
         || importer.is_some_and(|snapshot| crate::snapshot_has_alias(snapshot, alias))
-        || crate::workspace_link_target(workspace_packages, alias, specifier).is_none()
+        || crate::workspace_link_target(workspace_links, alias, specifier).is_none()
 }
 // Only overrides and excluded links require a clone; all other freshness checks borrow the manifest.
 pub(super) fn normalized_freshness_manifest<'a>(
     manifest: &'a PackageManifest,
     config: &Config,
-    workspace_packages: Option<&pnpm_resolving_resolver_base::WorkspacePackages>,
+    workspace_links: Option<crate::WorkspaceLinks<'_>>,
     importer: &pnpm_lockfile::ProjectSnapshot,
     parsed_overrides: Option<&[pnpm_config_parse_overrides::VersionOverride]>,
     lockfile_dir: &Path,
@@ -232,7 +240,7 @@ pub(super) fn normalized_freshness_manifest<'a>(
         crate::VersionsOverrider::new(parsed, lockfile_dir).apply(&mut cloned, Some(project_dir));
     }
     if config.exclude_links_from_lockfile {
-        exclude_linked_dependencies(&mut cloned, workspace_packages, Some(importer));
+        exclude_linked_dependencies(&mut cloned, workspace_links, Some(importer));
     }
     std::borrow::Cow::Owned(cloned)
 }

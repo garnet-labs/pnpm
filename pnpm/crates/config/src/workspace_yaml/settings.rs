@@ -1,128 +1,15 @@
 use super::{
     AllowBuild, AuditConfig, AuditLevel, AuditSettings, BTreeMap, BTreeSet, CargoSettings,
-    CatalogMode, ConfigDependency, Deserialize, Deserializer, DroppedKeys, EnvVar, HashMap,
-    HoistingLimits, IgnoredAny, IndexMap, InitType, LinkWorkspacePackages, LoadWorkspaceYamlError,
-    LockfileSetting, NodeLinkerSetting, NodePackageMapMode, NodePackageMapType,
-    PackageConfigsSetting, PackageExtension, PackageImportMethod, PackagePermissions, Path,
-    PathBuf, PeerDependencyRules, Placeholder, PmOnFail, PnpmfileSetting, PythonSettings,
-    RegistryEntry, RemoteCacheSettings, RemoteSideEffectsCacheSettings, ResolutionMode,
-    RuntimeOnFail, SCHEMA_DIRECTIVE_KEY, SaveWorkspaceProtocol, ScriptsPrependNodePath,
+    CatalogMode, ConfigDependency, Deserialize, Deserializer, HashMap, HoistingLimits, IndexMap,
+    InitType, LinkWorkspacePackages, LoadWorkspaceYamlError, LockfileSetting, NodeLinkerSetting,
+    NodePackageMapMode, NodePackageMapType, PackageConfigsSetting, PackageExtension,
+    PackageImportMethod, PackagePermissions, Path, PathBuf, PeerDependencyRules, PmOnFail,
+    PnpmfileSetting, PythonSettings, RegistryEntry, RemoteCacheSettings,
+    RemoteSideEffectsCacheSettings, ResolutionMode, RuntimeOnFail, SaveWorkspaceProtocol,
     SideEffectsCacheSetting, SkillsSettings, StoreIndexFormat, SupportedArchitectures, SystemEnv,
-    TaskSettings, Tool, ToolSettings, TrustPolicy, UpdateConfig, UpdateSettings,
-    VerifyDepsBeforeRun, VirtualStoreType, WORKSPACE_MANIFEST_FILENAME, WorkspaceKeyIssues,
-    drop_placeholders, read_workspace_document, redact_and_sanitize, resolvable_placeholders,
-    resolve_placeholders,
+    TaskSettings, TrustPolicy, UpdateConfig, UpdateSettings, VerifyDepsBeforeRun, VirtualStoreType,
+    WORKSPACE_MANIFEST_FILENAME, WorkspaceKeyIssues, parse_settings, read_workspace_document,
 };
-
-/// What a failed read reports in place of a value that came from the
-/// environment. `nodeLinker: ${NPM_TOKEN}` written by mistake must not put
-/// the token in a build log.
-const INVALID_EXPANSION: &str = "invalid environment-expanded value";
-
-/// How many times the second read may read the document.
-///
-/// Working out which placeholders are needed costs reads, and the file says
-/// how many placeholders there are, so without a bound a repository could set
-/// how long loading its own configuration takes.
-///
-/// Placeholders are decided in groups, which is what makes this affordable:
-/// the ones a document reads without — in comments, and in every setting that
-/// takes free text — cost about one read per doubling of their number rather
-/// than one each, and only the ones a setting genuinely needs cost about two
-/// apiece. A file naming this many settings out of the environment is far past
-/// anything written by hand, and is read as written.
-const MAX_DOCUMENT_READS: u32 = 512;
-
-/// Read the settings of a `pnpm-workspace.yaml` / `config.yaml`, resolving a
-/// setting written as `${VAR}` or `${VAR:-fallback}`.
-///
-/// Only the placeholders the document cannot be read without are resolved
-/// here. A setting that takes free text reads as written, so its placeholder
-/// is left for the trusted / untrusted substitution that follows — which is
-/// what keeps a repository-controlled file from naming a request destination
-/// out of the environment. A document that reads as written resolves nothing
-/// at all and is returned exactly as it was read, so what a file means today
-/// it goes on meaning.
-pub(crate) fn parse_settings<Sys: EnvVar>(
-    text: &str,
-) -> Result<WorkspaceSettings, Box<serde_saphyr::Error>> {
-    // A placeholder reaches serde as its own text, which only a string-valued
-    // setting can hold, so a document carrying one for any other setting has
-    // to be read a second time with that placeholder already resolved.
-    let as_written = match serde_saphyr::from_str::<WorkspaceSettings>(text) {
-        Ok(settings) => return Ok(settings),
-        Err(error) => error,
-    };
-    let placeholders = resolvable_placeholders::<Sys>(text);
-    if placeholders.is_empty() {
-        return Err(Box::new(as_written));
-    }
-    let mut resolved = vec![true; placeholders.len()];
-    let mut reads = 1;
-    if read_text(&resolve_placeholders(text, &placeholders, |index| resolved[index])).is_none() {
-        return Err(Box::new(classify(text, &placeholders)));
-    }
-    // Resolving a placeholder the document reads without would take a setting
-    // out of the hands of the substitution that knows which layer the file
-    // came from, so each one that turns out not to be needed is put back.
-    if !decide(text, &placeholders, &mut resolved, 0..placeholders.len(), &mut reads) {
-        return Err(Box::new(as_written));
-    }
-    read_text(&resolve_placeholders(text, &placeholders, |index| resolved[index]))
-        .ok_or_else(|| Box::new(as_written))
-}
-
-/// Work out which of `group` the document cannot be read without, leaving
-/// `resolved` false for the rest, and report whether it stayed inside
-/// [`MAX_DOCUMENT_READS`].
-///
-/// Resolving one placeholder says nothing about whether another is needed, so
-/// a group put back all at once answers for every placeholder in it: the
-/// document reads when none of them was needed, and otherwise the group is
-/// halved.
-fn decide(
-    text: &str,
-    placeholders: &[Placeholder],
-    resolved: &mut [bool],
-    group: std::ops::Range<usize>,
-    reads: &mut u32,
-) -> bool {
-    if *reads >= MAX_DOCUMENT_READS {
-        return false;
-    }
-    *reads += 1;
-    resolved[group.clone()].fill(false);
-    if read_text(&resolve_placeholders(text, placeholders, |index| resolved[index])).is_some() {
-        return true;
-    }
-    resolved[group.clone()].fill(true);
-    if group.len() == 1 {
-        return true;
-    }
-    let middle = group.start + group.len() / 2;
-    decide(text, placeholders, resolved, group.start..middle, reads)
-        && decide(text, placeholders, resolved, middle..group.end, reads)
-}
-
-/// The error a document that will not read even with its placeholders
-/// resolved reports.
-///
-/// The document read without them answers which it is. It reads when a
-/// placeholder is what the reader stumbled over, and the message must not
-/// repeat what one resolved to. Otherwise the file says something it cannot
-/// mean on its own, and that read is the one that says what: the first read
-/// stops at the placeholder, which is not the problem and whose line would
-/// send a reader to the wrong setting.
-fn classify(text: &str, placeholders: &[Placeholder]) -> serde_saphyr::Error {
-    match serde_saphyr::from_str::<WorkspaceSettings>(&drop_placeholders(text, placeholders)) {
-        Ok(_) => serde::de::Error::custom(INVALID_EXPANSION),
-        Err(dropped) => dropped,
-    }
-}
-
-fn read_text(text: &str) -> Option<WorkspaceSettings> {
-    serde_saphyr::from_str(text).ok()
-}
 
 /// `serde` helper for fields that need to distinguish "missing key"
 /// from "explicit null" in YAML / JSON.
@@ -180,6 +67,9 @@ pub struct NodePackageMapSettings {
 /// settings such as `allowBuilds`) from this file rather than from
 /// `package.json`'s `pnpm` field, resolving those settings against the
 /// workspace dir.
+///
+/// The settings a repository must not control are no fields of this struct
+/// but of [`MachineSettings`](super::MachineSettings).
 #[derive(Debug, Default, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 #[cfg_attr(
@@ -191,7 +81,6 @@ pub struct NodePackageMapSettings {
 )]
 pub struct WorkspaceSettings {
     pub bail: Option<bool>,
-    pub ci: Option<bool>,
     pub progress: Option<bool>,
     pub update_notifier: Option<bool>,
     pub color: Option<crate::ColorMode>,
@@ -225,10 +114,6 @@ pub struct WorkspaceSettings {
     pub public_hoist_pattern: Option<Option<Vec<String>>>,
     pub shamefully_hoist: Option<bool>,
     pub store_dir: Option<String>,
-    /// Machine preferences accepted from global `config.yaml` and the
-    /// environment. A repository cannot change the user's backup policy.
-    pub macos_backup: Option<MacosBackupSettings>,
-    pub state_dir: Option<String>,
     pub modules_dir: Option<String>,
     pub node_linker: Option<NodeLinkerSetting>,
     /// `nodePackageMap`. Wins over the deprecated
@@ -250,11 +135,6 @@ pub struct WorkspaceSettings {
     /// `virtualStoreOnly` from `pnpm-workspace.yaml`. See
     /// [`Config::virtual_store_only`](crate::settings::Config::virtual_store_only).
     pub virtual_store_only: Option<bool>,
-    /// `globalShims` from `pnpm-workspace.yaml` or the global
-    /// `config.yaml`. One layer of the record; merged key-wise into
-    /// [`Config::global_shims`](crate::settings::Config::global_shims) rather than assigned
-    /// wholesale. See [`crate::GlobalShims`].
-    pub global_shims: Option<crate::GlobalShimsSetting>,
     /// `enableModulesDir` from `pnpm-workspace.yaml`. See
     /// [`Config::enable_modules_dir`](crate::settings::Config::enable_modules_dir).
     pub enable_modules_dir: Option<bool>,
@@ -262,18 +142,6 @@ pub struct WorkspaceSettings {
     /// against the workspace dir like the other path-valued fields.
     /// When set, overrides the derived `<store_dir>/links` path.
     pub global_virtual_store_dir: Option<String>,
-    /// `globalDir` from the global `config.yaml` or the environment. A
-    /// relative value resolves against the directory pnpm runs in, which
-    /// is where pnpm itself resolves it. See [`Config::global_dir`](crate::settings::Config::global_dir).
-    ///
-    /// No repo-committed file may set it — see [`crate::refused_keys`].
-    pub global_dir: Option<String>,
-    /// `globalBinDir` from the global `config.yaml` or the environment. A
-    /// relative value resolves against the directory pnpm runs in, which
-    /// is where pnpm itself resolves it. See [`Config::global_bin_dir`](crate::settings::Config::global_bin_dir).
-    ///
-    /// No repo-committed file may set it — see [`crate::refused_keys`].
-    pub global_bin_dir: Option<String>,
     pub package_import_method: Option<PackageImportMethod>,
     pub modules_cache_max_age: Option<u64>,
     pub virtual_store_dir_max_length: Option<u64>,
@@ -298,7 +166,6 @@ pub struct WorkspaceSettings {
     pub prefer_offline: Option<bool>,
     pub lockfile_include_tarball_url: Option<bool>,
     pub registry: Option<String>,
-    pub scope: Option<String>,
     /// The registries the project declares. Keyed by registry URL, with the
     /// routes to each registry inside its entry; a map of plain strings is the
     /// older `<scope>: <url>` shape and is read as one.
@@ -306,10 +173,6 @@ pub struct WorkspaceSettings {
     pub pnpr_server: Option<String>,
     pub cargo: Option<CargoSettings>,
     pub python: Option<PythonSettings>,
-    /// `tools` from `pnpm-workspace.yaml`: what pnpm is told about the
-    /// programs it downloads, keyed by tool name. See [`ToolSettings`].
-    #[serde(default, deserialize_with = "crate::workspace_yaml::deserialize_tools")]
-    pub tools: Option<BTreeMap<Tool, ToolSettings>>,
     pub remote_side_effects_cache: Option<RemoteSideEffectsCacheSettings>,
     pub remote_cache: Option<RemoteCacheSettings>,
     pub https_proxy: Option<String>,
@@ -533,6 +396,10 @@ pub struct WorkspaceSettings {
     /// skips its git working-tree checks. See [`Config::git_checks`](crate::settings::Config::git_checks). The
     /// `--no-git-checks` CLI flag forces it off on top of this.
     pub git_checks: Option<bool>,
+    /// See [`Config::git_tag_version`](crate::settings::Config::git_tag_version).
+    pub git_tag_version: Option<bool>,
+    /// See [`Config::publish_branch`](crate::settings::Config::publish_branch).
+    pub publish_branch: Option<String>,
 
     /// See [`Config::publish_wait_timeout`](crate::settings::Config::publish_wait_timeout).
     pub publish_wait_timeout: Option<u64>,
@@ -568,11 +435,6 @@ pub struct WorkspaceSettings {
 
     /// Per-release-channel Node.js download mirrors.
     pub node_download_mirrors: Option<HashMap<String, String>>,
-
-    /// `scriptsPrependNodePath` from `pnpm-workspace.yaml`. Tri-state
-    /// — yaml accepts `true` / `false` / `"warn-only"`. Custom serde
-    /// shape, see [`ScriptsPrependNodePath`]'s `Deserialize` impl.
-    pub scripts_prepend_node_path: Option<ScriptsPrependNodePath>,
 
     /// `enablePrePostScripts` from `pnpm-workspace.yaml`. See
     /// [`Config::enable_pre_post_scripts`](crate::settings::Config::enable_pre_post_scripts).
@@ -931,45 +793,6 @@ pub struct WorkspaceSettings {
 }
 
 impl WorkspaceSettings {
-    /// Warn about the keys of the global `config.yaml` that never reach the
-    /// settings, in the messages pnpm emits for that file.
-    ///
-    /// What survived is read back off `self` rather than off a second list of
-    /// key names, which would drift from the struct: a key serde did not
-    /// recognize is absent from the serialized settings, and one
-    /// [`Self::clear_workspace_only_fields`] zeroed is null there.
-    ///
-    /// A dropped camelCase key pnpm's `isConfigFileKey` accepts stays silent:
-    /// pnpm honors it in this file, so the fix is to honor it too, and until
-    /// then a warning would diverge from pnpm's output on the same file.
-    pub(super) fn warn_about_dropped_keys(&self, text: &str, path: &Path) {
-        let Ok(document) = serde_saphyr::from_str::<IndexMap<String, Option<IgnoredAny>>>(text)
-        else {
-            return;
-        };
-        let Ok(serde_json::Value::Object(kept)) = serde_json::to_value(self) else {
-            return;
-        };
-
-        let mut dropped = DroppedKeys::default();
-        for key in document
-            .iter()
-            .filter(|(_, value)| value.is_some())
-            .map(|(key, _)| key)
-        {
-            if key == SCHEMA_DIRECTIVE_KEY
-                || matches!(kept.get(key), Some(value) if !value.is_null())
-            {
-                continue;
-            }
-            // The key comes from a file the machine's user controls, but the
-            // same rendering serves the project file, so it is sanitized here
-            // too rather than only where it must be.
-            dropped.classify(&redact_and_sanitize(key));
-        }
-        dropped.warn(path);
-    }
-
     /// Read `<dir>/pnpm-workspace.yaml` without walking ancestors.
     /// Returns `Ok(None)` only when nothing exists at that exact path;
     /// every other error (including `EISDIR` for a directory named
@@ -995,7 +818,7 @@ impl WorkspaceSettings {
 
     /// Parse and validate the text of the `pnpm-workspace.yaml` at `path`.
     fn read_valid(text: &str, path: &Path) -> Result<Self, LoadWorkspaceYamlError> {
-        let settings = parse_settings::<SystemEnv>(text)
+        let settings = parse_settings::<SystemEnv, Self>(text)
             .map_err(|source| LoadWorkspaceYamlError::ParseYaml {
                 path: path.to_path_buf(),
                 source,

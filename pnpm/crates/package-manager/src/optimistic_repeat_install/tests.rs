@@ -30,11 +30,13 @@ mod injected;
 
 mod validation;
 
+mod settings_classification;
+
 use super::{
     Decision, OptimisticRepeatInstallCheck, check_optimistic_repeat_install,
     deps_status::{RunDepsStatus, check_deps_status_before_run},
-    settings::current_settings,
 };
+use crate::install_state::settings::current_settings;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
@@ -83,7 +85,7 @@ fn check_with_catalogs(
     check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root,
         config,
-        project_manifests,
+        project_manifests: crate::DeclaredManifests::new(project_manifests),
         is_workspace_install,
         lockfile: MaybeLazyLockfile::Loaded(None),
         catalogs,
@@ -106,7 +108,7 @@ fn check_with_lockfile(
     check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root,
         config,
-        project_manifests,
+        project_manifests: crate::DeclaredManifests::new(project_manifests),
         is_workspace_install: false,
         lockfile: MaybeLazyLockfile::Loaded(Some(lockfile)),
         catalogs: &BTreeMap::default(),
@@ -258,7 +260,9 @@ fn record_installed(
         &super::validation::RecordValidation {
             workspace_root,
             config,
-            project_manifests,
+            project_manifests: crate::DeclaredManifests::new(project_manifests),
+            workspace_projects: None,
+            lockfile: None,
             vouched: &super::validation::Vouched::All,
         },
     );
@@ -289,7 +293,9 @@ fn record_validation_on_disk(workspace_root: &std::path::Path, state: &mut Works
         &super::validation::RecordValidation {
             workspace_root,
             config: &config,
-            project_manifests: &project_manifests,
+            project_manifests: crate::DeclaredManifests::new(&project_manifests),
+            workspace_projects: None,
+            lockfile: None,
             vouched: &super::validation::Vouched::All,
         },
     );
@@ -374,6 +380,18 @@ fn setup_fresh_install_with_config(
     // Pre-create the modules dir so the "missing node_modules" guard
     // doesn't fire on the happy-path tests.
     fs::create_dir_all(&config.modules_dir).unwrap();
+    // A fresh install links every `workspace:`/`link:` dependency, so a
+    // fixture that claims a fresh state has to show those entries too. A test
+    // that wants one gone removes it itself.
+    for (alias, spec) in manifest.dependencies([
+        pnpm_package_manifest::DependencyGroup::Prod,
+        pnpm_package_manifest::DependencyGroup::Dev,
+        pnpm_package_manifest::DependencyGroup::Optional,
+    ]) {
+        if super::modules_dirs::direct_links::is_local_link_spec(spec) {
+            fs::create_dir_all(config.modules_dir.join(alias)).unwrap();
+        }
+    }
 
     record_test_workspace_state(
         workspace_root,
@@ -400,11 +418,17 @@ fn record_test_workspace_state(
             supported_architectures: None,
         },
         catalogs: &BTreeMap::default(),
-        project_manifests,
+        projects: crate::install::StateProjects {
+            manifests: crate::DeclaredManifests::new(project_manifests),
+            workspace_projects: None,
+            lockfile: None,
+        },
         filesystem_now_ms: Some(backdate_validated_files(workspace_root)),
         carried: crate::install::CarriedSettings {
             established_auto_dedupe: config.auto_dedupe.then_some(true),
-            kept_groups: None,
+            registry_keys_verified: true,
+            registry_routes: Some(crate::install_state::settings::recorded_registry_routes(config)),
+            kept_settings: None,
         },
         vouched: &super::validation::Vouched::All,
     });
@@ -489,7 +513,7 @@ fn content_check_decision(
     check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root: dir.path(),
         config,
-        project_manifests,
+        project_manifests: crate::DeclaredManifests::new(project_manifests),
         is_workspace_install,
         lockfile: MaybeLazyLockfile::Loaded(lockfile.as_ref()),
         catalogs: &BTreeMap::default(),
@@ -558,8 +582,10 @@ fn date_lockfile_after(workspace_root: &std::path::Path, recorded: i64) {
 /// that records a file records a stat the next check trusts.
 fn wait_for_the_next_filesystem_tick(workspace_root: &std::path::Path) {
     let now = || {
-        super::timestamps::filesystem_now_ns_in_modules(&workspace_root.join("node_modules"))
-            .unwrap()
+        crate::install_state::timestamps::filesystem_now_ns_in_modules(&workspace_root.join(
+            "node_modules",
+        ))
+        .unwrap()
     };
     let written = now();
     while now() <= written {
@@ -641,7 +667,7 @@ fn deps_status(
         &OptimisticRepeatInstallCheck {
             workspace_root: dir.path(),
             config,
-            project_manifests,
+            project_manifests: crate::DeclaredManifests::new(project_manifests),
             is_workspace_install,
             lockfile: MaybeLazyLockfile::Loaded(lockfile.as_ref()),
             catalogs: &BTreeMap::default(),
@@ -1295,6 +1321,13 @@ fn linked_sibling_decision_for_spec(
     config.link_workspace_packages = link_workspace_packages;
     config.exclude_links_from_lockfile = exclude_links_from_lockfile;
     fs::create_dir_all(&config.modules_dir).unwrap();
+    // A fresh install links a `workspace:`/`link:` dependency, so the entry is
+    // part of the state the fixture records.
+    if super::modules_dirs::direct_links::is_local_link_spec(specifier)
+        || lockfile_ref.starts_with("link:")
+    {
+        fs::create_dir_all(config.modules_dir.join(dependency_name)).unwrap();
+    }
     let config = config.leak();
 
     let root_manifest = PackageManifest::from_path(workspace_root.join("package.json")).unwrap();
@@ -1342,10 +1375,10 @@ fn linked_sibling_decision_for_spec(
     check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
         workspace_root,
         config,
-        project_manifests: &[
+        project_manifests: crate::DeclaredManifests::new(&[
             (workspace_root.to_path_buf(), &root_manifest_touched),
             (sibling_dir, &sibling_manifest),
-        ],
+        ]),
         is_workspace_install: true,
         lockfile: MaybeLazyLockfile::Loaded(lockfile.as_ref()),
         catalogs: &BTreeMap::default(),

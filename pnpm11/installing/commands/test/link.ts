@@ -48,6 +48,10 @@ test('linking multiple packages', async () => {
 
   project.has('linked-foo')
   project.has('linked-bar')
+  expect(readYamlFileSync<{ overrides?: Record<string, string> }>('pnpm-workspace.yaml').overrides).toStrictEqual({
+    'linked-foo': 'link:../linked-foo',
+    'linked-bar': 'link:../linked-bar',
+  })
 })
 
 test('link global bin', async function () {
@@ -211,6 +215,48 @@ test('link fails if nothing is linked', async () => {
   ).rejects.toThrow(/You must provide a parameter/)
 })
 
+test.each<{ linked: string, linkedManifest: { name?: string, version: string } }>([
+  { linked: '.', linkedManifest: { version: '1.0.0' } },
+  { linked: './linked', linkedManifest: { name: 'mcp-use server', version: '1.0.0' } },
+])('link refuses the invalid package name of $linked without writing anything', async ({ linked, linkedManifest }) => {
+  prepareEmpty()
+  const rootProjectManifest = { version: '1.0.0' }
+  writePackageSync('.', rootProjectManifest)
+  writePackageSync(linked, linkedManifest)
+
+  await expect(
+    link.handler({
+      ...DEFAULT_OPTS,
+      dir: process.cwd(),
+      rootProjectManifest,
+      rootProjectManifestDir: process.cwd(),
+    }, [linked])
+  ).rejects.toMatchObject({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' })
+
+  expect(JSON.parse(fs.readFileSync('package.json', 'utf8'))).toStrictEqual({ version: '1.0.0' })
+  expect(fs.existsSync('pnpm-workspace.yaml')).toBe(false)
+})
+
+test('link checks every package name before writing any link', async () => {
+  prepareEmpty()
+  const rootProjectManifest = { version: '1.0.0' }
+  writePackageSync('.', rootProjectManifest)
+  writePackageSync('valid', { name: 'valid', version: '1.0.0' })
+  writePackageSync('invalid', { name: 'mcp-use server', version: '1.0.0' })
+
+  await expect(
+    link.handler({
+      ...DEFAULT_OPTS,
+      dir: process.cwd(),
+      rootProjectManifest,
+      rootProjectManifestDir: process.cwd(),
+    }, ['./valid', './invalid'])
+  ).rejects.toMatchObject({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' })
+
+  expect(JSON.parse(fs.readFileSync('package.json', 'utf8'))).toStrictEqual({ version: '1.0.0' })
+  expect(fs.existsSync('pnpm-workspace.yaml')).toBe(false)
+})
+
 test('logger warns about peer dependencies when linking', async () => {
   prepare()
 
@@ -311,55 +357,87 @@ test('logger should not warn about peer dependencies when adding a directory thr
   jest.mocked(logger.warn).mockRestore()
 })
 
-test('relative link from workspace package', async () => {
+function prepareLinkWorkspace (projectManifest: { name: string, version: string, dependencies?: Record<string, string> }) {
   prepareEmpty()
 
-  const rootProjectManifest = {
-    name: 'project',
-    version: '1.0.0',
-    dependencies: {
-      '@pnpm.e2e/hello-world-js-bin': '*',
-    },
-  }
-  writePackageSync('workspace/packages/project', rootProjectManifest)
+  const rootProjectManifest = { name: 'root', version: '1.0.0' }
+  writePackageSync('workspace', rootProjectManifest)
+  writePackageSync('workspace/packages/project', projectManifest)
   const workspaceDir = path.resolve('workspace')
   writeYamlFileSync(path.join(workspaceDir, 'pnpm-workspace.yaml'), { packages: ['packages/*'] })
 
   testFixtures.copy('hello-world-js-bin', 'hello-world-js-bin')
 
   const projectDir = path.resolve('workspace/packages/project')
-  const helloWorldJsBinDir = path.resolve('hello-world-js-bin')
-
   process.chdir(projectDir)
 
-  await link.handler({
-    ...DEFAULT_OPTS,
-    dedupeDirectDeps: false,
-    dir: process.cwd(),
-    globalPkgDir: '',
-    lockfileDir: workspaceDir,
-    rootProjectManifest,
-    rootProjectManifestDir: workspaceDir,
+  return {
+    projectDir,
     workspaceDir,
-    workspacePackagePatterns: ['packages/*'],
-  }, ['../../../hello-world-js-bin'])
+    helloWorldJsBinDir: path.resolve('../../../hello-world-js-bin'),
+    linkOpts: {
+      ...DEFAULT_OPTS,
+      dedupeDirectDeps: false,
+      dir: projectDir,
+      globalPkgDir: '',
+      lockfileDir: workspaceDir,
+      rootProjectManifest,
+      rootProjectManifestDir: workspaceDir,
+      workspaceDir,
+      workspacePackagePatterns: ['packages/*'],
+    },
+  }
+}
 
-  const manifest = readYamlFileSync<{ overrides?: Record<string, string> }>(path.join(workspaceDir, 'pnpm-workspace.yaml'))
-  expect(manifest.overrides?.['@pnpm.e2e/hello-world-js-bin']).toBe('link:../hello-world-js-bin')
+test('relative link from workspace package adds the dependency to that package', async () => {
+  const { projectDir, workspaceDir, helloWorldJsBinDir, linkOpts } = prepareLinkWorkspace({
+    name: 'project',
+    version: '1.0.0',
+  })
+
+  await link.handler(linkOpts, ['../../../hello-world-js-bin'])
+
+  const workspaceManifest = readYamlFileSync<{ overrides?: Record<string, string> }>(path.join(workspaceDir, 'pnpm-workspace.yaml'))
+  expect(workspaceManifest.overrides?.['@pnpm.e2e/hello-world-js-bin']).toBe('link:../hello-world-js-bin')
+
+  expect(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).dependencies).toStrictEqual({
+    '@pnpm.e2e/hello-world-js-bin': 'link:../../../hello-world-js-bin',
+  })
+  expect(JSON.parse(fs.readFileSync(path.join(workspaceDir, 'package.json'), 'utf8'))).toStrictEqual({
+    name: 'root',
+    version: '1.0.0',
+  })
 
   const workspace = assertProject(workspaceDir)
   ;[workspace.readLockfile(), workspace.readCurrentLockfile()].forEach(lockfile => {
-    expect(lockfile.importers['.'].dependencies?.['@pnpm.e2e/hello-world-js-bin'].version)
-      .toBe('link:../hello-world-js-bin')
+    expect(lockfile.importers['.'].dependencies).toBeUndefined()
     expect(lockfile.importers['packages/project'].dependencies?.['@pnpm.e2e/hello-world-js-bin'].version)
       .toBe('link:../../../hello-world-js-bin')
   })
 
-  const validateSymlink = (basePath: string) => {
-    process.chdir(path.join(basePath, 'node_modules', '@pnpm.e2e'))
-    expect(path.resolve(fs.readlinkSync('hello-world-js-bin'))).toBe(helloWorldJsBinDir)
-  }
+  expect(path.resolve(projectDir, 'node_modules/@pnpm.e2e', fs.readlinkSync(path.join(projectDir, 'node_modules/@pnpm.e2e/hello-world-js-bin'))))
+    .toBe(helloWorldJsBinDir)
+  expect(fs.existsSync(path.join(workspaceDir, 'node_modules/@pnpm.e2e/hello-world-js-bin'))).toBe(false)
+})
 
-  validateSymlink(workspaceDir)
-  validateSymlink(projectDir)
+test('relative link from workspace package overrides a dependency that the package already declares', async () => {
+  const { projectDir, workspaceDir, helloWorldJsBinDir, linkOpts } = prepareLinkWorkspace({
+    name: 'project',
+    version: '1.0.0',
+    dependencies: {
+      '@pnpm.e2e/hello-world-js-bin': '*',
+    },
+  })
+
+  await link.handler(linkOpts, ['../../../hello-world-js-bin'])
+
+  expect(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).dependencies).toStrictEqual({
+    '@pnpm.e2e/hello-world-js-bin': '*',
+  })
+
+  const workspace = assertProject(workspaceDir)
+  expect(workspace.readLockfile().importers['packages/project'].dependencies?.['@pnpm.e2e/hello-world-js-bin'].version)
+    .toBe('link:../../../hello-world-js-bin')
+  expect(path.resolve(projectDir, 'node_modules/@pnpm.e2e', fs.readlinkSync(path.join(projectDir, 'node_modules/@pnpm.e2e/hello-world-js-bin'))))
+    .toBe(helloWorldJsBinDir)
 })

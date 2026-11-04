@@ -123,7 +123,7 @@ pub(super) async fn warm_result_children<Chain>(
         return;
     }
     let opts = ctx.opts_for_depth(depth + 1);
-    let declaring_dir = declaring_manifest_dir(ctx, parent.result);
+    let declaring_dir = declaring_manifest_dir(&ctx.importer.lockfile_dir, parent.result);
     warmed
         .into_iter()
         .map(|(wanted, prior)| {
@@ -224,7 +224,9 @@ pub(super) async fn warm_child<Chain>(
     if child_id.starts_with("link:") {
         return;
     }
-    let landed_prior = prior.as_ref().filter(|key| landed_on_prior_entry(key, child_id));
+    let landed_prior = prior
+        .as_ref()
+        .filter(|key| landed_on_prior_entry(key, child_id, &ctx.workspace.cache.registry_context));
     warm_grandchildren(ctx, resolver, &child, landed_prior, parent_depth + 1).await;
 }
 

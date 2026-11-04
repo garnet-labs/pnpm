@@ -86,7 +86,11 @@ ephemeral per-process secrets. Use [`pnpr cache-gc`](cli.md#cache-gc) for
 on-demand or offline reclamation.
 
 The hosted store can instead live in an S3-compatible object store. See
-[Storage backends](storage.md).
+[Storage backends](storage.md). With the filesystem hosted store, package
+metadata lives in an embedded SQLite database by default. Several instances can
+share a [libSQL database](storage.md#libsql-metadata) instead, which an `s3:`
+block needs. The [`metadata` block](storage.md#sqlite-metadata) configures
+each of these.
 
 ## `registries` and `defaultRegistry`
 
@@ -206,14 +210,16 @@ registries:
 
 | Key | Description |
 | --- | --- |
-| `org` | [Storage namespace](storage.md#layout) for this registry's packages, so two hosted registries can hold the same `name@version` without colliding. Omitted means the default namespace, or `<ecosystem>~<name>` for a registry declared under an [ecosystem group](ecosystems.md#reusing-a-name-across-ecosystems). Must be a single path-safe segment. |
+| `org` | [Storage namespace](storage.md#layout) for this registry's packages, so two hosted registries can hold the same `name@version` without colliding. Omitted means the default namespace, or `<name>` for a registry declared under an [ecosystem group](ecosystems.md#reusing-a-name-across-ecosystems). Must be a single path-safe segment. |
 | `access` | The default read access for `packages:` entries that don't set their own. Defaults to `$all`. This is the only access field settable registry-wide. `publish` and `unpublish` belong to `packages:` entries. |
 | `teams` | Named user sets for this registry, referenced from its access lists as `team:<name>`. See [Teams](#teams). |
 | `packages` | The registry's namespace and per-package rules. See [above](#the-packages-map). Only these names can be served from or published to this registry. |
 | `tarballs` | The format this registry serves tarballs in: `tgz` (default) or `tar`. See [Tar registries](#tar-registries). |
 
-Two hosted registries cannot share an `org` namespace. That's rejected at
-config load.
+Two hosted registries of the same ecosystem cannot share an `org` namespace.
+That's rejected at config load. Hosted registries of different ecosystems can
+share an `org` because each ecosystem uses its own `<ecosystem>/` directory
+inside the namespace.
 
 The shape of a denial depends on who denied it. A caller that the
 registry-level `access:` default also denies is masked with a `404`. A
@@ -241,7 +247,7 @@ registries:
     url: https://npm.corp.example.com/
     auth:
       type: bearer
-      token_env: CORP_NPM_TOKEN
+      tokenEnv: CORP_NPM_TOKEN
     access: $authenticated
     packages:
       '@corp/*': {}
@@ -251,12 +257,12 @@ registries:
 | --- | --- |
 | `url` | Upstream registry URL. |
 | `public` | Marks an anonymous, world-readable origin (e.g. the public npm registry). A public upstream sends no credential and no custom headers; declaring `auth`, `access`, or `headers` alongside `public: true` is a config error. |
-| `auth` | Server-owned credential for a private origin. `type` is `bearer` or `basic`; provide `token`, or `token_env: true` to read `NPM_TOKEN`, or `token_env: NAME` to read a named environment variable. |
+| `auth` | Server-owned credential for a private origin. `type` is `bearer` or `basic`; provide `token`, or `tokenEnv: true` to read `NPM_TOKEN`, or `tokenEnv: NAME` to read a named environment variable. |
 | `headers` | Extra request headers to send upstream. If `headers.Authorization` is set, it overrides the `auth`-derived header. |
 | `access` | Which pnpr users may reach this registry at `/~<name>/` (and resolve through it). Required for a non-`public` upstream. |
 | `teams` | Named user sets for this registry, referenced from its access lists as `team:<name>`. See [Teams](#teams). |
 | `packages` | The names this upstream serves through pnpr. See [above](#the-packages-map). |
-| `maxAge` | Per-registry packument freshness window. Overrides [`packumentTtl`](#packumentttl) and `--packument-ttl` for this registry. Aliases: `maxage`, `max_age`. |
+| `maxAge` | Per-registry packument freshness window. Overrides [`packumentTtl`](#packumentttl) and `--packument-ttl` for this registry. |
 | `timeout` | Per-request upstream deadline. Defaults to `30s`. |
 | `maxFails` | Consecutive failures before the upstream circuit breaker opens. Defaults to `2`; `0` disables the breaker. |
 | `failTimeout` | Cooldown before an open circuit is probed again. Defaults to `5m`. |
@@ -326,7 +332,7 @@ A router also takes [`tarballs`](#tar-registries).
 
 ### Tar registries
 
-A registry with `tarballs: tar` serves each version as an uncompressed tar, the gzip-decoded content of its `.tgz`, with HTTP content coding the client's `Accept-Encoding` allows. Its metadata describes the tars: `dist.integrity` is the hash of the tar, and `dist.tarball`, `dist.shasum`, and `dist.signatures` are left out. A version with [registry revisions](https://pnpm.io/registry-revisions) keeps its `dist.tarball` on the digest route, its `dist.revision`, and its `dist.revisions` history, because a revision is always addressed by the digest of its tar. A tool that verifies npm signatures through its registry, such as `pnpm/setup`, needs a `.tgz` registry.
+A registry with `tarballs: tar` serves each version as an uncompressed tar, the gzip-decoded content of its `.tgz`, with HTTP content coding the client's `Accept-Encoding` allows. Its metadata describes the tars: `dist.integrity` is the hash of the tar, and `dist.tarball`, `dist.shasum`, and `dist.signatures` are left out. A version with [registry revisions](https://pnpm.io/registry-revisions) keeps its `dist.tarball` on the `<name>@<version>+r<revision>` route, its `dist.revision`, and its `dist.revisions` history, because a revision is always served as its uncompressed tar. A tool that verifies npm signatures through its registry, such as `pnpm/setup`, needs a `.tgz` registry.
 
 To offer tars next to `.tgz` files, add a router over the same sources:
 
@@ -356,7 +362,8 @@ npm, Yarn, and pnpm projects that do not opt in keep using `main`. A pnpm projec
 
 - Every registry serves a version's tarball at `<registry>/<name>@<version>`. A tar registry serves no `.tgz` path.
 - For an upstream package without fresh cached metadata, pnpr reads the version's metadata from `<upstream>/<name>/<version>`. If the upstream does not serve it, pnpr reads the package's full metadata.
-- pnpr keeps the published `.tgz` and derives the tar from it:
+- A hosted registry that declares `tarballs: tar` keeps no `.tgz`. At publish, pnpr compresses the tar at level 19 and stores only that. A `zstd` client gets the stored bytes, and any other client gets the tar decoded, compressed as the request accepts. pnpr refuses to start when a router without `tarballs: tar` lists such a registry as a source, because the router would have no `.tgz` to serve. npm signatures and provenance sign the `.tgz`, so these packages have neither.
+- For every other registry, pnpr keeps the published `.tgz` and derives the tar from it:
   - A `gzip` client gets the `.tgz` itself, which is the gzip encoding of its tar.
   - A `zstd` client gets a level-19 encoding once pnpr has stored one. Until then pnpr compresses the tar at level 3 as it streams, and a background worker stores the level-19 encoding. Tars larger than 256 MiB stay at level 3. The level-19 encodings live in the cache, so they can be evicted and are made again.
   - Any other client gets the tar uncompressed.
@@ -365,7 +372,7 @@ npm, Yarn, and pnpm projects that do not opt in keep using `main`. A pnpm projec
 - pnpr decodes at most 4.25 GiB from one `.tgz`, the most pnpm accepts by default. A version past that has no tar. Copies of tars waiting for the level-19 encoding share a 1 GiB quota, and a request makes no copy when it is full or when another request is already copying that version.
 - `tarballs` is accepted only on npm registries.
 
-You can also set `tarballs: tar` on the main router, so the base every pnpm project already uses serves tars. That works when all your clients are pnpm 12.15 or newer. npm, Yarn, and older pnpm cannot install from such a base: it has no `.tgz` path, and its metadata has no tarball URL, except for versions with [registry revisions](https://pnpm.io/registry-revisions). A project whose lockfile was written against the `.tgz` base has `.tgz` hashes in it, so run `pnpm install --update-checksums` there once after the switch.
+You can also set `tarballs: tar` on the main router, so the base every pnpm project already uses serves tars. That works when all your clients are pnpm 12.15 or newer and every project declares the base with `serverType: pnpr` in its [`registries`](https://pnpm.io/registries#tar-registries). Without that declaration, pnpm fails with "names no tarball URL". npm, Yarn, and older pnpm cannot install from such a base: it has no `.tgz` path, and its metadata has no tarball URL, except for versions with [registry revisions](https://pnpm.io/registry-revisions). A project whose lockfile was written against the `.tgz` base has `.tgz` hashes in it, so run `pnpm install --update-checksums` there once after the switch.
 
 ## Teams {#teams}
 
@@ -380,7 +387,7 @@ registries:
     url: https://npm.corp.example.com/
     auth:
       type: bearer
-      token_env: CORP_NPM_TOKEN
+      tokenEnv: CORP_NPM_TOKEN
     teams:
       platform: [alice, bob]
       frontend: [carol, dave]
@@ -523,7 +530,6 @@ CIDR-restricted bearer tokens. When omitted or empty, forwarding headers are ign
 and the socket peer IP is used directly.
 
 Supports exact IPs, CIDR notation (IPv4 and IPv6), and the `"loopback"` keyword.
-Accepts `trustedProxies` (camelCase) or `trusted_proxies` (snake_case).
 
 ## `trustedProxyHeader`
 
@@ -551,7 +557,6 @@ Defaults to `60s`. Set to `0` to disable timeouts.
 
 This timeout bounds request processing, authentication, and response generation. Once response headers are sent and streaming of the response body begins (such as for package tarballs or artifact blobs), active body transfers proceed without being interrupted by the timeout.
 
-Accepts `requestTimeout` (camelCase) or `request_timeout` (snake_case).
 Can be specified as an integer number of seconds (e.g. `30`) or with a duration suffix (e.g. `30s`, `1m`).
 
 ```yaml title="pnpr.yaml"
@@ -564,12 +569,50 @@ How long cached upstream packuments remain fresh before pnpr revalidates them ag
 
 Defaults to `5m`. Can be overridden per-process with the `--packument-ttl` CLI flag.
 
-Accepts `packumentTtl` (camelCase) or `packument_ttl` (snake_case).
 Can be specified as an integer number of seconds (e.g. `10`) or with a duration suffix (e.g. `10s`, `1m`).
 
 ```yaml title="pnpr.yaml"
 packumentTtl: 30s
 ```
+
+## `packageDocuments`
+
+How pnpr serves its own package document, which pnpm asks for from a registry
+declared [`serverType: pnpr`](https://pnpm.io/registries#servertype). See
+[pnpr's package document](endpoints.md#pnprs-package-document).
+
+```yaml title="pnpr.yaml"
+packageDocuments:
+  splitThreshold: 64KiB
+  publishTimeWindow: 30d
+```
+
+| Field | Meaning |
+| --- | --- |
+| `splitThreshold` | The size of a package's document with every manifest inline above which only the versions a resolution likely picks keep their manifests. pnpr decides on every read, so a document can go back below it, for example when a publish after a long gap drops the publish times that fall out of the window. Defaults to `64KiB`. |
+| `publishTimeWindow` | How far back from a package's last publish its versions keep their publish times. Defaults to `30d`, which is also the shortest window pnpr accepts. |
+
+## `releaseRecords`
+
+How pnpr logs the [release records](endpoints.md#pnprs-package-document) of
+the versions it hosts. Each
+hosted organization has a transparency log per ecosystem, in the
+[C2SP tiled log](https://c2sp.org/tlog-tiles) format Go's checksum database
+uses. A version's log entry is recorded in the same transaction that accepts
+the version. After the commit, pnpr adds the entry to the log's tiles and signs
+a new checkpoint. Tiles and checkpoints are kept in the hosted store, beside
+the archives.
+
+```yaml title="pnpr.yaml"
+releaseRecords:
+  logSigningKey: ${PNPR_LOG_SIGNING_KEY}
+  statementSigningKey: ${PNPR_STATEMENT_SIGNING_KEY}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `logSigningKey` | The signed-note private key that signs every log's checkpoints, `PRIVATE+KEY+<name>+<key hash>+<key>`, as Go's [`note.GenerateKey`](https://pkg.go.dev/golang.org/x/mod/sumdb/note#GenerateKey) writes one. Its name starts every log's origin: `<name>/npm` for the default organization, and `<name>/npm/~<organization>` for another one. Each log's checkpoints are signed with the same Ed25519 key under the log's origin. Without a key, pnpr records log entries but publishes no logs. Use [environment variable substitution](#environment-variable-substitution) rather than writing the key into the file. |
+| `statementSigningKey` | The signed-note private key, in the same format, that signs the registry's [in-toto statements](https://github.com/in-toto/attestation) about its records in DSSE envelopes. Its `<name>+<key hash>` is each signature's `keyid`. pnpr states that it accepted each logged record under its profile. Without a key, the records' evidence lists no statements. |
 
 ## Security limits and protections
 
@@ -603,13 +646,13 @@ auth:
     file: ./htpasswd
     # Self-registration is disabled when omitted or set to -1.
     # Set a non-negative cap to allow new users.
-    max_users: -1
+    maxUsers: -1
   tokens:
     # Optional. Defaults to a tokens.db sibling of the htpasswd file.
     file: ./tokens.db
 ```
 
-Omitted `max_users` means registration disabled, not unlimited registration.
+Omitted `maxUsers` means registration disabled, not unlimited registration.
 Existing users can still log in. When `auth.tokens.file` is omitted and
 `auth.htpasswd.file` is set, the token database defaults to `tokens.db` next to
 the htpasswd file.
@@ -881,7 +924,29 @@ Audit events record the `action`, the `actor` (the authenticated username, `"sci
 
 ### Prometheus metrics
 
-pnpr serves Prometheus metrics at `GET /-/metrics` (and `GET /metrics` for scrapers) in standard Prometheus text format (`text/plain; version=0.0.4`). Requests to `GET /metrics` carrying npm packument `Accept` headers receive the `metrics` package packument instead. Like health endpoints (`/-/ping`, `/-/ready`, `/-/live`), the metrics endpoints are intentionally unauthenticated to support telemetry scrapers:
+pnpr serves Prometheus metrics in the standard text format (`text/plain; version=0.0.4`) only when the config has a `metrics` block. The block needs a `token`, a `listen` address, or both:
+
+```yaml title="pnpr.yaml"
+metrics:
+  token: ${PNPR_METRICS_TOKEN}
+  listen: 127.0.0.1:9464
+```
+
+- `token`: the bearer token a scraper sends, at least 32 characters. Without `listen`, pnpr serves metrics at `GET /-/metrics` and `GET /metrics` on its main address, and refuses a request without the token with `401`.
+- `listen`: an address for a second listener that serves only `GET /metrics`. The main address then serves no metrics. Expose the main address and keep this one on a private network. With `token` set, the second listener requires it too.
+
+A Prometheus scrape job sends the token with `authorization`:
+
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: pnpr
+    authorization:
+      credentials_file: /etc/prometheus/pnpr-metrics-token
+    static_configs:
+      - targets: ["pnpr.internal:9464"]
+```
+
+The metrics are:
 
 - `pnpr_http_requests_in_flight` (gauge): number of requests currently being handled.
 - `pnpr_http_requests_total` (counter): requests served, labelled by `method` (normalized to standard HTTP methods or `OTHER`) and `status`.

@@ -86,6 +86,8 @@ pub(super) struct InstallScope<'w> {
     /// See [`crate::install::dependency_manifests_by_dir`]. The freshness
     /// checks compare an injected project's lockfile snapshot with these.
     pub(super) dependency_manifests: Option<ProjectManifestsByDir<'w>>,
+    /// See [`crate::RepeatInstallManifests::workspace_projects`].
+    pub(super) workspace_projects: Option<Vec<(PathBuf, &'w PackageManifest)>>,
 }
 impl<'a> InstallWorkspace<'a> {
     /// Consumes the catalogs and workspace-projects overrides off `owned`.
@@ -197,6 +199,10 @@ pub(super) fn workspace_projects<'s>(
     selection.map_or(loaded, |selection| Some(selection.all_projects))
 }
 impl<'w> InstallScope<'w> {
+    pub(super) fn declared_manifests(&self) -> crate::DeclaredManifests<'_> {
+        crate::DeclaredManifests::new(&self.project_manifests)
+    }
+
     pub(super) fn select(
         install: InstallView<'w>,
         workspace_root: &Path,
@@ -227,12 +233,18 @@ impl<'w> InstallScope<'w> {
             workspace_projects_are_overridden,
             config: install.context.config,
         });
+        let bin_projects = crate::install_state::validation::dedicated_bin_projects(
+            install.context.config,
+            &project_manifests,
+            workspace_projects,
+        );
         Self {
             project_manifests,
             importers,
             prune_stale_importers,
             project_scripts_current: false,
             dependency_manifests: dependency_manifests_by_dir(workspace_projects),
+            workspace_projects: bin_projects,
         }
     }
 
@@ -252,45 +264,62 @@ impl<'w> InstallScope<'w> {
         Some(dirs)
     }
 
+    /// The manifests the repeat-install check reads besides the importers'.
+    fn repeat_install_manifests<'s>(
+        &'s self,
+        owned: &'s InstallOwned,
+    ) -> crate::RepeatInstallManifests<'s> {
+        crate::RepeatInstallManifests {
+            dependency_manifests: self.dependency_manifests.as_ref(),
+            workspace_projects: self.workspace_projects.as_deref(),
+            hooks: owned.projects.pnpmfile_hook_override
+                .as_ref()
+                .map_or(crate::ManifestHooks::Pnpmfiles, crate::ManifestHooks::InMemory),
+        }
+    }
+
     pub(super) fn repeat_install_verdict(
         &self,
         install: InstallView<'_>,
         owned: &InstallOwned,
         mode: &RunMode,
         workspace: &InstallWorkspace<'_>,
+        repeat_install: crate::install_state::RepeatInstallCheck,
     ) -> Result<RepeatInstallVerdict, InstallError> {
         let selected_dirs = self.requested_project_dirs(&workspace.dirs.workspace_root);
-        repeat_install_verdict(&UpToDateCheck {
-            scope: selected_dirs
-                .as_deref()
-                .map_or(crate::optimistic_repeat_install::Scope::Workspace, |selected| {
-                    crate::optimistic_repeat_install::Scope::Selected(selected)
-                }),
-            workspace: super::super::OptimisticRepeatInstallCheck {
-                config: install.context.config,
-                workspace_root: &workspace.dirs.workspace_root,
-                project_manifests: &self.project_manifests,
-                is_workspace_install: workspace.workspace_manifest.is_some(),
-                lockfile: install.context.lockfile,
-                catalogs: &workspace.catalogs,
-                layout: crate::RepeatInstallLayout {
-                    node_linker: install.execution.node_linker,
-                    included: mode.included,
-                    supported_architectures: owned.projects
-                        .supported_architectures
-                        .as_ref(),
+        repeat_install_verdict(
+            &UpToDateCheck {
+                scope: selected_dirs
+                    .as_deref()
+                    .map_or(crate::install_state::Scope::Workspace, |selected| {
+                        crate::install_state::Scope::Selected(selected)
+                    }),
+                workspace: super::super::OptimisticRepeatInstallCheck {
+                    config: install.context.config,
+                    workspace_root: &workspace.dirs.workspace_root,
+                    project_manifests: self.declared_manifests(),
+                    is_workspace_install: workspace.workspace_manifest.is_some(),
+                    lockfile: install.context.lockfile,
+                    catalogs: &workspace.catalogs,
+                    layout: crate::RepeatInstallLayout {
+                        node_linker: install.execution.node_linker,
+                        included: mode.included,
+                        supported_architectures: owned.projects
+                            .supported_architectures
+                            .as_ref(),
+                    },
+                    manifests: self.repeat_install_manifests(owned),
                 },
-                manifests: crate::RepeatInstallManifests {
-                    dependency_manifests: self.dependency_manifests.as_ref(),
-                },
+                mutation: install.execution.mutation,
+                update_seed_policy: &owned.resolution.update_seed_policy,
+                frozen_lockfile: install.lockfile_policy.frozen,
+                resolve_only: mode.resolve_only,
+                disable_optimistic_repeat_install: install.lockfile_policy
+                    .disable_optimistic_repeat,
+                effective_node_version: mode.effective_node_version.as_deref(),
             },
-            mutation: install.execution.mutation,
-            update_seed_policy: &owned.resolution.update_seed_policy,
-            frozen_lockfile: install.lockfile_policy.frozen,
-            resolve_only: mode.resolve_only,
-            disable_optimistic_repeat_install: install.lockfile_policy.disable_optimistic_repeat,
-            effective_node_version: mode.effective_node_version.as_deref(),
-        })
+            repeat_install,
+        )
     }
 }
 /// Whether anything could declare a catalog this install has to resolve

@@ -75,7 +75,7 @@ export {
   MINIMUM_RELEASE_AGE_VIOLATION_CODE,
   TRUST_DOWNGRADE_VIOLATION_CODE,
 } from './violationCodes.js'
-export { pickMatchingLocalVersionOrNull } from './workspaceResolution.js'
+export { findWorkspaceLinkTarget, pickMatchingLocalVersionOrNull, type WorkspaceLinkContext } from './workspaceResolution.js'
 
 export interface ResolverFactoryOptions {
   cacheDir: string
@@ -95,6 +95,10 @@ export interface ResolverFactoryOptions {
   retry?: RetryTimeoutOptions
   timeout?: number
   registriesByScope: RegistriesByScope
+  /**
+   * The prefixes the project declares, as the user wrote them. The built-in
+   * aliases are merged in by the resolver.
+   */
   registriesByPrefix?: Record<string, string>
   saveWorkspaceProtocol?: boolean | 'rolling'
   preserveAbsolutePaths?: boolean
@@ -196,6 +200,7 @@ function createResolveFromNpmContext ({ fetch, metaCache, getAuthHeader, opts }:
     }),
     registriesByScope: opts.registriesByScope,
     registriesByPrefix,
+    declaredRegistriesByPrefix: opts.registriesByPrefix ?? {},
     namedRegistryNames: new Set(Object.keys(registriesByPrefix)),
     saveWorkspaceProtocol: opts.saveWorkspaceProtocol,
     ignoreMissingTimeField: opts.ignoreMissingTimeField,

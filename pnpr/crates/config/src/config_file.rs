@@ -1,16 +1,17 @@
 use super::{
     AccessSpec, ByteSize, Deserialize, Ecosystem, IndexMap, Interval, LogConfig, LogFormat,
-    LogLevel, Management, OciConfig, PackageAccess, PathBuf, S3Settings, ScimConfig, TarballFormat,
-    UpstreamAuthFile, default_storage_string, oidc,
+    LogLevel, Management, MetricsConfig, OciConfig, PackageAccess, PackageDocumentsFile, PathBuf,
+    ReleaseRecordsFile, S3Settings, ScimConfig, TarballFormat, UpstreamAuthFile,
+    default_storage_string, null_default::deserialize_null_default, oidc,
 };
 
 /// Disk shape of the `routes:` block.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct RoutesFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) public: Vec<PublicRouteFile>,
-    #[serde(default, alias = "allowed_private_networks")]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) allowed_private_networks: Vec<String>,
 }
 
@@ -46,7 +47,7 @@ pub(super) struct HostedFile {
     pub(super) ecosystem: Option<Ecosystem>,
     /// Storage namespace for this registry's packages, so two hosted registries can
     /// hold the same `name@version` without colliding. A grouped registry defaults
-    /// to `ecosystem~name`; a flat entry defaults to the storage root (`""`).
+    /// to `name`; a flat entry defaults to the default namespace (`""`).
     #[serde(default)]
     pub(super) org: Option<String>,
     /// The registry-level default: who may read this registry's packages when
@@ -57,22 +58,22 @@ pub(super) struct HostedFile {
     /// of member usernames. Referenced from this registry's access lists as
     /// `team:<name>` — teams are registry-scoped, never shared across
     /// registries (YAML anchors cover a shared roster in one file).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) teams: IndexMap<String, AccessSpec>,
     /// Whether `teams:` is the roster or only the seed of one the team API
     /// edits. Omitted ⇒ `config`.
-    #[serde(default, rename = "teamsManagedBy", alias = "teams_managed_by")]
+    #[serde(default)]
     pub(super) teams_managed_by: Management,
     /// Whether the `packages:` rules and `access:` are fixed, or a starting
     /// point the admin API may change. Omitted ⇒ `config`.
-    #[serde(default, rename = "rulesManagedBy", alias = "rules_managed_by")]
+    #[serde(default)]
     pub(super) rules_managed_by: Management,
     /// The names this registry serves and accepts publishes for — its
     /// namespace — with optional per-package `access`/`publish`/`unpublish`
     /// rules as values (`{}` or null ⇒ the registry defaults). The most
     /// specific matching key wins; key order carries no meaning. Omitted ⇒
     /// every name, default rules.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) packages: IndexMap<String, Option<PackageAccess>>,
     /// The format this registry serves tarballs in at its own URL. Omitted ⇒
     /// `tgz`.
@@ -106,15 +107,15 @@ pub(super) struct UpstreamFile {
     pub(super) public: bool,
     #[serde(default)]
     pub(super) auth: Option<UpstreamAuthFile>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) headers: IndexMap<String, String>,
-    #[serde(default, rename = "maxAge", alias = "maxage", alias = "max_age")]
+    #[serde(default, rename = "maxAge")]
     pub(super) maxage: Option<Interval>,
     #[serde(default)]
     pub(super) timeout: Option<Interval>,
-    #[serde(default, rename = "maxFails", alias = "max_fails")]
+    #[serde(default)]
     pub(super) max_fails: Option<u32>,
-    #[serde(default, rename = "failTimeout", alias = "fail_timeout")]
+    #[serde(default)]
     pub(super) fail_timeout: Option<Interval>,
     #[serde(default)]
     pub(super) cache: Option<bool>,
@@ -127,7 +128,7 @@ pub(super) struct UpstreamFile {
     pub(super) access: Option<AccessSpec>,
     /// This registry's teams, exactly as on a hosted registry — referenced
     /// from `access` and the per-package refinements as `team:<name>`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) teams: IndexMap<String, AccessSpec>,
     /// The names that may be requested through this registry — its namespace —
     /// with optional per-package `access` refinements as values (`{}` or null
@@ -135,7 +136,7 @@ pub(super) struct UpstreamFile {
     /// error, since no write can land on an upstream). Omitted ⇒ every name.
     /// Bounding a private upstream stops an authorized caller from pulling
     /// arbitrary public names through its server-owned credential.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) packages: IndexMap<String, Option<PackageAccess>>,
     /// The format this registry serves tarballs in at its own URL. Omitted ⇒
     /// `tgz`.
@@ -148,7 +149,7 @@ pub(super) struct UpstreamFile {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct RouterFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) sources: Vec<String>,
     /// The format this registry serves tarballs in at its own URL. Omitted ⇒
     /// `tgz`.
@@ -182,13 +183,13 @@ pub(super) enum CacheFile {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct CacheSettingsFile {
     #[serde(default)]
     pub(super) path: Option<String>,
-    #[serde(default, rename = "maxSize", alias = "max_size")]
+    #[serde(default)]
     pub(super) max_size: Option<ByteSize>,
-    #[serde(default, rename = "maxAge", alias = "max_age")]
+    #[serde(default)]
     pub(super) max_age: Option<Interval>,
 }
 
@@ -209,42 +210,48 @@ pub(super) struct ConfigFile {
     #[serde(default)]
     pub(super) cache: Option<CacheFile>,
     /// Reverse-proxy addresses trusted to supply client IP headers.
-    #[serde(default, rename = "trustedProxies", alias = "trusted_proxies")]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) trusted_proxies: Vec<String>,
     /// Header name trusted to supply client IP addresses (`x-forwarded-for`, `forwarded`, `x-real-ip`).
-    #[serde(default, rename = "trustedProxyHeader", alias = "trusted_proxy_header")]
+    #[serde(default)]
     pub(super) trusted_proxy_header: Option<String>,
     /// Request processing timeout (e.g. `60s`, `1m`).
-    #[serde(default, rename = "requestTimeout", alias = "request_timeout")]
+    #[serde(default)]
     pub(super) request_timeout: Option<Interval>,
     /// Duration before a cached packument is considered stale and refetched.
-    #[serde(
-        default,
-        rename = "packumentTtl",
-        alias = "packument_ttl",
-        alias = "packument_ttl_secs",
-        alias = "packumentTtlSecs"
-    )]
+    #[serde(default)]
     pub(super) packument_ttl: Option<Interval>,
+    /// pnpr-only: how pnpr's own package document is served.
+    #[serde(default)]
+    pub(super) package_documents: Option<PackageDocumentsFile>,
+    /// pnpr-only: how the release records of hosted versions are logged.
+    #[serde(default)]
+    pub(super) release_records: Option<ReleaseRecordsFile>,
     /// pnpr-only browser access policy. Cross-origin access stays disabled
     /// when this block is absent or its allowlist is empty.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) cors: CorsFile,
     /// pnpr-only web UI settings.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) ui: UiFile,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) oci: OciConfig,
+    /// Who may scrape Prometheus metrics. Omitted ⇒ pnpr serves none.
+    #[serde(default)]
+    pub(super) metrics: Option<MetricsConfig>,
     /// pnpr-only block: store the hosted (published) packages in an
     /// S3-compatible object store instead of `storage`.
     #[serde(default)]
     pub(super) s3: Option<S3Settings>,
+    /// pnpr-only block: where the hosted packages' metadata lives.
+    #[serde(default)]
+    pub(super) metadata: Option<crate::storage_config::MetadataFile>,
     /// pnpr-only block: back the auth record stores (users + tokens)
     /// with a shared SQL database.
     #[serde(default)]
     pub(super) backend: Option<BackendFile>,
     /// pnpr-only local OSV database settings.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) osv: OsvFile,
     /// pnpr-only feature toggle for the resolver surface. On unless
     /// explicitly disabled. `Option` so a bare `resolver:` (which YAML
@@ -262,11 +269,11 @@ pub(super) struct ConfigFile {
     pub(super) pipeline: Option<PipelineFeatureFile>,
     /// pnpr registries: hosted, upstream, and router origins, each
     /// exposed at `/~<name>/`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) registries: IndexMap<String, RegistryGroupFile>,
     /// The registry the path-less base URL aliases. Absent ⇒ the bare host has no
     /// registry and clients must address a `/~<name>/`.
-    #[serde(default, rename = "defaultRegistry", alias = "default_registry")]
+    #[serde(default)]
     pub(super) default_registry: Option<DefaultRegistryFile>,
     /// The removed top-level ACL block, kept only to *reject* it loudly.
     #[serde(default, deserialize_with = "detect_removed_block")]
@@ -295,7 +302,7 @@ pub(super) struct ConfigFile {
     /// Optional purpose-specific secrets for independent rotation.
     #[serde(default)]
     pub(super) secrets: Option<SecretsFile>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) auth: AuthFile,
     #[serde(default)]
     pub(super) log: Option<LogEntryFile>,
@@ -314,7 +321,7 @@ pub(super) struct SecretsFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct CorsFile {
-    #[serde(default, alias = "allowed_origins")]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) allowed_origins: Vec<String>,
 }
 
@@ -381,13 +388,13 @@ pub(super) fn default_log_type() -> String {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct AuthFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) admins: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) oidc: Vec<oidc::OidcProvider>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) htpasswd: HtpasswdFile,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) tokens: TokensFile,
     #[serde(default)]
     pub(super) scim: Option<ScimConfig>,
@@ -398,7 +405,7 @@ pub(super) struct AuthFile {
 pub(super) struct BackendFile {
     #[serde(default)]
     pub(super) libsql: Option<LibsqlFile>,
-    #[serde(default, alias = "postgresql")]
+    #[serde(default)]
     pub(super) postgres: Option<SqlBackendFile>,
     #[serde(default)]
     pub(super) mysql: Option<SqlBackendFile>,
@@ -407,32 +414,26 @@ pub(super) struct BackendFile {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct LibsqlFile {
-    pub(super) url: String,
-    #[serde(default, rename = "authToken", alias = "auth_token")]
-    pub(super) auth_token: Option<String>,
-    #[serde(default, rename = "replicaPath", alias = "replica_path")]
-    pub(super) replica_path: Option<PathBuf>,
-    #[serde(
-        default,
-        rename = "syncInterval",
-        alias = "sync_interval",
-        alias = "syncIntervalSecs",
-        alias = "sync_interval_secs"
-    )]
-    pub(super) sync_interval: Option<Interval>,
-    #[serde(default, rename = "maxConnections", alias = "max_connections")]
-    pub(super) max_connections: Option<u32>,
+    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) auth_token: Option<String>,
+    #[serde(default)]
+    pub(crate) replica_path: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) sync_interval: Option<Interval>,
+    #[serde(default)]
+    pub(crate) max_connections: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct SqlBackendFile {
     pub(super) url: String,
-    #[serde(default, rename = "maxConnections", alias = "max_connections")]
+    #[serde(default)]
     pub(super) max_connections: Option<u32>,
     #[serde(default)]
     pub(super) timeout: Option<Interval>,
-    #[serde(default, rename = "startupTimeout", alias = "startup_timeout")]
+    #[serde(default)]
     pub(super) startup_timeout: Option<Interval>,
 }
 
@@ -443,7 +444,7 @@ pub(super) struct HtpasswdFile {
     pub(super) file: Option<String>,
     /// `i64` so the sentinel `-1` (registration disabled)
     /// parses; anything `≥ 0` becomes a hard cap.
-    #[serde(default, rename = "maxUsers", alias = "max_users")]
+    #[serde(default)]
     pub(super) max_users: Option<i64>,
 }
 
@@ -488,18 +489,18 @@ impl Default for FeatureFile {
 pub(super) struct ArtifactsFeatureFile {
     #[serde(default)]
     pub(super) enabled: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) orgs: IndexMap<String, StorageAccessFile>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(super) quota: ArtifactQuotaFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ArtifactQuotaFile {
-    #[serde(rename = "ownerGiB", alias = "owner_gib")]
+    #[serde(rename = "ownerGiB")]
     pub(super) owner_gib: Option<u64>,
-    #[serde(rename = "totalGiB", alias = "total_gib")]
+    #[serde(rename = "totalGiB")]
     pub(super) total_gib: Option<u64>,
 }
 

@@ -557,3 +557,142 @@ diff --git a/package.json b/package.json
 
     drop((root, mock_instance));
 }
+
+#[cfg(unix)]
+#[test]
+fn deploy_preserves_links_to_dependencies_and_copies_file_links_to_unselected_targets() {
+    use std::{os::unix::fs::symlink, path::Path};
+
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages: [.]\ninjectWorkspacePackages: true\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "app", "version": "1.0.0", "files": [".next"],
+            "dependencies": {"local-dep": "file:vendor/local-dep"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join("vendor/local-dep")).unwrap();
+    fs::write(
+        workspace.join("vendor/local-dep/package.json"),
+        r#"{"name":"local-dep","version":"1.0.0","main":"index.cjs"}"#,
+    )
+    .unwrap();
+    fs::write(workspace.join("vendor/local-dep/index.cjs"), "module.exports = 42").unwrap();
+    pacquet
+        .with_args(["install", "--offline", "--ignore-scripts"])
+        .assert()
+        .success();
+    fs::create_dir_all(workspace.join(".next/node_modules/@scope")).unwrap();
+    fs::write(workspace.join("omitted.txt"), "omitted").unwrap();
+    fs::write(workspace.join(".next/control.txt"), "control").unwrap();
+    let links = [
+        ("node_modules/alias", "../../node_modules/local-dep"),
+        ("node_modules/@scope/alias", "../../../node_modules/local-dep"),
+        ("control-link", "control.txt"),
+        ("chain", "node_modules/alias"),
+    ];
+    for (name, target) in links {
+        symlink(target, workspace.join(".next").join(name)).unwrap();
+    }
+    symlink("../omitted.txt", workspace.join(".next/file-link")).unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join(".next/node_modules/alias/index.cjs")).unwrap(),
+        "module.exports = 42",
+    );
+    // A build restored without its `node_modules` leaves the aliases dangling.
+    for source_modules in ["installed", "removed"] {
+        if source_modules == "removed" {
+            fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+        }
+        for (mode, flags) in [("default", &[][..]), ("legacy", &["--legacy"][..])] {
+            let destination = root
+                .path()
+                .join(format!("{mode}-{source_modules}"));
+            let command = pacquet_cmd(&workspace)
+                .with_args([
+                    "--filter",
+                    "app",
+                    "deploy",
+                    "--prod",
+                    "--offline",
+                    "--ignore-scripts",
+                ]);
+            command
+                .with_args(flags)
+                .with_arg(&destination)
+                .assert()
+                .success();
+            for (name, target) in links {
+                assert_eq!(
+                    fs::read_link(destination.join(".next").join(name)).unwrap(),
+                    Path::new(target),
+                );
+            }
+            let file_link = destination.join(".next/file-link");
+            assert!(fs::symlink_metadata(&file_link).unwrap().is_file());
+            assert_eq!(fs::read_to_string(&file_link).unwrap(), "omitted");
+            let dependency = destination.join(".next/node_modules/alias/index.cjs");
+            assert_eq!(fs::read_to_string(&dependency).unwrap(), "module.exports = 42");
+            assert!(
+                fs::canonicalize(&dependency)
+                    .unwrap()
+                    .starts_with(fs::canonicalize(&destination).unwrap()),
+                "{dependency:?} must resolve inside {destination:?}",
+            );
+            assert!(
+                !destination.join("omitted.txt").exists(),
+                "unselected target must stay omitted",
+            );
+        }
+    }
+}
+
+/// Deploy writes its files with the mode the umask gives any new file, not 0600.
+#[cfg(unix)]
+#[test]
+fn deployed_files_get_the_umask_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |path: &std::path::Path| {
+        fs::metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, true);
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "deploy"])
+        .assert()
+        .success();
+
+    let reference = workspace.join("reference");
+    fs::File::create(&reference).unwrap();
+    let deploy_dir = workspace.join("deploy");
+    for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        let path = deploy_dir.join(file);
+        assert_eq!(mode(&path), mode(&reference), "{file} is {:o}", mode(&path));
+    }
+
+    drop((root, mock_instance));
+}

@@ -22,6 +22,16 @@ pub fn is_crates_io(index_url: &str) -> bool {
     index_url.trim_end_matches('/') == CRATES_IO_SPARSE_INDEX
 }
 
+/// Whether a `[patch.<key>]` table of a Cargo manifest replaces crates.io
+/// crates: `crates-io`, or the URL of the crates.io git or sparse index.
+#[must_use]
+pub fn patches_crates_io(key: &str) -> bool {
+    let url = key.trim_end_matches('/');
+    key == "crates-io"
+        || url == CRATES_IO_INDEX
+        || url.strip_prefix("sparse+").is_some_and(is_crates_io)
+}
+
 /// The `source` identifier of a sparse registry, as `cargo` spells it in
 /// `.cargo/config.toml` and in `Cargo.lock`.
 #[must_use]
@@ -122,6 +132,62 @@ pub fn latest_version(name: &str, index_file: &str) -> Result<String> {
         .find(|version| !version.yanked && version.version.pre.is_empty())
         .map(|version| version.version.to_string())
         .ok_or_else(|| miette::miette!("crate {name} has no stable, non-yanked version"))
+}
+
+/// The entries of `features` that version `version` of crate `name` does
+/// not define, read from its sparse-index entry. A dependency declaration
+/// that enables one of them cannot resolve to that version.
+pub fn missing_features(
+    name: &str,
+    index_file: &str,
+    version: &Version,
+    features: &[String],
+) -> Result<Vec<String>> {
+    let registry = Registry::new(
+        &BTreeMap::from([(name.to_string(), index_file.to_string())]),
+        CRATES_IO_SOURCE,
+    )?;
+    let package = registry
+        .package(name)?
+        .iter()
+        .find(|candidate| candidate.version == *version)
+        .ok_or_else(|| miette::miette!("crate {name} has no version {version} in its index"))?;
+    Ok(crate::features::missing_features(package, features)
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Return the newest non-yanked version from a crates.io sparse-index entry
+/// matching `requirement`, or the newest stable non-yanked version when
+/// `requirement` is `None`.
+pub fn latest_matching_version(
+    name: &str,
+    index_file: &str,
+    requirement: Option<&VersionReq>,
+) -> Result<Option<Version>> {
+    let registry = Registry::new(
+        &BTreeMap::from([(name.to_string(), index_file.to_string())]),
+        CRATES_IO_SOURCE,
+    )?;
+    let versions = registry.package(name)?;
+    let selected = match requirement {
+        Some(req) => versions
+            .iter()
+            .rev()
+            .find(|version| !version.yanked && req.matches(&version.version)),
+        None => versions
+            .iter()
+            .rev()
+            .find(|version| !version.yanked && version.version.pre.is_empty())
+            .or_else(|| {
+                versions
+                    .iter()
+                    .rev()
+                    .find(|version| !version.yanked)
+            }),
+    };
+    Ok(selected.map(|version| version.version.clone()))
 }
 
 fn parse_index_file(name: &str, contents: &str) -> Result<Vec<RegistryVersion>> {

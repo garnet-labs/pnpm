@@ -41,6 +41,7 @@ async fn main() {
         pnpm_repository.as_deref(),
         args.selection.with_pnpm,
         args.network.registry,
+        args.count_syscalls,
     );
 
     let build_only = args.build.build_only;
@@ -211,6 +212,7 @@ fn verify_prerequisites(
     pnpm_repository: Option<&std::path::Path>,
     with_pnpm: bool,
     registry_mode: RegistryMode,
+    count_syscalls: bool,
 ) {
     let has_pacquet_target = targets
         .iter()
@@ -235,6 +237,9 @@ fn verify_prerequisites(
     verify::ensure_program("bash");
     verify::ensure_program("git");
     verify::ensure_program("hyperfine");
+    if count_syscalls {
+        verify::ensure_program("strace");
+    }
     if needs_pacquet_repo {
         verify::ensure_program("cargo");
     }
@@ -267,7 +272,11 @@ fn seed_scenario_fixture(
         matches!(registry_mode, RegistryMode::Verdaccio),
         "the peer-heavy benchmark requires --registry=verdaccio",
     );
-    work_env::seed_peer_heavy_registry(pnpm_registry_mock::runtime_storage());
+    // Seed the fixtures first, so the scenario's packages go into the
+    // database the mocks serve.
+    pnpm_registry_mock::seed_runtime_storage()
+        .unwrap_or_else(|err| panic!("seed registry-mock fixtures into runtime storage: {err}"));
+    work_env::seed_peer_heavy_registry(&pnpm_registry_mock::runtime_metadata_path());
 }
 
 fn prepared_work_env(work_env: &std::path::Path) -> std::path::PathBuf {

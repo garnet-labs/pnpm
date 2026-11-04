@@ -2,6 +2,7 @@ use pnpm_config::Config;
 use pnpm_publish::{Access, OidcHttpOptions, PublishPackedPkgOptions};
 
 use super::PublishArgs;
+use crate::cli_args::release_notes::notes_registries;
 
 impl PublishArgs {
     /// Runs before git checks, packing, and any upload, so a rejected flag
@@ -14,6 +15,15 @@ impl PublishArgs {
     ) -> miette::Result<()> {
         if stage {
             self.publish_options(config, None, stage).validate()?;
+        }
+        if self.flags.variants.no_variants
+            && !self.flags.variants.variant_integrity.is_empty()
+        {
+            return Err(miette::miette!(
+                code = "ERR_PNPM_INVALID_VARIANT_FLAGS",
+                help = "--no-variants publishes only the archive packed here that targets any; --variant-integrity publishes the archives other jobs uploaded. Pass one of them.",
+                "--no-variants and --variant-integrity cannot be used together",
+            ));
         }
         if self.flags.batch && !recursive {
             return Err(miette::miette!(
@@ -55,6 +65,8 @@ impl PublishArgs {
                     fetch_timeout: Some(config.fetch_timeout),
                 },
             },
+            release_notes: self.release_notes_target(config),
+            pnpr_registries: notes_registries(config),
         }
     }
 

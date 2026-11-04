@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { resolveFromCatalog } from '@pnpm/catalogs.resolver'
 import type { Catalogs } from '@pnpm/catalogs.types'
+import { DEFAULT_REGISTRIES_BY_SCOPE } from '@pnpm/config.normalize-registries'
 import { refToRelative, removeSuffix } from '@pnpm/deps.path'
 import {
   getNonDevWantedDependencies,
@@ -16,7 +17,7 @@ import { nameVerFromPkgSnapshot } from '@pnpm/lockfile.utils'
 import { safeReadPackageJsonFromDir } from '@pnpm/pkg-manifest.reader'
 import { parseGitSpecCommittishAndPath } from '@pnpm/resolving.git-resolver'
 import type { DirectoryResolution } from '@pnpm/resolving.resolver-base'
-import type { DependencyManifest, ReadPackageHook } from '@pnpm/types'
+import type { DependencyManifest, ReadPackageHook, RegistryContext } from '@pnpm/types'
 import { safeReadParentPublishManifest, safeReadProjectManifestOnly } from '@pnpm/workspace.project-manifest-reader'
 import pEvery from 'p-every'
 import { pathExists } from 'path-exists'
@@ -62,7 +63,15 @@ export interface LocalDirectoryResolution {
    * again.
    */
   frozenLockfile?: boolean
+  /**
+   * How the registry of a locked child is decided, which a locked child must
+   * share with its spec. The default registries, which declare no prefix,
+   * when absent.
+   */
+  registries?: RegistryContext
 }
+
+const DEFAULT_REGISTRY_CONTEXT: RegistryContext = { registriesByScope: DEFAULT_REGISTRIES_BY_SCOPE }
 
 interface LocalDirectoryDep {
   lockfileDir: string
@@ -78,22 +87,27 @@ interface DependencyOfLocalDirectoryDep {
 }
 
 /**
- * Whether the dependencies of a local directory dependency still match its
- * lockfile snapshot. The package's children and the versions they accept are
- * the resolver's (see `getNonDevWantedDependencies` and
+ * Creates a check of whether the dependencies of a local directory dependency
+ * still match its lockfile snapshot. The package's children and the versions
+ * they accept are the resolver's (see `getNonDevWantedDependencies` and
  * `lockedVersionSatisfies`), read from its manifest after the read-package
  * hook. `parentPkgAliases` are the dependencies of the project that depends on
  * it, which supply its peers.
+ *
+ * The checks of one checker share the snapshots they visited, so a snapshot
+ * reached through several direct dependencies is walked once per peer scope.
+ * Create one checker per project.
  */
-export async function localDirectoryDepIsUpToDate (
-  ctx: LocalDirectoryDepContext,
-  pkgSnapshot: PackageSnapshot,
-  parentPkgAliases: Record<string, unknown> = {}
-): Promise<boolean> {
-  return localDirectoryDepIsUpToDateRec(ctx, pkgSnapshot, {
+export function createLocalDirectoryDepUpToDateChecker (
+  ctx: LocalDirectoryDepContext
+): (pkgSnapshot: PackageSnapshot, parentPkgAliases: Record<string, unknown>) => Promise<boolean> {
+  const visited = new Map<PackageSnapshot, Set<string>>()
+  // Collected on the first check, since most projects have no local directory dependency to check.
+  let recordedPeers: string[] | undefined
+  return async (pkgSnapshot, parentPkgAliases) => localDirectoryDepIsUpToDateRec(ctx, pkgSnapshot, {
     parentPkgAliases,
-    visited: new Map(),
-    recordedPeers: recordedPeersOf(ctx.lockfilePackages),
+    visited,
+    recordedPeers: recordedPeers ??= recordedPeersOf(ctx.lockfilePackages),
   })
 }
 
@@ -277,7 +291,7 @@ async function childIsUpToDate (
   const locked = lockedPackage(ctx, child.alias, lockfileDep)
   if (locked == null) return false
   if (isLockedToOtherSource(currentSpec, locked)) return false
-  return lockedVersionSatisfies({ alias: child.alias, bareSpecifier: currentSpec }, locked) ??
+  return lockedVersionSatisfies({ alias: child.alias, bareSpecifier: currentSpec }, locked, ctx.resolution?.registries ?? DEFAULT_REGISTRY_CONTEXT) ??
     (ctx.resolution?.frozenLockfile === true && locked.name === getTargetPkgName(currentSpec, child.alias))
 }
 

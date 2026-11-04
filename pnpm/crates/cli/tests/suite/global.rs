@@ -30,7 +30,7 @@ fn prepare_global_home(pnpm_home: &Path, npmrc_info: &AddMockedRegistry) {
     fs::write(
         pnpm_home.join("pnpm-workspace.yaml"),
         format!(
-            "storeDir: {}\ncacheDir: {}\nenableGlobalVirtualStore: false\n",
+            "storeDir: {}\ncacheDir: {}\n",
             npmrc_info.store_dir.display(),
             npmrc_info.cache_dir.display(),
         ),
@@ -299,7 +299,7 @@ fn global_add_creates_a_missing_global_bin_dir() {
     fs::write(
         pnpm_home.join("pnpm-workspace.yaml"),
         format!(
-            "storeDir: {}\ncacheDir: {}\nenableGlobalVirtualStore: false\n",
+            "storeDir: {}\ncacheDir: {}\n",
             npmrc_info.store_dir.display(),
             npmrc_info.cache_dir.display(),
         ),
@@ -350,13 +350,64 @@ fn global_add_installs_the_npm_package_a_purl_names() {
     let manifest = fs::read_to_string(install_dir.join("package.json"))
         .expect("read the global group manifest");
     assert!(manifest.contains(r#""node": "22.0.0""#), "{manifest}");
+    let installed = fs::canonicalize(install_dir.join("node_modules/node"))
+        .expect("resolve the installed node package");
+    let slots = fs::canonicalize(npmrc_info.store_dir.join("v11/links/@/node/22.0.0"))
+        .expect("resolve the node slots");
     assert!(
-        install_dir.join("node_modules/.pnpm/node@22.0.0").exists(),
-        "the npm package the purl names must be the one installed",
+        installed.starts_with(slots),
+        "the npm package the purl names must be the one installed: {installed:?}",
     );
 
     drop(npmrc_info);
     drop(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_add_normalizes_bin_parent_segments_and_removes_the_shim() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    for (target, file) in [
+        ("../dist/cli.js", "dist/cli.js"),
+        (r"..\dist\cli.js", "dist/cli.js"),
+        ("../dist/cli:dev.js", "dist/cli:dev.js"),
+    ] {
+        let CommandTempCwd { root, workspace, npmrc_info, .. } =
+            CommandTempCwd::init().add_mocked_registry();
+        let pnpm_home = root.path().join("pnpm-home");
+        prepare_global_home(&pnpm_home, &npmrc_info);
+        let package_dir = root.path().join("tool");
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            serde_json::json!({
+                "name": "example-tool",
+                "version": "1.0.0",
+                "bin": { "example-tool": target },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(package_dir.join(file), "#!/usr/bin/env node\nconsole.log('internal target')\n")
+            .unwrap();
+        let selector = format!("file:{}", package_dir.display());
+        global_command(&workspace, &pnpm_home)
+            .with_args(["add", "-g", &selector])
+            .assert()
+            .success();
+        let shim = pnpm_home.join("bin/example-tool");
+        Command::new(&shim)
+            .assert()
+            .success()
+            .stdout("internal target\n");
+        global_command(&workspace, &pnpm_home)
+            .with_args(["remove", "-g", "example-tool"])
+            .assert()
+            .success();
+        assert!(!shim.exists());
+        drop((root, npmrc_info));
+    }
 }
 
 /// A global add must materialize the added package's transitive
@@ -385,17 +436,49 @@ fn global_add_materializes_transitive_optional_dependencies() {
     assert_eq!(links.len(), 1, "exactly one cache-keyed hash symlink should exist: {links:?}");
     // The hash symlink's target is relative to the global packages dir.
     let install_dir = global_pkg_dir.join(fs::read_link(&links[0]).expect("read the hash symlink"));
-    let virtual_store = install_dir.join("node_modules").join(".pnpm");
+    let package_dir =
+        fs::canonicalize(install_dir.join("node_modules/@pnpm.e2e/pkg-with-good-optional"))
+            .expect("resolve the installed package");
+    let slot_modules_dir = package_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("the package sits in its slot's node_modules");
     assert!(
-        virtual_store.join("is-positive@1.0.0").exists(),
-        "the transitive optional dependency must be materialized",
+        slot_modules_dir.join("is-positive/package.json").exists(),
+        "the transitive optional dependency must be materialized and its alias symlink must resolve",
     );
-    assert!(
-        virtual_store
-            .join("@pnpm.e2e+pkg-with-good-optional@1.0.0/node_modules/is-positive/package.json")
-            .exists(),
-        "the optional dependency alias symlink must resolve",
-    );
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+/// A global group's packages live in the global virtual store, where Node
+/// cannot walk up to the group's hidden hoisted modules dir. The bin shim
+/// puts that dir on `NODE_PATH`, so a package that requires a dependency it
+/// does not declare still finds it (a native addon loader requiring its
+/// parent's platform package, for example).
+#[cfg(unix)]
+#[test]
+fn global_bin_resolves_hoisted_dependencies() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/bin-requires-hoisted-dep"])
+        .assert()
+        .success();
+
+    let output = Command::new(pnpm_home.join("bin/bin-requires-hoisted-dep"))
+        .current_dir(&workspace)
+        .env_remove("NODE_PATH")
+        .output()
+        .expect("run the installed global bin");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "@pnpm.e2e/dep-of-pkg-with-1-dep\n");
 
     drop(npmrc_info);
     drop(root);
@@ -1459,6 +1542,15 @@ fn global_update_requires_approval_for_the_immature_version() {
     drop((root, npmrc_info));
 }
 
+#[cfg(unix)]
+mod config_conflicts;
+
 mod shims;
 
 mod ownership;
+
+#[cfg(unix)]
+mod virtual_store;
+
+#[cfg(unix)]
+mod peers;

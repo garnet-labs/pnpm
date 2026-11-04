@@ -8,10 +8,10 @@ import { beforeEach, describe, expect, test } from '@jest/globals'
 import { LOCKFILE_VERSION } from '@pnpm/constants'
 import { getTarballIntegrity } from '@pnpm/crypto.hash'
 import type { LockfileObject, PackageSnapshot, ProjectSnapshot, TarballResolution } from '@pnpm/lockfile.types'
-import { allProjectsAreUpToDate, checkLinkedPackagesAreUpToDate, findPackageTarballIntegrityMismatch, resolveLocalTarballPath } from '@pnpm/lockfile.verification'
+import { allProjectsAreUpToDate, checkLinkedPackagesAreUpToDate, findPackageTarballIntegrityMismatch, localTarballDepsAreUpToDate, resolveLocalTarballPath } from '@pnpm/lockfile.verification'
 import { prepareEmpty } from '@pnpm/prepare'
 import type { WorkspacePackages } from '@pnpm/resolving.resolver-base'
-import type { DependencyManifest, DepPath, ProjectId, ProjectRootDir, ReadPackageHook } from '@pnpm/types'
+import type { BaseManifest, DependencyManifest, DepPath, ProjectId, ProjectRootDir, ReadPackageHook } from '@pnpm/types'
 import tar from 'tar-stream'
 
 const fooManifest = {
@@ -972,6 +972,45 @@ test('allProjectsAreUpToDate(): use link and registry version if linkWorkspacePa
   ).toBeTruthy()
 })
 
+test('allProjectsAreUpToDate(): accepts a workspace link that excludeLinksFromLockfile left out only when linkWorkspacePackages is on', async () => {
+  const projects = [
+    {
+      id: 'bar' as ProjectId,
+      manifest: {
+        dependencies: {
+          foo: '^1.0.0',
+        },
+      },
+      rootDir: 'bar' as ProjectRootDir,
+    },
+    {
+      id: 'foo' as ProjectId,
+      manifest: fooManifest,
+      rootDir: 'foo' as ProjectRootDir,
+    },
+  ]
+  const opts = {
+    autoInstallPeers: false,
+    catalogs: {},
+    excludeLinksFromLockfile: true,
+    wantedLockfile: {
+      importers: {
+        ['bar' as ProjectId]: {
+          specifiers: {},
+        },
+        ['foo' as ProjectId]: {
+          specifiers: {},
+        },
+      },
+      lockfileVersion: LOCKFILE_VERSION,
+    },
+    workspacePackages,
+    lockfileDir: '',
+  }
+  expect(await allProjectsAreUpToDate(projects, { ...opts, linkWorkspacePackages: true })).toBe(true)
+  expect(await allProjectsAreUpToDate(projects, { ...opts, linkWorkspacePackages: false })).toBe(false)
+})
+
 test('allProjectsAreUpToDate(): returns false if dependenciesMeta differs', async () => {
   expect(await allProjectsAreUpToDate([
     {
@@ -1468,6 +1507,46 @@ describe('transitive local directory dependency', () => {
   test('checkLinkedPackagesAreUpToDate(): accepts an unchanged chain of local directory dependencies', async () => {
     expect((await checkLinkedPackagesAreUpToDate(ctx(), project)).upToDate).toBe(true)
   })
+  test('checkLinkedPackagesAreUpToDate(): checks a shared transitive directory once across direct dependencies', async () => {
+    await mkdir('c')
+    await writeFile('./c/package.json', JSON.stringify({ name: 'c', version: '1.0.0', dependencies: { b: 'file:../b' } }))
+    const checkCountingReadsOfB = async (directDeps: Record<string, string>): Promise<number> => {
+      let bDependenciesReads = 0
+      const checkContext = {
+        ...ctx(),
+        hookedManifests: new Map(),
+        resolution: {
+          readPackageHook: async <Pkg extends BaseManifest>(manifest: Pkg) => {
+            if (manifest.name !== 'b') return manifest
+            return new Proxy(manifest, {
+              get (target, property, receiver) {
+                if (property === 'dependencies') bDependenciesReads++
+                return Reflect.get(target, property, receiver)
+              },
+            })
+          },
+        },
+        lockfilePackages: {
+          ...lockfilePackages,
+          'c@file:./c': {
+            resolution: { directory: './c', type: 'directory' },
+            version: '1.0.0',
+            dependencies: { b: 'file:./b' },
+          },
+        } as LockfileObject['packages'],
+      }
+      const projectWithDirectDeps = {
+        ...project,
+        manifest: { dependencies: directDeps },
+        snapshot: { dependencies: directDeps, specifiers: directDeps } as ProjectSnapshot,
+      }
+      expect((await checkLinkedPackagesAreUpToDate(checkContext, projectWithDirectDeps)).upToDate).toBe(true)
+      return bDependenciesReads
+    }
+    const readsThroughOneDirectDep = await checkCountingReadsOfB({ a: 'file:./a' })
+    expect(readsThroughOneDirectDep).toBeGreaterThan(0)
+    expect(await checkCountingReadsOfB({ a: 'file:./a', c: 'file:./c' })).toBe(readsThroughOneDirectDep)
+  })
   test('checkLinkedPackagesAreUpToDate(): reports a transitive local directory dependency whose own dependencies changed (pnpm/pnpm#17128)', async () => {
     await writeFile('./b/package.json', JSON.stringify({ name: 'b', version: '1.0.0', dependencies: { leaf: 'file:../leaf2' } }))
     expect((await checkLinkedPackagesAreUpToDate(ctx(), project)).upToDate).toBe(false)
@@ -1662,6 +1741,103 @@ describe('local tgz file dependency', () => {
 
     const lockfileDir = process.cwd()
     expect(await allProjectsAreUpToDate(projects, { ...options, lockfileDir })).toBeFalsy()
+  })
+
+  test.each([
+    ['unchanged', true],
+    ['replaced', false],
+  ])('localTarballDepsAreUpToDate(): checks a local file an injected project depends on when it is %s', async (state, upToDate) => {
+    const pack = tar.pack()
+    pack.entry({ name: 'package.json', mtime: new Date('1970-01-01T00:00:00.000Z') }, JSON.stringify({
+      name: 'local-tarball',
+      version: '1.0.0',
+    }))
+    if (state === 'replaced') pack.entry({ name: 'newly-added-file.txt' }, 'This file changes the tarball.')
+    pack.finalize()
+    await pipeline(pack, createWriteStream('./local-tarball.tar'))
+
+    expect(await localTarballDepsAreUpToDate({
+      fileIntegrityCache: new Map(),
+      lockfileDir: process.cwd(),
+      lockfilePackages: {
+        ...wantedLockfile.packages,
+        ['qux@file:qux' as DepPath]: {
+          resolution: { directory: 'qux', type: 'directory' },
+          dependencies: { 'local-tarball': 'file:local-tarball.tar' },
+        },
+      },
+    }, {
+      snapshot: { dependencies: { qux: 'file:qux' }, specifiers: { qux: 'workspace:*' } },
+    })).toBe(upToDate)
+  })
+
+  test('localTarballDepsAreUpToDate(): checks an aliased local file an injected project depends on', async () => {
+    const pack = tar.pack()
+    pack.entry({ name: 'package.json' }, JSON.stringify({ name: 'local-tarball', version: '1.0.0' }))
+    pack.entry({ name: 'newly-added-file.txt' }, 'This file changes the tarball.')
+    pack.finalize()
+    await pipeline(pack, createWriteStream('./local-tarball.tar'))
+
+    expect(await localTarballDepsAreUpToDate({
+      fileIntegrityCache: new Map(),
+      lockfileDir: process.cwd(),
+      lockfilePackages: {
+        ...wantedLockfile.packages,
+        ['qux@file:qux' as DepPath]: {
+          resolution: { directory: 'qux', type: 'directory' },
+          dependencies: { alias: 'local-tarball@file:local-tarball.tar' },
+        },
+      },
+    }, {
+      snapshot: { dependencies: { qux: 'file:qux' }, specifiers: { qux: 'workspace:*' } },
+    })).toBe(false)
+  })
+
+  test('localTarballDepsAreUpToDate(): skips the optional local file of a project whose production dependencies the install excludes', async () => {
+    const pack = tar.pack()
+    pack.entry({ name: 'package.json' }, JSON.stringify({ name: 'local-tarball', version: '1.0.0' }))
+    pack.entry({ name: 'newly-added-file.txt' }, 'This file changes the tarball.')
+    pack.finalize()
+    await pipeline(pack, createWriteStream('./local-tarball.tar'))
+
+    const check = async (dependencies: boolean) => localTarballDepsAreUpToDate({
+      fileIntegrityCache: new Map(),
+      includedDependencies: { dependencies, devDependencies: true, optionalDependencies: true },
+      lockfileDir: process.cwd(),
+      lockfilePackages: wantedLockfile.packages,
+    }, {
+      snapshot: {
+        optionalDependencies: { 'local-tarball': 'file:local-tarball.tar' },
+        specifiers: { 'local-tarball': 'file:local-tarball.tar' },
+      },
+    })
+    expect(await check(false)).toBe(true)
+    expect(await check(true)).toBe(false)
+  })
+
+  test('localTarballDepsAreUpToDate(): skips an optional local file the install excludes', async () => {
+    const pack = tar.pack()
+    pack.entry({ name: 'package.json' }, JSON.stringify({ name: 'local-tarball', version: '1.0.0' }))
+    pack.entry({ name: 'newly-added-file.txt' }, 'This file changes the tarball.')
+    pack.finalize()
+    await pipeline(pack, createWriteStream('./local-tarball.tar'))
+
+    const check = async (optionalDependencies: boolean) => localTarballDepsAreUpToDate({
+      fileIntegrityCache: new Map(),
+      includedDependencies: { dependencies: true, devDependencies: true, optionalDependencies },
+      lockfileDir: process.cwd(),
+      lockfilePackages: {
+        ...wantedLockfile.packages,
+        ['qux@file:qux' as DepPath]: {
+          resolution: { directory: 'qux', type: 'directory' },
+          optionalDependencies: { 'local-tarball': 'file:local-tarball.tar' },
+        },
+      },
+    }, {
+      snapshot: { dependencies: { qux: 'file:qux' }, specifiers: { qux: 'workspace:*' } },
+    })
+    expect(await check(false)).toBe(true)
+    expect(await check(true)).toBe(false)
   })
 
   test('findPackageTarballIntegrityMismatch(): reports a changed local file', async () => {
@@ -2510,3 +2686,54 @@ test('checkLinkedPackagesAreUpToDate(): skips comparing on-disk manifest for dep
   })
 })
 
+
+// https://github.com/pnpm/pnpm/issues/17486
+describe('local directory dependency beneath a registry package', () => {
+  beforeEach(async () => {
+    prepareEmpty()
+    await mkdir('lib')
+    await writeFile('./lib/package.json', JSON.stringify({ name: 'lib', version: '1.0.0', dependencies: { leaf: '1.0.0' } }))
+  })
+  const lockfilePackages = {
+    'reg@1.0.0': {
+      resolution: { integrity: 'sha512-reg' },
+      version: '1.0.0',
+      dependencies: { child: 'lib@file:lib' },
+    },
+    'lib@file:lib': {
+      resolution: { directory: 'lib', type: 'directory' },
+      version: '1.0.0',
+      dependencies: { leaf: '1.0.0' },
+    },
+    'leaf@1.0.0': { resolution: { integrity: 'sha512-leaf' }, version: '1.0.0' },
+    'other@1.0.0': { resolution: { integrity: 'sha512-other' }, version: '1.0.0' },
+  } as LockfileObject['packages']
+  const projectDependingOn = (name: string) => ({
+    dir: path.resolve('app'),
+    manifest: { dependencies: { [name]: '1.0.0' } },
+    snapshot: {
+      dependencies: { [name]: '1.0.0' },
+      specifiers: { [name]: '1.0.0' },
+    } as ProjectSnapshot,
+  })
+  const ctx = () => ({
+    linkWorkspacePackages: true,
+    manifestsByDir: {},
+    lockfilePackages,
+    lockfileDir: process.cwd(),
+  })
+  test('checkLinkedPackagesAreUpToDate(): accepts an unchanged directory beneath a registry package', async () => {
+    expect((await checkLinkedPackagesAreUpToDate(ctx(), projectDependingOn('reg'))).upToDate).toBe(true)
+  })
+  test('checkLinkedPackagesAreUpToDate(): reports a directory beneath a registry package whose dependencies changed', async () => {
+    await writeFile('./lib/package.json', JSON.stringify({ name: 'lib', version: '1.0.0', dependencies: { leaf: '2.0.0' } }))
+    expect(await checkLinkedPackagesAreUpToDate(ctx(), projectDependingOn('reg'))).toStrictEqual({
+      upToDate: false,
+      detailedReason: 'The dependencies of local directory dependency "lib@file:lib" do not match the lockfile',
+    })
+  })
+  test('checkLinkedPackagesAreUpToDate(): leaves a directory beneath a registry package to the projects that reach it', async () => {
+    await writeFile('./lib/package.json', JSON.stringify({ name: 'lib', version: '1.0.0', dependencies: { leaf: '2.0.0' } }))
+    expect((await checkLinkedPackagesAreUpToDate(ctx(), projectDependingOn('other'))).upToDate).toBe(true)
+  })
+})

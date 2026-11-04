@@ -4,9 +4,9 @@ use super::{
     InitType, LinkWorkspacePackages, LogLevel, NodeLinker, NodePackageMapMode, NodePackageMapType,
     PackageImportMethod, PackageManagerBootstrap, PathBuf, Pipe, PmOnFail, ProjectConfig,
     PythonSettings, RegistryOptions, RemoteCacheSettings, RemoteSideEffectsCacheSettings,
-    ReporterType, ResolutionMode, RuntimeOnFail, SaveWorkspaceProtocol, ScriptsPrependNodePath,
-    SmartDefault, StoreDir, StoreIndexFormat, SystemTime, Tool, ToolSettings, TrustPolicy,
-    VerifyDepsBeforeRun, WorkspaceKeyIssues, default_cache_dir, default_child_concurrency,
+    ReporterType, ResolutionMode, RuntimeOnFail, SaveWorkspaceProtocol, SmartDefault, StoreDir,
+    StoreIndexFormat, SystemTime, Tool, ToolSettings, TrustPolicy, VerifyDepsBeforeRun,
+    WorkspaceKeyIssues, default_cache_dir, default_child_concurrency,
     default_enable_global_virtual_store, default_fetch_min_speed_ki_bps, default_fetch_retries,
     default_fetch_retry_factor, default_fetch_retry_maxtimeout, default_fetch_retry_mintimeout,
     default_fetch_timeout, default_fetch_warn_timeout_ms, default_git_shallow_hosts,
@@ -17,6 +17,7 @@ use super::{
     default_virtual_store_dir_max_length, default_workspace_concurrency, is_ci, npmrc_auth,
     side_effects_cache_remote_env, source_date_epoch, workspace_yaml,
 };
+use crate::MacosBackupConfig;
 
 /// The two hoist patterns as one value, for
 /// [`Config::hoist_patterns_before_virtual_store_only`].
@@ -24,17 +25,6 @@ use super::{
 pub struct HoistPatterns {
     pub hoist_pattern: Option<Vec<String>>,
     pub public_hoist_pattern: Option<Vec<String>>,
-}
-
-/// Machine-local macOS Time Machine policy. Both directories remain eligible
-/// for backup unless the user opts out in the global pnpm configuration or
-/// through `PNPM_CONFIG_*` environment variables.
-#[derive(Debug, Clone, SmartDefault)]
-pub struct MacosBackupConfig {
-    #[default = false]
-    pub exclude_modules_dir: bool,
-    #[default = false]
-    pub exclude_store_dir: bool,
 }
 
 /// Resolved runtime config built from defaults, the auth subset of
@@ -616,6 +606,11 @@ pub struct Config {
     /// Add the full URL to the package's tarball to every entry in pnpm-lock.yaml.
     pub lockfile_include_tarball_url: bool,
 
+    /// The directories a changed lockfile may be written to through a
+    /// symlink. The `symlinkedLockfileTargetDirs` setting. Default empty: such a
+    /// write fails.
+    pub symlinked_lockfile_target_dirs: Vec<PathBuf>,
+
     /// Record `autoDedupe`, `dedupeInjectedDeps`, `dedupePeerDependents` and
     /// `linkWorkspacePackages` in the lockfile's `settings`, so a lockfile
     /// resolved under other values counts as outdated. The
@@ -1164,8 +1159,9 @@ pub struct Config {
 
     /// The `skills` decisions of `permissions` in `pnpm-workspace.yaml`:
     /// package names (or `name@version`, or a pkgId) mapped to whether
-    /// pnpm links the agent skills the package ships.
-    pub allow_skills: HashMap<String, bool>,
+    /// pnpm links the agent skills the package ships, or to the named
+    /// skills it links when the entry is a list.
+    pub allow_skills: HashMap<String, workspace_yaml::SkillsPermission>,
 
     /// `skills.dirs` from `pnpm-workspace.yaml`: the agent skill
     /// directories, relative to the workspace root, that replace the
@@ -1216,6 +1212,16 @@ pub struct Config {
     #[default(true)]
     pub git_checks: bool,
 
+    /// The branch `pnpm publish` allows when git checks run. `None` allows
+    /// `master` or `main`. The `--publish-branch` flag overrides it.
+    pub publish_branch: Option<String>,
+
+    /// `pnpm version` creates a git commit and tag for the bump. Setting it to
+    /// `false` in `pnpm-workspace.yaml` or `PNPM_CONFIG_GIT_TAG_VERSION`, or
+    /// passing `--no-git-tag-version`, skips both.
+    #[default = true]
+    pub git_tag_version: bool,
+
     /// Maximum time in milliseconds to wait for published versions and their
     /// tarballs to become available. Zero disables the check.
     pub publish_wait_timeout: u64,
@@ -1233,12 +1239,6 @@ pub struct Config {
     /// the prefix. Default `"v"`.
     #[default(_code = "default_tag_version_prefix()")]
     pub tag_version_prefix: String,
-
-    /// `scriptsPrependNodePath` from `pnpm-workspace.yaml`. Controls
-    /// whether `dirname(node_execpath)` is prepended to `PATH` when
-    /// running lifecycle scripts. Default `Never` (`scriptsPrependNodePath:
-    /// false`). Yaml accepts `true` / `false` / `"warn-only"`.
-    pub scripts_prepend_node_path: ScriptsPrependNodePath,
 
     /// `enablePrePostScripts` from `pnpm-workspace.yaml`. When `true`,
     /// `pnpm run <name>` also runs the `pre<name>` and `post<name>`

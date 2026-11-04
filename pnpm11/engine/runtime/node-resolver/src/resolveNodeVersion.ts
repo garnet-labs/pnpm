@@ -30,10 +30,10 @@ export async function resolveNodeVersion (
   const allVersions = await fetchAllVersions(createAuthenticatedFetch(fetch, getAuthHeader), nodeMirrorBaseUrl)
   versionSpec = normalizeRuntimeSpec(versionSpec)
   if (versionSpec === 'latest') {
-    return allVersions[0].version
+    return latestVersion(allVersions)
   }
   const { versions, versionRange } = filterVersions(allVersions, versionSpec)
-  return semver.maxSatisfying(versions, versionRange, SEMVER_OPTS) ?? null
+  return maxSatisfyingVersion(versions, versionRange)
 }
 
 export async function resolveNodeVersions (
@@ -48,10 +48,22 @@ export async function resolveNodeVersions (
   }
   versionSpec = normalizeRuntimeSpec(versionSpec)
   if (versionSpec === 'latest') {
-    return [allVersions[0].version]
+    const latest = latestVersion(allVersions)
+    return latest == null ? [] : [latest]
   }
   const { versions, versionRange } = filterVersions(allVersions, versionSpec)
   return versions.filter(version => semver.satisfies(version, versionRange, SEMVER_OPTS))
+}
+
+function latestVersion (versions: NodeVersion[]): string | null {
+  const latest = versions.find(({ version }) => semver.valid(version) != null && semver.prerelease(version) == null) ?? versions[0]
+  return latest?.version ?? null
+}
+
+function maxSatisfyingVersion (versions: string[], versionRange: string): string | null {
+  const stableVersions = versions.filter(version => semver.prerelease(version, SEMVER_OPTS) == null)
+  return semver.maxSatisfying(stableVersions, versionRange, SEMVER_OPTS) ??
+    semver.maxSatisfying(versions, versionRange, SEMVER_OPTS)
 }
 
 export function normalizeRuntimeSpec (versionSpec: string): string {

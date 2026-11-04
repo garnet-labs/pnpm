@@ -9,15 +9,16 @@ pub(crate) use cached_rows::{load_cached_cas_paths, load_legacy_synthesized_cas_
 
 use super::{
     Arc, ArchiveStoreProjection, HashMap, IntoParallelIterator, PackageContentCheck,
-    ParallelIterator, PathBuf, TarballError,
+    ParallelIterator, TarballError,
 };
 use pnpm_package_manifest::{
-    files_build_triggers, requires_build_from_cas_paths, stored_requires_build_needs_manifest_check,
+    requires_build_from_cas_paths, requires_build_from_files,
+    stored_requires_build_needs_manifest_check,
 };
 use pnpm_reporter::{GlobalLog, LogEvent, LogLevel};
 use pnpm_store_dir::{
     PackageFilesIndex, PendingFilesCheck, PkgContentMismatch, SharedReadonlyStoreIndex,
-    SharedVerifiedFilesCache, StoreDir,
+    SharedVerifiedFilesCache, StoreDir, files_maps,
 };
 
 /// Pre-fetched cas-paths map shared across all per-snapshot futures.
@@ -26,9 +27,9 @@ use pnpm_store_dir::{
 ///
 /// Values are `Arc`-wrapped so the cold-batch fallback can hand a hit
 /// back as a cheap pointer-clone rather than memcpy-ing the whole
-/// per-file map (each entry is a `HashMap<String, PathBuf>` with up
+/// per-file map (each entry is a `pnpm_fs::CasPaths` with up
 /// to ~hundred entries, so the deep clone is a hot-path cost).
-pub type PrefetchedCasPaths = HashMap<String, Arc<HashMap<String, PathBuf>>>;
+pub type PrefetchedCasPaths = HashMap<String, Arc<pnpm_fs::CasPaths>>;
 
 /// Bundled package manifests recovered from the `SQLite` store index,
 /// keyed by the same `<integrity>\t<pkg_id>` string [`PrefetchedCasPaths`]
@@ -162,7 +163,12 @@ impl PrefetchResult {
         let failed: Vec<String> = checks
             .into_par_iter()
             .filter_map(|(cache_key, check)| {
-                (!check.verify(store_dir, verified_files_cache)).then_some(cache_key)
+                let no_files = pnpm_store_dir::FilesMap::new();
+                let files = self.cas_paths.get(&cache_key).map_or(&no_files, |files| &**files);
+                let overlays = self.side_effects_maps.get(&cache_key).map(|maps| &**maps);
+                let passed =
+                    check.verify(store_dir, verified_files_cache, &files_maps(files, overlays));
+                (!passed).then_some(cache_key)
             })
             .collect();
         for cache_key in &failed {
@@ -346,23 +352,6 @@ fn decode_matching_prefetch_entry(cache_key: &str, bytes: &[u8]) -> Option<Packa
     Some(entry)
 }
 
-/// Derive `requiresBuild` for a store-index row that does not carry it, from
-/// the row's bundled manifest and its file list.
-fn row_requires_build<Filenames, Filename>(
-    manifest: Option<&serde_json::Value>,
-    filenames: Filenames,
-) -> bool
-where
-    Filenames: IntoIterator<Item = Filename>,
-    Filename: AsRef<str>,
-{
-    let mut triggers = files_build_triggers(filenames);
-    if let Some(manifest) = manifest {
-        triggers.read_manifest(manifest);
-    }
-    triggers.requires_build()
-}
-
 /// A git-hosted row (one that records `requiresPrepare`) with no bundled
 /// manifest derives `requiresBuild` from its files and ignores the stored
 /// value, which existing stores may hold wrong
@@ -371,7 +360,7 @@ fn resolve_row_requires_build(
     stored: Option<bool>,
     stored_requires_prepare: Option<bool>,
     manifest: Option<&serde_json::Value>,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &pnpm_fs::CasPaths,
 ) -> bool {
     if stored_requires_prepare.is_some() && manifest.is_none() {
         return requires_build_from_cas_paths(cas_paths);
@@ -381,7 +370,7 @@ fn resolve_row_requires_build(
             requires_build_from_cas_paths(cas_paths)
         }
         Some(stored) => stored,
-        None => row_requires_build(manifest, cas_paths.keys()),
+        None => requires_build_from_files(manifest, cas_paths.keys()),
     }
 }
 

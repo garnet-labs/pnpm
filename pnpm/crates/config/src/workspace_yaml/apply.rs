@@ -1,8 +1,7 @@
 use super::{
     Config, LockfileSetting, NodePackageMapMode, Path, PnpmfileSetting, ProxyKeys, ProxyValue,
     SideEffectsCacheSetting, StoreDir, UpdateConfig, WorkspaceSettings, no_proxy_scalar, overlay,
-    overlay_some, overlay_tools, registries, resolve, resolve_child_concurrency,
-    warn_deprecated_pairing,
+    overlay_some, registries, resolve, resolve_child_concurrency, warn_deprecated_pairing,
 };
 use pnpm_network::normalize_registry_url;
 
@@ -55,11 +54,6 @@ impl WorkspaceSettings {
 
         self.apply_node_package_map(config);
 
-        if let Some(macos_backup) = self.macos_backup.take() {
-            overlay(&mut config.macos_backup.exclude_modules_dir, macos_backup.exclude_modules_dir);
-            overlay(&mut config.macos_backup.exclude_store_dir, macos_backup.exclude_store_dir);
-        }
-
         overlay_some(&mut config.pipeline_base, self.pipeline_base.take());
         if let Some(concurrency_groups) = self.concurrency_groups.take() {
             config.concurrency_groups.extend(concurrency_groups);
@@ -67,12 +61,6 @@ impl WorkspaceSettings {
 
         if let Some(virtual_store_type) = virtual_store_type {
             config.enable_global_virtual_store = virtual_store_type.is_global();
-        }
-
-        // `globalShims` merges key-wise instead of replacing,
-        // so a layer can flip one package without restating the defaults.
-        if let Some(global_shims) = self.global_shims.take() {
-            config.global_shims.apply(&global_shims);
         }
 
         self.apply_update_settings(config, update_config_in_yaml);
@@ -167,12 +155,6 @@ impl WorkspaceSettings {
         if let Some(v) = self.global_virtual_store_dir.take() {
             config.global_virtual_store_dir = resolve(base_dir, &v);
         }
-        if let Some(v) = self.global_dir.take() {
-            config.global_dir = Some(resolve(base_dir, &v));
-        }
-        if let Some(v) = self.global_bin_dir.take() {
-            config.global_bin_dir = Some(resolve(base_dir, &v));
-        }
         // Last of the path-valued settings: pinning the lockfile dir
         // re-resolves `modulesDir` / `virtualStoreDir` against it, so it
         // must see whatever this layer set.
@@ -191,11 +173,9 @@ impl WorkspaceSettings {
         if let Some(v) = self.registry.take() {
             config.registry = normalize_registry_url(&v).into_owned();
         }
-        overlay_some(&mut config.scope, self.scope.take());
         overlay_some(&mut config.pnpr_server, self.pnpr_server.take());
         overlay(&mut config.cargo, self.cargo.take());
         overlay(&mut config.python, self.python.take());
-        overlay_tools(&mut config.tools, self.tools.take());
         if let Some(v) = self.remote_side_effects_cache.take() {
             config.remote_side_effects_cache.get_or_insert_default().overlay(v);
         }
@@ -325,6 +305,8 @@ impl WorkspaceSettings {
         overlay(&mut config.ignore_scripts, self.ignore_scripts.take());
         overlay(&mut config.ignore_pnpmfile, self.ignore_pnpmfile.take());
         overlay(&mut config.git_checks, self.git_checks.take());
+        overlay(&mut config.git_tag_version, self.git_tag_version.take());
+        overlay_some(&mut config.publish_branch, self.publish_branch.take());
         overlay(&mut config.engine_strict, self.engine_strict.take());
         overlay(&mut config.force_ignores_platform, self.force_ignores_platform.take());
         overlay_some(&mut config.node_version, self.node_version.take());
@@ -341,7 +323,6 @@ impl WorkspaceSettings {
         // file carries both.
         overlay_some(&mut config.max_sockets, self.maxsockets.take());
         overlay_some(&mut config.max_sockets, self.max_sockets.take());
-        overlay(&mut config.scripts_prepend_node_path, self.scripts_prepend_node_path.take());
         overlay(&mut config.script_shell, self.script_shell.take());
         overlay(&mut config.node_options, self.node_options.take());
         overlay(&mut config.unsafe_perm, self.unsafe_perm.take());
@@ -439,11 +420,12 @@ impl WorkspaceSettings {
         overlay_some(&mut config.audit_ignore_prune, audit.ignore_prune);
     }
 
-    /// An invalid `localAddress` clears the one a lower source set, as
-    /// it does between `.npmrc` layers.
-    fn apply_tls_to(&mut self, tls: &mut pnpm_network::TlsConfig) {
-        overlay_some(&mut tls.strict_ssl, self.strict_ssl.take());
-        if let Some(local_address) = self.local_address.take() {
+    /// Overlay `strictSsl` and `localAddress` onto `tls`, the project's or
+    /// the package-manager bootstrap's. An invalid `localAddress` clears the
+    /// one a lower source set, as it does between `.npmrc` layers.
+    pub(crate) fn apply_tls_to(&self, tls: &mut pnpm_network::TlsConfig) {
+        overlay_some(&mut tls.strict_ssl, self.strict_ssl);
+        if let Some(local_address) = self.local_address.as_deref() {
             tls.local_address = local_address.parse().ok();
         }
     }

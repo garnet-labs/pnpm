@@ -34,24 +34,28 @@ impl CustomFetcherSession {
                 CustomFetchOutcome::Fetched { resolution, tarball } => {
                     (resolution, None, Some(tarball))
                 }
+                CustomFetchOutcome::FetchedFiles { resolution, package } => {
+                    let resolution = recorded_resolution(original, resolution);
+                    self.cache_package(download.package.id, &resolution, &package);
+                    return Ok(ResolvedTarballMetadata { resolution, manifest: package.manifest });
+                }
                 CustomFetchOutcome::Declined(resolution) => (resolution, None, None),
                 CustomFetchOutcome::Delegate { resolution, delegate } => {
                     (resolution, Some(delegate), None)
                 }
+                // A directory is mutable source, so its walk is not cached.
+                CustomFetchOutcome::Walked { resolution, directory } => {
+                    return Ok(unarchived(original, resolution, directory.manifest));
+                }
             };
         let source = delegate.as_ref().unwrap_or(&resolution);
-        let tarball = if let Some(tarball) = fetched {
-            tarball
-        } else {
-            let Some(tarball) =
-                fetch_source::<Reporter>(&download, source, &lockfile_dir, config).await?
-            else {
-                return Ok(ResolvedTarballMetadata {
-                    resolution: recorded_resolution(original, resolution),
-                    manifest: None,
-                });
-            };
-            tarball
+        let tarball = match fetched {
+            Some(tarball) => tarball,
+            None => match fetch_source::<Reporter>(&download, source, &lockfile_dir, config).await?
+            {
+                Some(tarball) => tarball,
+                None => return Ok(unarchived(original, resolution, None)),
+            },
         };
         let mut metadata =
             resolve_archive_metadata((&resolution, source), &tarball, download.package.id).await?;
@@ -101,7 +105,10 @@ impl CustomFetcherSession {
         self.completed
             .lock()
             .unwrap()
-            .insert((package_id.to_owned(), identity.to_owned()), tarball);
+            .insert(
+                (package_id.to_owned(), identity.to_owned()),
+                super::CompletedFetch::Tarball(tarball),
+            );
     }
 }
 
@@ -115,6 +122,18 @@ fn recorded_resolution(
     // `canFetch` left on it, which `decode_resolution` strips only from
     // resolutions that have no `type`.
     if matches!(original, LockfileResolution::Custom(_)) { original.clone() } else { fetched }
+}
+
+/// The metadata of a fetch that produced no archive to read the manifest from.
+fn unarchived(
+    original: &LockfileResolution,
+    resolution: LockfileResolution,
+    manifest: Option<Value>,
+) -> ResolvedTarballMetadata {
+    ResolvedTarballMetadata {
+        resolution: recorded_resolution(original, resolution),
+        manifest: manifest.map(Arc::new),
+    }
 }
 
 /// Where in a git-hosted archive the package is installed from, `Some(None)`

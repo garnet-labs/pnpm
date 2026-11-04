@@ -1,23 +1,26 @@
+import path from 'node:path'
+
 import { isError } from '@pnpm/error'
 import { getWantedLockfileName } from '@pnpm/lockfile.fs'
 import { globalWarn } from '@pnpm/logger'
 import type { Project } from '@pnpm/types'
 import { findWorkspaceProjectsNoCheck } from '@pnpm/workspace.projects-reader'
-import { loadWorkspaceState, normalizeUnsetSetting, WORKSPACE_STATE_SETTING_KEYS, type WorkspaceState, type WorkspaceStateSettings } from '@pnpm/workspace.state'
+import { loadWorkspaceState, normalizeUnsetSetting, recordedRegistryKeySettings, recordedRegistryRoutes, type RegistryKeySettings, resolveStoreLocationSettings, WORKSPACE_STATE_SETTING_KEYS, type WorkspaceState, type WorkspaceStateSettings } from '@pnpm/workspace.state'
 import { readWorkspaceManifest } from '@pnpm/workspace.workspace-manifest-reader'
 import { equals } from 'ramda'
 
 import { checkRootProjectDepsStatus } from './checkRootProjectDepsStatus.js'
 import { checkWorkspaceDepsStatus } from './checkWorkspaceDepsStatus.js'
-import { findLocalFileDepsIssue } from './findLocalFileDepsIssue.js'
+import { findLocalFileDepsIssue, findRecordedLocalDependencyIssue } from './findLocalFileDepsIssue.js'
 import { outdatedResult } from './outdatedResult.js'
+import { storeBaseDir } from './storeBaseDir.js'
 import type { CheckDepsStatusOptions, CheckDepsStatusResult } from './types.js'
 import { getWantedLockfileDirs, scanWantedLockfiles } from './wantedLockfiles.js'
 
 export type { CheckDepsStatusOptions, CheckDepsStatusResult } from './types.js'
 
 export async function checkDepsStatus (opts: CheckDepsStatusOptions): Promise<CheckDepsStatusResult> {
-  const workspaceState = loadWorkspaceState(opts.lockfileDir ?? opts.workspaceDir ?? opts.rootProjectManifestDir)
+  const workspaceState = loadWorkspaceState(workspaceStateDir(opts))
   if (!workspaceState) {
     if (opts.allProjects == null && opts.workspaceDir == null && opts.rootProjectManifest == null) {
       // There is no project here at all (for example, a mistyped command fell
@@ -99,6 +102,12 @@ async function _checkDepsStatus (opts: CheckDepsStatusOptions, workspaceState: W
   return { upToDate: undefined, workspaceState }
 }
 
+function workspaceProjectDirs ({ allProjects, rootProjectManifestDir }: CheckDepsStatusOptions): Set<string> {
+  const dirs = new Set((allProjects ?? []).map(({ rootDir }) => path.resolve(rootDir)))
+  if (rootProjectManifestDir != null) dirs.add(path.resolve(rootProjectManifestDir))
+  return dirs
+}
+
 /**
  * The result of the checks that do not read the lockfiles, or `undefined`
  * when those checks pass.
@@ -110,7 +119,7 @@ function checkWithoutLockfiles (opts: CheckDepsStatusOptions, workspaceState: Wo
   // (the only one setting this flag) "up-to-date" would skip the install
   // and break the local-file-deps guarantee.
   if (opts.treatLocalFileDepsAsOutdated) {
-    const localFileDepsIssue = findLocalFileDepsIssue(opts)
+    const localFileDepsIssue = findLocalFileDepsIssue(opts) ?? findRecordedLocalDependencyIssue(workspaceState, workspaceProjectDirs(opts))
     if (localFileDepsIssue != null) return outdatedResult(localFileDepsIssue, workspaceState)
   }
 
@@ -139,7 +148,7 @@ function isUnfilteredWorkspaceInstall (opts: CheckDepsStatusOptions): boolean {
 
 function findSettingsIssue (opts: CheckDepsStatusOptions, workspaceState: WorkspaceState): string | undefined {
   if (workspaceState.settings) {
-    const changedSetting = findChangedSetting(opts, workspaceState.settings)
+    const changedSetting = findChangedSetting(opts, workspaceState.settings) ?? findChangedRegistrySettings(opts, workspaceState.settings)
     if (changedSetting != null) return `The value of the ${changedSetting} setting has changed`
   }
   if ((opts.configDependencies != null || workspaceState.configDependencies != null) && !equals(opts.configDependencies ?? {}, workspaceState.configDependencies ?? {})) {
@@ -149,16 +158,71 @@ function findSettingsIssue (opts: CheckDepsStatusOptions, workspaceState: Worksp
 }
 
 function findChangedSetting (opts: CheckDepsStatusOptions, storedSettings: WorkspaceState['settings']): string | undefined {
+  const stateDir = workspaceStateDir(opts)
+  const storeLocation: Partial<WorkspaceStateSettings> = resolveStoreLocationSettings(opts, {
+    stateDir,
+    storeBaseDir: storeBaseDir(opts, stateDir),
+  })
   const ignoredSettings = new Set<keyof WorkspaceStateSettings>(opts.ignoredWorkspaceStateSettings)
   ignoredSettings.add('catalogs')
   for (const settingName of WORKSPACE_STATE_SETTING_KEYS) {
     if (ignoredSettings.has(settingName as keyof WorkspaceStateSettings)) continue
-    const settingKey = settingName as keyof WorkspaceStateSettings
-    const storedValue = normalizeUnsetSetting(settingKey, storedSettings[settingKey])
-    const currentValue = normalizeUnsetSetting(settingKey, opts[settingKey])
+    const [storedValue, currentValue] = settingValues(settingName as keyof WorkspaceStateSettings, { opts, storedSettings, storeLocation })
     if (!equals(storedValue, currentValue)) return settingName
   }
   return undefined
+}
+
+interface SettingSources {
+  opts: CheckDepsStatusOptions
+  storedSettings: WorkspaceState['settings']
+  storeLocation: Partial<WorkspaceStateSettings>
+}
+
+/**
+ * The recorded and the current value of `settingKey`, in the form they are
+ * compared in.
+ */
+function settingValues (settingKey: keyof WorkspaceStateSettings, { opts, storedSettings, storeLocation }: SettingSources): [unknown, unknown] {
+  if (settingKey === 'patchedDependencies') {
+    const workspaceDir = opts.workspaceDir ?? opts.rootProjectManifestDir
+    return [resolvePatchFiles(storedSettings.patchedDependencies, workspaceDir), resolvePatchFiles(opts.patchedDependencies, workspaceDir)]
+  }
+  return [
+    normalizeUnsetSetting(settingKey, storedSettings[settingKey]),
+    normalizeUnsetSetting(settingKey, settingKey in storeLocation ? storeLocation[settingKey] : opts[settingKey]),
+  ]
+}
+
+/**
+ * pnpm v12 records each patch file as configured, and this CLI records it
+ * resolved against the workspace directory. Resolving both forms there
+ * compares the files they name. An unset map names none, as an empty one does.
+ */
+function resolvePatchFiles (patchedDependencies: Record<string, string> | undefined, workspaceDir: string): Record<string, string> {
+  return Object.fromEntries(Object.entries(patchedDependencies ?? {}).map(([selector, patchFile]) => [selector, path.resolve(workspaceDir, patchFile)]))
+}
+
+function workspaceStateDir (opts: CheckDepsStatusOptions): string {
+  return opts.lockfileDir ?? opts.workspaceDir ?? opts.rootProjectManifestDir
+}
+
+/**
+ * A state records the declared prefixes only for a lockfile whose keys carry
+ * them, so a missing or different record calls for the install that re-keys
+ * the lockfile. It records the routes the lockfile's plain keys resolved
+ * through, so a different record calls for the install that resolves the
+ * moved keys again.
+ */
+function findChangedRegistrySettings (opts: CheckDepsStatusOptions, storedSettings: WorkspaceState['settings']): string | undefined {
+  const ignored = new Set(opts.ignoredWorkspaceStateSettings)
+  if (!ignored.has('registryPrefixes') && !registryKeySettingsMatch(storedSettings, recordedRegistryKeySettings(opts))) return 'registryPrefixes'
+  if (ignored.has('registryRoutes') || opts.registriesByScope == null) return undefined
+  return equals(storedSettings.registryRoutes, recordedRegistryRoutes(opts.registriesByScope)) ? undefined : 'registryRoutes'
+}
+
+function registryKeySettingsMatch (stored: WorkspaceState['settings'], live: RegistryKeySettings): boolean {
+  return equals(stored.registryPrefixes, live.registryPrefixes) && stored.defaultRegistry === live.defaultRegistry
 }
 
 /**

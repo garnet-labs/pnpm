@@ -31,7 +31,7 @@ import { makeRunPacquet, type MakeRunPacquetOpts } from './runPacquet.js'
 import { verifyPacquetIdentity } from './verifyPacquetIdentity.js'
 import { preferNonvulnerablePackageVersions } from './vulnerabilityPreferences.js'
 import { warnAboutNestedWorkspaceManifests } from './warnAboutNestedWorkspaceManifests.js'
-import { recursiveInstallThenUpdateWorkspaceState } from './workspaceStateUpdate.js'
+import { loadLockedRegistriesByScope, recursiveInstallThenUpdateWorkspaceState } from './workspaceStateUpdate.js'
 
 export { createVulnerabilityUpdateMatching } from './vulnerabilityPreferences.js'
 
@@ -173,17 +173,22 @@ export type InstallDepsOptions = Pick<Config,
    * subcommand.
    */
   isInstallCommand?: boolean
-} & Partial<Pick<Config, 'dangerouslyAllowAllBuilds' | 'dryRun' | 'pnpmHomeDir' | 'strictDepBuilds' | 'useLockfile' | 'useGitBranchLockfile' | 'mergeGitBranchLockfiles'>>
+  /** See `RegistryContext.lockedRegistriesByScope`; read from the workspace state by `installDeps`. */
+  lockedRegistriesByScope?: Record<string, string>
+} & Partial<Pick<Config, 'dangerouslyAllowAllBuilds' | 'dryRun' | 'frozenLockfile' | 'pnpmHomeDir' | 'strictDepBuilds' | 'useLockfile' | 'useGitBranchLockfile' | 'mergeGitBranchLockfiles'>>
 
 export async function installDeps (
   opts: InstallDepsOptions,
   params: string[]
 ): Promise<DryRunInstallResult | undefined> {
   if (await reportAlreadyUpToDate(opts, params)) return undefined
+  opts.lockedRegistriesByScope = loadLockedRegistriesByScope(opts)
   if (opts.workspace) {
     applyWorkspaceOption(opts)
   }
-  const store = await createStoreController(opts)
+  // A copy, because the store controller writes the resolved store into its
+  // options, and the workspace state must record the configured `storeDir`.
+  const store = await createStoreController({ ...opts })
   const runPacquet = await createPacquetRunner(opts)
   const includeDirect = opts.includeDirect ?? {
     dependencies: true,

@@ -186,6 +186,7 @@ pub(super) fn update_install<'i>(
             pnpmfile_hook_override: read_package_hook.map(|(hook, _)| Arc::clone(hook)),
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
 }
@@ -193,7 +194,7 @@ fn update_execution(update: &UpdateOptions<'_>) -> crate::InstallExecution {
     crate::InstallExecution {
         skip_runtimes: update.config.skip_runtimes,
         mutation: update_mutation(update.selection.packages, update.version.latest),
-        installs_only: true,
+        installs_only: false,
         node_linker: update.config.node_linker,
         lockfile_only: update.lockfile_only,
         dry_run: false,

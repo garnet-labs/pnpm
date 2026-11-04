@@ -1,15 +1,13 @@
-mod revision_refs;
-
 mod hosted_backend;
 
 use super::{
     Arc, AsyncReadExt, AsyncSeekExt, BLOBS_DIR, BlobFinalize, BlobWrite, Body, BoxStream,
     CachedDocument, CanonicalPackageName, DOCUMENT_FILE, DocumentStamp, DocumentWrite, Duration,
-    ErrorKind, GetRange, HOSTED_REVISION_REF_INDEX_FILE, HOSTED_REVISION_REFS_DIR, HostedBackend,
-    HostedBlobFile, HostedDocumentForUpdate, HostedDocumentVersion, HostedRevisionRefIndex,
-    HostedRevisionRefWrite, PACKAGES_DIR, Path, PathBuf, RangedBlob, RegistryError, Result,
-    SeekFrom, StreamExt, SystemTime, async_trait, create_tmp_file, decode_segment, encode_segment,
-    fs, stream, streaming, unique_tmp_path, write_atomic, write_atomic_new,
+    Ecosystem, ErrorKind, GetRange, HostedBackend, HostedBlobFile, HostedDocumentForUpdate,
+    HostedDocumentVersion, PACKAGES_DIR, Path, PathBuf, RangedBlob, RegistryError, Result,
+    SeekFrom, StreamExt, SystemTime, async_trait, blob_segment, create_tmp_file,
+    decode_blob_segment, decode_package_segments, fs, package_segments, stream, streaming,
+    unique_tmp_path, write_atomic, write_atomic_new,
 };
 
 /// One on-disk store rooted at a single directory, laid out as
@@ -17,7 +15,7 @@ use super::{
 #[derive(Debug, Clone)]
 pub(super) struct Store {
     pub(super) root: PathBuf,
-    pub(super) revision_ref_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) ecosystem: Ecosystem,
     /// Serializes the read-compare-write of a record against every other
     /// write to it, removals included. One process owns this store, so an
     /// in-process lock is the whole of the compare-and-set the object-store
@@ -29,7 +27,7 @@ impl Store {
     pub(super) fn new(root: PathBuf) -> Self {
         Self {
             root,
-            revision_ref_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ecosystem: Ecosystem::Npm,
             record_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -40,7 +38,15 @@ impl Store {
     pub(super) fn namespaced(&self, prefix: &str) -> Store {
         Store {
             root: self.root.join(prefix),
-            revision_ref_write_lock: Arc::clone(&self.revision_ref_write_lock),
+            ecosystem: self.ecosystem,
+            record_write_lock: Arc::clone(&self.record_write_lock),
+        }
+    }
+
+    pub(super) fn with_ecosystem(&self, ecosystem: Ecosystem) -> Store {
+        Store {
+            root: self.root.clone(),
+            ecosystem,
             record_write_lock: Arc::clone(&self.record_write_lock),
         }
     }
@@ -144,20 +150,6 @@ impl Store {
         self.open_blob_tmp_at(final_path).await
     }
 
-    pub(super) async fn open_revision_blob(&self, digest: &str) -> Result<Option<(fs::File, u64)>> {
-        let file = match fs::File::open(self.revision_blob_path(digest)).await {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let len = file.metadata().await?.len();
-        Ok(Some((file, len)))
-    }
-
-    pub(super) async fn open_revision_blob_tmp(&self, digest: &str) -> Result<BlobWrite> {
-        self.open_blob_tmp_at(self.revision_blob_path(digest)).await
-    }
-
     pub(super) async fn open_blob_tmp_at(&self, final_path: PathBuf) -> Result<BlobWrite> {
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -223,31 +215,10 @@ impl Store {
         }
     }
 
-    /// Every package with a document, decoded and sorted.
-    pub(super) async fn list_package_names(&self) -> Result<Vec<String>> {
-        let mut names = Vec::new();
-        let Some(mut entries) = read_dir_if_present(&self.root.join(PACKAGES_DIR)).await? else {
-            return Ok(names);
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let segment = entry.file_name();
-            let Some(name) = segment.to_str().and_then(decode_segment) else {
-                continue;
-            };
-            if entry.file_type().await?.is_dir()
-                && is_regular_file(&entry.path().join(DOCUMENT_FILE)).await?
-            {
-                names.push(name);
-            }
-        }
-        names.sort();
-        Ok(names)
-    }
-
     pub(super) fn package_dir(&self, name: &CanonicalPackageName) -> PathBuf {
-        self.root
-            .join(PACKAGES_DIR)
-            .join(encode_segment(name.as_str()))
+        let mut dir = self.root.join(PACKAGES_DIR);
+        dir.extend(package_segments(name.ecosystem(), name.as_str()));
+        dir
     }
 
     pub(super) fn document_path(&self, name: &CanonicalPackageName) -> PathBuf {
@@ -257,16 +228,7 @@ impl Store {
     pub(super) fn blob_path(&self, name: &CanonicalPackageName, filename: &str) -> PathBuf {
         self.package_dir(name)
             .join(BLOBS_DIR)
-            .join(encode_segment(filename))
-    }
-
-    /// Keyed by the digest of the revision's tar. `.revisions/sha512` holds
-    /// blobs a `.tgz` digest named, which this path never serves.
-    pub(super) fn revision_blob_path(&self, digest: &str) -> PathBuf {
-        self.root
-            .join(".revisions")
-            .join("tar-sha512")
-            .join(digest)
+            .join(blob_segment(name.as_str(), filename))
     }
 
     /// A record's path. The key's `/` separators become path components, so a
@@ -326,23 +288,6 @@ impl Store {
         }
     }
 
-    pub(super) async fn remove_record_if_current(
-        &self,
-        namespace: &str,
-        key: &str,
-        expected: &[u8],
-    ) -> Result<bool> {
-        let _guard = self.record_write_lock.lock().await;
-        if self.read_record(namespace, key).await?.as_deref() != Some(expected) {
-            return Ok(false);
-        }
-        match fs::remove_file(self.record_path(namespace, key)).await {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(err.into()),
-        }
-    }
-
     pub(super) async fn list_record_keys(&self, namespace: &str) -> Result<Vec<String>> {
         let root = self.root.join(namespace);
         let mut keys = Vec::new();
@@ -364,9 +309,68 @@ impl Store {
     }
 }
 
-/// Whether `path` is a regular file, not following a symlink.
-pub(super) async fn is_regular_file(path: &Path) -> Result<bool> {
-    Ok(symlink_metadata_if_present(path).await?.is_some_and(|metadata| metadata.is_file()))
+/// Every package directory below `packages`, with its decoded name.
+/// `file_type` does not follow a symlink, so a link cannot lead a listing, or
+/// the deletions that act on it, out of the store.
+pub(super) async fn package_dirs(
+    packages: &Path,
+    ecosystem: Ecosystem,
+) -> Result<Vec<(String, PathBuf)>> {
+    let mut dirs = Vec::new();
+    let mut pending = Vec::new();
+    for (segment, dir) in subdirs(packages).await? {
+        if segment.starts_with(crate::layout::MARKER) {
+            pending.push((vec![segment], dir));
+        }
+    }
+    while let Some((segments, parent_dir)) = pending.pop() {
+        for (segment, dir) in subdirs(&parent_dir).await? {
+            visit_package_entry(ecosystem, &segments, segment, dir, &mut pending, &mut dirs);
+        }
+    }
+    Ok(dirs)
+}
+
+fn visit_package_entry(
+    ecosystem: Ecosystem,
+    segments: &[String],
+    segment: String,
+    dir: PathBuf,
+    pending: &mut Vec<(Vec<String>, PathBuf)>,
+    dirs: &mut Vec<(String, PathBuf)>,
+) {
+    let mut next = segments.to_vec();
+    let is_prefix = segment.starts_with(crate::layout::MARKER);
+    next.push(segment);
+    if is_prefix {
+        if ecosystem == Ecosystem::Oci && next.len() < 128 {
+            pending.push((next, dir));
+        }
+        return;
+    }
+    let refs: Vec<&str> = next
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if let Some(name) = decode_package_segments(ecosystem, &refs) {
+        dirs.push((name, dir));
+    }
+}
+
+/// The directories directly in `dir` with UTF-8 names.
+async fn subdirs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut dirs = Vec::new();
+    let Some(mut entries) = read_dir_if_present(dir).await? else {
+        return Ok(dirs);
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir()
+            && let Ok(name) = entry.file_name().into_string()
+        {
+            dirs.push((name, entry.path()));
+        }
+    }
+    Ok(dirs)
 }
 
 /// Whether `path` is a directory, not following a symlink.

@@ -28,6 +28,31 @@ separating the package selector from the dependency selector with a ">", for
 example `qar@1>zoo` will only override the `zoo` dependency of `qar@1`, not for
 any other dependencies.
 
+Both the parent selector and the target selector support `*` wildcard patterns on package names:
+
+```yaml title="pnpm-workspace.yaml"
+overrides:
+  "@esbuild/*:optional": "-"
+  "@mui/*>react:peer": "^17.0.0 || ^18.0.0"
+```
+
+#### Dependency-type selectors
+
+By default, an override applies to `dependencies`, `devDependencies`, `optionalDependencies`, and `peerDependencies`. Append a [Dependency Selector Syntax](https://docs.vlt.sh/cli/selectors) pseudo-selector to the target to restrict the override to one dependency group:
+
+- `:prod` matches only `dependencies`.
+- `:optional` matches only `optionalDependencies`.
+- `:peer` matches only `peerDependencies`.
+
+```yaml title="pnpm-workspace.yaml"
+overrides:
+  "foo:prod": "^2.0.0"
+  "@esbuild/*:optional": "-"
+  "react-dom>react:peer": "^18.0.0 || ^19.0.0"
+```
+
+When an override removes an entry from `optionalDependencies` with `"-"`, pnpm also removes any duplicate declaration of that package from `dependencies` in the same manifest.
+
 To keep an overridden version in sync with the version used elsewhere in your workspace, define the version in a [catalog](../catalogs.md) and reference it with the `catalog:` protocol. This way the version is maintained in a single place and referenced from both your dependencies and your overrides:
 
 ```yaml title="pnpm-workspace.yaml"
@@ -71,17 +96,30 @@ When a full resolution finds that every declared range also admits a newer versi
 
 #### Overriding peer dependencies
 
-Overrides also apply to `peerDependencies`. The behavior depends on the type of version specifier used in the override:
+Overrides also apply to `peerDependencies`. Use `:peer` on the target selector to target only `peerDependencies` without overriding direct or transitive runtime dependencies of the same name:
 
-- **Semver ranges** (e.g., `^1.0.0`), **workspace**, and **catalog** protocols: the peer dependency is overridden and remains a peer dependency.
-- **Non-range specifiers** such as `link:` or `file:` protocols: the peer dependency is overridden and moved to `dependencies`, since these are not valid peer dependency ranges.
-- **Removal** (`-`): the peer dependency is removed entirely.
+- **Version ranges** (e.g., `^1.0.0`, `*`), **workspace**, and **catalog** protocols: the peer dependency range is replaced in `peerDependencies`.
+- **Non-range specifiers** such as `link:`, `file:`, or `npm:` protocols: `peerDependencies` is left unchanged (so an untyped override like `"foo": "file:./foo.tgz"` replaces `foo` in `dependencies` without wiping out consumers' peer version ranges).
+- **Removal** (`-`): the peer dependency (and its `peerDependenciesMeta` entry) is removed.
 
-For example, to override the `react` peer dependency of `react-dom`:
+For example, to widen the `react` peer dependency of `react-dom`, or to allow any version for `@babel/*` peer dependencies:
 
 ```yaml title="pnpm-workspace.yaml"
 overrides:
-  "react-dom>react": "18.1.0"
+  "react-dom>react:peer": "^18.0.0 || ^19.0.0"
+  "@babel/*:peer": "*"
+```
+
+To replace a package's peer dependency with a direct dependency, add the dependency in [`packageExtensions`](#packageextensions) and remove the peer declaration with `:peer`:
+
+```yaml title="pnpm-workspace.yaml"
+packageExtensions:
+  react-dom:
+    dependencies:
+      react: "18.3.1"
+
+overrides:
+  "react-dom>react:peer": "-"
 ```
 
 ### packageExtensions
@@ -161,6 +199,8 @@ update:
 ```
 
 Patterns are also supported, so you may ignore any packages from a scope: `@babel/*`.
+
+The ignored packages still update when you name them, as in `pnpm update load-json-file`. They stay unchanged when every selector is negated, as in `pnpm update '!webpack'`.
 
 #### update.changeset
 
@@ -260,6 +300,12 @@ transitive optional dependencies. Equivalent to
 
 ### ignoredOptionalDependencies
 
+:::note
+
+Deprecated: use [`overrides`](#dependency-type-selectors) with `:optional` and `"-"` instead (for example, `"fsevents:optional": "-"` and `"@esbuild/*:optional": "-"`). `ignoredOptionalDependencies` continues to work for backward compatibility.
+
+:::
+
 If an optional dependency has its name included in this array, it will be skipped. For example:
 
 ```yaml title="pnpm-workspace.yaml"
@@ -298,6 +344,8 @@ For example, the following setting ensures that only packages released at least 
 ```yaml title="pnpm-workspace.yaml"
 minimumReleaseAge: 1440
 ```
+
+A registry declared [`serverType: pnpr`](../registries.md#servertype) supports a `minimumReleaseAge` of at most 43200 minutes (30 days).
 
 ### minimumReleaseAgeExclude
 
@@ -543,17 +591,27 @@ packages:
 
 Keyed by `name@version` alone, the same name and version served by two registries would collapse onto a single entry, and whichever resolved first would decide the tarball that every consumer got. That is a package-substitution risk: a package you expect from your private registry could be installed from another registry that publishes the same name and version, with nothing in the lockfile to reveal it. Registry-qualified keys give each registry its own entry and pin which one a dependency came from.
 
-The lockfile format version is unchanged, and qualified keys appear only for packages resolved from a named registry, including the built-in `gh:` and `npmjs:` aliases, which need no `namedRegistries` entry. A project that installs nothing through an alias sees no difference, and older pnpm versions keep reading the file.
+The lockfile format version is unchanged, and qualified keys appear only for packages resolved from a named registry, including the built-in `gh:` and `npmjs:` aliases, which need no `namedRegistries` entry. Most packages from the default registry keep plain keys, as described below. A project that declares no prefix and installs nothing through an alias sees no difference, and older pnpm versions keep reading the file.
+
+The key names the registry a package resolved from, not the way its dependency was written. A registry that declares a prefix, through `prefix` in [`registries`](#registries) or through `namedRegistries`, keys every package resolved from it with that prefix: one written as `work:^1.0.0` and one written as a plain range whose scope `registries` routes to that URL. A plain range and a prefixed specifier that reach one registry therefore share one `packages:` entry and one copy in `node_modules/.pnpm`, so a published package that depends on `@work/util` by a plain range shares the copy your project installs through `work:`. The built-in `gh:` and `npmjs:` aliases qualify only the specifiers that spell them, unless you declare that prefix yourself. The same name and version served by two registries still get two entries.
+
+Packages from the default registry, the one the `registry` setting names, keep plain keys. That includes packages installed through a prefix that points at the default registry, such as `npmjs` pointed at the npm mirror your `registry` setting uses. A plain range and such a prefixed specifier share the plain entry. The exception is a package whose scope `registries` routes to another registry: `npmjs:@work/util` is keyed `@work/util@npmjs:<version>` when `@work` routes elsewhere.
+
+When several prefixes declare one registry, its packages are keyed by the lexicographically smallest prefix, so `work:^1.0.0` and `zeta:^1.0.0` pointing at one URL record `foo@work:1.0.0`. The specifier in `package.json` is left as written.
 
 :::caution
 
 If any dependency is installed through an alias, your first non-frozen install on v11.20.0 or newer re-keys those entries, which shows up as a lockfile diff. Commit it. That diff is the fix being applied. Review it too: an entry that moves to a registry you did not expect is worth investigating.
+
+The same applies when a scope you route reaches a registry that also declares a prefix: the next `pnpm install` moves the scope-routed entries under the prefix and merges them with the prefixed ones. A frozen install keeps installing the lockfile as recorded.
 
 Have everyone working on the project move to v11.20.0 or newer first. An older pnpm reads the re-keyed lockfile fine, and frozen installs are unaffected, but it does not produce registry-qualified keys itself: any install that updates the lockfile writes those entries back to the old shape, and the next install on a current pnpm re-qualifies them. The lockfile then flips back and forth, and while it is in the old shape the project is exposed again. Because the lockfile format version is deliberately unchanged, pnpm cannot detect this and warn you.
 
 There is no setting to keep the old behavior. The old shape is the vulnerability.
 
 :::
+
+A plain key records no registry, so pnpm remembers in the workspace state (`node_modules/.pnpm-workspace-state-v1.json`) which registry each scope routed to when it last resolved the lockfile. When you route a scope to another registry, the next `pnpm install` resolves that scope's packages and their dependencies again from the new registry, at the locked versions it serves, and picks another version in range for a locked version it does not serve. A frozen install keeps installing the lockfile as recorded. Without that record, as in a fresh clone, pnpm reads the plain keys as resolved from the registries configured now. Only scope routes are tracked this way: changing the default registry, which is routinely a switch between mirrors, does not resolve anything again.
 
 Every non-built-in alias that the lockfile references must stay declared, through `prefix` in [`registries`](#registries) or through `namedRegistries`. Reading an entry whose alias is gone fails with `ERR_PNPM_MISSING_NAMED_REGISTRY` rather than falling back to the default registry, since that would fetch a different package. Renaming an alias re-resolves the packages that used it.
 
@@ -586,6 +644,8 @@ Added in: v12.6.0
 * Type: **Boolean**
 
 When set to `true`, `pnpm install` and `pnpm add` deduplicate compatible dependency versions during installation. If a dependency appears at multiple versions and one version satisfies every range in the workspace, pnpm picks that version for all of them.
+
+When set to `false`, each project's dependencies resolve from its own ranges. For example, a project with `ajv: "*"` gets the latest Ajv even if another project depends on `ajv@^6`. Packages that a project lists in `peerDependencies` still follow the versions other projects use. Run [`pnpm dedupe`](../cli/dedupe.md) to make both projects use one version. Set `autoDedupe: true` if you check the lockfile with `pnpm dedupe --check`.
 
 Deduplication covers the whole workspace. A filtered command such as `pnpm --filter <project> add` can also change the lockfile entries of projects outside the filter. Those projects get the deduplicated versions linked on the next `pnpm install`.
 

@@ -14,7 +14,7 @@ impl EnvVar for Env {
 }
 
 fn read<Sys: EnvVar>(text: &str) -> Result<WorkspaceSettings, Box<serde_saphyr::Error>> {
-    read_readable_settings(text, parse_settings::<Sys>)
+    read_readable_settings(text, parse_settings::<Sys, WorkspaceSettings>)
 }
 
 /// [`WorkspaceSettings::find_and_read`] over a file holding `text`, which
@@ -69,6 +69,31 @@ fn a_readable_document_is_read_whole() {
     let settings = read::<SystemEnv>("ignoreScripts: true\n").unwrap();
 
     assert_eq!(settings.ignore_scripts, Some(true));
+}
+
+#[test]
+fn comment_only_document_reads_as_default_settings() {
+    let settings = read::<SystemEnv>("# workspace settings\n").unwrap();
+    assert_eq!(settings, WorkspaceSettings::default());
+}
+
+#[test]
+fn comment_only_local_include_reads_as_default_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+        "include:\n  ./config.yaml: [nodeLinker]\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("config.yaml"), "# no workspace settings yet\n").unwrap();
+
+    let (_, settings) = WorkspaceSettings::find_and_read(dir.path(), SettingsRead::All)
+        .expect("read workspace config")
+        .expect("workspace config is present");
+
+    let expected =
+        WorkspaceSettings { includes: settings.includes.clone(), ..WorkspaceSettings::default() };
+    assert_eq!(settings, expected);
 }
 
 #[test]

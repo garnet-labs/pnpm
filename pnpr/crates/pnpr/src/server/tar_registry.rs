@@ -21,7 +21,7 @@ const MAX_PACKUMENT_BINS_BYTES: usize = 64 * 1024;
 /// How a served document describes each version's tarball.
 #[derive(Clone, Copy)]
 pub(super) struct DistView<'a> {
-    /// The upstream whose integrity-addressed revisions may be linked. Every
+    /// The upstream whose revision tarballs may be linked. Every
     /// other version is described by its canonical resource.
     pub(super) revision_registry: Option<&'a str>,
     /// Derived tar metadata of each version's `.tgz` (see
@@ -53,7 +53,7 @@ pub(super) fn dist_view<'a>(
     tar_integrities: Option<&'a BTreeMap<String, DerivedTar>>,
 ) -> DistView<'a> {
     let revision_registry = match source {
-        RegistrySource::Upstream(source) => revision_source_registry(state, registry, source),
+        RegistrySource::Upstream(source) => revision_source_registry(state, source),
         RegistrySource::Hosted(_) | RegistrySource::Unclaimed | RegistrySource::NotFound => None,
     };
     DistView { revision_registry, tar_integrities, tar_registry: is_tar_registry(state, registry) }
@@ -103,7 +103,7 @@ pub(super) fn overlay_verified_tar_stats(doc: &mut Value, table: &BTreeMap<Strin
 /// `dist.pnpr.requiresBuild` when known, and on a tar registry rewrite
 /// `dist` to describe its tar: the tar's integrity when it is known, and none
 /// of the fields that name or sign the `.tgz`. A projected revision already
-/// names its tar by digest, so it is kept as projected.
+/// names its tar at `<name>@<version>+r<revision>`, so it is kept as projected.
 pub(super) fn describe_tar(
     version: &mut Value,
     table: &BTreeMap<String, DerivedTar>,
@@ -111,6 +111,17 @@ pub(super) fn describe_tar(
 ) {
     let mut bins_budget = MAX_PRECALCULATED_BINS_BYTES;
     describe_tar_with_budget(version, table, tar_registry, &mut bins_budget);
+}
+
+/// Whether `table` holds every fact pnpr derives from the archive `version`'s
+/// `dist` names, so describing it again would add nothing.
+pub(super) fn has_settled_tar_facts(version: &Value, table: &BTreeMap<String, DerivedTar>) -> bool {
+    version
+        .get("dist")
+        .and_then(Value::as_object)
+        .and_then(tgz_integrity_key)
+        .and_then(|key| table.get(&key))
+        .is_some_and(DerivedTar::is_fully_scanned)
 }
 
 fn describe_tar_with_budget(

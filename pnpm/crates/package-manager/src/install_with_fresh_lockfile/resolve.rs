@@ -15,9 +15,7 @@ use super::InstallWithFreshLockfileError;
 use crate::VersionsOverrider;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
-use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::LogLevel;
 use pnpm_resolving_deps_resolver::{
     DependencyOverrider, ResolveImporterError, ResolveImporterOptions,
 };
@@ -28,54 +26,11 @@ use std::{
     sync::Arc,
 };
 
-/// Call the pnpmfile's `preResolution` hook before resolution starts.
-pub(super) async fn run_pre_resolution_hook<Reporter: pnpm_reporter::Reporter>(
-    hook: &Arc<dyn pnpm_hooks::PnpmfileHooks>,
-    config: &Config,
-    lockfile_dir: &Path,
-    wanted_lockfile: Option<&Lockfile>,
-) {
-    // A pnpmfile that fails to load still takes the one-shot run, which
-    // reports the failure.
-    if matches!(hook.has_pre_resolution().await, Ok(false)) {
-        return;
-    }
-    let wanted_lockfile_json = match wanted_lockfile {
-        Some(lockfile) => serde_json::to_value(lockfile).unwrap_or_else(|_| serde_json::json!({})),
-        None => serde_json::json!({}),
-    };
-    let current_lockfile =
-        Lockfile::load_current_from_install_state_dir(&config.install_state_dir).ok().flatten();
-    let exists_current_lockfile = current_lockfile.is_some();
-    let current_lockfile_json = match current_lockfile {
-        Some(lockfile) => serde_json::to_value(lockfile).unwrap_or_else(|_| serde_json::json!({})),
-        None => serde_json::json!({}),
-    };
-    let ctx = pnpm_hooks::PreResolutionHookContext {
-        wanted_lockfile: wanted_lockfile_json,
-        current_lockfile: current_lockfile_json,
-        exists_current_lockfile,
-        exists_non_empty_wanted_lockfile: wanted_lockfile
-            .as_ref()
-            .is_some_and(|lf| !lf.snapshots.as_ref().is_none_or(HashMap::is_empty)),
-        lockfile_dir: lockfile_dir.to_string_lossy().to_string(),
-        store_dir: config.store_dir.display().to_string(),
-        registries: serde_json::json!(config.resolved_registries()),
-    };
-    hook.pre_resolution(
-        ctx,
-        pnpm_hooks::PreResolutionHookLogger {
-            info: super::pre_resolution_log_fn::<Reporter>(lockfile_dir, LogLevel::Info),
-            warn: super::pre_resolution_log_fn::<Reporter>(lockfile_dir, LogLevel::Warn),
-        },
-    )
-    .await;
-}
-
 /// The [`ResolveOptions`] fields that are the same for every importer and
 /// for the fast-override pre-pass. Only the consuming project's directory
 /// and its preferred-versions seed vary — see [`Self::build`].
 pub(super) struct SharedResolveOptions<'a> {
+    pub locked_package_policy: pnpm_resolving_resolver_base::LockedPackagePolicy,
     pub policy: pnpm_resolving_resolver_base::ResolutionPolicyOptions,
     pub config: &'a Config,
     pub lockfile_dir: &'a Path,
@@ -112,6 +67,7 @@ impl SharedResolveOptions<'_> {
                 refresh_metadata: self.refresh_metadata,
                 ..Default::default()
             },
+            locked_package_policy: self.locked_package_policy,
             policy: pnpm_resolving_resolver_base::ResolutionPolicyOptions {
                 fallback_published_by: None,
                 published_by: self.policy.published_by,
@@ -194,6 +150,9 @@ pub(super) struct WorkspaceWalk {
     pub time_based: bool,
     pub registries: HashMap<String, String>,
     pub registries_by_prefix: HashMap<String, String>,
+    pub declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes,
+    /// See [`pnpm_lockfile::RegistryContext::locked_registries`].
+    pub locked_registries: Option<HashMap<String, String>>,
 }
 
 /// What every importer's resolve reads, and the walk reads alongside.
@@ -215,6 +174,19 @@ impl ImporterInputs<'_> {
         usize::try_from(self.config.peers_suffix_max_length).unwrap_or(usize::MAX)
     }
 
+    fn importer_base_opts(
+        &self,
+        importer_id: &str,
+        project_dir: std::path::PathBuf,
+        preferred_versions: &Arc<PreferredVersions>,
+    ) -> ResolveOptions {
+        let mut base_opts =
+            self.shared_resolve_options.build(project_dir, Arc::clone(preferred_versions));
+        base_opts.version.preferred_versions_overlay =
+            self.versions.own_manifest_specifiers_of(importer_id);
+        base_opts
+    }
+
     fn resolve_importer_options(
         &self,
         importer: &pnpm_resolving_deps_resolver::WorkspaceImporter<'_>,
@@ -228,10 +200,7 @@ impl ImporterInputs<'_> {
             .to_path_buf();
         let modules_dir = Some(project_dir.join(modules_basename));
         ResolveImporterOptions {
-            base_opts: self.shared_resolve_options.build(
-                project_dir,
-                Arc::clone(preferred_versions),
-            ),
+            base_opts: self.importer_base_opts(&importer.id, project_dir, preferred_versions),
             peers_suffix_max_length: self.peers_suffix_max_length(),
             peers: pnpm_resolving_deps_resolver::ImporterPeerOptions {
                 auto_install_peers: self.config.auto_install_peers,
@@ -274,7 +243,9 @@ impl WorkspaceWalk {
             registry_context: pnpm_lockfile::RegistryContext {
                 registries: self.registries,
                 registries_by_prefix: self.registries_by_prefix,
+                declared_prefixes: self.declared_prefixes,
                 registry_options_by_url: config.registry_options_by_url.clone(),
+                locked_registries: self.locked_registries,
             },
             share_workspace_resolutions: self.share_workspace_resolutions,
             allowed_deprecated_versions: config.allowed_deprecated_versions.clone(),

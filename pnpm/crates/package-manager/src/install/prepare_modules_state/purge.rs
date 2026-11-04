@@ -1,6 +1,6 @@
 use super::super::{
-    Config, HashSet, IncludedDependencies, InstallError, Lockfile, Path, PathBuf,
-    check_modules_settings_diff,
+    Config, HashSet, IncludedDependencies, InstallError, Lockfile, NodeLinker, Path, PathBuf,
+    refuse_drifted_modules_dir,
 };
 
 pub(super) fn is_safe_modules_purge_target(modules_dir: &Path, workspace_root: &Path) -> bool {
@@ -11,36 +11,36 @@ pub(super) struct InconsistentModulesDir<'a> {
     pub(super) config: &'static Config,
     pub(super) workspace_root: &'a Path,
     pub(super) modules_manifest: Option<&'a pnpm_modules_yaml::ModulesLayout>,
+    pub(super) node_linker: NodeLinker,
     pub(super) installs_only: bool,
     pub(super) filtered_install: bool,
 }
+/// Returns whether the install still treats the tree as inconsistent.
+/// `false` when [`refuse_drifted_modules_dir`] accepts the drift, as upstream
+/// `checkCompatibility` accepts a sibling `v3` store: the tree is kept, so
+/// the install merges into its recorded state.
 pub(super) fn purge_inconsistent_modules_dir(
     context: &InconsistentModulesDir<'_>,
-) -> Result<(), InstallError> {
-    // A plain install may recreate the drifted modules dir; `add` / `remove`
-    // must surface the drift instead (upstream `validateModules` with
-    // `forceNewModules = installsOnly`).
-    if !context.installs_only
-        && let Some(modules) = context.modules_manifest
-    {
-        check_modules_settings_diff(modules, context.config)?;
+) -> Result<bool, InstallError> {
+    // Only a plain install (upstream `forceNewModules = installsOnly`) of
+    // every project purges. A project the install skips is not relinked, and
+    // its dependencies live in the purged directory or link into it.
+    if !context.installs_only || context.filtered_install {
+        refuse_drifted_modules_dir(context.modules_manifest, context.config, context.node_linker)?;
+        return Ok(false);
     }
     let (is_safe, target_dir) = purge_target(context.config, context.workspace_root);
     if !is_safe {
-        if context.filtered_install {
-            return Err(InstallError::UnsafeFilteredModulesDir {
-                modules_dir: context.config.modules_dir.clone(),
-                workspace_root: context.workspace_root.to_path_buf(),
-            });
-        }
         tracing::warn!(
             ?context.config.modules_dir,
             "refusing to remove inconsistent modules directory outside the project root",
         );
-        return Ok(());
+        return Ok(true);
     }
-    let Some(target) = target_dir else { return Ok(()) };
-    purge_modules_dir_entries(&target, context.config, context.modules_manifest)
+    if let Some(target) = target_dir {
+        purge_modules_dir_entries(&target, context.config, context.modules_manifest)?;
+    }
+    Ok(true)
 }
 /// The canonicalized directory the purge may sweep, and whether sweeping it is
 /// safe at all. Deleting from the validated path closes the
@@ -140,7 +140,7 @@ pub(super) struct ExcludedGroupPrune<'a> {
 }
 pub(super) struct ManifestLinkProjects<'a> {
     pub(super) manifests: &'a [(PathBuf, &'a pnpm_package_manifest::PackageManifest)],
-    pub(super) workspace_packages: Option<&'a pnpm_resolving_resolver_base::WorkspacePackages>,
+    pub(super) workspace_links: Option<crate::WorkspaceLinks<'a>>,
 }
 /// Remove direct links from dependency groups excluded by this run.
 /// Unfiltered installs can use the global `included` value recorded in
@@ -174,7 +174,7 @@ pub(super) fn prune_excluded_direct_deps(
         workspace_root: context.workspace_root,
         project_manifests: context.manifest_links.manifests,
         importers: context.current_lockfile.map(|current| &current.importers),
-        workspace_packages: context.manifest_links.workspace_packages,
+        workspace_links: context.manifest_links.workspace_links,
         previously_included,
         new_included: context.included,
         modules_dir_name: context.config.modules_dir_name(),

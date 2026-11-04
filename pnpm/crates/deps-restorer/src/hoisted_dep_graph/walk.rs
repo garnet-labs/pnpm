@@ -11,17 +11,58 @@ use pnpm_lockfile::{Lockfile, LockfileResolution, PackageKey, PkgIdWithPatchHash
 use pnpm_modules_yaml::DepPath;
 use pnpm_real_hoist::{HoisterResult, RcByPtr};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
+/// Every directory each package landed in, in visit order. The first
+/// entry wins for parent → child wiring.
+///
+/// A lookup tries the exact snapshot key, then falls back to
+/// [`pnpm_real_hoist::pkg_id`]. A peer variant the hoister collapsed
+/// reaches the walk under the first-seen variant's key, so an edge
+/// declared against any other variant finds that node through the
+/// package id. A variant the hoister kept distinct is found by its own
+/// key.
+#[derive(Default)]
+pub(super) struct PackageLocations {
+    by_pkg_id: BTreeMap<String, Vec<PathBuf>>,
+    by_package_key: HashMap<PackageKey, Vec<PathBuf>>,
+}
+
+impl PackageLocations {
+    fn first(&self, pkg_key: &PackageKey) -> Option<&PathBuf> {
+        self.first_exact(pkg_key)
+            .or_else(|| {
+                self.by_pkg_id
+                    .get(&pnpm_real_hoist::pkg_id(pkg_key))
+                    .and_then(|locations| locations.first())
+            })
+    }
+
+    fn first_exact(&self, pkg_key: &PackageKey) -> Option<&PathBuf> {
+        self.by_package_key.get(pkg_key).and_then(|locations| locations.first())
+    }
+
+    fn record(&mut self, pkg_key: &PackageKey, dir: &Path) {
+        self.by_pkg_id
+            .entry(pnpm_real_hoist::pkg_id(pkg_key))
+            .or_default()
+            .push(dir.to_path_buf());
+        self.by_package_key
+            .entry(pkg_key.clone())
+            .or_default()
+            .push(dir.to_path_buf());
+    }
+}
+
 impl WalkState<'_> {
     /// Pass 2 — fill in each node's `children` map from the
-    /// now-complete `pkg_locations_by_pkg_id`, then assemble the result.
+    /// now-complete package location index, then assemble the result.
     ///
     /// The walk intentionally leaves `children` empty: every sibling and
     /// descendant of a node must have its directory recorded in
-    /// `pkg_locations_by_pkg_id` before any node resolves its children,
+    /// package locations before any node resolves its children,
     /// so the location index is complete by the time children are
     /// computed. The simplest way to preserve that invariant is to
     /// insert everything first and resolve children second.
@@ -29,7 +70,7 @@ impl WalkState<'_> {
         mut self,
         root_hierarchy: DepHierarchy,
     ) -> Result<LockfileToDepGraphResult, HoistedDepGraphError> {
-        fill_children(&mut self.result.graph, &self.pkg_locations_by_pkg_id, self.lockfile)?;
+        fill_children(&mut self.result.graph, &self.package_locations, self.lockfile)?;
 
         // The hoister produced a children order; the directory keys in
         // `root_hierarchy` follow it, and
@@ -48,9 +89,15 @@ impl WalkState<'_> {
         // after the hoisted linker runs.
         for importer_id in self.per_importer_direct_deps.keys() {
             let Some(importer) = self.lockfile.importers.get(importer_id) else { continue };
+            let modules_dir = self.lockfile_dir.join(importer_id).join("node_modules");
             direct_dependencies_by_importer_id.insert(
                 importer_id.clone(),
-                importer_direct_deps(importer, &self.pkg_locations_by_pkg_id),
+                importer_direct_deps(
+                    importer,
+                    &modules_dir,
+                    &self.result.graph,
+                    &self.package_locations,
+                ),
             );
         }
 
@@ -86,11 +133,14 @@ pub(super) fn root_direct_deps(
 /// One non-root importer's direct dependencies, read off its declared
 /// lockfile entries rather than off its hoist-tree node: the hoister
 /// moves dedupe-able deps up to root, leaving the workspace node's
-/// children empty even when the importer declared those deps. The first
-/// recorded location of each resolved snapshot wins.
+/// children empty even when the importer declared those deps.
+///
+/// Each dependency resolves through [`direct_dep_location`].
 pub(super) fn importer_direct_deps(
     importer: &pnpm_lockfile::ProjectSnapshot,
-    pkg_locations_by_pkg_id: &BTreeMap<String, Vec<PathBuf>>,
+    modules_dir: &Path,
+    graph: &DependenciesGraph,
+    pkg_locations: &PackageLocations,
 ) -> BTreeMap<String, PathBuf> {
     let mut direct_deps = BTreeMap::new();
     for dep_map in [
@@ -105,22 +155,54 @@ pub(super) fn importer_direct_deps(
             // For an aliased dep the snapshot key uses the alias's own
             // (name, suffix); for a regular dep it's `(alias, version)`.
             let Some(dep_key) = spec.version.resolved_key(alias) else { continue };
-            if let Some(first) = pkg_locations_by_pkg_id
-                .get(&pnpm_real_hoist::pkg_id(&dep_key))
-                .and_then(|locations| locations.first())
-            {
-                direct_deps.insert(alias.to_string(), first.clone());
+            let own_copy = modules_dir.join(alias.to_string());
+            if let Some(location) = direct_dep_location(own_copy, &dep_key, graph, pkg_locations) {
+                direct_deps.insert(alias.to_string(), location);
             }
         }
     }
     direct_deps
+}
+/// Where an importer finds its direct dependency `dep_key`.
+///
+/// A copy the hoister placed in the importer's own `modules_dir` is the one
+/// the importer resolves, even when another importer's copy of the same
+/// snapshot was recorded first. An exact snapshot match is taken before a
+/// package-id match, so a copy of another peer variant in `own_copy` never
+/// shadows the variant's own location; the package id still finds a variant
+/// the hoister collapsed.
+fn direct_dep_location(
+    own_copy: PathBuf,
+    dep_key: &PackageKey,
+    graph: &DependenciesGraph,
+    pkg_locations: &PackageLocations,
+) -> Option<PathBuf> {
+    let own_key = graph
+        .get(&own_copy)
+        .and_then(|node| {
+            node.package.dep_path
+                .as_str()
+                .parse::<PackageKey>()
+                .ok()
+        });
+    if own_key.as_ref() == Some(dep_key) {
+        return Some(own_copy);
+    }
+    if let Some(exact) = pkg_locations.first_exact(dep_key) {
+        return Some(exact.clone());
+    }
+    if own_key.is_some_and(|key| pnpm_real_hoist::pkg_id(&key) == pnpm_real_hoist::pkg_id(dep_key))
+    {
+        return Some(own_copy);
+    }
+    pkg_locations.first(dep_key).cloned()
 }
 /// Second walker pass: with every node's directory already in
 /// `pkg_locations`, resolve each graph node's `children: alias →
 /// dir` map by looking up the node's snapshot in the lockfile.
 pub(super) fn fill_children(
     graph: &mut DependenciesGraph,
-    pkg_locations: &BTreeMap<String, Vec<PathBuf>>,
+    pkg_locations: &PackageLocations,
     lockfile: &Lockfile,
 ) -> Result<(), HoistedDepGraphError> {
     let dirs: Vec<PathBuf> = graph.keys().cloned().collect();
@@ -158,16 +240,7 @@ pub(super) struct WalkState<'a> {
     /// way as the one going there now. `None` on the fresh-lockfile
     /// path, which has no current lockfile to walk.
     pub(super) prev_graph: Option<&'a DependenciesGraph>,
-    /// Records every directory each package landed in, in visit
-    /// order. The first entry wins for parent → child wiring.
-    ///
-    /// Keyed by [`pnpm_real_hoist::pkg_id`], not the snapshot key:
-    /// the hoister collapses every peer variant of one package
-    /// version onto a single node, so only the first-seen variant's
-    /// key reaches this walk. Sharing the hoister's own identity
-    /// function is what lets an edge declared against any other
-    /// variant still find that node's directory.
-    pub(super) pkg_locations_by_pkg_id: BTreeMap<String, Vec<PathBuf>>,
+    pub(super) package_locations: PackageLocations,
     /// Per-non-root-importer hierarchy emitted while walking
     /// `Workspace`-kind nodes. Outer key is the importer's root
     /// directory (`<lockfile_dir>/<importer_id>`). Folded into
@@ -433,7 +506,7 @@ pub(super) fn graph_node(
 /// location.
 pub(super) fn compute_children(
     snapshot: Option<&pnpm_lockfile::SnapshotEntry>,
-    pkg_locations: &BTreeMap<String, Vec<PathBuf>>,
+    pkg_locations: &PackageLocations,
 ) -> BTreeMap<String, PathBuf> {
     let mut children: BTreeMap<String, PathBuf> = BTreeMap::new();
     let Some(snapshot) = snapshot else { return children };
@@ -448,9 +521,7 @@ pub(super) fn compute_children(
         let Some(child_key) = dep_ref.resolve(alias_name) else {
             continue;
         };
-        if let Some(locations) = pkg_locations.get(&pnpm_real_hoist::pkg_id(&child_key))
-            && let Some(first) = locations.first()
-        {
+        if let Some(first) = pkg_locations.first(&child_key) {
             children.insert(alias_name.to_string(), first.clone());
         }
     }
@@ -458,8 +529,5 @@ pub(super) fn compute_children(
 }
 
 fn record_package_location(state: &mut WalkState<'_>, pkg_key: &PackageKey, dir: &Path) {
-    state.pkg_locations_by_pkg_id
-        .entry(pnpm_real_hoist::pkg_id(pkg_key))
-        .or_default()
-        .push(dir.to_path_buf());
+    state.package_locations.record(pkg_key, dir);
 }

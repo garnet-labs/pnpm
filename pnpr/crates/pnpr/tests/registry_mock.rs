@@ -55,11 +55,11 @@ async fn serves_scoped_packument_from_storage() {
 
     // The on-disk packument has a Verdaccio-form tarball URL —
     // `http://localhost:4873/@foo/no-deps/-/@foo/no-deps-1.0.0.tgz`.
-    // After our rewrite the client should see the npm-spec form
+    // After our rewrite the client should see the `<name>@<version>` form
     // pointed at our `public_url`.
     assert_eq!(
         doc["versions"]["1.0.0"]["dist"]["tarball"],
-        format!("{PUBLIC_URL}/npm/@foo/no-deps/-/no-deps-1.0.0.tgz"),
+        format!("{PUBLIC_URL}/npm/@foo/no-deps@1.0.0"),
     );
     // Other fields (integrity, shasum, name, version) should pass
     // through untouched.
@@ -78,7 +78,13 @@ async fn serves_scoped_packument_from_storage() {
 #[tokio::test]
 async fn serves_scoped_tarball_from_storage() {
     let storage = common::build_storage();
-    let on_disk = local_blob_path(storage.path(), "", "@foo/no-deps", "no-deps-1.0.0.tgz");
+    let on_disk = local_blob_path(
+        storage.path(),
+        "",
+        pnpr_storage::Ecosystem::Npm,
+        "@foo/no-deps",
+        "no-deps-1.0.0.tgz",
+    );
     let expected_bytes = std::fs::read(&on_disk).expect("fixture tarball");
 
     let app = router(static_config(storage.path().to_path_buf()));
@@ -149,10 +155,7 @@ async fn abbreviated_accept_header_strips_packument() {
     assert!(version_obj.get("contributors").is_none(), "abbreviated form should drop contributors");
     assert_eq!(version_obj["name"], "@foo/no-deps");
     assert_eq!(version_obj["version"], "1.0.0");
-    assert_eq!(
-        version_obj["dist"]["tarball"],
-        format!("{PUBLIC_URL}/npm/@foo/no-deps/-/no-deps-1.0.0.tgz"),
-    );
+    assert_eq!(version_obj["dist"]["tarball"], format!("{PUBLIC_URL}/npm/@foo/no-deps@1.0.0"));
     assert!(
         version_obj["dist"]["integrity"]
             .as_str()
@@ -226,10 +229,7 @@ async fn serves_version_manifest_by_dist_tag() {
     let manifest: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
     assert_eq!(manifest["name"], "@foo/no-deps");
     assert_eq!(manifest["version"], "1.0.0");
-    assert_eq!(
-        manifest["dist"]["tarball"],
-        format!("{PUBLIC_URL}/npm/@foo/no-deps/-/no-deps-1.0.0.tgz"),
-    );
+    assert_eq!(manifest["dist"]["tarball"], format!("{PUBLIC_URL}/npm/@foo/no-deps@1.0.0"));
     // The response is the single-version manifest, not the whole
     // packument — `versions` shouldn't be there.
     assert!(manifest.get("versions").is_none());
@@ -317,8 +317,14 @@ async fn serves_a_single_npm_ecosystem_at_the_root() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         body_bytes(response.into_body()).await,
-        std::fs::read(local_blob_path(storage.path(), "", "@foo/no-deps", "no-deps-1.0.0.tgz"))
-            .unwrap(),
+        std::fs::read(local_blob_path(
+            storage.path(),
+            "",
+            pnpr_storage::Ecosystem::Npm,
+            "@foo/no-deps",
+            "no-deps-1.0.0.tgz"
+        ))
+        .unwrap(),
     );
     let response = app
         .oneshot(

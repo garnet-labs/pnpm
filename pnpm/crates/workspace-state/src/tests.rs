@@ -94,7 +94,7 @@ fn omits_settings_that_are_none() {
 /// `packageExtensions` round-trips through `WorkspaceStateSettings`
 /// as a JSON object preserving the wire shape (`<selector>:
 /// { dependencies: { … } }`). The drift gate in
-/// `optimistic_repeat_install::settings_match` reads this field, so
+/// `first_setting_drift` in `pnpm-package-manager` reads this field, so
 /// the on-disk shape has to stay stable for the gate to be byte-
 /// comparable with pnpm's writer.
 #[test]
@@ -246,6 +246,29 @@ fn update_surfaces_write_file_error_when_target_is_a_directory() {
         "expected WriteFile error, got {err:?}",
     );
     assert_eq!(node_modules_entries(workspace_dir), vec![WORKSPACE_STATE_FILENAME.to_string()]);
+}
+
+/// Another user must be able to read the state file, for example when root
+/// installs in one Docker stage and an unprivileged user runs scripts in the next.
+#[cfg(unix)]
+#[test]
+fn update_gives_the_state_file_the_mode_of_any_new_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempdir().expect("create temp dir");
+    let workspace_dir = tmp.path();
+    let reference = workspace_dir.join("reference");
+    std::fs::File::create(&reference).expect("create reference file");
+
+    update_workspace_state(workspace_dir, &WorkspaceState::default()).expect("write state");
+
+    let mode_of = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .expect("stat file")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode_of(&get_file_path(workspace_dir)), mode_of(&reference));
 }
 
 #[test]

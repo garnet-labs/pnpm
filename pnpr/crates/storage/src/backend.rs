@@ -1,9 +1,9 @@
-use crate::{DocumentWrite, HostedRevisionRefWrite};
+use crate::DocumentWrite;
 use async_trait::async_trait;
 use axum::body::Body;
 use object_store::UpdateVersion;
 use pnpr_error::Result;
-use pnpr_package_name::CanonicalPackageName;
+use pnpr_package_name::{CanonicalPackageName, Ecosystem};
 use std::{
     fmt::Debug,
     path::{Path, PathBuf},
@@ -12,7 +12,7 @@ use std::{
 
 /// The pluggable store behind a hosted registry: a local directory, an
 /// S3-compatible bucket, or anything else that can hold documents,
-/// blobs, revision references, and staged publishes.
+/// blobs, and staged publishes.
 ///
 /// Only the hosted side is pluggable. The disposable proxy cache is always
 /// local, because its contents are re-fetchable and its value is being fast.
@@ -74,7 +74,7 @@ pub(crate) trait HostedBackend: Debug + Send + Sync {
 
     /// Promote a staged blob to its final home, consuming the tmp file
     /// unless the outcome is [`BlobFinalize::Conflict`] — those bytes stay
-    /// put so journal roll-forward can re-detect them.
+    /// put for the caller to remove.
     async fn finalize_blob(
         &self,
         tmp_path: &Path,
@@ -89,30 +89,18 @@ pub(crate) trait HostedBackend: Debug + Send + Sync {
     fn list_blob_files(&self)
     -> futures_util::stream::BoxStream<'_, Result<crate::HostedBlobFile>>;
 
-    async fn list_package_names(&self) -> Result<Vec<String>>;
-
     async fn list_package_blobs(&self, name: &CanonicalPackageName) -> Result<Vec<String>>;
 
     /// The names of the top-level directories (key prefixes) of this view.
     async fn list_top_level_dirs(&self) -> Result<Vec<String>>;
 
-    async fn read_revision_refs(&self, digest: &str) -> Result<Vec<Vec<u8>>>;
-
-    async fn write_revision_ref(
-        &self,
-        digest: &str,
-        ref_id: &str,
-        owner: &str,
-        bytes: &[u8],
-    ) -> Result<HostedRevisionRefWrite>;
-
-    async fn remove_revision_ref(&self, digest: &str, ref_id: &str, owner: &str) -> Result<()>;
-
-    async fn commit_revision_ref(&self, digest: &str, ref_id: &str, owner: &str) -> Result<()>;
-
     /// A view rooted under `segment`, giving a hosted registry its own
     /// namespace so two orgs hosting the same `name@version` never collide.
     fn namespaced(&self, segment: &str) -> Arc<dyn HostedBackend>;
+
+    /// A view that decodes package directories and object keys with
+    /// `ecosystem`'s [`crate::layout::package_segments`] rules.
+    fn with_ecosystem(&self, ecosystem: Ecosystem) -> Arc<dyn HostedBackend>;
 
     /// What separates this backend's objects from another organization's.
     ///
@@ -123,10 +111,9 @@ pub(crate) trait HostedBackend: Debug + Send + Sync {
     /// about who owns what is in it.
     fn namespace(&self) -> String;
 
-    /// The local directory this backend stages blobs in, and with them the
-    /// commit journal that rolls a staged publish forward after a crash. Local
-    /// even when the final home is a bucket: the decode/verify step writes
-    /// through `std::fs` and needs a real path.
+    /// The local directory this backend stages blobs in. Local even when the
+    /// final home is a bucket: the decode/verify step writes through
+    /// `std::fs` and needs a real path.
     fn local_scratch_root(&self) -> &Path;
 
     // --- Records ---------------------------------------------------------
@@ -163,13 +150,6 @@ pub(crate) trait HostedBackend: Debug + Send + Sync {
 
     async fn remove_record(&self, namespace: &str, key: &str) -> Result<bool>;
 
-    async fn remove_record_if_current(
-        &self,
-        namespace: &str,
-        key: &str,
-        expected: &[u8],
-    ) -> Result<bool>;
-
     /// Every key stored in `namespace`, in unspecified order, relative to the
     /// namespace and `/`-separated whatever the backend stores them on.
     async fn list_record_keys(&self, namespace: &str) -> Result<Vec<String>>;
@@ -189,6 +169,9 @@ pub enum HostedDocumentVersion {
     /// construction, so there is nothing to compare against.
     Unversioned,
     ObjectVersion(UpdateVersion),
+    /// The catalog generation that last changed the package, from a
+    /// metadata backend that tracks generations.
+    Generation(u64),
 }
 
 /// Outcome of promoting a staged blob into the hosted store.

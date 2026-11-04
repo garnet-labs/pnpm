@@ -1,11 +1,9 @@
 use super::{
-    super::{
-        Install, InstallError, ProjectMutation, UpToDateFastPathCheck, install_already_up_to_date,
-    },
+    super::{Install, InstallError, ProjectMutation},
     InstallDirs, assert_purge_diagnostic, fresh_lockfile_only_with_compatibility_db,
     install_then_go_offline, recorded_verified_file_integrity_report, touch_manifest,
 };
-use crate::PolicyExcludes;
+use crate::{PolicyExcludes, UpToDateFastPathCheck, install_already_up_to_date};
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, write_modules_manifest};
@@ -48,6 +46,10 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
     std::fs::create_dir_all(&dirs.project_root).expect("create project root");
     std::fs::create_dir_all(&dirs.modules_dir)
         .expect("create modules dirs.dir so the deps gate passes");
+    // A fresh install links a `link:` dependency, so the fixture's modules
+    // directory has to hold the entry the state was recorded for.
+    std::fs::create_dir_all(dirs.modules_dir.join("sibling"))
+        .expect("create the link entry the fresh install would have made");
     let manifest_path = dirs.project_root.join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path.clone()).unwrap();
     manifest.add_dependency("sibling", "link:../sibling", DependencyGroup::Prod).unwrap();
@@ -113,15 +115,21 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
             supported_architectures: None,
         },
         catalogs: &std::collections::BTreeMap::default(),
-        project_manifests: &[(dirs.project_root.clone(), &manifest)],
+        projects: crate::install::StateProjects {
+            manifests: crate::DeclaredManifests::new(&[(dirs.project_root.clone(), &manifest)]),
+            workspace_projects: None,
+            lockfile: None,
+        },
         filesystem_now_ms: Some(pnpm_testing_utils::fs::backdate_existing_files(
             &dirs.project_root,
         )),
         carried: crate::install::CarriedSettings {
             established_auto_dedupe: None,
-            kept_groups: None,
+            registry_keys_verified: true,
+            registry_routes: Some(crate::install_state::settings::recorded_registry_routes(config)),
+            kept_settings: None,
         },
-        vouched: &crate::optimistic_repeat_install::validation::Vouched::All,
+        vouched: &crate::install_state::validation::Vouched::All,
     });
     workspace_state::update_workspace_state(&dirs.project_root, &seed_state)
         .expect("seed workspace state");
@@ -174,6 +182,7 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -219,6 +228,10 @@ fn sync_fast_path_matches_optimistic_short_circuit() {
     let modules_dir = project_root.join("node_modules");
 
     std::fs::create_dir_all(&modules_dir).expect("create modules dir so the deps gate passes");
+    // A fresh install links a `link:` dependency, so the recorded state has to
+    // see the entry the install made.
+    std::fs::create_dir_all(modules_dir.join("sibling"))
+        .expect("create the link entry the fresh install would have made");
     let manifest_path = project_root.join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path.clone()).unwrap();
     manifest.add_dependency("sibling", "link:../sibling", DependencyGroup::Prod).unwrap();
@@ -250,13 +263,19 @@ fn sync_fast_path_matches_optimistic_short_circuit() {
             supported_architectures: None,
         },
         catalogs: &std::collections::BTreeMap::default(),
-        project_manifests: &[(project_root.clone(), &manifest)],
+        projects: crate::install::StateProjects {
+            manifests: crate::DeclaredManifests::new(&[(project_root.clone(), &manifest)]),
+            workspace_projects: None,
+            lockfile: None,
+        },
         filesystem_now_ms: Some(last_validated_timestamp),
         carried: crate::install::CarriedSettings {
             established_auto_dedupe: None,
-            kept_groups: None,
+            registry_keys_verified: true,
+            registry_routes: Some(crate::install_state::settings::recorded_registry_routes(config)),
+            kept_settings: None,
         },
-        vouched: &crate::optimistic_repeat_install::validation::Vouched::All,
+        vouched: &crate::install_state::validation::Vouched::All,
     });
     workspace_state::update_workspace_state(&project_root, &seed_state)
         .expect("seed workspace state");
@@ -394,15 +413,21 @@ async fn partial_install_disables_optimistic_short_circuit() {
             supported_architectures: None,
         },
         catalogs: &std::collections::BTreeMap::default(),
-        project_manifests: &[(dirs.project_root.clone(), &manifest)],
+        projects: crate::install::StateProjects {
+            manifests: crate::DeclaredManifests::new(&[(dirs.project_root.clone(), &manifest)]),
+            workspace_projects: None,
+            lockfile: None,
+        },
         filesystem_now_ms: Some(pnpm_testing_utils::fs::backdate_existing_files(
             &dirs.project_root,
         )),
         carried: crate::install::CarriedSettings {
             established_auto_dedupe: None,
-            kept_groups: None,
+            registry_keys_verified: true,
+            registry_routes: Some(crate::install_state::settings::recorded_registry_routes(config)),
+            kept_settings: None,
         },
-        vouched: &crate::optimistic_repeat_install::validation::Vouched::All,
+        vouched: &crate::install_state::validation::Vouched::All,
     });
     workspace_state::update_workspace_state(&dirs.project_root, &seed_state)
         .expect("seed workspace state");
@@ -454,6 +479,7 @@ async fn partial_install_disables_optimistic_short_circuit() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -550,6 +576,7 @@ async fn optimistic_repeat_install_short_circuits_offline_when_touched_manifest_
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -705,6 +732,7 @@ async fn fresh_install_applies_package_extensions_to_dependency_manifest() {
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
             dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

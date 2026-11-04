@@ -18,7 +18,7 @@ use super::{
     BTreeMap, CarriedSettings, HoistedDependencies, InstallError, Lockfile, Materialized, Reporter,
     StateWrite, recorded_workspace_state, update_workspace_state_or_warn,
 };
-use crate::optimistic_repeat_install::{filesystem_now_ms_in_modules, validation::Vouched};
+use crate::install_state::{ResolvedImporters, filesystem_now_ms_in_modules, validation::Vouched};
 use std::{collections::HashSet, path::PathBuf};
 
 pub(super) struct ApplyMaterializationInputs<'a, 'selection> {
@@ -99,7 +99,12 @@ async fn link_apply_projects<Reporter: self::Reporter + 'static>(
         },
         workspace_root: &inputs.projects.workspace_root,
         manifest_links: LinkMaterializedManifestLinks {
-            workspace_packages: inputs.projects.workspace_packages.as_deref(),
+            workspace_links: inputs.projects.workspace_packages
+                .as_deref()
+                .map(|packages| crate::WorkspaceLinks {
+                    packages,
+                    catalogs: &inputs.completion.catalogs,
+                }),
             included: inputs.projects.included,
             project_manifests: inputs.projects.importers.manifests,
         },
@@ -263,7 +268,7 @@ fn peer_report_workspace<'a>(
     crate::peer_dependency_issues::PeerReportWorkspace {
         lockfile_dir: &inputs.projects.workspace_root,
         catalogs: inputs.completion.catalog_context_present.then_some(&inputs.completion.catalogs),
-        project_manifests: inputs.projects.importers.declared_manifests,
+        project_manifests: inputs.projects.importers.declared_manifests.as_slice(),
     }
 }
 
@@ -312,7 +317,7 @@ fn finish_apply<Reporter: self::Reporter>(
             catalogs: peer_catalogs,
             workspace_root: &inputs.projects.workspace_root,
             workspace_manifest_dir: &inputs.completion.workspace_manifest_dir,
-            project_manifests: inputs.projects.importers.declared_manifests,
+            project_manifests: inputs.projects.importers.declared_manifests.as_slice(),
         },
 
         prefix: inputs.completion.prefix,
@@ -325,6 +330,32 @@ fn finish_apply<Reporter: self::Reporter>(
     });
     pnpm_fs::background_drop(inputs.materialized.fresh_lockfile);
     completion
+}
+
+/// The settings an install's state write takes from the run. See
+/// [`CarriedSettings`].
+fn applied_carried_settings<'a>(
+    inputs: &'a ApplyMaterializationInputs<'_, '_>,
+) -> CarriedSettings<'a> {
+    let config = inputs.completion.config;
+    let resolved = inputs.materialized.fresh_lockfile.as_ref();
+    let lockfile = resolved.or(inputs.resolution.loaded);
+    let resolution = match (resolved.is_some(), inputs.projects.filtered_install) {
+        (false, _) => ResolvedImporters::None,
+        (true, true) => ResolvedImporters::Selected,
+        (true, false) => ResolvedImporters::All,
+    };
+    CarriedSettings {
+        established_auto_dedupe: (config.auto_dedupe && resolved.is_some()).then_some(true),
+        registry_keys_verified: crate::install::registry_keys_current(config, lockfile),
+        registry_routes: Some(crate::install_state::recorded_registry_routes_after_install(
+            config,
+            inputs.resolution.locked_registry_routes.as_ref(),
+            lockfile,
+            resolution,
+        )),
+        kept_settings: None,
+    }
 }
 
 // Publish workspace freshness only after modules.yaml and the current lockfile are committed.
@@ -351,14 +382,15 @@ fn write_applied_workspace_state<Reporter: self::Reporter>(
             supported_architectures: inputs.projects.supported_architectures.as_ref(),
         },
         catalogs: &inputs.completion.catalogs,
-        project_manifests: inputs.projects.importers.manifests,
-        filesystem_now_ms: filesystem_now_ms_in_modules(&modules_dir),
-        carried: CarriedSettings {
-            established_auto_dedupe: (config.auto_dedupe
-                && inputs.materialized.fresh_lockfile.is_some())
-            .then_some(true),
-            kept_groups: None,
+        projects: crate::install::StateProjects {
+            manifests: inputs.projects.importers.declared_manifests,
+            workspace_projects: inputs.projects.importers.workspace_projects,
+            lockfile: inputs.materialized.fresh_lockfile
+                .as_ref()
+                .or(inputs.resolution.loaded),
         },
+        filesystem_now_ms: filesystem_now_ms_in_modules(&modules_dir),
+        carried: applied_carried_settings(inputs),
         vouched: &vouched,
     });
     update_workspace_state_or_warn::<Reporter>(

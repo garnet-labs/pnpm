@@ -41,6 +41,12 @@ When set to `true`, pnpm joins conflicting peer dependency ranges with `||` and 
 
 When this setting is set to `true`, packages with peer dependencies will be deduplicated after peers resolution.
 
+This setting also lets pnpm resolve missing required and optional peers using compatible versions available elsewhere in the workspace, including transitive dependencies of other projects. Required peers can be resolved this way even when `autoInstallPeers` is `false`. A required peer satisfied this way is not reported as missing. With `autoInstallPeers: false`, [`pnpm peers check`](../cli/peers.md) reports a separate advisory when the project and its dependency ancestors do not declare a provider.
+
+To prevent this workspace-wide peer reuse, set both `autoInstallPeers` and `dedupePeerDependents` to `false`. Dependencies of the workspace root can still provide peers when [`resolvePeersFromWorkspaceRoot`](#resolvepeersfromworkspaceroot) is enabled.
+
+Resolving a package's peer does not add that peer to your project's declared dependencies. If your project's scripts run a peer package's executable, declare that package directly in your project's `dependencies` or `devDependencies`.
+
 For instance, let's say we have a workspace with two projects and both of them have `webpack` in their dependencies. `webpack` has `esbuild` in its optional peer dependencies, and one of the projects has `esbuild` in its dependencies. In this case, pnpm will link two instances of `webpack` to the `node_modules/.pnpm` directory: one with `esbuild` and another one without it:
 
 ```text
@@ -131,6 +137,18 @@ When enabled, dependencies of the root workspace project are used to resolve pee
 It is a useful feature as you can install your peer dependencies only in the root of the workspace, and you can be sure that all projects in the workspace use the same versions of the peer dependencies.
 
 ### peerDependencyRules
+
+:::note
+
+Deprecated: `peerDependencyRules` only suppresses peer dependency warnings after resolution without changing `peerDependencies`. When you want to change or remove the declared peer dependency ranges so peer resolution itself is updated, use [`overrides`](./dependency-resolution.md#overriding-peer-dependencies) with `:peer`:
+
+- `peerDependencyRules.ignoreMissing: ["react", "@babel/*"]` only silences missing-peer warnings. The `overrides` entries `"react:peer": "-"` and `"@babel/*:peer": "-"` remove the peer declarations and their `peerDependenciesMeta` entries, so packages no longer receive those peers from their parents.
+- `peerDependencyRules.allowedVersions: { "button@2>react": "17" }` only changes peer-mismatch reporting and has no behavior-preserving `overrides` replacement. Use `"button@2>react:peer": "16 || 17"` in `overrides` when you intend to widen the declared peer range and change peer resolution.
+- `peerDependencyRules.allowAny: ["@babel/*"]` only suppresses peer-version mismatch warnings and does not rewrite `peerDependencies`, so it has no direct `overrides` equivalent. Use `"@babel/*:peer": "*"` in `overrides` only when you intend to widen the declared peer range and change peer resolution.
+
+`peerDependencyRules` continues to work for backward compatibility.
+
+:::
 
 #### peerDependencyRules.ignoreMissing
 

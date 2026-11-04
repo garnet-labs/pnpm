@@ -11,20 +11,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pnpm-config = { workspace = true }
 pnpm-lockfile = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-registry = { workspace = true }
+pnpm-semver-include-prerelease = { workspace = true }
+pnpm-version-policy = { workspace = true }
 
 chrono = { workspace = true }
 derive_more = { workspace = true }
 miette = { workspace = true }
 node-semver = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 ssri = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 

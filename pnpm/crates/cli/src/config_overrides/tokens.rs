@@ -154,9 +154,10 @@ pub(super) enum SettingArity {
 /// setting the invoked command declares as its own option is left for
 /// clap; a setting that collides with a *global* option would be claimed
 /// on every command line and so must not appear here at all.
-pub(super) const BARE_SETTING_FLAGS: [(&str, SettingArity); 46] = [
+pub(super) const BARE_SETTING_FLAGS: [(&str, SettingArity); 49] = [
     ("allow-unused-patches", SettingArity::Boolean),
     ("auto-dedupe", SettingArity::Boolean),
+    ("cache-dir", SettingArity::Text),
     ("child-concurrency", SettingArity::Parsed(is_i32)),
     ("dangerously-allow-all-builds", SettingArity::Boolean),
     ("engine-strict", SettingArity::Boolean),
@@ -176,6 +177,7 @@ pub(super) const BARE_SETTING_FLAGS: [(&str, SettingArity); 46] = [
     ("lockfile-dir", SettingArity::Text),
     ("lockfile-include-tarball-url", SettingArity::Boolean),
     ("lockfile-only", SettingArity::Boolean),
+    ("local-address", SettingArity::Text),
     ("merge-git-branch-lockfiles", SettingArity::Boolean),
     ("merge-git-branch-lockfiles-branch-pattern", SettingArity::Text),
     ("modules-dir", SettingArity::Text),
@@ -199,6 +201,7 @@ pub(super) const BARE_SETTING_FLAGS: [(&str, SettingArity); 46] = [
     ("side-effects-cache", SettingArity::Boolean),
     ("side-effects-cache-readonly", SettingArity::Boolean),
     ("strict-peer-dependencies", SettingArity::Boolean),
+    ("strict-ssl", SettingArity::Boolean),
     ("trust-lockfile", SettingArity::Boolean),
     ("trust-policy", SettingArity::Parsed(is_enum::<TrustPolicy>)),
     ("trust-policy-exclude", SettingArity::Text),
