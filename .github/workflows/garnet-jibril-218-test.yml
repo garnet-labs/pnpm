@@ -18,8 +18,19 @@ jobs:
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
           jibril_version: v2.18.0-rc.2
-      - name: Generate workload
+      - name: Workload burst 1
         run: |
-          git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw
+          git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw1
+          for i in $(seq 1 40); do curl -s -o /dev/null "https://registry.npmjs.org/-/ping"; done
+          for i in 1 2 3 4 5 6 7 8; do node -e "console.log('beat', $i)" & sleep 2; done; wait
+      - name: Workload burst 2
+        run: |
+          for i in $(seq 1 60); do curl -s -o /dev/null "https://api.github.com/zen"; sleep 3; done
+      - name: Workload burst 3
+        run: |
+          for i in $(seq 1 30); do (node -e "setTimeout(()=>{},4000)" &); done
           curl -sI https://registry.npmjs.org/pnpm | head -3
-          for i in 1 2 3 4 5; do node -e "console.log('beat', $i)"; sleep 5; done
+          sleep 90; wait
+      - name: Workload tail
+        run: |
+          for i in $(seq 1 20); do curl -s -o /dev/null "https://registry.npmjs.org/pnpm/$i.0.0" 2>/dev/null; sleep 6; done
