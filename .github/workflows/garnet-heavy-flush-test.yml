@@ -182,7 +182,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - if: ${{ inputs.garnet }}
+    - if: ${{ github.event_name == 'push' || inputs.garnet }}
       uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
@@ -199,11 +199,11 @@ jobs:
     - name: Install pnpm and Node
       uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
       with:
-        runtime: node@${{ inputs.node }}
+        runtime: node@${{ inputs.node || '24.0.0' }}
     - name: Verify Node version
       shell: bash
       env:
-        NODE_VERSION: ${{ inputs.node }}
+        NODE_VERSION: ${{ inputs.node || '24.0.0' }}
         # `pn node -v` falls back through `run`/`exec`, which would
         # otherwise trigger a verifyDepsBeforeRun install just to print
         # the version. Disable it so this step measures the runtime that
@@ -283,8 +283,8 @@ jobs:
     - name: Validate test chunk inputs
       shell: bash
       env:
-        TEST_CHUNK: ${{ inputs.test_chunk }}
-        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total }}
+        TEST_CHUNK: ${{ inputs.test_chunk || '2' }}
+        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total || '3' }}
       run: |
         case "$TEST_CHUNK" in
           ''|*[!0-9]*)
@@ -309,8 +309,8 @@ jobs:
         BENCHMARK: ${{ steps.test-scope.outputs.benchmark }}
         PNPM_WORKERS: 3
         TEST_SCRIPT: ${{ steps.test-scope.outputs.script }}
-        TEST_CHUNK: ${{ inputs.test_chunk }}
-        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total }}
+        TEST_CHUNK: ${{ inputs.test_chunk || '2' }}
+        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total || '3' }}
       run: |
         benchmark="$BENCHMARK"
         command=(pn pipeline "$TEST_SCRIPT" --include-workspace-root --full --no-cache)
@@ -326,8 +326,8 @@ jobs:
       if: steps.test-scope.outputs.full_tests == 'true'
       shell: bash
       env:
-        TEST_CHUNK: ${{ inputs.test_chunk }}
-        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total }}
+        TEST_CHUNK: ${{ inputs.test_chunk || '2' }}
+        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total || '3' }}
       run: |
         benchmark=tests.cli
         args=(
@@ -349,10 +349,10 @@ jobs:
       if: steps.test-scope.outputs.full_tests == 'true'
       env:
         BENCHMARK: ${{ steps.test-scope.outputs.benchmark }}
-        NODE_VERSION: ${{ inputs.node }}
-        PLATFORM: ${{ inputs.platform }}
-        TEST_CHUNK: ${{ inputs.test_chunk }}
-        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total }}
+        NODE_VERSION: ${{ inputs.node || '24.0.0' }}
+        PLATFORM: ${{ inputs.platform || 'blacksmith-8vcpu-ubuntu-2404' }}
+        TEST_CHUNK: ${{ inputs.test_chunk || '2' }}
+        TEST_CHUNK_TOTAL: ${{ inputs.test_chunk_total || '3' }}
       shell: bash
       run: |
         benchmark="$BENCHMARK"
@@ -403,7 +403,7 @@ jobs:
       if: steps.test-scope.outputs.full_tests == 'true'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: ci-performance-pnpm-${{ inputs.platform }}-node-${{ inputs.node }}-chunk-${{ inputs.test_chunk }}-of-${{ inputs.test_chunk_total }}
+        name: ci-performance-pnpm-${{ inputs.platform || 'blacksmith-8vcpu-ubuntu-2404' }}-node-${{ inputs.node || '24.0.0' }}-chunk-${{ inputs.test_chunk || '2' }}-of-${{ inputs.test_chunk_total || '3' }}
         path: .bench/artifact/pnpm/
         if-no-files-found: error
         retention-days: 14
