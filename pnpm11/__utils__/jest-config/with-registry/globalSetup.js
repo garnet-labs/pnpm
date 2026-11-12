@@ -106,8 +106,6 @@ export default async () => {
 
   await Promise.all([waitForServerOnline(process.env.PNPM_REGISTRY_MOCK_PORT), waitForServerOnline(currentVersionPort)])
 
-  await warnIfMirrorUnreachable()
-
   // Register the test user and store the auth token for bearer-based tests
   const { token } = await addUser({
     username: REGISTRY_MOCK_CREDENTIALS.username,
@@ -211,20 +209,6 @@ function findRustTargetBin (name) {
 }
 
 const UNUSUAL_REGISTRY_STARTUP_THRESHOLD = 15 // seconds
-
-// The npmjs upstream of the current-version registry falls back to this mirror
-// when registry.npmjs.org rate-limits CI. Warn early when the fallback is down
-// so a later 429 is not misread as a test failure.
-const FALLBACK_MIRROR_PING = 'https://registry.npmmirror.com/-/ping'
-
-async function warnIfMirrorUnreachable () {
-  try {
-    const res = await fetch(FALLBACK_MIRROR_PING, { signal: AbortSignal.timeout(5_000) })
-    if (!res.ok) console.warn(`Fallback registry mirror answered ${res.status}`)
-  } catch (err) {
-    console.warn('Fallback registry mirror is unreachable:', err?.cause?.code ?? err?.message)
-  }
-}
 
 async function waitForServerOnline (port) {
   const start = performance.now()
