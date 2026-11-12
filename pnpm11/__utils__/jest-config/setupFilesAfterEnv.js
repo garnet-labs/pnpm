@@ -12,7 +12,7 @@ const FALLBACK_MIRROR_PING = 'https://registry.npmmirror.com/-/ping'
 beforeAll(async () => {
   try {
     const res = await fetch(FALLBACK_MIRROR_PING, { signal: AbortSignal.timeout(5_000) })
-    if (!res.ok) console.warn(`Fallback registry mirror answered ${res.status}`)
+    console.info(`Fallback registry mirror answered ${res.status}`)
   } catch (err) {
     console.warn('Fallback registry mirror is unreachable:', err?.cause?.code ?? err?.message)
   }
