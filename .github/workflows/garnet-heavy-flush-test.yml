@@ -1,15 +1,15 @@
-name: Garnet heavy flush test
+name: Garnet jibril rc.4 profile drop test
 
 on:
   push:
     branches:
-      - devin/jibril-heavy-flush-test
+      - devin/1794943476-jibril-rc4-profile-drop
   workflow_dispatch:
     inputs:
       jibril_version:
         description: Jibril version for the Garnet action
         required: false
-        default: v2.18.0-rc.2
+        default: v2.18.0-rc.4
         type: string
       node:
         required: false
@@ -151,13 +151,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - leg: rc2-a
-            ver: v2.18.0-rc.2
-          - leg: rc2-b
-            ver: v2.18.0-rc.2
-          - leg: rc2-c
-            ver: v2.18.0-rc.2
-          - leg: control-2170
+          - leg: rc4-a
+            ver: v2.18.0-rc.4
+          - leg: rc4-b
+            ver: v2.18.0-rc.4
+          - leg: rc4-c
+            ver: v2.18.0-rc.4
+          - leg: control-2170-a
+            ver: v2.17.0
+          - leg: control-2170-b
+            ver: v2.17.0
+          - leg: control-2170-c
             ver: v2.17.0
     permissions:
       actions: read
