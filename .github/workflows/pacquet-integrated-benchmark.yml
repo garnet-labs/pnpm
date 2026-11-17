@@ -2,17 +2,6 @@ name: Pacquet Integrated-Benchmark
 
 on:
   workflow_dispatch:
-    inputs:
-      # Benchmark two arbitrary revisions with this ref's harness, e.g. a
-      # known regression against its parent to check the gates catch it.
-      head_ref:
-        description: SHA or origin/<branch> benchmarked as HEAD (default this ref)
-        required: false
-        default: ''
-      main_ref:
-        description: SHA or origin/<branch> benchmarked as main (default origin/main)
-        required: false
-        default: ''
   push:
     # Update Bencher's baselines whenever something that could move
     # install perf lands on main. This one benchmark drives two testbeds:
@@ -34,23 +23,10 @@ on:
       - 'pnpm/tasks/registry-mock/package.json'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
-      - '.config/pnpm/**'
       - 'pnpm/tasks/integrated-benchmark/src/fixtures/**'
       - '.github/actions/rustup/**'
       - '.github/actions/binstall/**'
-      - '.github/actions/install-crates/**'
       - '.github/workflows/pacquet-integrated-benchmark.yml'
-      - '.github/workflows/pacquet-integrated-benchmark-comment.yml'
-      - '.github/scripts/compare-integrated-benchmarks*.mjs'
-      - '.github/scripts/run-integrated-benchmark*.mjs'
-      # Integration test targets never link into the benchmarked binaries.
-      - '!pnpm/crates/*/tests/**'
-      - '!pnpr/crates/*/tests/**'
-      - '!pnpr/docs/**'
-      - '!pnpr/*.md'
-      - '!pnpr/crates/*/*.md'
-      - '!pnpr/docker/*.md'
-      - '!pnpr/client/*.md'
   pull_request:
     types: [opened, synchronize]
     paths:
@@ -64,46 +40,30 @@ on:
       - 'pnpm/tasks/registry-mock/package.json'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
-      - '.config/pnpm/**'
       - 'pnpm/tasks/integrated-benchmark/src/fixtures/**'
       - '.github/actions/rustup/**'
       - '.github/actions/binstall/**'
-      - '.github/actions/install-crates/**'
       - '.github/workflows/pacquet-integrated-benchmark.yml'
-      - '.github/workflows/pacquet-integrated-benchmark-comment.yml'
-      - '.github/scripts/compare-integrated-benchmarks*.mjs'
-      - '.github/scripts/run-integrated-benchmark*.mjs'
-      # Integration test targets never link into the benchmarked binaries.
-      - '!pnpm/crates/*/tests/**'
-      - '!pnpr/crates/*/tests/**'
-      - '!pnpr/docs/**'
-      - '!pnpr/*.md'
-      - '!pnpr/crates/*/*.md'
-      - '!pnpr/docker/*.md'
-      - '!pnpr/client/*.md'
 
 concurrency:
-  # Dispatches of one commit against different revisions run side by side.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.head_ref }}-${{ inputs.main_ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 # This workflow runs in the PR's privilege context, which is read-only for
 # fork PRs (GitHub Actions security policy). The result is uploaded as an
 # artifact and posted by `integrated-benchmark-comment.yml`, which runs in
 # the base-repo privilege context via `workflow_run`.
-# Fork PRs run on the runner `vars.INTEGRATED_BENCHMARK_RUNNER` names, so it
-# must be a hosted or ephemeral runner, never a persistent self-hosted one.
 permissions:
   contents: read
+  checks: write
 
 jobs:
   revisions:
     name: Resolve benchmark revisions
-    runs-on: ${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     outputs:
       head_sha: ${{ steps.revs.outputs.head_sha }}
       main_sha: ${{ steps.revs.outputs.main_sha }}
-      tools_sha: ${{ steps.revs.outputs.tools_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,29 +73,9 @@ jobs:
 
       - name: Resolve revisions once for all runners
         id: revs
-        env:
-          HEAD_REF: ${{ inputs.head_ref }}
-          MAIN_REF: ${{ inputs.main_ref }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
-          # On main the benchmark runs HEAD alone, so a main_ref would compare nothing.
-          if [ -n "$MAIN_REF" ] && [ "$REF_NAME" = main ]; then
-            echo "::error::main_ref is ignored when dispatching from main. Dispatch from another branch to compare two revisions."
-            exit 1
-          fi
-          # A failed command substitution inside echo would write an empty SHA
-          # and pass, and the build would then check out the dispatched ref.
-          head_sha=$(git rev-parse --verify --quiet --end-of-options "${HEAD_REF:-HEAD}^{commit}") || {
-            echo "::error::head_ref '$HEAD_REF' is not a commit here. Pass a SHA or origin/<branch>."
-            exit 1
-          }
-          main_sha=$(git rev-parse --verify --quiet --end-of-options "${MAIN_REF:-origin/main}^{commit}") || {
-            echo "::error::main_ref '$MAIN_REF' is not a commit here. Pass a SHA or origin/<branch>."
-            exit 1
-          }
-          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
-          echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
-          echo "tools_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "main_sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: revisions
@@ -143,33 +83,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}"]
+        os: [blacksmith-8vcpu-ubuntu-2404]
         revision: ${{ fromJSON(github.ref_name == 'main' && '["HEAD"]' || '["HEAD", "main"]') }}
     runs-on: ${{ matrix.os }}
     env:
       REVISION: ${{ matrix.revision }}
-      # Both revisions build with thin LTO and 16 codegen units, so the
-      # comparison stays like for like while the build takes about 4 minutes
-      # instead of 10. Released binaries keep the fat-LTO release profile.
-      CARGO_PROFILE_RELEASE_LTO: thin
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ matrix.revision == 'main' && needs.revisions.outputs.main_sha || needs.revisions.outputs.head_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      # A main push and a PR baseline must use the same cache paths.
       - name: Cache revision binaries
         id: binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: integrated-benchmark-bin-v3-${{ matrix.os }}-${{ matrix.revision == 'main' && needs.revisions.outputs.main_sha || needs.revisions.outputs.head_sha }}-${{ hashFiles('rust-toolchain.toml') }}
+          key: integrated-benchmark-bin-${{ matrix.os }}-${{ matrix.revision == 'main' && needs.revisions.outputs.main_sha || needs.revisions.outputs.head_sha }}-${{ hashFiles('rust-toolchain.toml') }}
           path: |
-            .bench-cache/release/pnpm
-            .bench-cache/release/pacquet
-            .bench-cache/release/pnpr
+            bench-work-env/pnpr@${{ matrix.revision }}/pacquet/target/release/pnpm
+            bench-work-env/pnpr@${{ matrix.revision }}/pacquet/target/release/pacquet
+            bench-work-env/pnpr@${{ matrix.revision }}/pacquet/target/release/pnpr
         timeout-minutes: 2
         continue-on-error: true
 
@@ -177,10 +112,10 @@ jobs:
         if: steps.binaries.outputs.cache-hit != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: integrated-benchmark-deps-thin-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}-${{ matrix.revision }}
+          key: integrated-benchmark-deps-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}-${{ matrix.revision }}
           restore-keys: |
-            integrated-benchmark-deps-thin-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-
-            integrated-benchmark-deps-thin-${{ matrix.os }}-
+            integrated-benchmark-deps-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-
+            integrated-benchmark-deps-${{ matrix.os }}-
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -195,10 +130,6 @@ jobs:
           restore-cache: false
           save-cache: false
 
-      - name: Install crates
-        if: steps.binaries.outputs.cache-hit != 'true'
-        uses: $/.github/actions/install-crates
-
       - name: Build client and pnpr server
         if: steps.binaries.outputs.cache-hit != 'true'
         timeout-minutes: 50
@@ -209,17 +140,16 @@ jobs:
               | select(. == "pnpm" or . == "pacquet")]
             | if length == 1 then .[0] else error("expected one pnpm CLI binary") end')
           cargo build --release --bin="$client" --bin=pnpr
-          mkdir -p .bench-cache/release
-          rm -f .bench-cache/release/pnpm .bench-cache/release/pacquet
-          cp "target/release/$client" target/release/pnpr .bench-cache/release/
+          release="bench-work-env/pnpr@$REVISION/pacquet/target/release"
+          mkdir -p "$release"
+          rm -f "$release/pnpm" "$release/pacquet"
+          cp "target/release/$client" target/release/pnpr "$release/"
 
       # Tar preserves executable permissions when artifacts cross runners.
       - name: Pack revision binaries
         shell: bash
         run: |
           release="bench-work-env/pnpr@$REVISION/pacquet/target/release"
-          mkdir -p "$release"
-          cp .bench-cache/release/* "$release/"
           client=pnpm
           if [ ! -f "$release/$client" ]; then
             client=pacquet
@@ -235,7 +165,7 @@ jobs:
           tar -cf "revision-$REVISION.tar" "${files[@]}"
 
       - name: Upload revision binaries
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integrated-benchmark-bin-${{ matrix.os }}-${{ matrix.revision }}
           path: revision-${{ matrix.revision }}.tar
@@ -245,21 +175,21 @@ jobs:
   executor:
     needs: revisions
     name: Build benchmark executor
-    runs-on: ${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.revisions.outputs.tools_sha }}
+          ref: ${{ needs.revisions.outputs.head_sha }}
           persist-credentials: false
 
       - name: Cache Rust deps
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: integrated-benchmark-deps-${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}-executor
+          key: integrated-benchmark-deps-blacksmith-8vcpu-ubuntu-2404-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}-executor
           restore-keys: |
-            integrated-benchmark-deps-${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-
-            integrated-benchmark-deps-${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}-
+            integrated-benchmark-deps-blacksmith-8vcpu-ubuntu-2404-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}-
+            integrated-benchmark-deps-blacksmith-8vcpu-ubuntu-2404-
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -273,9 +203,6 @@ jobs:
           restore-cache: false
           save-cache: false
 
-      - name: Install crates
-        uses: $/.github/actions/install-crates
-
       - name: Build the benchmark executor
         timeout-minutes: 30
         run: cargo build --bin=integrated-benchmark
@@ -284,9 +211,9 @@ jobs:
         run: tar -cf executor.tar target/debug/integrated-benchmark
 
       - name: Upload benchmark executor
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: integrated-benchmark-bin-${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}-executor
+          name: integrated-benchmark-bin-blacksmith-8vcpu-ubuntu-2404-executor
           path: executor.tar
           if-no-files-found: error
           retention-days: 1
@@ -296,7 +223,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}"] # windows is skipped because of complexity, macOS is skipped because of inconsistency
+        os: [blacksmith-8vcpu-ubuntu-2404] # windows is skipped because of complexity, macOS is skipped because of inconsistency
         # Each runner measures all revisions for one scenario.
         scenario:
           - isolated-linker.fresh-restore.cold-cache.cold-store
@@ -308,12 +235,8 @@ jobs:
           - isolated-linker.fresh-install.cold-cache.hot-store
           - isolated-linker.fresh-resolve.hot-cache.offline
           - isolated-linker.peer-heavy-resolve.hot-cache.offline
-          - isolated-linker.linked-workspace-resolve.hot-cache.offline
-          - isolated-linker.injected-workspace-repeat-install.hot-cache.hot-store
           - isolated-linker.fresh-restore.cold-cache.cold-store.cold-pnpr
           - gvs-linker.fresh-restore.hot-cache.hot-store
-          - store-only.unlocked-direct-deps.cold-cache.hot-store
-          - cargo.repeat-install.hot-cache.hot-store
     name: ${{ matrix.scenario }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     env:
@@ -336,11 +259,6 @@ jobs:
       # command exercises client-side peer resolution rather than server or
       # tarball performance.
       PEER_HEAVY_BENCHMARK_TARGETS: ${{ github.ref_name == 'main' && 'pacquet@HEAD pnpm@HEAD' || 'pacquet@HEAD pacquet@main pnpm@HEAD' }}
-      # The workspace fixtures use only local packages, and the store-only
-      # scenario measures the client's own resolution and store check, which
-      # a pnpr server would take over, so these compare the PR against main
-      # without one.
-      WORKSPACE_BENCHMARK_TARGETS: ${{ github.ref_name == 'main' && 'pacquet@HEAD' || 'pacquet@HEAD pacquet@main' }}
       BENCHMARK_BUILD_TARGETS: ${{ github.ref_name == 'main' && 'pacquet@HEAD pnpr@HEAD' || 'pacquet@HEAD pacquet@main pnpr@HEAD pnpr@main' }}
       # Network emulation so both install strategies cross the link they
       # would in production instead of free loopback (~GB/s, ~0 RTT), which
@@ -368,7 +286,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.revisions.outputs.tools_sha }}
+          ref: ${{ needs.revisions.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -378,14 +296,8 @@ jobs:
         run: git branch --force main "$MAIN_SHA"
 
       - name: Cache pnpm-registry storage
-        # The generated fixtures never populate the npm proxy cache: peer-heavy
-        # is seeded into hosted storage, while the workspace fixtures name
-        # no registry package.
-        if: >-
-          matrix.scenario != 'isolated-linker.peer-heavy-resolve.hot-cache.offline' &&
-          matrix.scenario != 'isolated-linker.linked-workspace-resolve.hot-cache.offline' &&
-          matrix.scenario != 'isolated-linker.injected-workspace-repeat-install.hot-cache.hot-store' &&
-          matrix.scenario != 'cargo.repeat-install.hot-cache.hot-store'
+        # Peer-heavy uses hosted fixtures and never populates the npm proxy cache.
+        if: matrix.scenario != 'isolated-linker.peer-heavy-resolve.hot-cache.offline'
         # Persists pnpm-registry's `--storage` dir across CI runs so
         # cold-cache benchmark scenarios don't refetch ~2.3k unscoped
         # packages from npmjs on every run. Replaces the older
@@ -408,7 +320,7 @@ jobs:
         continue-on-error: true
 
       - name: Download revision binaries
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: integrated-benchmark-bin-${{ matrix.os }}-*
           path: revision-binaries
@@ -429,7 +341,7 @@ jobs:
           save-cache: false # it's insufficient
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
         with:
           install: false
 
@@ -449,12 +361,8 @@ jobs:
         with:
           packages: hyperfine@1.18.0
 
-      # Every comparison also counts each install's syscalls under strace.
-      - name: Install strace
-        run: sudo apt-get update && sudo apt-get install --yes strace
-
       - name: Install just
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: just
 
@@ -463,20 +371,11 @@ jobs:
         timeout-minutes: 50
         env:
           SCENARIO: ${{ matrix.scenario }}
-          HEAD_SHA: ${{ needs.revisions.outputs.head_sha }}
         run: |
-          pnpm_repository_args=()
           if [ "$SCENARIO" = isolated-linker.peer-heavy-resolve.hot-cache.offline ]; then
             BENCHMARK_BUILD_TARGETS="$BENCHMARK_BUILD_TARGETS pnpm@HEAD"
-            # pnpm@HEAD builds the HEAD of the repository it is given. The
-            # checkout holds the tools revision, which a head_ref dispatch
-            # sets apart from the measured HEAD.
-            if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
-              git worktree add --detach "$RUNNER_TEMP/pnpm-head" "$HEAD_SHA"
-              pnpm_repository_args=(--pnpm-repository "$RUNNER_TEMP/pnpm-head")
-            fi
           fi
-          target/debug/integrated-benchmark --reuse-prebuilt-binaries --build-only --registry=npm "${pnpm_repository_args[@]}" $BENCHMARK_BUILD_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --build-only --registry=npm $BENCHMARK_BUILD_TARGETS
 
       - name: 'Benchmark: Isolated linker: fresh restore, cold cache + cold store'
         if: matrix.scenario == 'isolated-linker.fresh-restore.cold-cache.cold-store'
@@ -487,9 +386,9 @@ jobs:
         # timed runs across all four commands (cold client store, so each
         # iteration re-fetches — pacquet from the registry, pnpr from its
         # warm server), and a failure surfaces fast enough to iterate on.
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-restore.cold-cache.cold-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-restore.cold-cache.cold-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE.json
 
@@ -501,9 +400,9 @@ jobs:
         # store survives, and hyperfine's warmup populates it on the first
         # iteration so timed runs all see a hot client store (and a warm
         # server, as in every scenario).
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-restore.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-restore.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_HOT_CACHE_HOT_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_HOT_CACHE_HOT_STORE.json
 
@@ -516,9 +415,9 @@ jobs:
         # the harness asserts pnpr@HEAD is not slower than pacquet@HEAD
         # here, since a configured pnpr server must cost nothing when
         # there is nothing to resolve. Cheapest scenario per iteration.
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.repeat-install.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.repeat-install.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.json
 
@@ -529,9 +428,9 @@ jobs:
         # iteration: the up-to-date answer must be reached without any
         # metadata or verification-cache reads, so a cold cache may not
         # slow it down (same pnpm/pnpm#13904 gate as the hot variant).
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.repeat-install.cold-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.repeat-install.cold-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_COLD_CACHE_HOT_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_COLD_CACHE_HOT_STORE.json
 
@@ -544,9 +443,9 @@ jobs:
         # headroom for the default hyperfine 1 warmup + 10 timed runs
         # across all four commands without losing the per-command timeout
         # safety net the other steps document.
-        timeout-minutes: 45
+        timeout-minutes: 35
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.cold-cache.cold-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.cold-cache.cold-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_COLD_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_COLD_STORE.json
 
@@ -556,9 +455,9 @@ jobs:
         # Same timeout rationale as the cold-cache install step above; the
         # hot client store makes each iteration cheaper, so 25 min is
         # ample headroom across all four commands.
-        timeout-minutes: 35
+        timeout-minutes: 25
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_HOT_CACHE_HOT_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_HOT_CACHE_HOT_STORE.json
 
@@ -571,9 +470,9 @@ jobs:
         # the scenario that exposes pnpr's resolution-offload win — a direct
         # install pays the cold resolution while pnpr offloads it to its warm
         # server. Cheap per iteration (no download), so 25 min is ample.
-        timeout-minutes: 35
+        timeout-minutes: 25
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.cold-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.cold-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE.json
 
@@ -588,9 +487,9 @@ jobs:
         # prefer-offline resolution, e.g. the disk-to-memory metadata
         # promotion of pnpm/pnpm#12760. Cheapest scenario per iteration, so
         # 15 min is ample.
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-resolve.hot-cache.offline --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-resolve.hot-cache.offline --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESOLVE_HOT_CACHE_OFFLINE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESOLVE_HOT_CACHE_OFFLINE.json
 
@@ -617,10 +516,10 @@ jobs:
         # scenario's data point for the run, not just this one's. Record the
         # verdict here and re-raise it in the report job after the upload.
         continue-on-error: true
-        timeout-minutes: 40
+        timeout-minutes: 30
         run: |
           status=0
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.peer-heavy-resolve.hot-cache.offline --runs=9 --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $PEER_HEAVY_BENCHMARK_TARGETS || status=$?
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.peer-heavy-resolve.hot-cache.offline --runs=9 --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $PEER_HEAVY_BENCHMARK_TARGETS || status=$?
           # hyperfine exports both reports before the harness asserts, so a
           # failed gate still leaves a full measurement to publish. A failure
           # before hyperfine leaves nothing, and the Bencher build step's jq
@@ -628,31 +527,6 @@ jobs:
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_PEER_HEAVY_RESOLVE_HOT_CACHE_OFFLINE.md || true
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_PEER_HEAVY_RESOLVE_HOT_CACHE_OFFLINE.json || true
           exit $status
-
-      - name: 'Benchmark: Isolated linker: linked-workspace resolve, hot cache, offline'
-        if: matrix.scenario == 'isolated-linker.linked-workspace-resolve.hot-cache.offline'
-        shell: bash
-        # A generated workspace of 225 projects joined by 6,369 `workspace:*`
-        # edges, every linked project declaring a peer its consumers provide.
-        # The timed command resolves offline with no lockfile and no registry
-        # package, so the install's walk over linked workspace packages is the
-        # only variable cost. A walk that re-traverses a shared linked project
-        # once per importer that reaches it lands ~100x more edge visits here
-        # (https://github.com/pnpm/pnpm/issues/14906).
-        timeout-minutes: 30
-        run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.linked-workspace-resolve.hot-cache.offline --registry=verdaccio --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $WORKSPACE_BENCHMARK_TARGETS
-          cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_LINKED_WORKSPACE_RESOLVE_HOT_CACHE_OFFLINE.md
-          cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_LINKED_WORKSPACE_RESOLVE_HOT_CACHE_OFFLINE.json
-
-      - name: 'Benchmark: Isolated linker: injected workspace repeat install, hot cache + hot store'
-        if: matrix.scenario == 'isolated-linker.injected-workspace-repeat-install.hot-cache.hot-store'
-        shell: bash
-        timeout-minutes: 30
-        run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.injected-workspace-repeat-install.hot-cache.hot-store --registry=npm $WORKSPACE_BENCHMARK_TARGETS
-          cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_INJECTED_WORKSPACE_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.md
-          cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_INJECTED_WORKSPACE_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.json
 
       - name: 'Benchmark: Isolated linker: fresh restore, cold cache + cold store + cold pnpr'
         if: matrix.scenario == 'isolated-linker.fresh-restore.cold-cache.cold-store.cold-pnpr'
@@ -665,9 +539,9 @@ jobs:
         # Most expensive scenario (every iteration re-downloads ~1300 tarballs
         # through the mock), so it gets the same generous timeout as a fresh
         # install.
-        timeout-minutes: 45
+        timeout-minutes: 35
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-restore.cold-cache.cold-store.cold-pnpr --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-restore.cold-cache.cold-store.cold-pnpr --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE_COLD_PNPR.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE_COLD_PNPR.json
 
@@ -691,57 +565,11 @@ jobs:
         # The harness pre-warms the shared store per target before
         # hyperfine starts, because the scenario's contract is a
         # populated GVS and the pre-benchmark wipe empties it.
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=gvs-linker.fresh-restore.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --scenario=gvs-linker.fresh-restore.hot-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_GVS_FRESH_RESTORE_HOT_CACHE_HOT_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_GVS_FRESH_RESTORE_HOT_CACHE_HOT_STORE.json
-
-      - name: 'Benchmark: Store only: unlocked direct deps, cold cache + hot store'
-        if: matrix.scenario == 'store-only.unlocked-direct-deps.cold-cache.hot-store'
-        shell: bash
-        # The install a FUSE-mounted `node_modules` or a CI job that only
-        # fills a shared store runs: `enableModulesDir: false`, so the
-        # client resolves, writes the lockfile and checks the store, and
-        # links nothing. The seeded lockfile lacks the direct dependencies
-        # that have peers, the shape of `pnpm install` after dependencies
-        # were added to `package.json` by hand: those dependencies resolve
-        # from the registry and land on versions the lockfile's package
-        # graph still holds, so the walk reuses their subtrees instead of
-        # resolving them. (A dependency without peers is taken from the
-        # lockfile's package list without a registry request, so it would
-        # add nothing.) The metadata cache is wiped per iteration, so every
-        # package the walk does resolve costs a round trip over the
-        # emulated registry link; that is what makes the subtrees the
-        # lockfile spares show in the timing. The lockfile is trusted
-        # (`trustLockfile: true`): its supply-chain verification reads
-        # every entry's packument and would hide the walk's own fetches.
-        # The rest of the timed work is the per-package check that the
-        # store holds every file, against a per-file store index
-        # (`storeIndexFormat: files`), the format a store shared between
-        # machines uses.
-        #
-        # No other scenario resolves against a lockfile it can mostly
-        # reuse, runs store-only, or reads the per-file index; this is the
-        # series that guards the speculative warm-up against re-resolving
-        # reused subtrees (pnpm/pnpm#16886) and keeps the store check
-        # overlapped with the resolution (pnpm/pnpm#16888). Direct targets
-        # only: a pnpr server would take over the resolution being measured.
-        # No download and no linking per iteration, so 15 min is ample.
-        timeout-minutes: 25
-        run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=store-only.unlocked-direct-deps.cold-cache.hot-store --registry=verdaccio --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $WORKSPACE_BENCHMARK_TARGETS
-          cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_STORE_ONLY_UNLOCKED_DIRECT_DEPS_COLD_CACHE_HOT_STORE.md
-          cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_STORE_ONLY_UNLOCKED_DIRECT_DEPS_COLD_CACHE_HOT_STORE.json
-
-      - name: 'Benchmark: Cargo: repeat install, hot cache + hot store'
-        if: matrix.scenario == 'cargo.repeat-install.hot-cache.hot-store'
-        shell: bash
-        timeout-minutes: 30
-        run: |
-          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=cargo.repeat-install.hot-cache.hot-store --registry=npm $WORKSPACE_BENCHMARK_TARGETS
-          cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_CARGO_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.md
-          cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_CARGO_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.json
 
       # When a scenario fails, hyperfine aborts and the benchmarked install's
       # own output is invisible: each target's script redirects stdout+stderr to
@@ -793,10 +621,9 @@ jobs:
           echo "$OUTCOME" > bench-work-env/peer-heavy-outcome.txt
 
       - name: Upload scenario results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integrated-benchmark-scenario-${{ matrix.os }}-${{ matrix.scenario }}
-          overwrite: true
           path: |
             bench-work-env/BENCHMARK_REPORT_*.md
             bench-work-env/BENCHMARK_REPORT_*.json
@@ -807,52 +634,38 @@ jobs:
   report:
     needs: [revisions, benchmark]
     name: Combine benchmark results
-    runs-on: ${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
-    permissions:
-      contents: read
-      checks: write
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.revisions.outputs.tools_sha }}
+          ref: ${{ needs.revisions.outputs.head_sha }}
           persist-credentials: false
 
-      - name: Test benchmark comparison
-        run: node --test .github/scripts/compare-integrated-benchmarks.test.mjs .github/scripts/run-integrated-benchmark.test.mjs
-
       - name: Download scenario results
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: integrated-benchmark-scenario-${{ vars.INTEGRATED_BENCHMARK_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}-*
+          pattern: integrated-benchmark-scenario-blacksmith-8vcpu-ubuntu-2404-*
           path: bench-work-env
           merge-multiple: true
 
       - name: Generate summary
         shell: bash
         env:
-          # The measured HEAD on a head_ref dispatch, the PR head SHA for
-          # pull_request events, otherwise (push, workflow_dispatch) the
-          # ref's own SHA. Display-only — no control flow consumes it; the
-          # comment workflow resolves the PR number from the trusted
-          # workflow_run payload regardless.
-          SHA: ${{ inputs.head_ref && needs.revisions.outputs.head_sha || github.event.pull_request.head.sha || github.sha }}
-          MAIN_SHA: ${{ needs.revisions.outputs.main_sha }}
-          REF_NAME: ${{ github.ref_name }}
+          # The PR head SHA for pull_request events, otherwise (push,
+          # workflow_dispatch) the ref's own SHA. Display-only — no
+          # control flow consumes it; the comment workflow resolves the
+          # PR number from the trusted workflow_run payload regardless.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           (
             echo '## Integrated-Benchmark Report (${{ runner.os }})'
             echo
             echo "**Commit:** [\`${SHA:0:12}\`](${{ github.server_url }}/${{ github.repository }}/commit/$SHA)"
             echo
-            # On main the benchmark runs HEAD alone, with no main target.
-            if [ "$REF_NAME" != main ]; then
-              echo "**Compared against main at:** [\`${MAIN_SHA:0:12}\`](${{ github.server_url }}/${{ github.repository }}/commit/$MAIN_SHA)"
-              echo
-            fi
-            echo 'Regular scenarios report direct and pnpr installs. The peer-heavy resolver scenario compares current Rust, main Rust, and TypeScript pnpm; the linked, injected, and Cargo workspace scenarios compare current Rust against main Rust. Bencher consumes pacquet@HEAD and pnpr@HEAD.'
+            echo 'Regular scenarios report direct and pnpr installs. The peer-heavy resolver scenario compares current Rust, main Rust, and TypeScript pnpm. Bencher consumes pacquet@HEAD and pnpr@HEAD.'
             echo
-            echo 'The tables below show mean ± σ. Bencher tracks absolute minimum latency; PR regression checks compare HEAD and main samples from the same runner. Historical timing alerts do not gate PRs.'
+            echo 'The tables below show mean ± σ; Bencher thresholds on the **minimum** latency, which is far less perturbed by shared-runner contention (noise only adds time).'
             echo
             echo '### Scenario: Isolated linker: fresh restore, cold cache + cold store'
             echo
@@ -861,7 +674,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -873,7 +686,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_HOT_CACHE_HOT_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_HOT_CACHE_HOT_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -885,7 +698,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -897,7 +710,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_COLD_CACHE_HOT_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_REPEAT_INSTALL_COLD_CACHE_HOT_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -909,7 +722,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_COLD_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_COLD_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -921,7 +734,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_HOT_CACHE_HOT_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_HOT_CACHE_HOT_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -933,7 +746,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -945,7 +758,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESOLVE_HOT_CACHE_OFFLINE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESOLVE_HOT_CACHE_OFFLINE.json
             echo '```'
             echo
             echo '</details>'
@@ -957,31 +770,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_PEER_HEAVY_RESOLVE_HOT_CACHE_OFFLINE.json
-            echo '```'
-            echo
-            echo '</details>'
-            echo
-            echo '### Scenario: Isolated linker: linked-workspace resolve, hot cache, offline'
-            echo
-            cat bench-work-env/BENCHMARK_REPORT_ISOLATED_LINKED_WORKSPACE_RESOLVE_HOT_CACHE_OFFLINE.md
-            echo
-            echo '<details><summary>BENCHMARK_REPORT.json</summary>'
-            echo
-            echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_LINKED_WORKSPACE_RESOLVE_HOT_CACHE_OFFLINE.json
-            echo '```'
-            echo
-            echo '</details>'
-            echo
-            echo '### Scenario: Isolated linker: injected workspace repeat install, hot cache + hot store'
-            echo
-            cat bench-work-env/BENCHMARK_REPORT_ISOLATED_INJECTED_WORKSPACE_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.md
-            echo
-            echo '<details><summary>BENCHMARK_REPORT.json</summary>'
-            echo
-            echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_INJECTED_WORKSPACE_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_PEER_HEAVY_RESOLVE_HOT_CACHE_OFFLINE.json
             echo '```'
             echo
             echo '</details>'
@@ -993,7 +782,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE_COLD_PNPR.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE_COLD_PNPR.json
             echo '```'
             echo
             echo '</details>'
@@ -1007,35 +796,7 @@ jobs:
             echo '<details><summary>BENCHMARK_REPORT.json</summary>'
             echo
             echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_GVS_FRESH_RESTORE_HOT_CACHE_HOT_STORE.json
-            echo '```'
-            echo
-            echo '</details>'
-            echo
-            echo '### Scenario: Store only: unlocked direct deps, cold cache + hot store'
-            echo
-            echo 'Store-only install (`enableModulesDir: false`, per-file store index, trusted lockfile) against a lockfile missing the direct dependencies that have peers, with the metadata cache wiped per iteration: the install resolves those from the registry, reuses their subtrees from the lockfile and checks the store, linking nothing. Direct installs only.'
-            echo
-            cat bench-work-env/BENCHMARK_REPORT_STORE_ONLY_UNLOCKED_DIRECT_DEPS_COLD_CACHE_HOT_STORE.md
-            echo
-            echo '<details><summary>BENCHMARK_REPORT.json</summary>'
-            echo
-            echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_STORE_ONLY_UNLOCKED_DIRECT_DEPS_COLD_CACHE_HOT_STORE.json
-            echo '```'
-            echo
-            echo '</details>'
-            echo
-            echo '### Scenario: Cargo: repeat install, hot cache + hot store'
-            echo
-            echo 'Frozen repeat install of a Cargo workspace (`cargo.enabled: true`) whose crates are already materialized in `<storeDir>/v11/crates/` and linked into `.pnpm/crates/crates-io`. Direct installs only.'
-            echo
-            cat bench-work-env/BENCHMARK_REPORT_CARGO_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.md
-            echo
-            echo '<details><summary>BENCHMARK_REPORT.json</summary>'
-            echo
-            echo '```json'
-            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_CARGO_REPEAT_INSTALL_HOT_CACHE_HOT_STORE.json
+            jq 'del(.results[].exit_codes, .results[].times)' bench-work-env/BENCHMARK_REPORT_GVS_FRESH_RESTORE_HOT_CACHE_HOT_STORE.json
             echo '```'
             echo
             echo '</details>'
@@ -1048,9 +809,19 @@ jobs:
         # scenarios contribute both testbeds; the client-only peer-heavy case
         # contributes only `pacquet@HEAD`.
         #
-        # Keep absolute minimum latency for historical continuity in Bencher.
-        # The PR gate uses same-run sample distributions in the comment
-        # workflow; historical timings vary with the machine running them.
+        # We report each scenario's *minimum* latency as the metric value, so
+        # Bencher's threshold tracks the min rather than the mean. On a shared
+        # CI runner, contention only ever *adds* time, so the minimum is the run
+        # least perturbed by a noisy neighbour and the truest signal of a real
+        # code regression — the mean drifts run-to-run with whatever else the
+        # machine is doing (the latency-free offline scenario is pure CPU/disk
+        # and swung ~30% between runs, tripping a spurious alert on a control
+        # run whose HEAD and main binaries were byte-identical). Because the
+        # minimum only needs one uncontended run, hyperfine's default sampling
+        # suffices for regular scenarios. The peer-heavy case is noisier and
+        # fixes its own count instead. The human-readable
+        # comment still reports mean ± σ; only the alerting signal moves to the
+        # min.
         #
         # BMF rather than the `shell_hyperfine` adapter with a doctored `mean`:
         # this reports the min honestly as the value instead of relabelling it.
@@ -1093,12 +864,8 @@ jobs:
             'ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE:isolated-linker.fresh-install.cold-cache.hot-store' \
             'ISOLATED_FRESH_RESOLVE_HOT_CACHE_OFFLINE:isolated-linker.fresh-resolve.hot-cache.offline' \
             'ISOLATED_PEER_HEAVY_RESOLVE_HOT_CACHE_OFFLINE:isolated-linker.peer-heavy-resolve.hot-cache.offline' \
-            'ISOLATED_LINKED_WORKSPACE_RESOLVE_HOT_CACHE_OFFLINE:isolated-linker.linked-workspace-resolve.hot-cache.offline' \
-            'ISOLATED_INJECTED_WORKSPACE_REPEAT_INSTALL_HOT_CACHE_HOT_STORE:isolated-linker.injected-workspace-repeat-install.hot-cache.hot-store' \
             'ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE_COLD_PNPR:isolated-linker.fresh-restore.cold-cache.cold-store.cold-pnpr' \
-            'GVS_FRESH_RESTORE_HOT_CACHE_HOT_STORE:gvs-linker.fresh-restore.hot-cache.hot-store' \
-            'STORE_ONLY_UNLOCKED_DIRECT_DEPS_COLD_CACHE_HOT_STORE:store-only.unlocked-direct-deps.cold-cache.hot-store' \
-            'CARGO_REPEAT_INSTALL_HOT_CACHE_HOT_STORE:cargo.repeat-install.hot-cache.hot-store'
+            'GVS_FRESH_RESTORE_HOT_CACHE_HOT_STORE:gvs-linker.fresh-restore.hot-cache.hot-store'
 
           build_bencher_file bench-work-env/bencher-results-pnpr.json pnpr@HEAD \
             'ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE:isolated-linker.fresh-restore.cold-cache.cold-store' \
@@ -1132,27 +899,26 @@ jobs:
           cp bench-work-env/bencher-results-pnpr.json benchmark-artifact/bencher-results-pnpr.json
 
       - name: Upload benchmark report
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integrated-benchmark-report-ubuntu-latest
-          overwrite: true
           path: benchmark-artifact/
           if-no-files-found: error
           retention-days: 14
 
       - name: Install Bencher CLI
-        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && !inputs.head_ref
-        uses: bencherdev/bencher@58a33f76185c1187f3df355817d2ac7285ac77f0 # v0.6.14
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: bencherdev/bencher@8d75325c3bc59403a2186a056b472c4f49d42838 # v0.6.12
 
       - name: Upload results to Bencher
         # Runs on push and workflow_dispatch — both execute in the
         # base-repo privilege context where secrets are available.
         # PR runs (including from forks) skip this step and upload
-        # via the workflow_run comment workflow instead. A dispatch with
-        # head_ref measured another revision than the branch it names.
-        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && !inputs.head_ref
+        # via the workflow_run comment workflow instead.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REF_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
@@ -1163,8 +929,10 @@ jobs:
           # One run is one benchmark, two testbeds: `pacquet` (direct
           # install, all scenarios) and `pnpr` (accelerated path, hot
           # scenarios). Upload each from its own bencher-results file.
-          # Historical alerts remain in Bencher. Only same-run comparisons
-          # gate branches, since absolute times vary between runners.
+          # `--start-point-clone-thresholds` so the forked branch inherits
+          # the threshold configured on main; `--err` so the workflow fails
+          # when a sample breaches the upper boundary. Main pushes skip
+          # both — by then the regression has already landed.
           upload() {
             local testbed=$1 file=$2
             if [ ! -f "$file" ]; then
@@ -1176,6 +944,7 @@ jobs:
               --testbed "$testbed"
               --adapter json
               --file "$file"
+              --github-actions "$GITHUB_TOKEN"
             )
             if [ "$REF_NAME" = "main" ]; then
               args+=(--branch main)
@@ -1185,20 +954,13 @@ jobs:
                 --start-point main
                 --start-point-reset
                 --start-point-clone-thresholds
+                --err
               )
             fi
             bencher run "${args[@]}"
           }
           upload pacquet bench-work-env/bencher-results.json
           upload pnpr bench-work-env/bencher-results-pnpr.json
-
-      - name: Check same-run regressions on dispatched branches
-        if: github.event_name == 'workflow_dispatch' && github.ref_name != 'main'
-        shell: bash
-        run: |
-          node .github/scripts/compare-integrated-benchmarks.mjs bench-work-env > comparison.md || status=$?
-          cat comparison.md >> "$GITHUB_STEP_SUMMARY"
-          exit "${status:-0}"
 
       - name: Re-raise the peer-heavy gate
         # Deferred from the peer-heavy step so its cross-engine assertion

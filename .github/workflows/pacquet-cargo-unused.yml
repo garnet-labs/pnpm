@@ -26,11 +26,8 @@ jobs:
       - name: Install Rust Toolchain
         uses: $/.github/actions/rustup
 
-      - name: Install crates
-        uses: $/.github/actions/install-crates
-
       - name: Install cargo-unused-features
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: cargo-unused-features
 
@@ -52,17 +49,9 @@ jobs:
             src:
               - 'Cargo.lock'
 
-      - name: Install Rust Toolchain
-        if: steps.filter.outputs.src == 'true'
-        uses: $/.github/actions/rustup
-
-      - name: Install crates
-        if: steps.filter.outputs.src == 'true'
-        uses: $/.github/actions/install-crates
-
       - name: Install cargo-udeps
         if: steps.filter.outputs.src == 'true'
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: cargo-udeps
 
