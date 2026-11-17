@@ -4,7 +4,7 @@
 use super::{
     FreshnessCheckError, LockfileFreshnessInputs,
     directory_deps::{
-        InjectedDirectory, NestedByImporter, is_declared_local_directory, is_deploy_file_url_key,
+        InjectedDirectory, is_declared_local_directory, is_deploy_file_url_key,
         overridden_unhooked_manifest, unhooked_manifest,
     },
     project_manifests_by_dir,
@@ -37,24 +37,19 @@ impl DirectoryManifests {
 }
 
 /// The manifest of every directory package the importers of `inputs` reach
-/// through directory packages, and of every `nested` one they reach and the directory
-/// packages beneath it, with the resolver's manifest hooks applied as the resolver applies them:
+/// through directory packages, that no project in `inputs` describes, with
+/// the resolver's manifest hooks applied as the resolver applies them:
 /// `packageExtensions`, the pnpmfile's `readPackage` with the recorded
-/// directory, overrides, and `ignoredOptionalDependencies`. Projects are included
-/// when `addMissingPeerTypes` requires their dependency hook chain.
+/// directory, overrides, and `ignoredOptionalDependencies`.
 ///
 /// The children of a package come from its hooked manifest, so the packages
 /// are hooked one level of the graph at a time.
 pub(super) async fn hooked_directory_manifests(
     lockfile: &Lockfile,
     inputs: &LockfileFreshnessInputs<'_, '_>,
-    (parsed_overrides, nested): (
-        Option<&[pnpm_config_parse_overrides::VersionOverride]>,
-        &NestedByImporter<'_>,
-    ),
+    parsed_overrides: Option<&[pnpm_config_parse_overrides::VersionOverride]>,
 ) -> Result<DirectoryManifests, FreshnessCheckError> {
     let mut level = direct_directory_deps(lockfile, inputs);
-    level.extend(nested_directory_deps(nested));
     if level.is_empty() {
         return Ok(DirectoryManifests::default());
     }
@@ -62,7 +57,10 @@ pub(super) async fn hooked_directory_manifests(
         lockfile,
         inputs,
         parsed_overrides,
-        manifests_by_dir: dependency_manifest_sources(inputs),
+        manifests_by_dir: project_manifests_by_dir(
+            inputs.manifests.iter().map(|(_, manifest)| *manifest),
+            inputs.dependency_manifests,
+        ),
         hooks: resolver_hooks(inputs, parsed_overrides)?,
     };
     // A directory is read once, but each snapshot of it is walked: peer
@@ -170,20 +168,6 @@ fn direct_directory_deps(
         .collect()
 }
 
-/// Each nested package under both declarations, which the check tries (see
-/// [`super::directory_deps::check_nested_directory_package`]).
-fn nested_directory_deps<'n>(nested: &'n NestedByImporter<'_>) -> impl Iterator<Item = Visit> + 'n {
-    nested
-        .packages()
-        .flat_map(|package| {
-            [false, true].map(|declared_as_file| Visit {
-                dep: (package.directory.clone(), declared_as_file),
-                alias: package.alias.clone(),
-                key: package.key.clone(),
-            })
-        })
-}
-
 struct DirectoryWalk<'a, 'i> {
     lockfile: &'a Lockfile,
     inputs: &'a LockfileFreshnessInputs<'i, 'i>,
@@ -220,7 +204,7 @@ impl DirectoryWalk<'_, '_> {
     }
 
     /// The manifest the check reads for `visit`, and whether it was hooked
-    /// here. Projects need the dependency hook chain when it adds optional type peers.
+    /// here. A project's manifest comes in already hooked.
     async fn read(
         &self,
         visit: &Visit,
@@ -235,7 +219,7 @@ impl DirectoryWalk<'_, '_> {
                 .unwrap_or(self.inputs.lockfile_dir),
             manifests_by_dir: &self.manifests_by_dir,
         };
-        if self.manifests_by_dir.contains_key(&dir) && !self.inputs.config.add_missing_peer_types {
+        if self.manifests_by_dir.contains_key(&dir) {
             let manifest = overridden_unhooked_manifest(
                 &injected,
                 self.parsed_overrides,
@@ -308,21 +292,5 @@ impl DirectoryWalk<'_, '_> {
             alias: child.alias,
             key,
         })
-    }
-}
-
-fn dependency_manifest_sources<'a>(
-    inputs: &LockfileFreshnessInputs<'_, 'a>,
-) -> super::ProjectManifestsByDir<'a> {
-    if inputs.config.add_missing_peer_types {
-        project_manifests_by_dir(
-            inputs.dependency_manifests.declared.iter().map(|(_, manifest)| *manifest),
-            inputs.dependency_manifests.injected,
-        )
-    } else {
-        project_manifests_by_dir(
-            inputs.manifests.iter().map(|(_, manifest)| *manifest),
-            inputs.dependency_manifests.injected,
-        )
     }
 }
