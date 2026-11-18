@@ -1,0 +1,82 @@
+name: Jibril RC benchmark
+
+on:
+  push:
+    branches:
+      - devin/1795029421-jibril-rc4-benchmark
+
+permissions:
+  contents: read
+
+jobs:
+  compile-and-lint:
+    name: TS CI / Compile & Lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+    - name: Checkout Commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Initialize Rust before dependency installation
+      uses: $/.github/actions/rustup
+      with:
+        restore-cache: false
+    - name: Install pnpm
+      uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
+      with:
+        install: false
+    - name: Test CI and release publication scripts
+      run: |
+        .github/scripts/npm-package-publication-state.test.sh
+        .github/scripts/npm-staged-publication.test.sh
+        .github/scripts/issue-fix-intent.test.sh
+        .github/scripts/docker-image-tags.test.sh
+        .agents/skills/pull-requests/scripts/resolve-pr-conflicts.test.sh
+        node --test .github/scripts/ts-test-scope.test.mjs .github/scripts/ts-test-chunks.test.mjs .github/scripts/assert-windows-crt-static.test.mjs .github/scripts/wait-for-pnpr.test.mjs .github/scripts/update-npm-signing-keys.test.mjs
+    - name: Test Cloudflare cache policy example
+      run: node --test pnpr/examples/cloudflare/*.test.mjs
+    - name: Compile and lint TypeScript
+      run: pn pipeline ts-check --include-workspace-root --full --no-cache
+    - name: Package compiled artifacts
+      shell: bash
+      run: |
+        mapfile -d '' -t lib_dirs < <(find . -type d -name lib -not -path '*/node_modules/*' -print0)
+        mapfile -d '' -t tsbuildinfo_files < <(find . -name 'tsconfig.tsbuildinfo' -not -path '*/node_modules/*' -print0)
+        tar -czf compiled.tar.gz --exclude='node_modules' "${lib_dirs[@]}" "${tsbuildinfo_files[@]}" pnpm11/pnpm/dist
+    - name: Upload compiled artifacts
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: compiled-packages
+        path: compiled.tar.gz
+        retention-days: 1
+
+  build-pnpr-linux:
+    name: TS CI / Build pnpr
+    uses: $/.github/workflows/build-pnpr.yml
+    with:
+      os: blacksmith-16vcpu-ubuntu-2404
+
+  test:
+    name: TS CI / Test / ubuntu (${{ matrix.version }}, repeat ${{ matrix.repeat }})
+    needs: compile-and-lint
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        repeat: [1, 2, 3]
+        version: [v2.17.0, v2.18.0-rc.4]
+    uses: $/.github/workflows/test.yml
+    with:
+      node: '24.0.0'
+      node_major: '24'
+      platform: blacksmith-8vcpu-ubuntu-2404
+      test_chunk: '2'
+      test_chunk_total: '3'
+      garnet: true
+      wait_for_pnpr: true
+      jibril_version: ${{ matrix.version }}
+      benchmark_sample: ${{ format('{0}', strategy.job-index) }}
+    secrets:
+      GARNET_API_TOKEN: ${{ secrets.GARNET_API_TOKEN }}
