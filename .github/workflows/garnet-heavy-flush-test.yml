@@ -3,7 +3,7 @@ name: Garnet jibril rc.4 profile drop test
 on:
   push:
     branches:
-      - devin/1794943476-jibril-rc4-profile-drop
+      - bench/jibril-v2180-3way
   workflow_dispatch:
     inputs:
       jibril_version:
@@ -151,18 +151,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - leg: rc4-a
-            ver: v2.18.0-rc.4
-          - leg: rc4-b
-            ver: v2.18.0-rc.4
-          - leg: rc4-c
-            ver: v2.18.0-rc.4
-          - leg: control-2170-a
+          - leg: control-2170-1
             ver: v2.17.0
-          - leg: control-2170-b
+          - leg: rc4-1
+            ver: v2.18.0-rc.4
+          - leg: stable-1
+            ver: v2.18.0
+          - leg: control-2170-2
             ver: v2.17.0
-          - leg: control-2170-c
+          - leg: rc4-2
+            ver: v2.18.0-rc.4
+          - leg: stable-2
+            ver: v2.18.0
+          - leg: control-2170-3
             ver: v2.17.0
+          - leg: rc4-3
+            ver: v2.18.0-rc.4
+          - leg: stable-3
+            ver: v2.18.0
+          - leg: control-2170-4
+            ver: v2.17.0
+          - leg: rc4-4
+            ver: v2.18.0-rc.4
+          - leg: stable-4
+            ver: v2.18.0
+          - leg: control-2170-5
+            ver: v2.17.0
+          - leg: rc4-5
+            ver: v2.18.0-rc.4
+          - leg: stable-5
+            ver: v2.18.0
     permissions:
       actions: read
       contents: read
