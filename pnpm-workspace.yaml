@@ -159,3 +159,5 @@ savePrefix: ''
 virtualStoreType: global
 
 autoDedupe: true
+
+registry: https://registry.npmjs.org/
