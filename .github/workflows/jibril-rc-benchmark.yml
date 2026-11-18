@@ -1,9 +1,9 @@
-name: Jibril RC benchmark
+name: Jibril stable TS benchmark
 
 on:
   push:
     branches:
-      - devin/1795029421-jibril-rc4-benchmark
+      - devin/1795034776-jibril-stable-benchmark
 
 permissions:
   contents: read
@@ -66,7 +66,7 @@ jobs:
       fail-fast: false
       matrix:
         repeat: [1, 2, 3]
-        version: [v2.17.0, v2.18.0-rc.4]
+        version: [v2.17.0, v2.18.0]
     uses: $/.github/workflows/test.yml
     with:
       node: '24.0.0'
