@@ -3,7 +3,7 @@ name: Jibril stable TS benchmark
 on:
   push:
     branches:
-      - devin/1795034776-jibril-stable-benchmark
+      - devin/1795067637-action203-pnpm-regression
 
 permissions:
   contents: read
