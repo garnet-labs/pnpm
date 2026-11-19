@@ -55,12 +55,16 @@ test('fetchFromRegistry', async () => {
 })
 
 test('fetchFromRegistry fullMetadata', async () => {
-  // Read the full metadata document from the default registry.
+  // Read the full metadata document from the default and mirrored registries.
   const fetchFromRegistry = createFetchFromRegistry({})
   const res = await fetchFromRegistry('https://registry.npmjs.org/is-positive', { fullMetadata: true })
   const metadata = await res.json() as any // eslint-disable-line
   expect(metadata.name).toBe('is-positive')
   expect(metadata.versions['1.0.0'].scripts).toBeTruthy()
+  const mirrorRes = await fetchFromRegistry('https://registry.npmmirror.com/is-positive', { fullMetadata: true })
+  const mirrorMetadata = await mirrorRes.json() as any // eslint-disable-line
+  expect(mirrorMetadata.name).toBe(metadata.name)
+  expect(mirrorMetadata.versions['1.0.0'].scripts).toEqual(metadata.versions['1.0.0'].scripts)
 })
 
 test('authorization headers are removed before redirection if the target is on a different host', async () => {
