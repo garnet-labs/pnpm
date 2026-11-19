@@ -1,7 +1,7 @@
 /**
  * Check if a name is strictly kebab-case.
  *
- * "Strictly kebab-case" means that the name is kebab-case and has at least 2 words.
+ * "Strictly kebab-case" means that the name is kebab-case and has at least two words.
  */
 export function isStrictlyKebabCase (name: string): boolean {
   const segments = name.split('-')
