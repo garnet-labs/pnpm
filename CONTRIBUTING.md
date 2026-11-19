@@ -35,7 +35,7 @@ The repository holds two implementations of the same package manager: the TypeSc
 1. Alternatively, for recompiling all the projects with typechecking after your changes, again run `pnpm run compile` in the root of the repository.
 1. Run the tests for what you changed rather than the whole repository, which takes a long time: `pnpm test` inside a project's directory, `pnpm --filter <project name> test` from the root, or `pnpm --filter <project name> test <file path>` for a single file. `pnpm run test-all` runs the whole TypeScript suite on the rare occasion you need it; the Rust and `pnpr` suites are separate, and are covered in [`pnpm/CONTRIBUTING.md`](./pnpm/CONTRIBUTING.md).
 
-Some of the e2e tests run node-gyp, so you might need to install some build-essentials on your system for those tests to pass. On Fedora, install these:
+Some of the e2e tests run node-gyp, so you might need to install build tools on your system for those tests to pass. On Fedora, install these:
 
 ```shell
 sudo dnf install make automake gcc gcc-c++ kernel-devel
