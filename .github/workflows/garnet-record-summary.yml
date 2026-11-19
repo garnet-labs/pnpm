@@ -77,7 +77,7 @@ jobs:
           echo "apply=${eligible}" >> "${GITHUB_OUTPUT}"
       - name: Write finalized record summary and publish draft
         if: steps.eligible.outputs.apply == 'true'
-        uses: garnet-labs/actions/garnet-record-summary@01b9805273fb5d42d08ab2e1833347e0aca2ef7e
+        uses: garnet-labs/actions/garnet-record-summary@a74774a4916d3ffafb5cfe361ba0b0eda640b4aa
         with:
           github-token: ${{ github.token }}
           pr-number: ${{ matrix.pr }}
