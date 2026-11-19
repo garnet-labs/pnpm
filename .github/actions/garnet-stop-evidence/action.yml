@@ -1,0 +1,6 @@
+name: Garnet stop evidence
+description: Placed before the Garnet step so its post runs after Garnet's post and records what Jibril left behind.
+runs:
+  using: node24
+  main: main.js
+  post: post.js
