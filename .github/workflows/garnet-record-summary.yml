@@ -43,7 +43,7 @@ jobs:
           prs=$(
             for pr_number in ${candidates}; do
               gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
-                --jq 'select(.state == "open" and any(.labels[]; .name == "garnet-record-summary")) | .number'
+                --jq 'select(.state == "open" and ((.body // "") | contains("<!-- garnet:record-summary:opt-in -->"))) | .number'
             done | jq -cs 'unique'
           )
           echo "prs=${prs}" >> "${GITHUB_OUTPUT}"
@@ -73,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           eligible=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
-            --jq '.state == "open" and any(.labels[]; .name == "garnet-record-summary")')
+            --jq '.state == "open" and ((.body // "") | contains("<!-- garnet:record-summary:opt-in -->"))')
           echo "apply=${eligible}" >> "${GITHUB_OUTPUT}"
       - name: Write finalized record summary and publish draft
         if: steps.eligible.outputs.apply == 'true'
