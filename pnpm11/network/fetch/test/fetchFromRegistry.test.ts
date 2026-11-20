@@ -55,12 +55,18 @@ test('fetchFromRegistry', async () => {
 })
 
 test('fetchFromRegistry fullMetadata', async () => {
-  // This test uses real network - no mock needed
+  // Compare full and abbreviated metadata from the default registry.
   const fetchFromRegistry = createFetchFromRegistry({})
   const res = await fetchFromRegistry('https://registry.npmjs.org/is-positive', { fullMetadata: true })
   const metadata = await res.json() as any // eslint-disable-line
   expect(metadata.name).toBe('is-positive')
   expect(metadata.versions['1.0.0'].scripts).toBeTruthy()
+  const abbreviatedRes = await fetchFromRegistry('https://registry.npmjs.org/is-positive')
+  const abbreviatedMetadata = await abbreviatedRes.json() as any // eslint-disable-line
+  expect(abbreviatedMetadata.name).toBe(metadata.name)
+  expect(abbreviatedMetadata.versions['1.0.0'].version).toBe(metadata.versions['1.0.0'].version)
+  expect(abbreviatedMetadata.versions['1.0.0'].dist.tarball).toBe(metadata.versions['1.0.0'].dist.tarball)
+  expect(abbreviatedMetadata.versions['1.0.0'].scripts).not.toBeTruthy()
 })
 
 test('authorization headers are removed before redirection if the target is on a different host', async () => {
