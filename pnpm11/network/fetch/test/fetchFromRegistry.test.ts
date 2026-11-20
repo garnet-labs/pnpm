@@ -55,16 +55,18 @@ test('fetchFromRegistry', async () => {
 })
 
 test('fetchFromRegistry fullMetadata', async () => {
-  // Read the full metadata document from the default and mirrored registries.
+  // Compare full and abbreviated metadata from the default registry.
   const fetchFromRegistry = createFetchFromRegistry({})
   const res = await fetchFromRegistry('https://registry.npmjs.org/is-positive', { fullMetadata: true })
   const metadata = await res.json() as any // eslint-disable-line
   expect(metadata.name).toBe('is-positive')
   expect(metadata.versions['1.0.0'].scripts).toBeTruthy()
-  const mirrorRes = await fetchFromRegistry('https://registry.npmmirror.com/is-positive', { fullMetadata: true })
-  const mirrorMetadata = await mirrorRes.json() as any // eslint-disable-line
-  expect(mirrorMetadata.name).toBe(metadata.name)
-  expect(mirrorMetadata.versions['1.0.0'].scripts).toEqual(metadata.versions['1.0.0'].scripts)
+  const abbreviatedRes = await fetchFromRegistry('https://registry.npmjs.org/is-positive')
+  const abbreviatedMetadata = await abbreviatedRes.json() as any // eslint-disable-line
+  expect(abbreviatedMetadata.name).toBe(metadata.name)
+  expect(abbreviatedMetadata.versions['1.0.0'].version).toBe(metadata.versions['1.0.0'].version)
+  expect(abbreviatedMetadata.versions['1.0.0'].dist.tarball).toBe(metadata.versions['1.0.0'].dist.tarball)
+  expect(abbreviatedMetadata.versions['1.0.0'].scripts).not.toBeTruthy()
 })
 
 test('authorization headers are removed before redirection if the target is on a different host', async () => {
