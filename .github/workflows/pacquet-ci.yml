@@ -174,7 +174,6 @@ jobs:
     name: Rust CI / Test / ${{ matrix.os_label }}
     permissions:
       contents: read
-      id-token: write
     needs: changes
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') }}
     # Build the nextest artifacts with line-tables-only debug info. The full
@@ -223,6 +222,8 @@ jobs:
       - name: Record runtime with Garnet
         if: ${{ matrix.os_label == 'ubuntu' && runner.arch == 'X64' }}
         uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
 
       # The nextest build holds a full set of debug artifacts in
       # target/, which no longer fits in the hosted runner's free disk —
