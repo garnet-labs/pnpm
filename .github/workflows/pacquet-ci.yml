@@ -19,6 +19,7 @@ on:
   push:
     branches:
       - main
+      - 'devin/1795560360-umar-base-*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -30,10 +31,17 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       rust: ${{ steps.manual.outputs.rust || steps.filter.outputs.rust }}
+      lockfiles: ${{ steps.filter.outputs.lockfiles }}
+      replay_baseline: ${{ steps.replay_baseline.outputs.enabled }}
       changesets: ${{ steps.filter.outputs.changesets }}
       docs: ${{ steps.filter.outputs.docs }}
       convergence: ${{ steps.manual.outputs.rust || steps.filter.outputs.convergence }}
     steps:
+      - name: Detect replay baseline push
+        if: github.repository == 'garnet-labs/pnpm' && github.event_name == 'push' && startsWith(github.ref_name, 'devin/1795560360-umar-base-')
+        id: replay_baseline
+        run: echo "enabled=true" >> "$GITHUB_OUTPUT"
+
       # Force the full Rust suite on manual runs and in the merge queue.
       # The merge queue tests the merged commit, so path filtering it away
       # would defeat the point; running unconditionally also guarantees the
@@ -44,16 +52,19 @@ jobs:
         run: echo "rust=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' && github.event_name != 'pull_request'
+        if: github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' && github.event_name != 'pull_request' && steps.replay_baseline.outputs.enabled != 'true'
         with:
           persist-credentials: false
 
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        if: github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group'
+        if: github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' && steps.replay_baseline.outputs.enabled != 'true'
         id: filter
         with:
           predicate-quantifier: some-with-excludes
           filters: |
+            lockfiles:
+              - 'Cargo.lock'
+              - 'pnpm-lock.yaml'
             # The Markdown the rust filter excludes, so the spell check still
             # runs when only that Markdown changes.
             docs:
@@ -181,7 +192,7 @@ jobs:
   test:
     name: Rust CI / Test / ${{ matrix.os_label }}
     needs: changes
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.replay_baseline == 'true') }}
     # Build the nextest artifacts with line-tables-only debug info. The full
     # `cargo nextest` build holds a complete set of `--all-targets` debug
     # binaries for the whole workspace (~60 crates plus heavy C deps like
@@ -200,7 +211,9 @@ jobs:
       # Jitter entropy initialization aborts on Windows runners: pnpm/tasks#239.
       AWS_LC_SYS_NO_JITTER_ENTROPY: ${{ matrix.os_label == 'windows' && '1' || '' }}
       # Main only restores compiler cache entries that main wrote.
-      SCCACHE_SCOPE: ${{ github.event.pull_request.number && format('pr{0}', github.event.pull_request.number) || github.ref_name }}
+      SCCACHE_SCOPE: >-
+        ${{ (github.repository == 'garnet-labs/pnpm' && startsWith(github.head_ref || github.ref_name, 'devin/1795560360-umar-replay-') && (github.head_ref || github.ref_name)) ||
+            (github.event.pull_request.number && format('pr{0}', github.event.pull_request.number)) || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +237,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Report initial disk headroom
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: df -h /
+
+      - name: Record runtime with Garnet
+        if: >-
+          ${{ runner.os == 'Linux' && runner.arch == 'X64' &&
+              ((github.event_name == 'push' &&
+                (needs.changes.outputs.replay_baseline == 'true' ||
+                 (github.ref == 'refs/heads/main' && needs.changes.outputs.lockfiles == 'true'))) ||
+               (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository &&
+                needs.changes.outputs.lockfiles == 'true' &&
+                ((github.base_ref == 'main' && github.head_ref == 'chore/update-lockfile') ||
+                 (github.repository == 'garnet-labs/pnpm' && startsWith(github.head_ref, 'devin/1795560360-umar-replay-'))))) }}
+        continue-on-error: true
+        uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
 
       # The nextest build holds a full set of debug artifacts in
       # target/, which no longer fits in the hosted runner's free disk —
@@ -484,6 +516,11 @@ jobs:
           path: .bench/artifact/rust/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Report final disk headroom
+        if: always() && runner.os == 'Linux' && runner.arch == 'X64'
+        run: df -h /
+
 
   metadata-databases:
     name: Rust CI / Metadata databases
