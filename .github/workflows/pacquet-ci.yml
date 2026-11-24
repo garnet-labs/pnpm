@@ -1,7 +1,5 @@
 name: Rust CI
 
-# Record the main baseline before opening the dependency replay PRs.
-
 # This workflow covers every Rust crate in the repo — pacquet and
 # pnpr alike. They share the same cargo workspace, so `just test`,
 # dylint, doc, etc. all see both stacks in one pass; running two
@@ -32,6 +30,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       rust: ${{ steps.manual.outputs.rust || steps.filter.outputs.rust }}
+      lockfiles: ${{ steps.filter.outputs.lockfiles }}
       changesets: ${{ steps.filter.outputs.changesets }}
       docs: ${{ steps.filter.outputs.docs }}
       convergence: ${{ steps.manual.outputs.rust || steps.filter.outputs.convergence }}
@@ -56,6 +55,9 @@ jobs:
         with:
           predicate-quantifier: some-with-excludes
           filters: |
+            lockfiles:
+              - 'Cargo.lock'
+              - 'pnpm-lock.yaml'
             # The Markdown the rust filter excludes, so the spell check still
             # runs when only that Markdown changes.
             docs:
@@ -220,7 +222,13 @@ jobs:
           persist-credentials: false
 
       - name: Record runtime with Garnet
-        if: ${{ matrix.os_label == 'ubuntu' && runner.arch == 'X64' }}
+        if: >-
+          ${{ runner.os == 'Linux' && runner.arch == 'X64' && needs.changes.outputs.lockfiles == 'true' &&
+              ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+               (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository &&
+                ((github.base_ref == 'main' && github.head_ref == 'chore/update-lockfile') ||
+                 (github.repository == 'garnet-labs/pnpm' && startsWith(github.head_ref, 'devin/1795560360-umar-replay-'))))) }}
+        continue-on-error: true
         uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
