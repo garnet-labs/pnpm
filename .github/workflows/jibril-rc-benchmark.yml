@@ -3,7 +3,7 @@ name: Jibril stable TS benchmark
 on:
   push:
     branches:
-      - devin/1795067637-action203-pnpm-regression
+      - devin/1795557110-action-v2.5.3-regression
 
 permissions:
   contents: read
@@ -57,7 +57,7 @@ jobs:
       os: blacksmith-16vcpu-ubuntu-2404
 
   test:
-    name: TS CI / Test / ubuntu (${{ matrix.version }}, repeat ${{ matrix.repeat }})
+    name: TS CI / Test / ubuntu (${{ matrix.version || 'default' }}, repeat ${{ matrix.repeat }})
     needs: compile-and-lint
     permissions:
       actions: read
@@ -66,7 +66,7 @@ jobs:
       fail-fast: false
       matrix:
         repeat: [1, 2, 3]
-        version: [v2.17.0, v2.18.0]
+        version: [v2.17.0, '']
     uses: $/.github/workflows/test.yml
     with:
       node: '24.0.0'

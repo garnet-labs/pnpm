@@ -19,7 +19,7 @@ on:
       jibril_version:
         required: false
         type: string
-        default: 'v2.17.0'
+        default: ''
       benchmark_sample:
         required: false
         type: string
@@ -67,8 +67,13 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - if: ${{ inputs.garnet }}
-      uses: garnet-org/action@f4315627734aac6935e41f9649fdfd875f75ed97 # action203 regression
+    - if: ${{ inputs.garnet && inputs.jibril_version == '' }}
+      uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
+      with:
+        api_token: ${{ secrets.GARNET_API_TOKEN }}
+        job_index: ${{ inputs.benchmark_sample }}
+    - if: ${{ inputs.garnet && inputs.jibril_version != '' }}
+      uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
         jibril_version: ${{ inputs.jibril_version }}

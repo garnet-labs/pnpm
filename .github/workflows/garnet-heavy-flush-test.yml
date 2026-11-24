@@ -3,7 +3,7 @@ name: Garnet Jibril stable heavy flush test
 on:
   push:
     branches:
-      - devin/1795067637-action203-pnpm-regression
+      - devin/1795557110-action-v2.5.3-regression
   workflow_dispatch:
     inputs:
       jibril_version:
@@ -154,11 +154,11 @@ jobs:
       matrix:
         include:
           - leg: stable-a
-            ver: v2.18.0
+            ver: ''
           - leg: stable-b
-            ver: v2.18.0
+            ver: ''
           - leg: stable-c
-            ver: v2.18.0
+            ver: ''
           - leg: control-2170-a
             ver: v2.17.0
           - leg: control-2170-b
@@ -189,8 +189,12 @@ jobs:
       with:
         ref: 8db3fd0c3e0696c5307850a772a3662563159830
         persist-credentials: false
-    - if: ${{ github.event_name == 'push' || inputs.garnet }}
-      uses: garnet-org/action@f4315627734aac6935e41f9649fdfd875f75ed97 # action203 regression
+    - if: ${{ (github.event_name == 'push' || inputs.garnet) && matrix.ver == '' }}
+      uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
+      with:
+        api_token: ${{ secrets.GARNET_API_TOKEN }}
+    - if: ${{ (github.event_name == 'push' || inputs.garnet) && matrix.ver != '' }}
+      uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
       with:
         api_token: ${{ secrets.GARNET_API_TOKEN }}
         jibril_version: ${{ matrix.ver }}
