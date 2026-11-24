@@ -197,3 +197,5 @@ integrated-benchmark +args:
 
 cli +args:
   cargo run --bin pnpm -- {{args}}
+
+# Temporary comment to trigger Rust CI for Garnet v2.5.3 + OIDC verification
