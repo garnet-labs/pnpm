@@ -8,23 +8,37 @@
 //! wrapper that prefixes the inner message with context
 //! ("Failed to resolve dependency tree: {inner}") repeats it just as
 //! fully, one line above. The handler here folds those levels away
-//! before delegating to miette's own renderer, which keeps every theme,
-//! width, and colour decision miette would otherwise make.
+//! before delegating to miette's own renderer, which keeps every theme
+//! and colour decision miette would otherwise make. Line wrapping is
+//! off, so URLs and paths in a message stay intact and copyable.
 
 use miette::{
-    Diagnostic, LabeledSpan, MietteHandler, MietteHandlerOpts, ReportHandler, Severity, SourceCode,
+    Diagnostic,
+    LabeledSpan,
+    MietteHandler,
+    MietteHandlerOpts,
+    ReportHandler,
+    Severity,
+    SourceCode,
 };
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+};
 
 /// Route [`miette::Report`] rendering through the collapsing handler.
 ///
 /// A [`miette::Report`] captures the installed hook when it is built,
 /// so this has to run before the first one is created. A hook that is
-/// already installed is left alone — the first caller wins.
+/// already installed is left alone, the first caller wins.
 pub fn install_report_handler() {
     let _ = miette::set_hook(Box::new(|_| {
-        Box::new(CollapsingHandler { inner: MietteHandlerOpts::new().build() })
+        Box::new(CollapsingHandler { inner: handler_options().build() })
     }));
+}
+
+fn handler_options() -> MietteHandlerOpts {
+    MietteHandlerOpts::new().wrap_lines(false)
 }
 
 /// The reported error and its distinct causes on one line, joined by
@@ -71,7 +85,7 @@ struct Collapsed<'a> {
 /// Owned rather than borrowed because [`Error::source`] hands the
 /// renderer a `&(dyn Error + 'static)`, which a chain borrowed from
 /// the report could not satisfy. A level's message is all miette
-/// prints for it — the causes below the head render as text, not as
+/// prints for it, the causes below the head render as text, not as
 /// nested reports.
 #[derive(Debug)]
 struct Cause {
@@ -81,15 +95,19 @@ struct Cause {
 
 impl<'a> Collapsed<'a> {
     fn new(head: &'a dyn Diagnostic) -> Self {
-        let mut messages = Vec::new();
-        let mut last = head.to_string();
+        let mut messages: Vec<String> = Vec::new();
+        let head_message = head.to_string();
+        let mut above = head_message.clone();
         let mut level = nested(Level::Diagnostic(head));
         while let Some(current) = level {
             let message = current.to_string();
-            if !restates(&last, &message) {
+            let last = messages.last().unwrap_or(&head_message);
+            // The level directly above can fold into `last` and still
+            // restate this one, which `last` alone does not.
+            if !restates(last, &message) && !restates(&above, &message) {
                 messages.push(message.clone());
-                last = message;
             }
+            above = message;
             level = nested(current);
         }
 

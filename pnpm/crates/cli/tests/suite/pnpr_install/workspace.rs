@@ -1,11 +1,37 @@
 use super::{
-    AddMockedRegistry, CommandExtra, CommandTempCwd, Lockfile, MISSING_PEERS_PARENT,
-    WORKSPACE_HELLO, WORKSPACE_PARENT, assert_filtered_workspace_pnpr,
-    assert_standard_workspace_pnpr_from, configure_pnpr_auth, configure_workspace, fs,
-    is_preserved_key, mock_filtered_repair_response, pacquet_at, read_workspace_lockfile,
-    replace_workspace_dependency, seed_filtered_repair_workspace, selected_only_pnpr_lockfile,
-    start_pnpr, workspace_has_link, workspace_importer, workspace_importer_version, workspace_slot,
-    workspace_snapshot_entries, write_workspace_project,
+    AddMockedRegistry,
+    CommandExtra,
+    CommandTempCwd,
+    Lockfile,
+    MISSING_PEERS_PARENT,
+    WORKSPACE_HELLO,
+    WORKSPACE_PARENT,
+    assert_filtered_workspace_pnpr,
+    assert_standard_workspace_pnpr_from,
+    configure_pnpr_auth,
+    configure_workspace,
+    fs,
+    is_preserved_key,
+    mock_filtered_repair_response,
+    pacquet_at,
+    pnpr_done_frame,
+    read_workspace_lockfile,
+    replace_workspace_dependency,
+    seed_filtered_repair_workspace,
+    selected_only_pnpr_lockfile,
+    selected_only_pnpr_lockfile_for,
+    start_pnpr,
+    workspace_has_link,
+    workspace_importer,
+    workspace_importer_version,
+    workspace_slot,
+    workspace_snapshot_entries,
+    write_workspace_project,
+};
+use crate::_utils::{
+    append_workspace_yaml_key,
+    bravo_dep_mature_up_to_1_0_1_minimum_release_age,
+    set_minimum_release_age,
 };
 use assert_cmd::assert::OutputAssertExt;
 use std::fmt::Write as _;
@@ -42,7 +68,7 @@ fn workspace_install_via_pnpr_resolves_catalog_references() {
 }
 
 /// The importer ids the server request carries, and the ones the
-/// filtered-lockfile merge keys on, are relative to the lockfile — which
+/// filtered-lockfile merge keys on, are relative to the lockfile, which
 /// `lockfileDir` can pin outside the workspace. Deriving them from the
 /// workspace root instead leaves the two sides naming different projects.
 #[test]
@@ -242,7 +268,7 @@ fn filtered_pnpr_repair_preserves_unselected_metadata() {
     fs::write(&lockfile_path, serde_saphyr::to_string(&broken).expect("serialize lockfile"))
         .expect("write broken lockfile");
     let mut server = mockito::Server::new();
-    let (handshake_mock, resolve_mock) = mock_filtered_repair_response(&mut server, &fresh);
+    let (handshake_mock, resolve_mock) = mock_filtered_repair_response(&mut server, &fresh, &[]);
 
     pacquet_at(&workspace)
         .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
@@ -288,7 +314,8 @@ fn filtered_pnpr_repair_preserves_unselected_metadata() {
                 snapshot.optional
                     && snapshot.transitive_peer_dependencies
                         .as_ref()
-                        .is_some_and(|peers| peers.len() == 1 && peers[0] == "preserved-peer")
+                        .filter(|peers| peers.len() == 1)
+                        .is_some_and(|peers| peers[0] == "preserved-peer")
             }),
     );
     handshake_mock.assert();
@@ -315,7 +342,7 @@ fn filtered_pnpr_repair_verifies_the_merged_lockfile_before_writing() {
     let before = serde_saphyr::to_string(&broken).expect("serialize lockfile");
     fs::write(&lockfile_path, &before).expect("write broken lockfile");
     let mut server = mockito::Server::new();
-    let (handshake_mock, resolve_mock) = mock_filtered_repair_response(&mut server, &fresh);
+    let (handshake_mock, resolve_mock) = mock_filtered_repair_response(&mut server, &fresh, &[]);
 
     let output = pacquet_at(&workspace)
         .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
@@ -346,6 +373,84 @@ fn filtered_pnpr_repair_verifies_the_merged_lockfile_before_writing() {
 }
 
 #[test]
+fn filtered_pnpr_repair_verifies_server_allowed_release_age_picks() {
+    const BRAVO_DEP: &str = "@pnpm.e2e/bravo-dep";
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    configure_workspace(&workspace);
+    write_workspace_project(&workspace, "selected", "selected", (BRAVO_DEP, "^1.0.0"));
+    write_workspace_project(&workspace, "unselected", "unselected", (WORKSPACE_PARENT, "100.0.0"));
+    let minimum_release_age = bravo_dep_mature_up_to_1_0_1_minimum_release_age();
+    set_minimum_release_age(&workspace, minimum_release_age);
+    append_workspace_yaml_key(&workspace, "minimumReleaseAgeStrict", false);
+    append_workspace_yaml_key(&workspace, "trustLockfile", false);
+    pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    let previous = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&previous, "packages/selected", BRAVO_DEP), "1.0.1");
+    let original_workspace_yaml =
+        fs::read_to_string(workspace.join("pnpm-workspace.yaml")).expect("read workspace config");
+    fs::remove_file(&lockfile_path).expect("remove lockfile to resolve the latest fallback");
+
+    // Build a realistic immature fallback from the registry while preserving the
+    // original mature lockfile as the repair input.
+    replace_workspace_dependency(&workspace, "selected", (BRAVO_DEP, "1.1.0"));
+    pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    let fresh = selected_only_pnpr_lockfile_for(read_workspace_lockfile(&workspace), BRAVO_DEP);
+    replace_workspace_dependency(&workspace, "selected", (BRAVO_DEP, "^1.0.0"));
+    fs::write(workspace.join("pnpm-workspace.yaml"), original_workspace_yaml)
+        .expect("restore workspace config");
+    let mut broken: serde_json::Value =
+        serde_saphyr::from_str(&serde_saphyr::to_string(&previous).expect("serialize lockfile"))
+            .expect("parse lockfile value");
+    broken["time"] = serde_json::json!("invalid");
+    fs::write(&lockfile_path, serde_saphyr::to_string(&broken).expect("serialize lockfile"))
+        .expect("write broken lockfile");
+
+    let mut server = mockito::Server::new();
+    let allowed_picks = vec![format!("{BRAVO_DEP}@1.1.0")];
+    let (handshake_mock, resolve_mock) =
+        mock_filtered_repair_response(&mut server, &fresh, &allowed_picks);
+
+    pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args([
+            "--filter",
+            "selected",
+            "install",
+            "--fix-lockfile",
+            "--lockfile-only",
+            "--pnpr-server",
+            &server.url(),
+        ])
+        .assert()
+        .success();
+
+    let workspace_yaml =
+        fs::read_to_string(workspace.join("pnpm-workspace.yaml")).expect("read workspace config");
+    assert!(
+        workspace_yaml.contains("@pnpm.e2e/bravo-dep@1.1.0"),
+        "repair did not persist its allowed pick: {workspace_yaml}",
+    );
+    let repaired = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&repaired, "packages/selected", BRAVO_DEP), "1.1.0");
+    handshake_mock.assert();
+    resolve_mock.assert();
+
+    drop((root, mock_instance));
+}
+
+#[test]
 fn filtered_workspace_pnpr_reports_a_missing_selected_importer_without_panicking() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
@@ -364,7 +469,7 @@ fn filtered_workspace_pnpr_reports_a_missing_selected_importer_without_panicking
         .mock("POST", "/-/pnpr/v0/resolve")
         .with_status(200)
         .with_header("content-type", "application/x-ndjson")
-        .with_body(format!("{response}\n"))
+        .with_body_from_request(move |request| pnpr_done_frame(request, response.clone()))
         .expect(1)
         .create();
 

@@ -1,5 +1,8 @@
 use crate::install::lockfile_freshness::manifest::exclude_linked_dependencies;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 
 #[test]
 fn exclude_linked_dependencies_drops_link_deps_from_every_group() {
@@ -69,7 +72,11 @@ fn exclude_linked_dependencies_drops_matching_workspace_ranges() {
     )]);
     exclude_linked_dependencies(
         &mut manifest,
-        Some(crate::WorkspaceLinks { packages: &workspace_packages, catalogs: &catalogs }),
+        Some(crate::WorkspaceLinks {
+            packages: Some(&workspace_packages),
+            workspace_dir: std::path::Path::new("."),
+            catalogs: &catalogs,
+        }),
         None,
     );
 
@@ -117,7 +124,8 @@ fn exclude_linked_dependencies_keeps_registry_selected_workspace_ranges() {
     exclude_linked_dependencies(
         &mut manifest,
         Some(crate::WorkspaceLinks {
-            packages: &workspace_packages,
+            packages: Some(&workspace_packages),
+            workspace_dir: std::path::Path::new("."),
             catalogs: &pnpm_catalogs_types::Catalogs::new(),
         }),
         Some(&importer),

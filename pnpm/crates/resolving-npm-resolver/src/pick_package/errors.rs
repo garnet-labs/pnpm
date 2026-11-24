@@ -2,10 +2,16 @@
 
 use std::path::PathBuf;
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 
-use crate::{FetchMetadataError, pick_package_from_meta::PickPackageFromMetaError};
+use crate::{
+    FetchMetadataError,
+    pick_package_from_meta::PickPackageFromMetaError,
+};
 
 /// Failure modes for [`crate::pick_package()`]. Distinguishes the pure-pick
 /// errors ([`PickPackageError::Pick`]) from the fetch / IO errors so
@@ -37,9 +43,9 @@ pub enum PickPackageError {
         #[help]
         hint: Option<String>,
     },
-    /// `ERR_PNPM_CORRUPT_METADATA_MIRROR`: a bypassing refetch — the
+    /// `ERR_PNPM_CORRUPT_METADATA_MIRROR`: a bypassing refetch (the
     /// last available remedy for a mirror fragment that fails to
-    /// decode — rewrote the mirror and the fragment is still
+    /// decode) rewrote the mirror and the fragment is still
     /// undecodable.
     #[display(
         "Metadata mirror for {spec_name}@{spec_fetch_spec} is still unreadable after a bypassing refetch ({pkg_mirror:?})"
@@ -65,13 +71,35 @@ pub enum PickPackageError {
     /// longer than pnpr's own package document supports
     /// ([`super::MAX_PNPR_FORMAT_RELEASE_AGE_MINUTES`]).
     #[display(
-        "minimumReleaseAge is {minutes} minutes, but {registry} is declared with serverType: pnpr, whose package documents support a minimumReleaseAge of at most 43200 minutes (30 days)"
+        "The minimumReleaseAge window, measured back from the current time, is {minutes} minutes, but {registry} is declared with serverType: pnpr, whose package documents support a window of at most 43200 minutes (30 days)"
     )]
     #[diagnostic(
         code(ERR_PNPM_UNSUPPORTED_MINIMUM_RELEASE_AGE),
-        help("Set minimumReleaseAge to 43200 or less.")
+        help(
+            "Keep minimumReleaseAge, plus how far referenceTime lags the current time if it is set, at 43200 minutes or less."
+        )
     )]
     UnsupportedMinimumReleaseAge {
+        #[error(not(source))]
+        minutes: u64,
+        #[error(not(source))]
+        registry: String,
+    },
+    /// `ERR_PNPM_UNSUPPORTED_TRUST_POLICY_IGNORE_AFTER`: a
+    /// `trustPolicyIgnoreAfter` window that counts back from
+    /// `referenceTime` reaches further back than pnpr's own package
+    /// document dates versions
+    /// ([`super::MAX_PNPR_FORMAT_RELEASE_AGE_MINUTES`]).
+    #[display(
+        "The trustPolicyIgnoreAfter window, measured back from the current time, is {minutes} minutes, but {registry} is declared with serverType: pnpr, whose package documents date versions for less than 43200 minutes (30 days)"
+    )]
+    #[diagnostic(
+        code(ERR_PNPM_UNSUPPORTED_TRUST_POLICY_IGNORE_AFTER),
+        help(
+            "Keep trustPolicyIgnoreAfter, plus how far referenceTime lags the current time, under 43200 minutes."
+        )
+    )]
+    UnsupportedTrustPolicyIgnoreAfter {
         #[error(not(source))]
         minutes: u64,
         #[error(not(source))]
@@ -87,6 +115,10 @@ pub enum PickPackageError {
         #[error(not(source))]
         error: String,
     },
+    /// `ERR_PNPM_MALFORMED_METADATA`: `dist.revision` in a registry package
+    /// document is not a valid tarball revision.
+    #[diagnostic(transparent)]
+    InvalidRevisionMetadata(crate::InvalidTarballRevisionMetadataError),
 }
 
 impl From<PickPackageFromMetaError> for PickPackageError {
@@ -98,5 +130,11 @@ impl From<PickPackageFromMetaError> for PickPackageError {
 impl From<FetchMetadataError> for PickPackageError {
     fn from(error: FetchMetadataError) -> Self {
         PickPackageError::Fetch(error)
+    }
+}
+
+impl From<crate::InvalidTarballRevisionMetadataError> for PickPackageError {
+    fn from(error: crate::InvalidTarballRevisionMetadataError) -> Self {
+        PickPackageError::InvalidRevisionMetadata(error)
     }
 }

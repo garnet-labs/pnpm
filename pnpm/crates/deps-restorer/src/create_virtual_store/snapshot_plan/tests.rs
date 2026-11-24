@@ -1,18 +1,37 @@
-use super::{SnapshotPlan, SnapshotPlanInputs, optional_children_match, plan_snapshots};
+use super::{
+    SnapshotPlan,
+    SnapshotPlanInputs,
+    optional_children_match,
+    plan_snapshots,
+};
 use crate::{
-    AllowBuildPolicy, CreateVirtualStoreError, SkippedSnapshots, VirtualStoreLayout,
+    CreateVirtualStoreError,
+    SkippedSnapshots,
+    VirtualStoreLayout,
     create_virtual_store::{
-        SnapshotCacheKey, snapshot_plan::children::optional_children_match_with,
+        SnapshotCacheKey,
+        snapshot_plan::children::optional_children_match_with,
     },
 };
 use pnpm_lockfile::{
-    DirectoryResolution, LockfileEntries, LockfileResolution, PackageKey, PackageMetadata, PkgName,
-    RegistryResolution, SnapshotDepRef, SnapshotEntry,
+    DirectoryResolution,
+    LockfileEntries,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    RegistryResolution,
+    SnapshotDepRef,
+    SnapshotEntry,
 };
 use pnpm_reporter::SilentReporter;
 use std::{
-    collections::{HashMap, HashSet},
-    fs, io,
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    fs,
+    io,
     path::Path,
 };
 
@@ -122,6 +141,7 @@ const DUMMY_SHA512: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 fn registry_metadata() -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Registry(RegistryResolution {
             integrity: DUMMY_SHA512.parse().expect("parse integrity"),
             revision: None,
@@ -157,7 +177,7 @@ impl PlanFixture {
             None,
             Some(&snapshots),
             Some(&packages),
-            None,
+            crate::BuildGating { policy: None, runs_builds: true },
             None,
             &crate::host_platform_selector(),
         );
@@ -197,7 +217,6 @@ impl PlanFixture {
     }
 
     fn plan_inner(&self, current_matches_wanted: bool, force: bool) -> SnapshotPlan<'_> {
-        let allow_build_policy = AllowBuildPolicy::new(HashSet::new(), HashSet::new(), false);
         let mut cache_keys = self.snapshots
             .keys()
             .map(|snapshot_key| {
@@ -225,8 +244,6 @@ impl PlanFixture {
                 snapshots: current_matches_wanted.then_some(&self.snapshots),
             },
             layout: &self.layout,
-            allow_build_policy: &allow_build_policy,
-
             cache_keys: &mut cache_keys,
         })
         .expect("plan snapshots")
@@ -319,7 +336,7 @@ fn gvs_slot_missing_a_regular_child_link_survives() {
         None,
         Some(&snapshots),
         Some(&packages),
-        None,
+        crate::BuildGating { policy: None, runs_builds: true },
         None,
         &crate::host_platform_selector(),
     );
@@ -427,6 +444,7 @@ fn force_defeats_the_current_lockfile_skip() {
 fn gvs_directory_resolution_is_never_skipped_by_slot_existence() {
     let temp_dir = tempfile::tempdir().expect("create temp directory");
     let metadata = PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Directory(DirectoryResolution {
             directory: "local-foo".to_string(),
         }),

@@ -1,11 +1,28 @@
 use super::{
     cargo::CargoUpdateOptions,
-    cargo_manifest_ops::{DeclaredCargoDep, same_declared_dep},
+    cargo_manifest_ops::{
+        DeclaredCargoDep,
+        same_declared_dep,
+    },
     cargo_workspace_scope::CargoWorkspaceScope,
 };
-use miette::{IntoDiagnostic, Result, bail};
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
-use semver::{Op, Version, VersionReq};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    bail,
+};
+use pnpm_matcher::WildcardMatcher;
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
+use semver::{
+    Op,
+    Version,
+    VersionReq,
+};
 
 /// A dependency `pnpm update` is to update.
 pub(super) struct SelectedCargoDep<'a> {
@@ -20,9 +37,13 @@ pub(super) fn select_cargo_deps_to_update<'a>(
     declared: &'a [DeclaredCargoDep],
     options: &'a CargoUpdateOptions<'a>,
 ) -> Vec<SelectedCargoDep<'a>> {
+    let exclusions: Vec<WildcardMatcher> = options.exclusions
+        .iter()
+        .map(|pattern| WildcardMatcher::new(pattern))
+        .collect();
     let mut selected: Vec<SelectedCargoDep<'a>> = Vec::new();
     for dep in declared {
-        if let Some(selection) = match_cargo_dep(dep, options)
+        if let Some(selection) = match_cargo_dep(dep, options, &exclusions)
             && !selected.iter().any(|sel| same_declared_dep(sel.dep, dep))
         {
             selected.push(selection);
@@ -34,12 +55,11 @@ pub(super) fn select_cargo_deps_to_update<'a>(
 fn match_cargo_dep<'a>(
     dep: &'a DeclaredCargoDep,
     options: &'a CargoUpdateOptions<'a>,
+    exclusions: &[WildcardMatcher],
 ) -> Option<SelectedCargoDep<'a>> {
     if !options.step.include_groups.contains(&dep.group)
-        || options.step.ignore_matcher.is_some_and(|matcher| matcher.matches(&dep.alias))
-        || options.exclusions
-            .iter()
-            .any(|name| name == &dep.alias || name == &dep.package_name)
+        || options.step.ignore_matcher.is_some_and(|matcher| dep.matches_pattern(matcher))
+        || is_excluded_cargo_dep(dep, exclusions)
     {
         return None;
     }
@@ -49,7 +69,7 @@ fn match_cargo_dep<'a>(
     }
     if let Some(req) = options.requests
         .iter()
-        .find(|req| req.name == dep.alias || req.name == dep.package_name)
+        .find(|req| dep.matches_name(&req.name))
     {
         return Some(SelectedCargoDep {
             dep,
@@ -57,9 +77,15 @@ fn match_cargo_dep<'a>(
             named: true,
         });
     }
-    (options.bare_matcher.is_some_and(|matcher| matcher.matches(&dep.alias))
+    (options.bare_matcher.is_some_and(|matcher| dep.matches_pattern(matcher))
         || options.update_all_except_exclusions)
         .then_some(unnamed)
+}
+
+fn is_excluded_cargo_dep(dep: &DeclaredCargoDep, exclusions: &[WildcardMatcher]) -> bool {
+    exclusions
+        .iter()
+        .any(|matcher| dep.matches_wildcard(matcher))
 }
 
 pub(super) struct SelectedCargoTarget<'a> {
@@ -96,7 +122,10 @@ pub(super) fn is_held_by_patch<Reporter: self::Reporter>(target: &SelectedCargoT
     }
     warn::<Reporter>(
         target.scope,
-        format!("Not updating crate {}: `[patch.crates-io]` in Cargo.toml replaces it", dep.alias),
+        format!(
+            "Not updating crate {}: `[patch.crates-io]` in Cargo.toml replaces it",
+            dep.primary_alias(),
+        ),
     );
     true
 }
@@ -120,7 +149,7 @@ pub(super) fn is_held_as_downgrade<Reporter: self::Reporter>(
     };
     warn::<Reporter>(
         target.scope,
-        format!("Not updating crate {}: {version} is older than {current}", dep.alias),
+        format!("Not updating crate {}: {version} is older than {current}", dep.primary_alias()),
     );
     true
 }
@@ -161,10 +190,11 @@ pub(super) fn admits_enabled_features<Reporter: self::Reporter>(
     if missing.is_empty() {
         return Ok(true);
     }
-    let crate_version = if dep.alias == dep.package_name {
-        format!("{} {version}", dep.alias)
+    let alias = dep.primary_alias();
+    let crate_version = if alias == dep.package_name {
+        format!("{alias} {version}")
     } else {
-        format!("{} ({} {version})", dep.alias, dep.package_name)
+        format!("{alias} ({} {version})", dep.package_name)
     };
     let features = missing
         .iter()

@@ -1,7 +1,18 @@
 use super::{
-    ARTIFACTORY_REGISTRY, BTreeMap, GIT_COMMIT, LockfileResolution, RegistryOptions,
-    RegistryServerType, TarballResolution, assert_eq, libc_matches, registry_server_type,
-    select_platform_variant, selector, target, variant,
+    ARTIFACTORY_REGISTRY,
+    BTreeMap,
+    GIT_COMMIT,
+    LockfileResolution,
+    RegistryOptions,
+    RegistryServerType,
+    TarballResolution,
+    assert_eq,
+    libc_matches,
+    registry_server_type,
+    select_platform_variant,
+    selector,
+    target,
+    variant,
 };
 
 /// The flag is a hint: the fetch dispatch and the store-index key
@@ -132,24 +143,4 @@ fn registry_server_type_is_undeclared_by_default_and_tolerates_a_missing_trailin
     );
     assert_eq!(registry_server_type(&options, "https://npm.example.com/"), None);
     assert_eq!(registry_server_type(&BTreeMap::new(), ARTIFACTORY_REGISTRY), None);
-}
-
-#[test]
-fn first_match_skips_a_target_whose_floor_the_host_does_not_meet() {
-    let mut floored = target("linux", "x64", None);
-    floored.napi = Some(9);
-    let variants = vec![
-        variant("needs-napi-9", vec![floored]),
-        variant("plain", vec![target("linux", "x64", None)]),
-    ];
-    let mut host = selector("linux", "x64", None);
-    host.floors = Some(pnpm_platform_variants::HostFloors {
-        napi: Some(8),
-        ..pnpm_platform_variants::HostFloors::default()
-    });
-    let picked = select_platform_variant(&variants, &host).expect("a matching variant");
-    let LockfileResolution::Binary(inner) = &picked.resolution else {
-        panic!("expected Binary inner resolution");
-    };
-    assert_eq!(inner.url, "plain");
 }

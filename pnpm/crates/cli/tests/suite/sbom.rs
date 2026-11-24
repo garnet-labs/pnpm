@@ -1,22 +1,24 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     command_env::CommandTestExt,
 };
-use std::{collections::HashSet, ffi::OsStr, fs, path::Path, process::Command};
+use std::{
+    collections::HashSet,
+    ffi::OsStr,
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
 fn copy_fixture(name: &str) -> TempDir {
     let tmp = TempDir::new().expect("create temp dir");
-    let local_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
-    let fixture_dir = if local_fixture.exists() {
-        local_fixture
-    } else {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../pnpm11/deps/compliance/commands/test/sbom/fixtures")
-            .join(name)
-    };
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
     for entry in fs::read_dir(&fixture_dir).expect("read fixture dir") {
         let entry = entry.expect("read dir entry");
         let dest = tmp.path().join(entry.file_name());
@@ -345,17 +347,39 @@ fn sbom_exclude_peers_drops_subtree() {
 }
 
 #[test]
-fn sbom_exclude_peers_tolerates_malformed_manifest() {
+fn sbom_exclude_peers_fails_on_malformed_manifest() {
     let tmp = copy_fixture("with-peer-workspace");
     fs::write(tmp.path().join("packages/pkg-a/package.json"), "{ not valid json").unwrap();
-    let parsed = run_sbom_json(tmp.path(), "cyclonedx", &["--exclude-peers"]);
-    let components = parsed["components"].as_array().expect("components");
-    assert!(
-        components
-            .iter()
-            .any(|comp| comp["name"] == "is-positive"),
-        "should still produce output",
-    );
+    let output = pacquet(
+        tmp.path(),
+        ["sbom", "--sbom-format", "cyclonedx", "--lockfile-only", "--exclude-peers"],
+    )
+    .output()
+    .expect("run pacquet sbom");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("package.json"));
+}
+
+#[test]
+fn sbom_fails_on_malformed_linked_workspace_manifest() {
+    let tmp = copy_fixture("with-peer-workspace");
+    fs::write(tmp.path().join("packages/pkg-a/package.json"), "{ not valid json").unwrap();
+    let lockfile_path = tmp.path().join("pnpm-lock.yaml");
+    let lockfile = fs::read_to_string(&lockfile_path).unwrap();
+    let root_dependency = "      is-positive:\n        specifier: 3.1.0\n        version: 3.1.0\n";
+    assert!(lockfile.contains(root_dependency));
+    fs::write(
+        lockfile_path,
+        lockfile.replace(root_dependency, &format!(
+            "{root_dependency}      pkg-a:\n        specifier: link:packages/pkg-a\n        version: link:packages/pkg-a\n",
+        )),
+    )
+    .unwrap();
+    let output = pacquet(tmp.path(), ["sbom", "--sbom-format", "cyclonedx", "--lockfile-only"])
+        .output()
+        .expect("run pacquet sbom");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("package.json"));
 }
 
 #[test]
@@ -659,7 +683,7 @@ fn sbom_dev_flag_includes_only_dev() {
 }
 
 /// The names of the root components of a `--split` run's NDJSON lines, in
-/// output order — one per selected workspace importer.
+/// output order; one per selected workspace importer.
 fn split_root_names(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -778,9 +802,8 @@ fn sbom_root_repository_that_is_not_a_url_is_omitted() {
         !root
             .get("externalReferences")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|ext_refs| ext_refs
-                .iter()
-                .any(|ext_ref| ext_ref["type"] == "vcs")),
+            .map(|ext_refs| ext_refs.iter())
+            .is_some_and(|mut value| value.any(|ext_ref| ext_ref["type"] == "vcs")),
         "an email is not a repository URL and must not be published: {root}",
     );
 }
@@ -1002,4 +1025,5 @@ fn spdx_package<'a>(document: &'a serde_json::Value, name: &str) -> &'a serde_js
 
 mod license;
 mod metadata;
+mod named_registries;
 mod workspace;

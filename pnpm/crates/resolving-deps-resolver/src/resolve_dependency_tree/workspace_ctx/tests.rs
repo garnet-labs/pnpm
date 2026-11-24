@@ -1,19 +1,33 @@
 use pnpm_resolving_resolver_base::ResolveOptions;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     sync::Arc,
 };
 
 use super::{
-    super::{lock_recoverable, test_support::manifest_result},
+    super::{
+        lock_recoverable,
+        test_support::manifest_result,
+    },
     WorkspaceTreeCtx,
     children_ownership::ChildrenRecording,
 };
 use crate::{
-    DirectDep, NodeId,
+    DirectDep,
+    NodeId,
     parent_pkg_aliases::ParentPkgAliases,
-    resolved_tree::{DependenciesTreeNode, ResolvedPackageInput, TreeChildren},
+    resolved_tree::{
+        DependenciesTreeNode,
+        ResolvedPackageInput,
+        TreeChildren,
+    },
 };
 
 #[test]
@@ -113,8 +127,12 @@ fn importer_snapshot_follows_lazy_edges_for_the_package_closure() {
 #[test]
 fn ownership_rewrite_of_existing_nodes_bumps_children_rewrites() {
     use super::{
-        super::{lock_recoverable, tree_ctx::TreeCtx},
-        insert_tree_node, make_non_owner_nodes_lazy,
+        super::{
+            lock_recoverable,
+            tree_ctx::TreeCtx,
+        },
+        insert_tree_node,
+        make_non_owner_nodes_lazy,
     };
     use std::sync::Arc;
 
@@ -152,7 +170,12 @@ fn ownership_rewrite_of_existing_nodes_bumps_children_rewrites() {
 
 #[test]
 fn owner_missing_record_is_written_once_per_generation() {
-    use super::{super::lock_recoverable, ChildrenOwner, ChildrenOwnerEntry, WorkspaceTreeCtx};
+    use super::{
+        super::lock_recoverable,
+        ChildrenOwner,
+        ChildrenOwnerEntry,
+        WorkspaceTreeCtx,
+    };
     use crate::resolve_peers::MissingNames;
     use std::sync::Arc;
 
@@ -217,7 +240,12 @@ fn owner_missing_record_is_written_once_per_generation() {
 
 #[test]
 fn owner_scope_snapshots_are_shared_until_a_write_changes_the_map() {
-    use super::{super::lock_recoverable, ChildrenOwner, ChildrenOwnerEntry, WorkspaceTreeCtx};
+    use super::{
+        super::lock_recoverable,
+        ChildrenOwner,
+        ChildrenOwnerEntry,
+        WorkspaceTreeCtx,
+    };
     use crate::resolve_peers::MissingNames;
     use std::sync::Arc;
 
@@ -336,7 +364,11 @@ fn run_preferred_versions_fold_workspace_manifest_identities_once_reachable() {
     let workspace = WorkspaceTreeCtx::default();
     lock_recoverable(&workspace.tree.packages)
         .insert(Arc::from("link:packages/opt".to_string()), snapshot_package("link:packages/opt"));
-    workspace.versions.record_workspace_manifest_identity("link:packages/opt", "opt", "1.0.0");
+    workspace.versions.record_workspace_manifest_identity(
+        "link:packages/opt".to_owned(),
+        "opt",
+        "1.0.0",
+    );
     insert_named_package(&workspace, "root", "1.0.0");
     workspace.versions.record_preferred_version_roots(std::iter::once("root@1.0.0"));
     workspace.tree.bump_revision();
@@ -362,7 +394,11 @@ fn run_preferred_versions_pick_up_an_identity_recorded_after_the_first_visit() {
     workspace.tree.bump_revision();
     assert!(!workspace.run_preferred_versions().versions.contains_key("opt"));
 
-    workspace.versions.record_workspace_manifest_identity("link:packages/opt", "opt", "1.0.0");
+    workspace.versions.record_workspace_manifest_identity(
+        "link:packages/opt".to_owned(),
+        "opt",
+        "1.0.0",
+    );
     workspace.tree.bump_revision();
     assert_eq!(bucket_versions(&workspace.run_preferred_versions().versions, "opt"), ["1.0.0"]);
 }
@@ -485,7 +521,7 @@ fn record_package(workspace: &WorkspaceTreeCtx, pkg_id: &str, peer_names: &[&str
     let mut all_peers = lock_recoverable(&workspace.tree.all_peer_dep_names);
     for name in peer_names {
         if all_peers.insert((*name).to_string()) {
-            workspace.tree.record_peer_dep_name(name);
+            workspace.tree.record_peer_dep_name((*name).to_string());
         }
     }
     drop(all_peers);
@@ -532,8 +568,14 @@ fn recorded(edges: Vec<crate::resolved_tree::ChildEdge>) -> super::RecordedChild
 #[test]
 fn recorded_children_match_only_under_the_recording_context() {
     use super::{
-        super::{UpdateReuseScope, tree_ctx::TreeCtx},
-        RecordedChildrenContext, claim_children_owner, record_children, recorded_children_match,
+        super::{
+            UpdateReuseScope,
+            tree_ctx::TreeCtx,
+        },
+        RecordedChildrenContext,
+        claim_children_owner,
+        record_children,
+        recorded_children_match,
     };
     use std::sync::Arc;
 
@@ -584,7 +626,7 @@ fn recorded_children_match_only_under_the_recording_context() {
 
 /// Which of a package's dependencies its own peers supply is a
 /// property of the occurrence, and pinned children were filtered under
-/// the recording occurrence's set — so the pins stand in for a fresh
+/// the recording occurrence's set, so the pins stand in for a fresh
 /// walk only where the two shadow the same names.
 #[test]
 fn a_pin_stands_in_only_for_a_walk_that_shadows_the_same_dependencies() {
@@ -623,7 +665,10 @@ fn a_pin_stands_in_only_for_a_walk_that_shadows_the_same_dependencies() {
 #[test]
 fn children_are_published_only_by_the_standing_owner() {
     use super::{
-        super::tree_ctx::TreeCtx, RecordedChildrenContext, claim_children_owner, record_children,
+        super::tree_ctx::TreeCtx,
+        RecordedChildrenContext,
+        claim_children_owner,
+        record_children,
     };
     use std::sync::Arc;
 
@@ -656,13 +701,16 @@ fn children_are_published_only_by_the_standing_owner() {
 /// A later owner re-walks whenever its resolution context differs from
 /// the recorded one, which the claim's own `peer_shadowed` comparison
 /// cannot see. Only edges that actually moved stale the realized
-/// children every other occurrence node still holds — and never the
+/// children every other occurrence node still holds, and never the
 /// ones the prior lockfile pinned, whose whole point is to survive a
 /// fresh walk's different answer.
 #[test]
 fn re_recording_reports_whether_the_child_edges_moved() {
     use super::{
-        super::tree_ctx::TreeCtx, RecordedChildrenContext, claim_children_owner, record_children,
+        super::tree_ctx::TreeCtx,
+        RecordedChildrenContext,
+        claim_children_owner,
+        record_children,
     };
     use std::sync::Arc;
 
@@ -726,4 +774,27 @@ fn re_recording_reports_whether_the_child_edges_moved() {
         .map(|edge| &*edge.pkg_id)
         .collect();
     assert_eq!(standing, ["dep@1.0.0"], "the pinned children are what every occurrence reads");
+}
+
+#[test]
+fn shared_leaf_keeps_provenance_when_another_occurrence_has_no_prior_entry() {
+    for node_id in [NodeId::leaf("peer@1.0.0"), NodeId::next()] {
+        let workspace = WorkspaceTreeCtx::default();
+        lock_recoverable(&workspace.tree.dependencies_tree)
+            .insert(
+                node_id.clone(),
+                DependenciesTreeNode::new(Arc::from("peer@1.0.0"), TreeChildren::empty(), 0),
+            );
+        let locked = crate::resolved_tree::LockedResolution {
+            previous_dep_path: Some("peer@1.0.0".into()),
+            ..Default::default()
+        };
+        workspace.record_locked_resolution(&node_id, Some(Box::new(locked)));
+        workspace.record_locked_resolution(&node_id, None);
+        let nodes = lock_recoverable(&workspace.tree.dependencies_tree);
+        assert_eq!(
+            nodes[&node_id].previous_dep_path().is_some(),
+            matches!(node_id, NodeId::Leaf(_)),
+        );
+    }
 }

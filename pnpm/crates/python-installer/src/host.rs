@@ -1,9 +1,25 @@
-use crate::{async_process::Command, process::Stdio};
+use crate::{
+    async_process::Command,
+    process::Stdio,
+};
 
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use pnpm_python_resolver::Target;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, ffi::OsStr, path::PathBuf};
+use serde::{
+    Deserialize,
+    Serialize,
+    de::DeserializeOwned,
+};
+use std::{
+    collections::BTreeMap,
+    ffi::OsStr,
+    path::PathBuf,
+};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,12 +246,15 @@ struct FileImport {
     destination: PathBuf,
     executable: bool,
     device: u64,
-    /// The source's `st_mode`, which the helper reads anyway.
+    /// The source's `st_mode`, which the helper reads anyway. Bare bits
+    /// because this struct is deserialized.
     mode: Option<u32>,
 }
 
 impl FileImport {
-    fn import<Sys: pnpm_fs::FsReflink + pnpm_deps_restorer::FsHardLink>(
+    fn import<
+        Sys: pnpm_fs::FsReflink + pnpm_deps_restorer::FsHardLink + pnpm_fs::FsCopyContents,
+    >(
         &self,
         state: &pnpm_deps_restorer::ImportState,
         logged: &std::sync::atomic::AtomicU8,
@@ -244,17 +263,22 @@ impl FileImport {
         let method = state.import::<pnpm_reporter::SilentReporter, Sys>(
             mode,
             logged,
-            &pnpm_fs::StoreFile::with_mode(self.source.clone(), self.mode),
+            &pnpm_fs::StoreFile::with_mode(
+                self.source.clone(),
+                self.mode.map(pnpm_fs::FileMode::from_mode),
+            ),
             &self.destination,
         )?;
         // Unpacked wheels use their file modes, even when a name has the CAS -exec suffix.
         if method != pnpm_reporter::PackageImportMethod::Hardlink
             && (self.executable || pnpm_fs::file_mode::cas_path_is_executable(&self.source))
         {
-            pnpm_fs::file_mode::set_path_permissions(
-                &self.destination,
-                if self.executable { 0o755 } else { 0o644 },
-            )?;
+            let mode = if self.executable {
+                pnpm_fs::file_mode::EXEC_MODE
+            } else {
+                pnpm_fs::FileMode::from_mode(0o644)
+            };
+            pnpm_fs::file_mode::set_path_permissions(&self.destination, mode)?;
         }
         Ok(())
     }

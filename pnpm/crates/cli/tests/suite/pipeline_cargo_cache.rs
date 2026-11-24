@@ -6,15 +6,19 @@ use command_extra::CommandExtra;
 use pnpm_testing_utils::command_env::CommandTestExt;
 use std::{
     env::consts::EXE_SUFFIX,
-    fs::{self, File, FileTimes},
+    fs::{
+        self,
+        File,
+        FileTimes,
+    },
     path::Path,
     process::Command,
 };
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
-        .current_dir(root)
-        .args(args)
+        .with_current_dir(root)
+        .with_args(args)
         .output()
         .unwrap();
     assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
@@ -80,8 +84,8 @@ fn cargo_state_is_shared_between_worktrees_and_survives_cache_deletion() {
     fs::write(first_worktree.join("pnpm-workspace.yaml"), "packages: []\nincludeWorkspaceRoot: true\npipelines:\n  default: [build]\ntasks:\n  build:\n    dependsOn: []\n    cargoTargetDir: target\n").unwrap();
     assert!(
         Command::new("cargo")
-            .current_dir(&first_worktree)
-            .args(["generate-lockfile", "--offline"])
+            .with_current_dir(&first_worktree)
+            .with_args(["generate-lockfile", "--offline"])
             .status()
             .unwrap()
             .success(),
@@ -127,4 +131,59 @@ fn cargo_state_is_shared_between_worktrees_and_survives_cache_deletion() {
     assert!(!cache.join("pnpm/cargo-build").exists());
     assert!(repeat.contains("task-executed"), "{repeat}");
     assert_eq!(run_binary(&first_worktree), format!("one\n{}\n", first_worktree.display()));
+}
+
+#[test]
+fn dependent_cargo_tasks_keep_build_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(temp.path()).unwrap();
+    let first_worktree = root.join("wt-a");
+    let second_worktree = root.join("wt-b");
+    let cache = temp.path().join("cache");
+    for crate_name in ["leaf", "app"] {
+        let dir = first_worktree.join("crates").join(crate_name);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = '{crate_name}'\nversion = '0.1.0'\nedition = '2024'\n[workspace]\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        assert!(
+            Command::new("cargo")
+                .with_current_dir(&dir)
+                .with_args(["generate-lockfile", "--offline"])
+                .status()
+                .unwrap()
+                .success(),
+        );
+    }
+    fs::write(
+        first_worktree.join("crates/leaf/package.json"),
+        r#"{"name":"leaf","version":"1.0.0","scripts":{"build":"cargo build --locked --offline"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        first_worktree.join("crates/app/package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"workspace:*"},"scripts":{"build":"cargo build --locked --offline"}}"#,
+    )
+    .unwrap();
+    pnpm_testing_utils::git_repo::init_isolated_repo(&first_worktree);
+    fs::write(first_worktree.join(".gitignore"), "**/target/\n**/node_modules/\n").unwrap();
+    fs::write(first_worktree.join("package.json"), r#"{"private":true}"#).unwrap();
+    fs::write(
+        first_worktree.join("pnpm-workspace.yaml"),
+        "packages: ['crates/*']\npipelines:\n  default: [build]\ntasks:\n  build:\n    dependsOn: ['^build']\n    cargoTargetDir: target\n",
+    )
+    .unwrap();
+    pnpm(&first_worktree, &cache, &["install"]);
+    git(&first_worktree, &["add", "."]);
+    git(&first_worktree, &["commit", "-m", "cargo-deps-fixture"]);
+    git(&first_worktree, &["worktree", "add", "--detach", second_worktree.to_str().unwrap()]);
+
+    let first = pnpm(&first_worktree, &cache, &["pipeline", "--full"]);
+    assert!(!first.contains("Cargo build cache:"), "{first}");
+    let second = pnpm(&second_worktree, &cache, &["pipeline", "--full", "--reporter=ndjson"]);
+    assert!(second.contains("crates/leaf#build: restored Cargo build state"), "{second}");
+    assert!(second.contains("crates/app#build: restored Cargo build state"), "{second}");
 }

@@ -8,29 +8,55 @@ pub use loaded_state::LoadedState;
 mod loaded_state;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
-use miette::{Context, IntoDiagnostic};
-use pnpm_fs::{lexical_normalize, read_modules_dir};
-use pnpm_lockfile::{Lockfile, ProjectSnapshot, RegistryOptions};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
+use pnpm_fs::{
+    lexical_normalize,
+    read_modules_dir,
+};
+use pnpm_lockfile::{
+    Lockfile,
+    ProjectSnapshot,
+    RegistryOptions,
+};
 use pnpm_modules_yaml::{
-    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH, Host, IncludedDependencies, Modules,
+    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH,
+    Host,
+    IncludedDependencies,
+    Modules,
     read_modules_manifest,
 };
 use pnpm_package_manifest::parse_manifest_bytes;
 
 use super::{
-    DependencyNode, TreeNodeId,
+    DependencyNode,
+    TreeNodeId,
     dep_types::detect_dep_types,
-    get_tree::{GetTreeOptions, MaterializationCache, MaxDepth, get_tree},
+    get_tree::{
+        GetTreeOptions,
+        MaterializationCache,
+        MaxDepth,
+        get_tree,
+    },
     graph::DependencyGraph,
     pkg_info::PkgInfoEnv,
     search::Searcher,
 };
 
-/// One project's categorized dependency hierarchy — the input of the
+/// One project's categorized dependency hierarchy, the input of the
 /// `list` renderers.
 #[derive(Debug, Default)]
 pub struct DependenciesHierarchy {
@@ -48,7 +74,7 @@ pub struct BuildTreeOptions<'a> {
     pub only_projects: bool,
     pub search: Option<&'a Searcher>,
     pub show_deduped_search_matches: bool,
-    pub modules_dir_opt: Option<&'a Path>,
+    pub unsaved_modules_dir_name: Option<&'a Path>,
 }
 
 /// The importer root ids of `project_dirs` that exist in the lockfile.
@@ -103,12 +129,6 @@ fn hierarchy_for_project(
         return Ok(DependenciesHierarchy::default());
     };
 
-    let project_modules_dir = match opts.modules_dir_opt {
-        Some(dir) if dir.is_absolute() => dir.to_path_buf(),
-        Some(dir) => project_dir.join(dir),
-        None => project_dir.join("node_modules"),
-    };
-
     let mut hierarchy = DependenciesHierarchy::default();
 
     let get_tree_opts = GetTreeOptions {
@@ -139,15 +159,22 @@ fn hierarchy_for_project(
 
     // Unsaved (extraneous) dependencies: packages present in the
     // project's modules dir but absent from its lockfile entry. They
-    // are irrelevant while searching — they are not in the lockfile
-    // graph and cannot contain paths to the search target — and they
+    // are irrelevant while searching (they are not in the lockfile
+    // graph and cannot contain paths to the search target) and they
     // are not workspace projects, which is all `only_projects` lists.
-    if opts.search.is_none() && !opts.only_projects {
+    if opts.search.is_none()
+        && !opts.only_projects
+        && let Some(modules_dir_name) = opts.unsaved_modules_dir_name
+    {
+        let project_modules_dir = if importer_id.as_str() == "." {
+            state.modules_dir.clone()
+        } else {
+            project_dir.join(modules_dir_name)
+        };
         hierarchy.unsaved_dependencies =
             read_unsaved_dependencies(importer, project_dir, &project_modules_dir)?;
     }
 
-    let _ = state;
     Ok(hierarchy)
 }
 
@@ -218,7 +245,7 @@ pub fn importer_id_for(lockfile_dir: &Path, project_dir: &Path) -> String {
 
 /// The on-disk directory of a lockfile importer key, spelled with the
 /// platform's separators, or `None` for a key that cannot be safely
-/// joined (absolute, drive-prefixed, or `..`-traversing — a malformed or
+/// joined (absolute, drive-prefixed, or `..`-traversing, a malformed or
 /// hostile lockfile).
 #[must_use]
 pub fn safe_importer_dir(lockfile_dir: &Path, importer_id: &str) -> Option<PathBuf> {
@@ -246,7 +273,7 @@ fn read_unsaved_dependencies(
 }
 
 /// The alias keys of an importer's `dependencies`, `devDependencies`,
-/// and `optionalDependencies` — always spanning all three groups
+/// and `optionalDependencies`, always spanning all three groups
 /// regardless of the include filter, matching the TypeScript CLI's
 /// `getAllDirectDependencies`.
 fn saved_direct_dep_names(importer: &ProjectSnapshot) -> HashSet<String> {

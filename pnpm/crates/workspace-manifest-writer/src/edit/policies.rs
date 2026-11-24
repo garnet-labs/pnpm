@@ -1,12 +1,24 @@
 use super::{
-    Inline, Manifest, detect_sequence_indent, flow, insert_top_level_block, locate,
-    locate_sequence, mapping_keys, reconcile_sequence_items, remove_mapping_entries,
-    remove_top_level_block, render, render_top_level_sequence, replace_top_level_block,
-    top_level_span, upsert_sequence_entry,
+    Inline,
+    Manifest,
+    detect_sequence_indent,
+    flow,
+    insert_top_level_block,
+    locate,
+    locate_sequence,
+    mapping_keys,
+    reconcile_sequence_items,
+    remove_mapping_entries,
+    remove_top_level_block,
+    render,
+    render_top_level_sequence,
+    replace_top_level_block,
+    top_level_span,
+    upsert_sequence_entry,
 };
 
 /// Set the ignore list to `ghsas` (the complete desired list) in whichever
-/// spelling the manifest uses — the canonical `audit.ignore` wins over the
+/// spelling the manifest uses, the canonical `audit.ignore` wins over the
 /// deprecated `auditConfig.ignoreGhsas`, matching the reader's precedence,
 /// so a stale canonical list can't shadow the update on the next read. When
 /// both spellings are present, the shadowed deprecated list is removed as
@@ -69,7 +81,7 @@ fn set_audit_ignore(manifest: &mut Manifest, ghsas: &[String]) -> bool {
 
 fn remove_audit_config_ghsas(manifest: &mut Manifest, block: &str) -> bool {
     let text = manifest.document.text();
-    // Nothing to remove if `ignoreGhsas` isn't present — and crucially,
+    // Nothing to remove if `ignoreGhsas` isn't present, and crucially,
     // don't touch sibling `auditConfig` keys.
     if locate(text, &[block]).is_none()
         || !mapping_keys(text, &[block])
@@ -83,7 +95,7 @@ fn remove_audit_config_ghsas(manifest: &mut Manifest, block: &str) -> bool {
     true
 }
 
-/// Remove `block.key` from the document — the whole `block:` when the key is
+/// Remove `block.key` from the document, the whole `block:` when the key is
 /// its only entry, so no empty mapping is left behind. Sibling keys of
 /// `block` are never touched. A missing block or key is a no-op.
 fn remove_block_list_key(manifest: &mut Manifest, block: &str, key: &str) {
@@ -137,7 +149,7 @@ pub(crate) fn set_minimum_release_age_excludes(manifest: &mut Manifest, items: &
 /// Set `list`'s top-level block to `items` (the complete desired list),
 /// creating or replacing it, and removing it when `items` is empty. A
 /// block-style list whose entries are already on disk is reconciled entry by
-/// entry — an entry whose value survives keeps its lines, comments included,
+/// entry, an entry whose value survives keeps its lines, comments included,
 /// and only the changed entries are re-rendered. Returns whether anything
 /// changed.
 fn set_exclude_list(manifest: &mut Manifest, list: ExcludeList, items: &[String]) -> bool {
@@ -158,14 +170,13 @@ fn set_exclude_list(manifest: &mut Manifest, list: ExcludeList, items: &[String]
         .to_vec();
 
     let text = manifest.document.text();
-    let quote_style = render::detect_quote_style(text);
     match locate_sequence(text, &[block]) {
         Inline::Flow(collection) => {
             let rendered: Vec<String> = items
                 .iter()
-                .map(|item| render::render_value_with_quotes(item, quote_style))
+                .map(|item| render::render_value(item))
                 .collect();
-            manifest.document.set_text(flow::set_items(text, &collection, &rendered));
+            manifest.document.set_text(flow::set_items(text.to_owned(), &collection, &rendered));
             *decoded(manifest) = Some(items.to_vec());
             return true;
         }
@@ -176,25 +187,20 @@ fn set_exclude_list(manifest: &mut Manifest, list: ExcludeList, items: &[String]
         Inline::Block => {}
     }
 
-    if let Some(new_text) = reconcile_sequence_items(text, block, &current, items, quote_style) {
+    if let Some(new_text) = reconcile_sequence_items(text, block, &current, items) {
         manifest.document.set_text(new_text);
         *decoded(manifest) = Some(items.to_vec());
         return true;
     }
 
-    replace_exclude_sequence(manifest, block, items, quote_style);
+    replace_exclude_sequence(manifest, block, items);
     *decoded(manifest) = Some(items.to_vec());
     true
 }
 
-fn replace_exclude_sequence(
-    manifest: &mut Manifest,
-    block: &str,
-    items: &[String],
-    quote_style: render::QuoteStyle,
-) {
+fn replace_exclude_sequence(manifest: &mut Manifest, block: &str, items: &[String]) {
     let indent = detect_sequence_indent(manifest.document.text(), Some(block));
-    let rendered = render_top_level_sequence(block, items, quote_style, indent);
+    let rendered = render_top_level_sequence(block, items, indent);
     if let Some(span) = top_level_span(manifest.document.text(), block) {
         manifest.document.set_text(replace_top_level_block(
             manifest.document.text(),
@@ -247,7 +253,7 @@ pub(crate) fn prune_trust_policy_excludes(
 /// write goes through [`set_exclude_list`]'s entry-by-entry reconciliation, so
 /// the comments of the surviving entries stay, a pruned-to-empty list drops
 /// the block, and an unchanged list is a no-op. A list that is absent or
-/// already empty is left verbatim — it has nothing to prune, and dropping the
+/// already empty is left verbatim; it has nothing to prune, and dropping the
 /// block would diverge from pnpm. Returns whether anything changed.
 fn prune_exclude_list(
     manifest: &mut Manifest,

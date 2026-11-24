@@ -1,7 +1,23 @@
-use crate::{ParsePkgNameSuffixError, ParsePkgVerPeerError, PkgName, PkgNameVerPeer, PkgVerPeer};
-use derive_more::{Display, Error};
-use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, str::FromStr};
+use crate::{
+    ParsePkgNameSuffixError,
+    ParsePkgVerPeerError,
+    PkgName,
+    PkgNameVerPeer,
+    PkgVerPeer,
+};
+use derive_more::{
+    Display,
+    Error,
+};
+use pnpm_deps_path::link_path_to_peer_version;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use std::{
+    borrow::Cow,
+    str::FromStr,
+};
 
 /// The start of a [`SnapshotDepRef::Link`] target that points inside the
 /// package declaring it, as in `link:<root>/typings/css-tree`. `<root>`
@@ -30,10 +46,10 @@ pub fn package_root_link_target(link_target: &str) -> Option<&str> {
 /// declaring package's directory one segment at a time, so the result uses
 /// the platform's separator.
 #[must_use]
-pub fn join_package_root_link(package_dir: &std::path::Path, target: &str) -> std::path::PathBuf {
+pub fn join_package_root_link(package_dir: std::path::PathBuf, target: &str) -> std::path::PathBuf {
     target
         .split('/')
-        .fold(package_dir.to_path_buf(), |dir, segment| dir.join(segment))
+        .fold(package_dir, |dir, segment| dir.join(segment))
 }
 
 /// Value of a single entry in [`SnapshotEntry::dependencies`](crate::SnapshotEntry::dependencies)
@@ -41,7 +57,7 @@ pub fn join_package_root_link(package_dir: &std::path::Path, target: &str) -> st
 ///
 /// A snapshot dependency can be written in one of three forms:
 ///
-/// * A bare version with an optional peer-dependency suffix — the dependency
+/// * A bare version with an optional peer-dependency suffix, the dependency
 ///   resolves to `<alias-name>@<version>` in the `snapshots:` map.
 ///
 ///   ```yaml
@@ -50,7 +66,7 @@ pub fn join_package_root_link(package_dir: &std::path::Path, target: &str) -> st
 ///       string-width: 5.1.2
 ///   ```
 ///
-/// * An npm-alias of the form `<target-name>@<version>` — the dependency
+/// * An npm-alias of the form `<target-name>@<version>`, the dependency
 ///   resolves to `<target-name>@<version>` in the `snapshots:` map and the
 ///   entry key is only used as the directory name inside `node_modules`.
 ///
@@ -60,7 +76,7 @@ pub fn join_package_root_link(package_dir: &std::path::Path, target: &str) -> st
 ///       string-width-cjs: string-width@4.2.3
 ///   ```
 ///
-/// * A `link:<path>` value — the dependency is a workspace sibling at
+/// * A `link:<path>` value, the dependency is a workspace sibling at
 ///   `<path>` relative to the lockfile root. Pnpm writes this shape for
 ///   injected workspace packages whose own dependencies resolve to other
 ///   workspace projects (and for which `excludeLinksFromLockfile` is off);
@@ -100,6 +116,15 @@ impl SnapshotDepRef {
             }
             SnapshotDepRef::Alias(key) => Some(key.clone()),
             SnapshotDepRef::Link(_) => None,
+        }
+    }
+
+    /// The key used to identify this provider in a peer suffix. A link
+    /// has a peer key derived from its path, even without a snapshot.
+    pub(crate) fn peer_provider_key(&self, alias: &PkgName) -> Option<PkgNameVerPeer> {
+        match self {
+            Self::Link(path) => format!("{alias}@{}", link_path_to_peer_version(path)).parse().ok(),
+            _ => self.resolve(alias),
         }
     }
 

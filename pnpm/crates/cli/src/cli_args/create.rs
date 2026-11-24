@@ -1,6 +1,9 @@
 use crate::cli_args::dlx::DlxArgs;
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
 use pnpm_reporter::Reporter;
@@ -15,7 +18,7 @@ pub struct CreateArgs {
     pub command: Vec<String>,
 
     /// Package names allowed to run lifecycle (build) scripts during
-    /// the install. May be repeated.
+    /// the install. Repeat or comma-separate for multiple.
     #[clap(long = "allow-build")]
     pub allow_build: Vec<String>,
 

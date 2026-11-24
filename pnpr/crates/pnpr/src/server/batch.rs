@@ -1,50 +1,86 @@
-//! `PUT /-/pnpr/v0/publish` — one publish transaction across ecosystems.
+//! `PUT /-/pnpr/v0/publish`: one publish transaction across ecosystems.
 //!
 //! Mounted at the server root, under `/npm/`, and under a named npm
 //! registry's `/npm/~<registry>/`, so both cross-ecosystem releases and
 //! `pnpm publish --batch` (which resolves relative to the configured npm
 //! registry URL) address the same handler.
 //!
-//! Each entry names its `ecosystem` — absent means npm, so an npm batch body
-//! is already a valid one — and carries what that surface's own publish
+//! Each entry names its `ecosystem` (absent means npm, so an npm batch body
+//! is already a valid one) and carries what that surface's own publish
 //! endpoint takes, with the binary parts base64-encoded. Every entry is
 //! validated and staged before any of them is committed, and the whole batch
-//! commits as one generation of its organization's catalog, or not at all: a
+//! commits as one generation of its hosted namespace, or not at all: a
 //! release that spans ecosystems either lands whole or leaves nothing behind,
 //! and a reader sees all of it or none of it. A blob whose immutable slot
 //! another writer already owns fails the batch before anything is recorded
 //! (see `publishing::atomic`).
 
 use super::{
-    AppState, AuthedCaller, Identity,
-    cargo::{CratePublication, authorize_crate_publish, verify_crate_archive},
-    oci::{OciPublication, authorize_publication},
+    AppState,
+    AuthedCaller,
+    Identity,
+    cargo::{
+        CratePublication,
+        authorize_crate_publish,
+        verify_crate_archive,
+    },
+    oci::{
+        OciPublication,
+        authorize_publication,
+    },
     oidc::WorkloadScope,
     publishing::{
-        PublishReceipt, StagedPublish, cleanup_tmp_slots, commit_publication, publication_name,
-        publication_request, publish_committed_response, refuse_notes_of_published_python_versions,
-        replayed_outcome, single_catalog, stage_publish, take_note, take_version_note,
+        PublishReceipt,
+        StagedPublish,
+        check_body_versions,
+        cleanup_tmp_slots,
+        commit_publication,
+        publication_name,
+        publication_request,
+        publish_committed_response,
+        refuse_notes_of_published_python_versions,
+        replayed_outcome,
+        single_namespace,
+        stage_publish,
+        take_note,
+        take_version_note,
         validate_publish_doc,
     },
-    pypi::{PypiPublication, authorize_upload, verify_upload},
+    pypi::{
+        PypiPublication,
+        authorize_upload,
+        verify_upload,
+    },
     resolve_write_target,
     staged_archives::StagedReferences,
 };
 use axum::{
     Extension,
     body::Bytes,
-    extract::{Path, State},
+    extract::{
+        Path,
+        State,
+    },
     http::HeaderMap,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine,
+    engine::general_purpose::STANDARD as BASE64,
+};
 use pnpr_cargo::PublishMetadata;
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_pypi::Upload;
 use pnpr_registry::Ecosystem;
 use pnpr_storage::{
-    metadata::{PublicationRequest, PublishNotes},
+    database::{
+        PublicationRequest,
+        PublishNotes,
+    },
     publish::now_iso,
 };
 use serde::Deserialize;
@@ -92,8 +128,13 @@ async fn serve(
 ) -> Response {
     let key = headers
         .get(IDEMPOTENCY_KEY)
-        .and_then(|key| key.to_str().ok());
-    publish_batch(state, caller, key, body).await.unwrap_or_else(IntoResponse::into_response)
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok);
+    super::publishing::retry::retry_reclaimed(&state.inner.locks.publish_replays, body, |body| {
+        publish_batch(state, caller, key, body)
+    })
+    .await
+    .unwrap_or_else(IntoResponse::into_response)
 }
 
 /// Who sends a batch, and the registry its npm entries are addressed
@@ -161,13 +202,13 @@ impl ValidatedEntry {
         }
     }
 
-    /// The organization whose catalog the entry is published into.
-    fn org(&self) -> &str {
+    /// The hosted namespace the entry is published into.
+    fn namespace(&self) -> &str {
         match self {
-            ValidatedEntry::Npm(_, org) => org,
-            ValidatedEntry::Cargo(publication) => publication.org(),
-            ValidatedEntry::Pypi(publication) => publication.org(),
-            ValidatedEntry::Oci(publication) => publication.org(),
+            ValidatedEntry::Npm(_, namespace) => namespace,
+            ValidatedEntry::Cargo(publication) => publication.namespace(),
+            ValidatedEntry::Pypi(publication) => publication.namespace(),
+            ValidatedEntry::Oci(publication) => publication.namespace(),
         }
     }
 
@@ -182,7 +223,9 @@ impl ValidatedEntry {
 
     async fn stage(self, state: &AppState, now: &str) -> Result<StagedPublish, RegistryError> {
         match self {
-            ValidatedEntry::Npm(doc, org) => stage_publish(state, *doc, now, Some(&org)).await,
+            ValidatedEntry::Npm(doc, namespace) => {
+                stage_publish(state, *doc, now, Some(&namespace)).await
+            }
             ValidatedEntry::Cargo(publication) => publication.stage(state).await,
             ValidatedEntry::Pypi(publication) => publication.stage(state).await,
             ValidatedEntry::Oci(publication) => publication.stage(state).await.map_err(Into::into),
@@ -198,9 +241,6 @@ async fn publish_batch(
 ) -> Result<Response, RegistryError> {
     let identity = caller.identity;
     let mut incoming: Value = serde_json::from_slice(&body).map_err(|err| malformed_body(&err))?;
-    // The parsed body holds everything the entries need, and the payloads are
-    // decoded out of it below: keep only one copy of a body that may run to
-    // the request limit.
     drop(body);
     let name = publication_name(&incoming)?;
     let request = publication_request(identity, &incoming, key, name, None);
@@ -213,7 +253,8 @@ async fn publish_batch(
     // just like with a single publish.
     let names: Vec<&str> = validated
         .iter()
-        .map(|entry| entry.key().as_str())
+        .map(ValidatedEntry::key)
+        .map(CanonicalPackageName::as_str)
         .collect();
     let _guards = state.inner.locks.packages.lock_many(&names).await;
     // Every entry is authorized above, so a retry gets the outcome of the
@@ -253,7 +294,7 @@ async fn stage_and_commit(
 }
 
 /// Refuse the batch's notes for Python versions already published, in the
-/// one catalog its entries target.
+/// one namespace its entries target.
 async fn refuse_late_python_notes(
     state: &AppState,
     validated: &[ValidatedEntry],
@@ -262,13 +303,13 @@ async fn refuse_late_python_notes(
     if notes.versions.is_empty() {
         return Ok(());
     }
-    let catalog = single_catalog(validated.iter().map(ValidatedEntry::org))?;
-    refuse_notes_of_published_python_versions(state, &catalog, notes).await
+    let namespace = single_namespace(validated.iter().map(ValidatedEntry::namespace))?;
+    refuse_notes_of_published_python_versions(state, &namespace, notes).await
 }
 
-/// The recorded outcome of the batch `request` repeats, in the one catalog
+/// The recorded outcome of the batch `request` repeats, in the one namespace
 /// its entries target. A request exists only with `SQLite` metadata, whose
-/// publish targets one catalog.
+/// publish targets one namespace.
 async fn replayed_batch(
     state: &AppState,
     request: Option<&PublicationRequest>,
@@ -277,8 +318,8 @@ async fn replayed_batch(
     if request.is_none() {
         return Ok(None);
     }
-    let catalog = single_catalog(validated.iter().map(ValidatedEntry::org))?;
-    replayed_outcome(state, &catalog, request).await
+    let namespace = single_namespace(validated.iter().map(ValidatedEntry::namespace))?;
+    replayed_outcome(state, &namespace, request).await
 }
 
 /// Stage every entry, removing what was staged when one fails.
@@ -384,17 +425,18 @@ async fn validate_entry(
                 serde_json::from_value(package).map_err(|err| malformed_body(&err))?;
             // Decide where this crate writes, and whether the caller may write
             // it, before spending anything on decoding its archive.
-            let target = authorize_crate_publish(state, identity, None, &entry.metadata)?;
+            let target = authorize_crate_publish(state, identity, None, &entry.metadata).await?;
             let archive = decode_base64(&entry.archive, "archive")?;
             Ok(ValidatedEntry::Cargo(
                 verify_crate_archive(target, entry.metadata, archive.into()).await?,
             ))
         }
-        Ecosystem::Pypi => validate_pypi_entry(state, identity, package),
+        Ecosystem::Pypi => validate_pypi_entry(state, identity, package).await,
         Ecosystem::Oci => {
             let entry: OciEntry =
                 serde_json::from_value(package).map_err(|err| malformed_body(&err))?;
             let target = authorize_publication(state, identity, None, &entry.name)
+                .await
                 .map_err(RegistryError::from)?;
             let bytes = decode_base64(&entry.manifest, "manifest")?;
             OciPublication::new(
@@ -449,6 +491,7 @@ async fn validate_npm_entry(
     if let Some(entry) = package.as_object_mut() {
         entry.remove("ecosystem");
     }
+    check_body_versions(&package)?;
     let name = package
         .get("name")
         .and_then(Value::as_str)
@@ -466,10 +509,10 @@ async fn validate_npm_entry(
     // registry's publish rule per document.
     let (doc, target) =
         validate_publish_doc(state, caller.identity, caller.registry, name, package).await?;
-    Ok(ValidatedEntry::Npm(Box::new(doc), target.org))
+    Ok(ValidatedEntry::Npm(Box::new(doc), target.namespace))
 }
 
-fn validate_pypi_entry(
+async fn validate_pypi_entry(
     state: &AppState,
     identity: &Identity,
     package: Value,
@@ -484,7 +527,7 @@ fn validate_pypi_entry(
         sha256_digest: entry.sha256_digest,
         requires_python: entry.requires_python,
     };
-    let target = authorize_upload(state, identity, None, &upload)?;
+    let target = authorize_upload(state, identity, None, &upload).await?;
     upload.content = decode_base64(&entry.content, "content")?;
-    Ok(ValidatedEntry::Pypi(verify_upload(target, upload)?))
+    Ok(ValidatedEntry::Pypi(verify_upload(target, upload).await?))
 }

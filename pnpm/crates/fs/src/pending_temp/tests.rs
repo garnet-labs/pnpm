@@ -1,7 +1,12 @@
-use super::{ACTIVE_WALKS, remove_pending_temp_files, track_temp_file};
+use super::{
+    remove_pending_temp_files,
+    track_temp_file,
+};
+#[cfg(unix)]
+use command_extra::CommandExtra;
 use std::{
     fs,
-    sync::{Mutex, atomic::Ordering},
+    sync::Mutex,
 };
 
 /// The registry is process-global and `cargo test` runs these tests on
@@ -54,8 +59,11 @@ fn released_slot_is_reused() {
     assert!(!second.exists(), "reused slot must be unlinked: {second:?}");
 }
 
+/// A write that publishes its temp file while a cleanup walk is running
+/// releases its slot from inside that walk, which is the shape the signal
+/// handler creates. The slot has to come back usable afterwards.
 #[test]
-fn slot_released_during_a_walk_stays_usable() {
+fn a_slot_released_during_a_cleanup_stays_usable() {
     let _lock = LOCK.lock().expect("registry test lock");
     let dir = tempfile::tempdir().expect("tempdir");
     let first = dir.path().join("first.tmp");
@@ -63,24 +71,23 @@ fn slot_released_during_a_walk_stays_usable() {
     fs::write(&first, "1").expect("stage first temp file");
     fs::write(&second, "2").expect("stage second temp file");
 
-    // A walk in progress keeps the released path alive rather than freeing
-    // it under the walker; the slot itself is free for the next write.
-    ACTIVE_WALKS.fetch_add(1, Ordering::SeqCst);
-    drop(track_temp_file(&first));
-    ACTIVE_WALKS.fetch_sub(1, Ordering::SeqCst);
+    let mut guard = Some(track_temp_file(&first));
+    remove_pending_temp_files();
+    guard.take();
+
     let _guard = track_temp_file(&second);
     remove_pending_temp_files();
 
-    assert!(first.exists(), "released slot must not be unlinked: {first:?}");
-    assert!(!second.exists(), "reused slot must be unlinked: {second:?}");
+    assert!(!first.exists(), "a registered temp file is unlinked: {first:?}");
+    assert!(!second.exists(), "the reused slot is unlinked: {second:?}");
 }
 
 #[cfg(unix)]
 #[test]
 fn die_from_signal_does_not_dump_core() {
     use std::{
-        env, io,
-        os::unix::process::{CommandExt, ExitStatusExt},
+        env,
+        os::unix::process::ExitStatusExt,
         path::Path,
         process::Command,
     };
@@ -95,40 +102,14 @@ fn die_from_signal_does_not_dump_core() {
     let temp = dir.path().join(".pnpm-lock.yaml.123.2.tmp");
     fs::write(&temp, "partial lockfile").expect("stage temp file");
 
-    let mut command = Command::new(env::current_exe().expect("test binary path"));
-    command
-        .args(["--exact", "pending_temp::tests::die_from_signal_does_not_dump_core", "--nocapture"])
-        .env(CHILD_TEMP_ENV, &temp);
-    // SAFETY: `getrlimit`, `setrlimit`, and `prctl` are async-signal-safe and
-    // use a stack local that outlives the call. Both attributes survive `exec`.
-    unsafe {
-        let mut inherited_limit: libc::rlimit = std::mem::zeroed();
-        assert_eq!(
-            libc::getrlimit(libc::RLIMIT_CORE, &raw mut inherited_limit),
-            0,
-            "getrlimit(RLIMIT_CORE) failed: {}",
-            io::Error::last_os_error(),
-        );
-        assert_ne!(
-            inherited_limit.rlim_max, 0,
-            "core-dump regression test requires a non-zero RLIMIT_CORE hard limit",
-        );
-        command.pre_exec(|| {
-            let mut limit: libc::rlimit = std::mem::zeroed();
-            if libc::getrlimit(libc::RLIMIT_CORE, &raw mut limit) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            limit.rlim_cur = limit.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_CORE, &raw const limit) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    let mut command = Command::new(env::current_exe().expect("test binary path"))
+        .with_args([
+            "--exact",
+            "pending_temp::tests::die_from_signal_does_not_dump_core",
+            "--nocapture",
+        ])
+        .with_env(CHILD_TEMP_ENV, &temp);
+    pnpm_testing_utils::spawn::enable_core_dumps(&mut command);
 
     let status = command.status().expect("spawn child test process");
 

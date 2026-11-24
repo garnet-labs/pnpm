@@ -1,29 +1,56 @@
 pub(super) mod persistence;
-pub(super) use persistence::{finish_single_update, settle_selected_update};
+pub(super) use persistence::{
+    finish_single_update,
+    settle_selected_update,
+};
 
 use super::{
-    SelectedProjects, UpdateError, UpdateOptions, UpdateResources, UpdateSite, manifest_dir,
-    prepare::{
-        ReadPackageHook, SelectedUpdatePreparation, UpdatePreparation,
+    SelectedProjects,
+    UpdateError,
+    UpdateOptions,
+    UpdateResources,
+    UpdateSite,
+    hook::{
+        ReadPackageHook,
         apply_read_package_hook_to_update_manifest,
+    },
+    manifest_dir,
+    prepare::{
+        SelectedUpdatePreparation,
+        UpdatePreparation,
     },
     update_mutation,
 };
 use crate::{
-    Install, PolicyExcludes, UpdateSeedPolicy, WorkspaceInstallSelection,
-    catalog_cleanup::{write_workspace_catalogs, write_workspace_catalogs_selected},
+    Install,
+    PolicyExcludes,
+    UpdateSeedPolicy,
+    WorkspaceInstallSelection,
+    catalog_cleanup::{
+        write_workspace_catalogs,
+        write_workspace_catalogs_selected,
+    },
     defer_ignored_builds,
     manifest_spec_bumps::ManifestSpecBumps,
 };
 use pipe_trait::Pipe;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::PreferredVersions;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 
 pub(super) async fn run_prepared_selected_update<Reporter: self::Reporter + 'static>(
@@ -35,16 +62,7 @@ pub(super) async fn run_prepared_selected_update<Reporter: self::Reporter + 'sta
     unsaved: UnsavedManifests,
     mut prepared: SelectedUpdatePreparation,
 ) -> Result<(), UpdateError> {
-    if update.version.save {
-        write_workspace_catalogs_selected(
-            update.config,
-            site.catalogs_dir(prepared.workspace_dir_for_catalogs.as_deref()),
-            &prepared.updated_catalogs,
-            None,
-            selected.projects,
-        )
-        .map_err(UpdateError::WriteWorkspaceManifest)?;
-    }
+    let update = saved_selected_update_options(update, &site, &prepared, selected.projects)?;
 
     let bumps = (!prepared.bump_targets.is_empty()).then(|| ManifestSpecBumps {
         targets: std::mem::take(&mut prepared.bump_targets),
@@ -86,16 +104,7 @@ pub(super) async fn run_prepared_update<Reporter: self::Reporter + 'static>(
     unsaved: UnsavedManifests,
     mut prepared: UpdatePreparation,
 ) -> Result<(), UpdateError> {
-    if update.version.save {
-        write_workspace_catalogs(
-            update.config,
-            prepared.workspace_dir_for_catalogs.as_deref(),
-            &prepared.updated_catalogs,
-            None,
-            manifest,
-        )
-        .map_err(UpdateError::WriteWorkspaceManifest)?;
-    }
+    let update = saved_single_update_options(update, &prepared, manifest)?;
     let importer_id =
         pnpm_workspace::importer_id_from_root_dir(&site.workspace_root, manifest_dir(manifest));
     let bumps = (!prepared.bump_targets.is_empty()).then(|| ManifestSpecBumps {
@@ -121,6 +130,7 @@ pub(super) async fn run_prepared_update<Reporter: self::Reporter + 'static>(
 
     finish_single_update::<Reporter>(
         update,
+        &site,
         manifest,
         &prepared,
         &importer_id,
@@ -135,6 +145,70 @@ pub(super) async fn run_prepared_update<Reporter: self::Reporter + 'static>(
 pub(super) struct UnsavedManifests {
     pub(super) hooked_paths: HashSet<PathBuf>,
     pub(super) lockfile_specifiers: Option<Vec<(PathBuf, PackageManifest)>>,
+}
+/// The update options a saving selected-projects update runs its install
+/// under: the catalogs it rewrote are written first for the resolve to
+/// re-read, and the config carries the moved overrides so the resolve
+/// answers to the moved pins rather than the ones startup read. The moved
+/// overrides themselves are persisted by [`settle_selected_update`] once
+/// the install succeeds, so a failed install leaves the workspace manifest
+/// as it was.
+fn saved_selected_update_options<'a>(
+    update: UpdateOptions<'a>,
+    site: &UpdateSite,
+    prepared: &SelectedUpdatePreparation,
+    projects: &[pnpm_workspace::Project],
+) -> Result<UpdateOptions<'a>, UpdateError> {
+    if !update.version.save {
+        return Ok(update);
+    }
+    write_workspace_catalogs_selected(
+        update.config,
+        site.catalogs_dir(prepared.catalogs.workspace_dir_for_catalogs.as_deref()),
+        &prepared.catalogs.updated_catalogs,
+        None,
+        projects,
+    )
+    .map_err(UpdateError::WriteWorkspaceManifest)?;
+    Ok(update_with_moved_overrides(update, &prepared.updated_overrides))
+}
+/// [`saved_selected_update_options`] for the single-project run.
+fn saved_single_update_options<'a>(
+    update: UpdateOptions<'a>,
+    prepared: &UpdatePreparation,
+    manifest: &PackageManifest,
+) -> Result<UpdateOptions<'a>, UpdateError> {
+    if !update.version.save {
+        return Ok(update);
+    }
+    write_workspace_catalogs(
+        update.config,
+        prepared.catalogs.workspace_dir_for_catalogs.as_deref(),
+        &prepared.catalogs.updated_catalogs,
+        None,
+        manifest,
+    )
+    .map_err(UpdateError::WriteWorkspaceManifest)?;
+    Ok(update_with_moved_overrides(update, &prepared.updated_overrides))
+}
+/// Resolve this run against the overrides it moved: the config carries the
+/// moved pins in place of the ones startup read, so the resolve, the
+/// lockfile settings it records, and the freshness checks all answer to
+/// them. The resolve reads overrides from the config, never the workspace
+/// manifest on disk, that write belongs to the settle phase.
+fn update_with_moved_overrides<'a>(
+    update: UpdateOptions<'a>,
+    updated_overrides: &[(String, String)],
+) -> UpdateOptions<'a> {
+    if updated_overrides.is_empty() {
+        return update;
+    }
+    let mut config = update.config.clone();
+    let overrides = config.overrides.get_or_insert_with(indexmap::IndexMap::new);
+    for (key, value) in updated_overrides {
+        overrides.insert(key.clone(), value.clone());
+    }
+    UpdateOptions { config: Box::leak(Box::new(config)), ..update }
 }
 /// What the resolve seeds from: the pins it keeps or drops, the versions it
 /// prefers, and the catalogs as the update rewrote them.
@@ -156,10 +230,12 @@ pub(super) fn update_install<'i>(
 ) -> Install<'i, Vec<DependencyGroup>> {
     let dependency_groups = update_dependency_groups(&update, &owned);
     Install {
-        lockfile_policy: update.lockfile_policy(),
+        lockfile_policy: update.lockfile_policy(owned.policy_excludes),
         execution: update_execution(&update),
         resolution: crate::ResolutionInputs {
             update_seed_policy: seed.policy,
+            local_filesystem_policy: pnpm_resolving_local_resolver::LocalFilesystemPolicy::default(
+            ),
             preferred_versions_override: Some(seed.preferred_versions_override.into()),
             auth_override: None,
             observer: owned.resolution_observer,
@@ -193,7 +269,7 @@ pub(super) fn update_install<'i>(
 fn update_execution(update: &UpdateOptions<'_>) -> crate::InstallExecution {
     crate::InstallExecution {
         skip_runtimes: update.config.skip_runtimes,
-        mutation: update_mutation(update.selection.packages, update.version.latest),
+        mutation: update.mutation(),
         installs_only: false,
         node_linker: update.config.node_linker,
         lockfile_only: update.lockfile_only,
@@ -327,18 +403,26 @@ where
 }
 
 impl UpdateOptions<'_> {
-    fn lockfile_policy(self) -> crate::InstallLockfilePolicy {
+    fn mutation(self) -> crate::ProjectMutation {
+        update_mutation(self.selection.packages, self.version.reaches_past_declared_range())
+    }
+
+    fn lockfile_policy(
+        self,
+        policy_excludes: Option<PolicyExcludes>,
+    ) -> crate::InstallLockfilePolicy {
         crate::InstallLockfilePolicy {
             frozen: false,
             prefer_frozen: Some(false),
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: self.config.trust_lockfile,
             update_checksums: self.version.patches,
-            excludes: if self.version.save {
+            excludes: policy_excludes.unwrap_or(if self.version.save {
                 PolicyExcludes::Persist
             } else {
                 PolicyExcludes::Forbidden
-            },
+            }),
             disable_optimistic_repeat: false,
         }
     }

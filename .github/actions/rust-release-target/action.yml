@@ -15,7 +15,7 @@ runs:
 
   steps:
     - name: Install cross
-      uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
       with:
         tool: cross
 

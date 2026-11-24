@@ -1,13 +1,45 @@
 use super::{
-    super::{dispatch_script, rebuild, script_override},
-    ApproveArgs, ApproveBuildsArgs, CommandFuture, Context, DedupeArgs, DedupePipeline, DeployArgs,
-    DeployPipeline, EnvArgs, EnvSubcommand, FetchArgs, ImportArgs, InstallArgs, InstallPipeline,
-    LinkArgs, PermissionsArgs, PermissionsCommand, PruneArgs, PrunePipeline, RebuildArgs, RunCtx,
-    RuntimeArgs, UnlinkArgs, apply_install_cli_config, apply_update_config, derive_config_root,
-    global, installed_project_config, render_permissions, resolve_bool_override,
+    super::{
+        dispatch_script,
+        rebuild,
+        script_override,
+    },
+    ApproveArgs,
+    ApproveBuildsArgs,
+    CommandFuture,
+    Context,
+    DedupeArgs,
+    DedupePipeline,
+    DeployArgs,
+    DeployPipeline,
+    EnvArgs,
+    EnvSubcommand,
+    FetchArgs,
+    ImportArgs,
+    InstallArgs,
+    InstallPipeline,
+    LinkArgs,
+    PermissionsArgs,
+    PermissionsCommand,
+    PruneArgs,
+    PrunePipeline,
+    RebuildArgs,
+    RunCtx,
+    RuntimeArgs,
+    UnlinkArgs,
+    apply_install_cli_config,
+    apply_update_config,
+    derive_config_root,
+    global,
+    installed_project_config,
+    render_permissions,
+    resolve_bool_override,
     warn_about_config_root,
 };
-use crate::cli_args::reporter::{CliReporter, selected_reporter};
+use crate::cli_args::reporter::{
+    CliReporter,
+    selected_reporter,
+};
 
 pub(in super::super) fn deploy<'a>(
     ctx: &RunCtx<'a>,
@@ -20,7 +52,8 @@ pub(in super::super) fn deploy<'a>(
     // never has to name a target it does not deploy to.
     let script_args = args.target_dirs
         .iter()
-        .map(|target| target.to_string_lossy().into_owned())
+        .map(|target| target.to_string_lossy())
+        .map(std::borrow::Cow::into_owned)
         .collect();
     if let Some(run_args) = script_override::resolve(ctx, cfg, "deploy", script_args)? {
         return dispatch_script::run(ctx, run_args);
@@ -91,12 +124,12 @@ pub(in super::super) fn fetch<'a>(
     args: FetchArgs,
 ) -> miette::Result<CommandFuture<'a>> {
     let ignore_pnpmfile = args.ignore_pnpmfile;
-    let command_state = ctx.prepared_state_with(true, move |config| {
+    let manifest_path = ctx.locations.manifest_path;
+    let config = ctx.prepared_config_with(move |config| {
         config.ignore_pnpmfile |= ignore_pnpmfile;
     });
     Ok(Box::pin(async move {
-        let command_state = command_state.await?;
-        args.run::<CliReporter>(command_state).await
+        super::super::pipelines::run_fetch::<CliReporter>(args, config.await?, manifest_path).await
     }))
 }
 
@@ -198,7 +231,7 @@ pub(in super::super) fn runtime<'a>(
     args: RuntimeArgs,
 ) -> miette::Result<CommandFuture<'a>> {
     if args.global {
-        let config = (ctx.loaders.global_config)()?;
+        let config = (ctx.loaders.global_packages_config)()?;
         let dir = ctx.locations.dir;
         return Ok(Box::pin(args.run_global::<CliReporter>(config, dir)));
     }
@@ -216,7 +249,7 @@ pub(in super::super) fn env<'a>(
     ctx: &RunCtx<'a>,
     args: EnvArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    let config = (ctx.loaders.global_config)()?;
+    let config = (ctx.loaders.global_packages_config)()?;
     let dir = ctx.locations.dir;
     Ok(match args.subcommand::<CliReporter>(config)? {
         EnvSubcommand::Use { package_name } => {
@@ -268,7 +301,7 @@ pub(in super::super) fn approve_builds<'a>(
     args: ApproveBuildsArgs,
 ) -> miette::Result<CommandFuture<'a>> {
     if args.global {
-        let config = (ctx.loaders.global_config)()?;
+        let config = (ctx.loaders.global_packages_config)()?;
         return Ok(Box::pin(global::approve_global_builds::<CliReporter>(config, args)));
     }
     let config = ctx.prepared_config();
@@ -281,8 +314,11 @@ pub(in super::super) fn approve_builds<'a>(
         else {
             return Ok(());
         };
-        let selected =
-            rebuild::RebuildSelection { names: Some(build_packages), projects: Vec::new() };
+        let selected = rebuild::RebuildSelection {
+            snapshots: None,
+            names: Some(build_packages),
+            projects: Vec::new(),
+        };
         Box::pin(rebuild::run_rebuild::<CliReporter>(&rebuild_state, selected, None)).await
     }))
 }

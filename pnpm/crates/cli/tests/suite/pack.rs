@@ -9,14 +9,22 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     diagnostics::assert_diagnostic_contains,
 };
 use serde_json::json;
-use std::{fmt::Write, fs, path::Path};
+use std::{
+    fmt::Write,
+    fs,
+    path::Path,
+};
 
 mod output;
-mod variants;
+mod private_dependency;
+mod publish_directory;
 
 #[test]
 fn pack_uses_embed_readme_and_manifest_obfuscation_settings() {
@@ -189,6 +197,7 @@ fn before_packing_hook_rewrites_the_packed_manifest() {
   hooks: {
     beforePacking (manifest) {
       delete manifest.devDependencies
+      manifest.bin = 'cli.js'
       manifest.packedByHook = true
       return manifest
     },
@@ -208,6 +217,7 @@ fn before_packing_hook_rewrites_the_packed_manifest() {
         .success();
 
     let manifest = read_manifest_from_tarball(&out.join("pkg-1.0.0.tgz"));
+    assert_eq!(manifest["bin"], json!({ "pkg": "cli.js" }));
     assert_eq!(manifest["packedByHook"], json!(true), "the hook's added field must be packed");
     assert!(
         manifest.get("devDependencies").is_none(),
@@ -215,6 +225,31 @@ fn before_packing_hook_rewrites_the_packed_manifest() {
     );
 
     drop(root);
+}
+
+#[test]
+fn before_packing_must_return_a_valid_package_name() {
+    for (change, code) in [
+        ("delete pkg.name", "ERR_PNPM_MISSING_REQUIRED_FIELD"),
+        ("pkg.name = 42", "ERR_PNPM_INVALID_PACKAGE_NAME"),
+        ("pkg.name = 42; pkg.bin = 'cli.js'", "ERR_PNPM_INVALID_PACKAGE_NAME"),
+    ] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        fs::write(workspace.join("package.json"), r#"{"name":"example","version":"1.0.0"}"#)
+            .unwrap();
+        fs::write(
+            workspace.join(".pnpmfile.cjs"),
+            format!("exports.hooks = {{ beforePacking(pkg) {{ {change}; return pkg }} }}"),
+        )
+        .unwrap();
+        let output = pacquet
+            .with_arg("pack")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_diagnostic_contains(&String::from_utf8_lossy(&output.stderr), code);
+        drop(root);
+    }
 }
 
 /// The workspace-root `.pnpmfile.cjs` applies to a `--filter`-selected
@@ -381,9 +416,9 @@ module.exports = {{
     let events = fs::read_to_string(events).expect("read pack events");
     let events = events.lines().collect::<Vec<_>>();
     assert_eq!(events.len(), 4);
-    for pair in events.chunks_exact(2) {
-        let project = pair[0].strip_suffix(":start").expect("start event");
-        assert_eq!(pair[1], format!("{project}:end"));
+    for [start, end] in events.as_chunks::<2>().0 {
+        let project = start.strip_suffix(":start").expect("start event");
+        assert_eq!(*end, format!("{project}:end"));
     }
     assert!(workspace.join("artifact.tgz").exists());
 
@@ -459,9 +494,7 @@ fn recursive_pack_reports_results_in_dependency_order() {
 }
 
 /// `--config.ignore-scripts=true` suppresses the pack lifecycle scripts
-/// just like the bare `--ignore-scripts` flag does for the commands that
-/// declare it. `pack` has no such flag, so the dotted override is the only
-/// way to skip its `prepack` (pnpm/pnpm#13986).
+/// (pnpm/pnpm#13986).
 #[test]
 fn config_ignore_scripts_override_suppresses_prepack() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -509,6 +542,59 @@ fn config_ignore_scripts_override_suppresses_prepack() {
     assert!(tarball.exists(), "the tarball must still be packed");
 
     drop((root, ignoring_root));
+}
+
+/// `--ignore-pnpmfile` and `--ignore-scripts` let `pack` run on a
+/// directory without executing any of its code (pnpm/pnpm#18132).
+#[test]
+fn ignore_flags_pack_without_running_project_code() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "name": "pkg",
+            "version": "1.0.0",
+            "scripts": {
+                "prepack": r#"node -e "require('fs').writeFileSync('prepack-ran.txt','ran')""#,
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "require('fs').writeFileSync('pnpmfile-ran.txt', 'ran')\nmodule.exports = { hooks: {} }\n",
+    )
+    .expect("write .pnpmfile.cjs");
+
+    pacquet
+        .with_arg("pack")
+        .with_arg("--ignore-pnpmfile")
+        .with_arg("--ignore-scripts")
+        .assert()
+        .success();
+
+    assert!(workspace.join("pkg-1.0.0.tgz").exists(), "the tarball must be packed");
+    assert!(
+        !workspace.join("pnpmfile-ran.txt").exists(),
+        "--ignore-pnpmfile must not load the pnpmfile",
+    );
+    assert!(!workspace.join("prepack-ran.txt").exists(), "--ignore-scripts must suppress prepack");
+
+    let CommandTempCwd {
+        pacquet: unflagged,
+        root: unflagged_root,
+        ..
+    } = CommandTempCwd::init();
+    unflagged
+        .with_current_dir(&workspace)
+        .with_arg("pack")
+        .assert()
+        .success();
+    assert!(workspace.join("pnpmfile-ran.txt").exists(), "pack must load the pnpmfile by default");
+    assert!(workspace.join("prepack-ran.txt").exists(), "pack must run prepack by default");
+
+    drop((root, unflagged_root));
 }
 
 /// Extract `package/package.json` from a packed tarball.
@@ -825,6 +911,50 @@ fn pack_exports_the_command_to_lifecycle_scripts() {
     let value =
         fs::read_to_string(workspace.join("npm-command.txt")).expect("read npm-command.txt");
     assert_eq!(value, "pack");
+
+    drop(root);
+}
+
+#[test]
+fn dry_run_json_reports_the_publish_transformed_manifest() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "name": "pkg",
+            "version": "1.0.0",
+            "main": "./src/index.ts",
+            "publishConfig": { "main": "./dist/index.js" },
+            "scripts": { "build": "exit 0", "prepublishOnly": "exit 0" },
+            "pnpm": { "overrides": { "is-positive": "1.0.0" } },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    fs::write(workspace.join("README.md"), "# pkg").expect("write README.md");
+
+    let output = pacquet
+        .with_arg("pack")
+        .with_arg("--dry-run")
+        .with_arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value =
+        serde_json::from_slice(&output).expect("parse pack --json output");
+    let manifest = &result["manifest"];
+
+    assert_eq!(manifest["main"], json!("./dist/index.js"), "publishConfig must be applied");
+    assert!(manifest.get("publishConfig").is_none(), "publishConfig must be stripped");
+    assert_eq!(manifest["scripts"], json!({ "build": "exit 0" }));
+    assert!(manifest.get("pnpm").is_none(), "the pnpm field must be stripped");
+    assert!(
+        manifest.get("readme").is_none(),
+        "the readme is registry metadata, not part of the packed manifest",
+    );
+    assert!(!workspace.join("pkg-1.0.0.tgz").exists(), "--dry-run must not write a tarball");
 
     drop(root);
 }

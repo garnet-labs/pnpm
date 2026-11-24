@@ -1,8 +1,13 @@
-use super::{Config, Path, WorkspaceSettings, assert_eq};
+use super::{
+    Config,
+    Path,
+    WorkspaceSettings,
+    assert_eq,
+};
 
 /// `unsafePerm: false` from yaml propagates to `Config.unsafe_perm`
 /// on POSIX. The starting `Config::new()` value depends on the runtime
-/// uid (see [`default_unsafe_perm`]) — `true` for non-root, `false`
+/// uid (see [`default_unsafe_perm`]), `true` for non-root, `false`
 /// for root. Either way, `apply_to` with `Some(false)` ends in
 /// `false`.
 #[test]
@@ -22,7 +27,7 @@ fn parses_unsafe_perm_from_yaml_and_applies() {
 }
 
 /// On Windows, `apply_to` ignores the yaml value and forces
-/// `unsafe_perm = true` — running lifecycle scripts under a uid/gid
+/// `unsafe_perm = true`, running lifecycle scripts under a uid/gid
 /// drop is POSIX-only.
 #[cfg(windows)]
 #[test]
@@ -74,4 +79,22 @@ fn script_shell_and_node_options_null_clears_inherited_value() {
     cleared.apply_to(&mut config, Path::new("/irrelevant"));
     assert_eq!(config.script_shell, None, "explicit null must clear the inherited shell");
     assert_eq!(config.node_options, None, "explicit null must clear inherited NODE_OPTIONS");
+}
+
+/// `editor` names an executable, so a committed workspace file cannot set
+/// it, while `null` stays accepted.
+#[test]
+fn committed_workspace_cannot_set_editor() {
+    let path = Path::new("/repo/pnpm-workspace.yaml");
+    let error = WorkspaceSettings::read_valid_with::<crate::workspace_yaml::SystemEnv>(
+        "editor: ./tools/editor.sh\n",
+        path,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, crate::workspace_yaml::LoadWorkspaceYamlError::WorkspaceEditor { .. }),
+        "{error}",
+    );
+    WorkspaceSettings::read_valid_with::<crate::workspace_yaml::SystemEnv>("editor: null\n", path)
+        .unwrap();
 }

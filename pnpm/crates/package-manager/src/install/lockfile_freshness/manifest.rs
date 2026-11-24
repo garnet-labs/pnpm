@@ -1,6 +1,11 @@
 use super::{
     super::{
-        Config, DependencyGroup, Lockfile, PackageManifest, Path, StalenessReason,
+        Config,
+        DependencyGroup,
+        Lockfile,
+        PackageManifest,
+        Path,
+        StalenessReason,
         satisfies_package_manifest,
     },
     FreshnessCheckError,
@@ -22,12 +27,13 @@ pub(crate) struct ImporterSatisfactionCheck<'a> {
     pub(crate) config: &'a Config,
     pub(crate) workspace: WorkspaceProjects<'a>,
     pub(crate) optional_exclusions: OptionalDependencyExclusions<'a>,
-    pub(crate) parsed_overrides: Option<&'a [pnpm_config_parse_overrides::VersionOverride]>,
+    pub(crate) overrider: Option<&'a crate::VersionsOverrider>,
 }
 
 /// The workspace projects an importer's dependencies may point at.
 #[derive(Clone, Copy)]
 pub(crate) struct WorkspaceProjects<'a> {
+    pub(crate) peer_children: &'a super::directory_deps::RecordedPeerChildren,
     /// Linkable projects by name and version, when links are left out of
     /// the lockfile and have to be resolved against them.
     pub(crate) packages: Option<&'a pnpm_resolving_resolver_base::WorkspacePackages>,
@@ -64,30 +70,20 @@ pub(crate) fn check_importer_satisfies(
         })?;
 
     // Apply `pnpm.overrides` to a *cloned* manifest before the
-    // per-importer specifier check so the lockfile's specifiers —
-    // written with overrides already applied — match the on-disk
+    // per-importer specifier check so the lockfile's specifiers
+    // (written with overrides already applied) match the on-disk
     // manifest's deps. The caller's manifest stays pristine since the
     // override pass conceptually returns a new manifest
     // from the perspective of every consumer downstream of the
     // resolver.
-    let normalized_manifest = normalized_freshness_manifest(
-        check.manifest,
-        check.config,
-        check.workspace.packages.map(|packages| crate::WorkspaceLinks {
-            packages,
-            catalogs: check.workspace.catalogs,
-        }),
-        importer,
-        check.parsed_overrides,
-        check.lockfile_dir,
-    );
+    let normalized_manifest = normalized_freshness_manifest(check, importer);
     let manifest_for_freshness = normalized_manifest.as_ref();
 
     // Build the `ignoredOptionalDependencies` filter set: iterate
     // `manifest.optionalDependencies` and delete matches from BOTH the
     // `optional` and `dependencies` maps. A name only present in
     // `dependencies` that happens to match the
-    // pattern is NOT removed — set-based ("name was in
+    // pattern is NOT removed, set-based ("name was in
     // optionalDependencies AND matched") rather than pure pattern
     // matching. `devDependencies` is untouched on purpose; the group
     // gate inside `satisfies_package_manifest` enforces that.
@@ -209,38 +205,73 @@ fn retain_in_freshness_manifest(
     let Some(specifier) = specifier.as_str() else {
         return true;
     };
+    let Some(workspace_links) = workspace_links else {
+        return !specifier.starts_with("link:");
+    };
+    let Some(specifier) = workspace_links.resolve_specifier(
+        alias,
+        specifier,
+        pnpm_catalogs_resolver::CatalogAnchor::AsWritten,
+    ) else {
+        return true;
+    };
     if specifier.starts_with("link:") {
         return false;
     }
-    let Some(workspace_links) = workspace_links else {
-        return true;
-    };
     specifier.starts_with("workspace:")
         || importer.is_some_and(|snapshot| crate::snapshot_has_alias(snapshot, alias))
-        || crate::workspace_link_target(workspace_links, alias, specifier).is_none()
+        || workspace_links.packages
+            .and_then(|packages| crate::workspace_link_target(packages, alias, &specifier))
+            .is_none()
 }
 // Only overrides and excluded links require a clone; all other freshness checks borrow the manifest.
 pub(super) fn normalized_freshness_manifest<'a>(
-    manifest: &'a PackageManifest,
-    config: &Config,
-    workspace_links: Option<crate::WorkspaceLinks<'_>>,
+    check: &'a ImporterSatisfactionCheck<'a>,
     importer: &pnpm_lockfile::ProjectSnapshot,
-    parsed_overrides: Option<&[pnpm_config_parse_overrides::VersionOverride]>,
-    lockfile_dir: &Path,
 ) -> std::borrow::Cow<'a, PackageManifest> {
-    if parsed_overrides.is_none() && !config.exclude_links_from_lockfile {
-        return std::borrow::Cow::Borrowed(manifest);
+    let recorded_meta = recorded_dependencies_meta(check, importer);
+    if check.overrider.is_none()
+        && !check.config.exclude_links_from_lockfile
+        && recorded_meta.is_none()
+    {
+        return std::borrow::Cow::Borrowed(check.manifest);
     }
-    let project_dir = manifest
+    let project_dir = check.manifest
         .path()
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    let mut cloned = manifest.clone();
-    if let Some(parsed) = parsed_overrides {
-        crate::VersionsOverrider::new(parsed, lockfile_dir).apply(&mut cloned, Some(project_dir));
+    let mut cloned = check.manifest.clone();
+    if let (Some(meta), Some(manifest)) = (recorded_meta, cloned.value_mut().as_object_mut()) {
+        match meta {
+            Some(meta) => manifest.insert("dependenciesMeta".to_string(), meta),
+            None => manifest.remove("dependenciesMeta"),
+        };
     }
-    if config.exclude_links_from_lockfile {
+    if let Some(overrider) = check.overrider {
+        overrider.apply(&mut cloned, Some(project_dir));
+    }
+    if check.config.exclude_links_from_lockfile {
+        let workspace_links = Some(crate::WorkspaceLinks {
+            packages: check.workspace.packages,
+            workspace_dir: check.config.workspace_dir.as_deref().unwrap_or(check.lockfile_dir),
+            catalogs: check.workspace.catalogs,
+        });
         exclude_linked_dependencies(&mut cloned, workspace_links, Some(importer));
     }
     std::borrow::Cow::Owned(cloned)
+}
+
+/// The manifest's `dependenciesMeta` as a next-format lockfile records it
+/// (see [`pnpm_lockfile::ProjectSnapshot::injected_dependencies_meta`]), when
+/// that differs from the manifest's.
+fn recorded_dependencies_meta(
+    check: &ImporterSatisfactionCheck<'_>,
+    importer: &pnpm_lockfile::ProjectSnapshot,
+) -> Option<Option<serde_json::Value>> {
+    if !check.lockfile.is_next_format() {
+        return None;
+    }
+    let declared = check.manifest.value().get("dependenciesMeta");
+    let recorded = importer.injected_dependencies_meta(declared);
+    (recorded.as_ref() != declared).then_some(recorded)
 }

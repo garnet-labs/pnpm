@@ -1,5 +1,11 @@
 use super::{
-    ConcreteKind, Ecosystem, PackagePattern, Registries, Registry, RegistryConfigError, Resolved,
+    ConcreteKind,
+    Ecosystem,
+    PackagePattern,
+    Registries,
+    Registry,
+    RegistryConfigError,
+    Resolved,
 };
 
 fn pattern(raw: &str) -> PackagePattern {
@@ -80,7 +86,7 @@ fn rejects_exact_pattern_that_is_not_a_package_name() {
 
 /// A `@<scope>/*` pattern whose scope request parsing (`CanonicalPackageName::parse`)
 /// would reject is a claim no valid package name can ever match. It must be a
-/// config error rather than a dead pattern — a mistyped private-scope claim
+/// config error rather than a dead pattern, a mistyped private-scope claim
 /// that never matches would silently let the names it was meant to cover land
 /// on a later (often public) router source.
 #[test]
@@ -344,7 +350,7 @@ fn rejects_source_shadowed_by_broader_scope() {
 
 #[test]
 fn allows_narrower_source_before_broader() {
-    // `@acme/foo` exact before `@acme/*` is fine — the exact claims strictly
+    // `@acme/foo` exact before `@acme/*` is fine, the exact claims strictly
     // less, so the scope source is still reachable for every other name.
     let registry = registries(
         vec![
@@ -377,7 +383,7 @@ fn allows_sibling_scopes_before_any_scoped() {
 fn rejects_partially_shadowed_source() {
     // The later source stays reachable through `plainpkg` (which `@*/*` cannot
     // cover), but its `@secret/foo` claim is swallowed by the earlier `@*/*`
-    // source. That one pattern must be rejected by name — otherwise requests
+    // source. That one pattern must be rejected by name; otherwise requests
     // for `@secret/foo` silently go to the public upstream instead of the
     // private registry, and the whole-source unreachability check never fires.
     let registry = registries(
@@ -418,7 +424,7 @@ fn rejects_identical_claim_across_two_sources() {
     );
 }
 
-/// Namespaces that overlap in both directions can't be saved by reordering —
+/// Namespaces that overlap in both directions can't be saved by reordering;
 /// either order leaves one source's claim dead, so both orders are rejected.
 #[test]
 fn rejects_bidirectionally_overlapping_sources_in_either_order() {
@@ -546,8 +552,8 @@ fn registries_are_npm_unless_declared_otherwise() {
         ],
         None,
     )
-    .with_ecosystem("crates", Ecosystem::Cargo)
-    .with_ecosystem("crates-io", Ecosystem::Cargo);
+    .with_ecosystem("crates".to_owned(), Ecosystem::Cargo)
+    .with_ecosystem("crates-io".to_owned(), Ecosystem::Cargo);
     set.validate().expect("graph is valid");
     assert_eq!(set.ecosystem("local"), Some(Ecosystem::Npm));
     assert_eq!(set.ecosystem("crates"), Some(Ecosystem::Cargo));
@@ -574,9 +580,9 @@ fn a_router_serves_every_ecosystem_its_sources_speak() {
         ],
         Some("main"),
     )
-    .with_ecosystem("crates", Ecosystem::Cargo)
-    .with_ecosystem("crates-io", Ecosystem::Cargo)
-    .with_ecosystem("python", Ecosystem::Pypi);
+    .with_ecosystem("crates".to_owned(), Ecosystem::Cargo)
+    .with_ecosystem("crates-io".to_owned(), Ecosystem::Cargo)
+    .with_ecosystem("python".to_owned(), Ecosystem::Pypi);
     set.validate().expect("a mixed router is valid");
     assert_eq!(
         set.resolve("main", Ecosystem::Npm, "demo"),
@@ -609,7 +615,7 @@ fn shadowing_is_decided_within_one_ecosystem() {
         ],
         None,
     )
-    .with_ecosystem("crates-io", Ecosystem::Cargo);
+    .with_ecosystem("crates-io".to_owned(), Ecosystem::Cargo);
     set.validate().expect("catch-all sources of different ecosystems do not shadow each other");
 
     let set = registries(
@@ -620,8 +626,8 @@ fn shadowing_is_decided_within_one_ecosystem() {
         ],
         None,
     )
-    .with_ecosystem("crates-io", Ecosystem::Cargo)
-    .with_ecosystem("crates", Ecosystem::Cargo);
+    .with_ecosystem("crates-io".to_owned(), Ecosystem::Cargo)
+    .with_ecosystem("crates".to_owned(), Ecosystem::Cargo);
     assert_eq!(
         set.validate(),
         Err(RegistryConfigError::UnreachableSource {
@@ -635,7 +641,7 @@ fn shadowing_is_decided_within_one_ecosystem() {
 #[test]
 fn an_ecosystem_needs_a_concrete_registry() {
     let set = registries(vec![("local", hosted(&[])), ("main", router(&["local"]))], None)
-        .with_ecosystem("main", Ecosystem::Pypi);
+        .with_ecosystem("main".to_owned(), Ecosystem::Pypi);
     assert_eq!(
         set.validate(),
         Err(RegistryConfigError::EcosystemOnNonConcreteRegistry {
@@ -643,8 +649,8 @@ fn an_ecosystem_needs_a_concrete_registry() {
             ecosystem: Ecosystem::Pypi,
         }),
     );
-    let set =
-        registries(vec![("local", hosted(&[]))], None).with_ecosystem("ghost", Ecosystem::Pypi);
+    let set = registries(vec![("local", hosted(&[]))], None)
+        .with_ecosystem("ghost".to_owned(), Ecosystem::Pypi);
     assert!(matches!(
         set.validate(),
         Err(RegistryConfigError::EcosystemOnNonConcreteRegistry { .. }),
@@ -755,4 +761,27 @@ fn a_refused_pattern_names_the_shapes_its_own_ecosystem_takes() {
 
     let crates = PackagePattern::parse("foo*", Ecosystem::Cargo).unwrap_err().to_string();
     assert!(crates.contains("nothing narrower"), "{crates}");
+}
+
+#[test]
+fn a_pattern_that_is_not_a_name_names_the_shapes_its_own_ecosystem_takes() {
+    let message = |raw, ecosystem| PackagePattern::parse(raw, ecosystem).unwrap_err().to_string();
+
+    let npm = message("@acme", Ecosystem::Npm);
+    assert!(npm.contains("not a valid npm package name"), "{npm}");
+    assert!(npm.contains("`@scope/*`"), "{npm}");
+
+    let image = message("-acme", Ecosystem::Oci);
+    assert!(image.contains("`<namespace>/*`"), "{image}");
+    assert!(!image.contains("@scope"), "{image}");
+
+    for ecosystem in [Ecosystem::Cargo, Ecosystem::Pypi] {
+        assert_eq!(
+            message("-acme", ecosystem),
+            format!(
+                "registry pattern \"-acme\" is not a valid {ecosystem} package name, so it can \
+                 never match; use an exact name, nothing narrower, or `**`",
+            ),
+        );
+    }
 }

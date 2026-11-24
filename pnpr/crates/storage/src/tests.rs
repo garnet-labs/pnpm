@@ -1,7 +1,16 @@
 use super::{
-    AsyncWriteExt, BlobWrite, CanonicalPackageName, DocumentWrite, ErrorKind, HostedStoreConfig,
-    PackageTombstone, RegistryError, RegistryRecord, Storage, atomic_write::create_tmp_file_with,
+    AsyncWriteExt,
+    BlobWrite,
+    CanonicalPackageName,
+    DocumentWrite,
+    HostedStoreConfig,
+    Storage,
+    atomic_write::create_tmp_file_with,
     fs,
+};
+use crate::archives::testing::{
+    served,
+    store_file,
 };
 use tempfile::TempDir;
 
@@ -10,7 +19,7 @@ fn storage_in(tmp: &TempDir) -> Storage {
         &HostedStoreConfig::Fs,
         tmp.path().join("storage"),
         tmp.path().join("cache"),
-        &pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite")),
     )
     .unwrap()
 }
@@ -25,29 +34,6 @@ fn document_write_conflict_delay_caps_growth() {
     assert_eq!(super::document_write_conflict_delay(1).as_millis(), 10);
     assert_eq!(super::document_write_conflict_delay(6).as_millis(), 250);
     assert_eq!(super::document_write_conflict_delay(32).as_millis(), 250);
-}
-
-#[tokio::test]
-async fn hosted_blob_under_non_directory_package_path_is_an_error() {
-    let tmp = TempDir::new().unwrap();
-    let storage = storage_in(&tmp);
-    let name = pkg("foo");
-    let package_dir = crate::layout::local_package_dir(
-        &tmp.path().join("storage"),
-        "",
-        pnpr_package_name::Ecosystem::Npm,
-        "foo",
-    );
-    fs::create_dir_all(package_dir.parent().unwrap()).await.unwrap();
-    fs::write(&package_dir, b"not a directory").await.unwrap();
-
-    let Err(err) = storage.open_hosted_blob(&name, "foo-1.0.0.tgz").await else {
-        panic!("expected hosted blob open to fail");
-    };
-    match err {
-        RegistryError::Io(err) => assert_eq!(err.kind(), ErrorKind::NotADirectory),
-        other => panic!("expected I/O error, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -139,19 +125,19 @@ async fn nested_names_are_stored_as_siblings() {
     for name in [&parent, &child, &top, &blobs_repo] {
         storage.write_hosted_document_if_current(name, b"{}", None, None).await.unwrap();
     }
-    let slot = storage.reserve_hosted_blob(&top, "sha256-top").await.unwrap();
-    fs::write(&slot.tmp_path, b"top-layer").await.unwrap();
-    storage.finalize_blob_slot(slot).await.unwrap();
-    let slot = storage.reserve_hosted_blob(&blobs_repo, "sha256-repo").await.unwrap();
-    fs::write(&slot.tmp_path, b"repo-layer").await.unwrap();
-    storage.finalize_blob_slot(slot).await.unwrap();
+    store_file(&storage, &top, "sha256-top", b"top-layer").await;
+    store_file(&storage, &blobs_repo, "sha256-repo", b"repo-layer").await;
     assert_eq!(
         storage.hosted_package_names().await.unwrap(),
         ["acme", "acme/app", "acme/app/tool", "acme/blobs"],
     );
-    assert_eq!(storage.hosted_package_blobs(&top).await.unwrap(), ["sha256-top"]);
-    assert_eq!(storage.hosted_package_blobs(&blobs_repo).await.unwrap(), ["sha256-repo"]);
-    storage.remove_package(&parent).await.unwrap();
+    assert_eq!(served(&storage, &top, "sha256-top").await.as_deref(), Some(&b"top-layer"[..]));
+    assert_eq!(served(&storage, &top, "sha256-repo").await, None);
+    assert_eq!(
+        served(&storage, &blobs_repo, "sha256-repo").await.as_deref(),
+        Some(&b"repo-layer"[..]),
+    );
+    storage.remove_package(&parent, None).await.unwrap();
     assert_eq!(
         storage.hosted_package_names().await.unwrap(),
         ["acme", "acme/app/tool", "acme/blobs"],
@@ -159,43 +145,48 @@ async fn nested_names_are_stored_as_siblings() {
 }
 
 #[tokio::test]
-async fn blobs_have_one_path_each() {
+async fn each_namespace_stores_an_archive_under_its_key() {
     let tmp = TempDir::new().unwrap();
     let storage = storage_in(&tmp);
     let name = pkg("@scope/App");
+    let mut keys = Vec::new();
     for namespace in
         [storage.clone(), storage.for_hosted("npm~internal", pnpr_package_name::Ecosystem::Npm)]
     {
-        let slot = namespace.reserve_hosted_blob(&name, "App-1.0.0.tgz").await.unwrap();
-        fs::write(&slot.tmp_path, b"tarball").await.unwrap();
-        namespace.finalize_blob_slot(slot).await.unwrap();
+        let promoted = store_file(&namespace, &name, "App-1.0.0.tgz", b"tarball").await;
+        keys.push(promoted.artifact.blob.key());
     }
-
-    for package in ["default/npm", "orgs/npm!7einternal/npm"] {
-        let package = tmp
-            .path()
-            .join(format!("storage/{package}/packages/@scope/!41pp"));
-        assert!(package.join("blobs/1.0.0.tgz").is_file(), "{}", package.display());
+    assert_eq!(keys[0], keys[1], "the same bytes have one key");
+    for namespace in ["", "npm~internal"] {
+        let path = crate::layout::local_archive_path(
+            tmp.path().join("storage"),
+            namespace,
+            pnpr_package_name::Ecosystem::Npm,
+            &keys[0],
+        );
+        assert!(path.is_file(), "{}", path.display());
     }
 }
 
 #[tokio::test]
-async fn an_org_named_like_a_package_is_its_own_namespace() {
+async fn a_namespace_named_like_a_package_is_isolated() {
     let tmp = TempDir::new().unwrap();
     let storage = storage_in(&tmp);
-    let org = storage.for_hosted("acme", pnpr_package_name::Ecosystem::Npm);
+    let named = storage.for_hosted("acme", pnpr_package_name::Ecosystem::Npm);
     storage
         .write_hosted_document_if_current(&pkg("acme"), b"{}", None, None)
         .await
         .unwrap();
-    org.write_hosted_document_if_current(&pkg("tool"), b"{}", None, None).await
+    named
+        .write_hosted_document_if_current(&pkg("tool"), b"{}", None, None)
+        .await
         .unwrap();
     assert_eq!(storage.hosted_package_names().await.unwrap(), ["acme"]);
     storage
-        .remove_package(&pkg("acme"))
+        .remove_package(&pkg("acme"), None)
         .await
         .unwrap();
-    assert_eq!(org.hosted_package_names().await.unwrap(), ["tool"]);
+    assert_eq!(named.hosted_package_names().await.unwrap(), ["tool"]);
 }
 
 #[tokio::test]
@@ -205,11 +196,244 @@ async fn a_store_without_packages_gets_the_layout_marker() {
     fs::create_dir_all(tmp.path().join("storage/.team-rosters")).await.unwrap();
     storage.ensure_hosted_layout().await.unwrap();
     let marker = fs::read(tmp.path().join("storage/layout.json")).await.unwrap();
+    let parsed = serde_json::from_slice::<crate::layout::LayoutMarker>(&marker).unwrap();
+    assert_eq!(parsed.layout, crate::layout::LAYOUT_VERSION);
+    let store_id = parsed.store_id.expect("store_id written to layout.json");
+    assert_eq!(store_id.len(), 32);
+    assert!(
+        store_id
+            .chars()
+            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f')),
+    );
     assert_eq!(
-        serde_json::from_slice::<crate::layout::LayoutMarker>(&marker).unwrap(),
-        crate::layout::LayoutMarker { layout: crate::layout::LAYOUT_VERSION },
+        storage.database.store_binding().await.unwrap(),
+        crate::database::sql::StoreBinding::Bound(store_id.clone()),
     );
     storage.ensure_hosted_layout().await.unwrap();
+    let marker_after = fs::read(tmp.path().join("storage/layout.json")).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<crate::layout::LayoutMarker>(&marker_after).unwrap().store_id,
+        Some(store_id),
+    );
+}
+
+#[tokio::test]
+async fn mismatched_or_half_bound_store_and_database_are_refused() {
+    let tmp_a = TempDir::new().unwrap();
+    let storage_a = storage_in(&tmp_a);
+    storage_a.ensure_hosted_layout().await.unwrap();
+
+    let tmp_b = TempDir::new().unwrap();
+    let storage_b = storage_in(&tmp_b);
+    storage_b.ensure_hosted_layout().await.unwrap();
+
+    // Store A paired with database B: differing store_ids.
+    let cross = Storage::new(
+        &HostedStoreConfig::Fs,
+        tmp_a.path().join("storage"),
+        tmp_a.path().join("cache"),
+        &pnpr_config::DatabaseBackend::Sqlite(tmp_b.path().join("metadata.sqlite")),
+    )
+    .unwrap();
+    let err = cross
+        .check_hosted_layout()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("bound to store"), "{err}");
+    assert!(cross.ensure_hosted_layout().await.is_err());
+
+    // Populated store paired with an empty database.
+    let empty_db = TempDir::new().unwrap();
+    let store_only = Storage::new(
+        &HostedStoreConfig::Fs,
+        tmp_a.path().join("storage"),
+        tmp_a.path().join("cache"),
+        &pnpr_config::DatabaseBackend::Sqlite(empty_db.path().join("fresh.sqlite")),
+    )
+    .unwrap();
+    let err = store_only
+        .check_hosted_layout()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no store_id in hosted_store"), "{err}");
+    assert!(store_only.ensure_hosted_layout().await.is_err());
+    assert!(store_only.write_hosted_layout_marker().await.is_err());
+    assert_eq!(
+        store_only.database.store_binding().await.unwrap(),
+        crate::database::sql::StoreBinding::Unmarked { has_data: false },
+    );
+
+    // Bound database paired with an unmarked empty store.
+    let empty_store = TempDir::new().unwrap();
+    let db_only = Storage::new(
+        &HostedStoreConfig::Fs,
+        empty_store.path().join("storage"),
+        empty_store.path().join("cache"),
+        &pnpr_config::DatabaseBackend::Sqlite(tmp_a.path().join("metadata.sqlite")),
+    )
+    .unwrap();
+    let err = db_only
+        .check_hosted_layout()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("has no layout.json"), "{err}");
+    assert!(db_only.ensure_hosted_layout().await.is_err());
+    assert!(db_only.write_hosted_layout_marker().await.is_err());
+    assert!(
+        !empty_store
+            .path()
+            .join("storage/layout.json")
+            .exists(),
+    );
+
+    // Store with `{"layout": 2}` and no `store_id`.
+    let no_id = TempDir::new().unwrap();
+    fs::create_dir_all(no_id.path().join("storage")).await.unwrap();
+    fs::write(
+        no_id.path().join("storage/layout.json"),
+        format!(r#"{{"layout":{}}}"#, crate::layout::LAYOUT_VERSION),
+    )
+    .await
+    .unwrap();
+    let legacy_marker = storage_in(&no_id);
+    let err = legacy_marker
+        .check_hosted_layout()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("has no store_id"), "{err}");
+    assert!(legacy_marker.ensure_hosted_layout().await.is_err());
+}
+
+#[tokio::test]
+async fn interrupted_store_claim_recovers_across_restarts_without_binding_other_databases() {
+    // 1. Interrupted after `begin_store_claim` and before `layout.json` is written.
+    let tmp_before_marker = TempDir::new().unwrap();
+    let initial = storage_in(&tmp_before_marker);
+    let pending_nonce = crate::layout::new_store_id();
+    assert_eq!(
+        initial.database.begin_store_claim(pending_nonce.clone()).await.unwrap(),
+        crate::database::sql::StoreClaim::Pending(pending_nonce),
+    );
+    drop(initial);
+
+    let restarted = storage_in(&tmp_before_marker);
+    restarted.ensure_hosted_layout().await.unwrap();
+    assert!(matches!(
+        restarted.database.store_binding().await.unwrap(),
+        crate::database::sql::StoreBinding::Bound(_),
+    ));
+
+    // 2. Interrupted after `layout.json` is written and before `confirm_store_claim` completes.
+    let tmp = TempDir::new().unwrap();
+    let first_boot = storage_in(&tmp);
+    let db_nonce = crate::layout::new_store_id();
+    assert_eq!(
+        first_boot.database.begin_store_claim(db_nonce.clone()).await.unwrap(),
+        crate::database::sql::StoreClaim::Pending(db_nonce.clone()),
+    );
+    let candidate = format!("{}{}", &db_nonce[..16], &crate::layout::new_store_id()[..16]);
+    fs::create_dir_all(tmp.path().join("storage")).await.unwrap();
+    fs::write(
+        tmp.path().join("storage/layout.json"),
+        serde_json::to_vec(&crate::layout::LayoutMarker {
+            layout: crate::layout::LAYOUT_VERSION,
+            store_id: Some(candidate.clone()),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    drop(first_boot);
+
+    // Another initializer with a separate empty database refuses to bind to the marker.
+    let other_db = TempDir::new().unwrap();
+    let other_storage = Storage::new(
+        &HostedStoreConfig::Fs,
+        tmp.path().join("storage"),
+        tmp.path().join("cache"),
+        &pnpr_config::DatabaseBackend::Sqlite(other_db.path().join("other.sqlite")),
+    )
+    .unwrap();
+    assert!(other_storage.write_hosted_layout_marker().await.is_err());
+    assert_eq!(
+        other_storage.database.store_binding().await.unwrap(),
+        crate::database::sql::StoreBinding::Unmarked { has_data: false },
+    );
+
+    // A newly constructed Storage instance after restart completes the confirmation.
+    let restarted_after_marker = storage_in(&tmp);
+    restarted_after_marker.ensure_hosted_layout().await.unwrap();
+    assert_eq!(
+        restarted_after_marker.database.store_binding().await.unwrap(),
+        crate::database::sql::StoreBinding::Bound(candidate),
+    );
+
+    // 3. Initializer A creates pending claim N for store X, initializer B shares N and writes a
+    // marker to store Y, and a conflicting marker lands in store X before A writes its marker.
+    // A's failure does not erase N, so B can still confirm store Y.
+    let race_dir = TempDir::new().unwrap();
+    let shared_db = pnpr_config::DatabaseBackend::Sqlite(race_dir.path().join("shared.sqlite"));
+    let store_x = race_dir.path().join("store-x");
+    let store_y = race_dir.path().join("store-y");
+    let init_a = Storage::new(
+        &HostedStoreConfig::Fs,
+        store_x.clone(),
+        race_dir.path().join("cache-a"),
+        &shared_db,
+    )
+    .unwrap();
+    let init_b = Storage::new(
+        &HostedStoreConfig::Fs,
+        store_y.clone(),
+        race_dir.path().join("cache-b"),
+        &shared_db,
+    )
+    .unwrap();
+    let race_nonce = crate::layout::new_store_id();
+    assert_eq!(
+        init_a.database.begin_store_claim(race_nonce.clone()).await.unwrap(),
+        crate::database::sql::StoreClaim::Pending(race_nonce.clone()),
+    );
+    assert_eq!(
+        init_b.database
+            .begin_store_claim(crate::layout::new_store_id())
+            .await
+            .unwrap(),
+        crate::database::sql::StoreClaim::Pending(race_nonce.clone()),
+    );
+    let candidate_b = format!("{}{}", &race_nonce[..16], &crate::layout::new_store_id()[..16]);
+    fs::create_dir_all(&store_y).await.unwrap();
+    fs::write(
+        store_y.join("layout.json"),
+        serde_json::to_vec(&crate::layout::LayoutMarker {
+            layout: crate::layout::LAYOUT_VERSION,
+            store_id: Some(candidate_b.clone()),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    fs::create_dir_all(&store_x).await.unwrap();
+    fs::write(
+        store_x.join("layout.json"),
+        serde_json::to_vec(&crate::layout::LayoutMarker {
+            layout: crate::layout::LAYOUT_VERSION,
+            store_id: Some(crate::layout::new_store_id()),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(init_a.claim_and_write_layout_marker().await.is_err());
+    init_b.ensure_hosted_layout().await.unwrap();
+    assert_eq!(
+        init_b.database.store_binding().await.unwrap(),
+        crate::database::sql::StoreBinding::Bound(candidate_b),
+    );
 }
 
 #[tokio::test]
@@ -267,8 +491,6 @@ async fn a_cache_from_another_layout_is_emptied_once() {
     assert!(cache.join("~public").exists());
 }
 
-/// The local backend has no `ETag`, so its claim on a staged record compares
-/// the bytes: only the writer whose copy is what the store holds wins.
 #[tokio::test]
 async fn a_staged_record_is_replaced_only_while_it_is_unchanged() {
     let tmp = TempDir::new().unwrap();
@@ -276,23 +498,29 @@ async fn a_staged_record_is_replaced_only_while_it_is_unchanged() {
     let stage_id = "11111111-2222-3333-4444-555555555555";
     storage.create_staged_meta(stage_id, br#"{"id":"stage"}"#).await.unwrap();
 
+    let original = storage
+        .read_staged_meta(stage_id)
+        .await
+        .unwrap()
+        .unwrap();
     let first = storage
-        .replace_staged_meta_if_current(stage_id, br#"{"id":"stage"}"#, br#"{"id":"stage","a":1}"#)
+        .replace_staged_meta_if_current(stage_id, &original, br#"{"id":"stage","a":1}"#)
         .await
         .unwrap();
-    assert_eq!(first, super::DocumentWrite::Written);
+    assert!(first.is_some());
 
     let second = storage
-        .replace_staged_meta_if_current(stage_id, br#"{"id":"stage"}"#, br#"{"id":"stage","b":2}"#)
+        .replace_staged_meta_if_current(stage_id, &original, br#"{"id":"stage","b":2}"#)
         .await
         .unwrap();
-    assert_eq!(second, super::DocumentWrite::Conflict);
+    assert!(second.is_none());
     assert_eq!(
         storage
             .read_staged_meta(stage_id)
             .await
             .unwrap()
-            .as_deref(),
+            .as_ref()
+            .map(|record| record.bytes.as_slice()),
         Some(&br#"{"id":"stage","a":1}"#[..]),
     );
 
@@ -300,12 +528,12 @@ async fn a_staged_record_is_replaced_only_while_it_is_unchanged() {
     let removed = storage
         .replace_staged_meta_if_current(
             stage_id,
-            br#"{"id":"stage","a":1}"#,
+            first.as_ref().unwrap(),
             br#"{"id":"stage","c":3}"#,
         )
         .await
         .unwrap();
-    assert_eq!(removed, super::DocumentWrite::Conflict);
+    assert!(removed.is_none());
     assert!(
         storage
             .read_staged_meta(stage_id)
@@ -313,194 +541,6 @@ async fn a_staged_record_is_replaced_only_while_it_is_unchanged() {
             .unwrap()
             .is_none(),
     );
-}
-
-fn add_tombstone_ban(
-    existing: Option<PackageTombstone>,
-    package: &str,
-    maintainer: &str,
-    version: &str,
-) -> PackageTombstone {
-    let mut tombstone = existing.unwrap_or_else(|| PackageTombstone {
-        package: package.to_string(),
-        unpublished_by: Some(maintainer.to_string()),
-        unpublished_at: "2026-01-01T00:00:00Z".to_string(),
-        maintainers: vec![maintainer.to_string()],
-        unpublished_versions: Vec::new(),
-    });
-    if !tombstone.maintainers
-        .iter()
-        .any(|user| user == maintainer)
-    {
-        tombstone.maintainers.push(maintainer.to_string());
-    }
-    if !tombstone.unpublished_versions
-        .iter()
-        .any(|ver| ver == version)
-    {
-        tombstone.unpublished_versions.push(version.to_string());
-    }
-    tombstone
-}
-
-#[tokio::test]
-async fn concurrent_tombstone_writers_retain_all_version_bans() {
-    let tmp = TempDir::new().unwrap();
-    let storage = std::sync::Arc::new(storage_in(&tmp));
-    let name = pkg("concurrent-pkg");
-
-    let mut handles = Vec::new();
-    for i in 0..10 {
-        let storage = std::sync::Arc::clone(&storage);
-        let name = name.clone();
-        let version = format!("1.{i}.0");
-        let maintainer = format!("user-{i}");
-        handles.push(tokio::spawn(async move {
-            storage
-                .update_tombstone(&name, |existing| {
-                    add_tombstone_ban(existing, name.as_str(), &maintainer, &version)
-                })
-                .await
-                .unwrap();
-        }));
-    }
-
-    for handle in handles {
-        handle.await.unwrap();
-    }
-
-    let tombstone = storage
-        .read_tombstone(&name)
-        .await
-        .unwrap()
-        .expect("tombstone exists");
-    assert_eq!(tombstone.package, "concurrent-pkg");
-    assert_eq!(tombstone.unpublished_versions.len(), 10);
-    for i in 0..10 {
-        let version = format!("1.{i}.0");
-        assert!(
-            tombstone.unpublished_versions.contains(&version),
-            "missing unpublished version {version}",
-        );
-        let maintainer = format!("user-{i}");
-        assert!(tombstone.maintainers.contains(&maintainer), "missing maintainer {maintainer}");
-    }
-}
-
-#[tokio::test]
-async fn concurrent_write_tombstone_merges_version_bans() {
-    let tmp = TempDir::new().unwrap();
-    let storage = std::sync::Arc::new(storage_in(&tmp));
-    let name = pkg("concurrent-write-pkg");
-
-    let mut handles = Vec::new();
-    for i in 0..5 {
-        let storage = std::sync::Arc::clone(&storage);
-        let name = name.clone();
-        let version = format!("2.{i}.0");
-        handles.push(tokio::spawn(async move {
-            let tombstone = PackageTombstone {
-                package: name.as_str().to_string(),
-                unpublished_by: Some("admin".to_string()),
-                unpublished_at: "2026-01-01T00:00:00Z".to_string(),
-                maintainers: vec!["admin".to_string()],
-                unpublished_versions: vec![version],
-            };
-            storage.write_tombstone(&tombstone).await.unwrap();
-        }));
-    }
-
-    for handle in handles {
-        handle.await.unwrap();
-    }
-
-    let tombstone = storage
-        .read_tombstone(&name)
-        .await
-        .unwrap()
-        .expect("tombstone exists");
-    assert_eq!(tombstone.unpublished_versions.len(), 5);
-    for i in 0..5 {
-        let version = format!("2.{i}.0");
-        assert!(tombstone.unpublished_versions.contains(&version));
-    }
-}
-
-#[tokio::test]
-async fn subsequent_write_tombstone_replaces_maintainers_and_merges_version_bans() {
-    let tmp = TempDir::new().unwrap();
-    let storage = storage_in(&tmp);
-    let name = pkg("ownership-reset-pkg");
-
-    let first = PackageTombstone {
-        package: name.as_str().to_string(),
-        unpublished_by: Some("alice".to_string()),
-        unpublished_at: "2026-01-01T00:00:00Z".to_string(),
-        maintainers: vec!["alice".to_string()],
-        unpublished_versions: vec!["1.0.0".to_string()],
-    };
-    storage.write_tombstone(&first).await.unwrap();
-
-    let second = PackageTombstone {
-        package: name.as_str().to_string(),
-        unpublished_by: Some("bob".to_string()),
-        unpublished_at: "2026-02-01T00:00:00Z".to_string(),
-        maintainers: vec!["bob".to_string()],
-        unpublished_versions: vec!["2.0.0".to_string()],
-    };
-    storage.write_tombstone(&second).await.unwrap();
-
-    let stored = storage
-        .read_tombstone(&name)
-        .await
-        .unwrap()
-        .expect("tombstone exists");
-    assert_eq!(stored.maintainers, vec!["bob".to_string()]);
-    assert_eq!(stored.unpublished_versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
-    assert_eq!(stored.unpublished_by.as_deref(), Some("bob"));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn symlinks_in_the_packages_directory_are_not_followed() {
-    use futures_util::TryStreamExt as _;
-    let tmp = TempDir::new().unwrap();
-    let storage = storage_in(&tmp);
-    let outside = tmp.path().join("outside");
-    fs::create_dir_all(outside.join("blobs")).await.unwrap();
-    fs::write(outside.join("document.json"), b"{}").await.unwrap();
-    fs::write(outside.join("blobs/sha256-aa"), b"keep").await.unwrap();
-    let real = storage
-        .reserve_hosted_blob(&pkg("real"), "real-1.0.0.tgz")
-        .await
-        .unwrap();
-    fs::write(&real.tmp_path, b"tarball").await.unwrap();
-    storage.finalize_blob_slot(real).await.unwrap();
-    let scopes = tmp.path().join("storage/default/npm/packages");
-    fs::create_dir_all(tmp.path().join("outside-scope/pkg")).await.unwrap();
-    fs::write(tmp.path().join("outside-scope/pkg/document.json"), b"{}").await.unwrap();
-    fs::symlink(tmp.path().join("outside-scope"), scopes.join("@linked")).await.unwrap();
-    let packages = scopes.join("@");
-    fs::symlink(&outside, packages.join("linked")).await.unwrap();
-    fs::symlink(outside.join("blobs/sha256-aa"), packages.join("real/blobs/sha256-aa"))
-        .await
-        .unwrap();
-    fs::symlink(outside.join("document.json"), packages.join("linked-doc"))
-        .await
-        .unwrap();
-    fs::create_dir_all(packages.join("other")).await.unwrap();
-    fs::symlink(outside.join("blobs"), packages.join("other/blobs")).await.unwrap();
-
-    let files: Vec<_> = storage
-        .hosted_blob_files()
-        .try_collect()
-        .await
-        .unwrap();
-    let listed: Vec<_> = files
-        .iter()
-        .map(|file| (file.package.as_str(), file.blob.as_deref()))
-        .collect();
-    assert_eq!(listed, [("real", Some("real-1.0.0.tgz"))], "{files:?}");
 }
 
 #[tokio::test]
@@ -512,78 +552,19 @@ async fn a_blob_being_staged_is_not_listed() {
     let slot = storage.reserve_hosted_blob(&name, "left-pad-1.0.0.tgz").await.unwrap();
     fs::write(&slot.tmp_path, b"tarball").await.unwrap();
     let files: Vec<_> = storage
-        .hosted_blob_files()
+        .hosted_archives()
         .try_collect()
         .await
         .unwrap();
     assert!(files.is_empty(), "{files:?}");
-    storage.finalize_blob_slot(slot).await.unwrap();
+    let identity = storage.identify_blob_slot(&slot).await.unwrap();
+    storage.promote_blob_slot(slot, identity, None).await.unwrap();
     let files: Vec<_> = storage
-        .hosted_blob_files()
+        .hosted_archives()
         .try_collect()
         .await
         .unwrap();
     assert_eq!(files.len(), 1, "{files:?}");
-}
-
-#[tokio::test]
-async fn grouped_registries_with_same_local_name_keep_records_isolated() {
-    let tmp = TempDir::new().unwrap();
-    let storage = storage_in(&tmp);
-
-    let npm_record = b"npm-team-roster";
-    let pypi_record = b"pypi-team-roster";
-
-    assert!(
-        storage
-            .create_registry_record(RegistryRecord::TeamRoster, "npm/shared", npm_record)
-            .await
-            .unwrap(),
-    );
-    assert!(
-        storage
-            .create_registry_record(RegistryRecord::TeamRoster, "pypi/shared", pypi_record)
-            .await
-            .unwrap(),
-    );
-
-    assert_eq!(
-        storage.read_registry_record(RegistryRecord::TeamRoster, "npm/shared").await.unwrap(),
-        Some(npm_record.to_vec()),
-    );
-    assert_eq!(
-        storage.read_registry_record(RegistryRecord::TeamRoster, "pypi/shared").await.unwrap(),
-        Some(pypi_record.to_vec()),
-    );
-    assert!(
-        storage.remove_registry_record(RegistryRecord::TeamRoster, "npm/shared").await.unwrap(),
-    );
-    assert_eq!(
-        storage.read_registry_record(RegistryRecord::TeamRoster, "npm/shared").await.unwrap(),
-        None,
-    );
-}
-
-#[tokio::test]
-async fn replace_registry_record_returns_conflict_if_record_is_absent() {
-    let tmp = TempDir::new().unwrap();
-    let storage = storage_in(&tmp);
-
-    let write_result = storage
-        .replace_registry_record_if_current(
-            RegistryRecord::TeamRoster,
-            "npm/shared",
-            b"expected-val",
-            b"new-val",
-        )
-        .await
-        .unwrap();
-    assert_eq!(write_result, DocumentWrite::Conflict);
-
-    assert_eq!(
-        storage.read_registry_record(RegistryRecord::TeamRoster, "npm/shared").await.unwrap(),
-        None,
-    );
 }
 
 #[test]
@@ -600,32 +581,42 @@ async fn multi_component_and_max_length_oci_repositories_round_trip_on_local_sto
     let max_len_repo = ["a"; 128].join("/");
     assert_eq!(max_len_repo.len(), 255);
     let repos = ["acme", "acme/blobs", "acme/app", "acme/app/tool", max_len_repo.as_str()];
+    let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    let make_doc = |repo: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "formatVersion": 1,
+            "name": repo,
+            "manifests": [{
+                "digest": digest,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "size": 1,
+            }],
+            "tags": [],
+        }))
+        .unwrap()
+    };
 
     for repo in repos {
         let name = CanonicalPackageName::parse(repo, pnpr_package_name::Ecosystem::Oci).unwrap();
-        let doc = format!(r#"{{"repository":"{repo}"}}"#);
+        let doc = make_doc(repo);
         assert_eq!(
-            storage
-                .write_hosted_document_if_current(&name, doc.as_bytes(), None, None)
-                .await
-                .unwrap(),
+            storage.write_hosted_document_if_current(&name, &doc, None, None).await.unwrap(),
             DocumentWrite::Written,
         );
-        let slot = storage.reserve_hosted_blob(&name, "sha256-deadbeef").await.unwrap();
-        fs::write(&slot.tmp_path, repo.as_bytes()).await.unwrap();
-        storage.finalize_blob_slot(slot).await.unwrap();
+        store_file(&storage, &name, "sha256-deadbeef", repo.as_bytes()).await;
     }
 
     for repo in repos {
         let name = CanonicalPackageName::parse(repo, pnpr_package_name::Ecosystem::Oci).unwrap();
-        let expected_doc = format!(r#"{{"repository":"{repo}"}}"#);
+        let expected_doc = make_doc(repo);
         assert_eq!(
             storage
                 .read_hosted_document(&name)
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(expected_doc.as_bytes()),
+            Some(expected_doc.as_slice()),
         );
     }
 
@@ -637,4 +628,102 @@ async fn multi_component_and_max_length_oci_repositories_round_trip_on_local_sto
         .collect();
     expected.sort();
     assert_eq!(listed, expected);
+}
+
+/// An archive staging file a process left behind is swept once it is old
+/// enough; anything else in the archives directory stays.
+#[tokio::test]
+async fn abandoned_archive_staging_files_are_swept() {
+    let tmp = TempDir::new().unwrap();
+    let storage = storage_in(&tmp);
+    let staged = storage.hosted.reserve_archive_tmp().await.unwrap();
+    tokio::fs::write(&staged, b"left behind").await.unwrap();
+    let other = staged.with_file_name("not-a-staging-file");
+    tokio::fs::write(&other, b"keep").await.unwrap();
+
+    let young = std::time::Duration::from_hours(1);
+    assert_eq!(storage.sweep_archive_temps(young).await.unwrap(), 0);
+    assert!(staged.exists());
+    assert_eq!(storage.sweep_archive_temps(std::time::Duration::ZERO).await.unwrap(), 1);
+    assert!(!staged.exists());
+    assert!(other.exists());
+}
+
+#[tokio::test]
+async fn local_upstream_metadata_updates_preserve_fetch_age() {
+    let tmp = TempDir::new().unwrap();
+    let storage = storage_in(&tmp);
+    let name = pkg("example");
+    storage.write_upstream_document("mirror", &name, b"old").await.unwrap();
+    let path = storage.cached.namespaced("mirror").document_path(&name);
+    let fetched = std::time::SystemTime::now() - std::time::Duration::from_mins(5);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(fetched))
+        .unwrap();
+    let original = storage
+        .upstream_document_stamp("mirror", &name)
+        .await
+        .unwrap()
+        .unwrap();
+    for bytes in [b"one", b"two"] {
+        storage.update_upstream_document("mirror", &name, bytes).await.unwrap();
+        assert!(
+            storage
+                .read_upstream_document("mirror", &name, std::time::Duration::from_mins(1))
+                .await
+                .unwrap()
+                .is_none(),
+        );
+        assert!(
+            storage
+                .fresh_upstream_document_stamp("mirror", &name, std::time::Duration::from_mins(1))
+                .await
+                .unwrap()
+                .is_none(),
+        );
+        assert_ne!(
+            storage
+                .upstream_document_stamp("mirror", &name)
+                .await
+                .unwrap()
+                .unwrap(),
+            original,
+        );
+        assert_eq!(
+            storage
+                .read_upstream_document_any("mirror", &name)
+                .await
+                .unwrap()
+                .unwrap(),
+            bytes,
+        );
+    }
+    storage.write_upstream_document("mirror", &name, b"new").await.unwrap();
+    assert_eq!(
+        storage
+            .read_upstream_document("mirror", &name, std::time::Duration::from_mins(1))
+            .await
+            .unwrap()
+            .unwrap(),
+        b"new",
+    );
+}
+
+#[test]
+fn namespaced_splits_slash_separated_subtrees_into_path_components() {
+    let tmp = TempDir::new().unwrap();
+    let storage = storage_in(&tmp);
+    let nested = storage.cached.namespaced("~public/abc/artifacts/def");
+    assert_eq!(
+        nested.root,
+        storage.cached.root
+            .join("~public")
+            .join("abc")
+            .join("artifacts")
+            .join("def"),
+    );
+    assert_eq!(storage.cached.namespaced("").root, storage.cached.root);
 }

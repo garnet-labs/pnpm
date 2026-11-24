@@ -2,21 +2,41 @@ pub(super) mod exact;
 pub(super) mod symlinks;
 
 use super::{
-    ImportIndexedDirError, Placement, SymlinkTargets, remove_non_dir_dirent, staging::import_atomic,
+    ImportIndexedDirError,
+    Placement,
+    SymlinkTargets,
+    remove_non_dir_dirent,
+    staging::import_atomic,
 };
-use crate::{import_into_fresh_target, link_pool::in_link_pool};
+use crate::{
+    import_into_fresh_target,
+    link_pool::in_link_pool,
+};
 use pnpm_config::PackageImportMethod;
-use pnpm_fs::{Host, StoreFile};
+use pnpm_fs::{
+    Host,
+    StoreFile,
+};
 use pnpm_reporter::Reporter;
 use rayon::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
-    fs, io,
-    path::Path,
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::atomic::AtomicU8,
 };
 use symlinks::{
-    SymlinkRoots, imported_paths, place_symlink_or_resolve_file, symlink_matches_store_entry,
+    SymlinkRoots,
+    imported_paths,
+    place_symlink_or_resolve_file,
+    symlink_matches_store_entry,
 };
 
 /// Make the parent dir set, then import the entries of `cas_paths`, one
@@ -165,7 +185,7 @@ pub(super) fn create_indexed_dirs(
     ordered.sort_by_key(|s| s.len());
     for rel in ordered {
         if placement == Placement::Repair {
-            clear_dirent_blocking_dir::<Host>(dir_path, rel)?;
+            clear_dirent_blocking_dir::<Host>(dir_path.to_path_buf(), rel)?;
         }
         let abs = dir_path.join(rel);
         pnpm_fs::create_dir_all_with_retry(&abs)
@@ -178,7 +198,7 @@ pub(super) fn create_indexed_dirs(
 ///
 /// [`Placement::Fresh`] links straight at the final path with no
 /// pre-flight stat: `import_into_fresh_target` tolerates an existing
-/// target, so the stat would be pure overhead — ~170k saved syscalls on
+/// target, so the stat would be pure overhead, ~170k saved syscalls on
 /// the alotta-files fixture.
 ///
 /// [`Placement::Repair`] instead asks whether what is already there is
@@ -321,10 +341,10 @@ pub(super) fn clear_dir_blocking_file<Sys: FsRemoveDirAll>(
 /// never stat-ed: the parent is cleared first, and everything below a
 /// missing component is missing too.
 pub(super) fn clear_dirent_blocking_dir<Sys: FsRemoveNonDirDirent>(
-    root: &Path,
+    root: PathBuf,
     rel: &str,
 ) -> Result<(), ImportIndexedDirError> {
-    let mut abs = root.to_path_buf();
+    let mut abs = root;
     for component in Path::new(rel).components() {
         abs.push(component);
         match pnpm_fs::symlink_metadata_with_retry(&abs) {
@@ -351,7 +371,7 @@ pub(super) fn clear_dirent_blocking_dir<Sys: FsRemoveNonDirDirent>(
 /// fallback file for old store entries indexed before the synthetic
 /// manifest. pnpm picks the first inserted key; `cas_paths` is unordered,
 /// so we pick the lexicographically smallest non-build-marker entry
-/// instead — deterministic, which is all the gate and the write need.
+/// instead, deterministic, which is all the gate and the write need.
 /// `None` only when no package file is present.
 pub(super) fn marker_file(cas_paths: &pnpm_fs::CasPaths) -> Option<&str> {
     const PACKAGE_JSON: &str = "package.json";
@@ -424,7 +444,6 @@ fn file_mode_matches_store_entry(
     store: (&Path, &fs::Metadata),
     same_identity: bool,
 ) -> bool {
-    use std::os::unix::fs::PermissionsExt;
     let (store_path, store_meta) = store;
     let is_store_entry = pnpm_fs::file_mode::is_cas_file_path(store_path);
     let expected_mode = if is_store_entry {
@@ -433,10 +452,12 @@ fn file_mode_matches_store_entry(
             pnpm_fs::file_mode::current_umask(),
         )
     } else {
-        store_meta.permissions().mode() & 0o777
+        pnpm_fs::FileMode::from_permissions(&store_meta.permissions())
     };
-    let target_mode = target_meta.permissions().mode() & 0o777;
-    target_mode == expected_mode
+    let target_mode = pnpm_fs::FileMode::from_permissions(&target_meta.permissions());
+    // Setuid, setgid and sticky are not part of what an import places.
+    let access_bits = |mode: pnpm_fs::FileMode| mode.mode() & 0o777;
+    access_bits(target_mode) == access_bits(expected_mode)
         || same_identity
             && is_store_entry
             && pnpm_fs::file_mode::store_inode_mode_is_linkable(target_mode, expected_mode)
@@ -460,7 +481,7 @@ pub(super) fn files_have_equal_contents(left: &Path, right: &Path) -> io::Result
     loop {
         let left_chunk = left.fill_buf()?;
         let right_chunk = right.fill_buf()?;
-        // One side ending first means the sizes disagree after all —
+        // One side ending first means the sizes disagree after all,
         // the caller's size check can only read stale metadata.
         if left_chunk.is_empty() || right_chunk.is_empty() {
             return Ok(left_chunk.is_empty() && right_chunk.is_empty());
@@ -474,7 +495,7 @@ pub(super) fn files_have_equal_contents(left: &Path, right: &Path) -> io::Result
     }
 }
 /// Whether `dir_path` holds the completion marker. An empty map has no
-/// marker, so it counts as present — there is nothing to import.
+/// marker, so it counts as present; there is nothing to import.
 #[must_use]
 pub fn marker_present(dir_path: &Path, cas_paths: &pnpm_fs::CasPaths) -> bool {
     match marker_file(cas_paths) {

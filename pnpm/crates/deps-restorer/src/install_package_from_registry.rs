@@ -1,18 +1,39 @@
 use crate::{
-    ImportIndexedDirError, ImportIndexedDirOpts, SymlinkPackageError, import_indexed_dir,
-    safe_join_modules_dir::{InvalidDependencyAliasError, safe_join_modules_dir},
+    ImportIndexedDirError,
+    ImportIndexedDirOpts,
+    SymlinkPackageError,
+    import_indexed_dir,
+    safe_join_modules_dir::{
+        InvalidDependencyAliasError,
+        safe_join_modules_dir,
+    },
     symlink_package,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_lockfile::LockfileResolution;
-use pnpm_reporter::{LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    ProgressLog,
+    ProgressMessage,
+    Reporter,
+};
 use pnpm_resolving_resolver_base::ResolveResult;
 use pnpm_store_dir::SharedVerifiedFilesCache;
-use pnpm_tarball::{IngestTarballToStore, TarballError};
+use pnpm_tarball::{
+    IngestTarballToStore,
+    TarballError,
+};
 use serde_json::Value;
 use ssri::Integrity;
-use std::{path::Path, sync::atomic::AtomicU8};
+use std::{
+    path::Path,
+    sync::atomic::AtomicU8,
+};
 
 /// Materialize one pre-resolved package on disk:
 ///
@@ -43,7 +64,7 @@ pub struct InstallPackageFromRegistry<'a> {
     /// [`pnpm_reporter::StageLog`].
     pub requester: &'a str,
     pub node_modules_dir: &'a Path,
-    /// Per-package virtual-store directory — output of
+    /// Per-package virtual-store directory, output of
     /// [`crate::VirtualStoreLayout::slot_dir`] for this package's
     /// snapshot key. The unpacked files land at
     /// `<slot_dir>/node_modules/<real-name>/`.
@@ -139,7 +160,7 @@ impl InstallPackageFromRegistry<'_> {
                 auth_headers: &config.auth_headers,
                 retry_opts: config.retry_opts(),
                 offline: config.offline,
-                tar_limits: config.tar_limits(),
+                tar_limits: pnpm_tarball::TarLimits::new(config.max_tarball_unpacked_size),
             },
             package: pnpm_tarball::TarballPackage {
                 integrity_kind: self.resolution.resolution
@@ -152,7 +173,7 @@ impl InstallPackageFromRegistry<'_> {
                 id: package_id,
             },
             store: pnpm_tarball::ArchiveStoreContext {
-                dir: &config.store_dir,
+                dir: std::borrow::Cow::Borrowed(&config.store_dir),
                 index: self.fetching.store_index.cloned(),
                 index_writer: self.fetching.store_index_writer.cloned(),
                 verify_integrity: config.verify_store_integrity,
@@ -177,13 +198,10 @@ impl InstallPackageFromRegistry<'_> {
         }
     }
 
-    fn report_resolved<Reporter: self::Reporter>(&self, package_id: &str) {
+    fn report_resolved<Reporter: self::Reporter>(&self, package_id: String) {
         Reporter::emit(&LogEvent::Progress(ProgressLog {
             level: LogLevel::Debug,
-            message: ProgressMessage::Resolved {
-                package_id: package_id.to_owned(),
-                requester: self.requester.to_owned(),
-            },
+            message: ProgressMessage::Resolved { package_id, requester: self.requester.to_owned() },
         }));
     }
 
@@ -199,7 +217,7 @@ impl InstallPackageFromRegistry<'_> {
         );
         let (tarball_url, integrity) = extract_tarball(&self.resolution.resolution)?;
 
-        self.report_resolved::<Reporter>(package_id);
+        self.report_resolved::<Reporter>(package_id.to_owned());
 
         let download = self.tarball_download(package_id, tarball_url, &integrity);
         let cas_paths = if revision_addressed {
@@ -223,7 +241,7 @@ impl InstallPackageFromRegistry<'_> {
         )
         .map_err(InstallPackageFromRegistryError::ImportIndexedDir)?;
 
-        // `pnpm:progress imported` — see the matching emit in
+        // `pnpm:progress imported`: see the matching emit in
         // `create_virtual_dir_by_snapshot::run` for the rationale
         // on the optimistic `method` value. `to` is the per-
         // package virtual-store directory the symlink under
@@ -243,7 +261,7 @@ impl InstallPackageFromRegistry<'_> {
 /// The package's canonical `(name, version)`. Prefers the resolver's
 /// structured `name_ver` (npm registry); falls back to the name/version
 /// read from the fetched manifest for resolvers that learn them only
-/// after the fetch — remote (non-registry) tarball, git, and file deps,
+/// after the fetch, remote (non-registry) tarball, git, and file deps,
 /// whose name/version live in `package.json`.
 fn real_name_version(resolution: &ResolveResult) -> Option<(String, String)> {
     if let Some(name_ver) = resolution.package.name_ver.as_ref() {
@@ -289,7 +307,7 @@ pub fn extract_tarball(
 }
 
 /// Read `dist.unpackedSize` off the resolver-fetched manifest. Returns
-/// `None` when missing or non-numeric — the tarball extractor treats it
+/// `None` when missing or non-numeric, the tarball extractor treats it
 /// as a hint, not a hard requirement.
 #[must_use]
 pub fn manifest_unpacked_size(manifest: Option<&Value>) -> Option<usize> {
@@ -305,12 +323,11 @@ pub fn manifest_file_count(manifest: Option<&Value>) -> Option<usize> {
 }
 
 /// Read `dist.pnpr.requiresBuild` off the resolver-fetched manifest.
-/// Only trusted from this field — never from `dist.requiresBuild` or
-/// top-level `hasInstallScript` — because only `dist.pnpr.requiresBuild`
+/// Only trusted from this field (never from `dist.requiresBuild` or
+/// top-level `hasInstallScript`) because only `dist.pnpr.requiresBuild`
 /// is derived from the tarball's own bytes and stripped on ingest.
 #[must_use]
 pub fn manifest_requires_build(manifest: Option<&Value>) -> Option<bool> {
-    let manifest = manifest.filter(|manifest| !has_platform_variants(manifest));
     manifest?
         .get("dist")?
         .get("pnpr")?
@@ -323,8 +340,7 @@ pub fn manifest_requires_build(manifest: Option<&Value>) -> Option<bool> {
 pub fn manifest_bins(
     manifest: Option<&Value>,
 ) -> Option<std::sync::Arc<std::collections::BTreeMap<String, pnpm_package_manifest::PackageBin>>> {
-    let raw = manifest
-        .filter(|manifest| !has_platform_variants(manifest))?
+    let raw = manifest?
         .get("dist")?
         .get("pnpr")?
         .get("bins")?;
@@ -337,18 +353,7 @@ pub fn manifest_bins(
     .then(|| std::sync::Arc::new(bins))
 }
 
-/// Whether the version publishes platform variants. Its `dist` facts then
-/// describe only the variant that targets `any`, which a host may not
-/// install.
-fn has_platform_variants(manifest: &Value) -> bool {
-    manifest
-        .pointer("/dist/pnpr/variants")
-        .and_then(Value::as_array)
-        .is_some_and(|variants| !variants.is_empty())
-}
-
 fn manifest_dist_field(manifest: Option<&Value>, field: &str) -> Option<usize> {
-    let manifest = manifest.filter(|manifest| !has_platform_variants(manifest));
     // `usize::try_from` so a `u64` value larger than the host's
     // `usize` (32-bit targets) degrades to "no hint" rather than
     // truncating silently and producing an undersized pre-allocation.
@@ -356,7 +361,8 @@ fn manifest_dist_field(manifest: Option<&Value>, field: &str) -> Option<usize> {
         .get("dist")?
         .get(field)?
         .as_u64()
-        .and_then(|value| usize::try_from(value).ok())
+        .map(usize::try_from)
+        .and_then(Result::ok)
 }
 
 #[cfg(test)]

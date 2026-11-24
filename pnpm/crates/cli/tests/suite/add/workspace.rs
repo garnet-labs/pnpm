@@ -1,9 +1,27 @@
 use super::{
-    Command, CommandExtra, CommandTempCwd, DependencyGroup, HERMETIC_STORE_YAML, Lockfile,
-    PackageManifest, Pipe, PkgName, TempDir, add_in, assert_eq, linking_settings, prod_spec,
-    saved_spec, workspace_with_lib, write_json, write_workspace_with_local_fixtures,
+    Command,
+    CommandExtra,
+    CommandTempCwd,
+    DependencyGroup,
+    HERMETIC_STORE_YAML,
+    Lockfile,
+    PackageManifest,
+    Pipe,
+    PkgName,
+    TempDir,
+    add_in,
+    assert_eq,
+    linking_settings,
+    prod_spec,
+    saved_spec,
+    workspace_with_lib,
+    write_json,
+    write_workspace_with_local_fixtures,
 };
-use assert_cmd::{assert::OutputAssertExt, cargo::CommandCargoExt};
+use assert_cmd::{
+    assert::OutputAssertExt,
+    cargo::CommandCargoExt,
+};
 
 #[test]
 fn add_to_multi_pattern_workspace_root_requires_workspace_root_flag() {
@@ -35,6 +53,93 @@ fn add_to_multi_pattern_workspace_root_requires_workspace_root_flag() {
         .with_args(["add", "--ignore-workspace-root-check", "local@file:./local"])
         .assert()
         .success();
+}
+
+/// Run `pnpm add foo` from `subdir` of a workspace whose root manifest is the
+/// only one, and return the failed command's stderr.
+fn add_from_workspace_subdir(packages: &str, subdir: &str, extra_args: &[&str]) -> String {
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("package.json"), r#"{"name":"root","version":"1.0.0"}"#)
+        .unwrap();
+    std::fs::write(root.path().join("pnpm-workspace.yaml"), format!("packages:\n{packages}"))
+        .unwrap();
+    let cwd = root.path().join(subdir);
+    std::fs::create_dir_all(&cwd).unwrap();
+    let root_dir = root
+        .path()
+        .to_str()
+        .expect("UTF-8 temp dir")
+        .to_string();
+    let output = Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&cwd)
+        .with_args(["add", "foo"])
+        .with_args(
+            extra_args
+                .iter()
+                .map(|arg| arg.replace("<root>", &root_dir)),
+        )
+        .output()
+        .expect("run pnpm add");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!output.status.success(), "adding to the workspace root must fail: {stderr}");
+    assert!(stderr.contains("ERR_PNPM_ADDING_TO_ROOT"), "unexpected stderr: {stderr}");
+    stderr
+}
+
+const INIT_SUGGESTION: &str = r#"running "pnpm init" to generate a package.json"#;
+
+#[test]
+fn add_from_a_matched_directory_without_a_manifest_suggests_pnpm_init() {
+    let stderr =
+        add_from_workspace_subdir("  - packages/*\n  - tools/*\n", "packages/project", &[]);
+    assert!(stderr.contains(INIT_SUGGESTION), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn add_from_a_matched_directory_without_a_manifest_suggests_pnpm_init_with_one_pattern() {
+    let stderr = add_from_workspace_subdir("  - packages/*\n", "packages/project", &[]);
+    assert!(stderr.contains(INIT_SUGGESTION), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn add_from_a_directory_outside_the_patterns_keeps_the_root_warning() {
+    let stderr = add_from_workspace_subdir("  - packages/*\n  - tools/*\n", "scripts", &[]);
+    assert!(!stderr.contains(INIT_SUGGESTION), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn add_from_a_directory_excluded_by_the_patterns_keeps_the_root_warning() {
+    let stderr = add_from_workspace_subdir(
+        "  - packages/*\n  - tools/*\n  - '!packages/ignored'\n",
+        "packages/ignored",
+        &[],
+    );
+    assert!(!stderr.contains(INIT_SUGGESTION), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn add_from_inside_the_modules_dir_keeps_the_root_warning() {
+    let stderr =
+        add_from_workspace_subdir("  - '**'\n  - tools/*\nmodulesDir: deps\n", "deps/foo", &[]);
+    assert!(!stderr.contains(INIT_SUGGESTION), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn add_from_a_matched_directory_suggests_pnpm_init_when_the_modules_dir_is_the_root() {
+    let stderr =
+        add_from_workspace_subdir("  - packages/*\nmodulesDir: .\n", "packages/project", &[]);
+    assert!(stderr.contains(INIT_SUGGESTION), "unexpected stderr: {stderr}");
+}
+
+#[test]
+fn add_with_dir_at_the_workspace_root_keeps_the_root_warning() {
+    let stderr = add_from_workspace_subdir(
+        "  - packages/*\n  - tools/*\n",
+        "packages/project",
+        &["--dir", "<root>"],
+    );
+    assert!(!stderr.contains(INIT_SUGGESTION), "unexpected stderr: {stderr}");
 }
 
 #[test]
@@ -301,7 +406,8 @@ fn add_lockfile_only_from_workspace_subdir_prints_manifest_summary() {
     assert!(output.status.success(), "add failed\nstderr:\n{stderr}");
     let records = stderr
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .filter_map(Result::ok)
         .collect::<Vec<_>>();
     let initial_manifest_count = records
         .iter()
@@ -418,7 +524,7 @@ fn a_workspace_add_at_a_dist_tag_keeps_the_local_package_over_a_matching_catalog
 }
 
 /// `workspace:<target>@<range>` installs `<target>` under the name the
-/// selector gave, so the saved specifier has to keep naming the target —
+/// selector gave, so the saved specifier has to keep naming the target,
 /// dropping it would leave a `workspace:` entry pointing at the install
 /// name, which resolves to nothing.
 ///
@@ -462,7 +568,7 @@ fn the_pinned_form_picks_the_highest_workspace_version_by_semver() {
 }
 
 /// The setting is readable from `PNPM_CONFIG_SAVE_WORKSPACE_PROTOCOL`
-/// too, not only `pnpm-workspace.yaml` — pnpm exposes every setting
+/// too, not only `pnpm-workspace.yaml`, pnpm exposes every setting
 /// through its env pass.
 #[test]
 fn the_env_var_drives_the_saved_workspace_range() {
@@ -479,7 +585,7 @@ fn the_env_var_drives_the_saved_workspace_range() {
             .expect("find the pnpm binary")
             .with_current_dir(&app_dir)
             .with_args(["add", &format!("{LIB}@workspace:^1.0.0"), "--lockfile-only"])
-            .env("PNPM_CONFIG_SAVE_WORKSPACE_PROTOCOL", value)
+            .with_env("PNPM_CONFIG_SAVE_WORKSPACE_PROTOCOL", value)
             .assert()
             .success();
 

@@ -1,23 +1,60 @@
+mod long;
 mod named_registry;
+mod selectors;
 
 use super::{
-    ChoiceNotes, InteractiveUpdateProject, PromptRow, PromptStyle, UpdatePrompt, collect_choices,
+    ChoiceNotes,
+    InteractiveUpdateProject,
+    PromptRow,
+    PromptStyle,
+    TargetVersion,
+    UpdateDetails,
+    UpdatePrompt,
     dependencies_prompt_message,
+    gather::{
+        ChoiceFilter,
+        collect_filtered_choices,
+    },
 };
-use crate::{checkbox_prompt::KeyOutcome, cli_args::update::UpdateArgs};
+use crate::{
+    checkbox_prompt::KeyOutcome,
+    cli_args::{
+        outdated::{
+            OutdatedPackage,
+            TrustChange,
+        },
+        update::UpdateArgs,
+    },
+};
 use clap::Parser;
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
 use pnpm_network::ThrottledClient;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter, SilentReporter};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SilentReporter,
+};
+use pnpm_resolving_npm_resolver::TrustEvidence;
 use pnpm_testing_utils::registry::TestRegistry;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
     collections::VecDeque,
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 use tempfile::TempDir;
 
@@ -25,6 +62,25 @@ const TEST_INTEGRITY: &str = "sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 /// The default release-age policy fetches abbreviated metadata, then upgrades
 /// it to full metadata when this test fixture omits publish times.
 const RELEASE_AGE_METADATA_REQUESTS: usize = 2;
+
+pub(super) async fn collect_choices(
+    projects: &[InteractiveUpdateProject<'_>],
+    lockfile: Option<&Lockfile>,
+    config: &Config,
+    http_client: &Arc<ThrottledClient>,
+    target_version: TargetVersion<'_>,
+    include_direct: &[DependencyGroup],
+    details: UpdateDetails,
+) -> miette::Result<Vec<OutdatedPackage>> {
+    collect_filtered_choices(
+        (projects, &[]),
+        lockfile,
+        config,
+        http_client,
+        ChoiceFilter { target_version, include_direct, details, package_selectors: &[] },
+    )
+    .await
+}
 
 #[tokio::test]
 async fn interactive_choices_respect_minimum_release_age() {
@@ -63,8 +119,9 @@ importers:
         Some(&lockfile),
         &config,
         &Arc::new(ThrottledClient::default()),
-        true,
+        TargetVersion::Latest,
         &[DependencyGroup::Prod],
+        UpdateDetails::Compact,
     )
     .await
     .expect("collect interactive choices");
@@ -127,8 +184,9 @@ importers:
         Some(&lockfile),
         &config,
         &Arc::new(ThrottledClient::default()),
-        false,
+        TargetVersion::WithinRange,
         &[DependencyGroup::Prod],
+        UpdateDetails::Compact,
     )
     .await
     .expect("collect interactive choices");
@@ -199,8 +257,9 @@ importers:
         Some(&lockfile),
         &config,
         &Arc::new(ThrottledClient::default()),
-        false,
+        TargetVersion::WithinRange,
         &[DependencyGroup::Prod],
+        UpdateDetails::Compact,
     )
     .await
     .expect("collect interactive choices");
@@ -263,8 +322,9 @@ importers:
         Some(&lockfile),
         &config,
         &Arc::new(ThrottledClient::default()),
-        false,
+        TargetVersion::WithinRange,
         &[DependencyGroup::Prod],
+        UpdateDetails::Compact,
     )
     .await
     .expect("collect interactive choices");
@@ -277,7 +337,11 @@ importers:
         vec![Some("packages-a"), Some("packages-b")],
     );
     // And they render as one row naming both.
-    let groups = super::choices::update_choices(&choices.iter().collect::<Vec<_>>(), true);
+    let groups = super::choices::update_choices(
+        &choices.iter().collect::<Vec<_>>(),
+        true,
+        UpdateDetails::Long,
+    );
     assert!(
         groups[0].rows[1].label.contains("packages-a, packages-b"),
         "{}",
@@ -330,8 +394,9 @@ importers:
             Some(&lockfile),
             &config,
             &Arc::new(ThrottledClient::default()),
-            false,
+            TargetVersion::WithinRange,
             &[DependencyGroup::Prod],
+            UpdateDetails::Compact,
         )
         .await
         .expect("collect interactive choices");
@@ -377,7 +442,7 @@ fn manifest_with_dependency_spec(
     PackageManifest::from_path(manifest_path).expect("read project manifest")
 }
 
-/// A project manifest whose `name` is absent, or present but empty —
+/// A project manifest whose `name` is absent, or present but empty;
 /// both shapes a workspace project's `package.json` can carry.
 fn manifest_without_usable_name(
     root: &std::path::Path,
@@ -393,6 +458,228 @@ fn manifest_without_usable_name(
     }
     std::fs::write(&manifest_path, manifest.to_string()).expect("write project manifest");
     PackageManifest::from_path(manifest_path).expect("read project manifest")
+}
+
+/// A registry package `foo` publishing `versions` in order, a month apart,
+/// each with the given trust evidence. `latest` is the last one.
+fn package_body_with_trust(registry: &str, versions: &[(&str, Option<TrustEvidence>)]) -> String {
+    let provenance = json!({ "provenance": { "predicateType": "https://slsa.dev/provenance/v1" } });
+    let mut documents = serde_json::Map::new();
+    let mut times = serde_json::Map::new();
+    for (month, (version, evidence)) in versions.iter().enumerate() {
+        let mut document = json!({
+            "name": "foo",
+            "version": version,
+            "dist": {
+                "integrity": TEST_INTEGRITY,
+                "tarball": format!("{registry}foo/-/foo-{version}.tgz"),
+            },
+        });
+        if evidence.is_some() {
+            document["dist"]["attestations"] = provenance.clone();
+        }
+        match evidence {
+            Some(TrustEvidence::TrustedPublisher) => {
+                document["_npmUser"] = json!({ "trustedPublisher": { "id": "github" } });
+            }
+            Some(TrustEvidence::StagedPublish) => {
+                document["_npmUser"] = json!({ "approver": { "name": "maintainer" } });
+            }
+            Some(TrustEvidence::Provenance) | None => {}
+        }
+        documents.insert((*version).to_string(), document);
+        times.insert(
+            (*version).to_string(),
+            json!(format!("2020-{:02}-01T00:00:00.000Z", month + 1)),
+        );
+    }
+    let latest = versions.last().expect("at least one version").0;
+    json!({ "name": "foo", "dist-tags": { "latest": latest }, "versions": documents, "time": times })
+        .to_string()
+}
+
+/// One offered choice: its target version and the trust it recorded.
+type OfferedTrust = (String, Option<TrustChange>);
+
+/// What `update --interactive --latest` offers for one dependency on the
+/// mock registry's `foo`, declared as `(alias, specifier, locked version)`.
+/// `configure` receives the mock registry's URL.
+async fn trust_of_choices(
+    (alias, specifier, locked): (&str, &str, &str),
+    versions: &[(&str, Option<TrustEvidence>)],
+    configure: impl FnOnce(&mut Config, &str),
+) -> Vec<OfferedTrust> {
+    let temp = tempfile::tempdir().expect("create temporary workspace");
+    let manifest = manifest_with_dependency_spec(temp.path(), "packages/a", (alias, specifier));
+    let lockfile: Lockfile = serde_saphyr::from_str(&format!(
+        "
+lockfileVersion: '9.0'
+importers:
+  packages/a:
+    dependencies:
+      {alias}:
+        specifier: '{specifier}'
+        version: '{locked}'
+",
+    ))
+    .expect("parse workspace lockfile");
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let foo_mock = server
+        .mock("GET", "/foo")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(package_body_with_trust(&registry, versions))
+        .expect(1)
+        .create_async()
+        .await;
+    let mut config = Config::new();
+    config.registry = registry.clone();
+    config.cache_dir = temp.path().join("cache");
+    configure(&mut config, &registry);
+    let projects =
+        [InteractiveUpdateProject { manifest: &manifest, importer_id: "packages/a".to_string() }];
+
+    let choices = collect_choices(
+        &projects,
+        Some(&lockfile),
+        &config,
+        &Arc::new(ThrottledClient::default()),
+        TargetVersion::Latest,
+        &[DependencyGroup::Prod],
+        UpdateDetails::Compact,
+    )
+    .await
+    .expect("collect interactive choices");
+
+    foo_mock.assert_async().await;
+    choices
+        .into_iter()
+        .map(|choice| (choice.target.to_string(), choice.metadata.trust))
+        .collect()
+}
+
+fn no_downgrade(config: &mut Config, _registry: &str) {
+    config.trust_policy = pnpm_config::TrustPolicy::NoDowngrade;
+}
+
+const TRUSTED_THEN_PROVENANCE: &[(&str, Option<TrustEvidence>)] =
+    &[("1.0.0", Some(TrustEvidence::TrustedPublisher)), ("1.1.0", Some(TrustEvidence::Provenance))];
+
+const PROVENANCE_THEN_TRUSTED: &[(&str, Option<TrustEvidence>)] =
+    &[("1.0.0", Some(TrustEvidence::Provenance)), ("1.1.0", Some(TrustEvidence::TrustedPublisher))];
+
+fn trust_offer(target: &str, current: TrustEvidence, offered: TrustEvidence) -> OfferedTrust {
+    (target.to_string(), Some(TrustChange { current: Some(current), target: Some(offered) }))
+}
+
+#[tokio::test]
+async fn no_downgrade_trust_policy_reports_the_trust_of_both_versions() {
+    let expected =
+        [trust_offer("1.1.0", TrustEvidence::Provenance, TrustEvidence::TrustedPublisher)];
+    assert_eq!(
+        trust_of_choices(("foo", "^1.0.0", "1.0.0"), PROVENANCE_THEN_TRUSTED, no_downgrade).await,
+        expected,
+    );
+    assert_eq!(
+        trust_of_choices(
+            ("bar", "npm:foo@^1.0.0", "foo@1.0.0"),
+            PROVENANCE_THEN_TRUSTED,
+            no_downgrade
+        )
+        .await,
+        expected,
+    );
+}
+
+/// The installed version's evidence is read from the registry the
+/// specifier names, not from the default registry.
+#[tokio::test]
+async fn trust_of_a_named_registry_dependency_comes_from_that_registry() {
+    let choices = trust_of_choices(
+        ("foo", "work:^1.0.0", "work:1.0.0"),
+        PROVENANCE_THEN_TRUSTED,
+        |config, registry| {
+            no_downgrade(config, registry);
+            config.registries_by_prefix.insert("work".to_string(), registry.to_string());
+            config.registry = format!("{registry}unused-default/");
+        },
+    )
+    .await;
+    assert_eq!(
+        choices,
+        [trust_offer("1.1.0", TrustEvidence::Provenance, TrustEvidence::TrustedPublisher)],
+    );
+}
+
+/// The list offers what `pnpm update` installs, which never moves to a
+/// version with weaker evidence than an earlier release.
+#[tokio::test]
+async fn a_trust_downgrade_is_not_offered() {
+    let choices =
+        trust_of_choices(("foo", "^1.0.0", "1.0.0"), TRUSTED_THEN_PROVENANCE, no_downgrade).await;
+    assert_eq!(choices, []);
+}
+
+#[tokio::test]
+async fn a_stronger_intermediate_release_blocks_a_weaker_later_one() {
+    let choices = trust_of_choices(
+        ("foo", "^1.0.0", "1.0.0"),
+        &[
+            ("1.0.0", Some(TrustEvidence::Provenance)),
+            ("1.0.5", Some(TrustEvidence::TrustedPublisher)),
+            ("1.1.0", Some(TrustEvidence::Provenance)),
+        ],
+        no_downgrade,
+    )
+    .await;
+    assert_eq!(
+        choices,
+        [trust_offer("1.0.5", TrustEvidence::Provenance, TrustEvidence::TrustedPublisher)],
+    );
+}
+
+#[tokio::test]
+async fn a_package_excluded_from_the_trust_policy_offers_its_downgrade() {
+    let choices = trust_of_choices(
+        ("foo", "^1.0.0", "1.0.0"),
+        TRUSTED_THEN_PROVENANCE,
+        |config, registry| {
+            no_downgrade(config, registry);
+            config.trust_policy_exclude = Some(vec!["foo".to_string()]);
+        },
+    )
+    .await;
+    assert_eq!(
+        choices,
+        [trust_offer("1.1.0", TrustEvidence::TrustedPublisher, TrustEvidence::Provenance)],
+    );
+}
+
+/// `trustPolicyIgnoreAfter` waives the check for a version published
+/// longer ago than the cutoff, so the downgrade is offered.
+#[tokio::test]
+async fn a_downgrade_older_than_the_ignore_after_cutoff_is_offered() {
+    let choices = trust_of_choices(
+        ("foo", "^1.0.0", "1.0.0"),
+        TRUSTED_THEN_PROVENANCE,
+        |config, registry| {
+            no_downgrade(config, registry);
+            config.trust_policy_ignore_after = Some(60);
+        },
+    )
+    .await;
+    assert_eq!(
+        choices,
+        [trust_offer("1.1.0", TrustEvidence::TrustedPublisher, TrustEvidence::Provenance)],
+    );
+}
+
+#[tokio::test]
+async fn trust_is_not_looked_up_without_the_no_downgrade_policy() {
+    let choices =
+        trust_of_choices(("foo", "^1.0.0", "1.0.0"), TRUSTED_THEN_PROVENANCE, |_, _| {}).await;
+    assert_eq!(choices, [("1.1.0".to_string(), None)]);
 }
 
 fn package_body(name: &str, registry: &str) -> String {
@@ -438,8 +725,12 @@ fn package_body_with_publish_times(name: &str, registry: &str) -> String {
 
 mod selection {
     use super::super::{
-        choices::{ChoiceGroup, ChoiceRow},
-        flatten_groups, selected_packages,
+        choices::{
+            ChoiceGroup,
+            ChoiceRow,
+        },
+        flatten_groups,
+        selected_packages,
     };
 
     fn group(message: &str, rows: &[(&str, Option<&str>)]) -> ChoiceGroup {
@@ -456,7 +747,7 @@ mod selection {
         }
     }
 
-    /// Checking a group heading or a column header updates nothing —
+    /// Checking a group heading or a column header updates nothing,
     /// `dialoguer` lets either be checked, where pnpm's prompt disables
     /// them outright.
     #[test]
@@ -501,16 +792,14 @@ mod selection {
     }
 }
 
-// ---------------------------------------------------------------------
 // The scripted prompt behind [`UpdatePrompt::Scripted`], and the ports of
-// `pnpm11/installing/commands/test/update/interactive.ts` it carries.
-// ---------------------------------------------------------------------
+// <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/installing/commands/test/update/interactive.ts> it carries.
 
 /// What one prompt put in front of the user.
 struct SeenPrompt {
     message: String,
     /// The label of each row, paired with the package checking it
-    /// updates — [`None`] for a group heading or a header row.
+    /// updates. [`None`] for a group heading or a header row.
     rows: Vec<(String, Option<String>)>,
 }
 
@@ -537,8 +826,8 @@ static SCRIPT_LOCK: Mutex<()> = Mutex::new(());
 
 /// One test's claim on the scripted prompt.
 ///
-/// [`SCRIPT`] is process-global, which `cargo nextest run` — a process
-/// per test — makes invisible, but `cargo test` does not. Holding this
+/// [`SCRIPT`] is process-global, which `cargo nextest run` (a process
+/// per test) makes invisible, but `cargo test` does not. Holding this
 /// for the test's lifetime keeps two tests from consuming each other's
 /// answers.
 struct ScriptedPrompts {
@@ -728,10 +1017,9 @@ impl UpdateFixture {
             #[clap(flatten)]
             args: UpdateArgs,
         }
+        assert_eq!(args.first(), Some(&"update"));
         let mut parsed =
-            Harness::try_parse_from(std::iter::once("pacquet-test").chain(args.iter().copied()))
-                .expect("parse update arguments")
-                .args;
+            Harness::try_parse_from(args.iter().copied()).expect("parse update arguments").args;
         parsed.prompt = UpdatePrompt::Scripted;
         let state = crate::State::init(self.project.join("package.json"), self.config, false)
             .expect("initialize the state");
@@ -805,6 +1093,143 @@ async fn interactively_update() {
         fixture.lockfile_packages(),
         [format!("{MULTI_A}@2.1.0"), format!("{MULTI_B}@2.0.0"), format!("{MULTI_C}@3.0.0")],
     );
+}
+
+/// A tag target is an exact destination: a tag pointing below the
+/// installed version is offered and applied, the way a non-interactive
+/// `--tag` update downgrades.
+#[tokio::test]
+async fn interactive_tag_update_offers_a_downgrade() {
+    let fixture = UpdateFixture::new();
+
+    fixture.write_manifest(&json!({ MULTI_A: "2.0.0" }));
+    fixture.update(&["update"]).await;
+    fixture.set_dist_tag(MULTI_A, "1.0.0", "next");
+
+    let scripted = scripted_prompts();
+    scripted.answer_next(&[MULTI_A]);
+    fixture.update(&["update", "--interactive", "--tag", "next"]).await;
+
+    let prompts = scripted.seen();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(
+        offered(&prompts[0]),
+        [(MULTI_A.to_string(), "2.0.0".to_string(), "1.0.0".to_string())],
+    );
+    assert!(
+        fixture
+            .lockfile_packages()
+            .contains(&format!("{MULTI_A}@1.0.0")),
+    );
+}
+
+/// A complete `npm:` alias names its package behind the manifest key, and
+/// the `--tag` rewrite leaves such declarations unchanged: the alias drops
+/// out of the tag report instead of being queried as `<alias>@<tag>` and
+/// offered an update that cannot apply.
+#[tokio::test]
+async fn interactive_tag_update_skips_aliased_dependencies() {
+    let fixture = UpdateFixture::new();
+
+    fixture.write_manifest(&json!({ "fooAlias": format!("npm:{MULTI_B}@2.0.0") }));
+    fixture.update(&["update"]).await;
+    fixture.set_dist_tag(MULTI_B, "1.0.0", "next");
+
+    let scripted = scripted_prompts();
+    fixture.update(&["update", "--interactive", "--tag", "next"]).await;
+
+    let prompts = scripted.seen();
+    assert!(
+        prompts.is_empty(),
+        "the aliased dependency must not be offered: {} prompt(s) shown",
+        prompts.len(),
+    );
+    let packages = fixture.lockfile_packages();
+    assert!(
+        packages.contains(&format!("{MULTI_B}@2.0.0")),
+        "the aliased dependency keeps its installed version: {packages:?}",
+    );
+}
+
+#[tokio::test]
+async fn interactive_tag_update_skips_catalog_dependencies() {
+    let fixture = UpdateFixture::with_workspace();
+    fs::write(
+        fixture.dir.path().join("pnpm-workspace.yaml"),
+        format!("packages:\n  - 'project'\ncatalog:\n  '{MULTI_B}': ^2.0.0\n"),
+    )
+    .expect("write pnpm-workspace.yaml");
+    fixture.write_manifest(&json!({ MULTI_B: "catalog:" }));
+    fixture.update(&["update"]).await;
+    fixture.set_dist_tag(MULTI_B, "1.0.0", "next");
+
+    let scripted = scripted_prompts();
+    fixture.update(&["update", "--interactive", "--tag", "next"]).await;
+
+    let prompts = scripted.seen();
+    assert!(
+        prompts.is_empty(),
+        "the catalog dependency must not be offered: {} prompt(s) shown",
+        prompts.len(),
+    );
+}
+
+#[tokio::test]
+async fn interactive_tag_update_offers_tag_change_when_resolved_version_matches() {
+    let fixture = UpdateFixture::new();
+
+    fixture.set_dist_tag(MULTI_A, "2.0.0", "next");
+    fixture.set_dist_tag(MULTI_A, "2.0.0", "canary");
+    fixture.write_manifest(&json!({ MULTI_A: "next" }));
+    fixture.update(&["update"]).await;
+
+    let scripted = scripted_prompts();
+    scripted.answer_next(&[MULTI_A]);
+    fixture.update(&["update", "--interactive", "--tag", "canary"]).await;
+
+    let prompts = scripted.seen();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(
+        offered(&prompts[0]),
+        [(MULTI_A.to_string(), "2.0.0".to_string(), "2.0.0".to_string())],
+    );
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.project.join("package.json")).expect("read package.json"),
+    )
+    .expect("parse package.json");
+    assert_eq!(manifest["dependencies"][MULTI_A], "canary");
+}
+
+#[tokio::test]
+async fn interactive_tag_update_no_save_offers_in_range_version() {
+    let fixture = UpdateFixture::new();
+
+    fixture.set_dist_tag(MULTI_A, "2.0.0", "latest");
+    fixture.write_manifest(&json!({ MULTI_A: "^2.0.0" }));
+    fixture.update(&["update"]).await;
+    fixture.set_dist_tag(MULTI_A, "2.1.0", "latest");
+    fixture.set_dist_tag(MULTI_A, "1.0.0", "next");
+
+    let scripted = scripted_prompts();
+    scripted.answer_next(&[MULTI_A]);
+    fixture.update(&["update", "--interactive", "--tag", "next", "--no-save"]).await;
+
+    let prompts = scripted.seen();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(
+        offered(&prompts[0]),
+        [(MULTI_A.to_string(), "2.0.0".to_string(), "2.1.0".to_string())],
+    );
+    assert!(
+        fixture
+            .lockfile_packages()
+            .contains(&format!("{MULTI_A}@2.1.0")),
+    );
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.project.join("package.json")).expect("read package.json"),
+    )
+    .expect("parse package.json");
+    assert_eq!(manifest["dependencies"][MULTI_A], "^2.0.0");
 }
 
 /// Ports `interactively update should ignore dependencies from the
@@ -934,7 +1359,7 @@ async fn global_interactive_update_handles_an_empty_global_directory() {
     let selected = super::select_global_package_groups::<pnpm_reporter::SilentReporter>(
         config,
         &[],
-        true,
+        TargetVersion::Latest,
         UpdatePrompt::Scripted,
     )
     .await
@@ -977,8 +1402,9 @@ importers:
         Some(&lockfile),
         &config,
         &Arc::new(ThrottledClient::default()),
-        true,
+        TargetVersion::Latest,
         &[DependencyGroup::Prod],
+        UpdateDetails::Compact,
     )
     .await
     .expect("collect interactive choices");

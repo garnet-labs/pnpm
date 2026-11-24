@@ -1,7 +1,20 @@
 use super::{
-    BTreeMap, Context, DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH, HashMap, HashSet, Host,
-    IntoDiagnostic, Lockfile, Modules, Path, PathBuf, PkgInfoEnv, RegistryOptions,
-    detect_dep_types, lexical_normalize, read_modules_manifest,
+    BTreeMap,
+    Context,
+    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH,
+    HashMap,
+    HashSet,
+    Host,
+    IntoDiagnostic,
+    Lockfile,
+    Modules,
+    Path,
+    PathBuf,
+    PkgInfoEnv,
+    RegistryOptions,
+    detect_dep_types,
+    lexical_normalize,
+    read_modules_manifest,
 };
 
 /// The lockfiles and modules-manifest state one tree build runs
@@ -30,14 +43,13 @@ impl LoadedState {
         };
         let relative_modules_dir = modules_dir_raw
             .strip_prefix(lockfile_dir)
-            .map_or_else(
-                |_| {
-                    modules_dir_raw
-                        .file_name()
-                        .map_or_else(|| PathBuf::from("node_modules"), PathBuf::from)
-                },
-                Path::to_path_buf,
-            );
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| {
+                modules_dir_raw
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("node_modules"))
+            });
         let modules_dir = pnpm_fs::realpath_missing(&modules_dir_raw)
             .unwrap_or_else(|_| lexical_normalize(&modules_dir_raw));
         let modules = read_modules_manifest::<Host>(&modules_dir)
@@ -79,14 +91,16 @@ impl LoadedState {
         lockfile_dir: &Path,
         config: &pnpm_config::Config,
     ) -> Option<PkgInfoEnv<'a>> {
-        self.env_with_node_linker(
+        let mut env = self.env_with_node_linker(
             lockfile_dir,
             config.virtual_store_dir_max_length as usize,
             &config.resolved_registries(),
             config.registry_options_by_url.clone(),
             config.peer_edge_options(),
             config.node_linker,
-        )
+        )?;
+        env.layout.store_dir.get_or_insert_with(|| config.store_dir.root().to_path_buf());
+        Some(env)
     }
 
     #[must_use]

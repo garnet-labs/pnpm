@@ -1,7 +1,28 @@
 use super::{
-    AccessList, AuthState, Body, CHALLENGE, Request, ServiceExt, StatusCode, TempDir, Value, app,
-    app_allowing_deletes, basic, body_bytes, check_protocol_surface, digest_of, get, header,
-    image_manifest, json, oci_config, push_image, router_with_auth, sha256_hex, token,
+    AccessList,
+    AuthState,
+    Body,
+    CHALLENGE,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    Value,
+    app,
+    app_allowing_deletes,
+    basic,
+    body_bytes,
+    check_protocol_surface,
+    digest_of,
+    get,
+    header,
+    image_manifest,
+    json,
+    oci_config,
+    push_image,
+    router_with_auth,
+    sha256_hex,
+    token,
 };
 
 #[tokio::test]
@@ -509,7 +530,16 @@ async fn scoped_bearer_credentials_stop_with_their_owners_account() {
         StatusCode::OK,
     );
 
-    auth_state.users.delete_user("alice").await.unwrap();
+    auth_state.users
+        .delete_user(
+            &auth_state.users
+                .account_id("alice")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(
         app.oneshot(pull()).await
             .unwrap()

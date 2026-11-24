@@ -1,5 +1,8 @@
 use crate::Digest;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::cmp::Ordering;
 
 /// One manifest the repository holds, keyed by the digest of its bytes.
@@ -9,9 +12,19 @@ pub struct ManifestEntry {
     pub digest: Digest,
     pub media_type: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Digest>,
     /// Missing metadata is populated from the manifest during referrer discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub referrer: Option<ReferrerMetadata>,
+}
+
+/// Outcome of [`ImageDocument::remove_manifest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestRemoval {
+    Removed,
+    NotFound,
+    ReferencedByIndex,
 }
 
 /// Metadata used to discover artifacts attached to a subject manifest.
@@ -33,8 +46,8 @@ pub struct TagEntry {
     /// When this tag last moved, in milliseconds since the Unix epoch.
     ///
     /// A tag is the one mutable thing in a repository, so "what is already
-    /// here wins" — the rule that makes an immutable version safe to
-    /// re-apply — would let a write that lands late drag a tag back to an
+    /// here wins" (the rule that makes an immutable version safe to
+    /// re-apply) would let a write that lands late drag a tag back to an
     /// older manifest. Comparing when instead makes the merge monotonic, so
     /// re-applying an old write is a no-op.
     ///
@@ -74,9 +87,7 @@ struct StoredImageDocument {
     #[serde(default)]
     tags: Vec<TagEntry>,
     #[serde(default)]
-    generation: u64,
-    #[serde(default)]
-    deleting_blob: Option<Digest>,
+    owners: Vec<String>,
 }
 
 impl From<StoredImageDocument> for ImageDocument {
@@ -86,12 +97,11 @@ impl From<StoredImageDocument> for ImageDocument {
             name,
             mut manifests,
             mut tags,
-            generation,
-            deleting_blob,
+            owners,
         } = stored;
         manifests.sort_by(|left, right| left.digest.hex().cmp(right.digest.hex()));
         tags.sort_by(|left, right| left.tag.cmp(&right.tag));
-        Self { format_version, name, manifests, tags, generation, deleting_blob }
+        Self { format_version, name, manifests, tags, owners }
     }
 }
 
@@ -115,12 +125,10 @@ pub struct ImageDocument {
     manifests: Vec<ManifestEntry>,
     #[serde(default)]
     tags: Vec<TagEntry>,
-    /// Fences publishes prepared before an explicit blob deletion.
-    #[serde(default)]
-    pub generation: u64,
-    /// Blocks new publishes until the deletion completes or offline collection recovers it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deleting_blob: Option<Digest>,
+    /// The account IDs that may publish to this repository, recorded by its first
+    /// publish. When empty, `$owners` admits only admins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
 }
 
 impl Default for ImageDocument {
@@ -130,16 +138,15 @@ impl Default for ImageDocument {
             name: String::new(),
             manifests: Vec::new(),
             tags: Vec::new(),
-            generation: 0,
-            deleting_blob: None,
+            owners: Vec::new(),
         }
     }
 }
 
 impl ImageDocument {
     #[must_use]
-    pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), ..Self::default() }
+    pub fn new(name: String) -> Self {
+        Self { name, ..Self::default() }
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, serde_json::Error> {
@@ -214,16 +221,22 @@ impl ImageDocument {
         }
     }
 
-    /// Every tag that named the manifest goes with it. `false` when the
-    /// repository held no such manifest.
-    pub fn remove_manifest(&mut self, digest: &Digest) -> bool {
+    /// Remove a manifest and every tag that named it, unless a retained index
+    /// in this repository still lists it as a child.
+    pub fn remove_manifest(&mut self, digest: &Digest) -> ManifestRemoval {
         let Ok(index) = self.manifests.binary_search_by(|held| held.digest.hex().cmp(digest.hex()))
         else {
-            return false;
+            return ManifestRemoval::NotFound;
         };
+        if self.manifests
+            .iter()
+            .any(|held| held.digest != *digest && held.children.contains(digest))
+        {
+            return ManifestRemoval::ReferencedByIndex;
+        }
         self.manifests.remove(index);
         self.tags.retain(|tag| &tag.digest != digest);
-        true
+        ManifestRemoval::Removed
     }
 
     /// The manifest the tag named stays, still reachable by digest. `false`
@@ -243,14 +256,7 @@ impl ImageDocument {
     /// bytes and is left alone. Tags reach the same result whichever order
     /// the two documents arrive in, so a write that lands after the one that
     /// superseded it changes nothing.
-    ///
-    /// A generation mismatch or pending blob deletion refuses the addition
-    /// and returns `false`, just like an unchanged document. Older generations
-    /// cannot be replayed after deletion advances the stored generation.
     pub fn merge(&mut self, addition: Self) -> bool {
-        if self.generation != addition.generation || self.deleting_blob.is_some() {
-            return false;
-        }
         let mut changed = false;
         if self.name.is_empty() && !addition.name.is_empty() {
             self.name.clone_from(&addition.name);

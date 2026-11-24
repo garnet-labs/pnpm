@@ -2,10 +2,13 @@ use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::CommandTempCwd;
 use serde_json::json;
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::Command,
+};
 
 #[test]
-fn relative_workspace_peer_is_auto_installed_from_its_declaring_directory() {
+fn relative_path_peer_is_auto_installed_from_its_declaring_directory() {
     struct Case {
         also_dependency: bool,
         explicit_provider: bool,
@@ -35,6 +38,22 @@ fn relative_workspace_peer_is_auto_installed_from_its_declaring_directory() {
             also_dependency: true,
             explicit_provider: false,
             peer_specifier: r"workspace:..\provider",
+        },
+        Case {
+            also_dependency: false,
+            explicit_provider: false,
+            peer_specifier: "file:../provider",
+        },
+        Case {
+            also_dependency: true,
+            explicit_provider: false,
+            peer_specifier: "file:../provider",
+        },
+        Case { also_dependency: true, explicit_provider: true, peer_specifier: "file:../provider" },
+        Case {
+            also_dependency: true,
+            explicit_provider: false,
+            peer_specifier: r"file:..\provider",
         },
     ] {
         let CommandTempCwd { mut pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -73,12 +92,12 @@ fn relative_workspace_peer_is_auto_installed_from_its_declaring_directory() {
         .unwrap();
         }
         let consumer = workspace.join("examples");
+        pacquet = pacquet
+            .with_current_dir(&consumer)
+            .with_args(["install", "--offline", "--ignore-scripts", "--store-dir"])
+            .with_arg(root.path().join("store"));
         pacquet
-            .current_dir(&consumer)
-            .args(["install", "--offline", "--ignore-scripts", "--store-dir"])
-            .arg(root.path().join("store"));
-        pacquet
-            .args([
+            .with_args([
                 "--lockfile-only",
                 "--no-frozen-lockfile",
                 "--config.preferFrozenLockfile=false",
@@ -110,8 +129,13 @@ fn relative_workspace_peer_is_auto_installed_from_its_declaring_directory() {
 }
 
 #[test]
-fn relative_workspace_peer_uses_each_importers_directory_when_discovery_is_cached() {
-    for shared_lockfile in [true, false] {
+fn relative_path_peer_uses_each_importers_directory_when_discovery_is_cached() {
+    for (shared_lockfile, peer_specifier) in [
+        (true, "workspace:../provider"),
+        (false, "workspace:../provider"),
+        (true, "file:../provider"),
+        (false, "file:../provider"),
+    ] {
         let CommandTempCwd { mut pacquet, root, workspace, .. } = CommandTempCwd::init();
         fs::write(
         workspace.join("pnpm-workspace.yaml"),
@@ -129,7 +153,7 @@ fn relative_workspace_peer_uses_each_importers_directory_when_discovery_is_cache
             (
                 "packages/library",
                 json!({ "name": "library", "version": "1.0.0", "peerDependencies": {
-                "provider": "workspace:../provider",
+                "provider": peer_specifier,
             } }),
                 "module.exports = require('provider');",
             ),
@@ -160,9 +184,9 @@ fn relative_workspace_peer_uses_each_importers_directory_when_discovery_is_cache
             fs::write(project.join("package.json"), manifest.to_string()).unwrap();
             fs::write(project.join("index.js"), source).unwrap();
         }
-        pacquet
-            .args(["install", "--offline", "--store-dir"])
-            .arg(root.path().join("store"));
+        pacquet = pacquet
+            .with_args(["install", "--offline", "--store-dir"])
+            .with_arg(root.path().join("store"));
         pacquet.assert().success();
         pacquet
             .with_arg("--frozen-lockfile")
@@ -178,5 +202,56 @@ fn relative_workspace_peer_uses_each_importers_directory_when_discovery_is_cache
                     .stdout("local-provider\n");
             }
         }
+    }
+}
+
+/// An injected sibling is a directory package whose lockfile entry carries
+/// no version, so the peer check reads it from the sibling's manifest.
+#[test]
+fn injected_sibling_satisfies_the_peer_range_by_its_manifest_version() {
+    for (provider_version, satisfied) in [("1.0.0", true), ("2.0.0", false)] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\nautoInstallPeers: false\nstrictPeerDependencies: true\n\
+             injectWorkspacePackages: true\ndedupeInjectedDeps: false\n",
+        )
+        .expect("write workspace manifest");
+        for (dir, manifest) in [
+            ("provider", json!({ "name": "provider", "version": provider_version })),
+            (
+                "lib",
+                json!({
+                    "name": "lib",
+                    "version": "1.0.0",
+                    "peerDependencies": { "provider": "^1.0.0" },
+                }),
+            ),
+            (
+                "app",
+                json!({
+                    "name": "app",
+                    "version": "1.0.0",
+                    "dependencies": { "lib": "workspace:*", "provider": "workspace:*" },
+                }),
+            ),
+        ] {
+            let dir = workspace.join("packages").join(dir);
+            fs::create_dir_all(&dir).expect("create project dir");
+            fs::write(dir.join("package.json"), manifest.to_string()).expect("write manifest");
+        }
+
+        let output = pacquet
+            .with_arg("install")
+            .output()
+            .expect("run pnpm install");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), satisfied, "{provider_version}: {output:?}");
+        if !satisfied {
+            assert!(stderr.contains("Installed: 2.0.0"), "{stderr}");
+            assert!(stderr.contains("lib@1.0.0"), "{stderr}");
+        }
+
+        drop(root);
     }
 }

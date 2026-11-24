@@ -1,12 +1,27 @@
 use super::{
-    host, no_importers, root_importer, snapshot_dep_map, snapshot_key, synthetic_metadata,
+    host,
+    no_importers,
+    root_importer,
+    snapshot_dep_map,
+    snapshot_key,
+    synthetic_metadata,
 };
 use crate::installability::{
-    InstallabilityHost, SkippedSnapshots, any_installability_constraint,
-    any_optional_installability_constraint, compute_skipped_snapshots,
+    InstallabilityHost,
+    SkippedSnapshots,
+    any_installability_constraint,
+    any_optional_installability_constraint,
+    compute_skipped_snapshots,
 };
-use pnpm_lockfile::{PackageKey, SnapshotEntry};
-use pnpm_reporter::{LogEvent, SkippedOptionalPackage, SkippedOptionalReason};
+use pnpm_lockfile::{
+    PackageKey,
+    SnapshotEntry,
+};
+use pnpm_reporter::{
+    LogEvent,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
+};
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 
@@ -298,8 +313,8 @@ fn seeded_still_incompatible_snapshot_stays_skipped() {
         "the skip is re-evaluated and re-reported on every install, got {events:?}",
     );
 }
-/// A seeded installability skip whose package passes the current check —
-/// e.g. `supportedArchitectures` changed between installs — is dropped, so
+/// A seeded installability skip whose package passes the current check
+/// (e.g. `supportedArchitectures` changed between installs) is dropped, so
 /// the newly compatible optional is installed instead of staying skipped.
 #[test]
 fn seeded_snapshot_compatible_with_new_host_is_unskipped() {
@@ -583,7 +598,7 @@ fn engine_strict_hard_fails_a_required_incompatible_dep() {
 
     let strict_host = InstallabilityHost {
         node_version: "20.10.0".to_string(),
-        node_detected: true,
+        node_source: crate::NodeVersionSource::Probed,
         os: "darwin",
         cpu: "arm64",
         libc: "unknown",

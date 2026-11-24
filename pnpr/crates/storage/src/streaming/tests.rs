@@ -1,16 +1,30 @@
 use super::{
-    BlobStreamError, download_computing_sha512, integrity_checker, parse_integrity,
+    BlobStreamError,
+    download_computing_sha512,
+    integrity_checker,
+    parse_integrity,
     stream_verified_to_cache,
 };
 use crate::Storage;
 use futures_util::StreamExt;
 use pnpr_config::HostedStoreConfig;
 use pnpr_package_name::CanonicalPackageName;
-use ssri::{Algorithm, Integrity, IntegrityOpts};
-use std::{path::Path, sync::Arc, time::Duration};
+use ssri::{
+    Algorithm,
+    Integrity,
+    IntegrityOpts,
+};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    },
     net::TcpListener,
     sync::Notify,
 };
@@ -155,7 +169,7 @@ async fn cancelling_in_flight_response_body_removes_tmp_file() {
         &HostedStoreConfig::Fs,
         tmp.path().join("hosted"),
         cache.clone(),
-        &pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite")),
     )
     .unwrap();
     let name = CanonicalPackageName::parse("foo", pnpr_package_name::Ecosystem::Npm).unwrap();
@@ -196,7 +210,7 @@ async fn oversized_response_is_rejected_and_tmp_is_removed() {
         &HostedStoreConfig::Fs,
         tmp.path().join("hosted"),
         cache.clone(),
-        &pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite")),
     )
     .unwrap();
     let name = CanonicalPackageName::parse("foo", pnpr_package_name::Ecosystem::Npm).unwrap();
@@ -230,7 +244,7 @@ async fn download_returns_the_sha512_of_the_staged_bytes() {
             &HostedStoreConfig::Fs,
             tmp.path().join("hosted"),
             cache.clone(),
-            &pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite")),
+            &pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite")),
         )
         .unwrap();
         let name = CanonicalPackageName::parse("foo", pnpr_package_name::Ecosystem::Npm).unwrap();
@@ -261,7 +275,7 @@ async fn a_sealed_download_is_not_in_the_cache_until_promoted() {
         &HostedStoreConfig::Fs,
         tmp.path().join("hosted"),
         cache.clone(),
-        &pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite")),
     )
     .unwrap();
     let name = CanonicalPackageName::parse("foo", pnpr_package_name::Ecosystem::Npm).unwrap();
@@ -291,7 +305,7 @@ async fn download_stages_nothing_when_the_expected_integrity_mismatches() {
         &HostedStoreConfig::Fs,
         tmp.path().join("hosted"),
         cache.clone(),
-        &pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite")),
     )
     .unwrap();
     let name = CanonicalPackageName::parse("foo", pnpr_package_name::Ecosystem::Npm).unwrap();

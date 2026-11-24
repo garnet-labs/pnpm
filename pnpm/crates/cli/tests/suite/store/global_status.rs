@@ -1,6 +1,7 @@
 use super::pacquet_at;
 use crate::_utils;
 use assert_cmd::prelude::*;
+use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::CommandTempCwd;
 use std::fs;
 
@@ -21,12 +22,15 @@ fn store_status_checks_global_packages_with_virtual_store_dir_override() {
 
 #[test]
 fn store_status_uses_installed_build_approvals() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(&workspace, "");
     pacquet
-        .args(["add", "@pnpm.e2e/generated-bins@1.0.0", "--allow-build=@pnpm.e2e/generated-bins"])
+        .with_args([
+            "add",
+            "@pnpm.e2e/generated-bins@1.0.0",
+            "--allow-build=@pnpm.e2e/generated-bins",
+        ])
         .assert()
         .success();
     let settings = workspace.join("pnpm-workspace.yaml");
@@ -35,58 +39,55 @@ fn store_status_uses_installed_build_approvals() {
     yaml["allowBuilds"]["@pnpm.e2e/generated-bins"] = serde_json::Value::Bool(false);
     fs::write(&settings, serde_saphyr::to_string(&yaml).unwrap()).unwrap();
     pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .assert()
         .success();
 }
 
 #[test]
 fn store_status_checks_global_packages_without_optional_dependencies() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(&workspace, "");
     pacquet
-        .args(["add", "@pnpm.e2e/pkg-with-good-optional", "--no-optional"])
+        .with_args(["add", "@pnpm.e2e/pkg-with-good-optional", "--no-optional"])
         .assert()
         .success();
     pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .assert()
         .success();
 }
 
 #[test]
-fn store_status_reports_unverifiable_global_slots_after_node_version_changes() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+fn store_status_finds_global_slots_after_node_version_changes() {
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(&workspace, "nodeVersion: 22.0.0\n");
     pacquet
-        .args(["add", "@pnpm.e2e/generated-bins@1.0.0", "--allow-build=@pnpm.e2e/generated-bins"])
+        .with_args([
+            "add",
+            "@pnpm.e2e/generated-bins@1.0.0",
+            "--allow-build=@pnpm.e2e/generated-bins",
+        ])
         .assert()
         .success();
     let settings = workspace.join("pnpm-workspace.yaml");
     let yaml = fs::read_to_string(&settings).unwrap();
     fs::write(&settings, yaml.replace("22.0.0", "24.0.0")).unwrap();
-    let output = pacquet_at(&workspace)
-        .args(["store", "status"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success());
-    assert!(stderr.contains("ERR_PNPM_STORE_STATUS_UNVERIFIABLE"), "{stderr}");
-    assert!(!stderr.contains("ERR_PNPM_MODIFIED_DEPENDENCY"));
+    pacquet_at(&workspace)
+        .with_args(["store", "status"])
+        .assert()
+        .success();
 }
 
 #[test]
 fn store_status_rejects_project_links_to_a_different_global_slot() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(&workspace, "");
     pacquet
-        .args(["add", "is-odd@3.0.1"])
+        .with_args(["add", "is-odd@3.0.1"])
         .assert()
         .success();
     let replacement = workspace.join("replacement");
@@ -94,7 +95,7 @@ fn store_status_rejects_project_links_to_a_different_global_slot() {
     fs::write(replacement.join("package.json"), "{}\n").unwrap();
     pnpm_fs::force_symlink_dir(&replacement, &workspace.join("node_modules/is-odd")).unwrap();
     let output = pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -104,18 +105,17 @@ fn store_status_rejects_project_links_to_a_different_global_slot() {
 
 #[test]
 fn store_status_reports_dangling_global_links_as_unverifiable() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(&workspace, "");
     pacquet
-        .args(["add", "is-odd@3.0.1"])
+        .with_args(["add", "is-odd@3.0.1"])
         .assert()
         .success();
     let package_dir = fs::canonicalize(workspace.join("node_modules/is-odd")).unwrap();
     fs::remove_dir_all(package_dir).unwrap();
     let output = pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -135,12 +135,11 @@ fn store_status_checks_deduplicated_workspace_links() {
 
 #[test]
 fn store_status_rejects_escaping_importer_paths() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(&workspace, "");
     pacquet
-        .args(["add", "is-odd@3.0.1"])
+        .with_args(["add", "is-odd@3.0.1"])
         .assert()
         .success();
     let lockfile = workspace.join("node_modules/.pnpm/lock.yaml");
@@ -151,7 +150,7 @@ fn store_status_rejects_escaping_importer_paths() {
     importers.insert("../outside".to_string(), root);
     fs::write(&lockfile, serde_saphyr::to_string(&value).unwrap()).unwrap();
     let output = pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -159,10 +158,54 @@ fn store_status_rejects_escaping_importer_paths() {
     assert!(stderr.contains("ERR_PNPM_PACKAGE_MANAGER_UNSAFE_IMPORTER_PATH"), "{stderr}");
 }
 
+#[test]
+fn store_status_handles_multibyte_utf8_lockfile_package_names() {
+    let CommandTempCwd { workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    fs::write(workspace.join("package.json"), r#"{"name":"app","version":"1.0.0"}"#).unwrap();
+    let lockfile = "\
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      ä:
+        specifier: https://example.invalid/a.tgz
+        version: https://example.invalid/a.tgz
+      '@ä/ü':
+        specifier: https://example.invalid/b.tgz
+        version: https://example.invalid/b.tgz
+
+packages:
+  'ä@https://example.invalid/a.tgz':
+    version: 1.0.0
+    resolution: {tarball: https://example.invalid/a.tgz}
+  '@ä/ü@https://example.invalid/b.tgz':
+    version: 1.0.0
+    resolution: {tarball: https://example.invalid/b.tgz, integrity: sha512-MJ7MSJwS1utMxA9QyQLytNDtd+5RGnx6m808qG1M2G+YndNbxf9JlnDaNCVbRbDP2DDoH2Bdz33FVC6TrpzXbw==}
+
+snapshots:
+  'ä@https://example.invalid/a.tgz': {}
+  '@ä/ü@https://example.invalid/b.tgz': {}
+";
+    fs::write(workspace.join("pnpm-lock.yaml"), lockfile).unwrap();
+
+    for enable_gvs in [false, true] {
+        if enable_gvs {
+            _utils::enable_gvs_in_workspace_yaml(&workspace, "");
+        }
+        let output = pacquet_at(&workspace)
+            .with_args(["store", "status"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "enable_gvs={enable_gvs}: {stderr}");
+    }
+}
+
 fn check_workspace_links(settings: &str, modules_dir: &str) {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(
         &workspace,
         &format!("packages:\n  - packages/*\n{settings}"),
@@ -176,7 +219,7 @@ fn check_workspace_links(settings: &str, modules_dir: &str) {
     )
     .unwrap();
     pacquet
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     assert!(
@@ -186,18 +229,17 @@ fn check_workspace_links(settings: &str, modules_dir: &str) {
             .exists(),
     );
     pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .assert()
         .success();
 }
 
 fn check_global_virtual_store_status(settings: &str) {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     _utils::enable_gvs_in_workspace_yaml(&workspace, settings);
     pacquet
-        .args([
+        .with_args([
             "add",
             "is-odd@3.0.1",
             "@pnpm.e2e/abc@1.0.0",
@@ -211,13 +253,13 @@ fn check_global_virtual_store_status(settings: &str) {
     assert!(generated_bin.is_file(), "build output at {generated_bin:?}");
 
     pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .assert()
         .success();
 
     fs::write(workspace.join("node_modules/@pnpm.e2e/abc/package.json"), "{}\n").unwrap();
     let output = pacquet_at(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);

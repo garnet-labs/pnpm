@@ -5,23 +5,42 @@
 //! it, which is also where its requirements are read from: an sdist
 //! declares them only in the wheel it produces.
 
-use super::{MAX_WHEEL_BYTES, read_manifest};
+use super::{
+    MAX_WHEEL_BYTES,
+    read_manifest,
+};
 use crate::{
-    build::{self, Buildable, Contract},
+    build::{
+        self,
+        Buildable,
+        Contract,
+    },
     host,
     registry::Registry,
 };
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use pep440_rs::Version;
 use pep508_rs::PackageName;
-use pnpm_python_resolver::{LockedSdist, parse_requirement};
+use pnpm_python_resolver::{
+    LockedSdist,
+    parse_requirement,
+};
 use pnpm_reporter::Reporter;
-use pnpm_tarball::{ArchiveStoreProjection, IngestTarballToStore, IngestZipArchiveToStore};
-use std::path::{Component, Path, PathBuf};
-
-/// What the store's progress reporting calls a Python download, the
-/// same for every artifact a Python install fetches.
-const REQUESTER: &str = "Python environment";
+use pnpm_tarball::{
+    ArchiveStoreProjection,
+    IngestTarballToStore,
+    IngestZipArchiveToStore,
+};
+use std::path::{
+    Component,
+    Path,
+    PathBuf,
+};
 
 impl Registry<'_> {
     /// Build the release's source distribution, leaving the wheel it
@@ -58,11 +77,13 @@ impl Registry<'_> {
         .await?;
         let mut built = match built {
             build::Build::Made(built) => built,
-            build::Build::NotApproved(names) => bail!(
-                "building the Python source distribution of {name} needs approved build \
-                 requirements: {}. Add them under allowBuilds in pnpm-workspace.yaml.",
-                names.join(", "),
-            ),
+            build::Build::NotApproved(names) => {
+                bail!(
+                    "building the Python source distribution of {name} needs approved build \
+                     requirements: {}. Add them under allowBuilds in pnpm-workspace.yaml.",
+                    names.join(", "),
+                );
+            }
         };
         self.check_source_wheel(&built.wheel, name, version)?;
         check_identity(&built.wheel.metadata, name, version, &sdist)?;
@@ -123,13 +144,13 @@ impl Registry<'_> {
         sdist: &LockedSdist,
     ) -> Result<pnpm_fs::CasPaths> {
         let integrity = sdist.integrity()?;
-        let package_id = format!("python:{}", sdist.name);
+        let package_id = crate::store_keys::archive_package_id(&sdist.name);
         let fetching = pnpm_tarball::ArchiveFetchOptions {
             http_client: self.client,
             auth_headers: &self.index.auth,
             retry_opts: self.config.retry_opts(),
             offline: self.config.offline,
-            tar_limits: self.config.tar_limits(),
+            tar_limits: pnpm_tarball::TarLimits::new(self.config.max_tarball_unpacked_size),
         };
         if sdist.is_zip() {
             return self.fetch_source_zip::<Reporter>(sdist, fetching, &integrity, &package_id)
@@ -149,7 +170,7 @@ impl Registry<'_> {
                 id: &package_id,
             },
             store: self.store.clone(),
-            requester: REQUESTER,
+            requester: pnpm_reporter::PYTHON_ENVIRONMENT_REQUESTER,
             ignore_file_pattern: None,
             progress_reported: None,
             store_projection: ArchiveStoreProjection::RawArchive,
@@ -177,7 +198,7 @@ impl Registry<'_> {
                 id: package_id,
             },
             store: self.store.clone(),
-            requester: REQUESTER,
+            requester: pnpm_reporter::PYTHON_ENVIRONMENT_REQUESTER,
             archive_prefix: Some(sdist.root()),
             ignore_file_pattern: None,
             store_projection: ArchiveStoreProjection::RawArchive,

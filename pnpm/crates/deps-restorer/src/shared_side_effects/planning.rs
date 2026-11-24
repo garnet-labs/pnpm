@@ -1,17 +1,44 @@
 use super::{
-    ApplySharedSideEffectsOptions, BaseCasPaths, RemoteCacheSetup, dependency_package,
-    insert_side_effects_map, package_version, patch_hash, stored_remote_side_effects_are_verified,
+    ApplySharedSideEffectsOptions,
+    BaseCasPaths,
+    RemoteCacheSetup,
+    dependency_package,
+    insert_side_effects_map,
+    package_version,
+    patch_hash,
+    stored_remote_side_effects_are_verified,
     stored_remote_side_effects_blobs_are_valid,
 };
 use crate::{
-    AllowBuildPolicy, RequiresBuildBySnapshot, SideEffectsBySnapshot, SideEffectsMapsBySnapshot,
-    StoreIndexKeysBySnapshot, build_deps_subgraph, deps_graph::in_lockfile_order,
+    AllowBuildPolicy,
+    RequiresBuildBySnapshot,
+    SideEffectsBySnapshot,
+    SideEffectsMapsBySnapshot,
+    StoreIndexKeysBySnapshot,
+    build_deps_subgraph,
+    deps_graph::in_lockfile_order,
 };
 use pnpm_config::Config;
-use pnpm_lockfile::{PackageKey, PackageMetadata, SnapshotEntry};
-use pnpm_pnpr_client::{ArtifactCandidate, ArtifactSubject, OwnerScope, PackageIdentity};
-use pnpm_store_dir::{SideEffectsDiff, SideEffectsOverlay};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use pnpm_lockfile::{
+    PackageKey,
+    PackageMetadata,
+    SnapshotEntry,
+};
+use pnpm_pnpr_client::{
+    ArtifactCandidate,
+    ArtifactSubject,
+    OwnerScope,
+    PackageIdentity,
+};
+use pnpm_store_dir::{
+    SideEffectsDiff,
+    SideEffectsOverlay,
+};
+use std::collections::{
+    BTreeMap,
+    HashMap,
+    HashSet,
+};
 
 pub(super) struct CandidateGroup {
     pub(super) candidate: ArtifactCandidate,
@@ -22,7 +49,7 @@ pub(super) fn plan_eligible_roots(
     setup: &RemoteCacheSetup,
 ) -> Vec<PackageKey> {
     let roots = eligible_roots(
-        options.snapshots,
+        options.wanted.0,
         options.requires_build_by_snapshot,
         options.allow_build_policy,
         options.cached.base_cas_paths,
@@ -64,7 +91,9 @@ pub(super) fn eligible_roots(
                 .copied()
                 .unwrap_or(false)
                 && eligible_packages.contains(&snapshot_key.name.to_string())
-                && allow_build_policy.check(&snapshot_key.without_peer().to_string()) == Some(true)
+                && allow_build_policy
+                    .check(&snapshot_key.without_peer().to_string())
+                    .unwrap_or(false)
                 && allow_build_policy.caches_build(snapshot_key)
                 && has_materialized_base(snapshot_key, base_cas_paths, cold_snapshots)
         })
@@ -79,6 +108,8 @@ pub(super) struct CandidatePlan<'a> {
     pub(super) setup: &'a RemoteCacheSetup,
     pub(super) side_effects_by_snapshot: &'a SideEffectsBySnapshot,
     pub(super) store_index_keys_by_snapshot: &'a StoreIndexKeysBySnapshot,
+    pub(super) supported_architectures:
+        Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
 }
 /// Group the eligible snapshots by artifact input key, dropping the
 /// ones a persisted or locally cached overlay already covers.
@@ -135,7 +166,9 @@ pub(super) struct DepStateHasher {
 }
 impl DepStateHasher {
     fn new(plan: &CandidatePlan<'_>, roots: &[PackageKey]) -> Self {
-        let graph = build_deps_subgraph(plan.snapshots, plan.packages, roots.iter().cloned());
+        let platforms = crate::runtime_platform_selector(plan.supported_architectures);
+        let graph =
+            build_deps_subgraph(plan.snapshots, plan.packages, (roots.iter().cloned(), &platforms));
         Self {
             graph,
             cache: pnpm_graph_hasher::DepsStateCache::new(),
@@ -206,6 +239,13 @@ pub(super) async fn plan_root(
 }
 /// The artifact one snapshot would look up. `None` when the package has
 /// no metadata row, or no integrity to bind the artifact's subject to.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`input_key` is copied only after the metadata and integrity early returns, and callers borrow it, so an owned parameter would allocate for snapshots that yield no candidate."
+    )
+)]
 pub(super) fn artifact_candidate(
     plan: &CandidatePlan<'_>,
     snapshot_key: &PackageKey,

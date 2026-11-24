@@ -1,10 +1,21 @@
 use pipe_trait::Pipe;
-use pnpm_lockfile::{Lockfile, PkgNameVerPeer};
+use pnpm_lockfile::{
+    Lockfile,
+    PkgNameVerPeer,
+};
 use pnpm_resolving_resolver_base::ResolveOptions;
-use std::{fmt::Write, path::Path, sync::Arc};
+use std::{
+    fmt::Write,
+    path::Path,
+    sync::Arc,
+};
 
 use super::subtree_fully_reusable;
-use crate::resolve_dependency_tree::{TreeCtx, lock_recoverable, workspace_ctx::WorkspaceTreeCtx};
+use crate::resolve_dependency_tree::{
+    TreeCtx,
+    lock_recoverable,
+    workspace_ctx::WorkspaceTreeCtx,
+};
 
 /// `a` and `b` depend on each other, and `a` also depends on `c`.
 const CYCLE: &str = "lockfileVersion: '9.0'
@@ -78,7 +89,7 @@ fn reusable_at(ctx: &TreeCtx, lockfile: &Lockfile, key: &str, depth: i32) -> boo
 }
 
 fn memoised_answers(ctx: &TreeCtx) -> usize {
-    lock_recoverable(&ctx.workspace.cache.subtree.reusable).len()
+    lock_recoverable(&ctx.workspace.cache.lockfile_reuse.reusable).len()
 }
 
 #[test]
@@ -224,10 +235,10 @@ fn importers_updating_the_same_targets_share_their_target_distances() {
         .pipe(Arc::new);
     for importer in ["first", "second"] {
         let ctx = TreeCtx::with_workspace(Arc::clone(&workspace), ResolveOptions::default())
-            .with_importer_id(importer);
+            .with_importer_id(importer.to_owned());
         assert!(!reusable(&ctx, &lockfile, "a@1.0.0"));
     }
-    assert_eq!(lock_recoverable(&workspace.cache.subtree.target_distances).len(), 1);
+    assert_eq!(lock_recoverable(&workspace.cache.lockfile_reuse.target_distances).len(), 1);
 }
 
 #[test]

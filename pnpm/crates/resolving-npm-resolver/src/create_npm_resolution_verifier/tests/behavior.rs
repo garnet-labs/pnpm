@@ -1,9 +1,27 @@
 use super::{
-    FAKE_INTEGRITY, HashMap, LockfileResolution, PkgName, REVISION_ONE_DIGEST, REVISION_TWO_DIGEST,
-    REVISION_ZERO_DIGEST, RegistryResolution, ResolutionVerification, TarballResolution,
-    TarballRevision, TrustPolicy, Utc, abbreviated_packument_json, assert_eq,
-    create_npm_resolution_verifier, create_package_version_policy, ctx, default_opts,
-    fake_integrity, min_age_packument_json, now_at, registry_resolution, revision_integrity,
+    FAKE_INTEGRITY,
+    HashMap,
+    LockfileResolution,
+    PkgName,
+    REVISION_ONE_DIGEST,
+    REVISION_TWO_DIGEST,
+    REVISION_ZERO_DIGEST,
+    RegistryResolution,
+    ResolutionVerification,
+    TarballResolution,
+    TarballRevision,
+    TrustPolicy,
+    abbreviated_packument_json,
+    assert_eq,
+    create_npm_resolution_verifier,
+    create_package_version_policy,
+    ctx,
+    default_opts,
+    fake_integrity,
+    min_age_packument_json,
+    now_at,
+    registry_resolution,
+    revision_integrity,
     tarball_resolution,
 };
 use pnpm_resolving_resolver_base::ResolutionVerifier;
@@ -212,7 +230,7 @@ async fn verify_short_circuits_non_registry_resolution() {
 }
 
 /// Git-host archive URLs pin a full commit SHA, and pnpm never
-/// recorded an integrity for them, so they stay exempt — recognized
+/// recorded an integrity for them, so they stay exempt, recognized
 /// from the URL even on a lockfile that omits the `gitHosted` marker.
 #[tokio::test]
 async fn git_hosted_archive_url_stays_exempt_without_the_flag() {
@@ -301,7 +319,7 @@ async fn verify_routes_via_named_registry_prefix() {
 
     let mut named = HashMap::new();
     named.insert("internal".to_string(), format!("{server_url}/"));
-    // Default registry is bogus — if the named-registry routing
+    // Default registry is bogus, if the named-registry routing
     // breaks, the request would target the bogus URL and the test
     // would fail with a connection error instead of finding the mock.
     let mut opts = default_opts("http://nonexistent.example.invalid/");
@@ -353,7 +371,8 @@ fn policy_snapshot_records_all_fields_sorted_and_deduped() {
     assert_eq!(
         min_age_excludes
             .iter()
-            .filter_map(|value| value.as_str().map(str::to_string))
+            .map(serde_json::Value::as_str)
+            .filter_map(|text| text.map(str::to_string))
             .collect::<Vec<_>>(),
         vec!["acme".to_string(), "lodash".to_string()],
         "sorted + deduped",
@@ -370,7 +389,7 @@ fn policy_snapshot_records_all_fields_sorted_and_deduped() {
 }
 
 /// Concurrent verifications of the same `(registry, name, version)`
-/// share one in-flight fetch — the lookup-context caches store
+/// share one in-flight fetch, the lookup-context caches store
 /// `Arc<OnceCell<…>>`, so 16 racing callers issue at most one
 /// abbreviated GET. Without the singleflight property the verifier
 /// regressed to N fetches per fan-out batch, which mockito's
@@ -406,68 +425,6 @@ async fn concurrent_verifications_share_one_fetch() {
         assert_eq!(result, ResolutionVerification::Ok);
     }
     abbreviated_mock.assert_async().await;
-}
-
-/// Same registry document, flag unset: the verifier still passes, but
-/// only by escalating to the full-packument fetch — a second request
-/// for the same document. Guards both directions: the new step never
-/// runs without the flag, and the request the flag saves is real.
-#[tokio::test]
-async fn without_registry_supports_time_field_abbreviated_time_is_not_consulted() {
-    let mut server = mockito::Server::new_async().await;
-    let registry = format!("{}/", server.url());
-    let server_url = server.url();
-    let now = Utc::now();
-    let meta = serde_json::json!({
-        "name": "aged-pkg",
-        "dist-tags": { "latest": "1.0.0" },
-        "modified": now.to_rfc3339(),
-        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
-        "versions": {
-            "1.0.0": {
-                "name": "aged-pkg",
-                "version": "1.0.0",
-                "dist": {
-                    "integrity": FAKE_INTEGRITY,
-                    "shasum": "0000000000000000000000000000000000000000",
-                    "tarball": format!("{server_url}/aged-pkg/-/aged-pkg-1.0.0.tgz"),
-                }
-            }
-        }
-    });
-    let meta_mock = server
-        .mock("GET", "/aged-pkg")
-        .with_status(200)
-        .with_body(meta.to_string())
-        // Abbreviated fetch for the modified shortcut, then the
-        // full-packument fallback for the per-version timestamp.
-        .expect(2)
-        .create_async()
-        .await;
-    // Without the flag the per-version fallbacks run in order, so the
-    // attestation endpoint is consulted (and 404s) before the full
-    // packument. Asserting it makes the escalation the flag avoids explicit.
-    let attestation_mock = server
-        .mock("GET", "/-/npm/v1/attestations/aged-pkg@1.0.0")
-        .with_status(404)
-        .expect(1)
-        .create_async()
-        .await;
-    let mut opts = default_opts(&registry);
-    opts.release_age.minimum_minutes = Some(60 * 24);
-    let verifier = create_npm_resolution_verifier(opts);
-    let resolution = LockfileResolution::Tarball(TarballResolution {
-        tarball: format!("{server_url}/aged-pkg/-/aged-pkg-1.0.0.tgz"),
-        integrity: Some(fake_integrity()),
-        revision: None,
-        git_hosted: None,
-        path: None,
-    });
-    let name: PkgName = "aged-pkg".parse().expect("parse");
-    let result = verifier.verify(&resolution, ctx(&name, "1.0.0")).await;
-    assert_eq!(result, ResolutionVerification::Ok);
-    meta_mock.assert_async().await;
-    attestation_mock.assert_async().await;
 }
 
 #[tokio::test]

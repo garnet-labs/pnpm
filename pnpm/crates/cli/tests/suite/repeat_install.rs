@@ -1,5 +1,5 @@
-//! End-to-end coverage for installs over an **existing** `node_modules`
-//! — the repair, reuse, and divergence scenarios of upstream's
+//! End-to-end coverage for installs over an **existing** `node_modules`,
+//! the repair, reuse, and divergence scenarios of upstream's
 //! `deps-restorer` and `deps-installer` suites. Every test installs
 //! once, damages or drifts some part of the on-disk state, installs
 //! again, and asserts the second install converges without rebuilding
@@ -12,15 +12,23 @@ use crate::_utils;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     fixtures::tarball_with_manifest,
-    fs::{SameFileWitness, is_symlink_or_junction},
+    fs::{
+        SameFileWitness,
+        is_symlink_or_junction,
+    },
 };
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+};
 
-pub(crate) const IS_POSITIVE_PATCH: &str = include_str!(
-    "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0.patch"
-);
+pub(crate) const IS_POSITIVE_PATCH: &str =
+    include_str!("../fixtures/patches/is-positive@1.0.0.patch");
 
 /// `version` field of the `package.json` under `workspace/relative`.
 pub(crate) fn version_of(workspace: &Path, relative: &str) -> String {
@@ -599,7 +607,7 @@ fn available_packages_are_relinked_during_forced_fresh_install() {
 /// TS: `available packages are relinked during forced install`
 /// (`deps-restorer index.ts:469`): a forced frozen install relinks
 /// every package the lockfile names, not just the diff against the
-/// previous install — a file removed from an already-materialized
+/// previous install, a file removed from an already-materialized
 /// package's virtual-store copy comes back, and the unchanged package
 /// is re-reported as `resolved` alongside the newly added one.
 #[test]
@@ -624,7 +632,7 @@ fn available_packages_are_relinked_during_forced_install() {
         .success();
 
     // Extend the manifest and wanted lockfile without touching
-    // `node_modules` — the CLI equivalent of upstream's fixture swap
+    // `node_modules`, the CLI equivalent of upstream's fixture swap
     // from `has-glob` to `has-glob-and-rimraf`.
     fs::write(
         workspace.join("package.json"),
@@ -663,7 +671,8 @@ fn available_packages_are_relinked_during_forced_install() {
     );
     let resolved: Vec<String> = ndjson_records(&output)
         .iter()
-        .filter(|record| record["name"] == "pnpm:progress" && record["status"] == "resolved")
+        .filter(|record| record["name"] == "pnpm:progress")
+        .filter(|record| record["status"] == "resolved")
         .filter_map(|record| record["packageId"].as_str().map(str::to_string))
         .collect();
     for package_id in ["@pnpm.e2e/foobarqar@1.0.0", "@pnpm.e2e/pkg-with-1-dep@100.0.0"] {
@@ -1378,14 +1387,15 @@ fn repeat_install_relinks_after_a_global_virtual_store_dir_change() {
 }
 
 #[test]
-fn repeat_install_verifies_the_lockfile_after_trust_lockfile_is_turned_off() {
+fn only_repeat_install_acts_on_trust_lockfile_drift() {
     let harness = CommandTempCwd::init().add_mocked_registry();
     let workspace = harness.workspace.clone();
-    fs::write(
-        workspace.join("package.json"),
-        serde_json::json!({ "dependencies": { "is-positive": "1.0.0" } }).to_string(),
-    )
-    .expect("write package.json");
+    let manifest_path = workspace.join("package.json");
+    let mut manifest = serde_json::json!({
+        "dependencies": { "is-positive": "1.0.0" },
+        "scripts": { "hello": "echo hello from script" },
+    });
+    fs::write(&manifest_path, manifest.to_string()).expect("write package.json");
     append_workspace_yaml_key(&workspace, "trustLockfile", true);
     pacquet_in(&workspace)
         .with_arg("install")
@@ -1396,6 +1406,23 @@ fn repeat_install_verifies_the_lockfile_after_trust_lockfile_is_turned_off() {
     let yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
     fs::write(&yaml_path, yaml.replace("trustLockfile: true", "trustLockfile: false"))
         .expect("turn trustLockfile off");
+    let state = || pnpm_workspace_state::load_workspace_state(&workspace).unwrap().unwrap();
+    let original = state();
+    assert_eq!(original.settings.trust_lockfile, Some(true));
+
+    manifest["description"] = serde_json::json!("edited");
+    fs::write(&manifest_path, manifest.to_string()).expect("edit package.json");
+    let run = pacquet_in(&workspace)
+        .with_args(["--config.verify-deps-before-run=error", "run", "hello"])
+        .output()
+        .expect("run the script");
+    assert_success(&run);
+    assert!(String::from_utf8_lossy(&run.stdout).contains("hello from script"));
+
+    let refreshed = state();
+    assert_eq!(refreshed.settings.trust_lockfile, Some(true));
+    assert_ne!(original.validation.unwrap().manifests, refreshed.validation.unwrap().manifests);
+
     let output = pacquet_in(&workspace)
         .with_args(["install", "--reporter=ndjson"])
         .output()
@@ -1588,13 +1615,12 @@ fn an_edited_directory_beneath_an_excluded_optional_dependency_passes_frozen_ins
     _utils::assert_success(&install(&["--frozen-lockfile"]));
 }
 
-/// A workspace project that publishes from `dist` reads differently through
-/// `file:` (its `dist/package.json`) and `workspace:` (the project
-/// manifest). The lockfile does not record which one the override used, so
-/// an edit to `dist/package.json` alone makes the frozen install reject the
-/// lockfile.
+/// A `file:` directory a workspace project publishes from is described by the
+/// project's manifest, whichever spec reaches it. Beneath a registry package,
+/// an edit to the built `dist/package.json` leaves the lockfile current, and
+/// an edit to the project's manifest makes it stale.
 #[test]
-fn an_edited_publish_directory_beneath_a_registry_package_fails_frozen_install() {
+fn a_publish_directory_beneath_a_registry_package_follows_its_project_manifest() {
     let fixture = _utils::WorkspaceFixture::new();
     fixture.append_workspace_yaml(
         "overrides:\n  \
@@ -1630,6 +1656,9 @@ fn an_edited_publish_directory_beneath_a_registry_package_fails_frozen_install()
 
     fs::write(lib.join("dist/package.json"), manifest("100.1.0"))
         .expect("edit the published manifest");
+    _utils::assert_success(&install(&["--frozen-lockfile"]));
+
+    fs::write(lib.join("package.json"), manifest("100.1.0")).expect("edit the project manifest");
     let frozen = install(&["--frozen-lockfile"]);
     let stderr = String::from_utf8_lossy(&frozen.stderr);
     assert!(

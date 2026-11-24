@@ -1,26 +1,49 @@
 use crate::{
     State,
     cli_args::pipelines::{
-        InstallFamilySelection, installed_project_config, project_names, select_workspace_projects,
+        InstallFamilySelection,
+        installed_project_config,
+        project_names,
+        select_workspace_projects,
     },
 };
 use clap::Args;
-use miette::{Context, IntoDiagnostic};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
 use pnpm_config::Config;
-use pnpm_modules_yaml::{Host, read_modules_layout, read_modules_manifest};
-use pnpm_package_manager::{ProjectMutation, RebuildOptions, allow_build_key_from_ignored_build};
-use pnpm_package_manifest::{DependencyGroup, project_manifest_path};
+use pnpm_lockfile::PackageKey;
+use pnpm_modules_yaml::{
+    Host,
+    read_modules_layout,
+    read_modules_manifest,
+};
+use pnpm_package_manager::{
+    ProjectMutation,
+    RebuildOptions,
+    allow_build_key_from_ignored_build,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    project_manifest_path,
+};
 use pnpm_reporter::Reporter;
 use pnpm_workspace_task_scheduler::{
-    ScheduleGraphAsyncOptions, TaskCompletion, schedule_graph_async,
+    ScheduleGraphAsyncOptions,
+    TaskCompletion,
+    schedule_graph_async,
 };
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Mutex,
 };
 
-/// `pnpm rebuild` — re-run the lifecycle scripts of installed
+/// `pnpm rebuild`: re-run the lifecycle scripts of installed
 /// dependencies.
 #[derive(Debug, Clone, Args)]
 pub struct RebuildArgs {
@@ -141,6 +164,8 @@ pub(crate) struct RebuildSelection {
     /// Allow-build keys of the dependencies to rebuild, or `None` for
     /// every build-needing package.
     pub(crate) names: Option<Vec<String>>,
+    /// Exact snapshot keys, overriding the name selection for `edit`.
+    pub(crate) snapshots: Option<Vec<PackageKey>>,
     /// [`RebuildOptions::pending_projects`]; only `--pending` populates it.
     pub(crate) projects: Vec<String>,
 }
@@ -151,7 +176,7 @@ pub(crate) struct RebuildSelection {
 ///
 /// A `pendingBuilds` record is a dep path for a dependency and an
 /// importer id for a project, and both are plain strings on disk. They
-/// are told apart by [`pending_entry_is_project`] — asking the string's
+/// are told apart by [`pending_entry_is_project`], asking the string's
 /// shape instead would misread a workspace directory named `foo@1.0.0`
 /// as a dependency and then drop its debt without running anything.
 fn resolve_selection(
@@ -161,14 +186,22 @@ fn resolve_selection(
 ) -> miette::Result<RebuildSelection> {
     let config = state.config;
     if !packages.is_empty() {
-        return Ok(RebuildSelection { names: Some(packages.to_vec()), projects: Vec::new() });
+        return Ok(RebuildSelection {
+            snapshots: None,
+            names: Some(packages.to_vec()),
+            projects: Vec::new(),
+        });
     }
     if !pending {
         return Ok(RebuildSelection::default());
     }
     let Some(modules) = read_modules_manifest::<Host>(&config.modules_dir).into_diagnostic()?
     else {
-        return Ok(RebuildSelection { names: Some(Vec::new()), projects: Vec::new() });
+        return Ok(RebuildSelection {
+            snapshots: None,
+            names: Some(Vec::new()),
+            projects: Vec::new(),
+        });
     };
     let lockfile_dir = config.modules_dir_anchor().unwrap_or(&config.modules_dir);
     let active_importer_id = state.active_importer_id();
@@ -177,6 +210,7 @@ fn resolve_selection(
         .iter()
         .partition(|entry| pending_entry_is_project(lockfile_dir, &active_importer_id, entry));
     Ok(RebuildSelection {
+        snapshots: None,
         names: Some(
             dep_paths
                 .into_iter()
@@ -194,7 +228,7 @@ fn resolve_selection(
 /// An importer id is always a relative path; a dep path can be
 /// absolute-looking (`/lodash@1.0.0`), and Rust's `Path::join` replaces
 /// the base on an absolute component, so only a relative entry is
-/// probed — an absolute one is a dependency by construction.
+/// probed, an absolute one is a dependency by construction.
 fn pending_entry_is_project(lockfile_dir: &Path, active_importer_id: &str, entry: &str) -> bool {
     !Path::new(entry).is_absolute()
         && (entry == active_importer_id
@@ -212,7 +246,12 @@ pub(crate) async fn run_rebuild<Reporter: self::Reporter + 'static>(
 ) -> miette::Result<()> {
     let lockfile_path = state.lockfile_path();
     let rebuild = RebuildOptions {
-        selected_names: selection.names.map(|names| names.into_iter().collect::<HashSet<_>>()),
+        selected_names: selection.names
+            .map(std::iter::IntoIterator::into_iter)
+            .map(std::iter::Iterator::collect::<HashSet<_>>),
+        selected_snapshots: selection.snapshots
+            .map(std::iter::IntoIterator::into_iter)
+            .map(std::iter::Iterator::collect),
         pending_projects: selection.projects,
         check_lockfile_patches_only: false,
         skip_if_has_side_effects_cache: false,
@@ -245,11 +284,11 @@ pub(crate) async fn run_rebuild<Reporter: self::Reporter + 'static>(
 /// The dependency groups the current `node_modules` was materialized with,
 /// read from `.modules.yaml`'s `included`. A rebuild must keep the
 /// installed set unchanged, so it reuses exactly these groups rather than
-/// widening to all of them — otherwise a `--prod` / `--no-optional`
+/// widening to all of them; otherwise a `--prod` / `--no-optional`
 /// install would have its excluded dev/optional dependencies fetched and
 /// their lifecycle scripts run. Falls back to every group when there is no
 /// `.modules.yaml`, or when it records no included groups (a legacy
-/// manifest written before `included` existed, or a corrupt one) — neither
+/// manifest written before `included` existed, or a corrupt one); neither
 /// is a recorded "include nothing" intent to preserve.
 fn rebuild_dependency_groups(config: &Config) -> miette::Result<Vec<DependencyGroup>> {
     const ALL: [DependencyGroup; 3] =

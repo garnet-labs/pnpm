@@ -6,18 +6,42 @@
 //! record of the channel next to them, which the dispatcher reads.
 
 use crate::{
-    cli_args::shim::{add_shims, check_shims_addable, remove_shims},
+    cli_args::shim::{
+        add_shims,
+        check_shims_addable,
+        remove_shims,
+    },
     shim_dispatch::rust_toolchain::{
-        RUST_SHIM_BINS, RUST_SHIM_PACKAGE, expire_for_shims, global_toolchain, install_for_shims,
-        installed_release_for_shims, record_global_toolchain,
+        RUST_SHIM_BINS,
+        RUST_SHIM_PACKAGE,
+        expire_for_shims,
+        global_toolchain,
+        install_for_shims,
+        installed_release_for_shims,
+        record_global_toolchain,
     },
 };
-use miette::{Context, IntoDiagnostic};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
 use pnpm_config::Config;
-use pnpm_global::{GlobalTool, ListReportAs};
+use pnpm_global::{
+    GlobalTool,
+    ListReportAs,
+};
 use pnpm_matcher::WildcardMatcher;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
-use pnpm_rust_toolchain::{Channel, Profile, ToolchainRequest};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
+use pnpm_rust_toolchain::{
+    Channel,
+    Profile,
+    ToolchainRequest,
+};
 use std::path::Path;
 
 /// The name `pnpm remove -g` and `pnpm update -g` take for the toolchain.
@@ -51,7 +75,7 @@ pub(super) async fn add_global_rust<Reporter: self::Reporter>(
     record_global_toolchain(global_bin_dir, &request.channel)
         .into_diagnostic()
         .wrap_err("record the global Rust toolchain")?;
-    report::<Reporter>(&format!("Installed {}", describe(&request)));
+    report::<Reporter>(format!("Installed {}", describe(&request)));
     Ok(())
 }
 
@@ -69,7 +93,7 @@ pub(super) fn remove_global_rust<Reporter: self::Reporter>(
         .any(|(_, bins)| !bins.is_empty());
     let removed = had_toolchain || removed_shims;
     if removed {
-        report::<Reporter>("Removed the global Rust toolchain");
+        report::<Reporter>("Removed the global Rust toolchain".to_owned());
     }
     Ok(removed)
 }
@@ -94,7 +118,7 @@ pub(super) async fn update_global_rust<Reporter: self::Reporter>(
         }
         _ => format!("Installed {}", describe(&request)),
     };
-    report::<Reporter>(&message);
+    report::<Reporter>(message);
     Ok(true)
 }
 
@@ -218,11 +242,8 @@ fn describe(request: &ToolchainRequest) -> String {
     }
 }
 
-fn report<Reporter: self::Reporter>(message: &str) {
-    Reporter::emit(&LogEvent::Global(GlobalLog {
-        level: LogLevel::Info,
-        message: message.to_string(),
-    }));
+fn report<Reporter: self::Reporter>(message: String) {
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Info, message }));
 }
 
 #[cfg(test)]

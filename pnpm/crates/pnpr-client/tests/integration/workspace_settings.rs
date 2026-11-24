@@ -1,6 +1,13 @@
 use super::{
-    BTreeMap, Ipv4Addr, PnprClient, ResolveProject, ResolveProjectsOptions, TcpListener,
-    capture_one_request_with_response, deps, options,
+    BTreeMap,
+    Ipv4Addr,
+    PnprClient,
+    ResolveProject,
+    ResolveProjectsOptions,
+    TcpListener,
+    capture_one_request_with_response,
+    deps,
+    options,
 };
 
 #[tokio::test]
@@ -9,6 +16,24 @@ async fn multi_project_request_sends_every_workspace_project_without_a_synthetic
     let addr = listener.local_addr().expect("capture addr");
     let done = serde_json::json!({
         "type": "done",
+        "lockfileFormat": "pnpm-lock/9.0",
+        "appliedPolicies": {
+            "autoInstallPeers": true,
+            "dedupePeers": true,
+            "excludeLinksFromLockfile": false,
+            "addMissingPeerTypes": false,
+            "projectScopedOptionalPeers": false,
+            "frozenLockfile": false,
+            "resolutionMode": "highest",
+            "minimumReleaseAge": null,
+            "minimumReleaseAgeExclude": [],
+            "minimumReleaseAgeIgnoreMissingTime": true,
+            "minimumReleaseAgeStrict": false,
+            "trustPolicy": null,
+            "trustPolicyExclude": [],
+            "trustPolicyIgnoreAfter": null,
+            "trustLockfile": false,
+        },
         "lockfile": {
             "lockfileVersion": "9.0",
             "importers": {
@@ -38,6 +63,7 @@ async fn multi_project_request_sends_every_workspace_project_without_a_synthetic
             dev_dependencies: BTreeMap::new(),
             optional_dependencies: BTreeMap::new(),
             peer_dependencies: BTreeMap::new(),
+            dependencies_meta: None,
         },
         ResolveProject {
             dir: "packages/lib".to_string(),
@@ -48,6 +74,7 @@ async fn multi_project_request_sends_every_workspace_project_without_a_synthetic
             dev_dependencies: deps([("lib-tool", "2.0.0")]),
             optional_dependencies: BTreeMap::new(),
             peer_dependencies: BTreeMap::new(),
+            dependencies_meta: None,
         },
     ];
 

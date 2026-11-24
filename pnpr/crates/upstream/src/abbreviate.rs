@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use pnpm_package_manifest::is_truthy;
 use serde_json::Value;
 
@@ -6,7 +6,7 @@ use serde_json::Value;
 /// (`application/vnd.npm.install-v1+json`) form.
 pub(super) const ABBREVIATED_TOP_FIELDS: &[&str] = &["name", "dist-tags"];
 
-/// Per-version fields preserved in the abbreviated form — a subset of
+/// Per-version fields preserved in the abbreviated form, a subset of
 /// the npm spec's abbreviated version object.
 pub(super) const ABBREVIATED_VERSION_FIELDS: &[&str] = &[
     "name",
@@ -31,7 +31,7 @@ pub(super) const ABBREVIATED_VERSION_FIELDS: &[&str] = &[
 /// Strip a parsed packument down to the abbreviated install-v1 form.
 /// Should be called *after* [`crate::rewrite_tarball_urls`] so the returned
 /// document's `dist.tarball` URLs already point at this server.
-pub fn abbreviate_packument(packument: &Value, now: DateTime<Utc>) -> Value {
+pub fn abbreviate_packument(packument: &Value, now: Timestamp) -> Value {
     let mut out = serde_json::Map::new();
     let Some(obj) = packument.as_object() else {
         return Value::Object(out);
@@ -69,7 +69,8 @@ pub(super) fn abbreviate_versions(versions: &serde_json::Map<String, Value>) -> 
 pub fn abbreviate_version(manifest: &Value) -> Value {
     manifest
         .as_object()
-        .map_or(Value::Null, |version_obj| Value::Object(abbreviate_version_object(version_obj)))
+        .map(abbreviate_version_object)
+        .map_or(Value::Null, Value::Object)
 }
 
 fn abbreviate_version_object(

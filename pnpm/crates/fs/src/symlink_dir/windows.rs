@@ -1,10 +1,30 @@
+use super::share_links::{
+    ShareLinks,
+    UnusableShareLinksError,
+    open_through,
+};
+use derive_more::{
+    Display,
+    Error,
+};
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    sync::{
-        Mutex, PoisonError,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+    borrow::Cow,
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
     },
+    sync::{
+        Mutex,
+        PoisonError,
+        atomic::{
+            AtomicU8,
+            AtomicU64,
+            Ordering,
+        },
+    },
+    time::Duration,
 };
 
 /// Cached choice of writer. `UNDECIDED` until the first successful
@@ -18,7 +38,7 @@ static MODE: AtomicU8 = AtomicU8::new(UNDECIDED);
 static JUNCTION_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 static JUNCTION_COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
-/// True symlinks on Windows take a relative target —
+/// True symlinks on Windows take a relative target,
 /// `path.relative(dirname(dest), src)`, the same form used on Unix.
 /// Junctions take the absolute path with a trailing backslash, but
 /// the `junction` crate handles that internally so we pass
@@ -38,6 +58,55 @@ pub(super) fn create_with_contents(
     contents: &Path,
     link: &Path,
 ) -> io::Result<()> {
+    create_link(original, contents, link)
+        .map_err(|error| explain_network_share_refusal(link, error))
+}
+
+/// A link on a network share that could not be created. Many SMB servers,
+/// Windows ones included, deny both the symlink and the junction, and
+/// pnpm 11 fails there in the same way. The share's permissions can deny
+/// it too, so the message doesn't claim to know which. The hoisted linker
+/// still links `link:` and `workspace:` dependencies, so the advice
+/// doesn't promise it avoids every link. The refusal stays reachable as
+/// the source.
+#[derive(Debug, Display, Error)]
+#[display(
+    "Could not create a link on a network share. Windows file shares often refuse junctions \
+     and symlinks. If this one does, move the project to a local drive, or set `nodeLinker: \
+     hoisted` in pnpm-workspace.yaml, which copies registry dependencies into node_modules \
+     instead of linking them. Workspace packages are linked even with the hoisted linker."
+)]
+pub(super) struct NetworkShareLinkError {
+    source: io::Error,
+}
+
+/// Keep the kind of a refused link, but say what to do about it when the
+/// link is on a network share.
+pub(super) fn explain_network_share_refusal(link: &Path, error: io::Error) -> io::Error {
+    let refused =
+        matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported);
+    let explained = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<UnusableShareLinksError>())
+        .is_some();
+    if !refused || explained || !crate::mapped_drive_path::is_on_network_drive(link) {
+        return error;
+    }
+    io::Error::new(error.kind(), NetworkShareLinkError { source: error })
+}
+
+fn create_link(original: &Path, contents: &Path, link: &Path) -> io::Result<()> {
+    // On a network share the kind of link is the one that can be opened
+    // there, see [`super::share_links`]. This doesn't touch `MODE`: links on
+    // local drives keep preferring symlinks.
+    match super::share_links::share_links(link, original)? {
+        Some(ShareLinks::Junction) => return create_junction(original, link),
+        Some(ShareLinks::Symlink) => return std::os::windows::fs::symlink_dir(contents, link),
+        Some(ShareLinks::Unusable(error)) => {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, error));
+        }
+        None => {}
+    }
     match MODE.load(Ordering::Relaxed) {
         USE_SYMLINK => match std::os::windows::fs::symlink_dir(contents, link) {
             Err(error) if should_fallback_to_junction(&error) => {
@@ -50,8 +119,124 @@ pub(super) fn create_with_contents(
     }
 }
 
+/// The contents of the link at `link` to `target` when it is of the kind
+/// that can be opened on its network share, and an error for any other
+/// entry. `None` when `link` isn't on a share. An earlier install may have
+/// left the other kind, which is replaced rather than reused even when it
+/// points at the right target. Where junctions are used, reading a junction
+/// as one fails for a symlink in the same open, so a warm install pays
+/// nothing extra per link. Where symlinks are used, telling them from
+/// junctions takes a second open per link. Where neither kind can be
+/// created, a link left by an earlier install is reused if it opens.
+pub(super) fn read_share_link(link: &Path, target: &Path) -> Option<io::Result<PathBuf>> {
+    match super::share_links::share_links(link, target) {
+        Ok(None) => None,
+        Ok(Some(ShareLinks::Junction)) => Some(read_junction_target(link)),
+        Ok(Some(ShareLinks::Symlink)) => Some(
+            fs::read_link(link)
+                .and_then(|contents| {
+                    if reparse_tag(link) == Some(IO_REPARSE_TAG_SYMLINK) {
+                        Ok(contents)
+                    } else {
+                        Err(io::Error::from(io::ErrorKind::InvalidInput))
+                    }
+                }),
+        ),
+        Ok(Some(ShareLinks::Unusable(error))) => Some(
+            fs::read_link(link)
+                .and_then(|contents| open_through(link).map(|()| contents))
+                .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, error)),
+        ),
+        Err(error) => Some(Err(error)),
+    }
+}
+
+/// Whether the link at `link` to `target` is of the kind [`create_link`]
+/// writes there, or, where no kind can be created, whether it opens. Off a
+/// network share both kinds are fine.
+pub(super) fn is_link_kind_usable(link: &Path, target: &Path) -> bool {
+    match super::share_links::share_links(link, target) {
+        Ok(None) => true,
+        Ok(Some(ShareLinks::Junction)) => reparse_tag(link) == Some(IO_REPARSE_TAG_MOUNT_POINT),
+        Ok(Some(ShareLinks::Symlink)) => reparse_tag(link) == Some(IO_REPARSE_TAG_SYMLINK),
+        Ok(Some(ShareLinks::Unusable(_))) => open_through(link).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// How long [`read_settled_link`] waits for an empty directory to become a
+/// link. An empty directory that is still not a link afterwards is replaced.
+const HALF_CREATED_LINK_BUDGET: Duration = Duration::from_secs(1);
+
+/// [`super::read_symlink_dir`], waiting out a symlink another process is
+/// still creating.
+pub(super) fn read_settled_link(link: &Path) -> io::Result<PathBuf> {
+    // `CreateSymbolicLinkW` creates an empty directory and then makes it a
+    // reparse point, so for a moment a concurrent reader finds an empty
+    // directory that is not a link. Moving that aside as an occupant leaves
+    // the link the other process completes behind as `.ignored_<name>`.
+    const ERROR_NOT_A_REPARSE_POINT: i32 = 4390;
+    crate::retry::retry_fs_operation_for(
+        || super::read_symlink_dir(link),
+        |error| error.raw_os_error() == Some(ERROR_NOT_A_REPARSE_POINT) && may_become_link(link),
+        HALF_CREATED_LINK_BUDGET,
+    )
+}
+
+/// Whether `path` may be a link that is still being created: an empty
+/// directory, one its creator holds open so it cannot be listed, or one that
+/// has become a link since a read found it was not one. A link lists its
+/// target's entries, so the tag is read after the listing.
+fn may_become_link(path: &Path) -> bool {
+    let may_be_half_created = match fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) => crate::retry::is_transient_file_lock_error(&error),
+    };
+    may_be_half_created || reparse_tag(path).is_some()
+}
+
+pub(super) const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+pub(super) const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+/// [`fs::read_link`] for a junction only: it fails for a true symlink or
+/// any other entry, with the same open and reparse read.
+///
+/// `junction::get_target` strips only the `\??\` prefix, so a junction to
+/// `\\server\share\…`, held as `\??\UNC\server\share\…`, comes back as
+/// `UNC\server\share\…`. That is turned back into the UNC path, which is
+/// what [`fs::read_link`] returns for it.
+pub(super) fn read_junction_target(link: &Path) -> io::Result<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{
+            OsStrExt as _,
+            OsStringExt as _,
+        },
+    };
+
+    let target = junction::get_target(link)?;
+    let wide: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let unc_prefix: Vec<u16> = r"UNC\".encode_utf16().collect();
+    let Some(rest) = wide.strip_prefix(unc_prefix.as_slice()) else {
+        return Ok(target);
+    };
+    let mut unc: Vec<u16> = r"\\".encode_utf16().collect();
+    unc.extend_from_slice(rest);
+    Ok(PathBuf::from(OsString::from_wide(&unc)))
+}
+
+/// The reparse tag of `path` itself, or `None` when it isn't a reparse
+/// point or can't be read. The standard library reports a junction and a
+/// symlink alike as a symlink, so the tag is the only way to tell them apart.
+pub(super) fn reparse_tag(path: &Path) -> Option<u32> {
+    pnpm_ffi_fs::reparse_tag(path)
+}
+
 fn probe_and_cache(original: &Path, contents: &Path, link: &Path) -> io::Result<()> {
-    // Try the true directory symlink first — that's what users
+    // Try the true directory symlink first; that's what users
     // running in Developer Mode (or as Administrator) get, and
     // true symlinks are preferred over junctions when allowed.
     // `CreateSymbolicLinkW` returns
@@ -74,7 +259,7 @@ pub(super) fn should_fallback_to_junction(error: &io::Error) -> bool {
     const ERROR_DIRECTORY: i32 = 267;
     // `CreateSymbolicLinkW` without symlink privilege (no Developer
     // Mode, not elevated) fails with `ERROR_PRIVILEGE_NOT_HELD`,
-    // which std maps to `Uncategorized` — not `PermissionDenied` —
+    // which std maps to `Uncategorized` (not `PermissionDenied`)
     // so it must be matched by raw os error.
     const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
     error.kind() == io::ErrorKind::PermissionDenied
@@ -90,8 +275,55 @@ fn create_and_cache_junction(original: &Path, link: &Path) -> io::Result<()> {
 }
 
 pub(super) fn create_junction(original: &Path, link: &Path) -> io::Result<()> {
-    let staging = stage_junction(original, link)?;
+    let staging = stage_junction(&junction_target(original), link)?;
     commit_staged_junction(link, &staging)
+}
+
+/// The target to give `junction::create` for `original`.
+///
+/// The `junction` crate prefixes the full path with `\??\`, which makes an
+/// NT path only of a drive path or a verbatim path. A plain UNC path
+/// `\\server\share\…` would become `\??\\\server\share\…`, which names
+/// nothing. Its verbatim form `\\?\UNC\server\share\…` becomes
+/// `\??\UNC\server\share\…`, the target Node.js writes for a junction to
+/// that path. A relative `original` is resolved first, as the crate would
+/// resolve it, because under a UNC working directory it becomes a UNC path.
+pub(super) fn junction_target(original: &Path) -> Cow<'_, Path> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{
+            OsStrExt as _,
+            OsStringExt as _,
+        },
+        path::{
+            Component,
+            Prefix,
+        },
+    };
+
+    if original.is_relative()
+        && let Ok(absolute) = std::path::absolute(original)
+    {
+        return match junction_target(&absolute) {
+            Cow::Borrowed(_) => Cow::Owned(absolute),
+            Cow::Owned(verbatim) => Cow::Owned(verbatim),
+        };
+    }
+    let is_plain_unc = matches!(
+        original.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..)),
+    );
+    if !is_plain_unc {
+        return Cow::Borrowed(original);
+    }
+    let mut verbatim: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    verbatim.extend(
+        original
+            .as_os_str()
+            .encode_wide()
+            .skip(2),
+    );
+    Cow::Owned(PathBuf::from(OsString::from_wide(&verbatim)))
 }
 
 /// Build the junction at a unique sibling path so no other worker can
@@ -102,8 +334,25 @@ fn stage_junction(original: &Path, link: &Path) -> io::Result<PathBuf> {
         match junction::create(original, &candidate) {
             Ok(()) => return Ok(candidate),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(discard_failed_staging(&candidate, error)),
         }
+    }
+}
+
+/// `junction::create` makes the directory before it sets the reparse
+/// point, and leaves it behind when that later step fails. Remove it so a
+/// failed link doesn't leave a `.pnpm-junction-*` directory next to it.
+/// `remove_dir` only removes an empty directory, and `NotFound` means the
+/// directory was never created. The error keeps its kind either way,
+/// because callers branch on it.
+fn discard_failed_staging(candidate: &Path, error: io::Error) -> io::Error {
+    match fs::remove_dir(candidate) {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => error,
+        Err(cleanup) => io::Error::new(
+            error.kind(),
+            format!("{error}; staged junction cleanup failed at {candidate:?}: {cleanup}"),
+        ),
     }
 }
 
@@ -146,7 +395,7 @@ enum CommitAttempt {
 /// Holding the lock for a single inspect-and-rename, rather than across
 /// the retries in [`commit_staged_junction`], keeps one locked path from
 /// stalling every other junction commit in the process and leaves the
-/// slow part — the reparse-point conversion inside [`stage_junction`] —
+/// slow part (the reparse-point conversion inside [`stage_junction`])
 /// running in parallel. Re-inspecting the destination on every try means
 /// a race lost while waiting is reused rather than retried through the
 /// budget. A delete-pending destination can deny inspection temporarily;
@@ -183,7 +432,7 @@ fn inspect_destination(link: &Path) -> Destination {
 
 /// The destination already holds a completed junction. Discard our staging
 /// copy and return `AlreadyExists` so [`super::force_symlink_inner`] reuses
-/// the finished link. A cleanup failure must not suppress that reuse — it
+/// the finished link. A cleanup failure must not suppress that reuse; it
 /// rides along as a [`super::ConcurrentCleanupWarning`] so the orphaned
 /// staging path still reaches the user.
 fn reuse_completed_destination(link: &Path, staging: &Path, context: &str) -> io::Error {
@@ -203,7 +452,7 @@ fn reuse_completed_destination(link: &Path, staging: &Path, context: &str) -> io
 }
 
 /// The destination couldn't be inspected. Discard staging and surface the
-/// inspection error, never as `AlreadyExists` — that kind would let the
+/// inspection error, never as `AlreadyExists`, that kind would let the
 /// caller reuse a link we could not verify. A concurrent cleanup failure
 /// downgrades the kind to `Other` since two independent errors are merged.
 fn inspect_failed(
@@ -225,7 +474,7 @@ fn inspect_failed(
 }
 
 /// The commit genuinely failed and left nothing at `link`. Discard staging
-/// and surface the commit error — but never as `AlreadyExists`, or
+/// and surface the commit error, but never as `AlreadyExists`, or
 /// [`super::force_symlink_inner`] would treat the missing link as reusable.
 /// A rename that lost the race only to have the winner vanish before the
 /// re-inspection can carry that kind, so strip it to `Other`; every other

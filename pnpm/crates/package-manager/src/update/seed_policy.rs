@@ -1,26 +1,63 @@
 pub(super) mod matching;
-pub(super) use matching::{ignored_resolved_names, matches_update_pattern};
+pub(super) use matching::{
+    ignored_resolved_names,
+    matches_update_pattern,
+};
 
 use super::{
-    CatalogCtx, LatestResolverChain, LatestRewriteCtx, MatchedRewriteInputs, UpdateError,
-    WorkspaceLinkTarget, emit_latest_ignored, latest_specifier,
+    CatalogCtx,
+    LatestResolverChain,
+    LatestRewriteCtx,
+    MatchedRewriteInputs,
+    UpdateError,
+    WorkspaceLinkTarget,
+    emit_range_flag_ignored,
+    latest_specifier,
     latest_subtree::widen_drop_targets_to_subtrees,
+    overrides::{
+        OverriddenDirect,
+        override_holds_declaration,
+    },
     record_matched_direct_update,
-    selectors::{ParsedSelector, expand_update_selectors, insert_update_target},
+    selectors::{
+        ParsedSelector,
+        expand_update_selectors,
+        insert_update_target,
+    },
+    tag_rewrite,
     workspace_specifier,
 };
-use crate::{ImporterUpdateSeedPolicy, UpdateSeedPolicy};
+use crate::{
+    ImporterUpdateSeedPolicy,
+    UpdateSeedPolicy,
+};
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
-use pnpm_matcher::{Matcher, create_matcher};
+use pnpm_matcher::{
+    Matcher,
+    create_matcher,
+};
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::Reporter;
-use pnpm_resolving_deps_resolver::{UpdateDepth, UpdateTargets};
-use pnpm_resolving_resolver_base::{PreferredVersions, WorkspacePackages};
-use std::collections::{BTreeMap, HashSet};
+use pnpm_resolving_deps_resolver::{
+    UpdateDepth,
+    UpdateTargets,
+};
+use pnpm_resolving_resolver_base::{
+    PreferredVersions,
+    WorkspacePackages,
+};
+use std::collections::{
+    BTreeMap,
+    HashSet,
+};
 
-use matching::{update_ignore_matcher, update_matcher_patterns};
+use matching::{
+    name_matched_seed_policy,
+    update_ignore_matcher,
+    update_matcher_patterns,
+};
 
 pub(super) fn selected_seed_policy(
     patches: bool,
@@ -41,7 +78,7 @@ pub(super) struct UpdateScope<'a> {
     pub(super) overridden_direct: &'a [OverriddenDirect],
     pub(super) lockfile: LockedImporter<'a>,
     pub(super) config: &'a Config,
-    pub(super) version: super::UpdateVersionOptions,
+    pub(super) version: super::UpdateVersionOptions<'a>,
     pub(super) selection: super::UpdateSelection<'a>,
     pub(super) updates_all_groups: bool,
 }
@@ -53,11 +90,6 @@ pub(super) struct LockedImporter<'a> {
     pub(super) id: &'a str,
 }
 
-pub(super) struct OverriddenDirect {
-    pub(super) name: String,
-    pub(super) group: DependencyGroup,
-    pub(super) effective_specifier: Option<String>,
-}
 /// What the branches accumulate on the way to a seed policy.
 #[derive(Default)]
 pub(super) struct UpdatePlan {
@@ -65,6 +97,11 @@ pub(super) struct UpdatePlan {
     pub(super) drop_targets: UpdateTargets,
     /// Manifest declarations to rewrite: `(name, group, specifier)`.
     pub(super) rewrites: Vec<(String, DependencyGroup, String)>,
+    /// Override entries to move: `(key, new value)`, keyed by the bare
+    /// package name the override pins. The move happens when an update that
+    /// names the package has to change the override for the resolution to
+    /// follow (pnpm/pnpm#8701).
+    pub(super) updated_overrides: Vec<(String, String)>,
     /// A compatible bump cannot name its version before the resolve, so the
     /// matched names are collected here and the install reports back what it
     /// settled on.
@@ -129,7 +166,7 @@ pub(super) async fn select_seed_policy<Reporter: self::Reporter>(
 
     let remaining_scope = UpdateScope { direct: &remaining_direct, ..*scope };
     if remaining_scope.use_name_matcher() {
-        return Ok(Some(name_matched_seed_policy(&remaining_scope, plan)));
+        return Ok(Some(name_matched_seed_policy::<Reporter>(&remaining_scope, plan, rewrite_ctx)));
     }
     let res = selector_seed_policy::<Reporter>(
         &remaining_scope,
@@ -181,8 +218,8 @@ pub(super) async fn all_direct_seed_policy<Reporter: self::Reporter>(
             .as_ref()
             .is_some_and(|matcher| matcher.matches(name))
     };
-    if scope.version.latest && !scope.version.save {
-        emit_latest_ignored::<Reporter>(rewrite_ctx.manifest);
+    if !scope.version.save {
+        emit_range_flag_ignored::<Reporter>(scope.version, rewrite_ctx.manifest);
     }
     for (name, group, previous) in scope.direct {
         if is_ignored(name) {
@@ -222,6 +259,12 @@ pub(super) async fn record_direct_update(
     declared: (&String, DependencyGroup, &String),
 ) -> Result<(), UpdateError> {
     let (name, group, previous) = declared;
+    // A selector-less update is no request to move an override, so the
+    // pair it holds is left alone.
+    if override_holds_declaration(scope, name, group) {
+        plan.drop_targets.insert(name.clone(), None);
+        return Ok(());
+    }
     if scope.version.latest
         && scope.version.save
         && let Some(specifier) =
@@ -231,7 +274,20 @@ pub(super) async fn record_direct_update(
             super::rewrite::apply_channel_bump_target(plan, name, group, previous, specifier);
         plan.rewrites.push((name.clone(), group, specifier));
     }
-    if scope.version.save && !scope.version.latest {
+    if let Some(tag) = scope.version.tag.filter(|_| scope.version.save)
+        && let Some(specifier) = tag_rewrite(
+            rewrite_ctx,
+            latest_chain,
+            &mut plan.preferred_versions_override,
+            scope.range_spec_style(),
+            (name, previous, tag),
+            Some(tag.to_string()),
+        )
+        .await?
+    {
+        plan.rewrites.push((name.clone(), group, specifier));
+    }
+    if scope.version.save && !scope.version.reaches_past_declared_range() {
         plan.bump_targets.push((name.clone(), group, previous.clone()));
     }
     plan.drop_targets.insert(name.clone(), None);
@@ -245,7 +301,8 @@ pub(super) fn widen_drop_targets_to_lockfile(
     nothing_dropped: bool,
     is_ignored: &impl Fn(&str) -> bool,
 ) {
-    if !scope.updates_all_groups || (scope.version.latest && nothing_dropped) {
+    if !scope.updates_all_groups || (scope.version.reaches_past_declared_range() && nothing_dropped)
+    {
         return;
     }
     let Some(snapshots) =
@@ -259,34 +316,6 @@ pub(super) fn widen_drop_targets_to_lockfile(
             plan.drop_targets.insert(name, None);
         }
     }
-}
-/// Bare-name selectors with a depth: every matching name updates, at any
-/// depth.
-pub(super) fn name_matched_seed_policy(
-    scope: &UpdateScope<'_>,
-    plan: &mut UpdatePlan,
-) -> UpdateSeedPolicy {
-    let patterns = update_matcher_patterns(scope);
-    let matcher = create_matcher(&patterns);
-    let ignore_matcher = update_ignore_matcher(scope);
-    let ignored_resolved_names = ignored_resolved_names(scope, ignore_matcher.as_ref());
-    for (name, group, previous) in scope.direct {
-        if !matches_update_pattern(&matcher, ignore_matcher.as_ref(), name) {
-            continue;
-        }
-        if scope.version.save {
-            plan.bump_targets.push((name.clone(), *group, previous.clone()));
-        }
-        plan.drop_targets.insert(name.clone(), None);
-    }
-    widen_drop_targets_by_matcher(
-        scope.lockfile.document,
-        plan,
-        &matcher,
-        ignore_matcher.as_ref(),
-        &ignored_resolved_names,
-    );
-    plan.drop_only(scope.max_depth())
 }
 /// Lockfile names keep transitive-only matches in the update scope.
 pub(super) fn widen_drop_targets_by_matcher(
@@ -327,10 +356,10 @@ pub(super) async fn selector_seed_policy<Reporter: self::Reporter>(
         .cloned()
         .collect::<Vec<_>>();
     if matched_direct.is_empty() {
-        // An unmatched `--latest` selector is a no-op. Deeper versioned
-        // selectors can still target lockfile names but cannot force that
-        // version.
-        if scope.selection.depth == 0 || scope.version.latest {
+        // An unmatched `--latest` / `--tag` selector is a no-op. Deeper
+        // versioned selectors can still target lockfile names but cannot
+        // force that version.
+        if scope.selection.depth == 0 || scope.version.reaches_past_declared_range() {
             return Ok(None);
         }
         widen_drop_targets_by_selectors(
@@ -342,8 +371,8 @@ pub(super) async fn selector_seed_policy<Reporter: self::Reporter>(
         );
         return Ok(Some(plan.drop_only(scope.max_depth())));
     }
-    if scope.version.latest && !scope.version.save {
-        emit_latest_ignored::<Reporter>(rewrite_ctx.manifest);
+    if !scope.version.save {
+        emit_range_flag_ignored::<Reporter>(scope.version, rewrite_ctx.manifest);
     }
     for (name, group, previous) in &matched_direct {
         record_matched_direct_update::<Reporter>(
@@ -381,7 +410,7 @@ pub(super) fn widen_drop_targets_by_selectors(
         if matches_update_pattern(&target_matcher, ignore_matcher, &name)
             && !ignored_resolved_names.contains(&name)
         {
-            insert_update_target(&mut plan.drop_targets, expanded, &name);
+            insert_update_target(&mut plan.drop_targets, expanded, &name, &name);
         }
     }
 }
@@ -422,7 +451,7 @@ impl UpdateScope<'_> {
         !self.selectors.is_empty()
             && self.selectors.iter().all(|selector| selector.version.is_none())
             && self.selection.depth > 0
-            && !self.version.latest
+            && !self.version.reaches_past_declared_range()
     }
 }
 

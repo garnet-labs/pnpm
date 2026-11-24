@@ -15,16 +15,31 @@
 //! time it is served, so it changes only when the package does.
 
 pub(super) use release_records::{
-    accepted_record_response, record_address, release_record, selected_revision,
-    version_document_response, without_pnpr_facts_in,
+    accepted_record_response,
+    record_address,
+    release_record,
+    version_document_response,
+    without_pnpr_facts_in,
 };
 
-use axum::http::{HeaderMap, header};
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
+use axum::http::{
+    HeaderMap,
+    header,
+};
+use jiff::{
+    SignedDuration,
+    Timestamp,
+};
 use node_semver::Version;
 use pnpr_config::PackageDocumentsConfig;
-use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use serde_json::{
+    Map,
+    Value,
+};
+use std::collections::{
+    BTreeMap,
+    HashSet,
+};
 mod release_records;
 
 /// The media type of pnpr's package document.
@@ -36,20 +51,21 @@ const DIST_FIELDS: [&str; 3] = ["integrity", "fileCount", "unpackedSize"];
 
 /// The fields of `dist.pnpr` that pnpr's format keeps beside them. npm's
 /// documents carry none of them.
-const PNPR_FIELDS: [&str; 3] = ["requiresBuild", "bins", "variants"];
+const PNPR_FIELDS: [&str; 2] = ["requiresBuild", "bins"];
 
 /// Whether the client's `Accept` header offers pnpr's format.
 pub(super) fn wants_install_v2(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .is_some_and(|accept| accept.contains(INSTALL_V2_CONTENT_TYPE))
 }
 
 /// The moment the document's publish times are anchored to: the package's
 /// last publish. Coarsening the times against it, rather than against the
 /// current time, keeps the document unchanged until the next publish.
-pub(super) fn document_anchor(packument: &Value) -> Option<DateTime<Utc>> {
+pub(super) fn document_anchor(packument: &Value) -> Option<Timestamp> {
     last_publish(
         packument.get("versions").and_then(Value::as_object)?,
         packument.get("time").and_then(Value::as_object)?,
@@ -98,12 +114,12 @@ fn leave_out_unlikely_picks(document: &mut Value, inline: &HashSet<String>) {
 }
 
 /// pnpr's document for an abbreviated packument, with every manifest inline.
-fn install_v2(abbreviated: &Value, config: &PackageDocumentsConfig) -> Value {
+pub(super) fn install_v2(abbreviated: &Value, config: &PackageDocumentsConfig) -> Value {
     let versions = object_field(abbreviated, "versions");
-    let window = Duration::from_std(config.publish_time_window).ok();
+    let window = SignedDuration::try_from(config.publish_time_window).ok();
     let times_since = last_publish(versions, object_field(abbreviated, "time"))
         .zip(window)
-        .and_then(|(last, window)| last.checked_sub_signed(window));
+        .and_then(|(last, window)| last.checked_sub(window).ok());
     let mut doc = Map::new();
     doc.insert(
         "name".into(),
@@ -117,7 +133,7 @@ fn install_v2(abbreviated: &Value, config: &PackageDocumentsConfig) -> Value {
         doc.insert("modified".into(), modified.clone());
     }
     if let Some(times_since) = &times_since {
-        let since = times_since.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let since = pnpm_time::format_millis(*times_since);
         doc.insert("timesSince".into(), Value::String(since));
     }
     let entries = version_entries(abbreviated, times_since.as_ref());
@@ -135,7 +151,7 @@ fn object_field<'doc>(value: &'doc Value, name: &str) -> &'doc Map<String, Value
 }
 
 /// Every version's entry, with its manifest.
-fn version_entries(abbreviated: &Value, times_since: Option<&DateTime<Utc>>) -> Map<String, Value> {
+fn version_entries(abbreviated: &Value, times_since: Option<&Timestamp>) -> Map<String, Value> {
     let time = object_field(abbreviated, "time");
     object_field(abbreviated, "versions")
         .iter()
@@ -148,7 +164,7 @@ fn version_entries(abbreviated: &Value, times_since: Option<&DateTime<Utc>>) -> 
 }
 
 /// The latest publish time of any listed version.
-fn last_publish(versions: &Map<String, Value>, time: &Map<String, Value>) -> Option<DateTime<Utc>> {
+fn last_publish(versions: &Map<String, Value>, time: &Map<String, Value>) -> Option<Timestamp> {
     versions
         .keys()
         .filter_map(|version| parse_time(time.get(version)?))
@@ -157,16 +173,8 @@ fn last_publish(versions: &Map<String, Value>, time: &Map<String, Value>) -> Opt
 
 /// A publish time as the abbreviated document gives it: RFC 3339, or
 /// coarsened to the minute (`2026-10-31T10:05Z`) or the day (`2026-10-31`).
-fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
-    let value = value.as_str()?;
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
-        return Some(parsed.with_timezone(&Utc));
-    }
-    if let Ok(parsed) = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%MZ") {
-        return Some(parsed.and_utc());
-    }
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
-    Some(date.and_hms_opt(0, 0, 0)?.and_utc())
+fn parse_time(value: &Value) -> Option<Timestamp> {
+    pnpm_time::parse_packument_timestamp(value.as_str()?)
 }
 
 /// A version's entry: its `deprecated` notice, trust rank, and selected
@@ -175,7 +183,7 @@ fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
 fn version_entry(
     manifest: &Value,
     published: Option<&Value>,
-    times_since: Option<&DateTime<Utc>>,
+    times_since: Option<&Timestamp>,
 ) -> Map<String, Value> {
     let mut entry = Map::new();
     match published.map(|value| (value, parse_time(value))) {
@@ -233,6 +241,15 @@ fn likely_picks(abbreviated: &Value) -> HashSet<String> {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect();
+    // A literal version or tag can occupy the URL of another version's record.
+    for key in object_field(abbreviated, "versions")
+        .keys()
+        .chain(object_field(abbreviated, "dist-tags").keys())
+    {
+        if let (base, Some(_)) = record_address(key) {
+            picks.insert(base.to_owned());
+        }
+    }
     let mut highest: BTreeMap<(u64, u64), (Version, &String)> = BTreeMap::new();
     let releases = object_field(abbreviated, "versions")
         .keys()

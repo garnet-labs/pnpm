@@ -11,16 +11,26 @@
 //! falls back to `copy` if hard-linking isn't supported on the
 //! target filesystem (cross-device, ACL, etc.).
 //!
-//! The metadata database is the exception. pnpr, and a benchmark scenario
+//! The database is the exception. pnpr, and a benchmark scenario
 //! that seeds packages of its own, write to the database the mock serves, so
 //! it is copied rather than linked, once, and never replaced under a mock that
 //! has it open.
 
-use crate::{registry_mock_storage, runtime_storage};
+use crate::{
+    registry_mock_storage,
+    runtime_storage,
+};
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::atomic::{
+        AtomicU64,
+        Ordering,
+    },
 };
 
 /// The proxy cache's directory in a storage directory, as pnpr defaults it.
@@ -41,8 +51,8 @@ pub fn seed_runtime_storage() -> io::Result<usize> {
         return Ok(0);
     }
     fs::create_dir_all(dest)?;
-    let database = pnpr_fixtures::metadata_path(Path::new(""));
-    let mut seeded = usize::from(copy_database(&pnpr_fixtures::metadata_path(src))?);
+    let database = pnpr_fixtures::database_path(Path::new(""));
+    let mut seeded = usize::from(copy_database(&pnpr_fixtures::database_path(src))?);
     for entry in WalkDir::new(src) {
         // Propagate traversal errors instead of silently dropping
         // them: a partial-mirror under a "success" return is much
@@ -83,10 +93,21 @@ pub fn runtime_hosted_storage() -> PathBuf {
     runtime_storage().join(".registry-mock").join(build)
 }
 
-/// The metadata database of [`runtime_hosted_storage`].
+/// Where every mock's config is written, beside [`runtime_hosted_storage`]:
+/// the config's relative `./htpasswd`, and the tokens beside it, resolve
+/// here.
+#[must_use]
+pub fn runtime_config_dir() -> PathBuf {
+    runtime_hosted_storage()
+        .parent()
+        .expect("the hosted store has a directory")
+        .to_path_buf()
+}
+
+/// The database of [`runtime_hosted_storage`].
 #[must_use]
 pub fn runtime_metadata_path() -> PathBuf {
-    pnpr_fixtures::metadata_path(&runtime_hosted_storage())
+    pnpr_fixtures::database_path(&runtime_hosted_storage())
 }
 
 /// Seed the fixture file at `src`, at `rel` in the fixture storage, to
@@ -99,7 +120,7 @@ fn seed_file(src: &Path, rel: &Path, dest: &Path, database: &Path) -> io::Result
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    // We don't pre-check `dest.exists()` — a TOCTOU window is wide enough
+    // We don't pre-check `dest.exists()`, a TOCTOU window is wide enough
     // on a shared CI worker (two pacquet processes racing past `GuardFile`)
     // that the existence check could pass and then `hard_link` still trip
     // `AlreadyExists`. Treat that as success directly inside `link_or_copy`.

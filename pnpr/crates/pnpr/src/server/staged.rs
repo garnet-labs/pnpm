@@ -3,9 +3,9 @@
 //! `POST /-/stage/package/:pkg` accepts a regular publish document but holds
 //! it back instead of making it visible; the staged record is then listed
 //! (`GET /-/stage`), inspected (`GET /-/stage/:id`, `GET
-//! /-/stage/:id/tarball`), and finally approved (`POST /-/stage/:id/approve`
-//! — which replays the held document through the regular publish flow) or
-//! rejected (`DELETE /-/stage/:id` — which deletes it). This is the server
+//! /-/stage/:id/tarball`), and finally approved (`POST /-/stage/:id/approve`,
+//! which replays the held document through the regular publish flow) or
+//! rejected (`DELETE /-/stage/:id`, which deletes it). This is the server
 //! half of `pnpm stage`.
 //!
 //! Every operation is gated by the same `publish` rule as a direct publish
@@ -22,31 +22,71 @@ mod record;
 use record::staged_record;
 
 mod list_query;
-use list_query::{MAX_PER_PAGE, StagedListQuery, parse_staged_list_query};
+use list_query::{
+    MAX_PER_PAGE,
+    StagedListQuery,
+    parse_staged_list_query,
+};
 
 mod approval;
 use approval::serve_staged_approve;
 
 use axum::{
     body::Body,
-    extract::{OriginalUri, Path, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    extract::{
+        OriginalUri,
+        Path,
+        State,
+    },
+    http::{
+        StatusCode,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use base64::{
+    Engine,
+    engine::general_purpose::STANDARD as BASE64,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Value,
+    json,
+};
 
 use super::{
-    Action, AppState, AuthedCaller, Identity, RegistrySource, TargetRegistry, authorize_package,
-    commit_publishes, json_response, not_found, private_no_cache,
-    publishing::{ValidatedPublish, cleanup_tmp_slots},
-    resolve_write_target, stage_publish, validate_publish_doc,
+    Action,
+    AppState,
+    AuthedCaller,
+    Identity,
+    JsonObject,
+    RegistrySource,
+    TargetRegistry,
+    authorize_package,
+    json_response,
+    not_found,
+    parse_json_body,
+    private_no_cache,
+    publishing::{
+        ValidatedPublish,
+        check_body_name,
+        cleanup_tmp_slots,
+        single_publish_notes,
+        validate_staged_publish_name,
+    },
+    resolve_write_target,
+    stage_publish,
+    validate_publish_doc,
 };
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
-use pnpr_search::percent_decode;
-use pnpr_storage::{DocumentWrite, publish::extract_attachments};
+use pnpr_storage::publish::extract_attachments;
 use std::time::Duration;
 
 pub const STAGED_RECORD_FORMAT_VERSION: u32 = 1;
@@ -78,6 +118,8 @@ struct StagedRecord {
     tag: Option<String>,
     created_at: String,
     actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_id: Option<String>,
     actor_type: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     shasum: Option<String>,
@@ -91,11 +133,9 @@ struct StagedRecord {
     approving_since: Option<String>,
 }
 
-/// A staged record as the store holds it. The bytes are what a conditional
-/// rewrite compares against, so they are the stored ones rather than a
-/// re-serialization of `record`.
+/// A staged record with the generation a conditional rewrite replaces.
 struct StoredStagedRecord {
-    bytes: Vec<u8>,
+    stored: pnpr_storage::MetadataRecord,
     record: StagedRecord,
 }
 
@@ -104,7 +144,7 @@ struct StoredStagedRecord {
 struct ApprovalClaim {
     record: StagedRecord,
     unclaimed_bytes: Vec<u8>,
-    claimed_bytes: Vec<u8>,
+    claimed: pnpr_storage::MetadataRecord,
 }
 
 /// How long a claim on a staged record is honored. An approval releases its
@@ -122,15 +162,14 @@ impl StagedRecord {
         let mut value = serde_json::to_value(self).expect("a staged record serializes");
         if let Some(object) = value.as_object_mut() {
             object.remove("registry");
+            object.remove("actorId");
         }
         value
     }
 }
 
-// ---------------------------------------------------------------------
 // Route handlers. Each is registered both bare and under `/~{registry}`;
 // `TargetRegistry` reports which form the request arrived on.
-// ---------------------------------------------------------------------
 
 /// Path capture of the staged routes that address one record. Named rather
 /// than a bare `Path<String>` because the prefixed registration captures the
@@ -188,8 +227,9 @@ pub(super) async fn approve_staged(
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
     Path(path): Path<StageIdPath>,
+    body: axum::body::Bytes,
 ) -> Response {
-    serve_staged_approve(&state, &identity, registry.as_deref(), &path.id).await
+    serve_staged_approve(&state, &identity, registry.as_deref(), &path.id, &body).await
 }
 
 pub(super) async fn get_staged_tarball(
@@ -201,11 +241,9 @@ pub(super) async fn get_staged_tarball(
     private_no_cache(serve_staged_tarball(&state, &identity, registry.as_deref(), &path.id).await)
 }
 
-// ---------------------------------------------------------------------
 // The handlers proper.
-// ---------------------------------------------------------------------
 
-/// `POST /-/stage/package/:pkg` — validate and authorize the publish
+/// `POST /-/stage/package/:pkg`: validate and authorize the publish
 /// document exactly like a direct publish, then hold it back under a fresh
 /// stage id instead of committing it.
 async fn serve_staged_publish(
@@ -219,26 +257,22 @@ async fn serve_staged_publish(
         Ok(name) => name,
         Err(err) => return err.into_response(),
     };
-    let incoming: Value = match serde_json::from_slice(body) {
+    let mut incoming: Value = match parse_json_body(body) {
         Ok(value) => value,
-        Err(err) => return RegistryError::Json(err).into_response(),
+        Err(err) => return err.into_response(),
     };
-    let body_name = incoming.get("name").and_then(Value::as_str);
-    if body_name.is_some_and(|body_name| body_name != name.as_str()) {
-        return RegistryError::BadRequest {
-            reason: format!(
-                "package in URL ({:?}) does not match body ({:?})",
-                name.as_str(),
-                body_name.unwrap_or(""),
-            ),
-        }
-        .into_response();
+    if let Err(err) = check_body_name(&name, &incoming) {
+        return err.into_response();
+    }
+
+    if let Err(err) = single_publish_notes(&mut incoming) {
+        return err.into_response();
     }
 
     // The same routing + `publish`-rule + attachment validation a direct
     // publish runs; conflicts with already-published versions are checked
     // when the stage is approved, against the registry state at that time.
-    let (validated, _target) =
+    let (validated, target) =
         match validate_publish_doc(state, identity, registry, name, incoming).await {
             Ok(validated) => validated,
             Err(err) => return err.into_response(),
@@ -258,7 +292,10 @@ async fn serve_staged_publish(
     }
 
     let stage_id = generate_stage_id();
-    let record = staged_record(&validated, identity, registry, &stage_id);
+    let record = staged_record(&validated, identity, registry, stage_id.clone());
+    if let Err(err) = validate_staged_publish_name(state, validated, &target.namespace).await {
+        return err.into_response();
+    }
 
     if let Err(err) = store_staged(state, &stage_id, body, &record).await {
         return err.into_response();
@@ -276,14 +313,10 @@ async fn store_staged(
 ) -> Result<(), RegistryError> {
     state.inner.storage.create_staged_body(stage_id, body).await?;
     let meta_bytes = serde_json::to_vec(record).expect("a staged record serializes");
-    if let Err(err) = state.inner.storage.create_staged_meta(stage_id, &meta_bytes).await {
-        let _ = state.inner.storage.remove_staged(stage_id).await;
-        return Err(err);
-    }
-    Ok(())
+    state.inner.storage.create_staged_meta(stage_id, &meta_bytes).await
 }
 
-/// `GET /-/stage?page=&perPage=&package=` — the staged records visible to
+/// `GET /-/stage?page=&perPage=&package=`: the staged records visible to
 /// the caller through this registry address, sorted oldest-first by staging
 /// time (then id) so pagination stays stable as new records arrive.
 async fn serve_staged_list(
@@ -293,13 +326,13 @@ async fn serve_staged_list(
     query: &StagedListQuery,
 ) -> Response {
     let per_page = query.per_page.clamp(1, MAX_PER_PAGE);
-    let ids = match state.inner.storage.list_staged_ids().await {
-        Ok(ids) => ids,
+    let staged = match state.inner.storage.list_staged_meta().await {
+        Ok(records) => records,
         Err(err) => return err.into_response(),
     };
     let mut records: Vec<StagedRecord> = Vec::new();
-    for stage_id in ids {
-        let Ok(Some(stored)) = read_staged_record(state, &stage_id).await else {
+    for (stage_id, stored) in staged {
+        let Ok(stored) = parse_staged_record(&stage_id, stored) else {
             continue;
         };
         let record = stored.record;
@@ -337,7 +370,7 @@ async fn serve_staged_list(
     )
 }
 
-/// `GET /-/stage/:id` — one staged record's metadata.
+/// `GET /-/stage/:id`: one staged record's metadata.
 async fn serve_staged_view(
     state: &AppState,
     identity: &Identity,
@@ -351,7 +384,7 @@ async fn serve_staged_view(
     json_response(StatusCode::OK, &stored.record.metadata())
 }
 
-/// `DELETE /-/stage/:id` — reject a staged publish, deleting its record and
+/// `DELETE /-/stage/:id`: reject a staged publish, deleting its record and
 /// held tarball.
 async fn serve_staged_reject(
     state: &AppState,
@@ -371,7 +404,7 @@ async fn serve_staged_reject(
     }
 }
 
-/// `GET /-/stage/:id/tarball` — the held tarball's bytes, decoded from the
+/// `GET /-/stage/:id/tarball`: the held tarball's bytes, decoded from the
 /// stored publish document's attachment.
 async fn serve_staged_tarball(
     state: &AppState,
@@ -387,7 +420,11 @@ async fn serve_staged_tarball(
         Ok(None) => return not_found(),
         Err(err) => return err.into_response(),
     };
-    let mut incoming: Value = match serde_json::from_slice(&body) {
+    staged_tarball_response(&body)
+}
+
+fn staged_tarball_response(body: &[u8]) -> Response {
+    let mut incoming: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(err) => return RegistryError::Json(err).into_response(),
     };
@@ -395,7 +432,10 @@ async fn serve_staged_tarball(
         Ok(attachments) => attachments,
         Err(err) => return err.into_response(),
     };
-    let Some(attachment) = attachments.into_iter().next() else {
+    let Some(attachment) = attachments
+        .into_iter()
+        .find(|attachment| attachment.filename.ends_with(".tgz"))
+    else {
         return not_found();
     };
     let Some(data) = attachment.inline_data() else {
@@ -419,9 +459,7 @@ async fn serve_staged_tarball(
         .expect("static-shape response always builds")
 }
 
-// ---------------------------------------------------------------------
 // Shared plumbing.
-// ---------------------------------------------------------------------
 
 /// Load a staged record and check the caller may act on it: the record must
 /// exist, be addressed through the same registry prefix it was staged with,
@@ -460,7 +498,7 @@ async fn authorize_staged(
         &RegistrySource::Hosted(target.source),
         name.as_str(),
         Action::Publish,
-        Some(&target.org),
+        Some(&target.namespace),
     )
     .await
 }
@@ -469,10 +507,17 @@ async fn read_staged_record(
     state: &AppState,
     stage_id: &str,
 ) -> Result<Option<StoredStagedRecord>, RegistryError> {
-    let Some(bytes) = state.inner.storage.read_staged_meta(stage_id).await? else {
+    let Some(stored) = state.inner.storage.read_staged_meta(stage_id).await? else {
         return Ok(None);
     };
-    let record: StagedRecord = serde_json::from_slice(&bytes).map_err(RegistryError::Json)?;
+    parse_staged_record(stage_id, stored).map(Some)
+}
+
+fn parse_staged_record(
+    stage_id: &str,
+    stored: pnpr_storage::MetadataRecord,
+) -> Result<StoredStagedRecord, RegistryError> {
+    let record: StagedRecord = serde_json::from_slice(&stored.bytes).map_err(RegistryError::Json)?;
     if record.format_version > STAGED_RECORD_FORMAT_VERSION {
         return Err(RegistryError::DocumentFormatTooNew {
             document: format!("staged record {stage_id}"),
@@ -480,24 +525,12 @@ async fn read_staged_record(
             supported_version: STAGED_RECORD_FORMAT_VERSION,
         });
     }
-    Ok(Some(StoredStagedRecord { bytes, record }))
+    Ok(StoredStagedRecord { stored, record })
 }
 
-/// A fresh random (version 4) UUID from the OS CSPRNG — the stage id
-/// clients quote back on view/approve/reject/download.
+/// The stage id clients quote back on view/approve/reject/download.
 fn generate_stage_id() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("OS CSPRNG must be available");
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = bytes
-        .iter()
-        .fold(String::with_capacity(32), |mut hex, byte| {
-            use std::fmt::Write;
-            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-            hex
-        });
-    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    super::uuid_v4::generate()
 }
 
 #[cfg(test)]

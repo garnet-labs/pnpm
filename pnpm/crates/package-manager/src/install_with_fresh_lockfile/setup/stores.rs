@@ -1,7 +1,11 @@
 //! The store handles a fresh resolution opens, and the verification of the
 //! wanted lockfile's rows a run that fetches into the store starts with them.
 
-use super::{FreshInputs, OwnedInputs, resolver_setup};
+use super::{
+    FreshInputs,
+    OwnedInputs,
+    resolver_setup,
+};
 
 /// Open the store handles, and start verifying the wanted lockfile's rows
 /// for a run that fetches into the store.
@@ -9,7 +13,7 @@ pub(super) async fn open_stores(
     install: FreshInputs<'_>,
     owned: &OwnedInputs,
     progress_reported: Option<pnpm_tarball::SharedReportedProgressKeys>,
-    store_dir: &'static pnpm_store_dir::StoreDir,
+    store_dir: &pnpm_store_dir::StoreDir,
 ) -> resolver_setup::StoreIndexHandles {
     let stores = resolver_setup::open_store_index_handles(
         install.drivers.config,

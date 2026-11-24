@@ -1,19 +1,53 @@
-pub(super) use fetcher::{Fetcher, checked_metadata_digests};
+pub(super) use fetcher::{
+    Fetcher,
+    checked_metadata_digests,
+};
 
 mod fetcher;
 
-use super::{Index, host, host::Interpreter, host::Wheel, host::WheelMetadata};
-use futures_util::{StreamExt, stream};
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use super::{
+    Index,
+    host,
+    host::{
+        Interpreter,
+        Wheel,
+        WheelMetadata,
+    },
+};
+use futures_util::{
+    StreamExt,
+    stream,
+};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use pep440_rs::Version;
 use pep508_rs::PackageName;
 use pnpm_config::Config;
 use pnpm_network::ThrottledClient;
-use pnpm_python_resolver::{Excluded, LockedWheel, Packages, Target, candidates_from_page};
+use pnpm_python_resolver::{
+    Excluded,
+    LockedWheel,
+    Packages,
+    Target,
+    candidates_from_page,
+};
 use pnpm_reporter::Reporter;
-use pnpm_tarball::{ArchiveStoreProjection, IngestZipArchiveToStore};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use pnpm_tarball::{
+    ArchiveStoreProjection,
+    IngestZipArchiveToStore,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 use url::Url;
 
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
@@ -102,7 +136,8 @@ impl Resolution {
         self.packages.candidates.retain(|_, versions| {
             versions
                 .values()
-                .all(|candidate| candidate.directory().is_some())
+                .map(pnpm_python_resolver::Candidate::directory)
+                .all(|directory| directory.is_some())
         });
         self.packages.direct_urls.clear();
         self.packages.rejected_sources.clear();
@@ -200,7 +235,7 @@ impl<'a> Registry<'a> {
             }
         }
         self.download_wheels::<Reporter>(wanted).await?;
-        self.record_sources(&[])?;
+        self.record_sources(Vec::new())?;
         self.fetch_vcs::<Reporter>(requirements).await?;
         self.build_sdists::<Reporter>().await?;
         Ok(())
@@ -294,14 +329,14 @@ impl<'a> Registry<'a> {
         buffer: Option<Vec<u8>>,
     ) -> Result<pnpm_fs::CasPaths> {
         let integrity = wheel.integrity()?;
-        let package_id = format!("python:{}", wheel.name);
+        let package_id = crate::store_keys::archive_package_id(&wheel.name);
         let ingestion = IngestZipArchiveToStore {
             fetching: pnpm_tarball::ArchiveFetchOptions {
                 http_client: self.client,
                 auth_headers: &self.index.auth,
                 retry_opts: self.config.retry_opts(),
                 offline: self.config.offline,
-                tar_limits: self.config.tar_limits(),
+                tar_limits: pnpm_tarball::TarLimits::new(self.config.max_tarball_unpacked_size),
             },
             package: pnpm_tarball::ZipArchivePackage {
                 max_bytes: Some(super::sources::MAX_WHEEL_BYTES),
@@ -311,7 +346,7 @@ impl<'a> Registry<'a> {
             },
             store: self.store.clone(),
 
-            requester: "Python environment",
+            requester: pnpm_reporter::PYTHON_ENVIRONMENT_REQUESTER,
 
             archive_prefix: None,
             ignore_file_pattern: None,

@@ -1,13 +1,22 @@
-use pnpm_lockfile::{DirectoryResolution, LockfileResolution};
-use pnpm_resolving_resolver_base::{PkgResolutionId, ResolveResult};
+use pnpm_lockfile::{
+    DirectoryResolution,
+    LockfileResolution,
+};
+use pnpm_resolving_resolver_base::{
+    PkgResolutionId,
+    ResolveResult,
+};
 
 use super::{
-    super::test_support::manifest_result, DependencySpec, extract_children,
+    super::test_support::manifest_result,
+    DependencySpec,
+    extract_children,
     extract_peer_dependencies,
 };
 use crate::resolved_tree::PeerDep;
 use pnpm_catalogs_types::Catalogs;
 use rustc_hash::FxHashSet as HashSet;
+use std::path::Path;
 
 #[test]
 fn dependency_engines_runtime_is_walked_as_a_runtime_dependency() {
@@ -224,8 +233,14 @@ fn only_taken_peers_are_dereferenced_from_catalogs() {
     )]);
     let peer = |version: &str| PeerDep { version: version.to_string(), optional: false };
 
-    let peer_set =
-        extract_peer_dependencies(&result, &HashSet::default(), Some(&catalogs)).unwrap();
+    let peer_set = extract_peer_dependencies(
+        &result,
+        &HashSet::default(),
+        Some(&catalogs),
+        None,
+        Path::new("."),
+    )
+    .unwrap();
 
     assert_eq!(
         peer_set
@@ -242,5 +257,94 @@ fn only_taken_peers_are_dereferenced_from_catalogs() {
             .collect::<Vec<_>>(),
         [(&"bar".to_string(), &peer("^2.0.0"))],
         "the unshadowed `foo` dependency supplies the package itself",
+    );
+}
+
+#[test]
+fn directory_specifiers_record_the_resolvers_effective_groups() {
+    let manifest = serde_json::json!({
+        "dependencies": { "regular": "catalog:", "both": "^1", "bundled": "*" },
+        "optionalDependencies": { "both": "^2", "optional": "file:../optional" },
+        "devDependencies": { "development": "*" },
+        "peerDependencies": { "peer": "workspace:*" },
+        "bundledDependencies": ["bundled"],
+        "dependenciesMeta": { "regular": { "injected": true } }
+    });
+    let recorded = super::declared_specifiers(&manifest, "directory").expect("read specifiers");
+    assert_eq!(
+        serde_json::to_value(recorded).expect("serialize specifiers"),
+        serde_json::json!({
+            "dependencies": { "regular": "catalog:" },
+            "optionalDependencies": { "both": "^1", "optional": "file:../optional" },
+            "injected": ["regular"]
+        }),
+    );
+}
+
+#[test]
+fn directory_specifiers_distinguish_empty_records_and_manifest_changes() {
+    let empty = super::declared_specifiers(&serde_json::json!({}), "directory")
+        .expect("read empty specifiers");
+    assert_eq!(
+        serde_json::to_value(&empty).expect("serialize empty specifiers"),
+        serde_json::json!({}),
+    );
+    for field in ["dependencies", "optionalDependencies"] {
+        let manifest = serde_json::json!({ field: { "child": "workspace:../child" } });
+        assert_ne!(
+            super::declared_specifiers(&manifest, "directory").expect("read changed specifiers"),
+            empty,
+        );
+    }
+    let declared = serde_json::json!({ "dependencies": { "child": "workspace:../child" } });
+    let mut injected = declared.clone();
+    injected["dependenciesMeta"] = serde_json::json!({ "child": { "injected": true } });
+    assert_ne!(
+        super::declared_specifiers(&injected, "directory").expect("read injected specifiers"),
+        super::declared_specifiers(&declared, "directory").expect("read declared specifiers"),
+    );
+    let undeclared = serde_json::json!({ "dependenciesMeta": { "child": { "injected": true } } });
+    assert_eq!(
+        super::declared_specifiers(&undeclared, "directory").expect("read undeclared meta"),
+        empty,
+        "metadata for an undeclared dependency changes nothing the resolver reads",
+    );
+}
+
+#[test]
+fn directory_specifiers_preserve_every_dependency_source() {
+    for specifier in [
+        "^1.0.0",
+        "catalog:",
+        "catalog:tools",
+        "workspace:*",
+        "workspace:../host",
+        "file:../local",
+        "link:../linked",
+        "file:../archive.tgz",
+        "npm:real-name@^1",
+        "https://example.invalid/archive.tgz",
+        "github:example/project#abcdef",
+    ] {
+        for group in ["dependencies", "optionalDependencies"] {
+            let manifest = serde_json::json!({ group: { "child": specifier } });
+            let record =
+                super::declared_specifiers(&manifest, "directory").expect("extract inputs");
+            assert_eq!(serde_json::to_value(record).expect("serialize inputs"), manifest);
+        }
+    }
+}
+
+#[test]
+fn directory_specifiers_include_runtime_dependencies() {
+    let manifest = serde_json::json!({
+        "engines": { "runtime": { "name": "node", "version": "22.19.0", "onFail": "download" } }
+    });
+    let record = super::declared_specifiers(&manifest, "directory").expect("extract runtime input");
+    assert_eq!(
+        serde_json::to_value(record).expect("serialize inputs"),
+        serde_json::json!({
+            "dependencies": { "node": "runtime:22.19.0" }
+        }),
     );
 }

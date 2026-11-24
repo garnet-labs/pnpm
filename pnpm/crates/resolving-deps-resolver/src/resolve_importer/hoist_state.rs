@@ -1,7 +1,20 @@
 use super::{
-    Arc, BTreeMap, DependencyOverrider, DirectDep, DirectSeeds, HashMap, HashSet, HoistSettings,
-    ImporterHoistState, LockedPeers, MissingPeer, PreferredVersions, TreeCtx, WorkspaceRootDep,
+    Arc,
+    BTreeMap,
+    DependencyOverrider,
+    DirectDep,
+    DirectSeeds,
+    HashMap,
+    HashSet,
+    HoistSettings,
+    ImporterHoistState,
+    LockedPeers,
+    MissingPeer,
+    PreferredVersions,
+    TreeCtx,
+    WorkspaceRootDep,
 };
+use pnpm_resolving_resolver_base::DIRECT_DEP_SELECTOR_WEIGHT;
 
 pub(super) struct ImporterHoistPolicy {
     pub(super) peers: crate::ImporterPeerOptions,
@@ -10,7 +23,7 @@ pub(super) struct ImporterHoistPolicy {
 
 impl ImporterHoistPolicy {
     pub(super) fn should_hoist_peers(&self) -> bool {
-        self.peers.auto_install_peers || self.peers.dedupe_peer_dependents
+        self.peers.auto_install_peers || self.peers.dedupe_peer_dependents.dedupes()
     }
 }
 
@@ -21,7 +34,7 @@ pub(super) struct ImporterHoistProgress {
     /// is a no-op unless its inputs changed since: an optional hoist
     /// extended its direct set, or a workspace children-ownership
     /// rewrite restructured shared subtrees. A round that broke off
-    /// with unhoistable misses is *not* converged — another importer's
+    /// with unhoistable misses is *not* converged, another importer's
     /// resolutions can extend the run-resolved preferred versions and
     /// make those misses hoistable, so it must re-discover every round.
     pub(super) discovery_converged: bool,
@@ -30,7 +43,7 @@ pub(super) struct ImporterHoistProgress {
     pub(super) converged_children_rewrites: u64,
     /// How many entries of [`ImporterHoistDependencies::direct`] previous rounds' discovery
     /// walks covered. A later round walks only the direct deps added
-    /// since — the earlier entries' subtrees are unchanged, so their
+    /// since, the earlier entries' subtrees are unchanged, so their
     /// (scope-filtered) missing reports are replayed from
     /// [`Self::merged_missing`] instead of re-walked.
     pub(super) walked_direct_len: usize,
@@ -54,7 +67,7 @@ pub(super) struct ImporterHoistDependencies {
     /// assigned together with `workspace_root_deps`.
     pub(super) workspace_root_dep_versions: Arc<HashMap<String, String>>,
     /// `alias → bare_specifier` as declared. Stands in wherever the
-    /// resolver reports no normalized form — a plain `"19.2.0"` arrives
+    /// resolver reports no normalized form, a plain `"19.2.0"` arrives
     /// as `None`.
     pub(super) wanted_specifier_by_alias: BTreeMap<String, String>,
     /// `NodeIds` appended to `direct` by
@@ -65,22 +78,72 @@ pub(super) struct ImporterHoistDependencies {
     pub(super) hoisted_peer_provider_node_ids: HashSet<crate::NodeId>,
     pub(super) parent_pkg_aliases: HashSet<String>,
     pub(super) all_missing_optional_peers: BTreeMap<String, Vec<String>>,
+    /// See [`crate::ImporterPeerInput::rejected_optional_peers`].
+    pub(super) rejected_optional_peers: HashSet<String>,
 }
 
 pub(super) struct ImporterHoistSelection {
     /// The lockfile + manifest preferred-versions seed. The hoist
     /// pickers merge it per lookup with the workspace-wide
-    /// run-resolved versions — see
-    /// [`TreeCtx::preferred_versions_for_names`] — instead of
+    /// run-resolved versions; see
+    /// [`TreeCtx::preferred_versions_for_names`]; instead of
     /// maintaining a per-importer copy of the whole run history.
     pub(super) preferred_versions: Arc<PreferredVersions>,
-    pub(super) locked_versions: Arc<HashMap<String, HashSet<String>>>,
+    pub(super) locked_versions: LockedPeers,
     pub(super) override_bare_specifier: Option<Arc<DependencyOverrider>>,
 }
 
 impl super::ImporterHoistState {
+    pub(super) fn requested_direct_dependencies(&self) -> HashSet<String> {
+        let lockfile = self.ctx.workspace().wanted_lockfile();
+        self.dependencies.wanted_specifier_by_alias
+            .iter()
+            .filter(|(alias, specifier)| {
+                self.ctx.direct_dependency_is_updated(alias, specifier)
+                    || lockfile.is_none_or(|lockfile| {
+                        !crate::resolve_dependency_tree::direct_dep_specifier_unchanged(
+                            lockfile,
+                            lockfile.importers.get(&self.importer_id),
+                            alias,
+                            specifier,
+                        )
+                    })
+            })
+            .map(|(alias, _)| alias.clone())
+            .chain(self.policy.peers.explicitly_requested_direct_dependencies.iter().cloned())
+            .collect()
+    }
+
+    /// With auto-install disabled, only manifest preferences and current providers may hoist.
+    pub(super) fn required_peer_preferred_versions<'name>(
+        &self,
+        names: impl Iterator<Item = &'name str>,
+        resolved: &HashMap<String, HashSet<String>>,
+    ) -> PreferredVersions {
+        let mut preferred =
+            self.ctx.preferred_versions_for_names(&self.selection.preferred_versions, names);
+        if self.policy.peers.auto_install_peers
+            || self.ctx
+                .workspace()
+                .wanted_lockfile()
+                .is_none()
+        {
+            return preferred;
+        }
+        preferred.retain(|name, versions| {
+            versions.retain(|version, entry| {
+                entry.weight() >= DIRECT_DEP_SELECTOR_WEIGHT
+                    || resolved
+                        .get(name)
+                        .is_some_and(|versions| versions.contains(version))
+            });
+            !versions.is_empty()
+        });
+        preferred
+    }
+
     pub(super) fn assemble(
-        importer_id: &str,
+        importer_id: String,
         ctx: TreeCtx,
         direct: Vec<DirectDep>,
         seeds: DirectSeeds,
@@ -88,7 +151,7 @@ impl super::ImporterHoistState {
         settings: HoistSettings,
     ) -> Self {
         ImporterHoistState {
-            importer_id: importer_id.to_string(),
+            importer_id,
             ctx,
             project_dir: settings.project_dir,
             policy: ImporterHoistPolicy {
@@ -105,10 +168,11 @@ impl super::ImporterHoistState {
                 hoisted_peer_provider_node_ids: HashSet::default(),
                 parent_pkg_aliases: seeds.parent_pkg_aliases,
                 all_missing_optional_peers: BTreeMap::new(),
+                rejected_optional_peers: HashSet::default(),
             },
             selection: ImporterHoistSelection {
                 preferred_versions: settings.all_preferred_versions,
-                locked_versions: locked.versions,
+                locked_versions: locked,
                 override_bare_specifier: settings.override_bare_specifier,
             },
         }

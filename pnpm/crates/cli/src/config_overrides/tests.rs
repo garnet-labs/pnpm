@@ -1,15 +1,34 @@
-use super::{ConfigOverrides, apply_state_dir_override, apply_store_dir_override};
+use super::{
+    ConfigOverrides,
+    apply_state_dir_override,
+    apply_store_dir_override,
+};
 use pnpm_config::{
-    ColorMode, Config, EnvVar, GetCurrentDir, GetHomeDir, LinkProbe, LinkWorkspacePackages,
-    NodeLinker, NodePackageMapMode, PackageImportMethod, PmOnFail, RemoteSideEffectsCacheSettings,
-    RuntimeOnFail, SaveWorkspaceProtocol, TrustPolicy,
+    ColorMode,
+    Config,
+    EnvVar,
+    GetCurrentDir,
+    GetHomeDir,
+    LinkProbe,
+    LinkWorkspacePackages,
+    NodeLinker,
+    NodePackageMapMode,
+    PackageImportMethod,
+    PmOnFail,
+    RemoteSideEffectsCacheSettings,
+    RuntimeOnFail,
+    SaveWorkspaceProtocol,
+    TrustPolicy,
 };
 use pnpm_store_dir::STORE_VERSION;
 use pretty_assertions::assert_eq;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 fn argv<Items: IntoIterator<Item = &'static str>>(items: Items) -> Vec<OsString> {
@@ -633,6 +652,24 @@ fn a_repeated_list_setting_accumulates_its_values() {
     overrides.apply(&mut config, Path::new("/workspace"));
     assert_eq!(config.hoist_pattern, Some(vec!["eslint".to_string(), "babel".to_string()]));
     assert_eq!(config.public_hoist_pattern, Some(vec!["types".to_string()]));
+}
+
+#[test]
+fn a_cli_linker_object_keeps_virtual_store_only_patterns_empty() {
+    let (overrides, _) = ConfigOverrides::extract(argv([
+        "pacquet",
+        "install",
+        "--virtual-store-only",
+        r#"--config.node-linker={"type":"isolated","hoist":{"public":["eslint"],"private":["*"]}}"#,
+    ]));
+    let mut config = Config::default();
+    overrides.apply(&mut config, Path::new("/workspace"));
+    assert_eq!(config.hoist_pattern, Some(vec![]));
+    assert_eq!(config.public_hoist_pattern, Some(vec![]));
+    config.virtual_store_only = false;
+    config.restore_hoist_patterns_after_virtual_store_only();
+    assert_eq!(config.hoist_pattern, Some(vec!["*".to_string()]));
+    assert_eq!(config.public_hoist_pattern, Some(vec!["eslint".to_string()]));
 }
 
 /// `pnpm clean --lockfile` removes lockfiles; it does not turn the

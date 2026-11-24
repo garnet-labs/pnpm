@@ -2,14 +2,23 @@
 //! production runner plugs into.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{
+        BTreeSet,
+        HashMap,
+    },
     future::Future,
     pin::Pin,
 };
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
-use node_semver::{Range, Version};
+use node_semver::{
+    Range,
+    Version,
+};
 use pnpm_network::redact_and_sanitize;
 
 /// Capability seam for `git ls-remote`.
@@ -276,7 +285,7 @@ fn resolve_v_tags(tags: &BTreeSet<String>, range: &Range) -> Option<String> {
         if range.satisfies(&parsed) {
             match best {
                 Some((ref best_v, _)) if best_v >= &parsed => {}
-                _ => best = Some((parsed.clone(), tag.clone())),
+                _ => best = Some((parsed, tag.clone())),
             }
         }
     }

@@ -1,12 +1,27 @@
 use crate::process::Command;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
+use pnpm_fs::{
+    LinkFailure,
+    LinkFallback,
+    LinkFallbackPolicy,
+};
 use pnpm_fs_packlist::PacklistError;
 use pnpm_package_manifest::PackageManifestError;
-use serde_json::{Map, Value};
+use serde_json::{
+    Map,
+    Value,
+};
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 mod diff_output;
@@ -129,7 +144,7 @@ fn prepare_pkg_files_for_diff_with_fs(
             })?;
         match fs_ops.hard_link(&source_path, &target) {
             Ok(()) => {}
-            Err(source) if is_unsupported_link_error(&source) => {
+            Err(source) if copies_instead_of_linking(&source) => {
                 fs_ops
                     .copy(&source_path, &target)
                     .map_err(|source| PatchCommitError::LinkFile { source_path, target, source })?;
@@ -257,7 +272,10 @@ impl PatchCommitFs for RealPatchCommitFs {
 }
 
 fn temporary_filtered_dir(src: &Path) -> PathBuf {
-    let name = src.file_name().map_or_else(|| "patch".into(), |n| n.to_string_lossy());
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| "patch".into());
     let parent = src.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{name}_tmp_{}", crate::process::id()))
 }
@@ -291,21 +309,11 @@ fn path_from_forward_slash(path: &str) -> PathBuf {
     path.split('/').collect()
 }
 
-fn is_unsupported_link_error(error: &io::Error) -> bool {
-    if matches!(
-        error.kind(),
-        io::ErrorKind::CrossesDevices
-            | io::ErrorKind::Unsupported
-            | io::ErrorKind::PermissionDenied,
-    ) {
-        return true;
-    }
-    #[cfg(unix)]
-    return error.raw_os_error() == Some(18);
-    #[cfg(windows)]
-    return error.raw_os_error() == Some(17);
-    #[cfg(not(any(unix, windows)))]
-    return false;
+/// The filtered copy is a scratch tree for `git diff`, so a hardlink is
+/// only a saving: a file the filesystem will not link is copied under
+/// [`LinkFallbackPolicy::NextMethod`], where the copy is the next method.
+fn copies_instead_of_linking(error: &io::Error) -> bool {
+    LinkFailure::of(error).fallback(LinkFallbackPolicy::NextMethod) != LinkFallback::Fail
 }
 
 fn normalize_diff_output(diff: &str, folder_a: &str, folder_b: &str) -> String {
@@ -314,12 +322,13 @@ fn normalize_diff_output(diff: &str, folder_a: &str, folder_b: &str) -> String {
     for line in diff.split_inclusive('\n') {
         let (content, newline) = line
             .strip_suffix('\n')
-            .map_or((line, ""), |line| (line, "\n"));
+            .map(|line| (line, "\n"))
+            .unwrap_or((line, ""));
         if content.starts_with("diff --git ") {
             in_hunk = false;
-            out.push_str(&normalize_diff_path_line(content, folder_a, folder_b));
+            out.push_str(&normalize_diff_path_line(content.to_owned(), folder_a, folder_b));
         } else if !in_hunk && is_diff_path_line(content) {
-            out.push_str(&normalize_diff_path_line(content, folder_a, folder_b));
+            out.push_str(&normalize_diff_path_line(content.to_owned(), folder_a, folder_b));
         } else {
             out.push_str(content);
         }
@@ -327,9 +336,6 @@ fn normalize_diff_output(diff: &str, folder_a: &str, folder_b: &str) -> String {
             in_hunk = true;
         }
         out.push_str(newline);
-    }
-    if let Some(without_marker) = out.strip_suffix("\n\\ No newline at end of file\n") {
-        out = format!("{without_marker}\n");
     }
     remove_ds_store_diff_blocks(&out)
 }
@@ -342,8 +348,8 @@ fn is_diff_path_line(line: &str) -> bool {
         || line.starts_with("rename to ")
 }
 
-fn normalize_diff_path_line(line: &str, folder_a: &str, folder_b: &str) -> String {
-    let mut out = line.to_string();
+fn normalize_diff_path_line(line: String, folder_a: &str, folder_b: &str) -> String {
+    let mut out = line;
     // `git diff --no-index` names both sides of an added or a deleted file after the single
     // folder that holds it, so each prefix has to be matched against both folders. Leaving one
     // of them to the bare folder fallback below would strip the `/` of its prefix along with

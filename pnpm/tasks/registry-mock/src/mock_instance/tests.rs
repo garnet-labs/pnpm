@@ -1,12 +1,35 @@
-use super::{MockInstance, MockInstanceOptions};
-use crate::{pick_port::pick_unused_port, process_kill::kill_process_by_pid};
-use reqwest::{Client, Proxy};
-use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, Signal, System};
+use super::{
+    MockInstance,
+    MockInstanceOptions,
+};
+use crate::{
+    pick_port::pick_unused_port,
+    process_kill::kill_process_by_pid,
+};
+use reqwest::{
+    Client,
+    Proxy,
+};
+use sysinfo::{
+    Pid,
+    ProcessRefreshKind,
+    RefreshKind,
+    Signal,
+    System,
+};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{
+        TcpListener,
+        TcpStream,
+    },
     sync::oneshot,
     task::JoinHandle,
-    time::{Duration, Instant, sleep, timeout},
+    time::{
+        Duration,
+        Instant,
+        sleep,
+        timeout,
+    },
 };
 
 fn options(client: &Client, port: u16) -> MockInstanceOptions<'_> {
@@ -23,6 +46,7 @@ fn options(client: &Client, port: u16) -> MockInstanceOptions<'_> {
 
 fn processes() -> System {
     System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()))
+        .expect("read the process table")
 }
 
 /// How long [`ChildCleanup::assert_reaped`] waits for the process table to

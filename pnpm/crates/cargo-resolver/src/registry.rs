@@ -1,8 +1,32 @@
-use crate::model::{DependencyKind, RegistryDependency, RegistryVersion};
-use cargo_util_schemas::index::{IndexPackage, RegistryDependency as IndexDependency};
-use miette::{IntoDiagnostic, Result, WrapErr};
-use semver::{Version, VersionReq};
-use std::collections::BTreeMap;
+use crate::{
+    model::{
+        DependencyKind,
+        RegistryDependency,
+        RegistryVersion,
+        ensure_not_cancelled,
+    },
+    preferences::{
+        PreferredVersions,
+        is_selectable,
+    },
+};
+use cargo_util_schemas::index::{
+    IndexPackage,
+    RegistryDependency as IndexDependency,
+};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+};
+use semver::{
+    Version,
+    VersionReq,
+};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
 /// The source identifier `cargo` writes for a crates.io package. A crate is
 /// locked against it when its dependency named crates.io or named no
@@ -73,19 +97,35 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    pub(crate) fn new(index_files: &BTreeMap<String, String>, source: &str) -> Result<Self> {
+    pub(crate) fn new(index_files: &BTreeMap<String, String>, source: String) -> Result<Self> {
+        Self::new_until(index_files, source, &|| false)
+    }
+
+    pub(crate) fn new_until(
+        index_files: &BTreeMap<String, String>,
+        source: String,
+        should_cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<Self> {
         let mut registry = Self::empty(source);
-        registry.add_entries(index_files)?;
+        registry.add_entries_until(index_files, should_cancel)?;
         Ok(registry)
     }
 
-    pub(crate) fn empty(source: &str) -> Self {
-        Self { packages: BTreeMap::new(), source: source.to_string() }
+    pub(crate) fn empty(source: String) -> Self {
+        Self { packages: BTreeMap::new(), source }
     }
 
-    pub(crate) fn add_entries(&mut self, index_files: &BTreeMap<String, String>) -> Result<()> {
+    pub(crate) fn add_entries_until(
+        &mut self,
+        index_files: &BTreeMap<String, String>,
+        should_cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<()> {
         for (name, contents) in index_files {
-            self.packages.insert(normalize_name(name), parse_index_file(name, contents)?);
+            ensure_not_cancelled(should_cancel)?;
+            self.packages.insert(
+                normalize_name(name),
+                parse_index_file_until(name, contents, should_cancel)?,
+            );
         }
         Ok(())
     }
@@ -96,7 +136,7 @@ impl Registry {
     /// entries it copies.
     pub(crate) fn validate_dependency_source(&self, registry: Option<&str>) -> Result<()> {
         let Some(registry) = registry else { return Ok(()) };
-        if is_crates_io_source(registry) || same_registry(registry, &self.source) {
+        if serves_registry(&self.source, registry) {
             return Ok(());
         }
         Err(miette::miette!(
@@ -111,6 +151,21 @@ impl Registry {
             .map(Vec::as_slice)
     }
 
+    /// Drop the preferred versions this registry does not offer, so no list
+    /// is longer than the crate's index entry.
+    pub(crate) fn retain_offered(&self, preferred_versions: &mut PreferredVersions) {
+        preferred_versions.retain(|name, versions| {
+            let offered = self
+                .versions(name)
+                .unwrap_or_default()
+                .iter()
+                .map(|version| &version.version)
+                .collect::<BTreeSet<_>>();
+            versions.retain(|version| offered.contains(version));
+            !versions.is_empty()
+        });
+    }
+
     pub(crate) fn package(&self, name: &str) -> Result<&[RegistryVersion]> {
         self.versions(name)
             .ok_or_else(|| {
@@ -123,13 +178,14 @@ impl Registry {
 pub fn latest_version(name: &str, index_file: &str) -> Result<String> {
     let registry = Registry::new(
         &BTreeMap::from([(name.to_string(), index_file.to_string())]),
-        CRATES_IO_SOURCE,
+        CRATES_IO_SOURCE.to_owned(),
     )?;
     registry
         .package(name)?
         .iter()
         .rev()
-        .find(|version| !version.yanked && version.version.pre.is_empty())
+        .filter(|version| !version.yanked)
+        .find(|version| version.version.pre.is_empty())
         .map(|version| version.version.to_string())
         .ok_or_else(|| miette::miette!("crate {name} has no stable, non-yanked version"))
 }
@@ -145,7 +201,7 @@ pub fn missing_features(
 ) -> Result<Vec<String>> {
     let registry = Registry::new(
         &BTreeMap::from([(name.to_string(), index_file.to_string())]),
-        CRATES_IO_SOURCE,
+        CRATES_IO_SOURCE.to_owned(),
     )?;
     let package = registry
         .package(name)?
@@ -168,18 +224,20 @@ pub fn latest_matching_version(
 ) -> Result<Option<Version>> {
     let registry = Registry::new(
         &BTreeMap::from([(name.to_string(), index_file.to_string())]),
-        CRATES_IO_SOURCE,
+        CRATES_IO_SOURCE.to_owned(),
     )?;
     let versions = registry.package(name)?;
     let selected = match requirement {
         Some(req) => versions
             .iter()
             .rev()
-            .find(|version| !version.yanked && req.matches(&version.version)),
+            .filter(|version| !version.yanked)
+            .find(|version| req.matches(&version.version)),
         None => versions
             .iter()
             .rev()
-            .find(|version| !version.yanked && version.version.pre.is_empty())
+            .filter(|version| !version.yanked)
+            .find(|version| version.version.pre.is_empty())
             .or_else(|| {
                 versions
                     .iter()
@@ -190,9 +248,14 @@ pub fn latest_matching_version(
     Ok(selected.map(|version| version.version.clone()))
 }
 
-fn parse_index_file(name: &str, contents: &str) -> Result<Vec<RegistryVersion>> {
+fn parse_index_file_until(
+    name: &str,
+    contents: &str,
+    should_cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Vec<RegistryVersion>> {
     let mut versions = Vec::new();
     for (line_index, line) in contents.lines().enumerate() {
+        ensure_not_cancelled(should_cancel)?;
         let package: IndexPackage<'_> = serde_json::from_str(line)
             .into_diagnostic()
             .wrap_err_with(|| format!("parse sparse index entry {name}:{}", line_index + 1))?;
@@ -231,7 +294,8 @@ fn registry_version_from_index(package: IndexPackage<'_>) -> Result<Option<Regis
 
 fn registry_dependency_from_index(dependency: IndexDependency<'_>) -> Result<RegistryDependency> {
     let alias = dependency.name.into_owned();
-    let name = dependency.package.map_or_else(|| alias.clone(), std::borrow::Cow::into_owned);
+    let name =
+        dependency.package.map(std::borrow::Cow::into_owned).unwrap_or_else(|| alias.clone());
     let requirement = VersionReq::parse(&dependency.req)
         .into_diagnostic()
         .wrap_err_with(|| format!("parse requirement for {name}"))?;
@@ -251,16 +315,18 @@ fn registry_dependency_from_index(dependency: IndexDependency<'_>) -> Result<Reg
 }
 
 /// The compatibility lines `requirement` is met on, oldest first, each
-/// paired with the newest non-yanked version on it.
+/// paired with the newest [selectable](is_selectable) version on it.
 ///
 /// `cargo` lets semver-incompatible versions of a crate coexist, so a
 /// requirement spanning several lines may be met on any one of them.
-pub(crate) fn matching_lines(
+pub(crate) fn matching_lines_with_preferences(
     versions: &[RegistryVersion],
     requirement: &VersionReq,
+    name: &str,
+    preferred_versions: &PreferredVersions,
 ) -> Vec<(String, Version)> {
     // Ascending, so the last version recorded for a line is its newest.
-    let newest = matching_versions(versions, requirement)
+    let newest = matching_versions(versions, requirement, name, preferred_versions)
         .map(|version| (compatibility_line(&version.version), version.version.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut lines = newest.into_iter().collect::<Vec<_>>();
@@ -268,13 +334,26 @@ pub(crate) fn matching_lines(
     lines
 }
 
+/// The [selectable](is_selectable) versions that meet `requirement`.
 pub(crate) fn matching_versions<'a>(
     versions: &'a [RegistryVersion],
     requirement: &'a VersionReq,
+    name: &'a str,
+    preferred_versions: &'a PreferredVersions,
 ) -> impl DoubleEndedIterator<Item = &'a RegistryVersion> {
     versions
         .iter()
-        .filter(|version| !version.yanked && requirement.matches(&version.version))
+        .filter(move |version| {
+            is_selectable(preferred_versions, name, version)
+                && requirement.matches(&version.version)
+        })
+}
+
+/// Whether the registry `source` names serves crates of `registry`: its own,
+/// or crates.io's, which a configured index mirrors.
+#[must_use]
+pub fn serves_registry(source: &str, registry: &str) -> bool {
+    is_crates_io_source(registry) || same_registry(registry, source)
 }
 
 pub(crate) fn is_crates_io_source(registry: &str) -> bool {

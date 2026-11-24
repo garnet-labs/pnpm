@@ -1,33 +1,61 @@
 //! The `registries` setting: one entry per registry, keyed by its URL.
 //!
-//! Every fact in an entry is a fact about that server — how it lays out
-//! tarball URLs, and which routes reach it — so a registry is declared once
+//! Every fact in an entry is a fact about that server (how it lays out
+//! tarball URLs, and which routes reach it) so a registry is declared once
 //! and each fact is stated in one place. [`RegistryLookups`] is the inverse of
 //! the routes, because a scope resolves to exactly one registry while a
 //! registry serves many.
 
-pub use python::{EcosystemIndex, PythonRegistryRoute};
+pub use pnpm_resolving_resolver_base::{
+    Ecosystem,
+    RegistryDeclaration,
+    RegistryPrefixes,
+};
 
-pub use ecosystems::{Ecosystem, serves_another_ecosystem, take_roles_from_earlier_layers};
+pub use python::{
+    EcosystemIndex,
+    PythonRegistryRoute,
+};
+
+pub use ecosystems::{
+    serves_another_ecosystem,
+    take_roles_from_earlier_layers,
+};
+
+pub use env_placeholders::{
+    refuse_env_placeholder_entries,
+    retain_without_env_placeholders,
+};
 
 use super::LoadWorkspaceYamlError;
-use crate::workspace_yaml::{redact_registry_url, registry_url_has_userinfo};
+use crate::workspace_yaml::{
+    redact_registry_url,
+    registry_url_has_userinfo,
+};
 use ecosystems::DeclaredIndexes;
 use indexmap::IndexMap;
-use pnpm_lockfile::{RegistryOptions, RegistryServerType};
+use pnpm_lockfile::RegistryOptions;
 use pnpm_network::normalize_registry_url;
 use serde::{
-    Deserialize, Deserializer,
-    de::{MapAccess, Visitor, value::MapAccessDeserializer},
+    Deserialize,
+    Deserializer,
+    de::{
+        MapAccess,
+        Visitor,
+        value::MapAccessDeserializer,
+    },
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     fmt,
     num::NonZeroUsize,
 };
 
 /// The bare scope standing for the registry that packages resolve from when
-/// no scope matches — the one the `registry` setting names.
+/// no scope matches, the one the `registry` setting names.
 pub const DEFAULT_REGISTRY_SCOPE: &str = "@";
 
 /// Credentials and TLS material stay in `.npmrc`, which is not committed.
@@ -55,78 +83,6 @@ pub enum RegistryEntry {
     /// The older `<scope>: <url>` shape, which is the scope lookup already.
     ScopeRoute(String),
     Declaration(RegistryDeclaration),
-}
-
-/// Everything a project declares about one registry.
-///
-/// Unknown fields are captured rather than refused by serde on purpose, for
-/// the same reason this module validates after parsing: a parse error renders
-/// the offending source line verbatim, so refusing an `_authToken` field at
-/// parse time would print the very credential being refused.
-#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistryDeclaration {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_type: Option<RegistryServerType>,
-    /// See [`RegistryOptions::supports_time_field`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_time_field: Option<bool>,
-    /// The most requests pnpm keeps in flight to this registry's origin, within
-    /// the overall `networkConcurrency`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_concurrency: Option<NonZeroUsize>,
-    /// The scopes routed here, `@`-prefixed. A bare `@` is the scope-less
-    /// default registry, the one the `registry` setting names.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scopes: Option<Vec<String>>,
-    #[serde(flatten)]
-    pub prefixes: RegistryPrefixes,
-    /// Which ecosystem's packages this registry serves. Absent is
-    /// [`Ecosystem::Npm`], so every entry written before there was anything
-    /// else to serve means what it did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ecosystem: Option<Ecosystem>,
-    /// Python package names or trailing-prefix patterns routed exclusively here.
-    /// Omitted, or `*`, declares the default Python index.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packages: Option<Vec<String>>,
-    #[serde(flatten)]
-    pub unknown: BTreeMap<String, serde_json::Value>,
-}
-
-impl Eq for RegistryDeclaration {}
-
-/// The bare-specifier prefixes that address a registry.
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
-pub struct RegistryPrefixes {
-    /// The bare-specifier prefix this registry answers to, as in
-    /// `"foo": "work:^1.0.0"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-    /// The other prefixes routed to this registry. A pnpr request carries
-    /// them, `pnpm-workspace.yaml` refuses them: the request names every
-    /// prefix the client resolves, while `prefix` holds the smallest, the one
-    /// lockfile keys carry.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-}
-
-impl RegistryPrefixes {
-    fn iter(&self) -> impl Iterator<Item = &str> {
-        self.prefix
-            .as_deref()
-            .into_iter()
-            .chain(self.aliases.iter().map(String::as_str))
-    }
-}
-
-impl RegistryDeclaration {
-    /// The ecosystem this entry serves, with the absent field read as
-    /// [`Ecosystem::Npm`].
-    #[must_use]
-    pub fn ecosystem(&self) -> Ecosystem {
-        self.ecosystem.unwrap_or_default()
-    }
 }
 
 impl<'de> Deserialize<'de> for RegistryEntry {
@@ -412,6 +368,13 @@ fn extend_npm_routes(
 
 /// A declaration that says nothing about the server records no options: an
 /// absent entry is what "assume nothing about this registry" is spelled as.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the URL is copied only when the declaration records server options"
+    )
+)]
 fn extend_registry_options(
     lookups: &mut RegistryLookups,
     normalized: &str,
@@ -473,7 +436,7 @@ pub fn to_declarations(lookups: &RegistryLookups) -> IndexMap<String, RegistryDe
 }
 
 /// [`to_declarations`] plus the default registry declared as the bare `@`
-/// scope and each registry's `networkConcurrency` — the resolved view
+/// scope and each registry's `networkConcurrency`, the resolved view
 /// `pnpm config get registries` prints, where nothing travels separately.
 /// A pnpr server receives neither: it does not make the client's requests.
 #[must_use]
@@ -511,19 +474,6 @@ pub fn to_resolved_declarations(
     declarations
 }
 
-/// Drop the entries whose request destination carries an unexpanded `${VAR}`.
-/// The destination is the value of a scope route and the key of a
-/// declaration, so which half is gated follows the entry's shape.
-pub fn retain_without_env_placeholders(
-    entries: &mut IndexMap<String, RegistryEntry>,
-    has_env_placeholder: impl Fn(&str) -> bool,
-) {
-    entries.retain(|registry, entry| match entry {
-        RegistryEntry::ScopeRoute(url) => !has_env_placeholder(url),
-        RegistryEntry::Declaration(_) => !has_env_placeholder(registry),
-    });
-}
-
 fn looks_like_registry_url(key: &str) -> bool {
     key.contains("://") || key.starts_with("//")
 }
@@ -537,4 +487,5 @@ pub(super) fn quote_and_join<'a>(values: impl IntoIterator<Item = &'a str>) -> S
 }
 
 mod ecosystems;
+mod env_placeholders;
 mod python;

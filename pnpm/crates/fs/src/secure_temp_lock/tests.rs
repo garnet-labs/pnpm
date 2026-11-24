@@ -1,7 +1,12 @@
 use super::{
-    android_user_lock_root, open_secure_lock_file, secure_temp_lock_dir, secure_user_lock_dir,
-    validate_unix_file, xdg_runtime_dir,
+    android_user_lock_root,
+    open_secure_lock_file,
+    secure_temp_lock_dir,
+    secure_user_lock_dir,
+    validate_unix_file,
+    xdg_runtime_dir,
 };
+use command_extra::CommandExtra;
 
 #[test]
 fn android_lock_root_falls_back_when_home_is_unavailable() {
@@ -66,8 +71,8 @@ fn xdg_runtime_dir_its_owner_cannot_write_to_is_ignored() {
 
 #[test]
 fn xdg_runtime_dir_owned_by_another_user_is_ignored() {
-    // SAFETY: `geteuid` has no preconditions and does not mutate memory.
-    if unsafe { libc::geteuid() } == 0 {
+    // Root owns `/`, so there would be no other user's directory to ignore.
+    if pnpm_ffi_process::effective_user_id() == 0 {
         return;
     }
     assert_eq!(xdg_runtime_dir(Some("/".into())), None);
@@ -76,14 +81,16 @@ fn xdg_runtime_dir_owned_by_another_user_is_ignored() {
 #[cfg(unix)]
 #[test]
 fn creates_a_private_user_owned_lock_directory() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{
+        MetadataExt as _,
+        PermissionsExt as _,
+    };
 
     let name = format!("pnpm-secure-lock-test-{}", std::process::id());
     let directory = secure_temp_lock_dir(&name).unwrap();
     let metadata = std::fs::symlink_metadata(&directory).unwrap();
     assert!(metadata.is_dir());
-    // SAFETY: `geteuid` has no preconditions and does not mutate memory.
-    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.uid(), pnpm_ffi_process::effective_user_id());
     assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     std::fs::remove_dir(directory).unwrap();
 }
@@ -128,13 +135,13 @@ fn stable_user_lock_directory_does_not_use_the_process_temp_root() {
     if std::env::var_os(CHILD).is_none() {
         let process_temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
+            .with_args([
                 "--exact",
                 "secure_temp_lock::tests::stable_user_lock_directory_does_not_use_the_process_temp_root",
             ])
-            .env(CHILD, "1")
-            .env("TMPDIR", process_temp.path())
-            .env_remove("XDG_RUNTIME_DIR")
+            .with_env(CHILD, "1")
+            .with_env("TMPDIR", process_temp.path())
+            .without_env("XDG_RUNTIME_DIR")
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -154,12 +161,12 @@ fn user_lock_directory_lives_in_the_xdg_runtime_dir() {
     let Some(runtime_dir) = std::env::var_os(CHILD) else {
         let runtime_dir = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
+            .with_args([
                 "--exact",
                 "secure_temp_lock::tests::user_lock_directory_lives_in_the_xdg_runtime_dir",
             ])
-            .env(CHILD, runtime_dir.path())
-            .env("XDG_RUNTIME_DIR", runtime_dir.path())
+            .with_env(CHILD, runtime_dir.path())
+            .with_env("XDG_RUNTIME_DIR", runtime_dir.path())
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");

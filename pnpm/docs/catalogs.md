@@ -56,6 +56,10 @@ You may use the `catalog:` protocol in the next fields:
     * `overrides`
 * [`pnx`](./cli/pnx.md) specifiers, such as `pnx shx@catalog:`
 
+The dependencies of a local directory installed as a copy, such as a `file:` dependency or an [injected](./package_json.md#dependenciesmetainjected) workspace package, can use the `catalog:` protocol too. They resolve against the catalogs of the workspace that installs the directory.
+
+When a local directory package uses a catalog entry for a peer dependency, pnpm records that entry in the lockfile. Run `pnpm install` after changing the entry so frozen installs can use the updated lockfile.
+
 The `catalog:` protocol allows an optional name after the colon (ex: `catalog:name`) to specify which catalog should be used. When a name is omitted, the default catalog is used.
 
 Depending on the scenario, the `catalog:` protocol offers a few [advantages](#advantages) compared to writing version ranges directly that are detailed next.
@@ -77,10 +81,10 @@ Catalogs are defined in the `pnpm-workspace.yaml` file. There are two ways to de
 
 :::tip
 
-If you have an existing workspace that you want to migrate to using catalogs, you can use the following [codemod](https://go.codemod.com/pnpm-catalog):
+If you have an existing workspace that you want to migrate to using catalogs, run [`pnpm catalog migrate`](./cli/catalog.md):
 
 ```sh
-pnx codemod pnpm/catalog
+pnpm catalog migrate
 ```
 
 :::
@@ -161,7 +165,7 @@ pnpm expands the `catalog:` reference to `workspace:^` and then links the worksp
 
 Added in: v12.6.0
 
-Catalog entries can use the `file:` and `link:` protocols ([#8642](https://github.com/pnpm/pnpm/issues/8642)). A relative path in an entry, such as `file:./tarballs/foo.tgz` or a bare `./tarballs/foo.tgz`, is measured from the directory holding `pnpm-workspace.yaml`:
+Catalog entries can use the `file:` and `link:` protocols ([#8642](https://github.com/pnpm/pnpm/issues/8642)). A relative path in an entry, such as `file:./tarballs/foo.tgz`, `workspace:./packages/foo`, or a bare `./tarballs/foo.tgz`, is measured from the directory holding `pnpm-workspace.yaml`:
 
 ```yaml title="pnpm-workspace.yaml"
 catalog:

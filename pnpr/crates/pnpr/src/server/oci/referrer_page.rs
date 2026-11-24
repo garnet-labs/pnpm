@@ -1,6 +1,16 @@
 use super::{
-    CanonicalPackageName, Digest, ImageDocument, MAX_REFERRER_READ_BYTES, MAX_REFERRER_READS,
-    Manifest, ManifestEntry, ReferrerMetadata, Response, Serialize, query_param, registry_error,
+    CanonicalPackageName,
+    Digest,
+    ImageDocument,
+    MAX_REFERRER_READ_BYTES,
+    MAX_REFERRER_READS,
+    Manifest,
+    ManifestEntry,
+    ReferrerMetadata,
+    Response,
+    Serialize,
+    query_param,
+    registry_error,
 };
 
 #[derive(Serialize)]
@@ -45,7 +55,10 @@ pub(super) struct ReferrerFilter {
 impl ReferrerFilter {
     pub(super) fn new(subject: Digest, query: &str) -> Self {
         let artifact_type = query_param(Some(query), "artifactType");
-        let artifact_type_digest = artifact_type.as_ref().map(|value| Digest::of(value.as_bytes()));
+        let artifact_type_digest = artifact_type
+            .as_ref()
+            .map(String::as_bytes)
+            .map(Digest::of);
         Self { subject, artifact_type, artifact_type_digest }
     }
 
@@ -217,8 +230,10 @@ pub(super) async fn read_image_document(
     key: &CanonicalPackageName,
 ) -> Result<ImageDocument, Response> {
     match storage.read_hosted_document(key).await {
-        Ok(Some(bytes)) => ImageDocument::parse(&bytes).map_err(|err| registry_error(err.into())),
-        Ok(None) => Ok(ImageDocument::new(key.as_str())),
+        Ok(Some(bytes)) => {
+            ImageDocument::parse(&bytes).map_err(std::convert::Into::into).map_err(registry_error)
+        }
+        Ok(None) => Ok(ImageDocument::new(key.as_str().to_owned())),
         Err(err) => Err(registry_error(err)),
     }
 }

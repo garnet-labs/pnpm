@@ -1,14 +1,31 @@
 use super::{
-    LifecycleScriptError, RunPostinstallHooks, StreamedScript, install_stage_script,
-    output::{PumpLink, STREAMED_OUTPUT_CHUNK_BYTES},
-    read_lifecycle_manifest, run_postinstall_hooks,
+    LifecycleScriptError,
+    RunPostinstallHooks,
+    StreamedScript,
+    install_stage_script,
+    output::{
+        PumpLink,
+        STREAMED_OUTPUT_CHUNK_BYTES,
+    },
+    read_lifecycle_manifest,
+    run_postinstall_hooks,
 };
 use pnpm_package_manifest::PackageManifestError;
 use pnpm_reporter::{
-    LifecycleMessage, LifecycleStdio, LogEvent, LogLevel, Reporter, SilentReporter,
+    LifecycleMessage,
+    LifecycleStdio,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SilentReporter,
 };
 use pretty_assertions::assert_eq;
-use std::{collections::HashMap, fs, io::Cursor, sync::Mutex};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Cursor,
+    sync::Mutex,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -416,59 +433,45 @@ fn missing_manifest_returns_false() {
 #[cfg(unix)]
 #[test]
 fn child_sees_stamped_npm_package_and_preserves_user_config() {
-    /// RAII guard that restores a process env var to its pre-test
-    /// value on drop, so an assertion failure can't leak the seed
-    /// into sibling tests — nor clobber a value the env already had.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-    impl EnvGuard {
-        fn new(key: &'static str) -> Self {
-            EnvGuard { key, prev: std::env::var_os(key) }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: nextest runs each test in its own thread, so the
-            // only risk is sibling tests calling `env::vars()`
-            // concurrently — this `Drop` still runs on panic.
-            unsafe {
-                match self.prev.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-    let _user_guard = EnvGuard::new("npm_config_platform_arch");
-    let _auth_guard = EnvGuard::new("npm_config__authtoken");
-    // SAFETY: nextest runs each test in its own thread, so the only
-    // risk is sibling tests calling `env::vars()` concurrently — the
-    // guards' `Drop` removes the vars even on panic.
-    unsafe {
-        std::env::set_var("npm_config_platform_arch", "x64");
-        std::env::set_var("npm_config__authtoken", "should-not-leak");
-    }
+    use super::run_lifecycle_hook;
+    use std::fmt::Write as _;
 
     let dir = tempdir().expect("create temp dir");
     let pkg_root = dir.path();
     let dump_path = pkg_root.join("env.dump");
 
+    const DUMP_LINES: &[(&str, &str)] = &[
+        ("stage", "$npm_lifecycle_event"),
+        ("script", "$npm_lifecycle_script"),
+        ("name", "$npm_package_name"),
+        ("ver", "$npm_package_version"),
+        ("config", "$npm_package_config_myKey"),
+        ("init_cwd", "$INIT_CWD"),
+        ("user", "$npm_config_platform_arch"),
+        ("auth", "$npm_config__authtoken"),
+    ];
+    // `printf`, not `echo`, so the line endings are consistent across shells.
+    let mut template = String::new();
+    let mut arguments = String::new();
+    for (label, expression) in DUMP_LINES {
+        write!(template, r"{label}=%s\n").expect("write to a String");
+        write!(arguments, r#" "{expression}""#).expect("write to a String");
+    }
+    let script = format!("printf '{template}'{arguments} > '{}'", dump_path.display());
     let manifest = serde_json::json!({
         "name": "stamp-target",
         "version": "9.9.9",
         "config": { "myKey": "myValue" },
-        "scripts": {
-            // printf, not echo, so the line endings are deterministic
-            // across shells.
-            "postinstall": format!(
-                r#"printf 'stage=%s\nscript=%s\nname=%s\nver=%s\nconfig=%s\ninit_cwd=%s\nuser=%s\nauth=%s\n' "$npm_lifecycle_event" "$npm_lifecycle_script" "$npm_package_name" "$npm_package_version" "$npm_package_config_myKey" "$INIT_CWD" "$npm_config_platform_arch" "$npm_config__authtoken" > {}"#,
-                dump_path.display(),
-            ),
-        },
     });
-    fs::write(pkg_root.join("package.json"), manifest.to_string()).expect("write manifest");
+    let mut parent_env: HashMap<String, String> =
+        [("npm_config_platform_arch", "x64"), ("npm_config__authtoken", "should-not-leak")]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+    // The hook finds its shell along `PATH`.
+    if let Ok(path) = std::env::var("PATH") {
+        parent_env.insert("PATH".to_string(), path);
+    }
 
     let extra_env: HashMap<String, String> = HashMap::new();
     let extra_bin_paths: Vec<std::path::PathBuf> = vec![];
@@ -497,8 +500,8 @@ fn child_sees_stamped_npm_package_and_preserves_user_config() {
         optional: false,
     };
 
-    let ran = run_postinstall_hooks::<SilentReporter>(&opts).expect("postinstall");
-    assert!(ran, "run_postinstall_hooks must report at least one script ran: ran={ran}");
+    run_lifecycle_hook::<SilentReporter>("postinstall", &script, &opts, &manifest, &parent_env)
+        .expect("postinstall");
 
     let dump = fs::read_to_string(&dump_path).expect("read env dump");
 
@@ -510,7 +513,7 @@ fn child_sees_stamped_npm_package_and_preserves_user_config() {
         ("config", "myValue"),
         ("init_cwd", expected_init_cwd.as_ref()),
         ("user", "x64"), // user-defined npm_config_* is preserved
-        ("auth", ""),    // auth npm_config_* is stripped — child sees empty string
+        ("auth", ""),    // auth npm_config_* is stripped, child sees empty string
     ];
     for (k, v) in expected_pairs {
         let line = format!("{k}={v}\n");
@@ -607,6 +610,7 @@ fn malformed_package_yaml_reports_the_selected_manifest() {
 /// the child-process pumps, so it needs its own proof that a script's
 /// stdout, stderr, and non-zero exit still reach the reporter. Runs
 /// everywhere: the emulated shell is the same on every platform.
+#[cfg_attr(not(feature = "shell-emulator"), ignore = "requires shell emulation")]
 #[test]
 fn shell_emulator_lifecycle_emits_stdio_and_a_failing_exit() {
     static EVENTS: Mutex<Vec<LogEvent>> = Mutex::new(Vec::new());

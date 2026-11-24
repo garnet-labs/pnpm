@@ -4,23 +4,44 @@
 //! recorded which projects are still proven installed, checks the rest that
 //! the gate covers against the lockfile, and records a passing check.
 
-pub(crate) use drift::{InputDrift, ProjectStatus};
+pub(crate) use drift::{
+    InputDrift,
+    ProjectStatus,
+};
 use missing_lockfile::settle_missing_wanted_lockfile;
 use registry_keys::state_unverified_by_changed_lockfile;
 
 use super::{
-    LockfileConflictCheckFailure, OptimisticRepeatInstallCheck, PathBuf, Scope, WorkspaceState,
+    LockfileConflictCheckFailure,
+    OptimisticRepeatInstallCheck,
+    PathBuf,
+    Scope,
+    WorkspaceState,
     catalogs_cache_matches,
     current_lockfile::CurrentLockfile,
     current_lockfile_file_has_content,
     deps_status::config_dependencies_drifted,
-    direct_dependency_link_dangling, filesystem_now_ms_in_modules,
-    first_held_project_missing_modules_dir, first_lockfile_requiring_conflict_safe_install,
-    first_setting_drift, held_project_dirs, held_projects_match_lockfile,
-    local_file_blocks_fast_path, pnpmfiles_drift, project_structure_matches,
-    relocation::{prove_move, rekeyed_validation_now},
+    direct_dependency_link_dangling,
+    filesystem_now_ms_in_modules,
+    first_held_project_missing_modules_dir,
+    first_lockfile_requiring_conflict_safe_install,
+    first_setting_drift,
+    held_project_dirs,
+    held_projects_match_lockfile,
+    local_file_blocks_fast_path,
+    pnpmfiles_drift,
+    project_structure_matches,
+    relocation::{
+        prove_move,
+        rekeyed_validation_now,
+    },
     settle::current_lockfile_unusable_with_non_empty_wanted,
-    validation::{FileDigest, Vouched, records_need_refresh, trusts_every_file},
+    validation::{
+        FileDigest,
+        Vouched,
+        records_need_refresh,
+        trusts_every_file,
+    },
 };
 use std::collections::HashSet;
 
@@ -138,7 +159,7 @@ pub(super) fn check_freshness(
 ) -> Result<(), Stale> {
     check_static_freshness(check, state, policy, scope)?;
     let drift = InputDrift::compute(check, state);
-    let held = drift.held(check, scope);
+    let held = drift.held(check, scope, proven_projects(check, state, policy));
     if !drift::held_workspace_bins_match(check, state, &held) {
         return Err(Stale::Content("workspace package bins changed since the last install"));
     }
@@ -176,6 +197,22 @@ pub(super) fn check_freshness(
     Ok(())
 }
 
+/// A gate that lets local file dependencies through still has to see a
+/// local directory dependency's manifest change, which changes what the
+/// lockfile records for it. No validation records that manifest, so the
+/// content check reads it for every project.
+fn proven_projects(
+    check: &OptimisticRepeatInstallCheck<'_>,
+    state: &WorkspaceState,
+    policy: &GatePolicy<'_>,
+) -> drift::ProvenProjects {
+    if !policy.check_local_file_deps && super::records_local_directory(check, state) {
+        drift::ProvenProjects::Rechecked
+    } else {
+        drift::ProvenProjects::Trusted
+    }
+}
+
 /// The static drift checks that run before [`InputDrift::compute`] stats any
 /// manifest.
 fn check_static_freshness(
@@ -184,6 +221,12 @@ fn check_static_freshness(
     policy: &GatePolicy<'_>,
     scope: Scope<'_>,
 ) -> Result<(), Stale> {
+    if check.config.node_linker == pnpm_config::NodeLinker::Pnp
+        && !check.config.virtual_store_only
+        && !check.workspace_root.join(pnpm_deps_restorer::PNP_FILENAME).is_file()
+    {
+        return Err(Stale::Content("the PnP loader is missing"));
+    }
     // A filtered state without validation records names no installed
     // project, and the current lockfile lists the projects that install did
     // not select as if it had installed them.
@@ -492,6 +535,7 @@ fn refreshed_state(
         },
         filesystem_now_ms: filesystem_now,
         carried: crate::install::CarriedSettings {
+            trust_lockfile: check.config.trust_lockfile,
             established_auto_dedupe: state.settings.auto_dedupe,
             // A gate that ignores `registryPrefixes` passes on a recorded
             // verification of other prefixes, which proves nothing about these.

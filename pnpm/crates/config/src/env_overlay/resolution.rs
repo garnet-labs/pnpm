@@ -1,7 +1,11 @@
 //! The peer and resolution settings of the environment overlay.
 
 use super::{
-    HoistingLimits, LinkWorkspacePackages, StringReader, WorkspaceSettings, parse_json,
+    HoistingLimits,
+    LinkWorkspacePackages,
+    StringReader,
+    WorkspaceSettings,
+    parse_json,
     parse_json_or_string,
 };
 
@@ -24,6 +28,12 @@ impl WorkspaceSettings {
             reader,
             resolve_peers_from_workspace_root,
             "RESOLVE_PEERS_FROM_WORKSPACE_ROOT"
+        );
+        json_field!(
+            settings,
+            reader,
+            project_scoped_optional_peers,
+            "PROJECT_SCOPED_OPTIONAL_PEERS"
         );
     }
 
@@ -49,6 +59,7 @@ impl WorkspaceSettings {
         json_field!(settings, reader, dedupe_injected_deps, "DEDUPE_INJECTED_DEPS");
         json_field!(settings, reader, ignore_compatibility_db, "IGNORE_COMPATIBILITY_DB");
         json_field!(settings, reader, block_exotic_subdeps, "BLOCK_EXOTIC_SUBDEPS");
+        json_field!(settings, reader, warn_unused_overrides, "WARN_UNUSED_OVERRIDES");
         json_field!(settings, reader, verify_store_integrity, "VERIFY_STORE_INTEGRITY");
         json_field!(
             settings,

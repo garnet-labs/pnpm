@@ -1,4 +1,7 @@
-use super::{Ecosystem, wildcard_shapes};
+use super::{
+    Ecosystem,
+    wildcard_shapes,
+};
 
 /// A static registry-configuration defect. Surfaced by [`crate::Registries::validate`] and by
 /// [`crate::PackagePattern::parse`]; the `config` module turns it into an
@@ -18,12 +21,12 @@ pub enum RegistryConfigError {
                 wildcard_shapes(*ecosystem))]
     InvalidPattern { pattern: String, ecosystem: Ecosystem },
     /// A wildcard-free registry pattern that is not a well-formed package name,
-    /// so it could never match any request.
-    #[display(
-        "registry pattern {pattern:?} is not a valid package name, so it can never match; \
-                 to claim every package in a scope use `@scope/*`"
-    )]
-    ExactPatternNotAName { pattern: String },
+    /// so it could never match any request. Carries the ecosystem for the same
+    /// reason as [`Self::InvalidPattern`].
+    #[display("registry pattern {pattern:?} is not a valid {ecosystem} package name, so it can \
+                 never match; use an exact name, {}, or `**`",
+                wildcard_shapes(*ecosystem))]
+    ExactPatternNotAName { pattern: String, ecosystem: Ecosystem },
     /// A `@<scope>/*` pattern whose scope no well-formed package name can
     /// carry, so it could never match any request.
     #[display(

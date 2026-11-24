@@ -170,12 +170,13 @@ test('linux riscv64 resolves the glibc package, and nothing under musl', async (
   assert.deepEqual(candidates(), [])
 })
 
-test('linux ppc64 and s390x resolve their glibc packages', async (t) => {
+test('linux ppc64, s390x and loong64 resolve their glibc packages', async (t) => {
   // The musl half of the contract is pinned by the riscv64 case above; these
-  // two share that code path and only need their table entries checked.
+  // architectures share that code path and only need their table entries checked.
   for (const [arch, specifier] of [
     ['ppc64', '@pnpm/exe.linux-ppc64/pnpm'],
     ['s390x', '@pnpm/exe.linux-s390x/pnpm'],
+    ['loong64', '@pnpm/exe.linux-loong64/pnpm'],
   ]) {
     const { setLibc, setEndianness } = fakeHost(t, 'linux', arch)
     const { getBinCandidates: candidates } = await import(`../native-binary.mjs?${arch}`)
@@ -221,6 +222,13 @@ test('freebsd x64 resolves the native package', async (t) => {
   // FreeBSD has no glibc/musl split, so its entry is a bare specifier and the
   // libc ordering never applies to it.
   assert.deepEqual(candidates(), ['@pnpm/exe.freebsd-x64/pnpm'])
+})
+
+test('netbsd x64 resolves the native package', async (t) => {
+  fakeHost(t, 'netbsd', 'x64')
+  const { getBinCandidates: candidates } = await import('../native-binary.mjs?netbsd')
+
+  assert.deepEqual(candidates(), ['@pnpm/exe.netbsd-x64/pnpm'])
 })
 
 test('an architecture released for both libcs still offers the other as a fallback', async (t) => {

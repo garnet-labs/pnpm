@@ -3,7 +3,11 @@
 //! create real symlinks / bin shims, so they are Unix-gated.
 
 #[cfg(unix)]
-use crate::_utils::{append_workspace_yaml_key, set_minimum_release_age, without_colors};
+use crate::_utils::{
+    append_workspace_yaml_key,
+    set_minimum_release_age,
+    without_colors,
+};
 use assert_cmd::cargo::CommandCargoExt;
 use command_extra::CommandExtra;
 #[cfg(unix)]
@@ -12,8 +16,14 @@ use pnpm_testing_utils::bin::CommandTempCwd;
 #[cfg(unix)]
 use pnpm_testing_utils::command_env::CommandTestExt;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
-use std::{fs, process::Command};
+use std::path::{
+    Path,
+    PathBuf,
+};
+use std::{
+    fs,
+    process::Command,
+};
 
 /// Create the global bin directory and seed the pnpm home with the mocked
 /// registry / store / cache. A `-g` install anchors its config at the pnpm
@@ -83,13 +93,13 @@ fn run_global_prompt(
     answer: &str,
 ) -> std::process::Output {
     without_colors(with_global_env(Command::new("python3"), workspace, pnpm_home))
-        .env("CI", "false")
-        .env_remove("GITHUB_ACTION")
-        .env("PNPM_TEST_MINIMUM_RELEASE_AGE_ANSWER", answer)
-        .arg("-c")
-        .arg(include_str!("../fixtures/minimum_release_age_prompt.py"))
-        .arg(env!("CARGO_BIN_EXE_pnpm"))
-        .args(args)
+        .with_env("CI", "false")
+        .without_env("GITHUB_ACTION")
+        .with_env("PNPM_TEST_MINIMUM_RELEASE_AGE_ANSWER", answer)
+        .with_arg("-c")
+        .with_arg(include_str!("../fixtures/minimum_release_age_prompt.py"))
+        .with_arg(env!("CARGO_BIN_EXE_pnpm"))
+        .with_args(args)
         .output()
         .expect("run the interactive global command in a pseudo-terminal")
 }
@@ -275,8 +285,68 @@ fn global_add_list_remove_round_trip() {
     drop(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn global_add_of_several_groups_summarizes_every_group() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    let output = without_colors(global_command(&workspace, &pnpm_home))
+        .with_args(["add", "-g", "is-positive", "is-negative"])
+        .output()
+        .expect("run add -g");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "add -g failed: {stdout}");
+    assert!(stdout.contains("+ is-positive"), "{stdout}");
+    assert!(stdout.contains("+ is-negative"), "{stdout}");
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_add_prints_no_summary_when_a_group_fails_activation() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    let selectors = ["alpha", "beta"].map(|name| {
+        let dir = root.path().join(name);
+        fs::create_dir_all(&dir).expect("create package dir");
+        fs::write(
+            dir.join("package.json"),
+            serde_json::json!({ "name": name, "version": "1.0.0", "bin": { "shared-tool": "cli.js" } })
+                .to_string(),
+        )
+        .expect("write manifest");
+        fs::write(dir.join("cli.js"), "#!/usr/bin/env node\n").expect("write bin");
+        format!("file:{}", dir.display())
+    });
+
+    let output = without_colors(global_command(&workspace, &pnpm_home))
+        .with_arg("add")
+        .with_arg("-g")
+        .with_args(&selectors)
+        .output()
+        .expect("run add -g");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "add -g should fail: {stdout}");
+    assert!(stderr.contains("ERR_PNPM_GLOBAL_BIN_CONFLICT"), "{stderr}");
+    assert!(!stdout.contains("+ alpha"), "{stdout}");
+    assert!(!stdout.contains("+ beta"), "{stdout}");
+
+    drop(npmrc_info);
+    drop(root);
+}
+
 /// A mutating global command must create a missing global bin directory
-/// instead of failing `ERR_PNPM_PNPM_DIR_NOT_WRITABLE` — pnpm's config
+/// instead of failing `ERR_PNPM_PNPM_DIR_NOT_WRITABLE`, pnpm's config
 /// reader runs `mkdir -p` on the bin dir for every `--global` command. A
 /// fresh `PNPM_HOME` whose `bin` is on `PATH` but not yet on disk (e.g.
 /// provisioned by a CI setup action) must work on the first `add -g` /
@@ -324,7 +394,7 @@ fn global_add_creates_a_missing_global_bin_dir() {
 
 /// `pnpm add -g node@22.0.0` installs the Node.js runtime, because a bare
 /// tool name names the tool. A Package URL names a package in a registry,
-/// so the global path has to install that package instead — the mark a purl
+/// so the global path has to install that package instead, the mark a purl
 /// carries reaches `tool_install_selectors` through the group each request
 /// splits into.
 #[cfg(unix)]
@@ -473,8 +543,8 @@ fn global_bin_resolves_hoisted_dependencies() {
         .success();
 
     let output = Command::new(pnpm_home.join("bin/bin-requires-hoisted-dep"))
-        .current_dir(&workspace)
-        .env_remove("NODE_PATH")
+        .with_current_dir(&workspace)
+        .without_env("NODE_PATH")
         .output()
         .expect("run the installed global bin");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -549,14 +619,24 @@ fn global_add_installs_standalone_package_files_without_scripts() {
     drop(root);
 }
 
-/// A build approved during a global install must persist to the stable
-/// global packages directory (where the next global install reads it back),
-/// not to the throwaway per-group install dir. Regression test: the group
-/// install pins `workspace_dir` to the install dir, which `approve-builds`
-/// would otherwise use as the `allowBuilds` write target.
+/// The global `config.yaml` of a [`global_command`] run with `pnpm_home`.
+#[cfg(unix)]
+fn global_config_yaml(pnpm_home: &Path) -> PathBuf {
+    pnpm_home
+        .join("config-home")
+        .join("pnpm")
+        .join("config.yaml")
+}
+
+/// A build approved during a global install must persist to
+/// `globalPackagesConfig` in the global `config.yaml` (where the next global
+/// install reads it back), not to the throwaway per-group install dir.
+/// Regression test: the group install pins `workspace_dir` to the install
+/// dir, which `approve-builds` would otherwise use as the `allowBuilds`
+/// write target.
 #[cfg(unix)]
 #[test]
-fn global_add_persists_build_approvals_to_the_global_packages_dir() {
+fn global_add_persists_build_approvals_to_the_global_config() {
     use assert_cmd::assert::OutputAssertExt;
 
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
@@ -574,13 +654,13 @@ fn global_add_persists_build_approvals_to_the_global_packages_dir() {
         .assert()
         .success();
 
-    let global_yaml = fs::read_to_string(global_pkg_dir.join("pnpm-workspace.yaml"))
-        .expect("allowBuilds should persist to the global packages dir");
-    assert!(
-        global_yaml.contains("allowBuilds:")
-            && global_yaml.contains("@pnpm.e2e/install-script-example"),
-        "the global packages dir should hold the allowBuilds decision: {global_yaml}",
+    let config_yaml = fs::read_to_string(global_config_yaml(&pnpm_home))
+        .expect("the build decision should persist to the global config");
+    assert_eq!(
+        config_yaml,
+        "globalPackagesConfig:\n  permissions:\n    '@pnpm.e2e/install-script-example':\n      build: true\n",
     );
+    assert!(!global_pkg_dir.join("pnpm-workspace.yaml").exists());
 
     // No per-group install dir should carry the decision.
     for entry in fs::read_dir(&global_pkg_dir).expect("read global packages dir").flatten() {
@@ -649,9 +729,195 @@ fn approve_builds_global_approves_every_install_group() {
     drop(root);
 }
 
-/// A global install must ignore the `pnpm-workspace.yaml` of global
-/// settings (`allowBuilds`, `catalog`, ...) that lives in the global packages
-/// directory: the per-group install dir sits under it, so an install that
+/// A denial recorded after the install, here in the global packages
+/// directory's `pnpm-workspace.yaml`, survives `--all` although the stale
+/// `ignoredBuilds` still lists the package.
+#[cfg(unix)]
+#[test]
+fn approve_builds_global_all_keeps_a_legacy_denial() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    let global_pkg_dir = pnpm_home.join("global").join("v11");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    for package in [
+        "@pnpm.e2e/install-script-example@1.0.0",
+        "@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0",
+    ] {
+        global_command(&workspace, &pnpm_home)
+            .with_args(["add", "-g", package])
+            .assert()
+            .success();
+    }
+    fs::write(
+        global_pkg_dir.join("pnpm-workspace.yaml"),
+        "allowBuilds:\n  '@pnpm.e2e/pre-and-postinstall-scripts-example': false\n",
+    )
+    .expect("write the legacy denial");
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["approve-builds", "-g", "--all"])
+        .assert()
+        .success();
+
+    let built = |name: &str, file: &str| {
+        pnpm_global::find_global_package(&global_pkg_dir, name)
+            .expect("scan global packages")
+            .expect("find the install group")
+            .install_dir
+            .join("node_modules")
+            .join(name)
+            .join(file)
+            .exists()
+    };
+    assert!(built("@pnpm.e2e/install-script-example", "generated-by-install.js"));
+    assert!(
+        !built("@pnpm.e2e/pre-and-postinstall-scripts-example", "generated-by-postinstall.js"),
+        "the denied build must not run",
+    );
+    assert_eq!(
+        fs::read_to_string(global_config_yaml(&pnpm_home)).expect("read the global config"),
+        "globalPackagesConfig:\n  permissions:\n    '@pnpm.e2e/install-script-example':\n      build: true\n    '@pnpm.e2e/pre-and-postinstall-scripts-example':\n      build: false\n",
+    );
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_add_runs_the_builds_global_packages_allows() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    let global_pkg_dir = pnpm_home.join("global").join("v11");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    let config_yaml = global_config_yaml(&pnpm_home);
+    fs::create_dir_all(config_yaml.parent().unwrap()).expect("create the global config dir");
+    fs::write(
+        &config_yaml,
+        "globalPackagesConfig:\n  permissions:\n    '@pnpm.e2e/install-script-example':\n      build: true\n",
+    )
+    .expect("write the global config");
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/install-script-example@1.0.0"])
+        .assert()
+        .success();
+
+    let generated =
+        pnpm_global::find_global_package(&global_pkg_dir, "@pnpm.e2e/install-script-example")
+            .expect("scan global packages")
+            .expect("find install-script group")
+            .install_dir
+            .join("node_modules/@pnpm.e2e/install-script-example/generated-by-install.js");
+    assert!(generated.exists(), "the build allowed in globalPackagesConfig should run");
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+/// The build decisions in the global packages directory's
+/// `pnpm-workspace.yaml` still apply, with a deprecation warning, and the
+/// next approval moves them into the global `config.yaml`. Its other
+/// settings are reported as ignored and stay.
+#[cfg(unix)]
+#[test]
+fn approve_builds_global_moves_the_decisions_of_the_global_packages_dir() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    let global_pkg_dir = pnpm_home.join("global").join("v11");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    fs::create_dir_all(&global_pkg_dir).expect("create the global packages dir");
+    let legacy_yaml = global_pkg_dir.join("pnpm-workspace.yaml");
+    fs::write(
+        &legacy_yaml,
+        "allowBuilds:\n  '@pnpm.e2e/legacy-decision': false\ntrustPolicyExclude:\n  - vercel\n",
+    )
+    .expect("write the legacy settings");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/install-script-example@1.0.0"])
+        .output()
+        .expect("run pnpm add -g");
+    assert!(output.status.success(), "{output:?}");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        printed.contains("The build settings in") && printed.contains("are deprecated"),
+        "the legacy decisions should be reported: {printed}",
+    );
+    assert!(
+        printed.contains("do not apply to global packages: trustPolicyExclude"),
+        "the ignored legacy setting should be reported: {printed}",
+    );
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["approve-builds", "-g", "--all"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(global_config_yaml(&pnpm_home)).expect("read the global config"),
+        "globalPackagesConfig:\n  permissions:\n    '@pnpm.e2e/install-script-example':\n      build: true\n    '@pnpm.e2e/legacy-decision':\n      build: false\n",
+    );
+    assert_eq!(
+        fs::read_to_string(&legacy_yaml).expect("read the legacy file"),
+        "trustPolicyExclude:\n  - vercel\n",
+        "the moved decisions should leave the legacy file",
+    );
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+/// The warning reaches a run with no build awaiting approval, which ends
+/// before any decision is written.
+#[cfg(unix)]
+#[test]
+fn approve_builds_global_reports_ignored_legacy_settings_with_nothing_pending() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    let global_pkg_dir = pnpm_home.join("global").join("v11");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    fs::create_dir_all(&global_pkg_dir).expect("create the global packages dir");
+    fs::write(global_pkg_dir.join("pnpm-workspace.yaml"), "trustPolicyExclude:\n  - vercel\n")
+        .expect("write the legacy settings");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["approve-builds", "-g", "--all"])
+        .output()
+        .expect("run pnpm approve-builds -g");
+
+    assert!(output.status.success(), "{output:?}");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        printed.contains("do not apply to global packages: trustPolicyExclude"),
+        "the ignored legacy setting should be reported: {printed}",
+    );
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+/// A global install must ignore a `pnpm-workspace.yaml` in the global
+/// packages directory: the per-group install dir sits under it, so an install that
 /// walked up and adopted it as a workspace would fail enumerating its
 /// non-existent root project. Regression test for that walk-up.
 #[cfg(unix)]
@@ -691,8 +957,8 @@ fn global_add_ignores_ambient_global_workspace_yaml() {
 
 /// A global install must not inherit the caller project's dependency-graph
 /// configuration. A project `overrides` entry that references a `catalog:`
-/// — resolved against the caller's catalogs, which the isolated global
-/// install does not see — would otherwise fail the install with
+/// (resolved against the caller's catalogs, which the isolated global
+/// install does not see) would otherwise fail the install with
 /// `ERR_PNPM_CATALOG_IN_OVERRIDES`. `catalogMode: strict` is included for
 /// the same reason. Regression test for that leak.
 #[cfg(unix)]
@@ -730,7 +996,7 @@ fn global_add_ignores_caller_project_overrides() {
 }
 
 /// A global install must not use the caller project's `.npmrc` for network
-/// settings — a repo `.npmrc` could otherwise redirect the registry or
+/// settings, a repo `.npmrc` could otherwise redirect the registry or
 /// downgrade TLS for a global runtime/package fetch. pnpm runs the install
 /// with `cwd` = the pnpm home; pacquet anchors the global-install config
 /// there. Pointing the caller project at a dead registry proves the global
@@ -799,6 +1065,7 @@ fn recursive_global_outdated_reads_each_global_install_lockfile() {
         .with_arg("outdated")
         .with_arg("-g")
         .with_arg("-r")
+        .with_arg("!*pkg_with_1_dep")
         .with_arg("--format")
         .with_arg("json")
         .output()
@@ -1021,8 +1288,83 @@ fn global_update_latest_exceeds_the_saved_range() {
     drop((root, npmrc_info));
 }
 
+#[cfg(unix)]
+#[test]
+fn global_update_latest_upgrades_npm_aliases_and_runtimes_across_majors_without_downgrading() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let mut node_server = mockito::Server::new();
+    let _node_mocks = crate::install_runtimes::mock_node_releases(
+        &mut node_server,
+        &["24.0.0-rc.4", "20.0.0-rc.1"],
+        None,
+    );
+
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    let yaml_path = pnpm_home.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&yaml_path).expect("read workspace yaml");
+    fs::write(&yaml_path, format!("{yaml}nodeDownloadMirrors:\n  rc: '{}/'\n", node_server.url()))
+        .expect("write workspace yaml with node mirror");
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "1.0.0", "latest");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "my-alias@npm:@pnpm.e2e/multi-version-a@^1.0.0"])
+        .assert()
+        .success();
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "node@20.0.0-rc.1"])
+        .assert()
+        .success();
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.1.0", "latest");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--latest"])
+        .assert()
+        .success();
+
+    let global_dir = pnpm_home.join("global/v11");
+    let alias_group = pnpm_global::find_global_package(&global_dir, "my-alias")
+        .expect("scan global")
+        .expect("find my-alias");
+    assert_eq!(
+        pnpm_global::installed_versions(&alias_group.install_dir)
+            .get("my-alias")
+            .map(String::as_str),
+        Some("2.1.0"),
+    );
+
+    let node_group = pnpm_global::find_global_package(&global_dir, "node")
+        .expect("scan global")
+        .expect("find node");
+    assert_eq!(
+        pnpm_global::installed_versions(&node_group.install_dir).get("node").map(String::as_str),
+        Some("24.0.0-rc.4"),
+    );
+
+    // Moving `latest` backwards must hold `my-alias` at 2.1.0 rather than downgrading to 1.0.0.
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "1.0.0", "latest");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--latest", "my-alias"])
+        .assert()
+        .success();
+    let alias_group_after = pnpm_global::find_global_package(&global_dir, "my-alias")
+        .expect("scan global")
+        .expect("find my-alias");
+    assert_eq!(
+        pnpm_global::installed_versions(&alias_group_after.install_dir)
+            .get("my-alias")
+            .map(String::as_str),
+        Some("2.1.0"),
+    );
+
+    drop((root, npmrc_info));
+}
+
 /// `--latest` resolves the `latest` dist-tag, which can point at an older
-/// release than the one installed — that is what rolled a self-updated pnpm
+/// release than the one installed, that is what rolled a self-updated pnpm
 /// back in pnpm/pnpm#14270. An update must never move a global package
 /// backwards.
 #[cfg(unix)]
@@ -1044,6 +1386,186 @@ fn global_update_latest_keeps_a_package_that_latest_would_downgrade() {
 
     global_command(&workspace, &pnpm_home)
         .with_args(["update", "-g", "--latest"])
+        .assert()
+        .success();
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("@pnpm.e2e/multi-version-a@2.1.0"),
+        "the installed version must be kept, got: {stdout}",
+    );
+
+    drop((root, npmrc_info));
+}
+
+/// `update -g --tag <tag>` moves the group to the version behind the named
+/// dist-tag rather than `latest` (pnpm/pnpm#3534).
+#[cfg(unix)]
+#[test]
+fn global_update_tag_resolves_the_named_tag() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.1.0", "latest");
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.0.0", "next");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/multi-version-a@1.0.0"])
+        .assert()
+        .success();
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--tag", "next"])
+        .assert()
+        .success();
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("STDOUT:\n{stdout}\n");
+    assert!(
+        stdout.contains("@pnpm.e2e/multi-version-a@2.0.0"),
+        "the tag's version must be installed, got: {stdout}",
+    );
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_tag_rejects_a_versioned_selector() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--tag", "next", "@pnpm.e2e/multi-version-a@2"])
+        .output()
+        .expect("run update -g --tag next with a versioned selector");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Specs are not allowed to be used with --tag"), "{stderr}");
+
+    drop((root, npmrc_info));
+}
+
+/// A dependency that does not publish the requested dist-tag keeps its
+/// recorded spec instead of aborting the whole group's update: the rest of
+/// the group still moves to the tag.
+#[cfg(unix)]
+#[test]
+fn global_update_tag_keeps_a_dependency_without_the_tag() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.1.0", "latest");
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.0.0", "next");
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-b", "3.1.0", "latest");
+    // One comma-separated group, so the two dependencies update together.
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/multi-version-a@1.0.0,@pnpm.e2e/multi-version-b@3.0.0"])
+        .assert()
+        .success();
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--tag", "next"])
+        .output()
+        .expect("run update -g --tag next");
+    assert!(
+        output.status.success(),
+        "a dependency without the tag must not abort the update: {output:?}",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(r#""next" dist-tag names no version"#)
+            || stderr.contains(r#""next" dist-tag names no version"#),
+        "the skipped dependency must be reported, stdout: {stdout}, stderr: {stderr}",
+    );
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("STDOUT:\n{stdout}\n");
+    assert!(
+        stdout.contains("@pnpm.e2e/multi-version-a@2.0.0"),
+        "the dependency with the tag must move to it, got: {stdout}",
+    );
+    assert!(
+        stdout.contains("@pnpm.e2e/multi-version-b@3.0.0"),
+        "the dependency without the tag must keep its recorded spec, got: {stdout}",
+    );
+
+    drop((root, npmrc_info));
+}
+
+/// The interactive prompt leaves out a tag below the installed version,
+/// since the global update would pin it back.
+#[cfg(unix)]
+#[test]
+fn global_interactive_update_tag_offers_no_downgrade() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.1.0", "latest");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/multi-version-a@2.1.0"])
+        .assert()
+        .success();
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "1.0.0", "next");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--interactive", "--tag", "next"])
+        .output()
+        .expect("run update -g --interactive --tag next");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(stdout.contains("already up to date"), "got: {stdout}");
+
+    drop((root, npmrc_info));
+}
+
+/// A tag that points at an older release than the installed one must not
+/// move the global package backwards, the same guarantee `--latest` has.
+#[cfg(unix)]
+#[test]
+fn global_update_tag_keeps_a_package_the_tag_would_downgrade() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.1.0", "latest");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/multi-version-a@2.1.0"])
+        .assert()
+        .success();
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "1.0.0", "next");
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--tag", "next"])
         .assert()
         .success();
 
@@ -1538,6 +2060,272 @@ fn global_update_requires_approval_for_the_immature_version() {
         listed.contains("@pnpm.e2e/multi-version-a@1.0.0"),
         "an unapproved update must not materialize the immature version: {listed}",
     );
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_commands_isolate_from_cwd_pnpmfile_workspace_yaml_and_npmrc() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    let untrusted_cwd = workspace.join("untrusted-cwd");
+    fs::create_dir_all(&untrusted_cwd).expect("create untrusted cwd");
+    let cwd_marker = untrusted_cwd.join("cwd-pnpmfile-ran.txt");
+    let evil_marker = untrusted_cwd.join("evil-pnpmfile-ran.txt");
+
+    let cwd_pnpmfile = format!(
+        "const fs = require('fs');\n\
+         fs.writeFileSync({cwd_marker:?}, 'loaded');\n\
+         console.error('CWD_PNPMFILE_EXECUTED');\n\
+         module.exports = {{\n\
+           hooks: {{\n\
+             updateConfig(cfg) {{ console.error('CWD_PNPMFILE_EXECUTED'); return cfg; }},\n\
+             readPackage(pkg) {{ console.error('CWD_PNPMFILE_EXECUTED'); return pkg; }}\n\
+           }}\n\
+         }};\n",
+        cwd_marker = cwd_marker.to_string_lossy(),
+    );
+    fs::write(untrusted_cwd.join(".pnpmfile.cjs"), cwd_pnpmfile).expect("write cwd pnpmfile");
+
+    let evil_pnpmfile = format!(
+        "const fs = require('fs');\n\
+         fs.writeFileSync({evil_marker:?}, 'loaded');\n\
+         console.error('EVIL_PNPMFILE_EXECUTED');\n\
+         module.exports = {{ hooks: {{}} }};\n",
+        evil_marker = evil_marker.to_string_lossy(),
+    );
+    fs::write(untrusted_cwd.join("evil.cjs"), evil_pnpmfile).expect("write evil pnpmfile");
+    fs::write(
+        untrusted_cwd.join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\npnpmfile: ./evil.cjs\nconfigDependencies:\n  pnpm-plugin-nonexistent: 1.0.0+sha512-deadbeef\n",
+    )
+    .expect("write untrusted pnpm-workspace.yaml");
+    fs::write(untrusted_cwd.join(".npmrc"), "registry=http://127.0.0.1:1/\n")
+        .expect("write untrusted .npmrc");
+
+    for args in [
+        &["add", "-g", "@pnpm.e2e/pkg-with-1-dep@100.0.0"][..],
+        &["list", "-g"],
+        &["list", "-g", "--depth", "1"],
+        &["why", "-g", "@pnpm.e2e/dep-of-pkg-with-1-dep"],
+        &["bin", "-g"],
+        &["root", "-g"],
+        &["prefix", "-g"],
+    ] {
+        let output = global_command(&untrusted_cwd, &pnpm_home)
+            .with_args(args)
+            .output()
+            .expect("run global command in untrusted cwd");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "args {args:?} failed:\n{stdout}\n{stderr}");
+        assert!(!stdout.contains("CWD_PNPMFILE_EXECUTED"), "{stdout}");
+        assert!(!stderr.contains("CWD_PNPMFILE_EXECUTED"), "{stderr}");
+        assert!(!stdout.contains("EVIL_PNPMFILE_EXECUTED"), "{stdout}");
+        assert!(!stderr.contains("EVIL_PNPMFILE_EXECUTED"), "{stderr}");
+    }
+    assert!(!cwd_marker.exists(), "CWD .pnpmfile.cjs must never execute on global commands");
+    assert!(
+        !evil_marker.exists(),
+        "CWD pnpm-workspace.yaml pnpmfile must never execute on global commands",
+    );
+
+    // Configured globalPnpmfile still runs on global commands.
+    let global_marker = root.path().join("global-pnpmfile-ran.txt");
+    let global_pnpmfile = root.path().join("trusted-global-pnpmfile.cjs");
+    fs::write(
+        &global_pnpmfile,
+        format!(
+            "const fs = require('fs');\n\
+             module.exports = {{\n\
+               hooks: {{\n\
+                 updateConfig(cfg) {{ fs.writeFileSync({marker:?}, 'ran'); return cfg; }}\n\
+               }}\n\
+             }};\n",
+            marker = global_marker.to_string_lossy(),
+        ),
+    )
+    .expect("write trusted global pnpmfile");
+
+    let output = global_command(&untrusted_cwd, &pnpm_home)
+        .with_env("PNPM_CONFIG_GLOBAL_PNPMFILE", &global_pnpmfile)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g with globalPnpmfile");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(global_marker.exists(), "trusted globalPnpmfile updateConfig hook should execute");
+    assert!(!cwd_marker.exists(), "CWD .pnpmfile.cjs must remain untouched");
+
+    let nested_parent = root.path().join("broken-parent");
+    let nested_pnpm_home = nested_parent.join("pnpm-home");
+    fs::create_dir_all(nested_pnpm_home.join("bin")).expect("create nested global bin dir");
+    fs::write(nested_parent.join("pnpm-workspace.yaml"), "packages: [\n")
+        .expect("write malformed parent pnpm-workspace.yaml");
+    let nested_hook_marker = root.path().join("nested-global-pnpmfile-ran.txt");
+    let nested_global_pnpmfile = root.path().join("nested-trusted-global-pnpmfile.cjs");
+    fs::write(
+        &nested_global_pnpmfile,
+        format!(
+            r"const fs = require('fs');
+module.exports = {{
+  hooks: {{
+    updateConfig (cfg) {{
+      fs.writeFileSync({marker:?}, 'updateConfig');
+      return cfg;
+    }},
+  }},
+}};
+",
+            marker = nested_hook_marker.to_string_lossy(),
+        ),
+    )
+    .expect("write nested trusted global pnpmfile");
+
+    let nested_output = global_command(&untrusted_cwd, &nested_pnpm_home)
+        .with_env("PNPM_CONFIG_GLOBAL_PNPMFILE", &nested_global_pnpmfile)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g with nested PNPM_HOME under malformed parent workspace");
+    assert!(
+        nested_output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&nested_output.stdout),
+        String::from_utf8_lossy(&nested_output.stderr),
+    );
+    assert!(
+        nested_hook_marker.exists(),
+        "trusted globalPnpmfile should run when PNPM_HOME has a malformed parent workspace",
+    );
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_list_depth_and_why_in_local_project_read_global_lockfile_not_local() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    let global_cli_src = root.path().join("my-global-cli");
+    fs::create_dir_all(&global_cli_src).expect("create my-global-cli");
+    fs::write(
+        global_cli_src.join("package.json"),
+        r#"{"name":"my-global-cli","version":"1.0.0","dependencies":{"is-positive":"1.0.0"}}"#,
+    )
+    .expect("write my-global-cli package.json");
+
+    let local_dep_src = root.path().join("my-local-dep");
+    fs::create_dir_all(&local_dep_src).expect("create my-local-dep");
+    fs::write(local_dep_src.join("package.json"), r#"{"name":"my-local-dep","version":"2.0.0"}"#)
+        .expect("write my-local-dep package.json");
+
+    let local_app = workspace.join("local-app");
+    fs::create_dir_all(&local_app).expect("create local-app");
+    fs::write(local_app.join("package.json"), r#"{"name":"local-app","version":"1.0.0"}"#)
+        .expect("write local-app package.json");
+    fs::write(local_app.join(".npmrc"), format!("registry={}\n", npmrc_info.mock_instance.url()))
+        .expect("write local-app .npmrc");
+    fs::write(
+        local_app.join("pnpm-workspace.yaml"),
+        format!(
+            "storeDir: {}\ncacheDir: {}\n",
+            npmrc_info.store_dir.display(),
+            npmrc_info.cache_dir.display(),
+        ),
+    )
+    .expect("write local-app pnpm-workspace.yaml");
+
+    let add_global = global_command(&local_app, &pnpm_home)
+        .with_args(["add", "-g", &format!("file:{}", global_cli_src.display())])
+        .output()
+        .expect("install my-global-cli globally");
+    assert!(
+        add_global.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&add_global.stdout),
+        String::from_utf8_lossy(&add_global.stderr),
+    );
+
+    let add_local = global_command(&local_app, &pnpm_home)
+        .with_args(["add", &format!("file:{}", local_dep_src.display())])
+        .output()
+        .expect("install my-local-dep locally");
+    assert!(
+        add_local.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&add_local.stdout),
+        String::from_utf8_lossy(&add_local.stderr),
+    );
+
+    let depth0 = global_command(&local_app, &pnpm_home)
+        .with_args(["list", "-g", "--depth", "0"])
+        .output()
+        .expect("run list -g --depth 0");
+    let depth0_stdout = String::from_utf8_lossy(&depth0.stdout);
+    assert!(depth0.status.success(), "{depth0_stdout}");
+    assert!(depth0_stdout.contains("my-global-cli@1.0.0"), "{depth0_stdout}");
+    assert!(!depth0_stdout.contains("my-local-dep"), "{depth0_stdout}");
+
+    let depth1 = global_command(&local_app, &pnpm_home)
+        .with_args(["list", "-g", "--depth", "1"])
+        .output()
+        .expect("run list -g --depth 1");
+    let depth1_stdout = String::from_utf8_lossy(&depth1.stdout);
+    assert!(
+        depth1.status.success(),
+        "{depth1_stdout}\n{}",
+        String::from_utf8_lossy(&depth1.stderr),
+    );
+    assert!(depth1_stdout.contains("my-global-cli"), "{depth1_stdout}");
+    assert!(
+        depth1_stdout.contains("is-positive 1.0.0") || depth1_stdout.contains("is-positive@1.0.0"),
+        "{depth1_stdout}",
+    );
+    assert!(!depth1_stdout.contains("my-local-dep"), "{depth1_stdout}");
+
+    let depth1_json = global_command(&local_app, &pnpm_home)
+        .with_args(["list", "-g", "--depth", "1", "--json"])
+        .output()
+        .expect("run list -g --depth 1 --json");
+    let depth1_json_stdout = String::from_utf8_lossy(&depth1_json.stdout);
+    assert!(depth1_json.status.success(), "{depth1_json_stdout}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&depth1_json_stdout).expect("parse list -g --depth 1 --json");
+    assert_eq!(
+        parsed[0]["dependencies"]["my-global-cli"]["dependencies"]["is-positive"]["version"],
+        "1.0.0",
+        "{depth1_json_stdout}",
+    );
+    assert!(!depth1_json_stdout.contains("my-local-dep"), "{depth1_json_stdout}");
+
+    let why_global = global_command(&local_app, &pnpm_home)
+        .with_args(["why", "-g", "is-positive"])
+        .output()
+        .expect("run why -g is-positive");
+    let why_global_stdout = String::from_utf8_lossy(&why_global.stdout);
+    assert!(why_global.status.success(), "{why_global_stdout}");
+    assert!(why_global_stdout.contains("is-positive@1.0.0"), "{why_global_stdout}");
+    assert!(why_global_stdout.contains("my-global-cli"), "{why_global_stdout}");
+    assert!(!why_global_stdout.contains("my-local-dep"), "{why_global_stdout}");
+
+    let why_local = global_command(&local_app, &pnpm_home)
+        .with_args(["why", "-g", "my-local-dep"])
+        .output()
+        .expect("run why -g my-local-dep");
+    let why_local_stdout = String::from_utf8_lossy(&why_local.stdout);
+    assert!(why_local.status.success(), "{why_local_stdout}");
+    assert!(why_local_stdout.trim().is_empty(), "{why_local_stdout}");
 
     drop((root, npmrc_info));
 }

@@ -2,43 +2,59 @@
 //! install them all.
 //!
 //! Handles three input shapes:
-//! 1. old object form `{ tarball?, integrity }` — migrated inline into
+//! 1. old object form `{ tarball?, integrity }`, migrated inline into
 //!    the lockfile when it carries a tarball URL, otherwise resolved,
-//! 2. old string form `<version>+<integrity>` — resolved against the
+//! 2. old string form `<version>+<integrity>`, resolved against the
 //!    registry for its tarball URL, keeping the inline integrity,
-//! 3. new clean specifier (`1.2.0` / `^1.0.0`) — resolved against the
+//! 3. new clean specifier (`1.2.0` / `^1.0.0`), resolved against the
 //!    registry when it isn't already pinned in the lockfile.
 
 use crate::{
-    ConfigDepError, install_config_deps::install_config_deps, options::ConfigDepsInstallOptions,
-    prune_env_lockfile, read_config_dependency_lockfile,
+    ConfigDepError,
+    install_config_deps::install_config_deps,
+    options::ConfigDepsInstallOptions,
+    prune_env_lockfile,
+    read_config_dependency_lockfile,
     resolve_optional_subdeps::resolve_optional_subdeps,
     verify_config_dep_resolutions::verify_config_dep_resolutions,
     verify_env_lockfile::write_verified_env_lockfile,
 };
 use pnpm_lockfile::{
-    EnvLockfile, LockfileFormOptions, LockfileResolution, PackageKey, PackageMetadata,
-    SnapshotEntry, SpecifierAndResolution, TarballResolution,
+    EnvLockfile,
+    LockfileFormOptions,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    SnapshotEntry,
+    SpecifierAndResolution,
+    TarballResolution,
+    TarballUrlOptions,
 };
 use pnpm_lockfile_preferred_versions::get_version_selector_type;
 use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::{
-    ResolutionPolicyOptions, ResolveOptions, ResolveResult, Resolver, UpdateBehavior,
-    VersionSelectorType, WantedDependency,
+    ResolutionPolicyOptions,
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
+    UpdateBehavior,
+    VersionSelectorType,
+    WantedDependency,
 };
 use pnpm_workspace_state::ConfigDependency;
 use ssri::Integrity;
 use std::collections::BTreeMap;
 
 mod plan;
-use plan::{ToResolve, plan_config_deps};
+use plan::{
+    ToResolve,
+    plan_config_deps,
+};
 
-/// Config deps keep the npm tarball layout: `registries` is a workspace
-/// setting, and config deps are resolved before workspace settings apply. The
-/// writer and the reader here agree because both use this same default.
-fn npm_lockfile_form(registry: &str) -> LockfileFormOptions<'_> {
-    LockfileFormOptions { registry, server_type: None, include_tarball_url: false }
+fn lockfile_form(tarball_url_options: TarballUrlOptions<'_>) -> LockfileFormOptions<'_> {
+    let TarballUrlOptions { registry, server_type } = tarball_url_options;
+    LockfileFormOptions { registry, server_type, include_tarball_url: false }
 }
 
 /// Resolve + install the config dependencies declared in
@@ -122,7 +138,7 @@ pub async fn resolve_and_install_config_deps_updating<Reporter: self::Reporter>(
     // snapshots; drop them before writing.
     prune_env_lockfile(&mut env_lockfile);
     verify_config_dep_resolutions(&env_lockfile, config_deps, opts).await?;
-    write_verified_env_lockfile(&env_lockfile, opts.root_dir, opts.lockfile.symlinked)?;
+    write_verified_env_lockfile(&env_lockfile, opts.root_dir, &opts.lockfile)?;
     install_config_deps::<Reporter>(&env_lockfile, opts).await?;
     Ok(saved_specifiers)
 }
@@ -246,7 +262,7 @@ async fn resolve_one(
         &version,
         result.resolution,
         pinned_integrity,
-        opts.verification.pick_registry(name),
+        opts,
     )?;
 
     // A pinned dependency covers only itself, so its optional subdeps stay out
@@ -279,7 +295,7 @@ fn record_config_dependency(
     version: &str,
     mut resolution: LockfileResolution,
     pinned_integrity: Option<&Integrity>,
-    registry: &str,
+    opts: &ConfigDepsInstallOptions<'_>,
 ) -> Result<(), ConfigDepError> {
     let (name, specifier) = declaration;
     env_lockfile
@@ -297,7 +313,11 @@ fn record_config_dependency(
         key.clone(),
         registry_package_metadata(
             resolution
-                .to_lockfile_form(name, version, npm_lockfile_form(registry))
+                .to_lockfile_form(
+                    name,
+                    version,
+                    lockfile_form(opts.verification.tarball_url_options(name)),
+                )
                 .map_err(ConfigDepError::LockfileForm)?,
         ),
     );
@@ -368,7 +388,7 @@ fn migrate_into_lockfile(
     version: &str,
     integrity: Integrity,
     tarball: String,
-    registry: &str,
+    tarball_url_options: TarballUrlOptions<'_>,
 ) -> Result<(), ConfigDepError> {
     let key = pkg_key(name, version)?;
     env_lockfile
@@ -385,17 +405,18 @@ fn migrate_into_lockfile(
         git_hosted: None,
         path: None,
     })
-    .to_lockfile_form(name, version, npm_lockfile_form(registry))
+    .to_lockfile_form(name, version, lockfile_form(tarball_url_options))
     .map_err(ConfigDepError::LockfileForm)?;
     env_lockfile.packages.insert(key.clone(), registry_package_metadata(resolution));
     env_lockfile.snapshots.insert(key, SnapshotEntry::default());
     Ok(())
 }
 
-/// A `packages:` entry carrying only a resolution — the shape a config
+/// A `packages:` entry carrying only a resolution, the shape a config
 /// dependency (with no peer/engine metadata of its own) takes.
 fn registry_package_metadata(resolution: LockfileResolution) -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution,
         version: None,
         engines: None,

@@ -11,19 +11,34 @@
 //!   exists yet, recorded for write-back to `pnpm-workspace.yaml`.
 
 use crate::is_workspace_local_path_specifier;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
-use node_semver::{Range, Version};
+use node_semver::Version;
 use pnpm_catalogs_protocol_parser::parse_catalog_protocol;
 use pnpm_catalogs_resolver::{
-    CatalogAnchor, CatalogResolutionResult, WantedDependency, resolve_from_catalog,
+    CatalogAnchor,
+    CatalogResolutionResult,
+    WantedDependency,
+    resolve_from_catalog,
 };
-use pnpm_catalogs_types::{Catalogs, DEFAULT_CATALOG_NAME};
+use pnpm_catalogs_types::{
+    Catalogs,
+    DEFAULT_CATALOG_NAME,
+};
 use pnpm_config::CatalogMode;
 use pnpm_registry::RangeSpecStyle;
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
 use pnpm_resolving_local_resolver::is_local_filesystem_specifier;
 use pnpm_resolving_npm_resolver::calc_version_range;
+use pnpm_semver_include_prerelease::parse_strict_semver_range;
 use pnpm_tool_protocol::is_tool_specifier;
 
 /// Wanted dependency outside the version range defined in catalog.
@@ -117,14 +132,7 @@ pub(crate) fn decide_catalog_outcome(
     dep: &CatalogModeDep<'_>,
     prefix: &str,
 ) -> Result<CatalogDecisionOutcome, CatalogVersionMismatchError> {
-    // A `tool:` / `runtime:` specifier round-trips to `devEngines.runtime` through
-    // the manifest writer; promoting it into a catalog would strand it in
-    // `devDependencies`. Skip it, matching pnpm.
-    if is_tool_specifier(dep.bare_specifier) {
-        return Ok(CatalogDecisionOutcome { decision: CatalogDecision::KeepDirect, warning: None });
-    }
-
-    if is_project_relative_path(dep.bare_specifier) {
+    if stays_out_of_catalogs(dep.bare_specifier) {
         return Ok(CatalogDecisionOutcome { decision: CatalogDecision::KeepDirect, warning: None });
     }
 
@@ -237,8 +245,18 @@ fn catalog_mismatch(
     }
 }
 
+/// Whether a dependency written with `bare_specifier` has to stay direct
+/// rather than move into a catalog.
+#[must_use]
+pub fn stays_out_of_catalogs(bare_specifier: &str) -> bool {
+    // A `tool:` / `runtime:` specifier round-trips to `devEngines.runtime`
+    // through the manifest writer; promoting it into a catalog would strand
+    // it in `devDependencies`.
+    is_tool_specifier(bare_specifier) || is_project_relative_path(bare_specifier)
+}
+
 /// Whether `specifier` names a path resolved against the project that
-/// declares it — a `file:` / `link:` protocol, a bare path or tarball
+/// declares it, a `file:` / `link:` protocol, a bare path or tarball
 /// filename, or a `workspace:` pointing at a directory rather than a range.
 ///
 /// A catalog measures such a path from `pnpm-workspace.yaml`'s own
@@ -260,7 +278,7 @@ fn is_project_relative_path(specifier: &str) -> bool {
 /// onto the version it names.
 pub(crate) fn catalog_covers(entry: &str, wanted: &str) -> bool {
     entry == wanted
-        || matches!((Range::parse(entry), Version::parse(wanted)), (Ok(entry), Ok(wanted)) if entry.satisfies(&wanted))
+        || matches!((parse_strict_semver_range(entry), Version::parse(wanted)), (Some(entry), Ok(wanted)) if entry.satisfies(&wanted))
 }
 
 /// The catalog entry that pins `wanted` under the operator `entry` declares,

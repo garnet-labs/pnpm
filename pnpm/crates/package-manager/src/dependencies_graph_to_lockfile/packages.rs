@@ -1,24 +1,46 @@
 use super::{
     DependenciesGraphToLockfileError,
-    importers::{real_name, self_aliased_file_ver},
+    importers::{
+        real_name,
+        self_aliased_file_ver,
+    },
     optional_children_of,
 };
 use pnpm_lockfile::{
-    BundledDependencies, LockfileFormError, LockfileFormOptions, LockfileResolution, PackageKey,
-    PackageMetadata, PkgName, PkgNameVerPeer, PkgVerPeer, RegistryOptions, SnapshotDepRef,
-    SnapshotEntry, registry_for_package, registry_server_type,
+    BundledDependencies,
+    LockfileFormError,
+    LockfileFormOptions,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    PkgNameVerPeer,
+    PkgVerPeer,
+    RegistryOptions,
+    SnapshotDepRef,
+    SnapshotEntry,
+    registry_for_package,
+    registry_server_type,
 };
-use pnpm_resolving_deps_resolver::{DepPath, DependenciesGraph, DependenciesGraphNode};
+use pnpm_resolving_deps_resolver::{
+    DepPath,
+    DependenciesGraph,
+    DependenciesGraphNode,
+};
 use rayon::prelude::*;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{
+    BTreeMap,
+    HashMap,
+};
 
-mod variant_snapshots;
+mod directory;
 
 pub(super) type PackagesAndSnapshots =
     (HashMap<PackageKey, PackageMetadata>, HashMap<PackageKey, SnapshotEntry>);
 /// Registry configuration and prior package records used to serialize package metadata.
 pub struct PackageMetadataSources<'a> {
+    pub lockfile_format: pnpm_lockfile::LockfileFormat,
     /// Registry routes keyed by `@scope`, plus `default`, as
     /// [`registry_for_package`] takes them.
     pub registries: &'a HashMap<String, String>,
@@ -28,7 +50,7 @@ pub struct PackageMetadataSources<'a> {
     pub previous_packages: Option<&'a HashMap<PackageKey, PackageMetadata>>,
 }
 /// Walk the depPath-keyed [`DependenciesGraph`] and emit the matching
-/// `(PackageMetadata, SnapshotEntry)` pair for each node — fanned out
+/// `(PackageMetadata, SnapshotEntry)` pair for each node, fanned out
 /// across the two top-level maps the v9 lockfile splits.
 ///
 /// Multiple snapshot entries (peer variants) share one packages entry,
@@ -57,18 +79,9 @@ pub(super) fn build_packages_and_snapshots(
     let mut packages: HashMap<PackageKey, PackageMetadata> = HashMap::new();
     let mut snapshots: HashMap<PackageKey, SnapshotEntry> = HashMap::new();
     for built_node in built {
-        let Some(BuiltNode {
-            node,
-            snapshot_key,
-            snapshot,
-            variant_snapshots,
-        }) = built_node?
-        else {
-            continue;
-        };
+        let Some(BuiltNode { node, snapshot_key, snapshot }) = built_node? else { continue };
         insert_package_metadata(&mut packages, node, snapshot_key.without_peer(), sources)?;
         snapshots.insert(snapshot_key, snapshot);
-        snapshots.extend(variant_snapshots);
     }
 
     Ok((packages, snapshots))
@@ -77,9 +90,6 @@ pub(super) struct BuiltNode<'graph> {
     node: &'graph pnpm_resolving_deps_resolver::DependenciesGraphNode,
     snapshot_key: PackageKey,
     snapshot: SnapshotEntry,
-    /// The snapshots of the platform variants whose dependencies differ
-    /// from the version's (see [`variant_snapshots`]).
-    variant_snapshots: Vec<(PackageKey, SnapshotEntry)>,
 }
 /// A node's snapshot row under its key; `None` for a workspace link, which
 /// has no row of its own.
@@ -91,7 +101,7 @@ pub(super) fn build_node<'graph>(
     let dep_path = node.dep_path.as_str();
     let snapshot_key = match dep_path.parse::<PackageKey>() {
         Ok(snapshot_key) => Ok(snapshot_key),
-        // A workspace link is the one node with no row of its own —
+        // A workspace link is the one node with no row of its own;
         // it resolves as its own importer and pnpm writes it none
         // either.
         Err(_) if dep_path.starts_with("link:") => return Ok(None),
@@ -101,12 +111,7 @@ pub(super) fn build_node<'graph>(
         }),
     }?;
     let snapshot = build_snapshot_entry(node, graph, optional_overrides);
-    let (snapshot, variant_snapshots) = variant_snapshots::split_variant_snapshots(
-        &snapshot_key,
-        node.resolve_result.package.manifest.as_deref(),
-        snapshot,
-    );
-    Ok(Some(BuiltNode { node, snapshot_key, snapshot, variant_snapshots }))
+    Ok(Some(BuiltNode { node, snapshot_key, snapshot }))
 }
 /// Record a package's metadata under its peer-stripped key, once: the first
 /// node of a key in graph order wins.
@@ -130,6 +135,7 @@ pub(super) fn insert_package_metadata(
         },
     )
     .map_err(DependenciesGraphToLockfileError::LockfileForm)?;
+    metadata.specifiers = directory::specifiers(node, entry.key(), sources.lockfile_format)?;
     carry_previous_deprecation(&mut metadata, entry.key(), sources);
     entry.insert(metadata);
     Ok(())
@@ -181,7 +187,7 @@ pub(super) fn carry_previous_deprecation(
 /// Build the per-`(name, version)` [`PackageMetadata`] block for the
 /// lockfile's `packages:` map.
 ///
-/// Covers the per-package half only — the per-snapshot fields
+/// Covers the per-package half only, the per-snapshot fields
 /// `dependencies` / `optionalDependencies` / `transitivePeerDependencies` /
 /// `optional` / `patched` go on the snapshot below.
 pub(super) fn build_package_metadata(
@@ -202,6 +208,7 @@ pub(super) fn build_package_metadata(
         lockfile_form,
     )?;
     Ok(PackageMetadata {
+        specifiers: None,
         version: explicit_version(node, metadata_key, &resolution, manifest),
         resolution,
         engines: read_engines(manifest),
@@ -262,7 +269,7 @@ pub(super) fn explicit_version(
 }
 /// Read a JSON array field off the resolver's manifest fragment and flatten it
 /// into a `Vec<String>`. `None` when the field is missing or has no string
-/// values — malformed metadata is silently dropped.
+/// values, malformed metadata is silently dropped.
 pub(super) fn read_string_list(manifest: Option<&Value>, key: &str) -> Option<Vec<String>> {
     match manifest?.get(key)? {
         Value::Array(items) => {
@@ -316,7 +323,7 @@ pub fn manifest_has_bin(manifest: Option<&Value>) -> Option<bool> {
 /// `transitivePeerDependencies` is sorted; `optional` is sourced from
 /// [`compute_corrected_optional`](crate::dependencies_graph_to_lockfile::compute_corrected_optional), which re-derives the flag from the
 /// importer graph because the resolver's per-node fold misses
-/// transitive descendants on revisits — see
+/// transitive descendants on revisits; see
 /// <https://github.com/pnpm/pnpm/issues/11916>.
 /// `BuildModules` consults this flag to decide whether a build
 /// failure is fatal or should be reported via
@@ -355,6 +362,7 @@ pub(super) fn build_snapshot_entry(
         .unwrap_or(node.optional);
 
     SnapshotEntry {
+        recorded_peer_bindings: node.recorded_peer_bindings.clone(),
         id: None,
         dependencies: (!dependencies.is_empty()).then_some(dependencies),
         optional_dependencies: (!optional_dependencies.is_empty()).then_some(optional_dependencies),

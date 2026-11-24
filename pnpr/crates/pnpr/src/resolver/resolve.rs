@@ -3,12 +3,15 @@
 //! Writes a throwaway project, resolves it lockfile-only (so
 //! `node_modules` is never linked and no tarball is fetched), then reads
 //! the produced lockfile back. pnpr serves no files, so the store is
-//! never populated with package contents — the client fetches every
+//! never populated with package contents, the client fetches every
 //! tarball itself.
 
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -16,16 +19,32 @@ use dashmap::DashMap;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    Lockfile, LockfileSettingsCheck, PnpmfileChecksumCheck, check_lockfile_settings,
+    Lockfile,
+    LockfileSettingsCheck,
+    PnpmfileChecksumCheck,
+    check_lockfile_settings,
     satisfies_package_manifest,
 };
-use pnpm_network::{AuthHeaders, ThrottledClient};
-use pnpm_package_manager::{Install, ResolutionObserver, ResolvedPackages};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+};
+use pnpm_package_manager::{
+    Install,
+    ResolutionObserver,
+    ResolvedPackages,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::SilentReporter;
 use tokio::io::AsyncWriteExt;
 
-use super::protocol::{ProjectDeps, ResolveRequest};
+use super::protocol::{
+    ProjectDeps,
+    ResolveRequest,
+};
 
 use install::ResolutionInstall;
 
@@ -37,6 +56,11 @@ pub enum ResolveError {
     Manifest(String),
     Install { message: String, code: Option<String> },
     NoLockfile,
+}
+
+pub struct ResolveResult {
+    pub lockfile: Lockfile,
+    pub allowed_picks: Vec<String>,
 }
 
 impl ResolveError {
@@ -75,18 +99,18 @@ struct Workspace<'a> {
 /// tarball downloads happen later from upstream URLs or an upstream's
 /// `/~<name>/` registry endpoint.
 ///
-/// A request is reconstructed as a real workspace in the temp dir — a
+/// A request is reconstructed as a real workspace in the temp dir (a
 /// `package.json` per requested project and, when there are members, a
-/// `pnpm-workspace.yaml` listing their dirs — so pacquet's install path
+/// `pnpm-workspace.yaml` listing their dirs) so pacquet's install path
 /// discovers and resolves every importer in one pass, producing a lockfile
 /// keyed by the same POSIX importer dirs the client sent.
 pub async fn resolve(
-    config: &'static Config,
+    config: &Config,
     client: &Arc<ThrottledClient>,
     request: &ResolveRequest,
     auth_headers: &Arc<AuthHeaders>,
     observer: Option<Arc<dyn ResolutionObserver>>,
-) -> Result<Lockfile, ResolveError> {
+) -> Result<ResolveResult, ResolveError> {
     let temp = tempfile::Builder::new().prefix("pnpr-resolve-").tempdir()?;
     let dir = temp.path();
 
@@ -96,16 +120,46 @@ pub async fn resolve(
     let resolved_packages: ResolvedPackages = DashMap::new();
     ResolutionInstall { config, client, request, auth_headers, observer }
         .build(&resolved_packages, &manifest, &lockfile_path)
-        .run::<SilentReporter>()
+        .run_with_prompt_eligibility::<SilentReporter>(false)
         .await
         .map_err(|err| {
             let code = miette::Diagnostic::code(&err).map(|code| code.to_string());
             ResolveError::Install { message: err.to_string(), code }
         })?;
 
-    Lockfile::load_wanted_from_dir(dir)
-        .map_err(|err| ResolveError::install(err.to_string()))?
-        .ok_or(ResolveError::NoLockfile)
+    let resolved_excludes = pnpm_config::WorkspaceSettings::load_at(dir)
+        .map_err(|err| err.to_string())
+        .map_err(ResolveError::install)?
+        .and_then(|settings| settings.minimum_release_age_exclude)
+        .unwrap_or_default();
+    let allowed_picks =
+        newly_allowed_picks(request.minimum_release_age_exclude.as_deref(), &resolved_excludes)?;
+    let lockfile = Lockfile::load_wanted_from_dir(dir)
+        .map_err(|err| err.to_string())
+        .map_err(ResolveError::install)?
+        .ok_or(ResolveError::NoLockfile)?;
+    Ok(ResolveResult { lockfile, allowed_picks })
+}
+
+fn newly_allowed_picks(
+    requested: Option<&[String]>,
+    resolved: &[String],
+) -> Result<Vec<String>, ResolveError> {
+    let requested =
+        pnpm_config::version_policy::expand_package_version_specs(requested.unwrap_or_default())
+            .map_err(|err| err.to_string())
+            .map_err(ResolveError::install)?;
+    let resolved = pnpm_config::version_policy::expand_package_version_specs(resolved)
+        .map_err(|err| err.to_string())
+        .map_err(ResolveError::install)?;
+    let mut added: Vec<_> = resolved
+        .difference(&requested)
+        .cloned()
+        .collect();
+    added.sort();
+    pnpm_config::version_policy::merge_package_version_specs(added)
+        .map_err(|err| err.to_string())
+        .map_err(ResolveError::install)
 }
 
 async fn prepare_resolve_workspace(
@@ -126,7 +180,8 @@ fn write_input_lockfile(
     if let Some(lockfile) = input_lockfile {
         lockfile
             .save_to_path(&lockfile_path, pnpm_lockfile::SymlinkedLockfile::Refuse)
-            .map_err(|err| ResolveError::install(err.to_string()))?;
+            .map_err(|err| err.to_string())
+            .map_err(ResolveError::install)?;
     }
     Ok(lockfile_path)
 }
@@ -138,7 +193,8 @@ fn root_manifest(dir: &Path, wrote_root: bool) -> Result<PackageManifest, Resolv
     let manifest_path = dir.join("package.json");
     if wrote_root {
         return PackageManifest::from_path(manifest_path)
-            .map_err(|err| ResolveError::Manifest(err.to_string()));
+            .map_err(|err| err.to_string())
+            .map_err(ResolveError::Manifest);
     }
     Ok(PackageManifest::from_value(
         manifest_path,
@@ -158,8 +214,9 @@ async fn write_workspace_manifest(dir: &Path, member_dirs: &[&str]) -> Result<()
         // YAML) so a dir with YAML-significant characters (`:`, `#`, leading
         // `-`, ...) stays a plain string instead of being reparsed as a
         // mapping or breaking the document.
-        let quoted =
-            serde_json::to_string(member).map_err(|err| ResolveError::install(err.to_string()))?;
+        let quoted = serde_json::to_string(member)
+            .map_err(|err| err.to_string())
+            .map_err(ResolveError::install)?;
         yaml.push_str("  - ");
         yaml.push_str(&quoted);
         yaml.push('\n');
@@ -201,7 +258,7 @@ async fn write_importer_manifests<'a>(
 ///
 /// The temp dir starts empty and the caller already rejected byte-equal dirs,
 /// so an existing `package.json` means two importer dirs addressed the same
-/// directory — `packages/Foo` and `packages/foo` on a case-insensitive
+/// directory, `packages/Foo` and `packages/foo` on a case-insensitive
 /// filesystem. Creating the file exclusively lets the host's own path
 /// semantics catch that, which a string comparison here cannot do portably.
 async fn write_importer_manifest(
@@ -210,8 +267,9 @@ async fn write_importer_manifest(
     project: &ProjectDeps,
 ) -> Result<(), ResolveError> {
     let manifest_json = importer_manifest_json(project, rel);
-    let manifest_bytes =
-        serde_json::to_vec(&manifest_json).map_err(|err| ResolveError::install(err.to_string()))?;
+    let manifest_bytes = serde_json::to_vec(&manifest_json)
+        .map_err(|err| err.to_string())
+        .map_err(ResolveError::install)?;
     let opened = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -235,7 +293,7 @@ async fn write_importer_manifest(
 
 /// The manifest the server resolves the importer at `rel` from.
 fn importer_manifest_json(project: &ProjectDeps, rel: &str) -> serde_json::Value {
-    serde_json::json!({
+    let mut manifest = serde_json::json!({
         "name": project.name.clone().unwrap_or_else(|| importer_manifest_name(rel)),
         "version": project.version.as_deref().unwrap_or("0.0.0"),
         "publishConfig": project.publish_config,
@@ -243,7 +301,11 @@ fn importer_manifest_json(project: &ProjectDeps, rel: &str) -> serde_json::Value
         "devDependencies": project.dev_dependencies,
         "optionalDependencies": project.optional_dependencies,
         "peerDependencies": project.peer_dependencies,
-    })
+    });
+    if let Some(dependencies_meta) = &project.dependencies_meta {
+        manifest["dependenciesMeta"] = serde_json::Value::Object(dependencies_meta.clone());
+    }
+    manifest
 }
 
 /// Return the caller's frozen input lockfile when pacquet's freshness
@@ -251,9 +313,10 @@ fn importer_manifest_json(project: &ProjectDeps, rel: &str) -> serde_json::Value
 /// unchanged.
 pub fn fresh_frozen_input_lockfile(config: &Config, request: &ResolveRequest) -> Option<Lockfile> {
     if request.update_patches
+        || request.update_checksums
         || request.fix_lockfile
         || !request.frozen_lockfile
-        || request.prefer_frozen_lockfile == Some(false)
+        || !request.prefer_frozen_lockfile.unwrap_or(true)
     {
         return None;
     }
@@ -381,6 +444,7 @@ fn check_frozen_settings(
             package_extensions_checksum: None,
             ignored_optional_dependencies: None,
             patched_dependencies: None,
+            project_scoped_optional_peers: config.project_scoped_optional_peers_take_effect(),
             resolution: pnpm_lockfile::ResolutionSettingsCheck {
                 auto_install_peers: config.auto_install_peers,
                 dedupe_peers: config.dedupe_peers,

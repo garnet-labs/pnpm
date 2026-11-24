@@ -1,10 +1,29 @@
 use super::{
-    ABBREVIATED_META_DIR, AuthHeaders, DateTime, EXISTING_VERSION_SELECTOR_WEIGHT,
-    InMemoryPackageMetaCache, PACKAGE_BODY, TempDir, ThrottledClient, Utc, VersionSelectorEntry,
-    VersionSelectorType, VersionSelectorWithWeight, VersionSelectors, assert_eq,
-    create_package_version_policy, default_opts, get_pkg_mirror_path, parse_cutoff,
-    persist_meta_to_mirror, pick_package, range_spec, shared_packument_fetch_locker,
-    version_selection::{public_ctx, set_mirror_mtime},
+    ABBREVIATED_META_DIR,
+    AuthHeaders,
+    EXISTING_VERSION_SELECTOR_WEIGHT,
+    InMemoryPackageMetaCache,
+    PACKAGE_BODY,
+    TempDir,
+    ThrottledClient,
+    Timestamp,
+    VersionSelectorEntry,
+    VersionSelectorType,
+    VersionSelectorWithWeight,
+    VersionSelectors,
+    assert_eq,
+    create_package_version_policy,
+    default_opts,
+    get_pkg_mirror_path,
+    parse_cutoff,
+    persist_meta_to_mirror,
+    pick_package,
+    range_spec,
+    shared_packument_fetch_locker,
+    version_selection::{
+        public_ctx,
+        set_mirror_mtime,
+    },
 };
 use pnpm_version_policy::PackageVersionPolicy;
 
@@ -19,7 +38,7 @@ const CUTOFF: &str = "2024-06-01T00:00:00Z";
 struct Mirror<'a> {
     fresh: bool,
     dropped_after_first_pick: bool,
-    published_by: Option<DateTime<Utc>>,
+    published_by: Option<Timestamp>,
     published_by_exclude: Option<&'a PackageVersionPolicy>,
 }
 
@@ -58,7 +77,11 @@ async fn pick_from_warm_mirror(
     persist_meta_to_mirror(cache_dir.path(), ABBREVIATED_META_DIR, &registry, &cached)
         .expect("warm mirror");
     if !mirror.fresh {
-        set_mirror_mtime(cache_dir.path(), &registry, parse_cutoff("2024-01-01T00:00:00Z").into());
+        set_mirror_mtime(
+            cache_dir.path(),
+            &registry,
+            std::time::SystemTime::try_from(parse_cutoff("2024-01-01T00:00:00Z")).unwrap(),
+        );
     }
     let http_client = ThrottledClient::default();
     let auth_headers = AuthHeaders::default();
@@ -146,4 +169,16 @@ async fn release_age_excluded_range_reuses_the_packument_left_in_memory() {
     };
     let picked = pick_from_warm_mirror(&lockfile_selectors(&["1.1.0"]), mirror, 0).await;
     assert_eq!(picked, "1.1.0");
+}
+
+#[tokio::test]
+async fn release_age_range_reuses_the_mirror_promoted_after_the_cutoff() {
+    let mirror = Mirror {
+        fresh: true,
+        dropped_after_first_pick: true,
+        published_by: Some(parse_cutoff(CUTOFF)),
+        published_by_exclude: None,
+    };
+    let picked = pick_from_warm_mirror(&VersionSelectors::new(), mirror, 0).await;
+    assert_eq!(picked, "1.0.0");
 }

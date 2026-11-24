@@ -1,7 +1,10 @@
 //! Which snapshots the build phase may build, patch, or restore a cached
 //! build into.
 
-use crate::{UnbuiltBuilds, linking::LinkPhaseInputs};
+use crate::{
+    UnbuiltBuilds,
+    linking::LinkPhaseInputs,
+};
 use pnpm_lockfile::PackageKey;
 use std::collections::HashSet;
 
@@ -32,7 +35,7 @@ pub(crate) fn records_unbuilt(unbuilt: &UnbuiltBuilds, dep_path: &str) -> bool {
 /// build phase ([`crate::PriorHoistedState::build_present_packages`]), when
 /// the caller did not report what it materialized, and for the other
 /// linkers: the hoisted linker scopes its build through its package roots,
-/// and a global virtual store slot is checked against its build marker.
+/// and a global virtual store slot is built unless it holds its package.
 pub(crate) fn isolated_build_scope(inputs: &LinkPhaseInputs<'_>) -> Option<HashSet<PackageKey>> {
     if inputs.ctx.is_hoisted()
         || inputs.ctx.linker.layout.enable_global_virtual_store()

@@ -3,16 +3,32 @@
 //! resolves, else a local resolution.
 
 use super::{
-    Inputs, Lockfile, Registry,
+    Inputs,
+    Lockfile,
+    Registry,
     environment::{
-        LockfileInputs, LockfileReplay, PythonPrepare, accept_server_lockfile, read_existing_lock,
+        LockfileInputs,
+        LockfileReplay,
+        PythonPrepare,
+        accept_server_lockfile,
+        read_existing_lock,
         resolve_via_pnpr,
     },
-    projects, resolver, workspace,
+    projects,
+    resolver,
+    workspace,
 };
 use miette::Result;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
-use std::{path::Path, sync::Arc};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
+use std::{
+    path::Path,
+    sync::Arc,
+};
 
 impl PythonPrepare<'_> {
     /// The lockfile on disk when this install may replay it: one that
@@ -158,7 +174,7 @@ impl PythonPrepare<'_> {
         registry.resolution.packages.candidates.clear();
         lock.seed(&mut registry.resolution.packages, &self.interpreter.target)?;
         workspace::offer_locked(&mut registry.resolution.packages, &local, &lock);
-        registry.record_sources(requirements)?;
+        registry.record_sources(requirements.to_vec())?;
         let replayed = match registry.fetch_wheels::<Reporter>(requirements).await {
             Ok(()) => resolver::validate_locked(&registry.resolution, requirements),
             Err(error) if same_target => return Err(error),
@@ -195,7 +211,7 @@ impl PythonPrepare<'_> {
         registry.resolution.packages.candidates.clear();
         lock.seed(&mut registry.resolution.packages, &self.interpreter.target)?;
         workspace::offer_locked(&mut registry.resolution.packages, local, &lock);
-        registry.record_sources(requirements)?;
+        registry.record_sources(requirements.to_vec())?;
         registry.fetch_wheels::<Reporter>(requirements).await?;
         resolver::validate_locked(&registry.resolution, requirements)?;
         Ok(lock)

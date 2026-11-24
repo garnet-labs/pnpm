@@ -1,7 +1,4 @@
 ---
-"@pnpm/fetching.git-fetcher": patch
-"@pnpm/error": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

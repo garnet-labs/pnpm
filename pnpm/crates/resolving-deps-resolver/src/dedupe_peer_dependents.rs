@@ -10,7 +10,7 @@
 //! the larger one, and the orphaned variant drops out of the lockfile.
 //!
 //! The collapse target is chosen by a total order over `(dep count, dep
-//! path)` so it never depends on the order importers were resolved in —
+//! path)` so it never depends on the order importers were resolved in,
 //! the determinism fix from
 //! [pnpm/pnpm#12179](https://github.com/pnpm/pnpm/pull/12179). A variant
 //! that is a subset of two mutually incompatible larger variants of
@@ -18,8 +18,12 @@
 //! visited first, producing machine-dependent lockfiles.
 
 pub(crate) use survivor_names::PeerSuffixes;
+pub(crate) use unbound_optional_peers::collect_unbound_optional_peers;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::collections::BTreeMap;
 
 use pnpm_deps_path::DepPath;
@@ -27,12 +31,25 @@ use survivor_names::rename_survivors;
 
 mod cycles;
 mod survivor_names;
+mod unbound_optional_peers;
 use cycles::collapse_cycles;
 
 use crate::{
-    dedupe_injected_deps::{DirectByImporter, prune_unreachable},
-    dep_path_compatibility::{is_compatible_and_has_more_deps, node_deps_count},
+    PeerDependentsDedupe,
+    dedupe_injected_deps::{
+        DirectByImporter,
+        prune_unreachable,
+    },
+    dep_path_compatibility::{
+        is_compatible_and_has_more_deps,
+        node_deps_count,
+    },
     dependencies_graph::DependenciesGraph,
+    peer_dependents_dedupe::{
+        CollapseGuard,
+        OptionalPeerScope,
+        UnboundOptionalPeers,
+    },
 };
 
 /// Collapse peer-dependent duplicate variants in `graph` into their
@@ -46,14 +63,24 @@ pub(crate) fn dedupe_peer_dependents(
     graph: &mut DependenciesGraph,
     direct_by_importer: &mut DirectByImporter,
     peer_suffixes: &PeerSuffixes<'_>,
-) {
+    dedupe: PeerDependentsDedupe,
+    mut unbound_optional_peers: UnboundOptionalPeers,
+) -> HashMap<DepPath, DepPath> {
+    if !dedupe.dedupes() {
+        return HashMap::default();
+    }
     let duplicates = collect_duplicates(graph);
     if duplicates.is_empty() {
-        return;
+        return HashMap::default();
     }
-    let dep_paths_map = deduplicate_all(graph, &duplicates);
+    let dep_paths_map = deduplicate_all(
+        graph,
+        duplicates,
+        dedupe.optional_peer_scope(),
+        &mut unbound_optional_peers,
+    );
     if dep_paths_map.is_empty() {
-        return;
+        return HashMap::default();
     }
     for direct in direct_by_importer.values_mut() {
         for dep_path in direct.values_mut() {
@@ -66,7 +93,24 @@ pub(crate) fn dedupe_peer_dependents(
     // edge and importer direct dep was rewritten above). Drop them so they
     // don't surface in the lockfile as orphans.
     prune_unreachable(graph, direct_by_importer);
-    rename_survivors(graph, direct_by_importer, &dep_paths_map, peer_suffixes);
+    let renames: HashMap<_, _> =
+        rename_survivors(graph, direct_by_importer, &dep_paths_map, peer_suffixes)
+            .into_iter()
+            .collect();
+    merge_renames(dep_paths_map, renames)
+}
+
+fn merge_renames(
+    mut dep_paths_map: HashMap<DepPath, DepPath>,
+    renames: HashMap<DepPath, DepPath>,
+) -> HashMap<DepPath, DepPath> {
+    for target in dep_paths_map.values_mut() {
+        if let Some(renamed) = renames.get(target) {
+            *target = renamed.clone();
+        }
+    }
+    dep_paths_map.extend(renames);
+    dep_paths_map
 }
 
 /// Group the graph's depPaths by their `pkgIdWithPatchHash` and keep the
@@ -75,7 +119,7 @@ pub(crate) fn dedupe_peer_dependents(
 /// instead of threading a parallel map through the walk.
 ///
 /// Groups are keyed through a `BTreeMap` only to make the outer order
-/// stable for readers — group order does not affect the collapse, since
+/// stable for readers, group order does not affect the collapse, since
 /// each `pkgIdWithPatchHash` group is processed independently. The order
 /// *within* a group is left as the graph yields it; determinism comes
 /// from the total-order sorter in [`deduplicate_dep_paths`], the fix this
@@ -97,19 +141,28 @@ fn collect_duplicates(graph: &DependenciesGraph) -> Vec<Vec<DepPath>> {
 /// Run [`deduplicate_dep_paths`] in rounds: after each round, rewrite the
 /// graph's child edges through the collapse map so the next round can see
 /// newly-compatible variants in the next round.
+///
+/// A variant that absorbs one listed in the [`UnboundOptionalPeers`]
+/// inherits its entry, so a later round cannot collapse it into a variant
+/// that resolves the listed peer.
 fn deduplicate_all(
     graph: &mut DependenciesGraph,
-    duplicates: &[Vec<DepPath>],
+    duplicates: Vec<Vec<DepPath>>,
+    optional_peers: OptionalPeerScope,
+    unbound_optional_peers: &mut UnboundOptionalPeers,
 ) -> HashMap<DepPath, DepPath> {
     let mut incoming = incoming_edges(graph);
-    let mut remaining = duplicates.to_vec();
+    let mut remaining = duplicates;
     let mut merged: HashMap<DepPath, DepPath> = HashMap::default();
     loop {
-        let (next, survivors) = deduplicate_round(&remaining, graph);
+        let guard =
+            CollapseGuard { optional_peers, unbound_optional_peers: Some(unbound_optional_peers) };
+        let (next, survivors) = deduplicate_round(&remaining, graph, guard);
         if next.is_empty() {
             return merged;
         }
         rewrite_children(graph, &next, &mut incoming);
+        transfer_unbound_optional_peers(unbound_optional_peers, &next);
         for target in merged.values_mut() {
             if let Some(replacement) = next.get(target) {
                 *target = replacement.clone();
@@ -123,16 +176,31 @@ fn deduplicate_all(
 fn deduplicate_round(
     duplicates: &[Vec<DepPath>],
     graph: &DependenciesGraph,
+    guard: CollapseGuard<'_>,
 ) -> (HashMap<DepPath, DepPath>, Vec<Vec<DepPath>>) {
-    let (next, mut survivors) = deduplicate_dep_paths(duplicates, graph);
+    let (next, mut survivors) = deduplicate_dep_paths(duplicates, graph, guard);
     if !next.is_empty() {
         return (next, survivors);
     }
-    let next = collapse_cycles(graph, duplicates);
+    let next = collapse_cycles(graph, duplicates, guard);
     for group in &mut survivors {
         group.retain(|path| !next.contains_key(path));
     }
     (next, survivors)
+}
+
+fn transfer_unbound_optional_peers(
+    unbound_optional_peers: &mut UnboundOptionalPeers,
+    replacements: &HashMap<DepPath, DepPath>,
+) {
+    for (collapsed, target) in replacements {
+        if let Some(names) = unbound_optional_peers.get(collapsed).cloned() {
+            unbound_optional_peers
+                .entry(target.clone())
+                .or_default()
+                .extend(names);
+        }
+    }
 }
 
 type IncomingEdges = HashMap<DepPath, Vec<(DepPath, String)>>;
@@ -179,6 +247,7 @@ fn rewrite_children(
 fn deduplicate_dep_paths(
     duplicates: &[Vec<DepPath>],
     graph: &DependenciesGraph,
+    guard: CollapseGuard<'_>,
 ) -> (HashMap<DepPath, DepPath>, Vec<Vec<DepPath>>) {
     let mut dep_paths_map: HashMap<DepPath, DepPath> = HashMap::default();
     let mut remaining_duplicates: Vec<Vec<DepPath>> = Vec::new();
@@ -189,7 +258,14 @@ fn deduplicate_dep_paths(
         sort_variants(graph, &mut current);
 
         while let Some(largest) = current.pop() {
-            absorb_compatible(graph, &largest, &mut current, &mut dep_paths_map, &mut survivors);
+            absorb_compatible(
+                graph,
+                guard,
+                &largest,
+                &mut current,
+                &mut dep_paths_map,
+                &mut survivors,
+            );
             sort_variants(graph, &mut current);
         }
 
@@ -221,6 +297,7 @@ fn sort_variants(graph: &DependenciesGraph, paths: &mut [DepPath]) {
 /// in `current` for the next round.
 fn absorb_compatible(
     graph: &DependenciesGraph,
+    guard: CollapseGuard<'_>,
     largest: &DepPath,
     current: &mut Vec<DepPath>,
     dep_paths_map: &mut HashMap<DepPath, DepPath>,
@@ -232,7 +309,7 @@ fn absorb_compatible(
         let same_children = graph[&candidate].edges.children
             .iter()
             .all(|(alias, child)| graph[largest].edges.children.get(alias) == Some(child));
-        if same_children && is_compatible_and_has_more_deps(graph, largest, &candidate) {
+        if same_children && is_compatible_and_has_more_deps(graph, largest, &candidate, guard) {
             dep_paths_map.insert(candidate.clone(), largest.clone());
             survivors.remove(&candidate);
         } else {

@@ -1,54 +1,94 @@
-//! `pnpm why` — show the packages that depend on `<pkg>`.
+//! `pnpm why`: show the packages that depend on `<pkg>`.
 
 use crate::{
     State,
     cli_args::{
         deps_tree::{
-            build::{LoadedState, importer_root_ids, read_project_manifest, safe_importer_dir},
+            build::{
+                LoadedState,
+                importer_root_ids,
+                read_project_manifest,
+                safe_importer_dir,
+            },
             dependents::{
-                BuildDependentsOptions, DependentsTree, ImporterInfo, build_dependents_tree,
+                BuildDependentsOptions,
+                DependencySpecifiers,
+                DependentsTree,
+                ImporterInfo,
+                build_dependents_tree,
                 merge_trees,
             },
             dependents_render::{
-                RenderDependentsOptions, render_dependents_json, render_dependents_parseable,
+                RenderDependentsOptions,
+                render_dependents_json,
+                render_dependents_parseable,
                 render_dependents_tree,
             },
-            graph::{BuildGraphOptions, DependencyGraph, build_dependency_graph},
+            graph::{
+                BoundPeerEdges,
+                BuildGraphOptions,
+                DependencyGraph,
+                build_dependency_graph,
+            },
             pkg_info::PkgInfoEnv,
             search::Searcher,
         },
-        deps_tree_finders::{FinderHandle, evaluate_finders, finder_candidates, resolve_finders},
+        deps_tree_finders::{
+            FinderHandle,
+            evaluate_finders,
+            finder_candidates,
+            resolve_finders,
+        },
         install::resolve_bool_override,
-        list::{print_output, recursive::dedicated_project_config},
+        list::{
+            global_install_dir_config,
+            print_output,
+            recursive::dedicated_project_config,
+        },
         parse_depth_limit,
-        recursive::{AutoExcludeRoot, discover_workspace_projects, select_recursive_projects},
+        recursive::{
+            AutoExcludeRoot,
+            discover_workspace_projects,
+            select_recursive_projects,
+        },
     },
 };
 use clap::Args;
+use miette::IntoDiagnostic;
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
 use pnpm_modules_yaml::IncludedDependencies;
 use pnpm_workspace_projects_graph::BaseProject;
+use ranges::render_dependents_ranges;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[derive(Debug, Args)]
 pub struct WhyArgs {
     pub packages: Vec<String>,
+    /// Inspect globally installed packages.
+    #[clap(short = 'g', long)]
+    pub global: bool,
     /// Max display depth of the reverse dependency tree. `Infinity`
     /// renders the whole tree.
     #[clap(long, value_parser = parse_depth_limit)]
     pub depth: Option<usize>,
-    /// Exclude peer dependencies. Ignored: `pnpm why` always includes them.
-    // The flag is there for parity: pnpm 11's `why` declares it and never
-    // forwards it either.
+    /// Leave out the dependents that reach a package only as a resolved
+    /// peer dependency.
     #[clap(long)]
     pub exclude_peers: bool,
     /// Search by a finder function declared in `.pnpmfile.cjs`.
     #[clap(long = "find-by")]
     pub find_by: Vec<String>,
+    /// Show the version ranges that the direct dependents of each matched
+    /// package declare, instead of the tree.
+    #[clap(long, conflicts_with_all = ["json", "parseable"])]
+    pub ranges: bool,
     #[clap(flatten)]
     pub output: crate::cli_args::list::TreeOutputArgs,
     #[clap(flatten)]
@@ -83,6 +123,48 @@ impl WhyArgs {
         };
 
         print_output(&self.render(&trees));
+        Ok(())
+    }
+
+    pub async fn run_global(self, config: &Config) -> miette::Result<()> {
+        if self.packages.is_empty() && self.find_by.is_empty() {
+            return Err(miette::miette!(
+                code = "ERR_PNPM_MISSING_PACKAGE_NAME",
+                "`pnpm why` requires the package name or --find-by=<finder-name>"
+            ));
+        }
+        let global_pkg_dir = config.global_pkg_dir
+            .clone()
+            .ok_or_else(|| {
+                miette::miette!(
+                    code = "ERR_PNPM_NO_GLOBAL_BIN_DIR",
+                    "Unable to find the global packages directory"
+                )
+            })?;
+        let finders = resolve_finders(config, &global_pkg_dir, &self.find_by).await?;
+        let install_dirs =
+            pnpm_global::find_global_install_dirs(&global_pkg_dir, &[]).into_diagnostic()?;
+        let mut any_lockfile = false;
+        let mut trees = Vec::new();
+        for install_dir in &install_dirs {
+            let group_config = global_install_dir_config(config, install_dir);
+            if let Some(group_trees) = self.trees_for_lockfile(
+                &group_config,
+                install_dir,
+                std::slice::from_ref(install_dir),
+                &finders,
+            )
+            .await?
+            {
+                any_lockfile = true;
+                trees.extend(group_trees);
+            }
+        }
+        if !any_lockfile {
+            return Ok(());
+        }
+        let merged = merge_trees(trees);
+        print_output(&self.render(&merged));
         Ok(())
     }
 
@@ -142,22 +224,28 @@ impl WhyArgs {
         let include = self.included_dependencies(config);
         let root_ids = importer_root_ids(lockfile, lockfile_dir, project_dirs);
         let graph = build_dependency_graph(
-            &root_ids,
+            root_ids,
             &BuildGraphOptions {
                 lockfile,
                 include,
                 only_projects: false,
                 peer_edges: config.peer_edge_options(),
+                bound_peer_edges: self.bound_peer_edges(),
             },
         );
-        let searcher = self.searcher(&env, &graph, finders).await?;
+        let searcher = self.searcher(&env, &graph, finders, config.frozen_store).await?;
         Ok(Some(build_dependents_tree(&BuildDependentsOptions {
             env: &env,
             graph: &graph,
             search: &searcher,
             importer_info: &importer_info,
             manifest_fields: &[],
+            dependency_specifiers: self.dependency_specifiers(),
         })))
+    }
+
+    fn bound_peer_edges(&self) -> BoundPeerEdges {
+        if self.exclude_peers { BoundPeerEdges::Skip } else { BoundPeerEdges::Follow }
     }
 
     fn included_dependencies(&self, config: &Config) -> IncludedDependencies {
@@ -179,19 +267,33 @@ impl WhyArgs {
         env: &PkgInfoEnv<'_>,
         graph: &DependencyGraph,
         finders: &[FinderHandle],
+        frozen_store: bool,
     ) -> miette::Result<Searcher> {
         let mut searcher = Searcher::from_queries(&self.packages)?;
         if !finders.is_empty() {
             let candidates = finder_candidates(env, graph);
-            let results = evaluate_finders(env, finders, candidates).await?;
+            let results = evaluate_finders(env, frozen_store, finders, candidates).await?;
             searcher.set_finder_results(results);
         }
         Ok(searcher)
     }
 
+    /// The specifiers shown by the format that [`Self::render`] picks.
+    fn dependency_specifiers(&self) -> DependencySpecifiers {
+        if self.ranges {
+            DependencySpecifiers::DirectDependents
+        } else if self.output.json && !self.output.parseable {
+            DependencySpecifiers::All
+        } else {
+            DependencySpecifiers::Omit
+        }
+    }
+
     fn render(&self, trees: &[DependentsTree]) -> String {
         let render_opts = RenderDependentsOptions { long: self.output.long, depth: self.depth };
-        if self.output.parseable {
+        if self.ranges {
+            render_dependents_ranges(trees)
+        } else if self.output.parseable {
             render_dependents_parseable(trees, &render_opts)
         } else if self.output.json {
             render_dependents_json(trees, &render_opts)
@@ -250,3 +352,8 @@ fn why_project_dirs(
 fn state_project_dirs(state: &State, lockfile_dir: &Path) -> miette::Result<Vec<PathBuf>> {
     why_project_dirs(state.config, lockfile_dir, state.project_dir().to_path_buf())
 }
+
+mod ranges;
+
+#[cfg(test)]
+mod tests;

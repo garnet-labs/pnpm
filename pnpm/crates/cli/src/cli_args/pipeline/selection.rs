@@ -1,10 +1,35 @@
 use super::{
-    Command, Config, CreateProjectsGraphOptions, GetChangedProjectsOptions, GraphPkg, HashMap,
-    HashSet, LogEvent, LogLevel, Path, PathBuf, PnpmLog, Project, ProjectGraph,
-    create_projects_graph, get_changed_projects,
+    Command,
+    Config,
+    GetChangedProjectsOptions,
+    GraphPkg,
+    HashMap,
+    HashSet,
+    LogEvent,
+    LogLevel,
+    Path,
+    PathBuf,
+    PnpmLog,
+    Project,
+    ProjectGraph,
+    get_changed_projects,
 };
-use crate::cli_args::catalogs::{configured_catalogs, workspace_catalogs};
-use pnpm_workspace_projects_graph::BaseProject;
+use crate::cli_args::{
+    catalogs::{
+        configured_catalogs,
+        workspace_catalogs,
+    },
+    recursive::overridden_project_dependencies,
+};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
+use pnpm_workspace_projects_graph::{
+    BaseProject,
+    CreateProjectsGraphOptions,
+    create_projects_graph,
+};
 
 /// The identity runs are recorded under on the server: the workspace
 /// directory's name plus the same path hash that keys the local pipeline
@@ -12,7 +37,8 @@ use pnpm_workspace_projects_graph::BaseProject;
 pub(super) fn workspace_identity(workspace_root: &Path) -> String {
     let basename: String = workspace_root
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+        .map(std::ffi::OsStr::to_string_lossy)
+        .map(std::borrow::Cow::into_owned)
         .unwrap_or_default()
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
@@ -26,13 +52,21 @@ pub(super) fn workspace_identity(workspace_root: &Path) -> String {
 pub(super) fn build_full_graph<'a>(
     projects: &'a [Project],
     config: &Config,
+    workspace_root: &Path,
 ) -> miette::Result<ProjectGraph<GraphPkg<'a>>> {
     let catalogs = configured_catalogs(config)?;
+    let dependency_rewriter =
+        pnpm_package_manager::overrides_dependency_rewriter(config, &catalogs, workspace_root)
+            .into_diagnostic()
+            .wrap_err("parsing the overrides")?;
     let graph_options = CreateProjectsGraphOptions {
         link_workspace_packages: Some(
             config.link_workspace_packages != pnpm_config::LinkWorkspacePackages::Off,
         ),
         catalogs: workspace_catalogs(config, &catalogs),
+        dependency_rewriter: dependency_rewriter
+            .as_ref()
+            .map(|rewriter| rewriter as &dyn pnpm_workspace_projects_graph::DependencyRewriter),
         ..CreateProjectsGraphOptions::default()
     };
     Ok(create_projects_graph(
@@ -51,7 +85,7 @@ pub struct Selection {
     /// projects and their dependents, without the workspace root unless
     /// `SelectAffectedOptions::keeps_workspace_root` is set.
     pub requested: Vec<PathBuf>,
-    /// The dependency closure of `requested` — the projects the task
+    /// The dependency closure of `requested`, the projects the task
     /// graph spans. The extra projects participate only through
     /// `dependsOn` edges (an upstream build pulled in without its lint or
     /// tests), which is what keeps a task's cache key independent of how
@@ -170,7 +204,7 @@ fn with_transitive_dependencies(
 
 /// `merge-base(HEAD, base)`, deepening a shallow clone until the merge
 /// base is reachable. `None` when it cannot be resolved (an unknown ref,
-/// unrelated histories, not a git repository) — the caller falls back to
+/// unrelated histories, not a git repository), the caller falls back to
 /// the full graph.
 fn resolve_merge_base(workspace_root: &Path, base: &str) -> Option<String> {
     for _ in 0..5 {
@@ -208,24 +242,7 @@ fn select_changed_projects(
     all_dirs: &[PathBuf],
     merge_base: String,
 ) -> miette::Result<Selection> {
-    let project_dependencies: HashMap<PathBuf, Vec<(String, String)>> = options
-        .graph
-        .iter()
-        .map(|(dir, node)| (dir.clone(), node.package.merged_dependencies(false)))
-        .collect();
-    let changed = get_changed_projects(
-        options.graph.keys().cloned().collect(),
-        &merge_base,
-        &GetChangedProjectsOptions {
-            workspace_dir: options.workspace_root,
-            working_dir: None,
-            test_pattern: &options.config.test_pattern,
-            changed_files_ignore_pattern: &options.config.changed_files_ignore_pattern,
-            project_dependencies: Some(&project_dependencies),
-            use_glob_dir_filtering: false,
-        },
-    )
-    .map_err(miette::Report::new)?;
+    let changed = read_changed_projects(options, &merge_base)?;
     let changed_count =
         changed.changed_projects.len() + changed.ignore_dependent_for_projects.len();
 
@@ -297,4 +314,32 @@ fn affected_selection(
         merge_base: Some(merge_base),
         changed_count,
     }
+}
+
+fn read_changed_projects(
+    options: &SelectAffectedOptions<'_>,
+    merge_base: &str,
+) -> miette::Result<pnpm_workspace_projects_filter::ChangedProjects> {
+    let project_dependencies =
+        overridden_project_dependencies(options.graph, options.config, options.workspace_root)?
+            .unwrap_or_else(|| {
+                options.graph
+                    .iter()
+                    .map(|(dir, node)| (dir.clone(), node.package.merged_dependencies(false)))
+                    .collect()
+            });
+    get_changed_projects(
+        options.graph.keys().cloned().collect(),
+        merge_base,
+        &GetChangedProjectsOptions {
+            include_untracked: true,
+            workspace_dir: options.workspace_root,
+            working_dir: None,
+            test_pattern: &options.config.test_pattern,
+            changed_files_ignore_pattern: &options.config.changed_files_ignore_pattern,
+            project_dependencies: Some(&project_dependencies),
+            use_glob_dir_filtering: false,
+        },
+    )
+    .map_err(miette::Report::new)
 }

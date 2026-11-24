@@ -1,7 +1,20 @@
 use super::{
-    BTreeMap, Config, HashMap, Host, IntoDiagnostic, Path, PathBuf, Result, TrustedSettings, Value,
-    WorkspaceSettings, apply_store_dir_override, config_delta, default_state_dir,
-    is_known_setting_key, resolve_configured_state_dir,
+    BTreeMap,
+    Config,
+    HashMap,
+    Host,
+    IntoDiagnostic,
+    Path,
+    PathBuf,
+    Result,
+    TrustedSettings,
+    Value,
+    WorkspaceSettings,
+    apply_store_dir_override,
+    config_delta,
+    default_state_dir,
+    is_known_setting_key,
+    resolve_configured_state_dir,
 };
 use miette::WrapErr;
 
@@ -10,19 +23,55 @@ struct HookExecutionChanges {
     changed_extra_env: Option<HashMap<String, String>>,
 }
 
+struct LockfileDirPathsBeforeHook {
+    lockfile_dir: Option<PathBuf>,
+    configured_virtual_store_dir: Option<PathBuf>,
+    node_path_dirs: [PathBuf; 2],
+    hook_node_path: Option<Option<String>>,
+    hook_node_options: Option<Option<String>>,
+    hook_modules_dir: Option<PathBuf>,
+    modules_dir_changed: bool,
+    hook_virtual_store_dir: HookVirtualStoreDir,
+}
+
+#[derive(Clone, Copy)]
+enum HookVirtualStoreDir {
+    Unchanged,
+    Cleared,
+    Set,
+}
+
+struct NodePathRefresh {
+    previous_dirs: [PathBuf; 2],
+    hook_node_path: Option<Option<String>>,
+    hook_node_options: Option<Option<String>>,
+}
+
+impl NodePathRefresh {
+    fn apply_to(self, config: &mut Config) {
+        config.refresh_node_path_after_lockfile_dir_change::<Host>(
+            [&self.previous_dirs[0], &self.previous_dirs[1]],
+            self.hook_node_path,
+            self.hook_node_options,
+        );
+    }
+}
+
 /// `extraBinPaths` / `extraEnv` aren't `WorkspaceSettings` fields, so
 /// `from_value(delta)` ignores them. The hook's values are pulled out
 /// first and assigned directly.
 fn hook_execution_changes(delta: &Value) -> Result<HookExecutionChanges> {
     let changed_extra_bin_paths = delta
         .get("extraBinPaths")
-        .map(|value| serde_json::from_value::<Vec<PathBuf>>(value.clone()))
+        .cloned()
+        .map(serde_json::from_value::<Vec<PathBuf>>)
         .transpose()
         .into_diagnostic()
         .wrap_err("the updateConfig hook produced an invalid extraBinPaths value")?;
     let changed_extra_env = delta
         .get("extraEnv")
-        .map(|value| serde_json::from_value::<HashMap<String, String>>(value.clone()))
+        .cloned()
+        .map(serde_json::from_value::<HashMap<String, String>>)
         .transpose()
         .into_diagnostic()
         .wrap_err("the updateConfig hook produced an invalid extraEnv value")?;
@@ -38,6 +87,7 @@ fn filter_hook_delta(config: &Config, mut delta: Value) -> Value {
             !config.cli_settings.contains(key)
                 && !config.cli_settings.contains(&pnpm_config::naming_cases::to_camel_case(key))
         });
+        super::node_linker_aliases::drop_cli_linker_aliases(config, delta);
     }
     delta
 }
@@ -67,6 +117,8 @@ pub(super) fn apply_hook_delta(
     base_dir: &Path,
 ) -> Result<()> {
     let delta = filter_hook_delta(config, config_delta(input, current));
+    let lockfile_dir_paths_before_hook =
+        lockfile_dir_paths_before_hook(config, input, current, &delta, base_dir);
     // `config_delta` only walks keys present in the hook output, so a
     // `scriptShell` the hook deleted (pnpm: `undefined`, no shell) leaves no
     // trace in the delta.
@@ -75,10 +127,6 @@ pub(super) fn apply_hook_delta(
     if delta.as_object().is_none_or(serde_json::Map::is_empty) && !script_shell_deleted {
         return Ok(());
     }
-    let changed_store_dir = delta
-        .get("storeDir")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     let execution_changes = hook_execution_changes(&delta)?;
     apply_registry_routing_changes(config, &delta)?;
 
@@ -86,17 +134,171 @@ pub(super) fn apply_hook_delta(
         .into_diagnostic()
         .wrap_err("deserialize the updateConfig hook result")?;
     record_explicit_setting_changes(config, &delta, &delta_settings);
+    super::hook_added_overrides::record_hook_added_overrides(config, input, &delta);
     delta_settings.apply_to(config, base_dir);
     config.apply_cli_registries();
     apply_hook_execution_changes(config, execution_changes, script_shell_deleted);
     restore_defaults_of_nulled_settings(config, &delta, base_dir);
+    super::node_linker_aliases::reapply_linker_options(config, &delta);
+    let node_path_refresh = lockfile_dir_paths_before_hook.map(|paths_before_hook| {
+        apply_lockfile_dir_change(config, paths_before_hook)
+    });
     apply_state_dir_change(config, &delta);
-    apply_project_selector_changes(config, &delta)?;
+    apply_project_selector_changes(config, &delta, base_dir)?;
     if delta.get("shamefullyHoist").is_some() || config.cli_settings.contains("shamefullyHoist") {
         config.apply_shamefully_hoist_derivation();
     }
-    apply_hook_store_dir(config, changed_store_dir.as_deref(), base_dir)?;
+    apply_hook_store_dir_change(config, &delta, base_dir)?;
+    if let Some(node_path_refresh) = node_path_refresh {
+        node_path_refresh.apply_to(config);
+    }
     Ok(())
+}
+
+/// Re-anchor the paths that follow the lockfile directory. `NODE_PATH` is
+/// refreshed by the returned value once the store paths are settled.
+fn apply_lockfile_dir_change(
+    config: &mut Config,
+    paths_before_hook: LockfileDirPathsBeforeHook,
+) -> NodePathRefresh {
+    let project_dir = config.dir.clone();
+    let modules_dir = config.modules_dir.clone();
+    let install_state_dir = config.install_state_dir.clone();
+    if let Some(lockfile_dir) =
+        config.configured_lockfile_dir.clone().or_else(|| config.lockfile_dir.clone())
+    {
+        if paths_before_hook.lockfile_dir.is_none() {
+            config.lockfile_dir = None;
+        }
+        config.pin_lockfile_dir(&lockfile_dir, &project_dir);
+    }
+    restore_default_lockfile_dir_paths(config, &paths_before_hook, modules_dir, install_state_dir);
+    NodePathRefresh {
+        previous_dirs: paths_before_hook.node_path_dirs,
+        hook_node_path: paths_before_hook.hook_node_path,
+        hook_node_options: paths_before_hook.hook_node_options,
+    }
+}
+
+fn restore_default_lockfile_dir_paths(
+    config: &mut Config,
+    paths_before_hook: &LockfileDirPathsBeforeHook,
+    modules_dir: PathBuf,
+    install_state_dir: PathBuf,
+) {
+    if config.lockfile_dir.is_some() {
+        return;
+    }
+    let configured_virtual_store_dir = paths_before_hook
+        .configured_virtual_store_dir
+        .as_ref();
+    config.modules_dir = modules_dir;
+    let hook_virtual_store_dir = match paths_before_hook.hook_virtual_store_dir {
+        HookVirtualStoreDir::Unchanged => {
+            config.configured_virtual_store_dir = configured_virtual_store_dir.cloned();
+            None
+        }
+        HookVirtualStoreDir::Cleared => {
+            config.configured_virtual_store_dir = None;
+            None
+        }
+        HookVirtualStoreDir::Set => config.configured_virtual_store_dir.clone(),
+    };
+    config.install_state_dir = install_state_dir;
+    if paths_before_hook.lockfile_dir.is_some() {
+        restore_default_lockfile_dir(config, configured_virtual_store_dir, hook_virtual_store_dir);
+    }
+    if let Some(hook_modules_dir) = paths_before_hook.hook_modules_dir.as_ref() {
+        config.modules_dir.clone_from(hook_modules_dir);
+    }
+    if paths_before_hook.modules_dir_changed
+        && (!config.explicit_settings.contains_key("virtualStoreDir")
+            || config.enable_global_virtual_store)
+    {
+        config.install_state_dir = config.modules_dir.join(".pnpm");
+    }
+}
+
+fn restore_default_lockfile_dir(
+    config: &mut Config,
+    configured_virtual_store_dir: Option<&PathBuf>,
+    hook_virtual_store_dir: Option<PathBuf>,
+) {
+    let project_dir = config.dir.clone();
+    let lockfile_dir = config.lockfile_dir_for(&project_dir).to_path_buf();
+    let paths_dir = config.workspace_dir.clone().unwrap_or(lockfile_dir);
+    let project_relative_virtual_store_dir = config.explicit_settings
+        .get("virtualStoreDir")
+        .and_then(Value::as_str)
+        .and_then(|raw| {
+            configured_virtual_store_dir.filter(|dir| {
+                !Path::new(raw).is_absolute()
+                    && pnpm_fs::lexical_normalize(dir)
+                        == pnpm_fs::lexical_normalize(&project_dir.join(raw))
+            })
+        });
+    config.anchor_lockfile_paths(&paths_dir);
+    if !config.enable_global_virtual_store
+        && let Some(dir) = project_relative_virtual_store_dir
+    {
+        config.set_virtual_store_dir(dir.clone());
+    }
+    if !config.enable_global_virtual_store
+        && let Some(dir) = hook_virtual_store_dir
+    {
+        config.set_virtual_store_dir(dir);
+    }
+}
+
+fn changed_extra_env_value(input: &Value, current: &Value, key: &str) -> Option<Option<String>> {
+    let before = input
+        .get("extraEnv")
+        .and_then(|env| env.get(key))
+        .and_then(Value::as_str);
+    let after = current
+        .get("extraEnv")
+        .and_then(|env| env.get(key))
+        .and_then(Value::as_str);
+    (before != after).then(|| after.map(str::to_owned))
+}
+
+fn lockfile_dir_paths_before_hook(
+    config: &Config,
+    input: &Value,
+    current: &Value,
+    delta: &Value,
+    base_dir: &Path,
+) -> Option<LockfileDirPathsBeforeHook> {
+    delta
+        .get("lockfileDir")
+        .map(|_| LockfileDirPathsBeforeHook {
+            lockfile_dir: config.lockfile_dir.clone(),
+            configured_virtual_store_dir: config.configured_virtual_store_dir.clone(),
+            node_path_dirs: [
+                config.install_state_dir.join("node_modules"),
+                config.modules_dir.clone(),
+            ],
+            hook_node_path: changed_extra_env_value(input, current, "NODE_PATH"),
+            hook_node_options: changed_extra_env_value(input, current, "NODE_OPTIONS"),
+            hook_modules_dir: delta
+                .get("modulesDir")
+                .and_then(Value::as_str)
+                .map(|modules_dir| pnpm_fs::lexical_normalize(&base_dir.join(modules_dir))),
+            modules_dir_changed: delta.get("modulesDir").is_some(),
+            hook_virtual_store_dir: match delta.get("virtualStoreDir") {
+                None => HookVirtualStoreDir::Unchanged,
+                Some(Value::Null) => HookVirtualStoreDir::Cleared,
+                Some(_) => HookVirtualStoreDir::Set,
+            },
+        })
+}
+
+fn apply_hook_store_dir_change(config: &mut Config, delta: &Value, base_dir: &Path) -> Result<()> {
+    let changed_store_dir = delta
+        .get("storeDir")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    apply_hook_store_dir(config, changed_store_dir.as_deref(), base_dir)
 }
 
 /// Apply the routing a hook rewrote under the `registriesByScope` /
@@ -148,6 +350,9 @@ fn record_explicit_setting_changes(
         .map(|(key, _)| key)
     {
         if is_known_setting_key(key) {
+            if key == "nodeLinker" {
+                config.forget_node_linker_aliases();
+            }
             config.explicit_settings.remove(key);
         }
     }
@@ -173,19 +378,43 @@ fn restore_defaults_of_nulled_settings(config: &mut Config, delta: &Value, base_
 /// Apply the `filter` / `filterProd` selectors a hook set. Either one
 /// replaces the `{.}...` default, which pnpm falls back to only when
 /// nothing selected projects.
-fn apply_project_selector_changes(config: &mut Config, delta: &Value) -> Result<()> {
+///
+/// Relative directory selectors a hook sets are rebased from `base_dir` to
+/// [`Config::dir`] so they select the same projects when `--dir` or the
+/// working directory is not the workspace root.
+fn apply_project_selector_changes(
+    config: &mut Config,
+    delta: &Value,
+    base_dir: &Path,
+) -> Result<()> {
     let filter = hook_selectors(delta, "filter")?;
     let filter_prod = hook_selectors(delta, "filterProd")?;
     if filter.is_none() && filter_prod.is_none() {
         return Ok(());
     }
+    let prev_filter = config.filter.clone();
+    let prev_filter_prod = config.filter_prod.clone();
+    let prefix = if config.dir.as_os_str().is_empty() { base_dir } else { &config.dir };
     if let Some(filter) = filter {
-        config.filter = filter;
+        config.filter = filter
+            .into_iter()
+            .map(|selector| {
+                pnpm_workspace_projects_filter::rebase_project_selector(&selector, base_dir, prefix)
+            })
+            .collect();
     } else if !config.cli_settings.contains("filter") {
         config.filter.clear();
     }
     if let Some(filter_prod) = filter_prod {
-        config.filter_prod = filter_prod;
+        config.filter_prod = filter_prod
+            .into_iter()
+            .map(|selector| {
+                pnpm_workspace_projects_filter::rebase_project_selector(&selector, base_dir, prefix)
+            })
+            .collect();
+    }
+    if config.filter != prev_filter || config.filter_prod != prev_filter_prod {
+        config.filter_order.clear();
     }
     Ok(())
 }

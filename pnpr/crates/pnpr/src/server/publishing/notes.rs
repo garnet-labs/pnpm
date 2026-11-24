@@ -4,11 +4,18 @@
 //! ecosystem's publish path sees it, so no ecosystem's format gains a field,
 //! and stored in the publish's own transaction.
 
-use super::{RegistryError, Value};
+use super::{
+    RegistryError,
+    Value,
+};
 use crate::server::AppState;
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_registry::Ecosystem;
-use pnpr_storage::metadata::{PublishNotes, VersionNote, validate_note};
+use pnpr_storage::database::{
+    PublishNotes,
+    VersionNote,
+    validate_note,
+};
 
 const NOTES: &str = "notes";
 
@@ -73,10 +80,10 @@ fn entry_version(entry: &Value, ecosystem: Ecosystem) -> Option<(String, String)
 /// so the commit's own check covers it.
 pub(in super::super) async fn refuse_notes_of_published_python_versions(
     state: &AppState,
-    org: &str,
+    namespace: &str,
     notes: &PublishNotes,
 ) -> Result<(), RegistryError> {
-    let storage = state.inner.storage.for_hosted(org, Ecosystem::Pypi);
+    let storage = state.inner.storage.for_hosted(namespace, Ecosystem::Pypi);
     for note in notes.versions
         .iter()
         .filter(|note| note.ecosystem == Ecosystem::Pypi)

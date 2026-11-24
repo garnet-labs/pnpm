@@ -1,7 +1,14 @@
-use pnpr_upstream::{tarball_basename_for_package, version_route_tarball_version};
+use pnpr_upstream::{
+    tarball_basename_for_package,
+    version_route_tarball_version,
+};
 use serde_json::Map;
 
-use super::{CanonicalPackageName, RegistryError, Value};
+use super::{
+    CanonicalPackageName,
+    RegistryError,
+    Value,
+};
 
 #[derive(Default)]
 pub(super) struct PendingRestores {
@@ -51,14 +58,14 @@ fn validate_published_version(
 /// the partial-unpublish `PUT`, which otherwise persists the body verbatim.
 /// [`super::super::expected_tarball_dist`] resolves a tarball request to a version by
 /// `dist.tarball` basename and verifies the bytes against that version's string
-/// `dist.integrity`, so letting either drift — while the bytes on disk stay put —
+/// `dist.integrity`, so letting either drift (while the bytes on disk stay put)
 /// breaks installs of that version (`EINTEGRITY`, or a 404/502 redirect).
 ///
 /// For each version in the body, given a hosted packument: changing the
 /// `dist.integrity` or `dist.tarball` basename of an already-published version is
 /// rejected; omitting either is repaired from the hosted value (the round-trip
 /// drops them on retained versions); and a version not already published is
-/// rejected — this endpoint only removes versions, and an added entry could
+/// rejected; this endpoint only removes versions, and an added entry could
 /// collide a basename or seed a tarball-less one. A `PUT` to a package with no
 /// hosted packument is rejected outright (nothing to unpublish, and the write
 /// would seed versions that publish can never overwrite).
@@ -104,29 +111,38 @@ pub(super) fn enforce_published_version_immutability(
     None
 }
 
-/// The packument a rewrite submitted, with the fields only the store owns
-/// stripped.
+/// Validate a rewrite and retain its revision precondition.
 ///
 /// The write destination is the URL package name; a mismatched body name would
 /// otherwise land under the URL package and persist an inconsistent manifest.
 pub(super) fn submitted_packument(
-    body: &[u8],
-    name: &CanonicalPackageName,
+    mut packument: Value,
+    (name, revision): (&CanonicalPackageName, &str),
 ) -> Result<Value, RegistryError> {
-    let mut packument: Value = serde_json::from_slice(body).map_err(RegistryError::Json)?;
-    if let Some(body_name) = packument.get("name").and_then(Value::as_str)
-        && body_name != name.as_str()
+    if !packument.is_object() {
+        return Err(RegistryError::BadRequest {
+            reason: "packument must be an object".to_string(),
+        });
+    }
+    if packument
+        .get("_rev")
+        .is_some_and(|value| value.as_str() != Some(revision))
+    {
+        return Err(RegistryError::DocumentWriteConflict { package: name.as_str().to_string() });
+    }
+    if let Some(body_name) = packument.get("name")
+        && body_name.as_str() != Some(name.as_str())
     {
         return Err(RegistryError::BadRequest {
             reason: format!(
-                "packument name {body_name:?} does not match the URL package {:?}",
+                "packument name {body_name} does not match the URL package {:?}",
                 name.as_str(),
             ),
         });
     }
     if let Some(obj) = packument.as_object_mut() {
         obj.remove("_attachments");
-        obj.remove("_rev");
+        obj.insert("_rev".to_string(), Value::String(revision.to_string()));
         obj.remove("_revisions");
     }
     Ok(packument)
@@ -268,7 +284,7 @@ fn tarball_basename_or_version_route(url: &str, pkg: &CanonicalPackageName) -> O
 
 /// Reject a published version whose `dist` isn't an object: a restore needs an
 /// object to write into, so otherwise it would no-op and persist the version
-/// without the field — the stripping this guards against.
+/// without the field, the stripping this guards against.
 pub(super) fn require_object_dist(manifest: &Value, version: &str) -> Option<RegistryError> {
     if manifest.get("dist").is_some_and(Value::is_object) {
         return None;
@@ -278,8 +294,8 @@ pub(super) fn require_object_dist(manifest: &Value, version: &str) -> Option<Reg
     })
 }
 
-/// All fields of a published version manifest — other than `deprecated` and
-/// `dist` (which has dedicated integrity and tarball checks) — are immutable.
+/// All fields of a published version manifest (other than `deprecated` and
+/// `dist` (which has dedicated integrity and tarball checks)) are immutable.
 /// Modifications to `dependencies`, `scripts`, `bin`, or any other metadata
 fn check_existing_fields(
     version: &str,
@@ -386,8 +402,8 @@ fn check_no_extra_dist_fields(
     None
 }
 
-/// All fields of a published version manifest — other than `deprecated` and
-/// `dist` (which has dedicated integrity and tarball checks) — are immutable.
+/// All fields of a published version manifest (other than `deprecated` and
+/// `dist` (which has dedicated integrity and tarball checks)) are immutable.
 /// Modifications to `dependencies`, `scripts`, `bin`, or any other metadata
 /// must be rejected.
 pub(super) fn check_version_fields_immutable(

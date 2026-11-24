@@ -1,12 +1,41 @@
 use super::{
-    Action, AppState, Body, CanonicalPackageName, DiscoverySource, Ecosystem, FetchOutcome,
-    HostedConfig, HostedGate, Identity, Map, RegistryError, RegistrySource, Response, StatusCode,
-    Value, authorize, default_registry_target, discovery_sources, header, hosted_gate,
-    hosted_storage, json, not_found, resolve_registry_source,
+    Action,
+    AppState,
+    Body,
+    CanonicalPackageName,
+    DiscoverySource,
+    Ecosystem,
+    FetchOutcome,
+    HostedConfig,
+    HostedGate,
+    Identity,
+    Map,
+    Ownership,
+    RegistryError,
+    RegistrySource,
+    Response,
+    StatusCode,
+    Value,
+    allows_with_ownership,
+    authorize,
+    default_registry_target,
+    discovery_sources,
+    header,
+    hosted_gate,
+    hosted_storage,
+    json,
+    needs_package_owners,
+    not_found,
+    resolve_registry_source,
+    team_directory::{
+        Team,
+        Teams,
+    },
 };
 use axum::response::IntoResponse;
+use pnpr_config::RoutingConfig;
 
-/// `GET /-/org/{scope}/package` — the npm-compatible package-permission map.
+/// `GET /-/org/{scope}/package`: the npm-compatible package-permission map.
 /// Values are useful to npm's account UI; registry UIs such as npmX consume
 /// the keys as the authoritative package list.
 pub(super) async fn serve_org_packages(
@@ -72,22 +101,37 @@ pub(super) async fn add_hosted_org_packages(
     scan: OrgScan<'_>,
     packages: &mut Map<String, Value>,
 ) -> Result<(), RegistryError> {
-    let Some(hosted) = state.inner.config.routing.hosted.get(scan.source) else {
+    let routing = state.routing();
+    let Some(hosted) = routing.hosted.get(scan.source) else {
         return Ok(());
     };
     if !hosted.rules.any_access_admits(identity) {
         return Ok(());
     }
-    let storage = hosted_storage(state, Some(&hosted.org));
+    let storage = hosted_storage(state, Some(&hosted.namespace));
     let mut names = storage.hosted_package_names().await?;
     names.sort();
-    let resolved = RegistrySource::Hosted(scan.source.to_string());
+    names.retain(|name| hosted_org_package_is_visible(state, identity, &scan, name));
+    let rules = hosted.rules.snapshot();
+    let owner_checked: Vec<String> = names
+        .iter()
+        .filter(|name| needs_package_owners(state, identity, &rules, name, Action::Publish))
+        .cloned()
+        .collect();
+    let owners_by_package = storage.read_packages_owners(&owner_checked).await?;
     for name in names {
-        if !hosted_org_package_is_visible(state, identity, &scan, &name) {
-            continue;
-        }
-        let writable = authorize(state, identity, &resolved, &name, Action::Publish).is_ok();
-        let permission = if writable { "write" } else { "read" };
+        let owners = owners_by_package
+            .get(&name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[][..]);
+        let ownership = Ownership::Owners(owners);
+        let permission =
+            if allows_with_ownership(state, identity, &rules, (&name, &ownership), Action::Publish)
+            {
+                "write"
+            } else {
+                "read"
+            };
         packages.insert(name, Value::String(permission.to_string()));
     }
     Ok(())
@@ -117,17 +161,17 @@ pub(super) async fn add_upstream_org_packages(
     scope: &str,
     packages: &mut Map<String, Value>,
 ) -> Result<(), RegistryError> {
-    let Some(config) = state.inner.config.routing.upstreams.get(scan.source) else {
+    let routing = state.routing();
+    let Some(config) = routing.upstreams.get(scan.source) else {
         return Ok(());
     };
-    if !config.search
-        || config.access
-            .as_ref()
-            .is_some_and(|access| !access.allows(identity))
-    {
+    // The listing asks the origin, so it takes `cache` as well as `read`.
+    let admitted = config.rules.any_access_admits(identity)
+        && config.rules.any_admits(pnpr_policy::Action::Cache, identity);
+    if !config.search || !admitted {
         return Ok(());
     }
-    let Some(upstream) = state.inner.proxy.upstreams.get(scan.source) else {
+    let Some(upstream) = routing.upstream_clients.get(scan.source) else {
         return Ok(());
     };
     let upstream_packages = match upstream.fetch_org_packages(scope).await? {
@@ -158,25 +202,20 @@ pub(super) fn upstream_org_package_is_visible(
             resolve_registry_source(state, scan.registry, name),
             RegistrySource::Upstream(candidate) if candidate == scan.source,
         )
-        && authorize(state, identity, resolved, name, Action::Access).is_ok()
+        && authorize(state, identity, resolved, name, Action::Read).is_ok()
 }
 
-// --------------------------------------------------------------------
-// npm team API — read-only views over the config-declared `teams:` maps.
-// Team membership is part of the registry configuration (it feeds the
-// compiled access lists), so the API serves listings and rejects
-// mutations with an explicit "config-managed" error.
-// --------------------------------------------------------------------
-
-/// The hosted registry whose teams `@{scope}` addresses: the scope routes
+/// The hosted registry `@{scope}` addresses in a team request: the scope routes
 /// through the addressed registry (an explicit `/~<name>/`, or the
 /// path-less default) exactly as a package read in that scope would, then
-/// the registry-level default `access` gates the caller. A denial is
-/// masked as not-found — team and member names must not become an
+/// whether the caller may read anything in that registry gates it. A denial is
+/// masked as not-found, team and member names must not become an
 /// existence probe for a private registry. Returns the registry's name with
-/// its config.
+/// its config. Teams belong to the instance, so the registry only decides who
+/// may ask.
 pub(super) fn team_registry<'a>(
-    state: &'a AppState,
+    state: &AppState,
+    routing: &'a RoutingConfig,
     identity: &Identity,
     registry: Option<&str>,
     scope: &str,
@@ -196,57 +235,151 @@ pub(super) fn team_registry<'a>(
     let RegistrySource::Hosted(source) = resolve_registry_source(state, &target, &probe) else {
         return Err(RegistryError::NotFound);
     };
-    let Some((name, hosted)) = state.inner.config.routing.hosted.get_key_value(&source) else {
+    let Some((name, hosted)) = routing.hosted.get_key_value(&source) else {
         return Err(RegistryError::NotFound);
     };
-    if !hosted.rules.default_access_admits(identity) {
+    if !hosted.rules.any_access_admits(identity) {
         return Err(RegistryError::NotFound);
     }
     Ok((name, hosted))
 }
 
-/// `GET /-/org/{scope}/team` (path-less) or `GET /~<name>/-/org/{scope}/team`
-/// — list the teams of the hosted registry that claims `@{scope}`, in the
-/// shape the pnpm team command consumes: an array of `{"name": ...}`.
+/// The teams a caller who reaches `@{scope}`'s registry may see: every team
+/// for an admin, and otherwise the teams the caller is in.
+pub(super) struct VisibleTeams {
+    teams: std::sync::Arc<Teams>,
+    /// `None` for an admin.
+    own: Option<Vec<String>>,
+}
+
+impl VisibleTeams {
+    /// Sorted by name.
+    pub(super) fn list(&self) -> Vec<(&str, &Team)> {
+        let Some(own) = &self.own else {
+            return self.teams.iter().collect();
+        };
+        let mut teams: Vec<_> = own
+            .iter()
+            .filter_map(|id| self.teams.get(id))
+            .collect();
+        teams.sort_by_key(|(_, team)| team.name.as_str());
+        teams
+    }
+
+    pub(super) fn named(&self, name: &str) -> Result<(&str, &Team), RegistryError> {
+        self.list()
+            .into_iter()
+            .find(|(_, team)| team.name == name)
+            .ok_or(RegistryError::NotFound)
+    }
+}
+
+/// [`VisibleTeams`] for `identity`. A caller who is in no team and is not an
+/// admin gets not-found.
+pub(super) fn visible_teams(
+    state: &AppState,
+    identity: &Identity,
+    registry: Option<&str>,
+    scope: &str,
+) -> Result<VisibleTeams, RegistryError> {
+    team_registry(state, &state.routing(), identity, registry, scope)?;
+    super::require_caller(identity, "team listing")?;
+    let auth = &state.inner.config.identity;
+    let sees_all = auth.is_admin(identity) || auth.is_registry_admin(identity);
+    let own = (!sees_all).then(|| identity.teams().to_vec());
+    let visible = VisibleTeams { teams: state.inner.identity.managed.teams.snapshot(), own };
+    if !sees_all && visible.list().is_empty() {
+        return Err(RegistryError::NotFound);
+    }
+    Ok(visible)
+}
+
+#[derive(Default, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum TeamListFormat {
+    Cli,
+    #[default]
+    #[serde(other)]
+    Detailed,
+}
+
+/// `GET /-/org/{scope}/team` (path-less) or `GET /~<name>/-/org/{scope}/team`,
+/// list the teams the caller may see.
 pub(super) fn get_org_teams(
     state: &AppState,
     identity: &Identity,
     registry: Option<&str>,
     scope: &str,
+    format: TeamListFormat,
 ) -> Response {
-    let hosted = match team_registry(state, identity, registry, scope) {
-        Ok((_, hosted)) => hosted,
+    let teams = match visible_teams(state, identity, registry, scope) {
+        Ok(teams) => teams,
         Err(err) => return err.into_response(),
     };
-    let teams: Vec<Value> = hosted.teams
-        .snapshot()
-        .keys()
-        .map(|name| json!({ "name": name }))
+    let teams: Vec<Value> = teams
+        .list()
+        .into_iter()
+        .map(|(id, team)| match format {
+            TeamListFormat::Cli => {
+                json!(format!("{}:{}", scope.trim_start_matches('@'), team.name))
+            }
+            TeamListFormat::Detailed => json!({ "id": id, "name": team.name }),
+        })
         .collect();
     (StatusCode::OK, axum::Json(Value::Array(teams))).into_response()
 }
 
 /// `GET /-/team/{scope}/{team}/user` (path-less) or
-/// `GET /~<name>/-/team/{scope}/{team}/user` — list a team's members, in
-/// the shape the pnpm team command consumes: an array of `{"name": ...}`.
-pub(super) fn get_team_members(
+/// `GET /~<name>/-/team/{scope}/{team}/user`, list a team's members.
+pub(super) async fn get_team_members(
     state: &AppState,
     identity: &Identity,
     registry: Option<&str>,
-    scope: &str,
-    team: &str,
+    (scope, team): (&str, &str),
+    format: TeamListFormat,
 ) -> Response {
-    let hosted = match team_registry(state, identity, registry, scope) {
-        Ok((_, hosted)) => hosted,
+    let teams = match visible_teams(state, identity, registry, scope) {
+        Ok(teams) => teams,
         Err(err) => return err.into_response(),
     };
-    let roster = hosted.teams.snapshot();
-    let Some(members) = roster.get(team) else {
-        return not_found();
+    let record = match teams.named(team) {
+        Ok((_, record)) => record,
+        Err(err) => return err.into_response(),
     };
-    let members: Vec<Value> = members
-        .iter()
-        .map(|name| json!({ "name": name }))
-        .collect();
+    let ids: Vec<String> = record.members.iter().cloned().collect();
+    let accounts = match state.inner.identity.auth.users.accounts_by_id(&ids).await {
+        Ok(accounts) => accounts,
+        Err(err) => return err.into_response(),
+    };
+    let members = build_team_member_list(&record.members, accounts, format);
     (StatusCode::OK, axum::Json(Value::Array(members))).into_response()
+}
+
+fn build_team_member_list(
+    ids: &std::collections::BTreeSet<String>,
+    accounts: Vec<pnpr_auth::UserAccount>,
+    format: TeamListFormat,
+) -> Vec<Value> {
+    let names: std::collections::HashMap<_, _> = accounts
+        .into_iter()
+        .map(|account| (account.id, account.username))
+        .collect();
+    let mut members: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let name = names
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| format!("deleted:{id}"));
+            (name, id)
+        })
+        .collect();
+    members.sort_unstable();
+    members
+        .into_iter()
+        .map(|(name, id)| match format {
+            TeamListFormat::Cli => json!(name),
+            TeamListFormat::Detailed => json!({ "id": id, "name": name }),
+        })
+        .collect()
 }

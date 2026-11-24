@@ -1,15 +1,21 @@
-//! `pnpm get` / `pnpm set` — the top-level spellings of `pnpm config get`
+//! `pnpm get` / `pnpm set`: the top-level spellings of `pnpm config get`
 //! and `pnpm config set`.
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::CommandTempCwd, command_env::CommandTestExt, diagnostics::assert_diagnostic_contains,
+    bin::CommandTempCwd,
+    command_env::CommandTestExt,
+    diagnostics::assert_diagnostic_contains,
 };
 use pretty_assertions::assert_eq;
 use std::{
-    fs, io,
-    process::{Command, Stdio},
+    fs,
+    io,
+    process::{
+        Command,
+        Stdio,
+    },
 };
 
 fn pacquet_in(workspace: &std::path::Path) -> Command {
@@ -317,7 +323,7 @@ fn global_get_and_list_ignore_the_project_settings() {
         .expect("write package.json");
     fs::write(workspace.join("pnpm-workspace.yaml"), "minimumReleaseAge: 2880\n")
         .expect("write pnpm-workspace.yaml");
-    fs::write(workspace.join(".npmrc"), "//project.test/:_authToken=project-token\n")
+    fs::write(workspace.join(".npmrc"), "@project:registry=https://project.test/\n")
         .expect("write .npmrc");
     let config_home = root.path().join("xdg-config");
     fs::create_dir_all(config_home.join("pnpm")).expect("create global config directory");
@@ -345,7 +351,7 @@ fn global_get_and_list_ignore_the_project_settings() {
     assert_eq!(run(&["config", "get", "minimumReleaseAge", "--location=global"]), "undefined");
     assert_eq!(run(&["get", "-g", "minimumReleaseAge"]), "undefined");
     assert_eq!(run(&["config", "get", "minimumReleaseAge", "-g", "--location=project"]), "2880");
-    assert_eq!(run(&["config", "get", "//project.test/:_authToken", "--global"]), "undefined");
+    assert_eq!(run(&["config", "get", "@project:registry", "--global"]), "undefined");
     assert_eq!(run(&["config", "get", "fetchRetries", "--global"]), "5");
 
     let list = run(&["config", "list", "--global"]);
@@ -364,6 +370,236 @@ fn global_get_and_list_ignore_the_project_settings() {
     eprintln!("stderr={}", String::from_utf8_lossy(&from_env_workspace.stderr));
     assert!(from_env_workspace.status.success());
     assert_eq!(String::from_utf8_lossy(&from_env_workspace.stdout).trim_end(), "undefined");
+
+    drop(root);
+}
+
+#[test]
+fn flow_mapping_workspace_yaml_rejects_registry_env_and_drops_proxy_env() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    fs::write(workspace.join("package.json"), r#"{"name": "demo-app", "version": "1.0.0"}"#)
+        .expect("write package.json");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "{registry: https://example.invalid/${DEMO_REG_VAR}/}\n",
+    )
+    .expect("write flow pnpm-workspace.yaml");
+
+    let registry_out = pacquet_in(&workspace)
+        .with_env("DEMO_REG_VAR", "subpath")
+        .with_args(["config", "get", "registry"])
+        .output()
+        .expect("run pacquet config get registry");
+    let stderr = String::from_utf8_lossy(&registry_out.stderr);
+    let stdout = String::from_utf8_lossy(&registry_out.stdout);
+    assert!(!registry_out.status.success(), "expected failure, stdout={stdout}, stderr={stderr}");
+    assert!(stderr.contains("ERR_PNPM_REGISTRY_ENV_NOT_EXPANDED"), "stderr={stderr}");
+    assert!(!stdout.contains("subpath") && !stderr.contains("subpath"), "leaked env value");
+
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "{httpsProxy: http://127.0.0.1:8080/${DEMO_REG_VAR}, shamefullyHoist: ${DEMO_HOIST}}\n",
+    )
+    .expect("write flow proxy pnpm-workspace.yaml");
+    let proxy_get = pacquet_in(&workspace)
+        .with_env("DEMO_REG_VAR", "subpath")
+        .with_env("DEMO_HOIST", "true")
+        .with_args(["config", "get", "httpsProxy"])
+        .output()
+        .expect("run pacquet config get httpsProxy");
+    assert!(proxy_get.status.success(), "stderr={}", String::from_utf8_lossy(&proxy_get.stderr));
+    assert_eq!(String::from_utf8_lossy(&proxy_get.stdout).trim_end(), "undefined");
+
+    let proxy_list = pacquet_in(&workspace)
+        .with_env("DEMO_REG_VAR", "subpath")
+        .with_env("DEMO_HOIST", "true")
+        .with_args(["config", "list"])
+        .output()
+        .expect("run pacquet config list");
+    let list_stderr = String::from_utf8_lossy(&proxy_list.stderr);
+    let list_stdout = String::from_utf8_lossy(&proxy_list.stdout);
+    assert!(proxy_list.status.success(), "stderr={list_stderr}");
+    assert!(list_stderr.contains(r#"Ignored "httpsProxy""#), "stderr={list_stderr}");
+    assert!(!list_stdout.contains("subpath") && !list_stderr.contains("subpath"));
+    assert!(list_stdout.contains(r#""shamefullyHoist": true"#), "stdout={list_stdout}");
+
+    let config_home = root.path().join("xdg-config");
+    fs::create_dir_all(config_home.join("pnpm")).expect("create global config directory");
+    fs::write(
+        config_home.join("pnpm/config.yaml"),
+        "{registry: https://example.invalid/${DEMO_REG_VAR}/}\n",
+    )
+    .expect("write global config.yaml");
+    let pnpm_home = root.path().join("pnpm-home");
+    fs::create_dir_all(&pnpm_home).expect("create pnpm home");
+    let global_out = pacquet_in(&workspace)
+        .with_env("XDG_CONFIG_HOME", &config_home)
+        .with_env("PNPM_HOME", &pnpm_home)
+        .with_env("DEMO_REG_VAR", "subpath")
+        .with_args(["config", "get", "registry", "--global"])
+        .output()
+        .expect("run global config get registry");
+    assert!(global_out.status.success(), "stderr={}", String::from_utf8_lossy(&global_out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&global_out.stdout).trim_end(),
+        "https://example.invalid/subpath/",
+    );
+
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "{include: {'./shared.yaml': [shamefullyHoist]}, userAgent: agent/${DEMO_UNSET_VAR}}\n",
+    )
+    .expect("write root include flow pnpm-workspace.yaml");
+    fs::write(workspace.join("shared.yaml"), "shamefullyHoist: true\n").expect("write shared.yaml");
+    let include_get = pacquet_in(&workspace)
+        .with_args(["config", "get", "shamefully-hoist"])
+        .output()
+        .expect("run config get shamefully-hoist with include");
+    assert!(
+        include_get.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&include_get.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&include_get.stdout).trim_end(), "true");
+
+    let include_list = pacquet_in(&workspace)
+        .with_args(["config", "list"])
+        .output()
+        .expect("run config list with include");
+    let include_list_stderr = String::from_utf8_lossy(&include_list.stderr);
+    let include_list_stdout = String::from_utf8_lossy(&include_list.stdout);
+    assert!(include_list.status.success(), "stderr={include_list_stderr}");
+    assert!(include_list_stderr.contains(r#"Ignored "userAgent""#), "stderr={include_list_stderr}");
+    assert!(
+        include_list_stdout.contains(r#""shamefullyHoist": true"#),
+        "stdout={include_list_stdout}",
+    );
+
+    fs::write(workspace.join("pnpm-workspace.yaml"), "include:\n  ./shared.yaml: [registry]\n")
+        .expect("write include registry pnpm-workspace.yaml");
+    fs::write(
+        workspace.join("shared.yaml"),
+        "{registry: https://example.invalid/${DEMO_REG_VAR}/}\n",
+    )
+    .expect("write flow registry shared.yaml");
+    let include_reg = pacquet_in(&workspace)
+        .with_env("DEMO_REG_VAR", "subpath")
+        .with_args(["config", "get", "registry"])
+        .output()
+        .expect("run config get registry with included flow placeholder");
+    let include_reg_stderr = String::from_utf8_lossy(&include_reg.stderr);
+    let include_reg_stdout = String::from_utf8_lossy(&include_reg.stdout);
+    assert!(
+        !include_reg.status.success(),
+        "stdout={include_reg_stdout}, stderr={include_reg_stderr}",
+    );
+    assert!(
+        include_reg_stderr.contains("ERR_PNPM_REGISTRY_ENV_NOT_EXPANDED"),
+        "stderr={include_reg_stderr}",
+    );
+    assert!(!include_reg_stdout.contains("subpath") && !include_reg_stderr.contains("subpath"));
+
+    drop(root);
+}
+
+#[test]
+fn global_tools_and_resolution_keys_round_trip_through_cli() {
+    let CommandTempCwd {
+        pacquet: _pacquet, root, workspace, ..
+    } = CommandTempCwd::init();
+    let config_home = root.path().join("xdg-config");
+    let pnpm_home = root.path().join("pnpm-home");
+
+    let run = |args: &[&str]| {
+        pacquet_in(&workspace)
+            .with_env("XDG_CONFIG_HOME", &config_home)
+            .with_env("PNPM_HOME", &pnpm_home)
+            .with_args(args)
+            .output()
+            .expect("run pnpm config")
+    };
+
+    let bad_tools = run(&["config", "set", "--global", "--json", "tools", r#"{"node":"22.0.0"}"#]);
+    assert!(!bad_tools.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_tools.stderr).contains("ERR_PNPM_CONFIG_SET_STRUCTURED_VALUE"),
+        "stderr={}",
+        String::from_utf8_lossy(&bad_tools.stderr),
+    );
+
+    let project_tools = run(&[
+        "config",
+        "set",
+        "--location=project",
+        "--json",
+        "tools",
+        r#"{"node":{"mirror":"https://mirror.example.com/node/download"}}"#,
+    ]);
+    assert!(!project_tools.status.success());
+    let project_stderr = String::from_utf8_lossy(&project_tools.stderr);
+    assert!(
+        project_stderr.contains("ERR_PNPM_CONFIG_SET_NOT_A_PROJECT_SETTING")
+            && project_stderr.contains("pnpm config set --global tools"),
+        "stderr={project_stderr}",
+    );
+
+    let set_tools = run(&[
+        "config",
+        "set",
+        "--global",
+        "--json",
+        "tools",
+        r#"{"node":{"mirror":"https://mirror.example.com/node/download"}}"#,
+    ]);
+    assert!(set_tools.status.success(), "stderr={}", String::from_utf8_lossy(&set_tools.stderr));
+
+    let get_tools = run(&["config", "get", "--global", "tools.node.mirror"]);
+    assert!(get_tools.status.success(), "stderr={}", String::from_utf8_lossy(&get_tools.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&get_tools.stdout).trim_end(),
+        "https://mirror.example.com/node/download",
+    );
+
+    for (key, value) in [
+        ("blockExoticSubdeps", "true"),
+        ("excludeLinksFromLockfile", "true"),
+        ("pm-on-fail", "ignore"),
+        ("runtime-on-fail", "error"),
+    ] {
+        let set_out = run(&["config", "set", "--global", key, value]);
+        assert!(set_out.status.success(), "stderr={}", String::from_utf8_lossy(&set_out.stderr));
+        let get_out = run(&["config", "get", "--global", key]);
+        assert!(get_out.status.success(), "stderr={}", String::from_utf8_lossy(&get_out.stderr));
+        assert_eq!(String::from_utf8_lossy(&get_out.stdout).trim_end(), value, "{key}");
+    }
+
+    drop(root);
+}
+
+#[test]
+fn camel_case_dotted_state_dir_supports_values_and_empty_reset_on_cli() {
+    let CommandTempCwd {
+        pacquet: _pacquet, root, workspace, ..
+    } = CommandTempCwd::init();
+    fs::write(workspace.join("pnpm-workspace.yaml"), "packages: []\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let custom = pacquet_in(&workspace)
+        .with_args(["--config.stateDir=custom-state", "config", "get", "state-dir"])
+        .output()
+        .expect("run pnpm config get state-dir with --config.stateDir");
+    assert!(custom.status.success(), "stderr={}", String::from_utf8_lossy(&custom.stderr));
+    assert_eq!(String::from_utf8_lossy(&custom.stdout).trim_end(), "custom-state");
+
+    for flag in ["--state-dir=", "--config.state-dir=", "--config.stateDir="] {
+        let reset = pacquet_in(&workspace)
+            .with_args([flag, "config", "get", "state-dir"])
+            .output()
+            .expect("run pnpm config get state-dir with empty state-dir override");
+        let stderr = String::from_utf8_lossy(&reset.stderr);
+        assert!(reset.status.success(), "{flag} stderr={stderr}");
+        assert_eq!(String::from_utf8_lossy(&reset.stdout).trim_end(), "", "{flag}");
+    }
 
     drop(root);
 }

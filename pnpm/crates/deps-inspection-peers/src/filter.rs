@@ -1,6 +1,17 @@
+use pnpm_config_parse_overrides::split_parent_selector;
+
 use super::{
-    BTreeMap, BadPeerIssue, HashMap, HashSet, IssuesByProjects, MissingPeerIssue,
-    PeerDependencyRules, PeerIssues, intersect_multiple_ranges, parse_wanted_dependency, satisfies,
+    BTreeMap,
+    BadPeerIssue,
+    HashMap,
+    HashSet,
+    IssuesByProjects,
+    MissingPeerIssue,
+    PeerDependencyRules,
+    PeerIssues,
+    intersect_multiple_ranges,
+    parse_wanted_dependency,
+    satisfies,
 };
 
 pub(super) fn merge_missing_peers(
@@ -125,7 +136,8 @@ fn is_version_allowed(
         .iter()
         .filter(|rule| parent_range_matches(rule, &declaring_parent.version))
         .filter_map(|rule| rule.peer_rules.get(peer_name))
-        .any(|ranges| ranges.iter().any(|range| satisfies(&issue.found_version, range)))
+        .map(|ranges| ranges.iter())
+        .any(|mut value| value.any(|range| satisfies(&issue.found_version, range)))
 }
 
 /// A rule with no parent range applies to every version of the parent.
@@ -138,7 +150,7 @@ type AllowAllMatcher = HashMap<String, Vec<String>>;
 type AllowByParentMatcher = HashMap<String, Vec<ParentRule>>;
 
 pub(super) struct ParentRule {
-    parent_range: Option<String>,
+    pub(super) parent_range: Option<String>,
     pub(super) peer_rules: HashMap<String, Vec<String>>,
 }
 
@@ -149,7 +161,7 @@ pub(super) fn parse_allowed_versions(
     let mut by_parent: AllowByParentMatcher = HashMap::new();
 
     for (selector, spec) in allowed {
-        if let Some((parent, target)) = selector.split_once('>') {
+        if let Some((parent, target)) = split_parent_selector(selector) {
             add_parent_rule(&mut by_parent, parent, target, spec);
         } else {
             let parsed = parse_wanted_dependency(selector);
@@ -190,6 +202,7 @@ fn add_parent_rule(by_parent: &mut AllowByParentMatcher, parent: &str, target: &
 
 fn split_ranges(spec: &str) -> Vec<String> {
     spec.split("||")
-        .map(|seg| seg.trim().to_string())
+        .map(str::trim)
+        .map(std::string::ToString::to_string)
         .collect()
 }

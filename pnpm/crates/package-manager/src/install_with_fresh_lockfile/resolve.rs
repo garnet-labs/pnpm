@@ -6,7 +6,10 @@
 //! by [`super::resolver_setup`].
 
 pub(super) use reuse::{
-    ReuseSeedInputs, lockfile_reuse_seed, preferred_versions_seeds, stale_override_targets,
+    ReuseSeedInputs,
+    lockfile_reuse_seed,
+    preferred_versions_seeds,
+    stale_override_targets,
 };
 
 mod reuse;
@@ -15,20 +18,30 @@ use super::InstallWithFreshLockfileError;
 use crate::VersionsOverrider;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_resolving_deps_resolver::{
-    DependencyOverrider, ResolveImporterError, ResolveImporterOptions,
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
 };
-use pnpm_resolving_resolver_base::{PreferredVersions, ResolveOptions, Resolver};
+use pnpm_resolving_deps_resolver::{
+    DependencyOverrider,
+    PeerDependentsDedupe,
+    ResolveImporterError,
+    ResolveImporterOptions,
+};
+use pnpm_resolving_resolver_base::{
+    PreferredVersions,
+    ResolveOptions,
+    Resolver,
+};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     path::Path,
     sync::Arc,
 };
 
 /// The [`ResolveOptions`] fields that are the same for every importer and
 /// for the fast-override pre-pass. Only the consuming project's directory
-/// and its preferred-versions seed vary — see [`Self::build`].
+/// and its preferred-versions seed vary; see [`Self::build`].
 pub(super) struct SharedResolveOptions<'a> {
     pub locked_package_policy: pnpm_resolving_resolver_base::LockedPackagePolicy,
     pub policy: pnpm_resolving_resolver_base::ResolutionPolicyOptions,
@@ -51,6 +64,7 @@ impl SharedResolveOptions<'_> {
             project: pnpm_resolving_resolver_base::ResolverProjectOptions {
                 project_dir,
                 lockfile_dir: self.lockfile_dir.to_path_buf(),
+                workspace_dir: self.config.workspace_dir.clone(),
                 workspace_packages: self.workspace_packages.clone(),
                 link_workspace_packages: self.config.link_workspace_packages,
                 inject_workspace_packages: self.config.inject_workspace_packages,
@@ -74,7 +88,12 @@ impl SharedResolveOptions<'_> {
                 published_by_exclude: self.policy.published_by_exclude.clone(),
                 trust_policy: self.policy.trust_policy,
                 trust_policy_exclude: self.policy.trust_policy_exclude.clone(),
-                trust_policy_ignore_after: self.config.trust_policy_ignore_after,
+                trust_policy_ignore_after: self.config.trust_policy_ignore_after.map(|minutes| {
+                    pnpm_resolving_resolver_base::TrustIgnoreAfter {
+                        minutes,
+                        now: self.config.reference_time,
+                    }
+                }),
                 package_version_guard: self.policy.package_version_guard.clone(),
                 block_exotic_subdeps: self.config.block_exotic_subdeps,
             },
@@ -97,7 +116,7 @@ pub(super) async fn warn_stale_convergence_overrides<Reporter: pnpm_reporter::Re
     parsed_overrides: &[pnpm_config_parse_overrides::VersionOverride],
     versions_overrider: &VersionsOverrider,
     lockfile_dir: &Path,
-    published_by: Option<chrono::DateTime<chrono::Utc>>,
+    published_by: Option<jiff::Timestamp>,
     published_by_exclude: Option<&pnpm_config::version_policy::PackageVersionPolicy>,
 ) {
     use crate::warn_on_stale_convergence_overrides as stale;
@@ -137,6 +156,8 @@ pub(super) struct ResolvePassInputs<'a> {
     pub dependency_groups: &'a [DependencyGroup],
     pub walk: WorkspaceWalk,
     pub per_importer: ImporterInputs<'a>,
+    /// See [`super::DeprecationCollector`].
+    pub deprecation_log: pnpm_resolving_deps_resolver::DeprecationLogFn,
 }
 
 /// What the workspace walk consumes as a whole: the hooks and the reuse
@@ -148,11 +169,8 @@ pub(super) struct WorkspaceWalk {
     /// [`WorkspaceResolveOptions::share_workspace_resolutions`](pnpm_resolving_deps_resolver::WorkspaceResolveOptions::share_workspace_resolutions).
     pub share_workspace_resolutions: bool,
     pub time_based: bool,
-    pub registries: HashMap<String, String>,
-    pub registries_by_prefix: HashMap<String, String>,
-    pub declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes,
-    /// See [`pnpm_lockfile::RegistryContext::locked_registries`].
-    pub locked_registries: Option<HashMap<String, String>>,
+    pub registry_context: pnpm_lockfile::RegistryContext,
+    pub parsed_overrides: Option<Arc<[pnpm_resolving_deps_resolver::OverrideEntry]>>,
 }
 
 /// What every importer's resolve reads, and the walk reads alongside.
@@ -203,12 +221,15 @@ impl ImporterInputs<'_> {
             base_opts: self.importer_base_opts(&importer.id, project_dir, preferred_versions),
             peers_suffix_max_length: self.peers_suffix_max_length(),
             peers: pnpm_resolving_deps_resolver::ImporterPeerOptions {
+                explicitly_requested_direct_dependencies: self.versions.requested_for_importer(
+                    &importer.id,
+                ),
                 auto_install_peers: self.config.auto_install_peers,
                 auto_install_peers_from_highest_match: self.config
                     .auto_install_peers_from_highest_match,
                 resolve_peers_from_workspace_root: self.config.resolve_peers_from_workspace_root,
                 dedupe_peers: self.config.dedupe_peers,
-                dedupe_peer_dependents: self.config.dedupe_peer_dependents,
+                dedupe_peer_dependents: peer_dependents_dedupe(self.config),
             },
             links: pnpm_resolving_deps_resolver::PeerLinkOptions {
                 modules_dir,
@@ -237,22 +258,17 @@ impl WorkspaceWalk {
     fn into_options<Reporter: pnpm_reporter::Reporter>(
         self,
         shared: &ImporterInputs<'_>,
+        deprecation_log: pnpm_resolving_deps_resolver::DeprecationLogFn,
     ) -> pnpm_resolving_deps_resolver::WorkspaceResolveOptions {
         let config = shared.config;
         pnpm_resolving_deps_resolver::WorkspaceResolveOptions {
-            registry_context: pnpm_lockfile::RegistryContext {
-                registries: self.registries,
-                registries_by_prefix: self.registries_by_prefix,
-                declared_prefixes: self.declared_prefixes,
-                registry_options_by_url: config.registry_options_by_url.clone(),
-                locked_registries: self.locked_registries,
-            },
+            registry_context: self.registry_context,
             share_workspace_resolutions: self.share_workspace_resolutions,
             allowed_deprecated_versions: config.allowed_deprecated_versions.clone(),
             peers: pnpm_resolving_deps_resolver::WorkspacePeerResolutionOptions {
                 dedupe_peers: config.dedupe_peers,
                 dedupe_injected_deps: config.dedupe_injected_deps,
-                dedupe_peer_dependents: config.dedupe_peer_dependents,
+                dedupe_peer_dependents: peer_dependents_dedupe(config),
                 resolve_peers_from_workspace_root: config.resolve_peers_from_workspace_root,
                 exclude_links_from_lockfile: config.exclude_links_from_lockfile,
                 lockfile_dir: shared.lockfile_dir.to_path_buf(),
@@ -263,18 +279,22 @@ impl WorkspaceWalk {
                 read_package_log: self.hooks.read_package_log,
                 skipped_optional_log: Some(super::skipped_optional_log_fn::<Reporter>()),
                 finalized_package: self.hooks.finalized_package,
-                deprecation_log: Some(super::deprecation_log_fn::<Reporter>()),
+                deprecation_log: Some(deprecation_log),
+                resolved_package: self.hooks.resolved_package,
                 manifests: pnpm_resolving_deps_resolver::ManifestTransformHooks {
                     manifest_hook: shared.hooks.manifest_hook.clone(),
                     overrides_hook: shared.hooks.overrides_hook.clone(),
                     pnpmfile_hook: self.hooks.pnpmfile,
                 },
+                max_snapshots: self.hooks.max_snapshots,
+                cancel: self.hooks.cancel,
             },
             reuse: self.reuse,
             version: pnpm_resolving_deps_resolver::WorkspaceVersionResolution {
                 pick_lowest_direct: shared.versions.pick_lowest,
                 time_based: self.time_based,
             },
+            parsed_overrides: self.parsed_overrides,
         }
     }
 }
@@ -285,30 +305,24 @@ pub(super) async fn run_dependency_pass<Reporter: pnpm_reporter::Reporter>(
     pnpm_resolving_deps_resolver::ResolvedWorkspaceDependencies,
     InstallWithFreshLockfileError,
 > {
-    let ResolvePassInputs {
-        resolver,
-        importer_manifests,
-        dependency_groups,
-        walk,
-        per_importer,
-    } = inputs;
-    let workspace_importers: Vec<pnpm_resolving_deps_resolver::WorkspaceImporter<'_>> =
-        importer_manifests
-            .iter()
-            .map(|(id, manifest)| pnpm_resolving_deps_resolver::WorkspaceImporter {
-                id: id.clone(),
-                manifest,
-            })
-            .collect();
-    let modules_basename = per_importer.config.modules_dir
+    let workspace_importers: Vec<pnpm_resolving_deps_resolver::WorkspaceImporter<'_>> = inputs
+        .importer_manifests
+        .iter()
+        .map(|(id, manifest)| pnpm_resolving_deps_resolver::WorkspaceImporter {
+            id: id.clone(),
+            manifest,
+        })
+        .collect();
+    let modules_basename = inputs.per_importer.config.modules_dir
         .file_name()
-        .map_or_else(|| std::ffi::OsString::from("node_modules"), std::ffi::OsStr::to_os_string);
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("node_modules"));
     pnpm_resolving_deps_resolver::resolve_workspace_dependencies(
-        resolver,
+        inputs.resolver,
         &workspace_importers,
-        dependency_groups,
-        walk.into_options::<Reporter>(&per_importer),
-        |importer| per_importer.resolve_importer_options(importer, &modules_basename),
+        inputs.dependency_groups,
+        inputs.walk.into_options::<Reporter>(&inputs.per_importer, inputs.deprecation_log),
+        |importer| inputs.per_importer.resolve_importer_options(importer, &modules_basename),
     )
     .await
     .map_err(resolve_error)
@@ -322,5 +336,16 @@ pub(super) fn resolve_error(err: ResolveImporterError) -> InstallWithFreshLockfi
         ResolveImporterError::RootDepManifest(err) => {
             InstallWithFreshLockfileError::RootDepManifest(err)
         }
+    }
+}
+
+/// The resolver's view of `dedupePeerDependents` and
+/// `projectScopedOptionalPeers`. With deduplication off, optional peers
+/// are project-scoped regardless of the second setting.
+fn peer_dependents_dedupe(config: &Config) -> PeerDependentsDedupe {
+    match (config.dedupe_peer_dependents, config.project_scoped_optional_peers) {
+        (false, _) => PeerDependentsDedupe::Off,
+        (true, false) => PeerDependentsDedupe::On,
+        (true, true) => PeerDependentsDedupe::OnWithProjectScopedOptionalPeers,
     }
 }

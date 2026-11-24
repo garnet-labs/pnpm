@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 use miette::Context;
 use node_semver::Version;
@@ -6,18 +9,27 @@ use pnpm_config::Config;
 use pnpm_engine_runtime_node_resolver::normalize_node_runtime_version_specifier;
 use pnpm_lockfile::EnvLockfile;
 use pnpm_lockfile_preferred_versions::get_version_selector_type;
+use pnpm_package_manager::updated_node_runtime_specifier;
 use pnpm_package_manifest::PackageManifest;
 use pnpm_registry::RangeSpecStyle;
 use pnpm_resolving_npm_resolver::calc_version_range;
 use pnpm_resolving_resolver_base::VersionSelectorType;
-use pnpm_tool_protocol::RUNTIME_PROTOCOL;
 use serde_json::Value;
 
-use super::{DeclaredEngineDep, EngineDepKind, PmDeclarationLocation};
+use super::{
+    DeclaredEngineDep,
+    EngineDepKind,
+    PmDeclarationLocation,
+};
 use crate::{
-    cli_args::package_manager::{
-        PinRoots, should_persist_package_manager_lockfile, version_satisfies,
-        wanted_package_manager,
+    cli_args::{
+        package_manager::{
+            PinRoots,
+            should_persist_package_manager_lockfile,
+            version_satisfies,
+            wanted_package_manager,
+        },
+        self_update::project_pin::write_engines_pnpm,
     },
     config_deps,
     engine_pm::channel::PackageManager,
@@ -105,21 +117,17 @@ fn compute_node_runtime_spec(
     if save_exact {
         return resolved_version.to_string();
     }
-    let selector = match requested {
-        Some(req)
-            if Version::parse(req).is_err()
-                && get_version_selector_type(req) != Some(VersionSelectorType::Tag) =>
-        {
-            req
-        }
-        _ => dep.raw_specifier.as_str(),
+    let Some(requested) = requested else {
+        return updated_node_runtime_specifier(&dep.raw_specifier, resolved_version);
     };
-    let prev_runtime = format!("{RUNTIME_PROTOCOL}{selector}");
-    normalize_node_runtime_version_specifier(
-        selector,
-        &resolved_version.to_string(),
-        Some(&prev_runtime),
-    )
+    let selector = if Version::parse(requested).is_err()
+        && get_version_selector_type(requested) != Some(VersionSelectorType::Tag)
+    {
+        requested
+    } else {
+        dep.raw_specifier.as_str()
+    };
+    normalize_node_runtime_version_specifier(selector, &resolved_version.to_string(), None)
 }
 
 pub(super) fn persist_manifest_engine_updates(
@@ -185,6 +193,9 @@ fn apply_engine_dep_update_to_value(
                 let exact_pm = format!("{}@{resolved_version}", pm.name());
                 changed |= set_string_field(manifest, "packageManager", &exact_pm);
             }
+            if pm == PackageManager::Pnpm {
+                changed |= write_engines_pnpm(manifest, &resolved_version.to_string());
+            }
         }
         EngineDepKind::Runtime { engines_field } => {
             if let Some(entry) =
@@ -211,13 +222,15 @@ fn find_engine_entry_mut<'a>(
             .find(|item| {
                 item.get("name")
                     .and_then(Value::as_str)
-                    .is_some_and(|name| name.trim().eq_ignore_ascii_case(target_name))
+                    .map(str::trim)
+                    .is_some_and(|trimmed| trimmed.eq_ignore_ascii_case(target_name))
             });
     }
     field
         .get("name")
         .and_then(Value::as_str)
-        .is_some_and(|name| name.trim().eq_ignore_ascii_case(target_name))
+        .map(str::trim)
+        .is_some_and(|trimmed| trimmed.eq_ignore_ascii_case(target_name))
         .then_some(field)
 }
 

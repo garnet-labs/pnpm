@@ -1,14 +1,74 @@
 //! The pnpmfile's `preResolution` hook.
 
 use super::{
-    super::{Arc, InstallError, Lockfile, Path, Reporter},
+    super::{
+        Arc,
+        InstallError,
+        Lockfile,
+        Path,
+        Reporter,
+    },
     InstallView,
+    Verification,
     lockfile_load::Loaded,
+    validate_frozen::PreparedFrozenRun,
     wanted::WantedLockfile,
     workspace::InstallWorkspace,
 };
-use pnpm_reporter::{HookLog, LogEvent, LogLevel};
+use pnpm_reporter::{
+    HookLog,
+    LogEvent,
+    LogLevel,
+};
 use serde_json::Value;
+
+pub(super) async fn apply_or_run_pre_resolution_hook<Reporter: self::Reporter>(
+    install: InstallView<'_>,
+    workspace: &InstallWorkspace<'_>,
+    loaded: &mut Loaded<'_>,
+    wanted: &mut WantedLockfile<'_>,
+    prepared_frozen: Option<&mut PreparedFrozenRun>,
+    verification: &mut Verification,
+) -> Result<(), InstallError> {
+    if let Some(pre_resolution) =
+        prepared_frozen.and_then(|prepared| prepared.pre_resolution.take())
+    {
+        if let Some(hooked_wanted) = pre_resolution.hooked_wanted {
+            wanted.set_hooked(hooked_wanted);
+        }
+        if let Some(hooked_current) = pre_resolution.hooked_current {
+            loaded.current = Some(hooked_current);
+        }
+    } else {
+        run_pre_resolution_hook::<Reporter>(install, workspace, loaded, wanted).await?;
+    }
+    verification.enrich_with_pnpmfile_hook(
+        wanted.get(),
+        install.context.config,
+        install.context.http_client,
+        loaded.pnpmfile_hook.as_deref(),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) async fn run_pre_resolution_hook_and_enrich<Reporter: self::Reporter>(
+    install: InstallView<'_>,
+    workspace: &InstallWorkspace<'_>,
+    (loaded, wanted): (&mut Loaded<'_>, &mut WantedLockfile<'_>),
+    verification: &mut Verification,
+) -> Result<Option<Lockfile>, InstallError> {
+    let hooked_current =
+        run_pre_resolution_hook::<Reporter>(install, workspace, loaded, wanted).await?;
+    verification.enrich_with_pnpmfile_hook(
+        wanted.get(),
+        install.context.config,
+        install.context.http_client,
+        loaded.pnpmfile_hook.as_deref(),
+    )
+    .await?;
+    Ok(hooked_current)
+}
 
 /// Run the `preResolution` hook on the settled lockfiles, before the install
 /// decides whether the wanted lockfile is up to date. The install continues
@@ -21,12 +81,12 @@ pub(super) async fn run_pre_resolution_hook<Reporter: self::Reporter>(
     workspace: &InstallWorkspace<'_>,
     loaded: &mut Loaded<'_>,
     wanted: &mut WantedLockfile<'_>,
-) -> Result<(), InstallError> {
-    let Some(hook) = loaded.pnpmfile_hook.clone() else { return Ok(()) };
+) -> Result<Option<Lockfile>, InstallError> {
+    let Some(hook) = loaded.pnpmfile_hook.clone() else { return Ok(None) };
     if install.lockfile_policy.ignore_manifest_check
         || !hook.has_pre_resolution().await.map_err(InstallError::PreResolutionHook)?
     {
-        return Ok(());
+        return Ok(None);
     }
     let config = install.context.config;
     let lockfile_dir = &workspace.dirs.workspace_root;
@@ -57,17 +117,19 @@ pub(super) async fn run_pre_resolution_hook<Reporter: self::Reporter>(
         wanted.set_hooked(parse_hooked_lockfile("wantedLockfile", hooked.wanted_lockfile)?);
     }
     if hooked.current_lockfile != current_json {
-        loaded.current = Some(parse_hooked_lockfile("currentLockfile", hooked.current_lockfile)?);
+        let parsed = parse_hooked_lockfile("currentLockfile", hooked.current_lockfile)?;
+        loaded.current = Some(parsed.clone());
+        return Ok(Some(parsed));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The hook sees a missing lockfile as `{}`.
 fn lockfile_json(lockfile: Option<&Lockfile>) -> Result<Value, InstallError> {
-    lockfile.map_or_else(
-        || Ok(Value::Object(serde_json::Map::new())),
-        |lockfile| serde_json::to_value(lockfile).map_err(InstallError::PreResolutionSerialize),
-    )
+    lockfile
+        .map(serde_json::to_value)
+        .map(|value| value.map_err(InstallError::PreResolutionSerialize))
+        .unwrap_or_else(|| Ok(Value::Object(serde_json::Map::new())))
 }
 
 fn parse_hooked_lockfile(field: &'static str, value: Value) -> Result<Lockfile, InstallError> {

@@ -1,46 +1,69 @@
 use super::{
-    ArtifactQuota, Config, Identity, LogFormat, LogLevel, Path, PathBuf, RegistryError, listen,
+    ArtifactQuota,
+    Config,
+    FeatureOverrides,
+    Identity,
+    LogFormat,
+    LogLevel,
+    Path,
+    PathBuf,
+    RegistryError,
+    listen,
     parse_log_yaml,
 };
 
 #[test]
-fn org_policies_distinguish_readers_and_publishers() {
+fn owner_policies_distinguish_readers_and_publishers() {
     let config = Config::from_yaml_str(
-        "artifacts:\n  enabled: true\n  orgs:\n    acme:\n      access: [ci, developer]\n      publish: ci\n    disabled:\n      access: []\n      publish: []\n",
+        "artifacts:\n  enabled: true\n  owners:\n    acme:\n      access: [ci, developer]\n      publish: ci\n    disabled:\n      access: []\n      publish: []\n",
         Path::new("/config"), listen(), None,
     ).unwrap();
-    let policy = &config.features.artifacts.orgs["acme"];
+    let policy = &config.features.artifacts.owners["acme"];
     assert!(policy.access.allows(&Identity::user("developer")), "developer must be able to read");
     assert!(!policy.publish.allows(&Identity::user("developer")), "developer must not publish");
     assert!(policy.publish.allows(&Identity::user("ci")), "CI must be able to publish");
     assert!(!policy.access.allows(&Identity::Anonymous), "anonymous reads must not be granted");
     assert!(
-        config.features.artifacts.orgs["disabled"].access.is_empty(),
+        config.features.artifacts.owners["disabled"].access.is_empty(),
         "empty access must deny reads",
     );
 }
 
 #[test]
-fn org_policies_reject_ambiguous_or_incomplete_declarations() {
+fn owner_policies_reject_ambiguous_or_incomplete_declarations() {
     for declaration in [
         "    '../acme': { access: ci, publish: ci }",
         "    acme: { access: ci }",
         "    acme: { access: 'ci developer', publish: ci }",
-        "    acme: { access: ci, publish: 'team:missing' }",
+        "    acme: { access: ci, publish: 'team:' }",
         "    acme: { access: ci, publish: ci, unexpected: true }",
     ] {
-        let yaml = format!("artifacts:\n  enabled: true\n  orgs:\n{declaration}\n");
+        let yaml = format!("artifacts:\n  enabled: true\n  owners:\n{declaration}\n");
         let result = Config::from_yaml_str(&yaml, Path::new("/config"), listen(), None);
         assert!(result.is_err(), "accepted {declaration:?}");
     }
 }
 
+/// An artifact owner is not a registry, so its name is not held to the
+/// registry name grammar.
 #[test]
-fn artifact_quota_is_configured_in_gib() {
+fn owner_names_may_break_the_registry_name_grammar() {
+    for owner in ["npm", "1st", "team+a"] {
+        let yaml = format!(
+            "artifacts:\n  enabled: true\n  owners:\n    {owner}: {{ access: ci, publish: ci }}\n",
+        );
+        let config = Config::from_yaml_str(&yaml, Path::new("/config"), listen(), None)
+            .unwrap_or_else(|err| panic!("rejected owner {owner}: {err}"));
+        assert!(config.features.artifacts.owners.contains_key(owner));
+    }
+}
+
+#[test]
+fn artifact_quota_is_configured_as_byte_sizes() {
     let config = Config::from_yaml_str("", Path::new("/config"), listen(), None).unwrap();
     assert_eq!(config.features.artifacts.quota, ArtifactQuota::default());
 
-    let yaml = "artifacts:\n  quota:\n    ownerGiB: 50\n    totalGiB: 500\n";
+    let yaml = "artifacts:\n  quota:\n    perOwner: 50GiB\n    total: 500GiB\n";
     let config = Config::from_yaml_str(yaml, Path::new("/config"), listen(), None).unwrap();
     let gib = 1024 * 1024 * 1024;
     assert_eq!(
@@ -48,7 +71,7 @@ fn artifact_quota_is_configured_in_gib() {
         ArtifactQuota { owner: 50 * gib, total: 500 * gib },
     );
 
-    for quota in ["ownerGiB: 0", "ownerGiB: 20\n    totalGiB: 10", "perOwner: 1"] {
+    for quota in ["perOwner: 0", "perOwner: 20GiB\n    total: 10GiB", "ownerGiB: 1"] {
         let yaml = format!("artifacts:\n  quota:\n    {quota}\n");
         let result = Config::from_yaml_str(&yaml, Path::new("/config"), listen(), None);
         assert!(result.is_err(), "accepted {quota:?}");
@@ -114,52 +137,54 @@ fn osv_config_defaults_off_and_resolves_relative_path() {
 #[test]
 fn sql_backend_rejects_zero_startup_timeout() {
     let yaml = "\
-storage: /var/lib/pnpr
-backend:
-  mysql:
+storage:
+  path: /var/lib/pnpr
+  database:
     url: mysql://pnpr:secret@db.example/pnpr
     startupTimeout: 0
 ";
     let err = Config::from_yaml_str(yaml, Path::new("/etc/pnpr"), listen(), None)
         .expect_err("zero startup timeout must not be accepted");
     assert!(
-        matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("backend.mysql.startupTimeout")),
-        "expected an InvalidConfig naming backend.mysql.startupTimeout, got {err:?}",
+        matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("storage.database.startupTimeout")),
+        "expected an InvalidConfig naming storage.database.startupTimeout, got {err:?}",
     );
+}
+
+#[test]
+fn sql_backend_names_the_setting_of_a_malformed_interval() {
+    let yaml = "\
+storage:
+  database:
+    url: postgres://pnpr:secret@db.example/pnpr
+    timeout: soon
+";
+    let err = Config::from_yaml_str(yaml, Path::new("/etc/pnpr"), listen(), None).unwrap_err();
+    assert!(err.to_string().contains("storage.database.timeout has an invalid interval"), "{err}");
 }
 
 #[test]
 fn sql_backend_rejects_zero_timeout() {
     let yaml = "\
-storage: /var/lib/pnpr
-backend:
-  postgres:
+storage:
+  path: /var/lib/pnpr
+  database:
     url: postgres://pnpr:secret@db.example/pnpr
     timeout: 0
 ";
     let err = Config::from_yaml_str(yaml, Path::new("/etc/pnpr"), listen(), None)
         .expect_err("zero timeout must not be accepted");
     assert!(
-        matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("backend.postgres.timeout")),
-        "expected an InvalidConfig naming backend.postgres.timeout, got {err:?}",
+        matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("storage.database.timeout")),
+        "expected an InvalidConfig naming storage.database.timeout, got {err:?}",
     );
 }
 
 #[test]
-fn log_unsupported_sink_type_is_recorded_but_flagged_unsupported() {
-    // `type: file` parses but is not a sink the server implements, so
-    // `sink_is_supported` is false and the binary warns at startup.
-    // Format/level still apply.
-    let yaml = "\
-storage: ./s
-log:
-  type: file
-  format: json
-";
-    let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    assert_eq!(config.logs.sink, "file");
-    assert!(!config.logs.sink_is_supported());
-    assert_eq!(config.logs.format, LogFormat::Json);
+fn log_type_is_rejected() {
+    let yaml = "storage: ./s\nlog:\n  type: stdout\n";
+    let err = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
+    assert!(err.to_string().contains("unknown field `type`"), "{err}");
 }
 
 #[test]
@@ -167,7 +192,6 @@ fn log_pretty_and_level_picked_from_singular_block() {
     let yaml = "\
 storage: ./s
 log:
-  type: stdout
   format: pretty
   level: warn
 ";
@@ -191,11 +215,10 @@ logs:
 
 #[test]
 fn log_missing_fields_fall_back_to_defaults() {
-    // Only `type:` is given. Format and level default individually.
+    // Format and level default individually.
     let yaml = "\
 storage: ./s
 log:
-  type: stdout
 ";
     let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
     assert_eq!(config.logs.format, LogFormat::Pretty);
@@ -205,7 +228,7 @@ log:
 #[test]
 fn log_level_filter_directives_are_valid() {
     // Each LogLevel must map to a directive string that
-    // `EnvFilter::new` accepts at runtime — guards against typos.
+    // `EnvFilter::new` accepts at runtime, guards against typos.
     for level in [
         LogLevel::Trace,
         LogLevel::Debug,
@@ -262,7 +285,7 @@ fn log_level_accepts_each_known_variant() {
 #[test]
 fn log_level_rejects_unknown_variant() {
     // `fatal` (pino has it) and `silly` (npm's logger had it)
-    // are not in our set — we want a hard error, not a silent
+    // are not in our set; we want a hard error, not a silent
     // fallback.
     assert!(parse_log_yaml::<LogLevel>("fatal").is_err());
     assert!(parse_log_yaml::<LogLevel>("silly").is_err());
@@ -281,7 +304,7 @@ fn a_scim_token_must_be_long_and_stays_out_of_debug_output() {
     let token = "a".repeat(crate::ScimConfig::MIN_TOKEN_LEN);
     let config = Config::from_yaml_str(&yaml(&token), Path::new("/x"), listen(), None).unwrap();
     let scim = config.identity.auth.scim.as_ref().expect("auth.scim is set");
-    assert_eq!(scim.token, token);
+    assert_eq!(scim.token.expose(), token);
     assert!(!format!("{scim:?}").contains(&token));
 }
 
@@ -379,10 +402,11 @@ fn trusted_proxies_parses_cidrs_and_loopback() {
     let yaml = "\
 storage: ./s
 trustedProxies:
-  - loopback
-  - 10.0.0.0/8
-  - 192.168.1.1
-trustedProxyHeader: forwarded
+  networks:
+    - loopback
+    - 10.0.0.0/8
+    - 192.168.1.1
+  header: forwarded
 ";
     let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
     assert_eq!(config.http.trusted_proxies.len(), 4);
@@ -411,6 +435,75 @@ fn request_timeout_defaults_and_overrides() {
         matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("requestTimeout")),
         "expected InvalidConfig with requestTimeout, got {err:?}",
     );
+}
+
+#[test]
+fn shutdown_timeout_defaults_and_overrides() {
+    let base_config =
+        Config::from_yaml_str("storage: ./s\n", Path::new("/x"), listen(), None).unwrap();
+    assert_eq!(base_config.http.shutdown_timeout, crate::HttpConfig::DEFAULT_SHUTDOWN_TIMEOUT);
+
+    let custom_yaml = "storage: ./s\nshutdownTimeout: 15s\n";
+    let custom_config =
+        Config::from_yaml_str(custom_yaml, Path::new("/x"), listen(), None).unwrap();
+    assert_eq!(custom_config.http.shutdown_timeout, std::time::Duration::from_secs(15));
+
+    let zero_yaml = "storage: ./s\nshutdownTimeout: 0\n";
+    let zero_err = Config::from_yaml_str(zero_yaml, Path::new("/x"), listen(), None).unwrap_err();
+    assert!(
+        matches!(zero_err, RegistryError::InvalidConfig { ref reason } if reason.contains("shutdownTimeout")),
+        "expected InvalidConfig naming shutdownTimeout, got {zero_err:?}",
+    );
+
+    let invalid_yaml = "storage: ./s\nshutdownTimeout: invalid_val\n";
+    let err = Config::from_yaml_str(invalid_yaml, Path::new("/x"), listen(), None).unwrap_err();
+    assert!(
+        matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("shutdownTimeout")),
+        "expected InvalidConfig with shutdownTimeout, got {err:?}",
+    );
+}
+
+#[test]
+fn packument_ttl_rejects_an_invalid_interval() {
+    let yaml = "storage: ./s\npackumentTtl: forever\n";
+    let err = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
+    assert!(
+        matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("packumentTtl")),
+        "expected InvalidConfig naming packumentTtl, got {err:?}",
+    );
+}
+
+#[test]
+fn max_tarball_size_defaults_to_100_mib() {
+    let config = Config::from_yaml_str("storage: ./s\n", Path::new("/x"), listen(), None).unwrap();
+    assert_eq!(config.http.max_tarball_bytes, crate::HttpConfig::DEFAULT_MAX_TARBALL_BYTES);
+    assert_eq!(config.http.max_tarball_bytes, 100 * 1024 * 1024);
+}
+
+#[test]
+fn max_tarball_size_accepts_a_byte_size_or_a_byte_count() {
+    let sized = "storage: ./s\nmaxTarballSize: 512MiB\n";
+    let config = Config::from_yaml_str(sized, Path::new("/x"), listen(), None).unwrap();
+    assert_eq!(config.http.max_tarball_bytes, 512 * 1024 * 1024);
+
+    let counted = "storage: ./s\nmaxTarballSize: 120000000\n";
+    let config = Config::from_yaml_str(counted, Path::new("/x"), listen(), None).unwrap();
+    assert_eq!(config.http.max_tarball_bytes, 120_000_000);
+}
+
+#[test]
+fn max_tarball_size_rejects_an_invalid_size_and_zero() {
+    for yaml in [
+        "storage: ./s\nmaxTarballSize: huge\n",
+        "storage: ./s\nmaxTarballSize: 0\n",
+        "storage: ./s\nmaxTarballSize: \"18446744073709551616\"\n",
+    ] {
+        let err = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
+        assert!(
+            matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("maxTarballSize")),
+            "expected InvalidConfig naming maxTarballSize for {yaml:?}, got {err:?}",
+        );
+    }
 }
 
 #[test]
@@ -486,4 +579,90 @@ fn release_records_read_the_statement_signing_key() {
     let signer = config.release_records.statement_signing_key.clone().unwrap();
     assert_eq!(signer.verifier_key().key_name(), "PeterNeumann+c74f20a3");
     assert!(!format!("{:?}", config.release_records).contains("AYEKFALV"));
+}
+
+#[test]
+fn gc_lease_defaults_to_an_hour() {
+    let config = Config::from_yaml_str("", Path::new("/config"), listen(), None).unwrap();
+    assert_eq!(config.gc, crate::GcConfig::default());
+    assert_eq!(config.gc.lease, std::time::Duration::from_hours(1));
+
+    let config = Config::from_yaml_str("gc: {}\n", Path::new("/config"), listen(), None).unwrap();
+    assert_eq!(config.gc.lease, crate::GcConfig::DEFAULT_LEASE);
+}
+
+#[test]
+fn gc_lease_reads_an_interval() {
+    let config =
+        Config::from_yaml_str("gc:\n  lease: 30m\n", Path::new("/config"), listen(), None).unwrap();
+    assert_eq!(config.gc.lease, std::time::Duration::from_mins(30));
+}
+
+#[test]
+fn gc_lease_must_be_positive() {
+    for yaml in ["gc:\n  lease: 0s\n", "gc:\n  lease: 0\n", "gc:\n  lease: soon\n"] {
+        let err = Config::from_yaml_str(yaml, Path::new("/config"), listen(), None).unwrap_err();
+        assert!(
+            matches!(err, RegistryError::InvalidConfig { ref reason } if reason.contains("gc.lease")),
+            "{yaml:?}: {err:?}",
+        );
+    }
+}
+
+#[test]
+fn gc_refuses_unknown_keys() {
+    let result = Config::from_yaml_str("gc:\n  leese: 1h\n", Path::new("/config"), listen(), None);
+    assert!(matches!(result, Err(RegistryError::InvalidConfig { .. })), "{result:?}");
+}
+
+#[test]
+fn cloudflare_cdn_validates_identifiers_and_redacts_credentials() {
+    let yaml = "cloudflareCdn:\n  zoneId: '0123456789abcdef0123456789abcdef'\n  apiToken: secret-token\n  cacheTag: example-registry\n";
+    let config = Config::from_yaml_str(yaml, Path::new("/config"), listen(), None).unwrap();
+    let cdn = config.http.cloudflare_cdn.unwrap();
+    assert_eq!(cdn.cache_tag, "example-registry");
+    assert!(!format!("{cdn:?}").contains("secret-token"));
+    for invalid in [
+        yaml.replace("example-registry", "bad,tag"),
+        yaml.replace("secret-token", "'bad token'"),
+        yaml.replace("0123456789abcdef0123456789abcdef", "../other"),
+    ] {
+        assert!(Config::from_yaml_str(&invalid, Path::new("/config"), listen(), None).is_err());
+    }
+}
+
+#[test]
+fn listen_and_public_url_come_from_the_file_unless_overridden() {
+    let yaml = "listen: 0.0.0.0:4873\npublicUrl: https://registry.example.com\n";
+    let config = Config::from_yaml_str_with_overrides(
+        yaml,
+        Path::new("/x"),
+        None,
+        None,
+        FeatureOverrides::default(),
+    )
+    .unwrap();
+    assert_eq!(config.http.listen, "0.0.0.0:4873".parse().unwrap());
+    assert_eq!(config.http.public_url, "https://registry.example.com");
+
+    let overridden = Config::from_yaml_str(
+        yaml,
+        Path::new("/x"),
+        listen(),
+        Some("https://override.example.com".to_string()),
+    )
+    .unwrap();
+    assert_eq!(overridden.http.listen, listen());
+    assert_eq!(overridden.http.public_url, "https://override.example.com");
+
+    let defaults = Config::from_yaml_str_with_overrides(
+        "{}",
+        Path::new("/x"),
+        None,
+        None,
+        FeatureOverrides::default(),
+    )
+    .unwrap();
+    assert_eq!(defaults.http.listen.to_string(), Config::DEFAULT_LISTEN);
+    assert_eq!(defaults.http.public_url, format!("http://{}", Config::DEFAULT_LISTEN));
 }

@@ -6,8 +6,8 @@
 //! entries for them to work with, so it is edited here instead: the
 //! collection is rebuilt from its own entry texts with one entry inserted,
 //! replaced, or dropped. Every untouched entry keeps its text (and so its
-//! quoting), and everything outside the brackets — indentation, a trailing
-//! comment — stays verbatim, which is what the TypeScript writer's yaml
+//! quoting), and everything outside the brackets (indentation, a trailing
+//! comment) stays verbatim, which is what the TypeScript writer's yaml
 //! library emits for the same edit.
 //!
 //! Only collections written on one line are edited. A flow collection
@@ -109,7 +109,7 @@ pub(crate) fn upsert(text: &str, collection: &Collection, key: &str, value_text:
             .expect("key is in the order");
         entries.insert(position, format!("{}: {value_text}", crate::render::render_value(key)));
     }
-    splice(text, collection, &entries)
+    splice(text.to_owned(), collection, &entries)
 }
 
 /// Drop the entries whose key is in `keys` and return the document with the
@@ -124,12 +124,12 @@ pub(crate) fn remove_keys(text: &str, collection: &Collection, keys: &[String]) 
         })
         .map(|entry| text[entry.span.clone()].to_string())
         .collect();
-    splice(text, collection, &entries)
+    splice(text.to_owned(), collection, &entries)
 }
 
 /// Replace a flow sequence's items wholesale and return the document with
 /// the rebuilt collection spliced in. `items` are already-rendered YAML.
-pub(crate) fn set_items(text: &str, collection: &Collection, items: &[String]) -> String {
+pub(crate) fn set_items(text: String, collection: &Collection, items: &[String]) -> String {
     splice(text, collection, items)
 }
 
@@ -154,11 +154,10 @@ fn render(kind: Kind, entries: &[String]) -> String {
 
 /// Render `entries` into `collection`'s brackets and splice the result over
 /// the original collection text.
-fn splice(text: &str, collection: &Collection, entries: &[String]) -> String {
+fn splice(mut text: String, collection: &Collection, entries: &[String]) -> String {
     let rendered = render(collection.kind, entries);
-    let mut out = text.to_string();
-    out.replace_range(collection.span.clone(), &rendered);
-    out
+    text.replace_range(collection.span.clone(), &rendered);
+    text
 }
 
 /// Byte offset of the bracket closing the collection that opens at `open`,
@@ -186,7 +185,8 @@ pub(crate) fn closing_bracket_across_lines(text: &str, open: usize) -> Option<us
             b'#' if idx > open && bytes[idx - 1].is_ascii_whitespace() => {
                 idx = text[idx..]
                     .find('\n')
-                    .map_or(bytes.len(), |offset| idx + offset + 1);
+                    .map(|offset| idx + offset + 1)
+                    .unwrap_or(bytes.len());
             }
             b'{' | b'[' => {
                 depth += 1;

@@ -3,9 +3,9 @@
 //! `<base>/<name>/<version>+r<revision>/evidence`
 //! ([release records](https://github.com/pnpm/rfcs/blob/92d2b281af321ecf8f1e5fea63f698716ba4e9e7/pnpr/text/0000-release-records.md#client-protocol)).
 //!
-//! A registry address serves the log of the one hosted organization it
+//! A registry address serves the log of the one hosted namespace it
 //! reaches. Its checkpoint and hash tiles are read by anyone who may read a
-//! package of that organization, for consistency checks. Its entry bundles
+//! package of that namespace, for consistency checks. Its entry bundles
 //! name every logged package, so only a caller who may read every package
 //! the log holds gets them; anyone else gets the same not-found for every
 //! bundle, whatever it holds. A record's reader gets the record's own entry,
@@ -13,24 +13,55 @@
 //! the registry's statements about the record.
 
 use super::{
-    AppState, AuthedCaller, Ecosystem, Identity, RegistrySource, Response, StatusCode,
-    TargetRegistry, addressed_registry, caller_scoped, hosted_read_namespace, not_found,
-    private_no_cache, resolve_registry_source,
+    AppState,
+    AuthedCaller,
+    Ecosystem,
+    Identity,
+    RegistrySource,
+    Response,
+    StatusCode,
+    TargetRegistry,
+    addressed_registry,
+    caller_scoped,
+    hosted_read_namespace,
+    not_found,
+    private_no_cache,
+    resolve_registry_source,
 };
 use axum::{
     body::Body,
-    extract::{Path, State},
-    http::{HeaderValue, header},
+    extract::{
+        Path,
+        State,
+    },
+    http::{
+        HeaderValue,
+        header,
+    },
     response::IntoResponse,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use pnpm_release_record::{AcceptancePredicate, Envelope, PredicateType, Statement, StoredRecord};
+use base64::{
+    Engine as _,
+    engine::general_purpose::STANDARD,
+};
+use pnpm_release_record::{
+    AcceptancePredicate,
+    Envelope,
+    PredicateType,
+    Statement,
+    StoredRecord,
+};
 use pnpm_transparency_log::TilePath;
-use pnpr_config::HostedConfig;
 use pnpr_package_name::CanonicalPackageName;
-use pnpr_storage::transparency_log::{InclusionProof, LogId};
+use pnpr_storage::transparency_log::{
+    InclusionProof,
+    LogId,
+};
 use serde_json::json;
 use std::time::Duration;
+
+mod readers;
+use readers::LogReaders;
 
 /// How long a read of a record's evidence waits for the record's entry to
 /// be integrated before it answers that the proof is pending.
@@ -57,15 +88,15 @@ pub(super) async fn get_log_resource(
     let readers = LogReaders::of(&state, &log, &identity);
     let anyone = LogReaders::of(&state, &log, &Identity::Anonymous);
     if !readers.may_read_some {
-        return not_found();
+        return private_no_cache(not_found());
     }
     let (response, public) = if resource == "checkpoint" {
         (serve_checkpoint(&state, &log).await, anyone.may_read_some)
     } else {
         match resource.parse::<TilePath>() {
             Ok(TilePath::Entries { .. }) if !readers.may_read_all => (not_found(), false),
-            Ok(path @ TilePath::Entries { .. }) => {
-                (serve_tile(&state, &log, path).await, anyone.may_read_all)
+            Ok(TilePath::Entries { index, width }) => {
+                (serve_entry_bundle(&state, &log, index, width).await, anyone.may_read_all)
             }
             Ok(path) => (serve_tile(&state, &log, path).await, anyone.may_read_some),
             Err(_) => (not_found(), false),
@@ -73,6 +104,14 @@ pub(super) async fn get_log_resource(
     };
     // A named registry's responses are always caller-scoped.
     if public && registry.is_none() { response } else { private_no_cache(response) }
+}
+
+async fn serve_entry_bundle(state: &AppState, log: &LogId, index: u64, width: u32) -> Response {
+    match readers::log_still_claimed(state, log, index, width).await {
+        Ok(true) => serve_tile(state, log, TilePath::Entries { index, width }).await,
+        Ok(false) => private_no_cache(not_found()),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn serve_checkpoint(state: &AppState, log: &LogId) -> Response {
@@ -116,59 +155,22 @@ fn bytes_response(body: Vec<u8>, content_type: &'static str) -> Response {
 }
 
 /// The log a registry address serves: the npm log of the one hosted
-/// organization the addressed registry reaches. A registry that reaches
+/// namespace the addressed registry reaches. A registry that reaches
 /// none, or several, has no log.
 fn registry_log(state: &AppState, registry: Option<&str>) -> Option<LogId> {
     let target = addressed_registry(state, registry, Ecosystem::Npm)?;
-    let routing = &state.inner.config.routing;
-    let mut orgs = routing.registries
+    let routing = state.routing();
+    let mut namespaces = routing.registries
         .sources(&target, Ecosystem::Npm)
         .into_iter()
         .filter_map(|source| routing.hosted.get(source))
-        .map(|hosted| hosted.org.as_str());
-    let org = orgs.next()?;
-    if orgs.any(|other| other != org) {
+        .map(|hosted| hosted.namespace.as_str());
+    let namespace = namespaces.next()?;
+    if namespaces.any(|other| other != namespace) {
         return None;
     }
     state.inner.config.release_records.log_signing_key.as_ref()?;
-    Some(LogId { catalog: org.to_string(), ecosystem: Ecosystem::Npm })
-}
-
-/// What one caller may read of a log.
-struct LogReaders {
-    /// The caller may read some package the log holds.
-    may_read_some: bool,
-    /// The caller may read every package the log holds.
-    may_read_all: bool,
-}
-
-impl LogReaders {
-    /// What `identity` may read of `log`, by the rules of every hosted
-    /// registry of its organization.
-    fn of(state: &AppState, log: &LogId, identity: &Identity) -> Self {
-        let hosted: Vec<&HostedConfig> = state.inner.config.routing.hosted
-            .iter()
-            .filter(|(name, hosted)| {
-                hosted.org == log.catalog
-                    && state.inner.config.routing.registries.ecosystem(name) == Some(log.ecosystem)
-            })
-            .map(|(_, hosted)| hosted)
-            .collect();
-        let is_admin = identity
-            .username()
-            .is_some_and(|username| state.inner.config.identity.admins.contains(username));
-        // No registry's rules admit anyone to a log no registry holds.
-        let may_read_all = is_admin
-            || (!hosted.is_empty()
-                && hosted
-                    .iter()
-                    .all(|hosted| hosted.rules.snapshot().all_access_admit(identity)));
-        let may_read_some = may_read_all
-            || hosted
-                .iter()
-                .any(|hosted| hosted.rules.snapshot().any_access_admits(identity));
-        Self { may_read_some, may_read_all }
-    }
+    Some(LogId { namespace: namespace.to_string(), ecosystem: Ecosystem::Npm })
 }
 
 /// `GET <base>/<name>/<version>+r<revision>/evidence`: the record's digest
@@ -197,7 +199,7 @@ async fn record_evidence(
         Ok(logged) => logged,
         Err(response) => return response,
     };
-    let log = LogId { catalog: logged.org.clone(), ecosystem: Ecosystem::Npm };
+    let log = LogId { namespace: logged.namespace.clone(), ecosystem: Ecosystem::Npm };
     let inclusion = match wait_for_inclusion(state, &log, logged.index).await {
         Ok(Some(inclusion)) => inclusion,
         Ok(None) => return proof_pending(),
@@ -211,7 +213,7 @@ async fn record_evidence(
         Ok(None) => return retry_later("the record's metadata is changing; retry"),
         Err(err) => return err.into_response(),
     };
-    match sigstore_bundle(state, &logged.org, &logged.name, &logged.version).await {
+    match sigstore_bundle(state, &logged.namespace, &logged.name, &logged.version).await {
         Ok(sigstore) => evidence_response(&logged.digest, &inclusion, &statements, sigstore),
         Err(err) => err.into_response(),
     }
@@ -232,7 +234,7 @@ async fn registry_statements(
     let Some(key) = state.inner.config.release_records.statement_signing_key.as_ref() else {
         return Ok(Some(Vec::new()));
     };
-    let bytes = super::hosted_storage(state, Some(&logged.org))
+    let bytes = super::hosted_storage(state, Some(&logged.namespace))
         .read_release_record(&logged.name, &logged.version, 0)
         .await?;
     let Some(bytes) = bytes else { return Ok(None) };
@@ -252,7 +254,7 @@ async fn registry_statements(
 
 /// A logged release record of a hosted version.
 struct LoggedRecord {
-    org: String,
+    namespace: String,
     name: CanonicalPackageName,
     version: String,
     /// The index of its log entry.
@@ -278,7 +280,7 @@ async fn logged_record(
     else {
         return Err(not_found());
     };
-    let org = hosted_read_namespace(state, identity, &source, name.as_str())
+    let namespace = hosted_read_namespace(state, identity, &source, name.as_str())
         .map_err(IntoResponse::into_response)?;
     if super::ensure_osv_allowed(state, &name, version).is_err() {
         return Err(not_found());
@@ -286,10 +288,10 @@ async fn logged_record(
     if state.inner.config.release_records.log_signing_key.is_none() {
         return Err(not_found());
     }
-    let database = state.inner.storage.sql_metadata();
-    let entry = database.release_record_entry(&name, &org, version).await;
+    let database = state.inner.storage.sql_database();
+    let entry = database.release_record_entry(&name, &namespace, version).await;
     let (index, digest) = entry.map_err(IntoResponse::into_response)?.ok_or_else(not_found)?;
-    Ok(LoggedRecord { org, name, version: version.to_string(), index, digest })
+    Ok(LoggedRecord { namespace, name, version: version.to_string(), index, digest })
 }
 
 /// The inclusion proof of entry `index`, waiting a bounded time for an
@@ -324,8 +326,7 @@ fn proof_pending() -> Response {
 
 /// A `503` the client retries after a second.
 fn retry_later(reason: &'static str) -> Response {
-    let mut response =
-        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({ "error": reason }))).into_response();
+    let mut response = pnpr_error::json_error(StatusCode::SERVICE_UNAVAILABLE, reason, None);
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -335,18 +336,19 @@ fn retry_later(reason: &'static str) -> Response {
 /// The Sigstore bundle published with `version`, as it was published.
 async fn sigstore_bundle(
     state: &AppState,
-    org: &str,
+    namespace: &str,
     name: &CanonicalPackageName,
     version: &str,
 ) -> pnpr_error::Result<Option<serde_json::Value>> {
     let filename = name.sigstore_name_for_version(version);
     let Some((body, _)) =
-        super::hosted_storage(state, Some(org)).open_hosted_blob(name, &filename).await?
+        super::hosted_storage(state, Some(namespace)).open_hosted_blob(name, &filename).await?
     else {
         return Ok(None);
     };
     let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await
-        .map_err(|err| pnpr_error::RegistryError::Io(std::io::Error::other(err)))?;
+        .map_err(std::io::Error::other)
+        .map_err(pnpr_error::RegistryError::Io)?;
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 

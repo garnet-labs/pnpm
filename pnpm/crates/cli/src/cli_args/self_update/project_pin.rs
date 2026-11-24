@@ -1,12 +1,28 @@
 use super::{
-    Config, Context, EnvLockfile, PackageManifest, Path, Value, infer_range_spec_style,
-    range_satisfies, version_lt,
+    Config,
+    Context,
+    EnvLockfile,
+    PackageManifest,
+    Path,
+    Value,
+    infer_range_spec_style,
+    version_lt,
 };
 use crate::{
     cli_args::{
-        package_manager::{PinRoots, WantedPackageManager, wanted_package_manager},
+        package_manager::{
+            PinRoots,
+            WantedPackageManager,
+            version_satisfies,
+            wanted_package_manager,
+        },
         pre_command::{
-            Invocation, PinDecision, PinInput, SwitchProcessState, decide, read_pin_lockfile,
+            Invocation,
+            PinDecision,
+            PinInput,
+            SwitchProcessState,
+            decide,
+            read_pin_lockfile,
         },
     },
     config_deps,
@@ -133,6 +149,12 @@ pub(super) async fn update_project_pin(
     target_version: &str,
 ) -> miette::Result<String> {
     if pm.version.as_deref() == Some(target_version) {
+        if write_engines_pnpm(manifest.value_mut(), target_version) {
+            manifest
+                .save()
+                .map_err(miette::Report::new)
+                .wrap_err("write the project manifest")?;
+        }
         return Ok(format!("The current project is already set to use pnpm v{target_version}"));
     }
 
@@ -199,6 +221,7 @@ fn write_updated_manifest_pin(
             "packageManager".to_string(),
             Value::String(format!("pnpm@{target_version}")),
         );
+        write_engines_pnpm(manifest.value_mut(), target_version);
         manifest
             .save()
             .map_err(miette::Report::new)
@@ -237,6 +260,7 @@ fn write_dev_engines_pin(
         let new_legacy = format!("pnpm@{target_version}");
         changed |= insert_string_if_changed(manifest.value_mut(), "packageManager", &new_legacy);
     }
+    changed |= write_engines_pnpm(manifest.value_mut(), target_version);
     if changed {
         manifest
             .save()
@@ -244,6 +268,26 @@ fn write_dev_engines_pin(
             .wrap_err("write the project manifest")?;
     }
     Ok(pin_specifier)
+}
+
+/// Rewrite the manifest's `engines.pnpm` with [`update_version_constraint`] and
+/// report whether that changed the manifest. A range that already accepts
+/// `target_version`, such as `*` or `^12.2`, stays as is unless it names a full
+/// version, bare or after `^`, `~`, or `=`.
+pub(crate) fn write_engines_pnpm(manifest: &mut Value, target_version: &str) -> bool {
+    let Some(engines) = manifest.get_mut("engines") else {
+        return false;
+    };
+    let Some(current) = engines.get("pnpm").and_then(Value::as_str) else {
+        return false;
+    };
+    let names_full_version =
+        node_semver::Version::parse(current.trim_start_matches(['^', '~', '='])).is_ok();
+    if !names_full_version && version_satisfies(target_version, current) {
+        return false;
+    }
+    let updated = update_version_constraint(Some(current), target_version);
+    insert_string_if_changed(engines, "pnpm", &updated)
 }
 
 /// Set `key` to `value`, reporting whether that changed the object.
@@ -275,9 +319,9 @@ fn dev_engines_pnpm_entry_mut(manifest: &mut Value) -> Option<&mut Value> {
 /// The specifier to record in `packageManagerDependencies` after
 /// `self-update` rewrites the `devEngines.packageManager` pin. It must equal
 /// the constraint a later install reads back from the manifest (see
-/// [`super::super::package_manager::package_manager_to_sync_for_version`]) — the updated
+/// [`super::super::package_manager::package_manager_to_sync_for_version`]) (the updated
 /// devEngines constraint, never the CLI dist-tag or range passed to
-/// `self-update` — so a subsequent `--frozen-lockfile` install does not
+/// `self-update`) so a subsequent `--frozen-lockfile` install does not
 /// reject the lockfile as outdated. A legacy `packageManager` pin is always
 /// exact, so it takes the resolved version directly.
 pub(super) fn package_manager_pin_specifier(
@@ -298,13 +342,13 @@ pub(super) fn package_manager_pin_specifier(
 /// Complex ranges that still satisfy the new version are left as-is (the
 /// lockfile pins the exact version); otherwise the new version is written
 /// as a caret range.
-pub(super) fn update_version_constraint(current: Option<&str>, new_version: &str) -> String {
+pub(crate) fn update_version_constraint(current: Option<&str>, new_version: &str) -> String {
     let Some(current) = current else {
         return new_version.to_string();
     };
     match infer_range_spec_style(current) {
         Some(pinned) => format!("{}{new_version}", pinned.range_prefix()),
-        None if range_satisfies(current, new_version) => current.to_string(),
+        None if version_satisfies(new_version, current) => current.to_string(),
         None => format!("^{new_version}"),
     }
 }

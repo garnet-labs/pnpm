@@ -1,7 +1,27 @@
 use super::{
-    Action, AppState, Body, Ecosystem, FetchOutcome, HashSet, HostedGate, Identity, Registry,
-    RegistryError, RegistrySource, Response, StatusCode, Storage, Upstream, Value, authorize,
-    default_registry_target, header, hosted_gate, json, now_iso, resolve_ecosystem_source,
+    Action,
+    AppState,
+    Body,
+    Ecosystem,
+    FetchOutcome,
+    HashSet,
+    HostedGate,
+    Identity,
+    Registry,
+    RegistryError,
+    RegistrySource,
+    Response,
+    StatusCode,
+    Storage,
+    Upstream,
+    Value,
+    authorize,
+    default_registry_target,
+    header,
+    hosted_gate,
+    json,
+    now_iso,
+    resolve_ecosystem_source,
     resolve_registry_source,
 };
 use axum::response::IntoResponse;
@@ -33,13 +53,9 @@ impl<Item> SearchPage<Item> {
 
     pub(super) fn push_name(&mut self, name: &str) -> bool {
         let position = self.names.len();
-        if self.names.insert(name.to_string())
+        self.names.insert(name.to_string())
             && position >= self.from
             && position < self.from.saturating_add(self.size)
-        {
-            return true;
-        }
-        false
     }
 
     pub(super) fn total(&self) -> usize {
@@ -114,7 +130,7 @@ impl UpstreamSearchBudget {
     }
 }
 
-/// `GET /-/v1/search?text=...&from=...&size=...` — npm search v1 endpoint.
+/// `GET /-/v1/search?text=...&from=...&size=...`: npm search v1 endpoint.
 /// Hosted results are counted after routing and access filters, then optional
 /// upstream results are appended in registry-source order. An upstream only
 /// participates when its `search` setting is enabled, and only within the
@@ -199,8 +215,10 @@ pub(super) async fn append_hosted_search(
         return Ok(());
     };
     for name in names {
-        if page.push_name(&name) {
-            page.objects.push(pnpr_search::local_search_entry(&storage, &name).await);
+        if page.push_name(&name)
+            && let Some(entry) = pnpr_search::local_search_entry(&storage, &name).await
+        {
+            page.objects.push(entry);
         }
     }
     Ok(())
@@ -224,13 +242,14 @@ pub(super) async fn append_upstream_source(
     page: &mut SearchPage<Value>,
     budget: &mut UpstreamSearchBudget,
 ) -> Result<(), RegistryError> {
-    let Some(config) = state.inner.config.routing.upstreams.get(search.source) else {
+    let routing = state.routing();
+    let Some(config) = routing.upstreams.get(search.source) else {
         return Ok(());
     };
     if search.browse || !config.search || !upstream_search_admits(config, identity) {
         return Ok(());
     }
-    let Some(upstream) = state.inner.proxy.upstreams.get(search.source) else {
+    let Some(upstream) = routing.upstream_clients.get(search.source) else {
         return Ok(());
     };
     let context = UpstreamSearchContext {
@@ -244,15 +263,14 @@ pub(super) async fn append_upstream_source(
     append_upstream_search(context, page, budget).await
 }
 
-/// Whether an upstream's own gates admit this caller to its search.
+/// Whether an upstream's own gates admit this caller to its search, which
+/// asks the origin: the caller reads every package and may have it fetched.
 pub(super) fn upstream_search_admits(
     config: &pnpr_config::UpstreamConfig,
     identity: &Identity,
 ) -> bool {
-    config.access
-        .as_ref()
-        .is_none_or(|access| access.allows(identity))
-        && config.rules.all_access_admit(identity)
+    config.rules.all_access_admit(identity)
+        && config.rules.any_admits(pnpr_policy::Action::Cache, identity)
 }
 
 /// The hosted names one discovery source contributes to a search, beside the
@@ -267,13 +285,14 @@ pub(super) async fn hosted_search_names(
     ecosystem: Ecosystem,
     text: &pnpr_search::SearchText,
 ) -> Result<Option<(Storage, Vec<String>)>, RegistryError> {
-    let Some(hosted) = state.inner.config.routing.hosted.get(source) else {
+    let routing = state.routing();
+    let Some(hosted) = routing.hosted.get(source) else {
         return Ok(None);
     };
     if !hosted.rules.any_access_admits(identity) {
         return Ok(None);
     }
-    let storage = state.inner.storage.for_hosted(&hosted.org, ecosystem);
+    let storage = state.inner.storage.for_hosted(&hosted.namespace, ecosystem);
     let keep = |name: &str| {
         matches!(
             resolve_ecosystem_source(state, registry, ecosystem, name),
@@ -381,7 +400,7 @@ pub(super) fn search_result_is_visible(
     matches!(
         resolve_registry_source(context.state, context.registry, name),
         RegistrySource::Upstream(candidate) if candidate == context.source,
-    ) && authorize(context.state, context.identity, resolved, name, Action::Access).is_ok()
+    ) && authorize(context.state, context.identity, resolved, name, Action::Read).is_ok()
 }
 
 pub(super) fn discovery_sources(
@@ -389,7 +408,8 @@ pub(super) fn discovery_sources(
     registry: &str,
     ecosystem: Ecosystem,
 ) -> Vec<DiscoverySource> {
-    let registries = &state.inner.config.routing.registries;
+    let routing = state.routing();
+    let registries = &routing.registries;
     registries
         .sources(registry, ecosystem)
         .into_iter()

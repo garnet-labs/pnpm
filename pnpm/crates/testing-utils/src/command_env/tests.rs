@@ -1,7 +1,13 @@
-use super::{CommandTestExt, is_pnpm_config_var};
+use super::{
+    CommandTestExt,
+    is_pnpm_config_var,
+};
 use crate::env_guard::EnvGuard;
 use command_extra::CommandExtra;
-use std::{ffi::OsStr, process::Command};
+use std::{
+    ffi::OsStr,
+    process::Command,
+};
 
 const SETTING: &str = "PNPM_CONFIG_GLOBAL_SHIMS";
 const CI_SETTING: &str = "PNPM_CONFIG_CI";
@@ -16,6 +22,7 @@ fn pnpm_and_npm_settings_match_in_either_spelling() {
         "npm_config_registry",
         "PNPM_SHIM_BYPASS",
         "pnpm_shim_bypass",
+        "PNPM_SHIM_PREPARING",
         "npm_lifecycle_event",
         "NPM_LIFECYCLE_EVENT",
     ] {
@@ -43,7 +50,7 @@ fn the_environment_the_suites_rely_on_is_left_alone() {
 }
 
 /// The removal happens at construction precisely so that a test wanting one
-/// of these settings can still set it — the documented contract callers
+/// of these settings can still set it, the documented contract callers
 /// depend on.
 #[test]
 fn an_explicit_value_set_afterwards_survives_the_removal() {

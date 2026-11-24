@@ -1,6 +1,17 @@
 use super::{
-    Config, ConfigOverrides, EnvVar, GLOBAL_LAYOUT_VERSION, GetCurrentDir, GetHomeDir, LinkProbe,
-    Path, StoreDir, default_state_dir, lexical_normalize, resolve_child_concurrency, setting_value,
+    Config,
+    ConfigOverrides,
+    EnvVar,
+    GLOBAL_LAYOUT_VERSION,
+    GetCurrentDir,
+    GetHomeDir,
+    LinkProbe,
+    Path,
+    StoreDir,
+    default_state_dir,
+    lexical_normalize,
+    resolve_child_concurrency,
+    setting_value,
     verify_deps_env_is_set,
 };
 use pnpm_config::NodePackageMapMode;
@@ -308,9 +319,12 @@ impl ConfigOverrides {
         // command line carries both.
         if let Some(value) = self.maxsockets {
             config.max_sockets = Some(value);
+            config.explicit_settings.insert("maxsockets".to_string(), value.into());
+            config.explicit_settings.insert("maxSockets".to_string(), value.into());
         }
         if let Some(value) = self.max_sockets {
             config.max_sockets = Some(value);
+            config.explicit_settings.insert("maxsockets".to_string(), value.into());
             config.explicit_settings.insert("maxSockets".to_string(), value.into());
         }
         // pnpm seeds `explicitlySetKeys` from the command line as well as
@@ -340,8 +354,12 @@ impl ConfigOverrides {
         if let Some(value) = &self.node_linker {
             value.clone().apply_to(config);
             config.explicit_settings.insert("nodeLinker".to_string(), setting_value(value));
+            // The linker's hoist patterns land after the hoist overrides
+            // ran these derivations.
+            config.apply_shamefully_hoist_derivation();
+            config.apply_virtual_store_only_derivation();
             // A CLI-selected hoisted linker turns the default on just
-            // like a yaml-selected one — pnpm merges CLI options before
+            // like a yaml-selected one, pnpm merges CLI options before
             // its `nodeLinker` switch, so the derivation must see this
             // override too.
             config.apply_prefer_symlinked_executables_derivation();
@@ -383,7 +401,7 @@ impl ConfigOverrides {
     /// command-line `--modules-dir` / `--virtual-store-dir`.
     ///
     /// Both reach [`Config::explicit_settings`] as the raw spelling, which
-    /// is what [`Config::anchor_lockfile_paths`] resolves — so a later
+    /// is what [`Config::anchor_lockfile_paths`] resolves, so a later
     /// `--lockfile-dir` pin moves the CLI-set paths along with it.
     fn apply_lockfile_anchored_paths(&self, config: &mut Config, dir: &Path) {
         let raw_settings = [

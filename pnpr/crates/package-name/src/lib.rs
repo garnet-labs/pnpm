@@ -1,9 +1,25 @@
-use derive_more::{Display, Error};
-use pep508_rs::PackageName as PythonPackageName;
+pub use archive_paths::ArchivePaths;
+pub use pnpm_package_name::{
+    PythonNameError,
+    canonicalize_python_name,
+};
+
+use derive_more::{
+    Display,
+    Error,
+};
 use pnpr_error::RegistryError;
-use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
-use strum::{EnumIter, IntoEnumIterator as _};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use std::fmt;
+use strum::{
+    EnumIter,
+    IntoEnumIterator as _,
+};
+
+mod archive_paths;
 
 /// The protocol whose naming rules a registry surface follows.
 #[derive(
@@ -74,12 +90,6 @@ pub enum CrateNameError {
     InvalidCharacter { name: String },
 }
 
-#[derive(Debug, Display, Error, Clone, PartialEq, Eq)]
-#[display("{name:?} is not a valid Python project name")]
-pub struct PythonNameError {
-    pub name: String,
-}
-
 /// The OCI distribution spec's limit on a whole repository name.
 pub const MAX_OCI_NAME_LEN: usize = 255;
 
@@ -110,7 +120,7 @@ pub enum OciNameError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalPackageName {
     raw: String,
-    /// The unscoped portion — for `@scope/name` and `namespace/image` this is
+    /// The unscoped portion, for `@scope/name` and `namespace/image` this is
     /// the last component, for `name` this is the whole thing. Used to
     /// validate tarball filenames, which are always `<basename>-<version>.tgz`.
     basename: String,
@@ -119,8 +129,7 @@ pub struct CanonicalPackageName {
 
 impl CanonicalPackageName {
     /// Create a canonical name directly from an already-stored name without
-    /// re-parsing it against a specific ecosystem grammar. Used for offline
-    /// store migration and maintenance.
+    /// re-parsing it against a specific ecosystem grammar.
     #[must_use]
     pub fn from_stored(raw: &str, ecosystem: Ecosystem) -> Self {
         let basename = raw
@@ -134,18 +143,26 @@ impl CanonicalPackageName {
         let canonical = match ecosystem {
             Ecosystem::Npm => raw.to_string(),
             Ecosystem::Cargo => canonicalize_crate_name(raw)
-                .map_err(|error| invalid_ecosystem_name(raw, ecosystem, error.to_string()))?,
+                .map_err(|error| {
+                    invalid_ecosystem_name(raw.to_owned(), ecosystem, error.to_string())
+                })?,
             Ecosystem::Pypi => canonicalize_python_name(raw)
-                .map_err(|error| invalid_ecosystem_name(raw, ecosystem, error.to_string()))?,
+                .map_err(|error| {
+                    invalid_ecosystem_name(raw.to_owned(), ecosystem, error.to_string())
+                })?,
             // An image name is many `/`-joined components and may outrun the
             // npm length limit, so the OCI grammar is the whole check: it
             // holds every component to starting and ending alphanumeric,
             // which is stricter than `is_safe_segment` asks for.
             Ecosystem::Oci => {
                 let canonical = canonicalize_oci_name(raw)
-                    .map_err(|error| invalid_ecosystem_name(raw, ecosystem, error.to_string()))?;
-                let basename =
-                    canonical.rsplit_once('/').map_or(canonical.as_str(), |(_, last)| last);
+                    .map_err(|error| {
+                        invalid_ecosystem_name(raw.to_owned(), ecosystem, error.to_string())
+                    })?;
+                let basename = canonical
+                    .rsplit_once('/')
+                    .map(|(_, last)| last)
+                    .unwrap_or(canonical.as_str());
                 let basename = basename.to_string();
                 return Ok(Self { raw: canonical, basename, ecosystem });
             }
@@ -154,7 +171,7 @@ impl CanonicalPackageName {
             .map_err(|error| match ecosystem {
                 Ecosystem::Npm => error,
                 Ecosystem::Cargo | Ecosystem::Pypi | Ecosystem::Oci => invalid_ecosystem_name(
-                    raw,
+                    raw.to_owned(),
                     ecosystem,
                     "its canonical form is not a safe registry key".to_string(),
                 ),
@@ -179,6 +196,15 @@ impl CanonicalPackageName {
             raw.to_string()
         };
         Ok(Self { raw: raw.to_string(), basename, ecosystem })
+    }
+
+    /// Check the naming rules for publishing a new npm package. Reads retain
+    /// the legacy grammar used by [`Self::parse`].
+    pub fn validate_npm_publish(&self) -> Result<(), RegistryError> {
+        if !pnpm_package_name::is_valid_new_npm_package_name(&self.raw) {
+            return Err(RegistryError::InvalidPackageName { name: self.raw.clone() });
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -256,12 +282,8 @@ impl CanonicalPackageName {
     }
 }
 
-fn invalid_ecosystem_name(name: &str, ecosystem: Ecosystem, reason: String) -> RegistryError {
-    RegistryError::InvalidEcosystemPackageName {
-        name: name.to_string(),
-        ecosystem: ecosystem.to_string(),
-        reason,
-    }
+fn invalid_ecosystem_name(name: String, ecosystem: Ecosystem, reason: String) -> RegistryError {
+    RegistryError::InvalidEcosystemPackageName { name, ecosystem: ecosystem.to_string(), reason }
 }
 
 pub fn canonicalize_crate_name(name: &str) -> Result<String, CrateNameError> {
@@ -278,29 +300,7 @@ pub fn canonicalize_crate_name(name: &str) -> Result<String, CrateNameError> {
     if !chars.all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')) {
         return Err(CrateNameError::InvalidCharacter { name: name.to_string() });
     }
-    Ok(name.to_ascii_lowercase())
-}
-
-pub fn canonicalize_python_name(raw: &str) -> Result<String, PythonNameError> {
-    let invalid = || PythonNameError { name: raw.to_string() };
-    let normalized = PythonPackageName::from_str(raw)
-        .map_err(|_| invalid())?
-        .as_ref()
-        .to_string();
-    let well_formed = normalized
-        .chars()
-        .all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        })
-        && normalized
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_alphanumeric())
-        && normalized
-            .chars()
-            .next_back()
-            .is_some_and(|character| character.is_ascii_alphanumeric());
-    well_formed.then_some(normalized).ok_or_else(invalid)
+    Ok(name.to_ascii_lowercase().replace('_', "-"))
 }
 
 /// Normalize and validate an OCI repository name against the distribution
@@ -383,7 +383,7 @@ fn is_safe_segment(segment: &str) -> bool {
 /// traversal, no separators, no absolute-path or Windows drive prefixes). The
 /// upstream tarball path uses it to admit a non-canonical basename preserved
 /// from an upstream `dist.tarball` (see `rewrite_tarball_urls`) into the
-/// cache layout — the packument match is what authorizes the name; this only
+/// cache layout, the packument match is what authorizes the name; this only
 /// keeps it on disk safely.
 #[must_use]
 pub fn is_safe_path_segment(filename: &str) -> bool {

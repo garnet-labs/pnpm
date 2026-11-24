@@ -1,3 +1,6 @@
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
+
 //! The Python package index protocol pnpr speaks.
 //!
 //! A Python index is the **Simple Repository API**: a project list and one
@@ -8,16 +11,38 @@
 //! routing: project-name normalization, the project document and its two
 //! renderings, distribution-filename parsing, and the upload form.
 
+pub mod archive;
 pub mod multipart;
 
+pub use core_metadata::CoreMetadata;
 pub use pnpr_package_name::PythonNameError as NameError;
+pub use project_file::ProjectFile;
 
-use derive_more::{Display, Error};
+mod core_metadata;
+mod project_file;
+
+use derive_more::{
+    Display,
+    Error,
+};
 use pep440_rs::Version;
 use pnpr_package_name::canonicalize_python_name;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{collections::BTreeMap, fmt::Write as _, str::FromStr};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    fmt::Write as _,
+    str::FromStr,
+};
 
 /// The URL segment under a registry endpoint where the Simple API lives:
 /// `/~<name>/simple/`, `/~<name>/simple/<project>/`.
@@ -85,40 +110,7 @@ impl Yanked {
     }
 }
 
-/// One distribution file of a project, in the PEP 691 key spelling.
-///
-/// `url` is the file's origin URL as an upstream index published it, and is
-/// absent in a hosted document, where the server derives every file's URL
-/// from its own address at render time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ProjectFile {
-    pub filename: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// Lowercase hash algorithm name to lowercase hex digest. A file must
-    /// carry a `sha256`.
-    #[serde(default)]
-    pub hashes: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requires_python: Option<String>,
-    #[serde(default)]
-    pub yanked: Yanked,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_time: Option<String>,
-}
-
-impl ProjectFile {
-    /// The file's lowercase hex SHA-256, when the index published one.
-    #[must_use]
-    pub fn sha256(&self) -> Option<&str> {
-        self.hashes.get("sha256").map(String::as_str)
-    }
-}
-
-pub const PROJECT_DOCUMENT_FORMAT_VERSION: u32 = 1;
+pub const PROJECT_DOCUMENT_FORMAT_VERSION: u32 = 2;
 
 const fn default_format_version() -> u32 {
     PROJECT_DOCUMENT_FORMAT_VERSION
@@ -134,15 +126,24 @@ pub struct ProjectDocument {
     pub name: String,
     #[serde(default)]
     pub files: Vec<ProjectFile>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    /// Filenames permanently reserved after an administrator deletes them.
+    pub deleted_files: BTreeSet<String>,
+    /// The account IDs that may publish to this project, recorded by its first
+    /// publish. When empty, `$owners` admits only admins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
 }
 
 impl ProjectDocument {
     #[must_use]
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: String) -> Self {
         Self {
             format_version: PROJECT_DOCUMENT_FORMAT_VERSION,
-            name: name.to_string(),
+            name,
             files: Vec::new(),
+            deleted_files: BTreeSet::new(),
+            owners: Vec::new(),
         }
     }
 
@@ -186,24 +187,7 @@ impl ProjectDocument {
     pub fn render_json(&self, file_base: &str) -> Value {
         let files: Vec<Value> = self.files
             .iter()
-            .map(|file| {
-                let mut entry = json!({
-                    "filename": file.filename,
-                    "url": file_url(file_base, &file.filename),
-                    "hashes": file.hashes,
-                    "yanked": file.yanked,
-                });
-                if let Some(requires_python) = &file.requires_python {
-                    entry["requires-python"] = json!(requires_python);
-                }
-                if let Some(size) = file.size {
-                    entry["size"] = json!(size);
-                }
-                if let Some(upload_time) = &file.upload_time {
-                    entry["upload-time"] = json!(upload_time);
-                }
-                entry
-            })
+            .map(|file| file.render_json(file_base))
             .collect();
         json!({
             "meta": { "api-version": API_VERSION },
@@ -234,6 +218,7 @@ impl ProjectDocument {
             if let Some(requires_python) = &file.requires_python {
                 let _ = write!(html, r#" data-requires-python="{}""#, escape_html(requires_python));
             }
+            file.render_metadata_attributes(&mut html);
             match &file.yanked {
                 Yanked::Flag(false) => {}
                 Yanked::Flag(true) => html.push_str(r#" data-yanked="""#),
@@ -350,7 +335,8 @@ fn quality(accept: &str, media: &str) -> Option<f32> {
                 return None;
             }
             let weight = parameters
-                .filter_map(|parameter| parameter.trim().split_once('='))
+                .map(str::trim)
+                .filter_map(|trimmed| trimmed.split_once('='))
                 .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
                 .map_or(1.0, |(_, value)| {
                     value

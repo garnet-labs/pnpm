@@ -1,25 +1,61 @@
-pub(crate) use apply::{apply_state_dir_override, apply_store_dir_override};
+pub(crate) use apply::{
+    apply_state_dir_override,
+    apply_store_dir_override,
+};
 pub(crate) use global_conflicts::GlobalConflict;
-pub(crate) use tokens::{bare_boolean_setting_claims, bare_setting_flag_width, parse_bool};
+pub(crate) use tokens::{
+    bare_boolean_setting_claims,
+    bare_setting_flag_width,
+    parse_bool,
+};
 
 use pnpm_network::normalize_registry_url;
 
 use pnpm_config::{
-    CliLayer, ColorMode, Config, EnvVar, GLOBAL_LAYOUT_VERSION, GetCurrentDir, GetHomeDir,
-    LinkProbe, LinkWorkspacePackages, NodeLinkerSetting, PackageImportMethod, PmOnFail,
-    RuntimeOnFail, SaveWorkspaceProtocol, TrustPolicy, VerifyDepsBeforeRun, default_state_dir,
-    naming_cases::to_kebab_case, resolve_child_concurrency,
+    CliLayer,
+    ColorMode,
+    Config,
+    EnvVar,
+    GLOBAL_LAYOUT_VERSION,
+    GetCurrentDir,
+    GetHomeDir,
+    LinkProbe,
+    LinkWorkspacePackages,
+    NodeLinkerSetting,
+    PackageImportMethod,
+    PmOnFail,
+    RuntimeOnFail,
+    SaveWorkspaceProtocol,
+    TrustPolicy,
+    VerifyDepsBeforeRun,
+    default_state_dir,
+    naming_cases::to_kebab_case,
+    resolve_child_concurrency,
 };
 use pnpm_fs::lexical_normalize;
 use pnpm_store_dir::StoreDir;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    ffi::{OsStr, OsString},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashSet,
+    },
+    ffi::{
+        OsStr,
+        OsString,
+    },
     path::Path,
 };
 use tokens::{
-    ConfigToken, claims_as_value, classify, is_forwarded, parse_bool_or_enum, parse_enum,
-    scoped_registry_key, setting_value, verify_deps_env_is_set,
+    ConfigToken,
+    claims_as_value,
+    classify,
+    is_forwarded,
+    parse_bool_or_enum,
+    parse_enum,
+    scoped_registry_key,
+    setting_value,
+    verify_deps_env_is_set,
 };
 
 /// CLI overrides parsed from pnpm's `--config.<key>=<value>` dotted-key
@@ -180,8 +216,8 @@ macro_rules! record_list_overrides {
 }
 
 impl ConfigOverrides {
-    fn record_raw_config(&mut self, key: &str, value: &str) {
-        self.npmrc_tokens.push((key.to_owned(), value.to_owned()));
+    fn record_raw_config(&mut self, key: String, value: String) {
+        self.npmrc_tokens.push((key, value));
     }
 
     pub(crate) fn shared_workspace_lockfile(&self) -> Option<bool> {
@@ -203,10 +239,12 @@ impl ConfigOverrides {
         CliLayer {
             npmrc_tokens: self.npmrc_tokens.clone(),
             registry: registry_flag
-                .map(|registry| normalize_registry_url(registry).into_owned())
+                .map(normalize_registry_url)
+                .map(std::borrow::Cow::into_owned)
                 .or_else(|| self.registry.clone()),
             scoped_registries: self.registries.clone(),
             setting_values,
+            ..CliLayer::default()
         }
     }
 
@@ -251,7 +289,7 @@ impl ConfigOverrides {
         Argv: Iterator<Item = (usize, OsString)>,
     {
         // The token after a `--<setting> <value>` pair's flag, when the
-        // setting claims it — see [`claims_as_value`]. `None` when the
+        // setting claims it; see [`claims_as_value`]. `None` when the
         // flag ends argv, the token is already the child's, or it is
         // not a value the setting takes, all of which leave the
         // valueless flag for clap to report.
@@ -266,28 +304,31 @@ impl ConfigOverrides {
             Some(value)
         };
         match classify(&arg, claimed_by_command) {
-            ConfigToken::WellFormed { key, value } if matches!(key, "state-dir" | "store-dir") => {
-                self.record_raw_config(key, value);
-                remaining.push(OsString::from(format!("--{key}={value}")));
+            ConfigToken::WellFormed { key, value }
+                if matches!(to_kebab_case(key).as_str(), "state-dir" | "store-dir") =>
+            {
+                let kebab = to_kebab_case(key);
+                self.record_raw_config(key.to_owned(), value.to_owned());
+                remaining.push(OsString::from(format!("--{kebab}={value}")));
             }
             ConfigToken::WellFormed { key, value } => {
-                self.record_raw_config(key, value);
+                self.record_raw_config(key.to_owned(), value.to_owned());
                 self.set(key, value);
             }
             ConfigToken::BooleanFollows(key) => {
                 let value = following(key);
                 let value = value.as_deref().unwrap_or("true");
-                self.record_raw_config(key, value);
+                self.record_raw_config(key.to_owned(), value.to_owned());
                 self.set(key, value);
             }
-            // A flag whose value is missing — because it ends argv, or
+            // A flag whose value is missing (because it ends argv, or
             // because the token after it is one the setting does not
-            // take — goes back in place for clap to report; see
+            // take) goes back in place for clap to report; see
             // [`classify`].
             ConfigToken::ValueFollows(key) => match following(key) {
                 Some(value) => {
-                    self.record_raw_config(key, &value);
                     self.set(key, &value);
+                    self.record_raw_config(key.to_owned(), value);
                 }
                 None => remaining.push(arg),
             },

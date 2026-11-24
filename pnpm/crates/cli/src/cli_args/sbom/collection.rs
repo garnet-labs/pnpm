@@ -1,9 +1,31 @@
 use super::{
-    DepType, HashMap, HashSet, ImporterComponents, IncludeFilter, Lockfile, PackageKey, Path,
-    PathBuf, PeerSatisfactionEdges, SbomComponentType, SbomResult, SnapshotEntry, State,
-    TransitiveEdges, WalkStores, build_purl, component_walk_context, confined_importer_dir,
-    extract_author, extract_bugs_url, extract_description, extract_license, extract_repository,
-    required_sbom_lockfile, safe_read_project_manifest_from_dir, walk_importer_components,
+    DepType,
+    HashMap,
+    HashSet,
+    ImporterComponents,
+    IncludeFilter,
+    Lockfile,
+    PackageKey,
+    Path,
+    PathBuf,
+    PeerSatisfactionEdges,
+    SbomComponentType,
+    SbomResult,
+    SnapshotEntry,
+    State,
+    TransitiveEdges,
+    WalkStores,
+    build_purl,
+    component_walk_context,
+    confined_importer_dir,
+    extract_author,
+    extract_bugs_url,
+    extract_description,
+    extract_license,
+    extract_repository,
+    required_sbom_lockfile,
+    safe_read_project_manifest_from_dir,
+    walk_importer_components,
 };
 
 /// Every package's dependency type. A peer-satisfaction edge does not pass
@@ -24,8 +46,8 @@ fn detect_dep_types(
         importer_roots(lockfile, |importer| std::slice::from_ref(&importer.optional_dependencies));
     let prod_keys = [prod_keys, optional_keys].concat();
 
-    detect_dep_types_walk(snapshots, &mut dep_types, &mut walked, &dev_keys, true, transitive);
-    detect_dep_types_walk(snapshots, &mut dep_types, &mut walked, &prod_keys, false, transitive);
+    detect_dep_types_walk(snapshots, &mut dep_types, &mut walked, dev_keys, true, transitive);
+    detect_dep_types_walk(snapshots, &mut dep_types, &mut walked, prod_keys, false, transitive);
     dep_types
 }
 
@@ -38,7 +60,9 @@ fn importer_roots<'a>(
 ) -> Vec<PackageKey> {
     lockfile.importers
         .values()
-        .flat_map(|importer| maps(importer).iter().flatten())
+        .map(maps)
+        .map(|maps| maps.iter())
+        .flat_map(std::iter::Iterator::flatten)
         .flatten()
         .filter_map(|(name, spec)| spec.version.resolved_key(name))
         .collect()
@@ -48,11 +72,11 @@ fn detect_dep_types_walk(
     snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
     dep_types: &mut HashMap<PackageKey, DepType>,
     walked: &mut HashSet<(PackageKey, bool)>,
-    initial_keys: &[PackageKey],
+    initial_keys: Vec<PackageKey>,
     is_dev: bool,
     transitive: TransitiveEdges<'_>,
 ) {
-    let mut queue: Vec<PackageKey> = initial_keys.to_vec();
+    let mut queue = initial_keys;
 
     while let Some(key) = queue.pop() {
         if !walked.insert((key.clone(), is_dev)) {
@@ -94,7 +118,7 @@ pub(super) fn collect_components(
     let lockfile = required_sbom_lockfile(state)?;
 
     let lockfile_dir = state.lockfile_dir().to_path_buf();
-    let (manifest, root_manifest) = read_sbom_manifests(state, &lockfile_dir, filter_importer_ids);
+    let (manifest, root_manifest) = read_sbom_manifests(state, &lockfile_dir, filter_importer_ids)?;
     let root = RootMetadata::from_manifests(&manifest, root_manifest.as_ref());
     let peer_edges = PeerSatisfactionEdges::of_lockfile(lockfile, state.config.peer_edge_options());
     let dep_types = detect_dep_types(lockfile, TransitiveEdges::classifying(include, &peer_edges));
@@ -128,7 +152,7 @@ pub(super) fn collect_components(
             ctx: &ctx,
         },
         &mut stores,
-    );
+    )?;
 
     Ok(assemble_sbom_result(root, sbom_type, stores))
 }
@@ -217,7 +241,7 @@ fn read_sbom_manifests(
     state: &State,
     lockfile_dir: &Path,
     filter_importer_ids: Option<&[&str]>,
-) -> (serde_json::Value, Option<serde_json::Value>) {
+) -> miette::Result<(serde_json::Value, Option<serde_json::Value>)> {
     let fallback = |importer_id: &str| {
         if state.active_importer_id() == importer_id && state.manifest.path().exists() {
             state.manifest.value().clone()
@@ -225,21 +249,22 @@ fn read_sbom_manifests(
             serde_json::json!({})
         }
     };
-    let root_manifest = safe_read_project_manifest_from_dir(lockfile_dir)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| fallback("."));
+    let root_manifest =
+        safe_read_project_manifest_from_dir(lockfile_dir)?.unwrap_or_else(|| fallback("."));
 
     let single_id = match filter_importer_ids {
         Some(&[single_id]) if single_id != "." => single_id,
-        _ => return (root_manifest, None),
+        _ => return Ok((root_manifest, None)),
     };
 
-    let project_manifest = confined_importer_dir(lockfile_dir, single_id)
-        .and_then(|dir| safe_read_project_manifest_from_dir(&dir).ok().flatten())
-        .unwrap_or_else(|| fallback(single_id));
+    let project_manifest = match confined_importer_dir(lockfile_dir, single_id) {
+        Some(dir) => {
+            safe_read_project_manifest_from_dir(&dir)?.unwrap_or_else(|| fallback(single_id))
+        }
+        None => fallback(single_id),
+    };
 
-    (project_manifest, Some(root_manifest))
+    Ok((project_manifest, Some(root_manifest)))
 }
 
 fn assemble_sbom_result(

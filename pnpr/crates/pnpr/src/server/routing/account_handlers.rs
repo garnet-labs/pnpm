@@ -1,17 +1,39 @@
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    routing::{delete, get, post, put},
+    routing::{
+        delete,
+        get,
+        post,
+        put,
+    },
 };
 
 use crate::server::{
-    AppState, MAX_LOGIN_BODY_BYTES,
-    tokens::{delete_session_token, delete_token_by_key, get_token_list, post_create_token},
-    user_accounts::{get_profile, get_user, get_whoami, put_login},
-    web_login::{get_v1_login_poll, get_v1_login_start, post_v1_login},
+    AppState,
+    MAX_LOGIN_BODY_BYTES,
+    tokens::{
+        delete_session_token,
+        delete_token_by_key,
+        get_token_list,
+        post_create_token,
+    },
+    user_accounts::{
+        get_profile,
+        get_user,
+        get_whoami,
+        post_profile,
+        put_login,
+    },
+    web_login::{
+        get_v1_login_device,
+        get_v1_login_poll,
+        post_v1_login,
+        post_v1_login_device,
+    },
 };
 
-/// The account endpoints — adduser/login, whoami, profile, token
+/// The account endpoints, adduser/login, whoami, profile, token
 /// creation/listing/revocation, logout. They are pnpr account management, not
 /// npm-registry functionality: they mint and manage the tokens every
 /// authenticated surface demands, so they ride every tier alongside
@@ -37,7 +59,12 @@ pub(super) fn account_routes() -> Router<AppState> {
                     .route_layer(DefaultBodyLimit::max(MAX_LOGIN_BODY_BYTES)),
             )
             .route(&path("/-/user/token/{token}"), delete(delete_session_token))
-            .route(&path("/-/npm/v1/user"), get(get_profile))
+            .route(
+                &path("/-/npm/v1/user"),
+                get(get_profile)
+                    .post(post_profile)
+                    .route_layer(DefaultBodyLimit::max(MAX_LOGIN_BODY_BYTES)),
+            )
             .route(
                 &path("/-/npm/v1/tokens"),
                 get(get_token_list)
@@ -49,7 +76,12 @@ pub(super) fn account_routes() -> Router<AppState> {
                 &path("/-/v1/login"),
                 post(post_v1_login).route_layer(DefaultBodyLimit::max(MAX_LOGIN_BODY_BYTES)),
             )
-            .route(&path("/-/v1/login/start"), get(get_v1_login_start))
+            .route(
+                &path("/-/v1/login/device"),
+                get(get_v1_login_device)
+                    .post(post_v1_login_device)
+                    .route_layer(DefaultBodyLimit::max(MAX_LOGIN_BODY_BYTES)),
+            )
             .route(&path("/-/v1/login/poll/{session}"), get(get_v1_login_poll));
     }
     router

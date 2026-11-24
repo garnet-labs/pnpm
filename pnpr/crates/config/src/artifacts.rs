@@ -1,10 +1,17 @@
 //! The shared-artifact surface's settings: who may read and publish what
-//! each organization owns, and how much the artifact store keeps.
+//! each artifact owner owns, and how much the artifact store keeps.
 
 use super::{
-    AccessList, AccessSpec, ArtifactQuotaFile, IndexMap, RegistryError, StorageAccessFile,
-    TeamDirectory, validate_registry_name,
+    AccessList,
+    AccessSpec,
+    ArtifactQuotaFile,
+    ByteSize,
+    IndexMap,
+    RegistryError,
+    StorageAccessFile,
+    validate_artifact_owner_name,
 };
+use crate::byte_size::parse_positive_byte_size;
 
 /// Toggle for the shared-artifact surface. Off by default while the
 /// protocol is a proof of concept.
@@ -12,10 +19,10 @@ use super::{
 pub struct ArtifactsFeature {
     /// Master switch for artifact and compiler-cache endpoints.
     pub enabled: bool,
-    /// Who may read and who may publish what each organization owns: its
+    /// Who may read and who may publish what each artifact owner owns: its
     /// signed artifacts, its compiler cache, and its pipeline run records. An
-    /// undeclared organization is unavailable.
-    pub orgs: IndexMap<String, StorageAccess>,
+    /// undeclared owner is unavailable.
+    pub owners: IndexMap<String, StorageAccess>,
     pub quota: ArtifactQuota,
 }
 
@@ -30,7 +37,7 @@ pub struct ArtifactQuota {
     pub total: u64,
 }
 
-pub(super) const GIB: u64 = 1024 * 1024 * 1024;
+const GIB: u64 = 1024 * 1024 * 1024;
 
 impl Default for ArtifactQuota {
     fn default() -> Self {
@@ -44,23 +51,24 @@ pub struct StorageAccess {
     pub publish: AccessList,
 }
 
+/// The `artifacts.owners` policies.
 pub(super) fn parse_storage_access(
     policies: IndexMap<String, StorageAccessFile>,
 ) -> Result<IndexMap<String, StorageAccess>, RegistryError> {
     policies
         .into_iter()
         .map(|(name, policy)| {
-            validate_registry_name(&name)?;
+            validate_artifact_owner_name(&name)?;
             let parse = |field: &str, spec: &AccessSpec| {
                 let list = spec
-                    .to_access_list(&TeamDirectory::default())
+                    .to_access_list()
                     .map_err(|reason| RegistryError::InvalidConfig {
-                        reason: format!("organization {name:?}: {reason}"),
+                        reason: format!("artifact owner {name:?}: {reason}"),
                     })?;
                 if list.references_owners() {
                     return Err(RegistryError::InvalidConfig {
                         reason: format!(
-                            "organization {name:?}: `$owners` is not valid for artifact `{field}` rules",
+                            "artifact owner {name:?}: `$owners` is not valid for artifact `{field}` rules",
                         ),
                     });
                 }
@@ -77,22 +85,17 @@ pub(super) fn parse_artifact_quota(
     file: &ArtifactQuotaFile,
 ) -> Result<ArtifactQuota, RegistryError> {
     let default = ArtifactQuota::default();
-    let bytes = |gib: Option<u64>, default: u64, field: &str| match gib {
-        None => Ok(default),
-        Some(gib) => gib
-            .checked_mul(GIB)
-            .filter(|bytes| *bytes > 0)
-            .ok_or_else(|| RegistryError::InvalidConfig {
-                reason: format!("artifacts.quota.{field} must be a positive number of GiB"),
-            }),
+    let bytes = |raw: Option<&ByteSize>, default: u64, field: &str| {
+        raw.map(|raw| parse_positive_byte_size(field, raw))
+            .unwrap_or(Ok(default))
     };
     let quota = ArtifactQuota {
-        owner: bytes(file.owner_gib, default.owner, "ownerGiB")?,
-        total: bytes(file.total_gib, default.total, "totalGiB")?,
+        owner: bytes(file.per_owner.as_ref(), default.owner, "artifacts.quota.perOwner")?,
+        total: bytes(file.total.as_ref(), default.total, "artifacts.quota.total")?,
     };
     if quota.owner > quota.total {
         return Err(RegistryError::InvalidConfig {
-            reason: "artifacts.quota.ownerGiB exceeds artifacts.quota.totalGiB".to_string(),
+            reason: "artifacts.quota.perOwner exceeds artifacts.quota.total".to_string(),
         });
     }
     Ok(quota)

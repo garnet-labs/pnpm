@@ -1,12 +1,19 @@
-use super::{RELAYED_INTERRUPTS, RelayEntry, visit_targets};
+use super::{
+    RELAYED_INTERRUPTS,
+    RelayEntry,
+    visit_targets,
+};
 use pnpm_process::HostSignal;
 use std::{
     io,
-    sync::{Once, atomic::Ordering},
+    sync::{
+        Once,
+        atomic::Ordering,
+    },
     thread,
 };
 
-pub(super) fn install_handler() {
+pub(crate) fn install_handler() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         thread::spawn(listen);

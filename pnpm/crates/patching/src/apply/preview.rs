@@ -1,10 +1,22 @@
-use super::{PatchApplyError, package_relative_operation, read_patch_text, tolerant};
+use super::{
+    PatchApplyError,
+    package_relative_operation,
+    parse_file_patches,
+    read_patch_text,
+    tolerant,
+};
 
-use diffy::patch_set::{FileOperation, FilePatch, ParseOptions, PatchSet};
+use diffy::patch_set::{
+    FileOperation,
+    FilePatch,
+};
 use indexmap::IndexSet;
 use std::{
     fs,
-    path::{Component, Path},
+    path::{
+        Component,
+        Path,
+    },
 };
 
 /// How a package's manifest is spelled in [`PatchPreview::written_paths`] and
@@ -66,12 +78,8 @@ pub fn preview_patch(
         // states.
         manifest_removed: false,
     };
-    for file_patch_result in PatchSet::parse(&text, ParseOptions::gitdiff()) {
-        let file_patch = file_patch_result.map_err(|source| PatchApplyError::InvalidPatch {
-            patch_file_path: patch_file_path.to_path_buf(),
-            message: source.to_string(),
-        })?;
-        state.record(&file_patch)?;
+    for file_patch in parse_file_patches(&text, patch_file_path) {
+        state.record(&file_patch?)?;
     }
     let PreviewState {
         mut preview,
@@ -236,8 +244,8 @@ fn names_manifest(patched_dir: &Path, written: &str) -> bool {
 /// The path a patch header names, spelled the way [`apply_patch_to_dir`]
 /// resolves it: `.` segments dropped, separators normalized to `/`.
 ///
-/// `None` for a path that call would refuse — one that is absolute or
-/// climbs out of the package — so the preview never reports as written a
+/// `None` for a path that call would refuse (one that is absolute or
+/// climbs out of the package) so the preview never reports as written a
 /// path the apply will reject.
 ///
 /// [`apply_patch_to_dir`]: super::apply_patch_to_dir

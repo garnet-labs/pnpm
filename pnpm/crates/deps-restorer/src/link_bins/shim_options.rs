@@ -1,5 +1,11 @@
-use pnpm_cmd_shim::LinkBinsOptions;
-use pnpm_config::{Config, NodeLinker};
+use pnpm_cmd_shim::{
+    LinkBinsOptions,
+    OwnNodePaths,
+};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+};
 use std::path::Path;
 
 /// The config-derived options for every bin an install links. Its
@@ -11,6 +17,7 @@ pub fn shim_link_options(config: &Config, node_linker: NodeLinker) -> LinkBinsOp
     LinkBinsOptions {
         force: false,
         extra_node_paths,
+        own_node_paths: OwnNodePaths::WithExtras,
         prefer_symlinked_executables: config.prefer_symlinked_executables.unwrap_or(false),
         relocatable_root: config.modules_dir_anchor().map(Path::to_path_buf),
         project_modules_dir_name: (config.extend_node_path

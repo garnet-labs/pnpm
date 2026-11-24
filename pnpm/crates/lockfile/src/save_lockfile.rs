@@ -1,21 +1,43 @@
 use crate::{
-    EnvLockfile, Lockfile,
+    EnvLockfile,
+    Lockfile,
     git_merge_file::MERGE_CONFLICT_OURS,
     serialize_yaml,
     yaml_documents::{
-        YAML_DOCUMENT_SEPARATOR, YAML_DOCUMENT_START, extract_env_document,
+        YAML_DOCUMENT_SEPARATOR,
+        YAML_DOCUMENT_START,
+        extract_env_document,
         normalize_lockfile_content,
     },
 };
-use derive_more::{Display, Error};
-use pnpm_diagnostics::miette::{self, Diagnostic};
+use derive_more::{
+    Display,
+    Error,
+};
+use pnpm_diagnostics::miette::{
+    self,
+    Diagnostic,
+};
 use std::{
     borrow::Cow,
     env,
-    fs::{self, OpenOptions},
-    io::{self, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    ffi::OsStr,
+    fs::{
+        self,
+        OpenOptions,
+    },
+    io::{
+        self,
+        Write,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::atomic::{
+        AtomicU64,
+        Ordering,
+    },
 };
 
 /// Error when writing the lockfile to the filesystem.
@@ -33,6 +55,9 @@ pub enum SaveLockfileError {
     #[display("Failed to write lockfile content: {_0}")]
     #[diagnostic(code(ERR_PNPM_LOCKFILE_WRITE_FILE))]
     WriteFile(io::Error),
+
+    #[diagnostic(transparent)]
+    NextFormat(#[error(source)] crate::NextFormatError),
 
     #[display(
         "The lockfile at \"{}\" still has Git conflict markers in its leading document, which records the config dependencies. Its two sides cannot be merged.",
@@ -97,10 +122,32 @@ pub fn save_value_to_path<Document: serde::Serialize>(
     path: &Path,
     symlinked: SymlinkedLockfile<'_>,
 ) -> Result<(), SaveLockfileError> {
-    let existing = read_normalized_lockfile(path)?;
-    let output = render_value_over(value, existing.as_deref(), path)?;
-    if existing.as_deref() == Some(output.as_str()) {
-        return Ok(());
+    let content = serialize_yaml::to_string(value).map_err(SaveLockfileError::SerializeYaml)?;
+    save_content_to_path(content, path, symlinked).map(drop)
+}
+
+/// [`save_value_to_path`] for a main document already rendered, such as by
+/// [`Lockfile::to_yaml_string`].
+pub fn save_text_to_path(
+    content: String,
+    path: &Path,
+    symlinked: SymlinkedLockfile<'_>,
+) -> Result<(), SaveLockfileError> {
+    save_content_to_path(content, path, symlinked).map(drop)
+}
+
+fn save_content_to_path(
+    content: String,
+    path: &Path,
+    symlinked: SymlinkedLockfile<'_>,
+) -> Result<Option<fs::Metadata>, SaveLockfileError> {
+    let existing = read_existing_lockfile(path)?;
+    let output =
+        render_content_over(content, existing.as_ref().map(|file| file.text.as_str()), path)?;
+    if let Some(existing) = existing
+        && existing.text == output
+    {
+        return Ok(existing.metadata);
     }
     let target = lockfile_write_target(path, symlinked).map_err(SaveLockfileError::WriteFile)?;
     write_atomic(&target, output.as_bytes())
@@ -114,24 +161,61 @@ pub fn render_value_for_path<Document: serde::Serialize>(
     value: &Document,
     path: &Path,
 ) -> Result<String, SaveLockfileError> {
+    let content = serialize_yaml::to_string(value).map_err(SaveLockfileError::SerializeYaml)?;
+    render_text_for_path(content, path)
+}
+
+/// [`render_value_for_path`] for a main document already rendered.
+pub fn render_text_for_path(content: String, path: &Path) -> Result<String, SaveLockfileError> {
     let existing = read_normalized_lockfile(path)?;
-    render_value_over(value, existing.as_deref(), path)
+    render_content_over(content, existing.as_deref(), path)
+}
+
+/// The text of a lockfile a hook returned as a document. One whose
+/// `lockfileVersion` names the next format is read as a [`Lockfile`] and
+/// rendered through its writer, so the hook's result is written in that
+/// format rather than as the document's own shape; any other document is
+/// serialized as it is.
+pub fn render_hook_lockfile(value: &serde_json::Value) -> Result<String, SaveLockfileError> {
+    let next_format = value
+        .get("lockfileVersion")
+        .and_then(serde_json::Value::as_str)
+        .map(str::parse::<crate::ComVer>)
+        .and_then(Result::ok)
+        .is_some_and(|version| version.major == crate::NEXT_LOCKFILE_MAJOR);
+    if !next_format {
+        return serialize_yaml::to_string(value).map_err(SaveLockfileError::SerializeYaml);
+    }
+    let lockfile: Lockfile =
+        serde_json::from_value(value.clone()).map_err(SaveLockfileError::SerializeYaml)?;
+    lockfile.to_yaml_string()
 }
 
 fn read_normalized_lockfile(path: &Path) -> Result<Option<String>, SaveLockfileError> {
-    match fs::read_to_string(path) {
-        Ok(existing) => Ok(Some(normalize_lockfile_content(&existing).into_owned())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(SaveLockfileError::WriteFile(error)),
-    }
+    Ok(read_existing_lockfile(path)?.map(|file| file.text))
 }
 
-fn render_value_over<Document: serde::Serialize>(
-    value: &Document,
+/// The normalized text of the lockfile at `path`, and the metadata of the
+/// handle it was read through when no in-place change raced the read.
+struct ExistingLockfile {
+    text: String,
+    metadata: Option<fs::Metadata>,
+}
+
+fn read_existing_lockfile(path: &Path) -> Result<Option<ExistingLockfile>, SaveLockfileError> {
+    let existing = crate::load_lockfile::file_read::read_file_with_stable_metadata(path)
+        .map_err(SaveLockfileError::WriteFile)?;
+    Ok(existing.map(|(text, metadata)| ExistingLockfile {
+        text: normalize_lockfile_content(&text).into_owned(),
+        metadata,
+    }))
+}
+
+fn render_content_over(
+    content: String,
     existing: Option<&str>,
     path: &Path,
 ) -> Result<String, SaveLockfileError> {
-    let content = serialize_yaml::to_string(value).map_err(SaveLockfileError::SerializeYaml)?;
     Ok(match existing.and_then(extract_env_document) {
         Some(env) => {
             let env = preserved_env_document(&env, path)?;
@@ -162,8 +246,8 @@ fn preserved_env_document<'a>(
     path: &Path,
 ) -> Result<Cow<'a, str>, SaveLockfileError> {
     // Skips the parse for the documents that plainly carry no marker,
-    // which is all of them but the conflicted few. A false positive —
-    // a marker inside a comment or a scalar — costs a parse that then
+    // which is all of them but the conflicted few. A false positive
+    // (a marker inside a comment or a scalar) costs a parse that then
     // finds nothing to merge, and the document is written back as it is.
     if !env.contains(MERGE_CONFLICT_OURS) {
         return Ok(Cow::Borrowed(env));
@@ -231,7 +315,8 @@ fn allowed_link_target(path: &Path, allowed_dirs: &[PathBuf]) -> io::Result<Path
     let target = fs::canonicalize(path)?;
     let allowed = allowed_dirs
         .iter()
-        .filter_map(|dir| fs::canonicalize(dir).ok())
+        .map(fs::canonicalize)
+        .filter_map(Result::ok)
         .any(|dir| target.starts_with(dir));
     if allowed {
         Ok(target)
@@ -258,9 +343,21 @@ fn refused_symlinked_lockfile(path: &Path) -> io::Error {
 }
 
 impl Lockfile {
-    /// Render lockfile as pnpm-formatted YAML.
+    /// Render lockfile as pnpm-formatted YAML, in the format its
+    /// `lockfileVersion` names.
     pub fn to_yaml_string(&self) -> Result<String, SaveLockfileError> {
+        if self.is_next_format() {
+            return self.to_next_yaml_string();
+        }
         serialize_yaml::to_string(self).map_err(SaveLockfileError::SerializeYaml)
+    }
+
+    /// The text [`Self::save_to_path`] would leave in the lockfile at `path`.
+    /// See [`render_value_for_path`].
+    pub fn render_for_path(&self, path: &Path) -> Result<String, SaveLockfileError> {
+        let content = self.to_yaml_string()?;
+        let existing = read_normalized_lockfile(path)?;
+        render_content_over(content, existing.as_deref(), path)
     }
 
     /// Save lockfile to a specific path.
@@ -269,7 +366,36 @@ impl Lockfile {
         path: &Path,
         symlinked: SymlinkedLockfile<'_>,
     ) -> Result<(), SaveLockfileError> {
-        save_value_to_path(self, path, symlinked)
+        self.save_to_path_with_metadata(path, symlinked).map(drop)
+    }
+
+    /// [`Self::save_to_path`], returning the metadata of the file the save
+    /// left at `path`. It is read from the handle that wrote the file, or
+    /// that read the unchanged content the save then skipped writing, so a
+    /// file another process puts at `path` afterwards cannot be mistaken
+    /// for it. `None` when that handle could not report it.
+    pub fn save_to_path_with_metadata(
+        &self,
+        path: &Path,
+        symlinked: SymlinkedLockfile<'_>,
+    ) -> Result<Option<fs::Metadata>, SaveLockfileError> {
+        save_content_to_path(self.to_yaml_string()?, path, symlinked)
+    }
+
+    /// [`Self::save_to_path`] in `format`, whatever this lockfile's
+    /// `lockfileVersion` says.
+    pub fn save_to_path_as(
+        &self,
+        format: crate::LockfileFormat,
+        path: &Path,
+        symlinked: SymlinkedLockfile<'_>,
+    ) -> Result<(), SaveLockfileError> {
+        if self.lockfile_version == format.version() {
+            return self.save_to_path(path, symlinked);
+        }
+        let mut reformatted = self.clone();
+        reformatted.lockfile_version = format.version();
+        reformatted.save_to_path(path, symlinked)
     }
 
     /// Save lockfile to `pnpm-lock.yaml` in the current directory.
@@ -310,8 +436,12 @@ impl Lockfile {
                     dir: install_state_dir.to_path_buf(),
                     error,
                 })?;
-            let content = self.to_yaml_string()?;
-            write_atomic(&target, content.as_bytes())
+            // pnpm reads this file on every install, so it stays
+            // peer-suffixed, which needs no conversion. See
+            // `Shape::Suffixed`.
+            let content =
+                serialize_yaml::to_string(self).map_err(SaveLockfileError::SerializeYaml)?;
+            write_atomic(&target, content.as_bytes()).map(drop)
         }
     }
 }
@@ -343,6 +473,14 @@ fn carry_mode_across(_file: &fs::File, _target: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn lockfile_file_name(target: &Path) -> String {
+    target
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("lock.yaml"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Write `content` to `target` via a temp file in the same directory
 /// followed by `rename`. The rename is atomic on Unix and replaces
 /// in-place on Windows, so an observer never sees a torn file, and a
@@ -353,10 +491,12 @@ fn carry_mode_across(_file: &fs::File, _target: &Path) -> io::Result<()> {
 /// rather than `create + truncate`, so we never follow a symlink or
 /// truncate a file an attacker (or a crashed prior install) pre-seeded
 /// at our predicted temp path. On `AlreadyExists` we advance the
-/// counter and try again, up to `MAX_TEMP_ATTEMPTS` times — matching
+/// counter and try again, up to `MAX_TEMP_ATTEMPTS` times, matching
 /// the hardening already in `pnpm_fs::ensure_file::write_atomic`.
-fn write_atomic(target: &Path, content: &[u8]) -> Result<(), SaveLockfileError> {
-    /// Sixteen fresh counter values is plenty — under benign
+/// The metadata of the written file, read through a handle kept across the
+/// rename where the platform allows renaming an open file.
+fn write_atomic(target: &Path, content: &[u8]) -> Result<Option<fs::Metadata>, SaveLockfileError> {
+    /// Sixteen fresh counter values is plenty, under benign
     /// conditions we never collide; under shared-store-across-
     /// containers the chance of 16 consecutive same-pid same-counter
     /// collisions is negligible.
@@ -365,9 +505,7 @@ fn write_atomic(target: &Path, content: &[u8]) -> Result<(), SaveLockfileError> 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = pnpm_fs::process_id();
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .map_or_else(|| String::from("lock.yaml"), |name| name.to_string_lossy().into_owned());
+    let file_name = lockfile_file_name(target);
 
     let mut last_already_exists: Option<io::Error> = None;
     for _ in 0..MAX_TEMP_ATTEMPTS {
@@ -402,13 +540,13 @@ fn write_atomic(target: &Path, content: &[u8]) -> Result<(), SaveLockfileError> 
             let _ = fs::remove_file(&tmp);
             return Err(SaveLockfileError::WriteFile(error));
         }
+        let written = WrittenFile::before_close(&file);
         // Close the handle before `rename`. Windows `MoveFileEx` over
-        // an open source file can fail with sharing-violation; on Unix
-        // an early `close` lets the kernel commit dirty buffers before
-        // the rename commits the dirent change.
+        // an open source file can fail with sharing-violation.
         drop(file);
 
-        return commit_temp_file(tmp, target);
+        commit_temp_file(tmp, target)?;
+        return Ok(written.metadata_after_rename());
     }
 
     // Ran out of temp-name attempts. Surface the last `AlreadyExists`
@@ -419,6 +557,41 @@ fn write_atomic(target: &Path, content: &[u8]) -> Result<(), SaveLockfileError> 
             "exhausted temp-path attempts for atomic lockfile write",
         )
     })))
+}
+
+/// What a save reads the written file's metadata from. Unix keeps a second
+/// handle open across the rename, which changes the file's ctime. Windows
+/// cannot rename an open file, so it reads the metadata before closing: the
+/// rename keeps the last-write time, and the cache's Windows stat has no
+/// ctime or inode.
+struct WrittenFile(Option<WrittenFileSource>);
+
+#[cfg(unix)]
+type WrittenFileSource = fs::File;
+
+#[cfg(not(unix))]
+type WrittenFileSource = fs::Metadata;
+
+impl WrittenFile {
+    #[cfg(unix)]
+    fn before_close(file: &fs::File) -> Self {
+        WrittenFile(file.try_clone().ok())
+    }
+
+    #[cfg(not(unix))]
+    fn before_close(file: &fs::File) -> Self {
+        WrittenFile(file.metadata().ok())
+    }
+
+    #[cfg(unix)]
+    fn metadata_after_rename(self) -> Option<fs::Metadata> {
+        self.0?.metadata().ok()
+    }
+
+    #[cfg(not(unix))]
+    fn metadata_after_rename(self) -> Option<fs::Metadata> {
+        self.0
+    }
 }
 
 /// Rename the temp file over `target`. On Windows, another process holding

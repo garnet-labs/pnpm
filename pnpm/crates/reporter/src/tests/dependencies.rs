@@ -1,7 +1,34 @@
 use super::{
-    Envelope, LogEvent, LogLevel, PeerDependencyIssuesLog, Pipe, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalReason, Value, assert_eq,
+    Envelope,
+    LogEvent,
+    LogLevel,
+    PeerDependencyIssuesLog,
+    Pipe,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
+    UnusedOverrideLog,
+    Value,
+    assert_eq,
 };
+
+#[test]
+fn install_check_matches_the_package_installability_warning() {
+    let event = LogEvent::InstallCheck(super::PnpmLog {
+        level: LogLevel::Warn,
+        message: "Unsupported engine for foo@1.0.0".to_string(),
+        prefix: "/projects/x".to_string(),
+    });
+    assert_eq!(
+        serde_json::to_value(&event).unwrap(),
+        serde_json::json!({
+            "name": "pnpm:install-check",
+            "level": "warn",
+            "message": "Unsupported engine for foo@1.0.0",
+            "prefix": "/projects/x",
+        }),
+    );
+}
 
 /// `pnpm:skipped-optional-dependency` matches pnpm's wire shape:
 /// top-level `details`, `package: { id, name, version }`, `prefix`,
@@ -111,4 +138,25 @@ fn peer_dependency_issues_event_matches_pnpm_wire_shape() {
     assert_eq!(json["name"], "pnpm:peer-dependency-issues");
     assert_eq!(json["level"], "debug");
     assert_eq!(json["issuesByProjects"]["."]["bad"]["react"][0]["foundVersion"], "19.1.0");
+}
+
+/// `pnpm:unused-override` matches pnpm's wire shape: `prefix` and
+/// `selector` at the top level alongside the envelope `level`.
+#[test]
+fn unused_override_event_matches_pnpm_wire_shape() {
+    let event = LogEvent::UnusedOverride(UnusedOverrideLog {
+        level: LogLevel::Debug,
+        prefix: "/projects/x".to_string(),
+        selector: "foo>bar".to_string(),
+    });
+    let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
+    let json: Value = envelope
+        .pipe_ref(serde_json::to_string)
+        .expect("serialize envelope")
+        .pipe_as_ref(serde_json::from_str)
+        .expect("parse JSON");
+    assert_eq!(json["name"], "pnpm:unused-override");
+    assert_eq!(json["level"], "debug");
+    assert_eq!(json["prefix"], "/projects/x");
+    assert_eq!(json["selector"], "foo>bar");
 }

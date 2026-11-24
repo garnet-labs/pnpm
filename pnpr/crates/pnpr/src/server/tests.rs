@@ -1,43 +1,76 @@
-use super::tokens::token_timestamp_millis;
+use super::tokens::token_timestamp_iso;
 mod compiler_cache;
+mod npm_errors;
 mod observability;
 mod oidc_groups;
+mod schema;
+mod team_members;
 mod web_ui;
 
 use super::{
     PeerAddr,
-    authentication::{bearer_credentials, token_credentials},
-    restrictions::{cidr_contains, cidr_whitelist_allows, is_write_request},
-    router_with_auth, tilde_registry,
+    authentication::token_credentials,
+    restrictions::{
+        cidr_contains,
+        cidr_whitelist_allows,
+        is_write_request,
+    },
+    router_with_auth,
+    tilde_registry,
 };
 use async_trait::async_trait;
 use axum::{
-    body::{Body, to_bytes},
+    body::{
+        Body,
+        to_bytes,
+    },
     extract::ConnectInfo,
-    http::{Method, Request, StatusCode, header},
+    http::{
+        Method,
+        Request,
+        StatusCode,
+        header,
+    },
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use pnpr_auth::{AuthState, TokenBackend, TokenRecord, UserStore};
+use base64::{
+    Engine as _,
+    engine::general_purpose::STANDARD as BASE64_STANDARD,
+};
+use pnpr_auth::{
+    AuthState,
+    TokenBackend,
+    TokenRecord,
+};
 use pnpr_config::Config;
-use pnpr_error::{RegistryError, Result};
+use pnpr_error::{
+    RegistryError,
+    Result,
+};
 use pnpr_fixtures::MockConfigPresets;
-use pnpr_policy::{AccessList, PackageRule, PackageRules, TeamDirectory};
+use pnpr_policy::{
+    AccessList,
+    PackageRule,
+    PackageRules,
+};
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{
+        IpAddr,
+        Ipv4Addr,
+        Ipv6Addr,
+        SocketAddr,
+    },
     sync::Arc,
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 #[test]
-fn token_timestamp_millis_saturates_before_i64_conversion() {
-    assert_eq!(token_timestamp_millis(42), 42_000);
-    assert_eq!(token_timestamp_millis(u64::MAX), i64::MAX / 1000 * 1000);
+fn token_timestamp_iso_formats_millis_and_saturates_overflow() {
+    assert_eq!(token_timestamp_iso(42_123), "1970-01-01T00:00:42.123Z");
+    assert_eq!(token_timestamp_iso(u64::MAX), token_timestamp_iso(i64::MAX as u64));
 }
 
-// ---------------------------------------------------------------
 // CIDR matching
-// ---------------------------------------------------------------
 
 fn ip(addr: &str) -> IpAddr {
     addr.parse().unwrap()
@@ -102,9 +135,7 @@ fn cidr_whitelist_allows_requires_some_entry_to_match() {
     assert!(!cidr_whitelist_allows(&whitelist, ip("203.0.113.1")));
 }
 
-// ---------------------------------------------------------------
 // Method classification and header parsing
-// ---------------------------------------------------------------
 
 #[test]
 fn is_write_request_flags_only_mutating_requests() {
@@ -119,7 +150,6 @@ fn is_write_request_flags_only_mutating_requests() {
     assert!(!is_write_request(&Method::POST, "/-/pnpr/v0/resolve"));
     assert!(!is_write_request(&Method::POST, "/-/pnpr/v0/verify-lockfile"));
     assert!(!is_write_request(&Method::POST, "/-/pnpr/v0/artifacts/resolve"));
-    assert!(!is_write_request(&Method::POST, "/-/pnpr/v0/artifacts/blob"));
     assert!(!is_write_request(&Method::POST, "/-/oidc/handoff"));
     assert!(!is_write_request(&Method::POST, "/npm/-/npm/v1/security/audits"));
     assert!(!is_write_request(&Method::POST, "/npm/~local/-/npm/v1/security/advisories/bulk"));
@@ -159,18 +189,7 @@ fn token_credentials_accepts_every_client_token_shape() {
     assert_eq!(token_credentials("Digest abc"), None);
 }
 
-#[test]
-fn bearer_credentials_extracts_only_bearer_tokens() {
-    assert_eq!(bearer_credentials("Bearer abc123"), Some("abc123"));
-    assert_eq!(bearer_credentials("bearer abc123"), Some("abc123")); // case-insensitive
-    assert_eq!(bearer_credentials("  Bearer   abc123  "), Some("abc123"));
-    assert_eq!(bearer_credentials("Basic dXNlcjpwYXNz"), None);
-    assert_eq!(bearer_credentials("abc123"), None);
-}
-
-// ---------------------------------------------------------------
 // End-to-end restriction enforcement
-// ---------------------------------------------------------------
 
 const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 40000);
 const PROXY_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000);
@@ -190,6 +209,9 @@ pub(super) fn record(readonly: bool, cidr_whitelist: &[&str]) -> TokenRecord {
 /// No client endpoint mints read-only or CIDR-restricted tokens, so the
 /// enforcement tests inject one this way.
 struct OneToken {
+    account_reads: std::sync::atomic::AtomicUsize,
+    bulk_reads: std::sync::atomic::AtomicUsize,
+    accounts: std::collections::BTreeSet<String>,
     raw: String,
     record: TokenRecord,
 }
@@ -211,7 +233,7 @@ impl TokenBackend for OneToken {
     }
 
     async fn lookup(&self, raw: &str) -> Result<Option<String>> {
-        Ok((raw == self.raw).then(|| self.record.username.clone()))
+        Ok((raw == self.raw).then(|| self.record.user_id.clone()))
     }
 
     async fn lookup_record(&self, raw: &str) -> Result<Option<TokenRecord>> {
@@ -229,6 +251,20 @@ impl TokenBackend for OneToken {
     async fn revoke_by_key(&self, _key: &str) -> Result<Option<TokenRecord>> {
         Ok(None)
     }
+
+    async fn delete_expired(&self, _now: u64) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+/// Print what the server logs at `warn` and above into the test's captured
+/// output. A 5xx response says only "Internal Server Error", so this is how a
+/// failing test shows the error behind it.
+pub(super) fn capture_server_logs() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
 }
 
 pub(super) fn app_with_token(tmp: &TempDir, raw: &str, record: TokenRecord) -> axum::Router {
@@ -253,8 +289,23 @@ pub(super) fn app_with_config_and_token(
     raw: &str,
     record: TokenRecord,
 ) -> axum::Router {
-    let tokens: Arc<dyn TokenBackend> = Arc::new(OneToken { raw: raw.to_string(), record });
-    let auth = AuthState { users: Arc::new(UserStore::in_memory()), tokens };
+    capture_server_logs();
+    let mut accounts: std::collections::BTreeSet<String> = TEAMS
+        .iter()
+        .flat_map(|(_, members)| members.iter().map(ToString::to_string))
+        .collect();
+    accounts.insert(record.user_id.clone());
+    let account = Arc::new(OneToken {
+        accounts,
+        raw: raw.to_string(),
+        record,
+        account_reads: std::sync::atomic::AtomicUsize::default(),
+        bulk_reads: std::sync::atomic::AtomicUsize::default(),
+    });
+    let auth = AuthState {
+        users: Arc::clone(&account) as Arc<dyn pnpr_auth::UserBackend>,
+        tokens: account,
+    };
     router_with_auth(config, auth)
 }
 
@@ -319,24 +370,26 @@ async fn team_tokens_reach_package_authorization() {
     let tmp = TempDir::new().unwrap();
     let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let mut config = Config::static_serve(listen, tmp.path().to_path_buf());
-    use pnpr_policy::{AccessToken, Identity};
-    use pnpr_registry::{Ecosystem, PackagePattern};
+    use pnpr_policy::{
+        AccessToken,
+        Identity,
+    };
+    use pnpr_registry::{
+        Ecosystem,
+        PackagePattern,
+    };
     config.routing.hosted.get_mut("local").unwrap().rules = PackageRules::new(
         vec![PackageRule {
             pattern: PackagePattern::parse("@team/*", Ecosystem::Npm).unwrap(),
-            access: Some(AccessList::new(vec![AccessToken::Team {
-                name: "platform".to_string(),
-                directory: TeamDirectory::new(
-                    [("platform".to_string(), ["alice".to_string()].into())].into(),
-                ),
-            }])),
+            access: Some(AccessList::new(vec![AccessToken::Team("developers".to_string())])),
             publish: None,
             unpublish: None,
         }],
         None,
     );
+    seed_teams(&config).await;
     // Team membership reaches the per-package rule evaluation.
-    let alice = Identity::user("alice");
+    let alice = Identity::member("alice", vec!["developers".to_string()]);
     let carol = Identity::user("carol");
     let rules = &config.routing.hosted["local"].rules;
     assert!(
@@ -356,8 +409,8 @@ async fn team_tokens_reach_package_authorization() {
 
     // Over HTTP: the team member reaches storage (404, the package is
     // absent); a caller denied by the *explicit* `@team/*` entry is
-    // rejected loudly — 401 for anonymous, so clients can prompt for
-    // credentials — rather than masked (masking is the registry-level
+    // rejected loudly (401 for anonymous, so clients can prompt for
+    // credentials) rather than masked (masking is the registry-level
     // default's behavior, not an explicit entry's).
     let app = app_with_config_and_token(config, "tok", record(false, &[]));
     let allowed = app
@@ -556,11 +609,6 @@ fn access_log_uri_redacts_the_logout_token_segment() {
         redact("/~corp/-/user/token/npm_secret-token-value"),
         "/~corp/-/user/token/<redacted>",
     );
-    assert_eq!(redact("/-/v1/login/start?session=secret-session-id"), "/-/v1/login/start");
-    assert_eq!(
-        redact("/~corp/-/v1/login/start?session=secret-session-id"),
-        "/~corp/-/v1/login/start",
-    );
     assert_eq!(redact("/-/v1/login/poll/secret-poll-token"), "/-/v1/login/poll/<redacted>");
     assert_eq!(
         redact("/~corp/-/v1/login/poll/secret-poll-token"),
@@ -571,29 +619,27 @@ fn access_log_uri_redacts_the_logout_token_segment() {
     assert_eq!(redact("/-/npm/v1/search?text=foo"), "/-/npm/v1/search?text=foo");
 }
 
-// --------------------------------------------------------------------
-// npm team API — listings from the config-declared `teams:` map,
-// config-managed rejection for mutations, not-found masking for callers
-// the registry-level `access` denies.
-// --------------------------------------------------------------------
+// npm team API: listings of the instance's teams, not-found masking for
+// callers the registry-level `access` denies.
 
-fn config_with_teams(tmp: &TempDir) -> Config {
+/// The teams [`seed_teams`] stores, each under the ID of its name.
+const TEAMS: [(&str, &[&str]); 2] = [("developers", &["bob", "alice"]), ("admins", &["alice"])];
+
+/// Store [`TEAMS`] in the database `config` names.
+async fn seed_teams(config: &Config) {
+    let storage = pnpr_storage::Storage::from_config(&config.storage).unwrap();
+    for (team, members) in TEAMS {
+        storage.create_team(team, team).await.unwrap();
+        for member in members {
+            assert!(storage.add_team_member(team, member).await.unwrap());
+        }
+    }
+}
+
+async fn config_with_teams(tmp: &TempDir) -> Config {
     let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let mut config = Config::static_serve(listen, tmp.path().to_path_buf());
-    let teams = [("developers", vec!["bob", "alice"]), ("admins", vec!["alice"])];
-    let roster = teams
-        .into_iter()
-        .map(|(team, members)| {
-            (
-                team.to_string(),
-                members
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            )
-        })
-        .collect();
-    config.routing.hosted.get_mut("local").unwrap().teams = TeamDirectory::new(roster);
+    let config = Config::static_serve(listen, tmp.path().to_path_buf());
+    seed_teams(&config).await;
     config
 }
 
@@ -605,10 +651,9 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn team_listing_serves_config_declared_teams() {
     let tmp = TempDir::new().unwrap();
-    let app = app_with_config_and_token(config_with_teams(&tmp), "tok", record(false, &[]));
-    // Declaration order is preserved; the shape is what `pnpm team ls`
-    // consumes.
-    let expected = serde_json::json!([{ "name": "developers" }, { "name": "admins" }]);
+    let app = app_with_config_and_token(config_with_teams(&tmp).await, "tok", record(false, &[]));
+    // Sorted by name; the shape is what `pnpm team ls` consumes.
+    let expected = serde_json::json!([{ "id": "admins", "name": "admins" }, { "id": "developers", "name": "developers" }]);
     let response = app
         .clone()
         .oneshot(signed(Method::GET, "/npm/-/org/myorg/team", "tok"))
@@ -628,9 +673,10 @@ async fn team_listing_serves_config_declared_teams() {
 #[tokio::test]
 async fn team_members_are_listed_sorted() {
     let tmp = TempDir::new().unwrap();
-    let app = app_with_config_and_token(config_with_teams(&tmp), "tok", record(false, &[]));
+    let app = app_with_config_and_token(config_with_teams(&tmp).await, "tok", record(false, &[]));
     // Members come from a sorted set, not declaration order.
-    let expected = serde_json::json!([{ "name": "alice" }, { "name": "bob" }]);
+    let expected =
+        serde_json::json!([{ "id": "alice", "name": "alice" }, { "id": "bob", "name": "bob" }]);
     let response = app
         .clone()
         .oneshot(signed(Method::GET, "/npm/-/team/myorg/developers/user", "tok"))
@@ -645,7 +691,7 @@ async fn team_members_are_listed_sorted() {
         .unwrap();
     assert_eq!(prefixed.status(), StatusCode::OK);
     assert_eq!(body_json(prefixed).await, expected);
-    // A team the config does not declare is a definitive not-found.
+    // A team that does not exist is a definitive not-found.
     let missing = app
         .oneshot(signed(Method::GET, "/npm/-/team/myorg/nope/user", "tok"))
         .await
@@ -654,42 +700,15 @@ async fn team_members_are_listed_sorted() {
 }
 
 #[tokio::test]
-async fn team_mutations_are_rejected_as_config_managed() {
-    let tmp = TempDir::new().unwrap();
-    let app = app_with_config_and_token(config_with_teams(&tmp), "tok", record(false, &[]));
-    let mutations = [
-        (Method::PUT, "/npm/-/org/myorg/team"),
-        (Method::DELETE, "/npm/-/team/myorg/developers"),
-        (Method::PUT, "/npm/-/team/myorg/developers/user"),
-        (Method::DELETE, "/npm/-/team/myorg/developers/user"),
-        (Method::PUT, "/npm/~local/-/org/myorg/team"),
-        (Method::DELETE, "/npm/~local/-/team/myorg/developers"),
-        (Method::PUT, "/npm/~local/-/team/myorg/developers/user"),
-        (Method::DELETE, "/npm/~local/-/team/myorg/developers/user"),
-    ];
-    for (method, path) in mutations {
-        let response = app
-            .clone()
-            .oneshot(signed(method.clone(), path, "tok"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("declared in the pnpr configuration"), "{method} {path}: {body}");
-    }
-}
-
-#[tokio::test]
 async fn team_listing_masks_callers_the_registry_denies() {
     let tmp = TempDir::new().unwrap();
-    let mut config = config_with_teams(&tmp);
+    let mut config = config_with_teams(&tmp).await;
     // Registry-level default access admits only authenticated callers.
     config.routing.hosted.get_mut("local").unwrap().rules =
         PackageRules::new(Vec::new(), Some(AccessList::from_tokens(["$authenticated"])));
     let app = app_with_config_and_token(config, "tok", record(false, &[]));
     // An anonymous caller gets the not-found mask on reads and mutations
-    // alike — team names must not become an existence probe.
+    // alike, team names must not become an existence probe.
     for (method, path) in [
         (Method::GET, "/npm/-/org/myorg/team"),
         (Method::GET, "/npm/-/team/myorg/developers/user"),
@@ -765,7 +784,7 @@ async fn stored_tokens_with_jwt_shape_keep_their_backend_restrictions() {
     let mut config = Config::static_serve("127.0.0.1:0".parse().unwrap(), tmp.path().to_path_buf());
     config.identity.auth.oidc = serde_json::from_value(serde_json::json!([{
         "name": "github", "issuer": "https://token.actions.githubusercontent.com", "audience": "pnpr",
-        "workloads": [{"identity": {"subject": "repo:org/repo:ref:refs/heads/main", "username": "ci"},
+        "workloads": [{"identity": {"subject": "repo:org/repo:ref:refs/heads/main", "userId": "ci"},
             "registry": "local", "packages": ["foo"]}]
     }])).unwrap();
     let token = "header.payload.signature";
@@ -789,7 +808,7 @@ async fn post_v1_login_uses_peer_addr_fallback_for_rate_limiting() {
     config.http.public_url = "https://registry.example".to_string();
     config.identity.auth.oidc = serde_json::from_value(serde_json::json!([{
         "name": "login_provider", "issuer": "https://login.example", "audience": "pnpr",
-        "login": { "users": [{ "subject": "alice", "username": "alice" }] },
+        "login": { "users": [{ "subject": "alice", "userId": "alice" }] },
     }]))
     .unwrap();
     let app = crate::router(config);
@@ -844,4 +863,64 @@ async fn post_v1_login_uses_peer_addr_fallback_for_rate_limiting() {
             .status(),
         StatusCode::ACCEPTED,
     );
+}
+
+#[async_trait]
+impl pnpr_auth::UserBackend for OneToken {
+    async fn account_id(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.accounts.contains(name).then(|| name.to_string()))
+    }
+    async fn account_name(&self, id: &str) -> Result<Option<String>> {
+        self.account_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.accounts.contains(id).then(|| id.to_string()))
+    }
+    async fn accounts_by_id(&self, ids: &[String]) -> Result<Vec<pnpr_auth::UserAccount>> {
+        self.bulk_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(ids
+            .iter()
+            .filter(|id| self.accounts.contains(*id))
+            .map(|id| pnpr_auth::UserAccount { id: id.clone(), username: id.clone() })
+            .collect())
+    }
+
+    async fn list_users(&self) -> Result<Vec<String>> {
+        Ok(vec![self.record.user_id.clone()])
+    }
+    async fn credential(&self, _name: &str) -> Result<Option<pnpr_auth::AccountCredential>> {
+        Ok(None)
+    }
+    async fn active_account_id(&self, name: &str) -> Result<Option<String>> {
+        self.account_id(name).await
+    }
+    async fn active_account_name(&self, id: &str) -> Result<Option<String>> {
+        self.account_name(id).await
+    }
+    async fn account_status(&self, id: &str) -> Result<Option<pnpr_auth::AccountStatus>> {
+        Ok(self.accounts.contains(id).then_some(pnpr_auth::AccountStatus::Active))
+    }
+    async fn add_or_login(
+        &self,
+        _name: &str,
+        _password: &str,
+    ) -> Result<(pnpr_auth::UpsertOutcome, String)> {
+        unreachable!()
+    }
+    async fn create_user(&self, _name: &str, _password: &str) -> Result<pnpr_auth::UserCreation> {
+        unreachable!()
+    }
+    async fn set_password(&self, _id: &str, _password: &str) -> Result<pnpr_auth::PasswordChange> {
+        unreachable!()
+    }
+    async fn clear_password(&self, _id: &str) -> Result<pnpr_auth::PasswordChange> {
+        unreachable!()
+    }
+    async fn delete_user(&self, _id: &str) -> Result<pnpr_auth::UserRemoval> {
+        unreachable!()
+    }
+    async fn rename_user(&self, _id: &str, _name: &str) -> Result<()> {
+        unreachable!()
+    }
+    async fn provision_user(&self, _name: &str) -> Result<String> {
+        unreachable!()
+    }
 }

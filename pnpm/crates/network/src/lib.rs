@@ -1,32 +1,90 @@
-#[cfg(target_family = "wasm")]
 pub(crate) use pnpm_process as process;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) use std::process;
 
 #[cfg(target_family = "wasm")]
 extern crate pnpm_http as reqwest;
 
-pub use address_guard::{AddressGuard, GuardedDnsResolver, is_public_address};
+pub use address_guard::{
+    AddressGuard,
+    GuardedDnsResolver,
+    is_public_address,
+};
 pub use auth::{
-    AuthHeaders, AuthHeadersByScope, DEFAULT_REGISTRY_SCOPE, MetadataCacheScope, UpstreamRouteHook,
-    base64_encode, base64_encode_bytes, hide_auth_information, is_url_secure_for_credentials,
-    nerf_dart, normalize_auth_key, redact_and_sanitize, redact_and_sanitize_multiline,
-    redact_npm_auth_key, redact_url_credentials, redact_url_for_display,
+    AuthHeaders,
+    AuthHeadersByScope,
+    DEFAULT_REGISTRY_SCOPE,
+    LocalFetch,
+    LocalResponse,
+    MetadataCacheScope,
+    UpstreamRouteHook,
+    base64_encode,
+    base64_encode_bytes,
+    hide_auth_information,
+    is_url_secure_for_credentials,
+    nerf_dart,
+    normalize_auth_key,
+    redact_and_sanitize,
+    redact_and_sanitize_multiline,
+    redact_npm_auth_key,
+    redact_url_credentials,
+    redact_url_for_display,
+    strip_insecure_url_credentials,
 };
 pub use certificates::bundled_root_certs;
-pub use client_builder::{default_network_concurrency, native_dns_resolver};
-pub use error_chain::{is_permanent_error, walk_reqwest_chain};
-pub use limited_body::{BodyChunks, LimitedBody, read_limited_body, read_self_delimiting_body};
-pub use proxy::{NoProxySetting, ProxyConfig, ProxyError};
-pub use redirect_guard::{RedirectGuard, origins_redirect_guard};
-pub use retry::{
-    RetryOpts, retry_async, send_with_retry, send_with_retry_at_priority, should_retry_status,
+pub use client_builder::{
+    default_network_concurrency,
+    native_dns_resolver,
 };
-pub use tls::{PerRegistryTls, RegistryTls, TlsConfig, TlsError};
-pub use token_helper::{TokenHelperOutput, TokenHelperRunner};
+pub use error_chain::{
+    is_permanent_error,
+    walk_reqwest_chain,
+};
+pub use limited_body::{
+    BodyChunks,
+    LimitedBody,
+    read_limited_body,
+    read_limited_self_delimiting_body,
+    read_self_delimiting_body,
+};
+pub use package_request::PackageRequest;
+pub use proxy::{
+    NoProxySetting,
+    ProxyConfig,
+    ProxyError,
+};
+pub use redirect_guard::{
+    RedirectGuard,
+    is_blocked_redirect,
+    origins_redirect_guard,
+};
+pub use requests::{
+    HeadError,
+    ScopedGetOptions,
+    scoped_redirect_auth,
+};
+pub use retry::{
+    RetryOpts,
+    retry_async,
+    send_with_retry,
+    send_with_retry_at_priority,
+    should_retry_status,
+};
+pub use tls::{
+    PerRegistryTls,
+    RegistryTls,
+    TlsConfig,
+    TlsError,
+};
+pub use token_helper::{
+    TokenHelperOutput,
+    TokenHelperRunner,
+};
 pub use url_encoding::{
-    canonicalize_npm_registry_url, encode_package_name, encode_uri_component, escaped_package_name,
-    normalize_registry_url, percent_decode_str,
+    canonicalize_npm_registry_url,
+    encode_package_name,
+    encode_uri_component,
+    escaped_package_name,
+    normalize_registry_url,
+    percent_decode_str,
 };
 
 mod address_guard;
@@ -35,6 +93,7 @@ mod error_chain;
 mod host_socket_limit;
 mod limited_body;
 mod origin_gate;
+mod package_request;
 mod priority_semaphore;
 mod proxy;
 mod redirect_guard;
@@ -48,23 +107,50 @@ mod token_helper;
 mod url_encoding;
 
 use host_socket_limit::HostSocketLimit;
-use origin_gate::{OriginLimits, OriginPermit};
-use priority_semaphore::{Permit, PrioritySemaphore};
-use proxy::{NoProxyMatcher, parse_proxy_url, strip_userinfo};
+use origin_gate::{
+    OriginLimits,
+    OriginPermit,
+};
+use priority_semaphore::{
+    Permit,
+    PrioritySemaphore,
+};
+use proxy::{
+    NoProxyMatcher,
+    parse_proxy_url,
+    strip_userinfo,
+};
 use registry_limit::RegistryLimits;
 #[cfg(not(target_family = "wasm"))]
 use reqwest::dns::Addrs;
 use reqwest::{
-    Certificate, Client, Identity, Proxy,
-    dns::{Name, Resolve, Resolving},
-    header::{HeaderMap, HeaderValue, USER_AGENT},
+    Certificate,
+    Client,
+    Identity,
+    Proxy,
+    dns::{
+        Name,
+        Resolve,
+        Resolving,
+    },
+    header::{
+        HeaderMap,
+        HeaderValue,
+        USER_AGENT,
+    },
 };
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
     ops::Deref,
-    sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        LazyLock,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 use tokio::sync::Semaphore;
 
@@ -88,20 +174,20 @@ pub const DEFAULT_USER_AGENT: &str = "pnpm";
 
 /// Permit priority used by [`ThrottledClient::acquire`] /
 /// [`ThrottledClient::acquire_for_url`] for callers that don't pass an
-/// explicit one. Marks the request as latency class — packument and
-/// other metadata fetches that gate resolution progress — served FIFO
+/// explicit one. Marks the request as latency class (packument and
+/// other metadata fetches that gate resolution progress) served FIFO
 /// and preferred over size-prioritized downloads beyond the downloads'
-/// reserved share of the pool (see the `priority_semaphore` module
+/// reserved share of the pool (see the priority semaphore module
 /// docs for the grant policy).
 pub const UNPRIORITIZED: u64 = u64::MAX;
 
 /// Priority sentinel for the background class: metadata fetches whose
 /// deadline is the end of the install rather than the next resolution
-/// step — the lockfile-verification fan-out. A background request is
+/// step, the lockfile-verification fan-out. A background request is
 /// granted a slot only when no [`UNPRIORITIZED`] (latency-class)
 /// request is queued, so bulk verification never queue-jumps the
 /// resolver's critical-path packument fetches (see the
-/// `priority_semaphore` module docs for the full grant policy).
+/// priority semaphore module docs for the full grant policy).
 pub const BACKGROUND: u64 = u64::MAX - 1;
 
 /// Highest priority a throughput-class (download) request may carry.
@@ -124,6 +210,10 @@ pub const DEFAULT_FETCH_WARN_TIMEOUT_MS: u64 = 10_000;
 /// `fetchMinSpeedKiBps` default of `50`.
 pub const DEFAULT_FETCH_MIN_SPEED_KI_BPS: u64 = 50;
 
+/// Default ceiling, in bytes, on the summed size of the files one package
+/// archive may unpack to: the `maxTarballUnpackedSize` default of 4 GiB.
+pub const DEFAULT_MAX_TARBALL_UNPACKED_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Default socket limit per host/origin when `maxSockets` is not explicitly configured
 /// (used for proxied connections, matching undici / pnpm v11).
 pub const DEFAULT_MAX_SOCKETS: usize = 50;
@@ -136,7 +226,7 @@ pub const DEFAULT_MAX_SOCKETS: usize = 50;
 /// resolved values here.
 #[derive(Debug, Clone)]
 pub struct NetworkSettings {
-    /// Maximum number of concurrent in-flight network requests — the
+    /// Maximum number of concurrent in-flight network requests, the
     /// semaphore size. Default: [`default_network_concurrency`].
     pub network_concurrency: usize,
 
@@ -178,26 +268,26 @@ impl Default for NetworkSettings {
 }
 
 /// Wrapper around [`Client`] with a concurrent request limit enforced
-/// by a priority-ordered semaphore (`priority_semaphore` module).
+/// by a priority-ordered semaphore.
 ///
 /// Holds a default [`Client`] for the top-level proxy / TLS config
 /// plus an optional map of per-registry clients keyed by nerf-darted
 /// URI. [`Self::acquire_for_url`] picks the right client based on the
 /// request URL (a 5-step fallback), and [`Self::acquire`] always uses
-/// the default client. The semaphore is shared across both — bounding
+/// the default client. The semaphore is shared across both, bounding
 /// the total
 /// concurrent socket count regardless of which registry a request
 /// targets.
 ///
 /// When the pool saturates, freed slots are granted by the class policy
-/// in the `priority_semaphore` module docs.
+/// in the priority semaphore module docs.
 #[derive(Debug)]
 pub struct ThrottledClient {
     semaphore: PrioritySemaphore,
     default_clients: ClientSet,
     /// Per-registry clients keyed by nerf-darted URI. Empty when no
     /// `//host/:cert=…` / `:key=…` / `:ca=…` / `:cafile=…` /
-    /// `:certfile=…` / `:keyfile=…` `.npmrc` entries are present —
+    /// `:certfile=…` / `:keyfile=…` `.npmrc` entries are present,
     /// in which case `acquire_for_url` short-circuits to the default
     /// client without paying the routing cost.
     per_registry: tls::PerRegistryMap<ClientSet>,
@@ -242,7 +332,7 @@ impl ProxyRouting {
 /// with `port() == None`), so an explicit default and the implicit form map to
 /// the same origin key and a `:443` / `:80` variation cannot fragment the
 /// per-origin socket cap; a non-default port (`https://host:8443`) stays
-/// distinct — matching undici's per-origin keying.
+/// distinct, matching undici's per-origin keying.
 pub(crate) fn origin_of_url(url: &reqwest::Url) -> Option<String> {
     let host = url.host_str()?;
     Some(match url.port() {
@@ -265,7 +355,7 @@ pub(crate) fn origin_of_url(url: &reqwest::Url) -> Option<String> {
 /// real concurrent socket count. Under `try_join_all` fan-out the
 /// next batch of permits then `connect()` while previous bodies are
 /// still draining, and the per-process FD count overruns the
-/// platform limit — surfacing as `EMFILE` "too many open files".
+/// platform limit, surfacing as `EMFILE` "too many open files".
 pub struct ThrottledClientGuard<'a> {
     permit: Permit,
     /// The per-origin `maxSockets` permit, held for the same request lifetime
@@ -285,8 +375,8 @@ pub struct ThrottledResponse {
     _permit: Permit,
     _host_permit: Option<Permit>,
     _origin_permit: Option<OriginPermit>,
-    body_timeout: Duration,
-    received_at: Instant,
+    /// How long [`Self::bytes_stream`] waits for each chunk of the body.
+    idle_timeout: Duration,
 }
 
 impl ThrottledClientGuard<'_> {
@@ -299,19 +389,20 @@ impl ThrottledClientGuard<'_> {
     }
 
     /// Transfer both concurrency permits to the response body owner.
+    /// `idle_timeout` bounds each wait for more of the body, not the whole
+    /// transfer, so a body that keeps arriving is read to its end.
     #[must_use]
     pub fn retain_for_body(
         self,
         response: reqwest::Response,
-        body_timeout: Duration,
+        idle_timeout: Duration,
     ) -> ThrottledResponse {
         ThrottledResponse {
             response,
             _permit: self.permit,
             _host_permit: self.host_permit,
             _origin_permit: self.origin_permit,
-            body_timeout,
-            received_at: Instant::now(),
+            idle_timeout,
         }
     }
 }
@@ -328,7 +419,7 @@ impl ThrottledResponse {
         response.bytes().await
     }
 
-    /// Buffer at most one channel chunk. The producer deadline and cancellation
+    /// Buffer at most one channel chunk. The idle timeout and cancellation
     /// remain active even while the consumer stops polling the stream.
     pub fn bytes_stream(
         mut self,
@@ -336,20 +427,9 @@ impl ThrottledResponse {
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let (completion_sender, completion) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let remaining = self.body_timeout.saturating_sub(self.received_at.elapsed());
             let result = tokio::select! {
                 () = sender.closed() => Ok(()),
-                result = tokio::time::timeout(remaining, async {
-                    while let Some(chunk) = self.response.chunk().await.map_err(std::io::Error::other)? {
-                        if sender.send(chunk).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                    Ok(())
-                }) => result.unwrap_or_else(|_| Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "upstream response body deadline exceeded",
-                ))),
+                result = self.forward_body(&sender) => result,
             };
             drop(self);
             let _ = completion_sender.send(result);
@@ -367,6 +447,36 @@ impl ThrottledResponse {
     }
 }
 
+impl ThrottledResponse {
+    /// Send each chunk of the body to `sender`. Fails when the next chunk
+    /// takes longer than the idle timeout to arrive, or the reader takes
+    /// longer than it to accept one, so a stalled reader releases the
+    /// permits too.
+    async fn forward_body(
+        &mut self,
+        sender: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    ) -> std::io::Result<()> {
+        let stalled = |what: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{what} stalled past the timeout"),
+            )
+        };
+        loop {
+            let chunk = tokio::time::timeout(self.idle_timeout, self.response.chunk())
+                .await
+                .map_err(|_| stalled("the upstream response body"))?
+                .map_err(std::io::Error::other)?;
+            let Some(chunk) = chunk else { return Ok(()) };
+            match tokio::time::timeout(self.idle_timeout, sender.send(chunk)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Ok(()),
+                Err(_) => return Err(stalled("the reader of the response body")),
+            }
+        }
+    }
+}
+
 impl Deref for ThrottledResponse {
     type Target = reqwest::Response;
 
@@ -380,8 +490,7 @@ impl std::fmt::Debug for ThrottledResponse {
         formatter
             .debug_struct("ThrottledResponse")
             .field("response", &self.response)
-            .field("body_timeout", &self.body_timeout)
-            .field("received_at", &self.received_at)
+            .field("idle_timeout", &self.idle_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -448,7 +557,7 @@ impl ThrottledClient {
     ///
     /// Takes `url` as `&str` so callers don't have to round-trip
     /// `format!("{registry}{name}")` strings through `Url::parse`
-    /// just to satisfy the type signature — the lookup itself works
+    /// just to satisfy the type signature, the lookup itself works
     /// on the raw string form.
     pub async fn acquire_for_url(&self, url: &str) -> ThrottledClientGuard<'_> {
         self.acquire_for_url_with_priority(url, UNPRIORITIZED).await
@@ -527,7 +636,7 @@ where
 }
 
 /// Error surface of [`ThrottledClient::for_installs`]. Wraps either a
-/// proxy URL failure or a TLS material failure — the caller gets one
+/// proxy URL failure or a TLS material failure, the caller gets one
 /// error type to handle regardless of which side of `for_installs`
 /// rejected the input.
 #[derive(Debug, derive_more::Display, derive_more::Error, miette::Diagnostic)]
@@ -541,8 +650,8 @@ pub enum ForInstallsError {
 
     /// `network_concurrency` resolved to `0`. A zero-permit semaphore
     /// would make every `acquire` block forever, hanging the install.
-    /// pnpm rejects the same value — its `p-queue` throws
-    /// `Expected concurrency to be a number from 1 and up` — so pacquet
+    /// pnpm rejects the same value (its `p-queue` throws
+    /// `Expected concurrency to be a number from 1 and up`) so pacquet
     /// fails fast rather than deadlock.
     #[display("networkConcurrency must be at least 1")]
     ZeroNetworkConcurrency,
@@ -582,15 +691,29 @@ impl Default for ThrottledClient {
 mod certificates;
 #[cfg(target_vendor = "apple")]
 use certificates::is_platform_verifier_available;
-use certificates::{AppliedTls, TrustRoots, apply_tls, load_node_extra_ca_certs, merge_tls};
+use certificates::{
+    AppliedTls,
+    TrustRoots,
+    apply_tls,
+    load_node_extra_ca_certs,
+    merge_tls,
+};
 
 mod client_set;
-use client_set::{ClientPair, ClientSet, OwnedClientInputs};
+use client_set::{
+    ClientPair,
+    ClientSet,
+    OwnedClientInputs,
+};
 
 mod client_builder;
 use client_builder::{
-    CappedDnsResolver, ClientBuildInputs, ClientVariant, build_client_with_root_fallback,
-    configured_proxy, is_redirect_status,
+    CappedDnsResolver,
+    ClientBuildInputs,
+    ClientVariant,
+    build_client_with_root_fallback,
+    configured_proxy,
+    is_redirect_status,
 };
 use redirect_guard::MAX_REDIRECT_HOPS;
 

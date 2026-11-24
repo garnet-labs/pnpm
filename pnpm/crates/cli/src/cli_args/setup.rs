@@ -1,4 +1,4 @@
-//! `pacquet setup` — make pnpm available for global use.
+//! `pacquet setup`: make pnpm available for global use.
 //!
 //! The CLI is installed into the global packages directory, the `pn` /
 //! `pnpx` / `pnx` alias scripts are written into `$PNPM_HOME/bin`, and
@@ -9,17 +9,43 @@
 mod gh_actions_env;
 mod path_extender;
 
+use super::shadowing_pnpm::{
+    SetupPathEntry,
+    warn_if_shadowed_after_setup,
+};
 use crate::process::Command;
 use clap::Args;
-use miette::{Context, IntoDiagnostic};
-use path_extender::{
-    AddDirToEnvPathOpts, AddingPosition, ConfigFileChangeType, ConfigReport, PathExtenderError,
-    PathExtenderReport, sh_quote,
+use miette::{
+    Context,
+    IntoDiagnostic,
 };
-use pnpm_config::{Host, PNPM_VERSION, default_pnpm_home_dir, ensure_windows_home_dir_env};
+use path_extender::{
+    AddDirToEnvPathOpts,
+    AddingPosition,
+    ConfigFileChangeType,
+    ConfigReport,
+    PathExtenderError,
+    PathExtenderReport,
+    pwsh_quote,
+    sh_quote,
+};
+use pnpm_config::{
+    Host,
+    PNPM_VERSION,
+    default_pnpm_home_dir,
+    ensure_windows_home_dir_env,
+};
 use pnpm_fs::write_atomic;
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
-use std::{fs, path::Path};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
+use std::{
+    fs,
+    path::Path,
+};
 
 #[derive(Debug, Args)]
 pub struct SetupArgs {
@@ -89,12 +115,14 @@ fn handler<Reporter: self::Reporter + 'static>(
             .wrap_err("create the pnpm alias scripts")?;
     }
 
-    let output = if no_modify_path {
-        render_unmodified_path_output(&pnpm_home_dir, &ManualSetupShell::current())
+    let (output, path_entry) = if no_modify_path {
+        let shell = ManualSetupShell::current();
+        (render_unmodified_path_output(&pnpm_home_dir, &shell), SetupPathEntry::LeftAlone)
     } else {
         add_pnpm_home_to_env::<Reporter>(force, &pnpm_home_dir, &bin_dir, dir)?
     };
     remove_legacy_homedir_shims(&pnpm_home_dir);
+    warn_if_shadowed_after_setup::<Reporter>(&bin_dir, &path_entry, &dir.to_string_lossy());
     Ok(output)
 }
 
@@ -110,17 +138,20 @@ fn env_path_opts(force: bool) -> AddDirToEnvPathOpts<'static> {
 }
 
 /// Add `PNPM_HOME` and its `bin` directory to the user's environment and, on
-/// GitHub Actions, to the rest of the job.
+/// GitHub Actions, to the rest of the job. A setup that falls back to manual
+/// instructions leaves `PATH` alone.
 fn add_pnpm_home_to_env<Reporter: self::Reporter + 'static>(
     force: bool,
     pnpm_home_dir: &Path,
     bin_dir: &Path,
     dir: &Path,
-) -> miette::Result<String> {
+) -> miette::Result<(String, SetupPathEntry)> {
     let env_path_result = path_extender::add_dir_to_env_path(pnpm_home_dir, &env_path_opts(force));
+    let path_entry =
+        SetupPathEntry::after_env_update(&env_path_result, path_extender::persisted_path_dirs);
     let output = render_env_path_outcome(env_path_result, pnpm_home_dir)?;
     gh_actions_env::write_gh_actions_env_files::<Reporter, Host>(dir, pnpm_home_dir, bin_dir);
-    Ok(output)
+    Ok((output, path_entry))
 }
 
 /// The output of a setup whose CLI install succeeded.
@@ -209,15 +240,10 @@ fn posix_env_lines(pnpm_home_dir: &Path) -> String {
 }
 
 fn powershell_env_lines(pnpm_home_dir: &Path) -> String {
-    let mut quoted_home = String::new();
-    for character in pnpm_home_dir.to_string_lossy().chars() {
-        quoted_home.push(character);
-        // PowerShell also treats typographic apostrophes as string delimiters.
-        if matches!(character, '\'' | '\u{2018}'..='\u{201b}') {
-            quoted_home.push(character);
-        }
-    }
-    format!("$env:PNPM_HOME = '{quoted_home}'\n$env:Path = \"$env:PNPM_HOME\\bin;$env:Path\"")
+    format!(
+        "$env:PNPM_HOME = {}\n$env:Path = \"$env:PNPM_HOME\\bin;$env:Path\"",
+        pwsh_quote(&pnpm_home_dir.to_string_lossy()),
+    )
 }
 
 /// Install the CLI as a global package using `pnpm add -g file:<dir>`,
@@ -248,8 +274,8 @@ fn install_cli_globally<Reporter: self::Reporter + 'static>(
     }
 
     info::<Reporter>(
-        &prefix_dir.to_string_lossy(),
-        &format!("Installing pnpm CLI globally from {}", exec_dir.display()),
+        prefix_dir.to_string_lossy().into_owned(),
+        format!("Installing pnpm CLI globally from {}", exec_dir.display()),
     );
 
     // The published `pnpm` package ships a preinstall/postinstall pair that
@@ -279,7 +305,7 @@ fn install_cli_globally<Reporter: self::Reporter + 'static>(
 
     let status = status.into_diagnostic().wrap_err("run the global pnpm install")?;
     if !status.success() {
-        let code = status.code().map_or_else(|| "unknown".to_string(), |code| code.to_string());
+        let code = exit_code_label(status.code());
         return Err(miette::miette!("Failed to install pnpm globally (exit code {code})"));
     }
     cleanup
@@ -330,6 +356,10 @@ fn create_alias_scripts(target_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn exit_code_label(code: Option<i32>) -> String {
+    code.map(|code| code.to_string()).unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Write one alias, `subcommand` being the shell text it appends to the pnpm
 /// call (`" dlx"` for `pnpx` and `pnx`).
 ///
@@ -345,7 +375,7 @@ fn create_shell_script(target_dir: &Path, name: &str, subcommand: &str) -> std::
     // of the running pnpm executable, and Linux refuses that open with ETXTBSY.
     write_atomic(&script_path, posix_alias_script(name, subcommand).as_bytes())?;
     #[cfg(target_os = "wasi")]
-    pnpm_fs::file_mode::set_path_permissions(&script_path, 0o755)?;
+    pnpm_fs::file_mode::set_path_permissions(&script_path, pnpm_fs::FileMode::from_mode(0o755))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -359,6 +389,10 @@ fn create_shell_script(target_dir: &Path, name: &str, subcommand: &str) -> std::
 }
 
 /// The `sh` form of an alias, which reaches the sibling `pnpm` shim.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(perfectionist::em_dash_prose, reason = "pnpm v11 writes the same script")
+)]
 fn posix_alias_script(name: &str, subcommand: &str) -> String {
     format!(
         r#"#!/bin/sh
@@ -404,10 +438,11 @@ while [ -n "$rest" ]; do
 done
 # An empty PATH searches the current directory.
 PATH=${helper_path:-/}
-# A helper comes from PATH only when the default path lacks it and PATH has it.
-# The bash 3.2 that macOS ships as sh answers `command -p -v` from PATH.
+# A helper comes from PATH only when /usr/bin and /bin lack it and PATH has it.
+# `command -p -v` cannot tell, because the bash 3.2 that macOS ships as sh
+# answers it from PATH. `[ -x ]` also fails where a sandbox denies the file.
 run_helper() {
-  if command -p -v "$1" >/dev/null 2>&1 || ! command -v "$1" >/dev/null 2>&1; then command -p "$@"; else command "$@"; fi
+  if [ -x "/usr/bin/$1" ] || [ -x "/bin/$1" ] || ! command -v "$1" >/dev/null 2>&1; then command -p "$@"; else command "$@"; fi
 }
 self=$0
 # MSYS and Cygwin can launch this with a native Windows path, which has no slash
@@ -502,8 +537,9 @@ fn render_setup_output(report: &PathExtenderReport) -> String {
     output.push(format!("The following configuration changes were made:\n{}", report.new_settings));
     match &report.config_file {
         None => output.push("Setup complete. Open a new terminal to start using pnpm.".to_string()),
-        Some(config_file) if config_file.change_type != ConfigFileChangeType::Skipped => output
-            .push(format!("To start using pnpm, run:\nsource {}\n", config_file.path.display())),
+        Some(config_file) if config_file.change_type != ConfigFileChangeType::Skipped => {
+            output.push(format!("To start using pnpm, run:\n{}\n", config_file.reload_command()));
+        }
         Some(_) => {}
     }
     output.join("\n\n")
@@ -519,12 +555,8 @@ fn report_config_change(config_report: &ConfigReport) -> String {
     }
 }
 
-fn info<Reporter: self::Reporter>(prefix: &str, message: &str) {
-    Reporter::emit(&LogEvent::Pnpm(PnpmLog {
-        level: LogLevel::Info,
-        message: message.to_string(),
-        prefix: prefix.to_string(),
-    }));
+fn info<Reporter: self::Reporter>(prefix: String, message: String) {
+    Reporter::emit(&LogEvent::Pnpm(PnpmLog { level: LogLevel::Info, message, prefix }));
 }
 
 #[cfg(test)]

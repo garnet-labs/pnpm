@@ -3,22 +3,45 @@
 
 mod native;
 
-use super::{TarballLocation, failure, fetch_location};
+use super::{
+    TarballLocation,
+    failure,
+    fetch_location,
+};
 use crate::{
-    AllowBuildPolicy, InstallPackageBySnapshotError, install_package_by_snapshot::walk_directory,
+    AllowBuildPolicy,
+    InstallPackageBySnapshotError,
+    install_package_by_snapshot::walk_directory,
 };
 use miette::Diagnostic;
-use pnpm_config::{Config, PmOnFail};
+use pnpm_config::{
+    Config,
+    PmOnFail,
+};
 use pnpm_directory_fetcher::CopyFiles;
 use pnpm_fs::lexical_normalize;
-use pnpm_hooks::{CustomFetcher, FetcherCallback, FetcherMethod};
-use pnpm_lockfile::{DirectoryResolution, LockfileResolution};
+use pnpm_hooks::{
+    CustomFetcher,
+    FetcherCallback,
+    FetcherMethod,
+};
+use pnpm_lockfile::{
+    DirectoryResolution,
+    LockfileResolution,
+};
 use pnpm_reporter::Reporter;
-use pnpm_tarball::{FetchErrorDetails, FetchedTarball, IngestTarballToStore};
+use pnpm_tarball::{
+    FetchErrorDetails,
+    FetchedTarball,
+    IngestTarballToStore,
+};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -155,8 +178,8 @@ pub(super) async fn drive_fetcher<Reporter: self::Reporter>(
     Ok((result, verified))
 }
 
-fn callback_error(message: impl Into<String>, code: &str) -> FetchErrorDetails {
-    FetchErrorDetails { message: message.into(), code: Some(code.to_owned()), status: None }
+fn callback_error(message: impl Into<String>, code: impl Into<String>) -> FetchErrorDetails {
+    FetchErrorDetails { message: message.into(), code: Some(code.into()), status: None }
 }
 
 async fn run_callback<Reporter: self::Reporter>(
@@ -236,7 +259,8 @@ fn callback_lockfile_dir<'a>(
     callback.options
         .get("lockfileDir")
         .and_then(Value::as_str)
-        .map_or(native.lockfile_dir, Path::new)
+        .map(Path::new)
+        .unwrap_or(native.lockfile_dir)
 }
 
 /// `fetchers.directory`. A directory has no archive digest, see
@@ -256,7 +280,7 @@ fn walk_callback_directory(
         ));
     };
     let directory = lexical_normalize(&callback_lockfile_dir(native, callback).join(relative));
-    let output = walk_directory(&directory, native.files)
+    let output = walk_directory(directory.clone(), native.files)
         .map_err(|error| FetchErrorDetails {
             message: error.to_string(),
             code: error.code().map(|code| code.to_string()),
@@ -313,8 +337,8 @@ async fn temp_dir(download: &IngestTarballToStore<'_>) -> Result<Value, FetchErr
 ///
 /// Each callback answers for one transport, so the URL has to name that
 /// transport and no other. Without the positive test on the remote
-/// side, a scheme neither fetcher handles — `ftp:`, `data:`, a bare
-/// path — counts as remote and fails deep in the HTTP client instead of
+/// side, a scheme neither fetcher handles, `ftp:`, `data:`, a bare
+/// path, counts as remote and fails deep in the HTTP client instead of
 /// here.
 fn callback_location(
     callback: &FetcherCallback,

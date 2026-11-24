@@ -1,10 +1,29 @@
 use super::{
     super::{
-        Arc, HashSet, InstallError, Lockfile, LogEvent, LogLevel, Path, PathBuf, PnpmLog, Reporter,
-        emit_initial_package_manifest, report_merged_lockfile_conflicts,
+        Arc,
+        HashSet,
+        InstallError,
+        Lockfile,
+        LogEvent,
+        LogLevel,
+        Path,
+        PathBuf,
+        PnpmLog,
+        Reporter,
+        emit_initial_package_manifest,
+        report_merged_lockfile_conflicts,
     },
-    HookedManifests, InstallOwned, InstallView, RunMode, resolve_pnpmfile_hook,
-    workspace::{InstallScope, InstallWorkspace, report_install_scope_cycles, workspace_projects},
+    HookedManifests,
+    InstallOwned,
+    InstallView,
+    RunMode,
+    resolve_pnpmfile_hook,
+    workspace::{
+        InstallScope,
+        InstallWorkspace,
+        report_install_scope_cycles,
+        workspace_projects,
+    },
 };
 use pnpm_config::Config;
 
@@ -27,9 +46,9 @@ pub(super) async fn load_lockfiles<'a, Reporter: self::Reporter + 'static>(
     workspace: &InstallWorkspace<'a>,
     scope: &InstallScope<'a>,
     selection: Option<&crate::WorkspaceInstallSelection<'_>>,
-    discovery: (&HashSet<PathBuf>, Option<&[pnpm_workspace::Project]>),
+    discovery: (&mut super::super::InstallManifestOptions<'_>, Option<&[pnpm_workspace::Project]>),
 ) -> Result<Loaded<'a>, InstallError> {
-    let (pre_hooked_paths, loaded_workspace_projects) = discovery;
+    let (manifest_options, loaded_workspace_projects) = discovery;
     let StartedLockfiles {
         wanted,
         current_lockfile_task,
@@ -44,7 +63,7 @@ pub(super) async fn load_lockfiles<'a, Reporter: self::Reporter + 'static>(
     )?;
     announce_manifest_load::<Reporter>(install);
     let (pnpmfile_hook, manifests) =
-        load_hooked_manifests::<Reporter>(install, owned, workspace, scope, pre_hooked_paths)
+        resolve_or_load_manifests::<Reporter>(install, owned, workspace, scope, manifest_options)
             .await?;
     Ok(Loaded {
         wanted,
@@ -58,6 +77,34 @@ pub(super) async fn load_lockfiles<'a, Reporter: self::Reporter + 'static>(
         pnpmfile_hook,
         manifests,
     })
+}
+
+async fn resolve_or_load_manifests<Reporter: self::Reporter + 'static>(
+    install: InstallView<'_>,
+    owned: &mut InstallOwned,
+    workspace: &InstallWorkspace<'_>,
+    scope: &InstallScope<'_>,
+    manifest_options: &mut super::super::InstallManifestOptions<'_>,
+) -> Result<(Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>, HookedManifests), InstallError> {
+    if let Some(manifests) = manifest_options.prepared_frozen
+        .as_mut()
+        .and_then(|prepared| prepared.manifests.take())
+    {
+        let pnpmfile_hook = resolve_pnpmfile_hook(
+            install.context.config,
+            &workspace.dirs.workspace_root,
+            owned.projects.pnpmfile_hook_override.take(),
+        )?;
+        return Ok((pnpmfile_hook, manifests));
+    }
+    load_hooked_manifests::<Reporter>(
+        install,
+        owned,
+        workspace,
+        scope,
+        &manifest_options.hooked_paths,
+    )
+    .await
 }
 pub(super) type CurrentLockfileLoad =
     tokio::task::JoinHandle<Result<Option<Lockfile>, pnpm_lockfile::LoadLockfileError>>;
@@ -161,6 +208,8 @@ pub(super) async fn join_current_lockfile_load<Reporter: self::Reporter>(
 #[derive(Default)]
 pub(super) struct LoadedWantedLockfile<'a> {
     pub(super) lockfile: Option<&'a Lockfile>,
+    pub(super) loaded_path: Option<&'a Path>,
+    pub(super) loaded_metadata: Option<&'a std::fs::Metadata>,
     pub(super) shared: Option<Arc<Lockfile>>,
     pub(super) merge: Option<&'a Lockfile>,
     pub(super) pre_merge_importers:
@@ -184,6 +233,12 @@ pub(super) fn load_wanted_lockfile<'a, Reporter: self::Reporter>(
             report_merged_lockfile_conflicts::<Reporter>(merged_conflict_files, prefix);
             Ok(LoadedWantedLockfile {
                 lockfile,
+                loaded_path: lockfile_source
+                    .loaded_path()
+                    .map_err(InstallError::LoadWantedLockfile)?,
+                loaded_metadata: lockfile_source
+                    .loaded_metadata()
+                    .map_err(InstallError::LoadWantedLockfile)?,
                 shared: lockfile_source.shared().map_err(InstallError::LoadWantedLockfile)?,
                 merge: lockfile_source.get_for_merge().map_err(InstallError::LoadWantedLockfile)?,
                 pre_merge_importers: lockfile_source
@@ -206,8 +261,8 @@ pub(super) fn load_wanted_lockfile<'a, Reporter: self::Reporter>(
         Err(error) => Err(InstallError::LoadWantedLockfile(error)),
     }
 }
-/// A constraint-free lockfile spawns nothing — the probe's result would go
-/// unused (see `detect_installability_host` for why that matters) — and
+/// A constraint-free lockfile spawns nothing (the probe's result would go
+/// unused (see `detect_installability_host` for why that matters)) and
 /// neither does `--force` (skips the checks) or a resolve-only pass (returns
 /// before them). The scan is of the *wanted* lockfile: a fresh resolve whose
 /// new graph gains constraints the old lockfile lacked detects the host at
@@ -250,7 +305,7 @@ pub(super) fn load_current_lockfile<Reporter: self::Reporter>(
     }
 }
 
-async fn load_hooked_manifests<Reporter: self::Reporter + 'static>(
+pub(super) async fn load_hooked_manifests<Reporter: self::Reporter + 'static>(
     install: InstallView<'_>,
     owned: &mut InstallOwned,
     workspace: &InstallWorkspace<'_>,

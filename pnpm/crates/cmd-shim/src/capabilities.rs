@@ -19,7 +19,10 @@ mod tests;
 use pipe_trait::Pipe;
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Read up to `buf.len()` bytes of `path` starting at byte `offset`.
@@ -127,8 +130,8 @@ pub trait FsWrite {
     fn write(path: &Path, bytes: &[u8]) -> io::Result<()>;
 
     /// Create `path` as a brand-new file holding `bytes`, failing with
-    /// [`io::ErrorKind::AlreadyExists`] when any dirent — a dangling
-    /// symlink included — already occupies the path (`O_CREAT | O_EXCL`
+    /// [`io::ErrorKind::AlreadyExists`] when any dirent (a dangling
+    /// symlink included) already occupies the path (`O_CREAT | O_EXCL`
     /// semantics, which never follow a symlink). The shim writer uses
     /// this to skip its stale-entry probes on a freshly created `.bin`
     /// dir; on *any* error it falls back to the remove-then-[`write`]
@@ -192,7 +195,11 @@ pub struct Host;
 
 impl FsReadHead for Host {
     fn read_head(path: &Path, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{
+            Read,
+            Seek,
+            SeekFrom,
+        };
         let mut file = std::fs::File::open(path)?;
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))?;
@@ -235,6 +242,13 @@ impl FsWalkFiles for Host {
         path.pipe(walkdir::WalkDir::new)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".")
+            })
             .flatten()
             .filter(|entry| entry.file_type().is_file())
             .map(|entry| entry.path().to_path_buf())

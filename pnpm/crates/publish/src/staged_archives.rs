@@ -3,19 +3,32 @@
 //! bytes.
 //!
 //! pnpr stages an archive uploaded to
-//! `PUT <registry>/-/pnpr/v0/artifacts/blob?integrity=<sha512-…>` for the
-//! account that uploaded it, and answers `HEAD` on the same URL when it is
+//! `PUT <registry>/-/pnpr/v0/publish/archives/<sha512-…>` for the account
+//! that uploaded it, and answers `HEAD` on the same URL when it is
 //! staged already, so a resumed publish uploads only what is missing.
 
-use futures_util::{StreamExt as _, TryStreamExt as _, stream};
-use pnpm_diagnostics::miette::{self, Diagnostic};
-use pnpm_network::{ThrottledClient, read_limited_body};
+use futures_util::{
+    StreamExt as _,
+    TryStreamExt as _,
+    stream,
+};
+use pnpm_diagnostics::miette::{
+    self,
+    Diagnostic,
+};
+use pnpm_network::{
+    ThrottledClient,
+    read_limited_body,
+};
 use serde_json::Value;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicUsize,
+    Ordering,
+};
 
 use crate::registry_config_keys::NormalizedRegistryUrl;
 
-const STAGING_ENDPOINT: &str = "-/pnpr/v0/artifacts/blob";
+const STAGING_ENDPOINT: &str = "-/pnpr/v0/publish/archives/";
 
 /// The most staged archives one pnpr commit may reference. A batch with more
 /// sends its archives inline.
@@ -82,64 +95,21 @@ async fn stage_archive(
     authorization: Option<&str>,
     archive: &StagedArchive<'_>,
 ) -> Result<bool, StagingError> {
-    if staged_headers(client, registry, authorization, &archive.integrity)
-        .await?
-        .is_some()
-    {
+    if is_staged(client, registry, authorization, &archive.integrity).await? {
         return Ok(false);
     }
     upload_archive(client, registry, authorization, archive).await?;
     Ok(true)
 }
 
-/// Upload every archive of `archives` to `registry`'s staging endpoint,
-/// without asking whether it is staged already: uploading staged bytes
-/// again renews them.
-pub(crate) async fn upload_archives(
-    client: &ThrottledClient,
-    registry: &NormalizedRegistryUrl,
-    authorization: Option<&str>,
-    archives: &[StagedArchive<'_>],
-) -> Result<(), StagingError> {
-    stream::iter(archives)
-        .map(Ok::<_, StagingError>)
-        .try_for_each_concurrent(CONCURRENT_UPLOADS, |archive| {
-            upload_archive(client, registry, authorization, archive)
-        })
-        .await
-}
-
-/// The size of the archive `registry` holds staged by `integrity` for the
-/// caller, or `None` when it holds none, such as one another account staged
-/// or one that expired or expires within the hour.
-pub(crate) async fn staged_length(
+/// Whether `registry` holds the archive staged by `integrity` for the
+/// caller.
+async fn is_staged(
     client: &ThrottledClient,
     registry: &NormalizedRegistryUrl,
     authorization: Option<&str>,
     integrity: &str,
-) -> Result<Option<u64>, StagingError> {
-    let Some(headers) = staged_headers(client, registry, authorization, integrity).await? else {
-        return Ok(None);
-    };
-    // A `HEAD` response has no body, so its size is the header's, not the
-    // body's that `content_length` reports.
-    headers
-        .get("content-length")
-        .and_then(|length| length.to_str().ok()?.parse().ok())
-        .map(Some)
-        .ok_or_else(|| {
-            staging_failure(registry, integrity, "HEAD answered without a Content-Length")
-        })
-}
-
-/// The headers of `registry`'s answer to `HEAD` for the archive staged by
-/// `integrity`, or `None` when it holds none for the caller.
-async fn staged_headers(
-    client: &ThrottledClient,
-    registry: &NormalizedRegistryUrl,
-    authorization: Option<&str>,
-    integrity: &str,
-) -> Result<Option<reqwest::header::HeaderMap>, StagingError> {
+) -> Result<bool, StagingError> {
     let url = staging_url(registry, integrity)?;
     let guard = client.acquire_for_url(&url).await;
     let mut head = guard.head(&url);
@@ -149,25 +119,23 @@ async fn staged_headers(
     let response = head
         .send()
         .await
-        .map_err(|error| staging_failure(registry, integrity, &error.to_string()))?;
+        .map_err(|error| staging_failure(registry, integrity.to_owned(), error.to_string()))?;
     match response.status().as_u16() {
-        200 => Ok(Some(response.headers().clone())),
-        404 => Ok(None),
-        status => Err(staging_failure(registry, integrity, &format!("HEAD answered {status}"))),
+        200 => Ok(true),
+        404 => Ok(false),
+        status => {
+            Err(staging_failure(registry, integrity.to_owned(), format!("HEAD answered {status}")))
+        }
     }
 }
 
 /// A failure to stage the archive `integrity` on `registry`.
 fn staging_failure(
     registry: &NormalizedRegistryUrl,
-    integrity: &str,
-    reason: &str,
+    integrity: String,
+    reason: String,
 ) -> StagingError {
-    StagingError::Failed {
-        registry: registry.for_display(),
-        integrity: integrity.to_string(),
-        reason: reason.to_string(),
-    }
+    StagingError::Failed { registry: registry.for_display(), integrity, reason }
 }
 
 /// Upload `archive` to `registry`'s staging endpoint.
@@ -190,19 +158,17 @@ async fn upload_archive(
     let response = put
         .send()
         .await
-        .map_err(|error| staging_failure(registry, &archive.integrity, &error.to_string()))?;
+        .map_err(|error| staging_failure(registry, archive.integrity.clone(), error.to_string()))?;
     if response.status().is_success() {
         return Ok(());
     }
-    Err(staging_failure(registry, &archive.integrity, &refusal(response).await))
+    Err(staging_failure(registry, archive.integrity.clone(), refusal(response).await))
 }
 
 fn staging_url(registry: &NormalizedRegistryUrl, integrity: &str) -> Result<String, StagingError> {
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("integrity", integrity)
-        .finish();
+    let archive: String = url::form_urlencoded::byte_serialize(integrity.as_bytes()).collect();
     registry
-        .join(&format!("{STAGING_ENDPOINT}?{query}"))
+        .join(&format!("{STAGING_ENDPOINT}{archive}"))
         .map_err(StagingError::InvalidUrl)
 }
 
@@ -227,7 +193,7 @@ pub enum StagingError {
     #[diagnostic(
         code(ERR_PNPM_BATCH_PUBLISH_STAGING_FAILED),
         help(
-            "A registry declared `serverType: pnpr` receives each archive on its own request before the publish that references it. Nothing was published to this registry. Running the publish again uploads only the archives it still lacks."
+            "A registry declared `serverType: pnpr` receives each archive on its own request before the batch commit. Nothing was published to this registry. Running the publish again uploads only the archives it still lacks."
         )
     )]
     Failed {

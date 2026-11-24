@@ -1,7 +1,21 @@
 use super::{
-    BTreeMap, ConfigDepError, ConfigDependency, EnvLockfile, FixtureResolver, LockfileResolution,
-    PackageKey, SilentReporter, SpecifierAndResolution, TempDir, build_resolver, clean_spec,
-    harness, integrity_of, options, pnpm_engine_packages, resolve_and_install_config_deps,
+    BTreeMap,
+    ConfigDepError,
+    ConfigDependency,
+    EnvLockfile,
+    FixtureResolver,
+    LockfileResolution,
+    PackageKey,
+    SilentReporter,
+    SpecifierAndResolution,
+    TempDir,
+    build_resolver,
+    clean_spec,
+    harness,
+    integrity_of,
+    options,
+    pnpm_engine_packages,
+    resolve_and_install_config_deps,
     resolve_package_manager_integrities,
 };
 use crate::running_version_unpublished;
@@ -174,7 +188,13 @@ async fn frozen_lockfile_rejects_an_engine_package_pinned_at_another_version() {
                 version: "11.23.0".to_string(),
             },
         );
-    env_lockfile.write(root.path(), pnpm_lockfile::SymlinkedLockfile::Refuse).unwrap();
+    env_lockfile
+        .write(
+            root.path(),
+            pnpm_lockfile::SymlinkedLockfile::Refuse,
+            pnpm_lockfile::EnvDocumentFormat::V9,
+        )
+        .unwrap();
     let lockfile_path = root.path().join("pnpm-lock.yaml");
     let before = std::fs::read_to_string(&lockfile_path).unwrap();
 

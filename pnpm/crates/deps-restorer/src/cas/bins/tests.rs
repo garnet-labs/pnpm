@@ -1,5 +1,12 @@
-use super::{BinInstall, StoreManifest, write_bins};
-use std::collections::{BTreeMap, HashMap};
+use super::{
+    BinInstall,
+    StoreManifest,
+    write_bins,
+};
+use std::collections::{
+    BTreeMap,
+    HashMap,
+};
 
 #[test]
 fn stored_directories_bin_creates_commands_from_virtual_files() {
@@ -33,6 +40,8 @@ fn stored_directories_bin_creates_commands_from_virtual_files() {
                 super::super::StorePackage {
                     files: Some(BTreeMap::from([
                         ("package.json".into(), digest.clone()),
+                        ("commands/.gitkeep".into(), digest.clone()),
+                        ("commands/.hidden/nested".into(), digest.clone()),
                         ("commands/hello".into(), digest.clone()),
                         ("commands/nested/another".into(), digest),
                     ])),
@@ -48,12 +57,15 @@ fn stored_directories_bin_creates_commands_from_virtual_files() {
         &BinInstall {
             trusted_importer_ids: &std::collections::HashSet::new(),
             config: &config,
+            layout: legacy_layout(),
             root,
             importers: &importers,
         },
         &manifest,
     )
     .unwrap();
+    assert!(!root.join("node_modules/.bin/.gitkeep").exists());
+    assert!(!root.join("node_modules/.bin/nested").exists());
     assert!(root.join("node_modules/.bin/hello").is_file());
     assert!(root.join("node_modules/.bin/another").is_file());
     assert!(!root.join("node_modules/.pnpm/.pnpm-loader").exists());
@@ -73,6 +85,7 @@ fn loaded_bins_reject_untrusted_importer_paths_before_writing() {
             HashMap::from([(importer.to_string(), pnpm_lockfile::ProjectSnapshot::default())]);
         let inputs = BinInstall {
             config: &config,
+            layout: legacy_layout(),
             root,
             importers: &importers,
             trusted_importer_ids: &trusted,
@@ -85,6 +98,7 @@ fn loaded_bins_reject_untrusted_importer_paths_before_writing() {
     write_bins(
         &BinInstall {
             config: &config,
+            layout: legacy_layout(),
             root,
             importers: &importers,
             trusted_importer_ids: &trusted,
@@ -93,4 +107,9 @@ fn loaded_bins_reject_untrusted_importer_paths_before_writing() {
     )
     .unwrap();
     assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+}
+
+/// A layout without the global virtual store, so no package is staged.
+fn legacy_layout() -> &'static crate::VirtualStoreLayout {
+    Box::leak(Box::new(crate::VirtualStoreLayout::legacy(std::path::PathBuf::new(), 120)))
 }

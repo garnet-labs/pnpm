@@ -1,27 +1,68 @@
 use super::{
-    ConcurrentCheck, CreateVirtualStoreError, CreateVirtualStoreStoreContext, LinkPlan,
-    PackageBins, PackageManifests, RequiresBuildBySnapshot, WantedEntries,
+    CheckVerdict,
+    ConcurrentCheck,
+    CreateVirtualStoreError,
+    CreateVirtualStoreStoreContext,
+    LinkPlan,
+    PackageBins,
+    PackageManifests,
+    RequiresBuildBySnapshot,
+    WantedEntries,
     cache_keys::SlotReuse,
-    cas_paths_key, requires_build_from_cas_paths, run_checked,
-    slot_linking::{LinkSlotsParallel, link_cold_chunk},
+    cas_paths_key,
+    requires_build_from_cas_paths,
+    run_checked,
+    slot_linking::{
+        LinkSlotsParallel,
+        link_cold_chunk,
+    },
+    snapshot_needs_build_marker,
+    warm::SlotBuilds,
 };
-use crate::{CasPathsByPkgId, InstallPackageBySnapshot, InstallPackageBySnapshotError};
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use crate::{
+    CasPathsByPkgId,
+    InstallPackageBySnapshot,
+    InstallPackageBySnapshotError,
+};
+use futures_util::{
+    FutureExt,
+    StreamExt,
+    future::Shared,
+    stream::FuturesUnordered,
+};
 use miette::Diagnostic;
-use pnpm_lockfile::{PackageKey, PackageMetadata, PkgName, SnapshotEntry};
+use pnpm_lockfile::{
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    SnapshotEntry,
+};
 use pnpm_reporter::{
-    LogEvent, LogLevel, Reporter, SkippedOptionalDependencyLog, SkippedOptionalPackage,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
     SkippedOptionalReason,
 };
 use pnpm_store_dir::store_index_key;
-use pnpm_tarball::{PrefetchResult, pending_progress_key};
+use pnpm_tarball::{
+    PrefetchResult,
+    pending_progress_key,
+};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     ops::ControlFlow,
-    path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
     },
 };
 
@@ -29,7 +70,7 @@ pub(super) struct ColdInputs<'i, 'a> {
     pub(super) wanted: WantedEntries<'a>,
     pub(super) store: CreateVirtualStoreStoreContext<'i>,
     pub(super) prefetched: &'i PrefetchResult,
-    pub(super) marker_source: Option<&'i tempfile::NamedTempFile>,
+    pub(super) slot_builds: Option<SlotBuilds<'i>>,
     pub(super) links: &'i LinkPlan<'a>,
 }
 /// A cold snapshot whose CAS paths are staged and whose slot link was
@@ -43,12 +84,19 @@ pub(super) struct ColdCapture<'a> {
 }
 pub(super) fn add_cold_cas_paths(map: &mut CasPathsByPkgId, cold_cas_paths: Vec<ColdCapture<'_>>) {
     map.reserve(cold_cas_paths.len());
-    for ColdCapture { snapshot_key, installed, .. } in cold_cas_paths {
+    for ColdCapture {
+        snapshot_key,
+        installed,
+        requires_build,
+        ..
+    } in cold_cas_paths
+    {
         map.entry(cas_paths_key(snapshot_key))
             .or_insert_with(|| crate::HoistedPackageFiles {
                 cas_paths: installed.cas_paths,
                 source_is_mutable: installed.source_is_mutable,
                 source_exists: installed.source_exists,
+                needs_build: snapshot_needs_build_marker(snapshot_key, requires_build),
             });
     }
 }
@@ -57,10 +105,17 @@ pub(super) fn add_cold_cas_paths(map: &mut CasPathsByPkgId, cold_cas_paths: Vec<
 /// `reason=fetch_failure` so the user learns the package is missing.
 ///
 /// Scoped via [`is_fetch_side_failure`] to the tarball-fetch / git-fetch /
-/// CAS-write variants — the fetch-side surface an optional snapshot is allowed
+/// CAS-write variants, the fetch-side surface an optional snapshot is allowed
 /// to swallow. Local materialization (`CreateVirtualDir`) and config-shape
 /// errors (`MissingTarballIntegrity`, `UnsupportedResolution`) abort even for
-/// optional snapshots — they sit outside the swallowed fetch surface.
+/// optional snapshots; they sit outside the swallowed fetch surface.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`prefix` is copied only after the non-optional early return, and the caller borrows it from the install context, so an owned parameter would allocate on every failed fetch."
+    )
+)]
 pub(super) fn swallow_optional_fetch_failure<Reporter: self::Reporter, Captured>(
     snapshot_key: &PackageKey,
     snapshot: &SnapshotEntry,
@@ -110,9 +165,7 @@ pub(super) struct ColdBatch<'a> {
     pub(super) cold: &'a [(&'a PackageKey, &'a SnapshotEntry)],
     pub(super) installer: InstallPackageBySnapshot<'a>,
     pub(super) reuse: SlotReuse<'a>,
-    /// Kept alive by the caller for the whole batch: every slot that
-    /// needs a build marker hard-links this one file.
-    pub(super) marker_source: Option<&'a tempfile::NamedTempFile>,
+    pub(super) slot_builds: Option<SlotBuilds<'a>>,
     pub(super) removed_aliases_by_key: &'a HashMap<PackageKey, Vec<PkgName>>,
     pub(super) link_template: &'a LinkSlotsParallel<'a>,
     pub(super) shared_packages: Option<&'a HashSet<&'a str>>,
@@ -123,7 +176,7 @@ pub(super) struct ColdBatch<'a> {
 /// The downloads run as one cooperative fan-out on this task. Their slot
 /// links (`defer_link: true`) run on a thread of their own, because a
 /// blocking link pass inside this task would leave every in-flight
-/// download unpolled for as long as the pass takes — seconds on a slow
+/// download unpolled for as long as the pass takes, seconds on a slow
 /// volume. See [`link_while_downloading`].
 pub(super) async fn run_cold_batch<'a, Reporter: self::Reporter>(
     batch: ColdBatch<'a>,
@@ -135,10 +188,12 @@ pub(super) async fn run_cold_batch<'a, Reporter: self::Reporter>(
         return Ok(());
     }
 
-    let batch = &batch;
+    let verification = share_check(check);
     let mut downloads: FuturesUnordered<_> = batch.cold
         .iter()
-        .map(|&(snapshot_key, snapshot)| download_one::<Reporter>(batch, snapshot_key, snapshot))
+        .map(|&(snapshot_key, snapshot)| {
+            download_one::<Reporter>(&batch, snapshot_key, snapshot, verification.as_ref())
+        })
         .collect();
     let shared_packages = batch.shared_packages;
 
@@ -152,7 +207,7 @@ pub(super) async fn run_cold_batch<'a, Reporter: self::Reporter>(
     let cold_template = LinkSlotsParallel { batch: "cold", ..*batch.link_template };
     let linker = ColdLinker {
         packages: batch.reuse.packages,
-        marker_path: batch.marker_source.map(tempfile::NamedTempFile::path),
+        slot_builds: batch.slot_builds,
         removed_aliases_by_key: batch.removed_aliases_by_key,
         template: &cold_template,
     };
@@ -174,6 +229,12 @@ pub(super) async fn run_cold_batch<'a, Reporter: self::Reporter>(
     run_checked(check, drain).await?;
     linker.link_pass::<Reporter>(&ready)
 }
+fn share_check<'a>(check: &mut Option<ConcurrentCheck<'a>>) -> Option<Shared<ConcurrentCheck<'a>>> {
+    let shared = check.take()?.shared();
+    *check = Some(shared.clone().boxed());
+    Some(shared)
+}
+
 /// Drive the downloads and `check` on the calling thread while a scoped
 /// thread links each batch of completed downloads.
 ///
@@ -223,7 +284,7 @@ where
 /// The pass-invariant inputs of the cold link passes.
 struct ColdLinker<'a> {
     packages: &'a HashMap<PackageKey, PackageMetadata>,
-    marker_path: Option<&'a Path>,
+    slot_builds: Option<SlotBuilds<'a>>,
     removed_aliases_by_key: &'a HashMap<PackageKey, Vec<PkgName>>,
     template: &'a LinkSlotsParallel<'a>,
 }
@@ -283,7 +344,7 @@ impl ColdLinker<'_> {
         link_cold_chunk::<Reporter>(
             batch,
             self.packages,
-            self.marker_path,
+            self.slot_builds,
             self.removed_aliases_by_key,
             self.template,
         )
@@ -292,10 +353,11 @@ impl ColdLinker<'_> {
 /// One cold download. A failed optional snapshot lands in the first
 /// slot instead of failing the batch; the second carries what the link
 /// pass still has to place.
-pub(super) async fn download_one<'a, Reporter: self::Reporter>(
+async fn download_one<'a, Reporter: self::Reporter>(
     batch: &ColdBatch<'a>,
     snapshot_key: &'a PackageKey,
     snapshot: &'a SnapshotEntry,
+    verification: Option<&Shared<ConcurrentCheck<'_>>>,
 ) -> Result<(Option<PackageKey>, Option<ColdCapture<'a>>), CreateVirtualStoreError> {
     let metadata_key = snapshot_key.without_peer();
     let metadata = batch.reuse.packages
@@ -304,6 +366,13 @@ pub(super) async fn download_one<'a, Reporter: self::Reporter>(
             snapshot_key: snapshot_key.to_string(),
             metadata_key: metadata_key.to_string(),
         })?;
+    // A version-addressed tarball may only become available when verification refreshes its metadata.
+    if let Some(verification) = verification
+        && is_version_addressed_tarball(&metadata_key, &metadata.resolution)
+        && verification.clone().await == CheckVerdict::Abort
+    {
+        return Err(CreateVirtualStoreError::ConcurrentCheckAborted);
+    }
     let installed = match batch.installer.run::<Reporter>(snapshot_key, metadata, snapshot).await {
         Ok(installed) => installed,
         Err(err) => {
@@ -330,6 +399,20 @@ pub(super) async fn download_one<'a, Reporter: self::Reporter>(
             force_import: batch.reuse.must_replace(snapshot_key),
         }),
     ))
+}
+fn is_version_addressed_tarball(key: &PackageKey, resolution: &LockfileResolution) -> bool {
+    if resolution.revision().is_some() {
+        return true;
+    }
+    let LockfileResolution::Tarball(tarball) = resolution else {
+        return false;
+    };
+    key.suffix
+        .registry_version()
+        .is_some_and(|version| {
+            tarball.revision.is_some()
+                || tarball.tarball.ends_with(&format!("/{}@{version}", key.name))
+        })
 }
 /// A failed download that [`swallow_optional_fetch_failure`] keeps from
 /// failing the batch still settles the progress row its fetch announced.
@@ -429,24 +512,24 @@ pub(super) fn record_cold_outcome<'a>(
     Some(captured)
 }
 /// True for the [`InstallPackageBySnapshotError`] variants pacquet
-/// classifies as **fetch-side** — the failures that happen while
+/// classifies as **fetch-side**, the failures that happen while
 /// fetching a package into the CAS. These are the ones an optional
 /// snapshot is allowed to swallow:
 ///
-/// - `DownloadTarball` — HTTP fetch, integrity check, gzip decode,
+/// - `DownloadTarball`, HTTP fetch, integrity check, gzip decode,
 ///   CAS write.
-/// - `GitFetch` — `git` CLI clone / checkout / preparePackage /
+/// - `GitFetch`, `git` CLI clone / checkout / preparePackage /
 ///   packlist / CAS import.
-/// - `DirectoryFetch` — local-directory walk / manifest read /
+/// - `DirectoryFetch`, local-directory walk / manifest read /
 ///   packlist for injected workspace deps. Swallowed for optional
 ///   snapshots uniformly with the tarball / git paths.
 ///
-/// Excluded (propagate even for optional snapshots — they happen
+/// Excluded (propagate even for optional snapshots; they happen
 /// after the fetch, while linking the package into its slot):
 ///
-/// - `CreateVirtualDir` — local materialization (clone / hardlink /
+/// - `CreateVirtualDir`, local materialization (clone / hardlink /
 ///   copy / symlink from CAS into the slot dir).
-/// - `MissingTarballIntegrity`, `UnsupportedResolution` —
+/// - `MissingTarballIntegrity`, `UnsupportedResolution`,
 ///   config/shape errors raised before any fetch runs.
 pub(super) fn is_fetch_side_failure(err: &InstallPackageBySnapshotError) -> bool {
     matches!(

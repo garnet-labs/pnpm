@@ -213,6 +213,14 @@ jobs:
           rm -f .bench-cache/release/pnpm .bench-cache/release/pacquet
           cp "target/release/$client" target/release/pnpr .bench-cache/release/
 
+      # No other pull request job builds with the release profile, so this is
+      # where a profile change that keeps the symbol table fails before a
+      # release does. A `head_ref` dispatch builds another revision, which may
+      # predate the script.
+      - name: Reject a symbol table in the release binaries
+        if: matrix.revision == 'HEAD' && !inputs.head_ref
+        run: node .github/scripts/assert-stripped.mjs .bench-cache/release/pnpm .bench-cache/release/pnpr
+
       # Tar preserves executable permissions when artifacts cross runners.
       - name: Pack revision binaries
         shell: bash
@@ -226,7 +234,22 @@ jobs:
           fi
           test -x "$release/$client"
           test -x "$release/pnpr"
-          files=("$release/$client" "$release/pnpr")
+          fixture="bench-work-env/pnpr@$REVISION/pacquet/pnpr/.fixtures/config.yaml"
+          mkdir -p "$(dirname "$fixture")"
+          cp pnpr/.fixtures/config.yaml "$fixture"
+          files=("$release/$client" "$release/pnpr" "$fixture")
+          # A revision whose pnpr keeps its registries in the database has
+          # this file, and the benchmark imports it before starting pnpr.
+          if [ -f pnpr/.fixtures/registries.yaml ]; then
+            cp pnpr/.fixtures/registries.yaml "$(dirname "$fixture")/registries.yaml"
+            files+=("$(dirname "$fixture")/registries.yaml")
+          fi
+          # A revision whose pnpr decides access by grants has this file,
+          # and the benchmark imports it after the registries.
+          if [ -f pnpr/.fixtures/grants.yaml ]; then
+            cp pnpr/.fixtures/grants.yaml "$(dirname "$fixture")/grants.yaml"
+            files+=("$(dirname "$fixture")/grants.yaml")
+          fi
           if [ "$REVISION" = HEAD ]; then
             mkdir -p target/release
             cp "$release/pnpr" target/release/pnpr
@@ -306,6 +329,7 @@ jobs:
           - isolated-linker.fresh-install.cold-cache.cold-store
           - isolated-linker.fresh-install.hot-cache.hot-store
           - isolated-linker.fresh-install.cold-cache.hot-store
+          - isolated-linker.fresh-install.cold-cache.hot-store.cold-pnpr-resolve
           - isolated-linker.fresh-resolve.hot-cache.offline
           - isolated-linker.peer-heavy-resolve.hot-cache.offline
           - isolated-linker.linked-workspace-resolve.hot-cache.offline
@@ -331,11 +355,10 @@ jobs:
       # the realistic CI case. Running both tools in one hyperfine
       # invocation also yields the pnpr-vs-direct ratio per scenario.
       BENCHMARK_TARGETS: ${{ github.ref_name == 'main' && 'pacquet@HEAD pnpr@HEAD' || 'pacquet@HEAD pacquet@main pnpr@HEAD pnpr@main' }}
-      # The peer-heavy resolver case compares the PR against both main and the
-      # TypeScript CLI. It does not include pnpr because the timed offline
-      # command exercises client-side peer resolution rather than server or
-      # tarball performance.
-      PEER_HEAVY_BENCHMARK_TARGETS: ${{ github.ref_name == 'main' && 'pacquet@HEAD pnpm@HEAD' || 'pacquet@HEAD pacquet@main pnpm@HEAD' }}
+      # The peer-heavy resolver case does not include pnpr because the timed
+      # offline command exercises client-side peer resolution rather than
+      # server or tarball performance.
+      PEER_HEAVY_BENCHMARK_TARGETS: ${{ github.ref_name == 'main' && 'pacquet@HEAD' || 'pacquet@HEAD pacquet@main' }}
       # The workspace fixtures use only local packages, and the store-only
       # scenario measures the client's own resolution and store check, which
       # a pnpr server would take over, so these compare the PR against main
@@ -429,7 +452,7 @@ jobs:
           save-cache: false # it's insufficient
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -454,29 +477,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes strace
 
       - name: Install just
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: just
 
       - name: Prepare benchmark targets
         shell: bash
         timeout-minutes: 50
-        env:
-          SCENARIO: ${{ matrix.scenario }}
-          HEAD_SHA: ${{ needs.revisions.outputs.head_sha }}
         run: |
-          pnpm_repository_args=()
-          if [ "$SCENARIO" = isolated-linker.peer-heavy-resolve.hot-cache.offline ]; then
-            BENCHMARK_BUILD_TARGETS="$BENCHMARK_BUILD_TARGETS pnpm@HEAD"
-            # pnpm@HEAD builds the HEAD of the repository it is given. The
-            # checkout holds the tools revision, which a head_ref dispatch
-            # sets apart from the measured HEAD.
-            if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
-              git worktree add --detach "$RUNNER_TEMP/pnpm-head" "$HEAD_SHA"
-              pnpm_repository_args=(--pnpm-repository "$RUNNER_TEMP/pnpm-head")
-            fi
-          fi
-          target/debug/integrated-benchmark --reuse-prebuilt-binaries --build-only --registry=npm "${pnpm_repository_args[@]}" $BENCHMARK_BUILD_TARGETS
+          target/debug/integrated-benchmark --reuse-prebuilt-binaries --build-only --registry=npm $BENCHMARK_BUILD_TARGETS
 
       - name: 'Benchmark: Isolated linker: fresh restore, cold cache + cold store'
         if: matrix.scenario == 'isolated-linker.fresh-restore.cold-cache.cold-store'
@@ -576,6 +585,19 @@ jobs:
           node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.cold-cache.hot-store --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
           cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE.md
           cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE.json
+
+      - name: 'Benchmark: Isolated linker: fresh install, cold cache + hot store + cold pnpr resolve'
+        if: matrix.scenario == 'isolated-linker.fresh-install.cold-cache.hot-store.cold-pnpr-resolve'
+        shell: bash
+        # The scenario above with every pnpr server restarted with an empty
+        # cache before each iteration, so pnpr resolves from cold packuments
+        # instead of answering from its resolution cache. Every other scenario
+        # measures a warm pnpr server.
+        timeout-minutes: 35
+        run: |
+          node .github/scripts/run-integrated-benchmark.mjs --reuse-prebuilt-binaries --scenario=isolated-linker.fresh-install.cold-cache.hot-store.cold-pnpr-resolve --registry=verdaccio --pnpr-latency-ms=${PNPR_LATENCY_MS} --registry-latency-ms=${REGISTRY_LATENCY_MS} --registry-bandwidth-mbps=${REGISTRY_BANDWIDTH_MBPS} $BENCHMARK_TARGETS
+          cp bench-work-env/BENCHMARK_REPORT.md bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE_COLD_PNPR_RESOLVE.md
+          cp bench-work-env/BENCHMARK_REPORT.json bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE_COLD_PNPR_RESOLVE.json
 
       - name: 'Benchmark: Isolated linker: fresh resolve, hot cache, offline'
         if: matrix.scenario == 'isolated-linker.fresh-resolve.hot-cache.offline'
@@ -850,7 +872,7 @@ jobs:
               echo "**Compared against main at:** [\`${MAIN_SHA:0:12}\`](${{ github.server_url }}/${{ github.repository }}/commit/$MAIN_SHA)"
               echo
             fi
-            echo 'Regular scenarios report direct and pnpr installs. The peer-heavy resolver scenario compares current Rust, main Rust, and TypeScript pnpm; the linked, injected, and Cargo workspace scenarios compare current Rust against main Rust. Bencher consumes pacquet@HEAD and pnpr@HEAD.'
+            echo 'Regular scenarios report direct and pnpr installs. The peer-heavy resolver and the linked, injected, and Cargo workspace scenarios compare current Rust against main Rust. Bencher consumes pacquet@HEAD and pnpr@HEAD.'
             echo
             echo 'The tables below show mean ± σ. Bencher tracks absolute minimum latency; PR regression checks compare HEAD and main samples from the same runner. Historical timing alerts do not gate PRs.'
             echo
@@ -934,6 +956,18 @@ jobs:
             echo
             echo '```json'
             jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE.json
+            echo '```'
+            echo
+            echo '</details>'
+            echo
+            echo '### Scenario: Isolated linker: fresh install, cold cache + hot store + cold pnpr resolve'
+            echo
+            cat bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE_COLD_PNPR_RESOLVE.md
+            echo
+            echo '<details><summary>BENCHMARK_REPORT.json</summary>'
+            echo
+            echo '```json'
+            jq 'del(.results[].exit_codes, .results[].times, .confirmation.results[]?.exit_codes, .confirmation.results[]?.times, .syscalls)' bench-work-env/BENCHMARK_REPORT_ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE_COLD_PNPR_RESOLVE.json
             echo '```'
             echo
             echo '</details>'
@@ -1091,6 +1125,7 @@ jobs:
             'ISOLATED_FRESH_INSTALL_COLD_CACHE_COLD_STORE:isolated-linker.fresh-install.cold-cache.cold-store' \
             'ISOLATED_FRESH_INSTALL_HOT_CACHE_HOT_STORE:isolated-linker.fresh-install.hot-cache.hot-store' \
             'ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE:isolated-linker.fresh-install.cold-cache.hot-store' \
+            'ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE_COLD_PNPR_RESOLVE:isolated-linker.fresh-install.cold-cache.hot-store.cold-pnpr-resolve' \
             'ISOLATED_FRESH_RESOLVE_HOT_CACHE_OFFLINE:isolated-linker.fresh-resolve.hot-cache.offline' \
             'ISOLATED_PEER_HEAVY_RESOLVE_HOT_CACHE_OFFLINE:isolated-linker.peer-heavy-resolve.hot-cache.offline' \
             'ISOLATED_LINKED_WORKSPACE_RESOLVE_HOT_CACHE_OFFLINE:isolated-linker.linked-workspace-resolve.hot-cache.offline' \
@@ -1108,6 +1143,7 @@ jobs:
             'ISOLATED_FRESH_INSTALL_COLD_CACHE_COLD_STORE:isolated-linker.fresh-install.cold-cache.cold-store' \
             'ISOLATED_FRESH_INSTALL_HOT_CACHE_HOT_STORE:isolated-linker.fresh-install.hot-cache.hot-store' \
             'ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE:isolated-linker.fresh-install.cold-cache.hot-store' \
+            'ISOLATED_FRESH_INSTALL_COLD_CACHE_HOT_STORE_COLD_PNPR_RESOLVE:isolated-linker.fresh-install.cold-cache.hot-store.cold-pnpr-resolve' \
             'ISOLATED_FRESH_RESOLVE_HOT_CACHE_OFFLINE:isolated-linker.fresh-resolve.hot-cache.offline' \
             'ISOLATED_FRESH_RESTORE_COLD_CACHE_COLD_STORE_COLD_PNPR:isolated-linker.fresh-restore.cold-cache.cold-store.cold-pnpr' \
             'GVS_FRESH_RESTORE_HOT_CACHE_HOT_STORE:gvs-linker.fresh-restore.hot-cache.hot-store'
@@ -1142,7 +1178,7 @@ jobs:
 
       - name: Install Bencher CLI
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && !inputs.head_ref
-        uses: bencherdev/bencher@58a33f76185c1187f3df355817d2ac7285ac77f0 # v0.6.14
+        uses: bencherdev/bencher@b2484bc6734c8e6da4fad141bd13527a11da3988 # v0.6.17
 
       - name: Upload results to Bencher
         # Runs on push and workflow_dispatch — both execute in the

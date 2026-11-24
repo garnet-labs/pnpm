@@ -8,19 +8,53 @@
 //! [`super::tar_responses`]).
 
 use super::{
-    Action, AppState, CanonicalPackageName, Ecosystem, FetchOutcome, HeaderMap, Identity,
-    Integrity, MAX_TARBALL_BYTES, RegistryError, RegistrySource, Response, Storage, TarSource,
-    TgzTrust, Upstream, Value, authorize, authorized_upstream, ensure_osv_allowed,
-    extract_upstream_revision_integrity, header, hosted_read_namespace, not_found,
-    private_no_cache, read_source_packument, resolve_registry_source, revision_source_registry,
-    streaming, tar_decode_limit, tar_resource_integrity, tar_response, tarball_integrity_error,
-    tarball_response, tarball_stream_error_for_package, tgz_integrity_key,
+    Action,
+    AppState,
+    CanonicalPackageName,
+    Ecosystem,
+    FetchOutcome,
+    HeaderMap,
+    Identity,
+    Integrity,
+    RegistryError,
+    RegistrySource,
+    Response,
+    Storage,
+    TarSource,
+    TgzTrust,
+    Upstream,
+    Value,
+    authorize,
+    authorized_upstream,
+    ensure_osv_allowed,
+    extract_upstream_revision_integrity,
+    header,
+    hosted_read_namespace,
+    not_found,
+    private_no_cache,
+    read_source_packument,
+    resolve_registry_source,
+    revision_source_registry,
+    streaming,
+    tar_decode_limit,
+    tar_resource_integrity,
+    tar_response,
+    tarball_integrity_error,
+    tarball_response,
+    tarball_stream_error_for_package,
+    tgz_integrity_key,
     upstream_cache_namespace,
 };
-use axum::{body::Body, response::IntoResponse};
+use axum::{
+    body::Body,
+    response::IntoResponse,
+};
 use pnpm_crypto_hash::has_complete_sha512_digest;
 use pnpm_lockfile::TarballRevision;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{
+    AsyncReadExt,
+    AsyncSeekExt,
+};
 
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
@@ -41,7 +75,8 @@ pub(super) fn parse_revision_version(version: &str) -> Option<Result<(&str, Tarb
     let parsed = digits
         .parse::<u64>()
         .ok()
-        .and_then(|num| TarballRevision::try_from(num).ok());
+        .map(TarballRevision::try_from)
+        .and_then(Result::ok);
     Some(
         parsed
             .map(|revision| (base_version, revision))
@@ -107,7 +142,7 @@ async fn serve_upstream_revision_tarball(
         state,
         headers,
         source,
-        upstream,
+        upstream: &upstream,
         name,
         version,
         revision,
@@ -116,16 +151,16 @@ async fn serve_upstream_revision_tarball(
     request.serve(&integrity).await
 }
 
-async fn load_upstream_revision_target<'state>(
-    state: &'state AppState,
+async fn load_upstream_revision_target(
+    state: &AppState,
     identity: &Identity,
     source: &str,
     name: &CanonicalPackageName,
     version: &str,
     revision: TarballRevision,
-) -> Result<Option<(&'state Upstream, Integrity)>, Response> {
+) -> Result<Option<(Upstream, Integrity)>, Response> {
     let resolved = RegistrySource::Upstream(source.to_string());
-    if let Err(err) = authorize(state, identity, &resolved, name.as_str(), Action::Access) {
+    if let Err(err) = authorize(state, identity, &resolved, name.as_str(), Action::Read) {
         return Err(err.into_response());
     }
     if let Err(err) = ensure_osv_allowed(state, name, version) {
@@ -143,8 +178,18 @@ async fn load_upstream_revision_target<'state>(
         Ok(None) => return Ok(None),
         Err(err) => return Err(err.into_response()),
     };
-    match extract_upstream_revision_integrity(&bytes, name, version, revision, source_registry) {
-        Ok(integrity) => Ok(integrity.map(|integrity| (upstream, integrity))),
+    match extract_upstream_revision_integrity(
+        &bytes.bytes,
+        name,
+        version,
+        revision,
+        &source_registry,
+    ) {
+        Ok(Some(integrity)) => Ok(Some((upstream, integrity))),
+        Ok(None) => match bytes.stale_error {
+            Some(err) => Err(RegistryError::Shared(err).into_response()),
+            None => Ok(None),
+        },
         Err(err) => Err(RegistryError::from(err).into_response()),
     }
 }
@@ -209,9 +254,8 @@ impl UpstreamRevision<'_> {
         let storage = &self.state.inner.storage;
         let mut write =
             storage.open_upstream_blob_tmp(namespace, self.name, self.cache_filename).await?;
-        if let Err(err) =
-            streaming::download_unverified(response, &mut write, MAX_TARBALL_BYTES).await
-        {
+        let max_bytes = self.state.max_tarball_bytes();
+        if let Err(err) = streaming::download_unverified(response, &mut write, max_bytes).await {
             write.abandon().await;
             let label = format!("{}+r{}", self.version, self.revision);
             return Err(tarball_stream_error_for_package(err, self.name.as_str(), &label));
@@ -219,7 +263,8 @@ impl UpstreamRevision<'_> {
         let expected = integrity.clone();
         let checked = write.check(move |file| {
             tar_resource_integrity(std::io::BufReader::new(file), gzip)
-                .is_some_and(|tar| tar.matches(&expected).is_some())
+                .map(|tar| tar.matches(&expected))
+                .is_some_and(|expected| expected.is_some())
         })
         .await;
         match checked {
@@ -266,7 +311,7 @@ impl UpstreamRevision<'_> {
 
     fn integrity_error(&self, reason: String) -> RegistryError {
         let label = format!("{}+r{}", self.version, self.revision);
-        tarball_integrity_error(self.name.as_str(), &label, reason)
+        tarball_integrity_error(self.name.as_str().to_owned(), label, reason)
     }
 }
 
@@ -364,8 +409,8 @@ async fn serve_hosted_revision_tarball(
     source: &str,
     (package, version, revision): (&CanonicalPackageName, &str, TarballRevision),
 ) -> Response {
-    let org = match hosted_read_namespace(state, identity, source, package.as_str()) {
-        Ok(org) => org,
+    let namespace = match hosted_read_namespace(state, identity, source, package.as_str()) {
+        Ok(namespace) => namespace,
         Err(err) => return err.into_response(),
     };
     if let Err(err) = ensure_osv_allowed(state, package, version) {
@@ -374,7 +419,7 @@ async fn serve_hosted_revision_tarball(
     if revision.get() != 0 {
         return not_found();
     }
-    let storage = state.inner.storage.for_hosted(&org, pnpr_registry::Ecosystem::Npm);
+    let storage = state.inner.storage.for_hosted(&namespace, pnpr_registry::Ecosystem::Npm);
     let original = match hosted_original(&storage, package, version).await {
         Ok(Some(original)) => original,
         Ok(None) => return not_found(),
@@ -398,16 +443,11 @@ async fn hosted_original(
     package: &CanonicalPackageName,
     version: &str,
 ) -> Result<Option<HostedOriginal>, RegistryError> {
-    let Some(bytes) = storage.read_hosted_document(package).await? else {
+    let Some(manifest) = storage.read_hosted_version(package, version).await? else {
         return Ok(None);
     };
-    let packument = serde_json::from_slice::<Value>(&bytes)?;
-    let Some(dist) = packument
-        .get("versions")
-        .and_then(|versions| versions.get(version))
-        .and_then(|manifest| manifest.get("dist"))
-        .and_then(Value::as_object)
-    else {
+    let manifest = serde_json::from_str::<Value>(&manifest)?;
+    let Some(dist) = manifest.get("dist").and_then(Value::as_object) else {
         return Ok(None);
     };
     let Some(tgz_integrity) = tgz_integrity_key(dist) else { return Ok(None) };

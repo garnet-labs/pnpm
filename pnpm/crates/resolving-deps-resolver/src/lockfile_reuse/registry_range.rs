@@ -1,7 +1,15 @@
 use std::borrow::Cow;
 
 use node_semver::Range;
-use pnpm_lockfile::{PkgName, PkgNameVerPeer, Prefix, RegistryContext, VersionPart, same_registry};
+use pnpm_lockfile::{
+    PkgName,
+    PkgNameVerPeer,
+    Prefix,
+    RegistryContext,
+    VersionPart,
+    same_registry,
+};
+use pnpm_resolving_resolver_base::parse_strict_semver_range;
 
 /// Whether the version locked as `key` for the child `alias` still satisfies
 /// `bare_specifier`, from the registry the specifier resolves against. A
@@ -38,7 +46,7 @@ pub(crate) fn any_locked_key_admits<'key>(
         return false;
     };
     keys.into_iter()
-        .any(|key| wanted.admits(key, registries) == Some(true))
+        .any(|key| wanted.admits(key, registries).unwrap_or(false))
 }
 
 /// Whether `key` is the key a fresh resolve of `bare_specifier` for `alias`
@@ -96,14 +104,25 @@ impl<'a> WantedRegistryRange<'a> {
         )
     }
 
-    /// `None` for a specifier that is neither a semver range nor a
-    /// named-registry specifier (`<prefix>:[<name>@]<range>`) of a declared
-    /// prefix.
+    /// `None` for a specifier that is not a semver range, an `npm:` alias,
+    /// or a named-registry specifier (`<prefix>:[<name>@]<range>`) of a declared prefix.
     fn parse(
         alias: &'a PkgName,
         bare_specifier: &'a str,
         registries: &'a RegistryContext,
     ) -> Option<Self> {
+        if bare_specifier.starts_with("npm:") {
+            let alias_name = alias.to_string();
+            let (name, range) =
+                crate::unwrap_package_name::unwrap_package_name(&alias_name, bare_specifier);
+            let registry = registries.routed_registry(name);
+            return Some(Self {
+                name: Cow::Owned(name.parse().ok()?),
+                registry,
+                key_prefix: registries.key_prefix_for_registry(registry),
+                range: parse_strict_semver_range(range)?,
+            });
+        }
         if let Some((prefix, body)) = bare_specifier.split_once(':')
             && let Some(registry) = registries.registry_of_prefix(prefix)
         {
@@ -120,14 +139,19 @@ impl<'a> WantedRegistryRange<'a> {
                 None => (Cow::Borrowed(alias), body),
             };
             let key_prefix = registries.key_prefix_for_alias(prefix, &name.to_string());
-            return Some(Self { name, registry, key_prefix, range: range.parse().ok()? });
+            return Some(Self {
+                name,
+                registry,
+                key_prefix,
+                range: parse_strict_semver_range(range)?,
+            });
         }
         let registry = registries.routed_registry(&alias.to_string());
         Some(Self {
             name: Cow::Borrowed(alias),
             registry,
             key_prefix: registries.key_prefix_for_registry(registry),
-            range: bare_specifier.parse().ok()?,
+            range: parse_strict_semver_range(bare_specifier)?,
         })
     }
 }

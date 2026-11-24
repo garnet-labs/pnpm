@@ -14,25 +14,55 @@
 //!
 //! Right after an install, every gate it satisfied reports the tree up to
 //! date without installing again.
-
 pub use _utils::*;
+pub use inputs::Input;
+
+use command_extra::CommandExtra;
 
 use crate::_utils;
 
 use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
-    ffi::{OsStr, OsString},
+    cell::{
+        Cell,
+        RefCell,
+    },
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    ffi::{
+        OsStr,
+        OsString,
+    },
     fs,
-    path::{Path, PathBuf},
-    process::{Command, Output},
-    time::{Duration, SystemTime},
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::{
+        Command,
+        Output,
+    },
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
 
-use pnpm_lockfile::{PackageKey, ProjectSnapshot, SnapshotEntry};
+use pnpm_lockfile::{
+    PackageKey,
+    ProjectSnapshot,
+    SnapshotEntry,
+};
 use pnpm_package_manager::prune_unreachable_packages;
-use pnpm_testing_utils::{command_env::CommandTestExt, registry::TestRegistry};
-use serde_json::{Value, json};
+use pnpm_testing_utils::{
+    command_env::CommandTestExt,
+    registry::TestRegistry,
+};
+use serde_json::{
+    Value,
+    json,
+};
 
 #[derive(Debug, Clone)]
 enum Driver {
@@ -98,6 +128,8 @@ struct Scenario {
     oracle_runs: usize,
     /// A project depends on a local tarball or directory.
     local_file_dependency: bool,
+    /// A project depends on a local directory that is no workspace project.
+    local_directory_dependency: bool,
 }
 
 /// What an install leaves behind that a user can observe: where every
@@ -134,8 +166,14 @@ impl Scenario {
         let fixture = WorkspaceFixture::new();
         fixture.append_workspace_yaml(&layout.workspace_yaml());
         fixture.write_root_manifest("root", ManifestDeps::default());
-        let scenario =
-            Self { driver, fixture, layout, oracle_runs: 0, local_file_dependency: false };
+        let scenario = Self {
+            driver,
+            fixture,
+            layout,
+            oracle_runs: 0,
+            local_file_dependency: false,
+            local_directory_dependency: false,
+        };
         scenario.set_dependencies("a", &json!({ "@pnpm.e2e/foo": "100.0.0" }));
         scenario.write_manifest(
             "b",
@@ -231,8 +269,12 @@ impl Scenario {
     /// `file:` snapshot, which the install fast path does not compare, so both
     /// CLIs refuse it (pnpm/tasks#145). With a shared lockfile, v11 also
     /// refuses the install fast path to refresh injected copies (pnpm/pnpm#15679).
-    /// v11 refuses it over any local file dependency, unchanged or not.
+    /// v11 refuses it over any local file dependency, unchanged or not, and
+    /// both CLIs over a local directory dependency.
     fn offers_next_install_fast_path(&self) -> bool {
+        if self.local_directory_dependency {
+            return false;
+        }
         if self.local_file_dependency && self.next_is_v11() {
             return false;
         }
@@ -639,11 +681,11 @@ where
     }
     pacquet_in(cwd)
         .without_ambient_pnpm_config()
-        .current_dir(cwd)
-        .env("PNPM_CONFIG_REGISTRY", fixture.registry.mock_instance.url())
-        .env("XDG_CONFIG_HOME", fixture.workspace.with_file_name("xdg-config"))
-        .arg("--reporter=ndjson")
-        .args(args)
+        .with_current_dir(cwd)
+        .with_env("PNPM_CONFIG_REGISTRY", fixture.registry.mock_instance.url())
+        .with_env("XDG_CONFIG_HOME", fixture.workspace.with_file_name("xdg-config"))
+        .with_arg("--reporter=ndjson")
+        .with_args(args)
         .output()
         .expect("run pnpm")
 }
@@ -1216,8 +1258,8 @@ fn a_scope_route_moved(layout: Layout) {
     }
 }
 
-/// Edits to `b` that change none of its dependencies, each kept by the next.
-fn manifest_edits_that_change_no_dependency(layout: Layout) {
+/// Edits to `b`, its dependencies first, each kept by the next.
+fn manifest_fields_edited(layout: Layout) {
     let mut scenario = Scenario::new(layout);
     scenario.install(&[]);
     let mut manifest = json!({
@@ -1225,6 +1267,7 @@ fn manifest_edits_that_change_no_dependency(layout: Layout) {
         "devDependencies": { "@pnpm.e2e/bar": "100.0.0" },
     });
     for (field, value, allowed) in [
+        ("dependencies", json!({ "@pnpm.e2e/foo": "100.0.0" }), AllowedRefusal::None),
         ("description", json!("edited"), AllowedRefusal::None),
         ("scripts", json!({ "build": r#"node -e """# }), AllowedRefusal::None),
         ("version", json!("1.0.1"), AllowedRefusal::None),
@@ -1235,6 +1278,76 @@ fn manifest_edits_that_change_no_dependency(layout: Layout) {
     }
 }
 
+/// A local directory dependency of `c` that is no workspace project, then a
+/// dependency added to its manifest.
+fn a_local_directory_edited(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    let directory = scenario.workspace().join("vendor/local-dir");
+    let write_manifest = |dependencies: &Value| {
+        let manifest =
+            json!({ "name": "local-dir", "version": "1.0.0", "dependencies": dependencies });
+        fs::write(directory.join("package.json"), manifest.to_string())
+            .expect("write the local directory's manifest");
+    };
+    fs::create_dir_all(&directory).expect("create the local directory");
+    write_manifest(&json!({}));
+    scenario.set_dependencies(
+        "c",
+        &json!({
+            "a": "workspace:*",
+            "@pnpm.e2e/bar": "100.0.0",
+            "local-dir": "file:../../vendor/local-dir",
+        }),
+    );
+    scenario.install(&[]);
+    scenario.local_file_dependency = true;
+    scenario.local_directory_dependency = true;
+    scenario.check_gates();
+    write_manifest(&json!({ "@pnpm.e2e/foo": "100.0.0" }));
+    scenario.check_gates_after_a_workspace_input_edit();
+}
+
+/// A comment added to the file at `relative`, which changes no setting.
+fn a_comment_added(layout: Layout, relative: &str) {
+    let mut scenario = Scenario::new(layout);
+    scenario.install(&[]);
+    let path = scenario.workspace().join(relative);
+    let mut text = fs::read_to_string(&path).expect("read the file");
+    text.push_str("# a comment\n");
+    fs::write(&path, text).expect("write the file");
+    scenario.check_gates();
+}
+
+fn a_comment_added_to_the_npmrc(layout: Layout) {
+    a_comment_added(layout, ".npmrc");
+}
+
+fn a_comment_added_to_the_workspace_manifest(layout: Layout) {
+    a_comment_added(layout, "pnpm-workspace.yaml");
+}
+
+fn a_project_added(layout: Layout) {
+    let mut scenario = Scenario::new(layout);
+    scenario.install(&[]);
+    scenario.set_dependencies("d", &json!({ "@pnpm.e2e/foo": "100.0.0" }));
+    scenario.check_gates_after_a_workspace_input_edit();
+}
+
+const fn edits_of(input: Input) -> fn(Layout) {
+    match input {
+        Input::Manifest => manifest_fields_edited,
+        Input::Lockfile => a_lockfile_swap_that_keeps_an_older_mtime,
+        Input::Pnpmfile => a_pnpmfile_hook_edited,
+        Input::PatchFile => a_patch_added_edited_and_removed,
+        Input::LocalTarball => a_local_tarball_a_hook_adds_then_replaced,
+        Input::LocalDirectory => a_local_directory_edited,
+        Input::Npmrc => a_comment_added_to_the_npmrc,
+        Input::WorkspaceManifest => a_comment_added_to_the_workspace_manifest,
+        Input::ProjectDirectories => a_project_added,
+    }
+}
+
+mod inputs;
 mod lone_project;
 
 macro_rules! matrix {
@@ -1254,22 +1367,29 @@ macro_rules! matrix {
                     filtered_commands_for_every_project_after_a_pull,
                     rewritten_but_unchanged_inputs_keep_the_fast_path,
                     a_manifest_edit_that_keeps_its_mtime,
-                    a_lockfile_swap_that_keeps_an_older_mtime,
                     an_unfiltered_command_after_a_filtered_install_of_another_project,
                     a_root_command_after_an_edit_in_a_project,
                     a_state_without_validation_records,
                     a_production_install_then_every_group,
                     a_workspace_without_a_root_manifest,
                     overrides_edited,
-                    a_pnpmfile_hook_edited,
                     a_pnpmfile_hook_rewriting_a_project_specifier,
                     a_package_extension_of_a_project_then_an_edit,
-                    a_local_tarball_a_hook_adds_then_replaced,
-                    a_patch_added_edited_and_removed,
                     dedupe_peers_toggled,
                     a_workspace_bin_renamed,
                     a_scope_route_moved,
-                    manifest_edits_that_change_no_dependency,
+                );
+
+                matrix!(@inputs
+                    an_edit_to_a_manifest: Manifest,
+                    an_edit_to_a_lockfile: Lockfile,
+                    an_edit_to_a_pnpmfile: Pnpmfile,
+                    an_edit_to_a_patch_file: PatchFile,
+                    an_edit_to_a_local_tarball: LocalTarball,
+                    an_edit_to_a_local_directory: LocalDirectory,
+                    an_edit_to_the_npmrc: Npmrc,
+                    an_edit_to_the_workspace_manifest: WorkspaceManifest,
+                    an_edit_to_the_project_directories: ProjectDirectories,
                 );
             }
         )*
@@ -1279,6 +1399,19 @@ macro_rules! matrix {
             #[test]
             fn $scenario() {
                 super::run_across_drivers(LAYOUT, super::$scenario);
+            }
+        )*
+    };
+    (@inputs $($test:ident: $input:ident,)*) => {
+        // Every input has a test: the match fails to compile without one.
+        const _: fn(super::Input) = |input| match input {
+            $(super::Input::$input => {})*
+        };
+
+        $(
+            #[test]
+            fn $test() {
+                super::run_across_drivers(LAYOUT, super::edits_of(super::Input::$input));
             }
         )*
     };
@@ -1336,21 +1469,19 @@ fn ci_and_auto_dedupe_gate_converges_across_v11_and_v12() {
 
     let run_in_ci = |v11_bundle: Option<&OsStr>, args: &[&str]| {
         let command = if let Some(bundle) = v11_bundle {
-            let mut cmd = Command::new("node");
-            cmd.arg(bundle).arg("--config.confirm-modules-purge=false");
-            cmd
+            Command::new("node").with_arg(bundle).with_arg("--config.confirm-modules-purge=false")
         } else {
             pacquet_in(scenario.workspace())
         };
         command
             .without_ambient_pnpm_config()
-            .current_dir(scenario.workspace())
-            .env("CI", "true")
-            .env("PNPM_CONFIG_CI", "true")
-            .env("PNPM_CONFIG_REGISTRY", scenario.fixture.registry.mock_instance.url())
-            .env("XDG_CONFIG_HOME", scenario.fixture.workspace.with_file_name("xdg-config"))
-            .arg("--reporter=ndjson")
-            .args(args)
+            .with_current_dir(scenario.workspace())
+            .with_env("CI", "true")
+            .with_env("PNPM_CONFIG_CI", "true")
+            .with_env("PNPM_CONFIG_REGISTRY", scenario.fixture.registry.mock_instance.url())
+            .with_env("XDG_CONFIG_HOME", scenario.fixture.workspace.with_file_name("xdg-config"))
+            .with_arg("--reporter=ndjson")
+            .with_args(args)
             .output()
             .expect("run pnpm in CI")
     };

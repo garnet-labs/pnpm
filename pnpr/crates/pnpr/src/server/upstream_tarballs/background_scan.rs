@@ -1,13 +1,27 @@
 use super::UpstreamTarball;
 use crate::server::{
-    AppState, CanonicalPackageName, Integrity, expected_tarball_dist, tar_decode_limit,
+    AppState,
+    CanonicalPackageName,
+    Integrity,
+    expected_tarball_dist,
+    tar_decode_limit,
     tar_integrity_within,
 };
 use std::{
     collections::HashSet,
-    io::{BufReader, Read},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    io::{
+        BufReader,
+        Read,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        Mutex,
+        PoisonError,
+    },
 };
 
 /// Concurrent and queued background `.tgz` scans after an upstream tarball is
@@ -60,10 +74,10 @@ impl BackgroundTarScans {
     fn try_claim(
         self: &Arc<Self>,
         name: &CanonicalPackageName,
-        tgz_key: &str,
+        tgz_key: String,
         deferred_file: Option<(&str, &str)>,
     ) -> Option<InFlightScanGuard> {
-        let key = (name.as_str().to_string(), tgz_key.to_string());
+        let key = (name.as_str().to_string(), tgz_key);
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if state.in_flight.contains(&key) {
@@ -93,6 +107,13 @@ impl BackgroundTarScans {
         Some(InFlightScanGuard { scans: Arc::clone(self), key: Some(key) })
     }
 
+    #[cfg_attr(
+        dylint_lib = "perfectionist",
+        expect(
+            perfectionist::needless_borrowed_parameters,
+            reason = "the key is built only past the empty-queue and full-capacity early returns"
+        )
+    )]
     fn take_deferred_file(
         &self,
         namespace: &str,
@@ -140,10 +161,66 @@ impl PromotedTarballScan {
         }
     }
 
+    pub(super) async fn promote_if_current(
+        self,
+        state: AppState,
+        blob: pnpr_storage::SealedBlob,
+        cached_path: PathBuf,
+        manifest_generation: Option<u64>,
+    ) -> std::io::Result<()> {
+        let _guard = crate::server::upstream_packuments::lock_upstream_package(
+            &state,
+            &self.namespace,
+            &self.name,
+        )
+        .await;
+        if self.binding_is_current(&state, manifest_generation).await? {
+            blob.promote().await?;
+            self.spawn(cached_path);
+        } else {
+            blob.abandon().await;
+        }
+        Ok(())
+    }
+
+    async fn binding_is_current(
+        &self,
+        state: &AppState,
+        manifest_generation: Option<u64>,
+    ) -> std::io::Result<bool> {
+        let bytes = self.storage
+            .read_upstream_document_any(&self.namespace, &self.name)
+            .await
+            .map_err(std::io::Error::other)?;
+        if bytes.is_none()
+            && manifest_generation.is_some_and(|generation| {
+                generation
+                    == crate::server::upstream_packuments::upstream_package_generation(
+                        state,
+                        &self.namespace,
+                        &self.name,
+                    )
+            })
+        {
+            return Ok(true);
+        }
+        let name = self.name.clone();
+        let filename = self.filename.clone();
+        let current = state.inner.packuments.workers
+            .run(move || {
+                bytes.and_then(|bytes| {
+                    crate::server::expected_tarball_dist(&bytes, &name, &filename).ok().flatten()
+                })
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+        Ok(current.is_some_and(|current| current.integrity == self.tgz_integrity))
+    }
+
     pub(super) fn spawn(self, cached_path: PathBuf) {
         let Some(in_flight_guard) = self.background_scans.try_claim(
             &self.name,
-            &self.tgz_key,
+            self.tgz_key.clone(),
             Some((&self.namespace, &self.filename)),
         ) else {
             return;
@@ -174,7 +251,7 @@ pub(super) fn schedule_cached_tarball_scan(state: &AppState, tarball: UpstreamTa
     }
     let Some(in_flight_guard) = state.inner.proxy.background_tar_scans.try_claim(
         tarball.name,
-        &tgz_key,
+        tgz_key.clone(),
         Some((tarball.namespace, tarball.filename)),
     ) else {
         return;
@@ -219,7 +296,7 @@ pub(super) fn schedule_deferred_cached_tarball_scan(
             return;
         }
         let Some(in_flight_guard) =
-            background_scans.try_claim(&name, &tgz_key, Some((&namespace, &filename)))
+            background_scans.try_claim(&name, tgz_key.clone(), Some((&namespace, &filename)))
         else {
             return;
         };

@@ -1,10 +1,17 @@
 //! Checks a package's wanted `os` / `cpu` / `libc` against the host.
 
 use crate::supported_architectures::{
-    ArchitectureAxes, SupportedArchitectures,
-    platform::{NamedPlatform, SupportedPlatform},
+    ArchitectureAxes,
+    SupportedArchitectures,
+    platform::{
+        NamedPlatform,
+        SupportedPlatform,
+    },
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use serde::Serialize;
 
@@ -57,10 +64,7 @@ pub struct UnsupportedPlatformError {
 }
 
 impl UnsupportedPlatformError {
-    /// The error for `package_id`, which wants `wanted` where the host is
-    /// `current`.
-    #[must_use]
-    pub fn new(package_id: String, wanted: WantedPlatform, current: Platform) -> Self {
+    fn new(package_id: String, wanted: WantedPlatform, current: Platform) -> Self {
         let wanted_json = wanted_json(&wanted);
         let current_json = current_json(&current);
         Self { package_id, wanted, current, wanted_json, current_json }
@@ -121,6 +125,13 @@ fn json_string_array(values: &[String]) -> String {
 /// `current_os`, `current_cpu`, and `current_libc` are passed in
 /// rather than read from the environment so this function stays
 /// testable.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the id is copied only for an unsupported platform; a supported one returns first"
+    )
+)]
 pub fn check_platform(
     package_id: &str,
     wanted: WantedPlatformRef<'_>,
@@ -189,14 +200,10 @@ fn platform_allows(
 /// suits it on its own. A platform that has no C library places no
 /// constraint on one.
 fn named_platform_allows(platform: &NamedPlatform, wanted: WantedPlatformRef<'_>) -> bool {
-    wanted.os.is_none_or(|wanted_os| axis_is_supported(platform.os.name(), None, wanted_os))
-        && wanted.cpu.is_none_or(|wanted_cpu| {
-            axis_is_supported(platform.architecture.cpu(), None, wanted_cpu)
-        })
+    wanted.os.is_none_or(|wanted_os| axis_is_supported(platform.os(), None, wanted_os))
+        && wanted.cpu.is_none_or(|wanted_cpu| axis_is_supported(platform.cpu(), None, wanted_cpu))
         && wanted.libc.is_none_or(|wanted_libc| {
-            platform.libc
-                .as_ref()
-                .is_none_or(|libc| axis_is_supported(libc.name(), None, wanted_libc))
+            platform.libc().is_none_or(|libc| axis_is_supported(libc, None, wanted_libc))
         })
 }
 

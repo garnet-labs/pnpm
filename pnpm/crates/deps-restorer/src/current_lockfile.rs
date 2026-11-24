@@ -3,32 +3,52 @@
 //!
 //! Rather than re-running the engine + `supportedArchitectures` +
 //! `skipped` checks at filter time, reuse the [`SkippedSnapshots`]
-//! set produced during install — its
+//! set produced during install; its
 //! [transient subset][`SkippedSnapshots::transient_only`], since
 //! installability skips stay in the file.
 //!
 //! The output drives the **next** install's diff. Without this
 //! filter, pacquet's current lockfile recorded every snapshot the
 //! resolver imagined, including ones `--no-optional` or a failed
-//! optional fetch dropped — so a follow-up install would think
+//! optional fetch dropped, so a follow-up install would think
 //! those slots were already on disk and skip work that should
 //! actually run.
 
-pub use reachability::{GroupSelection, ReachableLockfileGraph, collect_reachable};
-pub use variant_snapshots::{has_variant_snapshots, with_selected_variant_snapshots};
+pub use missing_projects::{
+    directory_peer_catalog_references,
+    missing_project_importers,
+};
+pub use reachability::{
+    GroupSelection,
+    ReachableLockfileGraph,
+    collect_reachable,
+};
+pub use runtime_dependencies::runtime_dependency_alias;
 
 mod missing_projects;
 mod reachability;
-mod variant_snapshots;
+mod runtime_dependencies;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::Path,
 };
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
-use pnpm_lockfile::{Lockfile, PackageKey, Prefix, ProjectSnapshot, ResolvedDependencyMap};
+use pnpm_lockfile::{
+    Lockfile,
+    PackageKey,
+    Prefix,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+};
 use pnpm_modules_yaml::IncludedDependencies;
 
 use crate::SkippedSnapshots;
@@ -60,20 +80,12 @@ pub fn materialization_closure(
     groups: &GroupSelection,
     skipped: &SkippedSnapshots,
 ) -> MaterializationClosure {
-    // A platform variant with dependencies of its own is wired as its own
-    // snapshot. The walk follows the host's variant, also when
-    // `supportedArchitectures` names one other platform.
-    let selected = with_selected_variant_snapshots(
-        lockfile,
-        &crate::install_package_by_snapshot::host_platform_selector(),
-    );
-    let lockfile = selected.as_ref().unwrap_or(lockfile);
     let reachable =
         collect_reachable(lockfile, workspace_root, initial_importer_ids, groups, |key| {
             skipped.contains(key)
         });
     // Package metadata survives an installability skip and a failed fetch but
-    // not an optional exclusion, so it needs its own reachability walk —
+    // not an optional exclusion, so it needs its own reachability walk,
     // unless those two subsets are empty, in which case the second walk would
     // retrace the first over the whole graph.
     let metadata_walk = (!skipped.optional_exclusions_are_the_only_skips()).then(|| {
@@ -145,6 +157,7 @@ pub fn merge_filtered_wanted_lockfile(
     let missing_project_importers = missing_projects::retain_importers(
         previous_wanted,
         real_importer_ids,
+        workspace_root,
         &mut freshly_resolved,
     );
     let can_reuse_unselected_importers = previous_wanted.is_some_and(|previous| {
@@ -328,7 +341,7 @@ fn restore_skipped_package_metadata(
 /// optional package is skipped, its own dependency subtree is not
 /// materialized either, and both stacks must record the same set.
 ///
-/// Only the persisted `installability` subset seeds the closure — and
+/// Only the persisted `installability` subset seeds the closure, and
 /// only that subset receives the additions. Transient skips
 /// (`--no-optional`, `--no-runtime`, a failed optional fetch) must not
 /// leak into `.modules.yaml`, or a later install's seed would keep their
@@ -421,8 +434,8 @@ pub fn filter_lockfile_for_current(
     // Every importer is a root here, so no importer has to be *discovered*
     // through a `link:` dep and the walk needs no real workspace root to
     // resolve those links against. The empty root keeps the walk in the
-    // lockfile-relative space importer IDs already use — `importer_root_dir("", id)`
-    // is `id` — so link resolution stays correct rather than merely unused.
+    // lockfile-relative space importer IDs already use (`importer_root_dir("", id)`
+    // is `id`) so link resolution stays correct rather than merely unused.
     materialization_closure(
         lockfile,
         Path::new(""),

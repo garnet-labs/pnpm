@@ -1,4 +1,18 @@
-use super::{Lockfile, PnprLink, Reporter, State, pnpr_lockfile_dir};
+use super::{
+    InstallFamilySelection,
+    Lockfile,
+    MaybeLazyLockfile,
+    PnprLink,
+    Reporter,
+    State,
+    pnpr_catalogs,
+    pnpr_local_specs::{
+        check_no_local_lockfile_specs_for_pnpr,
+        check_no_local_specs_for_pnpr,
+    },
+    pnpr_lockfile_dir,
+    resolve_projects_for_pnpr,
+};
 use pnpm_hooks::PnpmfileHooks;
 use pnpm_network::redact_url_for_display;
 use std::sync::Arc;
@@ -58,6 +72,13 @@ pub(crate) async fn pnpr_target<'a, Reporter: self::Reporter>(
     let Some(server) = state.config.pnpr_server.as_deref() else {
         return Ok(None);
     };
+    if state.config.reference_time_applies() {
+        let server = redact_url_for_display(server);
+        pnpm_reporter::emit_global_warning::<Reporter>(&format!(
+            "Resolving dependencies locally because the pnpr server at {server} does not support referenceTime",
+        ));
+        return Ok(None);
+    }
     let pnpmfile_hook = load_pnpmfile(state, pnpr_lockfile_dir(state, link))?;
     if let Some(hook) = pnpmfile_hook.as_ref()
         && let Some(unsupported) = resolution_hook(hook.as_ref()).await?
@@ -69,6 +90,55 @@ pub(crate) async fn pnpr_target<'a, Reporter: self::Reporter>(
         return Ok(None);
     }
     Ok(Some(PnprTarget { server, pnpmfile_hook }))
+}
+
+/// Side-effect-free counterpart to [`pnpr_target`] for pre-clean validation,
+/// avoiding a duplicate fallback warning when the install later runs locally.
+pub(crate) async fn uses_pnpr_server(
+    state: &State,
+    selection: Option<&InstallFamilySelection>,
+    link: &PnprLink<'_>,
+) -> miette::Result<bool> {
+    if state.config.pnpr_server.is_none() || state.config.reference_time_applies() {
+        return Ok(false);
+    }
+    let pnpmfile_hook = load_pnpmfile(state, pnpr_lockfile_dir(state, link))?;
+    if let Some(hook) = pnpmfile_hook.as_ref()
+        && resolution_hook(hook.as_ref()).await?.is_some()
+    {
+        return Ok(false);
+    }
+    let projects = resolve_projects_for_pnpr(state, selection, link.use_state_lockfile)?;
+    let catalogs = pnpr_catalogs(state)?;
+    if check_no_local_specs_for_pnpr(state.config, &projects, catalogs.as_ref()).is_err() {
+        return Ok(false);
+    }
+    if link.lockfile.ignore_manifest_check
+        && check_no_local_lockfile_specs_for_pnpr(state.config, peek_previous_wanted(state, link)?)
+            .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn peek_previous_wanted<'a>(
+    state: &'a State,
+    link: &PnprLink<'_>,
+) -> miette::Result<Option<&'a Lockfile>> {
+    if !link.use_state_lockfile {
+        return Ok(None);
+    }
+    let lockfile_source = if link.lockfile.fix {
+        MaybeLazyLockfile::Repair(&state.lockfile)
+    } else {
+        MaybeLazyLockfile::Lazy(&state.lockfile)
+    };
+    match lockfile_source.get() {
+        Ok(lockfile) => Ok(lockfile),
+        Err(_) if !link.lockfile.frozen => Ok(None),
+        Err(error) => Err(miette::Report::new(error).wrap_err("load the lockfile")),
+    }
 }
 
 /// The pnpmfile hooks this install runs, unless the run disabled them.

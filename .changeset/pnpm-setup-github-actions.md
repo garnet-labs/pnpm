@@ -1,6 +1,4 @@
 ---
-"@pnpm/engine.pm.commands": minor
-"pacquet": minor
 "pnpm": minor
 ---
 

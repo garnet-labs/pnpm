@@ -1,6 +1,13 @@
 pub use handoffs::HANDOFF_TTL;
-pub use sessions::{LoginReturn, LoginSession};
-pub use web_login::{WEB_LOGIN_TTL, WebLoginPoll, WebLoginTokens};
+pub use sessions::{
+    LoginReturn,
+    LoginSession,
+};
+pub use web_login::{
+    WEB_LOGIN_TTL,
+    WebLoginPoll,
+    WebLoginTokens,
+};
 
 mod workload_verification;
 
@@ -11,11 +18,18 @@ mod web_login;
 use sessions::BrowserSessions;
 
 mod provider_config;
-use provider_config::{build_providers, secure_url};
+use provider_config::{
+    build_providers,
+    secure_url,
+};
 
 mod workload;
 use workload::{
-    bound_user, match_workload_binding, token_payload, token_verifier, verify_workload,
+    bound_user,
+    match_workload_binding,
+    token_payload,
+    token_verifier,
+    verify_workload,
 };
 
 mod network;
@@ -26,33 +40,85 @@ mod pending_login;
 use pending_login::PendingLogin;
 
 mod provider_metadata;
-use provider_metadata::{MetadataCache, MetadataFreshness};
+use provider_metadata::{
+    MetadataCache,
+    MetadataFreshness,
+};
 
 mod transport;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD};
-use chrono::Utc;
+use base64::{
+    Engine as _,
+    engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+};
+use jiff::Timestamp;
 use openidconnect::{
-    AccessTokenHash, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    EndpointMaybeSet, EndpointNotSet, EndpointSet, HttpRequest, HttpResponse, IssuerUrl,
-    JsonWebKeySetUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
+    AccessTokenHash,
+    AuthType,
+    AuthorizationCode,
+    ClientId,
+    ClientSecret,
+    CsrfToken,
+    EndpointMaybeSet,
+    EndpointNotSet,
+    EndpointSet,
+    HttpRequest,
+    HttpResponse,
+    IssuerUrl,
+    JsonWebKeySetUrl,
+    Nonce,
+    OAuth2TokenResponse,
+    PkceCodeChallenge,
+    PkceCodeVerifier,
+    RedirectUrl,
     TokenResponse,
     core::{
-        CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreIdToken, CoreIdTokenVerifier,
-        CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreTokenResponse,
+        CoreAuthenticationFlow,
+        CoreClient,
+        CoreClientAuthMethod,
+        CoreIdToken,
+        CoreIdTokenVerifier,
+        CoreJsonWebKeySet,
+        CoreJwsSigningAlgorithm,
+        CoreProviderMetadata,
+        CoreTokenResponse,
     },
 };
-use p256::ecdsa::{Signature, SigningKey};
-use pnpr_config::oidc::{OidcBinding, OidcProvider, OidcTeamGrant, OidcWorkload};
-use pnpr_error::{RegistryError, Result};
-use serde::{Deserialize, Serialize};
+use p256::ecdsa::{
+    Signature,
+    SigningKey,
+};
+use pnpr_config::oidc::{
+    OidcBinding,
+    OidcProvider,
+    OidcTeamGrant,
+    OidcWorkload,
+};
+use pnpr_error::{
+    RegistryError,
+    Result,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{
+        HashMap,
+        HashSet,
+        VecDeque,
+    },
     sync::Mutex,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{
+    Mutex as AsyncMutex,
+    Semaphore,
+};
 use url::Url;
 
 const MAX_ENTRIES: usize = 1024;
@@ -79,7 +145,7 @@ struct Provider {
 /// Who a browser session signed in as.
 #[derive(Debug, Clone)]
 pub struct SessionUser {
-    pub username: String,
+    pub user_id: String,
     /// The team grants the session's groups claim earned at sign-in.
     pub teams: Vec<OidcTeamGrant>,
 }
@@ -137,19 +203,20 @@ impl OidcState {
             nonce: nonce.secret().clone(),
             verifier: verifier.secret().clone(),
             state_hash: super::sha256_hex(state.secret().as_bytes()),
-            expires: Utc::now().timestamp() + LOGIN_TTL.as_secs() as i64,
+            expires: Timestamp::now().as_second() + LOGIN_TTL.as_secs() as i64,
             returns_to,
         };
         let browser_secret = self.seal_login(&pending)?;
         Ok(LoginStart { url: url.to_string(), state: state.secret().clone(), browser_secret })
     }
 
-    pub async fn finish(
+    pub async fn finish<SubjectBinding: AsRef<str>>(
         &self,
         provider_name: &str,
         state: &str,
         browser_secret: &str,
         code: &str,
+        resolve_subject: impl FnOnce(&str) -> Result<SubjectBinding>,
     ) -> Result<LoginSession> {
         let login = self.open_login(browser_secret)?;
         self.validate_pending_login(&login, provider_name, state, code)?;
@@ -174,8 +241,9 @@ impl OidcState {
             &Nonce::new(login.nonce),
         )
         .await?;
-        let user = bound_user(&provider.config, token)?;
-        let now = Utc::now().timestamp();
+        // Keep the binding locked until the session exists, so revocation cannot miss it.
+        let (user, _subject_binding) = bound_user(&provider.config, token, resolve_subject)?;
+        let now = Timestamp::now().as_second();
         if login.expires <= now {
             return Err(rejected());
         }
@@ -229,8 +297,8 @@ fn random_secret() -> Result<String> {
     Ok(BASE64_URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn invalid_config(reason: &str) -> RegistryError {
-    RegistryError::InvalidConfig { reason: reason.to_string() }
+fn invalid_config(reason: String) -> RegistryError {
+    RegistryError::InvalidConfig { reason }
 }
 
 fn rejected() -> RegistryError {

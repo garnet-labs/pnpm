@@ -9,14 +9,31 @@ mod installation;
 mod workspace;
 
 mod peer_edges;
+mod runtime_dependencies;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{
+    BTreeMap,
+    HashMap,
+};
 
 use indexmap::IndexMap;
 use pnpm_lockfile::{
-    CatalogSnapshots, ComVer, ImporterDepVersion, Lockfile, LockfileResolution, LockfileSettings,
-    LockfileVersion, PackageKey, PackageMetadata, PkgName, PkgVerPeer, ResolvedCatalogEntry,
-    ResolvedDependencyMap, ResolvedDependencySpec, SnapshotDepRef, SnapshotEntry,
+    CatalogSnapshots,
+    ComVer,
+    ImporterDepVersion,
+    Lockfile,
+    LockfileResolution,
+    LockfileSettings,
+    LockfileVersion,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    PkgVerPeer,
+    ResolvedCatalogEntry,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
+    SnapshotEntry,
     TarballResolution,
 };
 use pnpm_modules_yaml::IncludedDependencies;
@@ -64,6 +81,7 @@ fn snapshot_with_deps(deps: &[(&str, &str)]) -> SnapshotEntry {
 
 fn package_metadata(name: &str) -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Tarball(TarballResolution {
             integrity: None,
             tarball: format!("https://example.test/{name}.tgz"),
@@ -129,6 +147,7 @@ fn lockfile_with_top_level(marker: &str, minor: u16) -> Lockfile {
             dedupe_peers: Some(marker == "fresh"),
             exclude_links_from_lockfile: marker != "fresh",
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: marker == "fresh",
             peers_suffix_max_length: Some(if marker == "fresh" { 2000 } else { 1000 }),
             integrity_target: None,

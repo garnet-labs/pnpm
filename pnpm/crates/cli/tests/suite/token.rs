@@ -3,7 +3,10 @@ use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::CommandTempCwd;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 
@@ -143,6 +146,7 @@ fn token_revoke_deletes_token() {
         .create();
     let delete_mock = server
         .mock("DELETE", format!("/-/npm/v1/tokens/token/{key}").as_str())
+        .match_header("npm-command", "token")
         .match_header("authorization", "Bearer test-token")
         .with_status(200)
         .with_body(r#"{"ok":true}"#)
@@ -172,6 +176,7 @@ fn token_create_posts_token() {
     let registry = format!("{}/", server.url());
     let mock = server
         .mock("POST", "/-/npm/v1/tokens")
+        .match_header("npm-command", "token")
         .match_header("authorization", "Bearer test-token")
         .match_body(mockito::Matcher::Json(serde_json::json!({
             "password": "hunter2",

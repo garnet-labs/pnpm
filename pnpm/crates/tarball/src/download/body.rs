@@ -1,15 +1,36 @@
 use super::{
-    Arc, BodyChunkSender, Duration, IgnoreEntryFilter, Instant, NetworkError, Reporter,
-    STREAM_EXTRACT_COMPRESSED_THRESHOLD, STREAM_EXTRACT_DURING_DOWNLOAD_THRESHOLD, SemaphorePermit,
-    StoreDir, Stream, StreamExt, TarballError, ThrottledClient, allocate_tarball_buffer,
-    body_chunk_channel, fetch_error, redact_url_for_display, spawn_extraction,
+    Arc,
+    BodyChunkSender,
+    Duration,
+    IgnoreEntryFilter,
+    Instant,
+    NetworkError,
+    Reporter,
+    STREAM_EXTRACT_COMPRESSED_THRESHOLD,
+    STREAM_EXTRACT_DURING_DOWNLOAD_THRESHOLD,
+    SemaphorePermit,
+    StoreDir,
+    Stream,
+    StreamExt,
+    TarballError,
+    ThrottledClient,
+    allocate_tarball_buffer,
+    body_chunk_channel,
+    fetch_error,
+    redact_url_for_display,
+    spawn_extraction,
 };
 use crate::{
     TarLimits,
     archive_integrity::ArchiveVerification,
     content_coding::ContentCoding,
     download::buffered::ExtractedFiles,
-    extract::{BodyChunkReceiver, ExtractedResource, StreamedResource, stream_extract_channel},
+    extract::{
+        BodyChunkReceiver,
+        ExtractedResource,
+        StreamedResource,
+        stream_extract_channel,
+    },
 };
 
 /// How a body extracted while it downloads is decoded, checked, and stored.
@@ -17,7 +38,7 @@ pub(super) struct BodyVerification {
     pub(super) content_coding: ContentCoding,
     pub(super) verification: ArchiveVerification,
     pub(super) limits: TarLimits,
-    pub(super) store_dir: &'static StoreDir,
+    pub(super) store_dir: StoreDir,
     pub(super) ignore_file_pattern: Option<Arc<IgnoreEntryFilter>>,
 }
 
@@ -27,9 +48,8 @@ impl BodyVerification {
         self,
         chunks: BodyChunkReceiver,
         permit: SemaphorePermit<'static>,
-        package_url: &str,
+        package_url: String,
     ) -> tokio::task::JoinHandle<ExtractedResource> {
-        let package_url = package_url.to_owned();
         spawn_extraction(permit, move || {
             stream_extract_channel(
                 chunks,
@@ -38,7 +58,7 @@ impl BodyVerification {
                     verification: self.verification,
                     package_url: &package_url,
                     limits: self.limits,
-                    store_dir: self.store_dir,
+                    store_dir: &self.store_dir,
                     ignore_file_pattern: self.ignore_file_pattern.as_deref(),
                 },
             )
@@ -51,7 +71,7 @@ impl BodyVerification {
 /// The extractor runs on a blocking thread fed through a channel. It
 /// removes the content coding, hashes the decoded resource, and extracts
 /// it, so what is held in memory is the queued chunks plus the
-/// extractor's own bounded batch — never the archive.
+/// extractor's own bounded batch, never the archive.
 ///
 /// `seed` is the part of the body already pulled off the socket; the
 /// caller has reported it to `progress`.
@@ -81,7 +101,7 @@ where
     Body: Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
 {
     let (chunk_tx, chunk_rx) = body_chunk_channel();
-    let extract_task = verification.spawn(chunk_rx, streaming_permit, package_url);
+    let extract_task = verification.spawn(chunk_rx, streaming_permit, package_url.to_owned());
 
     let mut feed = ExtractorFeed { chunk_tx, open: true };
     for chunk in seed {
@@ -255,7 +275,7 @@ where
     // path will ever fill: past the threshold below the body is
     // handed to the streaming extractor, so reserving for a larger
     // advertised size would be reserving for bytes that never land
-    // here — and would let a server's claim, rather than its body,
+    // here, and would let a server's claim, rather than its body,
     // decide the size of an allocation.
     let reserve =
         inputs.expected_size.map(|size| size.min(STREAM_EXTRACT_COMPRESSED_THRESHOLD as u64));
@@ -293,6 +313,6 @@ pub(super) fn streams_while_downloading(
     unpacked_size: Option<usize>,
 ) -> bool {
     expected_size
-        .or_else(|| unpacked_size.and_then(|size| u64::try_from(size).ok()))
+        .or_else(|| unpacked_size.map(u64::try_from).and_then(Result::ok))
         .is_some_and(|size| size >= STREAM_EXTRACT_DURING_DOWNLOAD_THRESHOLD)
 }

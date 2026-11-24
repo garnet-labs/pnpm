@@ -1,13 +1,21 @@
 use super::{
-    OptimisticRepeatInstallCheck, current_lockfile::CurrentLockfile,
-    manifest_agreement::LinkedPackagesContext, manifest_string_field,
+    OptimisticRepeatInstallCheck,
+    current_lockfile::CurrentLockfile,
+    manifest_agreement::LinkedPackagesContext,
+    manifest_string_field,
 };
-use pnpm_config::{Config, LinkWorkspacePackages};
+use pnpm_config::{
+    Config,
+    LinkWorkspacePackages,
+};
 use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::PackageManifest;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Restore a missing `pnpm-lock.yaml` from the current lockfile before
@@ -27,14 +35,17 @@ pub(super) fn regenerate_wanted_lockfile_if_missing(
     if check.lockfile.is_loaded_or_on_disk() || !check.config.lockfile {
         return Ok(false);
     }
-    let Some(current) = current.get().ok_or("the current lockfile cannot be loaded")? else {
+    let Some(current_lockfile) = current.get().ok_or("the current lockfile cannot be loaded")?
+    else {
         return Ok(false);
     };
-    current
-        .save_to_path(
-            &check.workspace_root.join(check.config.wanted_lockfile_name()),
-            check.config.symlinked_lockfile(),
-        )
+    let target = check.workspace_root.join(check.config.wanted_lockfile_name());
+    let symlinked = check.config.symlinked_lockfile();
+    let saved = match current.regenerated_text(check.config.lockfile_format) {
+        Some(text) => pnpm_lockfile::save_text_to_path(text.to_string(), &target, symlinked),
+        None => current_lockfile.save_to_path_as(check.config.lockfile_format, &target, symlinked),
+    };
+    saved
         .map(|()| true)
         .map_err(|_| "failed to regenerate the wanted lockfile from the current lockfile")
 }
@@ -49,7 +60,17 @@ impl<'a> LinkedPackagesContext<'a> {
             std::collections::HashMap<String, &'a Path>,
         > = std::collections::HashMap::new();
         for (root_dir, manifest) in project_manifests {
-            manifests_by_dir.insert(root_dir.as_path(), *manifest);
+            manifests_by_dir.insert(std::borrow::Cow::Borrowed(root_dir.as_path()), *manifest);
+            let link_dir = pnpm_resolving_npm_resolver::resolve_workspace_package_dir(
+                root_dir,
+                manifest.value(),
+            );
+            if link_dir != *root_dir {
+                // Another project's root keeps its own manifest, whichever is indexed first.
+                manifests_by_dir
+                    .entry(std::borrow::Cow::Owned(pnpm_fs::lexical_normalize(&link_dir)))
+                    .or_insert(*manifest);
+            }
             if let (Some(name), Some(version)) = (
                 manifest_string_field(manifest, "name"),
                 manifest_string_field(manifest, "version"),
@@ -68,20 +89,23 @@ impl<'a> LinkedPackagesContext<'a> {
     }
 
     /// The version of the package manifest at `dir`, preferring the
-    /// already-loaded workspace manifests over a disk read.
+    /// already-loaded workspace manifests over a disk read. A manifest
+    /// without a version yields the empty string; `None` means `dir` has no
+    /// readable manifest.
     pub(super) fn linked_version(&self, dir: &Path) -> Option<String> {
-        if let Some(manifest) = self.manifests_by_dir.get(dir) {
-            return manifest_string_field(manifest, "version");
+        if let Some(manifest) = self.manifests_by_dir.get(pnpm_fs::lexical_normalize(dir).as_path())
+        {
+            return Some(manifest_string_field(manifest, "version").unwrap_or_default());
         }
-        pnpm_package_manifest::safe_read_package_json_from_dir(dir)
-            .ok()
-            .flatten()
-            .and_then(|value| {
-                value
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
+        let manifest =
+            pnpm_package_manifest::safe_read_package_json_from_dir(dir).ok().flatten()?;
+        Some(
+            manifest
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
     }
 }
 pub(super) fn current_lockfile_unusable_with_non_empty_wanted(

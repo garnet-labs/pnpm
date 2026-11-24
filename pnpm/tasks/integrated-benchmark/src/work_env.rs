@@ -1,15 +1,25 @@
-pub(crate) use fixtures::seed_peer_heavy_registry;
+pub(crate) use peer_heavy::seed_peer_heavy_registry;
+
+use command_extra::CommandExtra;
 
 mod scripts;
 use scripts::{
-    build_cleanup_command, create_install_script, dir_contains_file, may_create_lockfile,
-    sync_bench_repo, wipe_bench_dir,
+    build_cleanup_command,
+    create_install_script,
+    may_create_lockfile,
+    remove_dir_all_with_retry,
+    sync_bench_repo,
+    wipe_bench_dir,
 };
 
 mod fixtures;
+mod peer_heavy;
 
 use fixtures::{
-    create_generated_projects, create_npmrc, create_package_json, create_pnpm_workspace,
+    create_generated_projects,
+    create_npmrc,
+    create_package_json,
+    create_pnpm_workspace,
     save_pristine_copies,
 };
 
@@ -18,29 +28,58 @@ mod injected_workspace;
 mod linked_workspace;
 mod unlocked_deps;
 
+mod registries_home;
+mod revision_auth;
+mod revision_mock;
 mod server_config;
 use server_config::{
-    PnprServer, PnprServerPaths, RevisionMockRegistry, append_pnpr_auth_to_npmrc,
-    cold_revision_mock_command, distinct_public_route_registries, mint_pnpr_token, seed_pnpr_auth,
-    serves_npm_under_base_path, wait_for_pnpr_ready, write_pnpr_benchmark_config,
+    PnprResolverServer,
+    PnprServer,
+    PnprServerPaths,
+    RevisionMockRegistry,
+    append_pnpr_auth_to_npmrc,
+    cold_revision_mock_command,
+    distinct_public_route_registries,
+    mint_pnpr_token,
+    pnpr_cache_dir,
+    serves_npm_under_base_path,
+    wait_for_pnpr_ready,
+    write_pnpr_benchmark_config,
 };
 
 mod measurements;
 use measurements::{
-    BenchmarkDiagnostics, BenchmarkTargetDiagnostics, HyperfineCommand, check_peer_heavy_speedup,
-    collect_pnpr_direct_ratios, non_trivial_cold_batch, read_benchmark_diagnostics,
-    read_hyperfine_report, read_phase_events, render_diagnostics_markdown,
-    requires_fresh_pnpr_cold_batch_metrics, summarize_phase_events,
+    BenchmarkDiagnostics,
+    BenchmarkTargetDiagnostics,
+    HyperfineCommand,
+    check_peer_heavy_speedup,
+    collect_pnpr_direct_ratios,
+    non_trivial_cold_batch,
+    read_benchmark_diagnostics,
+    read_hyperfine_report,
+    read_phase_events,
+    render_diagnostics_markdown,
+    requires_fresh_pnpr_cold_batch_metrics,
+    summarize_phase_events,
 };
 
 mod diagnostics;
 
+mod mock_home;
+mod pnpr_restart;
+use pnpr_restart::PnprRestartListener;
 mod servers;
 
 mod build;
 
 use crate::{
-    cli_args::{RegistryMode, TargetKind, TargetSpec},
+    cli_args::{
+        BenchmarkScenario,
+        ColdPnprCache,
+        RegistryMode,
+        TargetKind,
+        TargetSpec,
+    },
     verify::executor,
 };
 use os_display::Quotable;
@@ -48,8 +87,13 @@ use pipe_trait::Pipe;
 use std::{
     collections::HashMap,
     fmt,
-    fs::{self},
-    path::{Path, PathBuf},
+    fs::{
+        self,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 
@@ -68,8 +112,8 @@ const PNPR_DIRECT_RATIO_MAX: f64 = 1.05;
 const PNPR_DIRECT_ABS_SLACK_SECONDS: f64 = 0.015;
 // A pacquet peer-resolution blowup lands *below* 1x on this DAG, so the floor
 // only has to clear measurement noise, not encode how far ahead pacquet is.
-// The TypeScript resolver's own hot-cache cost moves independently — offline
-// resolution of this fixture dropped from ~34s to ~3s in pnpm/pnpm#13504 — and
+// The TypeScript resolver's own hot-cache cost moves independently (offline
+// resolution of this fixture dropped from ~34s to ~3s in pnpm/pnpm#13504) and
 // a floor tracking that headroom would fail on every TypeScript perf win.
 // Compared on each target's fastest run: see `benchmark_target_min`.
 const PACQUET_PNPM_SPEEDUP_MIN: f64 = 1.25;
@@ -83,7 +127,6 @@ const PEER_HEAVY_DEPTH: usize = 5;
 const PEER_HEAVY_WIDTH: usize = 80;
 const PEER_HEAVY_PROVIDER: &str = "@pnpmtest/peer-benchmark-provider";
 const PEER_HEAVY_VERSION: &str = "1.0.0";
-const PEER_HEAVY_INTEGRITY: &str = "sha512-z6pI0F3yfz8Zl3R0+g1pwMbdY12h7Osj5UYSTh6Rcpd7UtO7nxeIzf+7gPDOAH4mgxi7BXaTyBDS0hBFgZVssQ==";
 // 7 x 32 projects with a shared peer provider, so the generated workspace
 // holds 225 importers joined by 6,369 `workspace:*` edges. Sized to keep
 // fixture generation instant while leaving a walk that re-traverses shared
@@ -128,7 +171,7 @@ impl<'a> From<&'a TargetSpec> for BenchId<'a> {
     }
 }
 
-/// Static bench id of the proxy-cache populator — the one id that warms
+/// Static bench id of the proxy-cache populator, the one id that warms
 /// the registry's on-disk cache rather than being benchmarked.
 const INIT_PROXY_CACHE_ID: &str = ".init-proxy-cache";
 
@@ -184,7 +227,7 @@ impl WorkEnv {
         self.options.selection.targets.iter().map(BenchId::from)
     }
 
-    /// Every bench dir the run will touch — every target plus, when
+    /// Every bench dir the run will touch; every target plus, when
     /// requested, the system-pnpm sibling.
     fn benchmarked_ids(&self) -> impl Iterator<Item = BenchId<'_>> + '_ {
         self.target_ids()
@@ -196,7 +239,7 @@ impl WorkEnv {
     }
 
     /// Repository to fetch pnpm revisions from. Falls back to the
-    /// pacquet repo when the caller didn't override it — useful when
+    /// pacquet repo when the caller didn't override it, useful when
     /// the same monorepo checkout contains both code bases.
     fn pnpm_repository(&self) -> &'_ Path {
         self.options.build.pnpm_repository.as_deref().unwrap_or_else(|| self.repository())
@@ -234,7 +277,7 @@ impl WorkEnv {
     /// front of a runtime-resolved bundle path.
     ///
     /// The script `cd`s into the bench dir before exec-ing this, so
-    /// every path here is relative to the bench dir — that lets the
+    /// every path here is relative to the bench dir, that lets the
     /// pnpm-target branch defer `pnpm.mjs` vs `pnpm.cjs` resolution
     /// to script runtime (after `build()` has produced the bundle),
     /// and also avoids embedding absolute paths that might contain
@@ -308,7 +351,7 @@ impl WorkEnv {
         if populate_proxy_cache {
             eprintln!("Populating proxy registry cache...");
             Command::new("bash")
-                .arg(self.script_path(WorkEnv::INIT_PROXY_CACHE))
+                .with_arg(self.script_path(WorkEnv::INIT_PROXY_CACHE))
                 .pipe_mut(executor("install.bash"));
         }
     }
@@ -320,7 +363,7 @@ impl WorkEnv {
         create_pnpm_workspace(
             dir,
             self.options.selection.fixture_dir.as_deref(),
-            registry,
+            registry.to_owned(),
             scenario,
         );
         create_npmrc(dir, registry, scenario);
@@ -338,18 +381,19 @@ impl WorkEnv {
         // preserves `store-dir` / `cache-dir` so subsequent iterations can
         // reuse them, which means whatever a previous run / scenario /
         // partial invocation left behind would otherwise carry into the
-        // warmup — and the warmup wouldn't actually be what primes them.
+        // warmup, and the warmup wouldn't actually be what primes them.
         // Wiping once upfront makes the warmup the priming run no matter
         // what state the work-env was in. For cold-cache scenarios this is
         // redundant with the per-iteration wipe but harmless (Copilot
         // review on <https://github.com/pnpm/pacquet/pull/296>).
         // `pnpr-storage` is the per-target pnpr server's
-        // store + cache (only present for `pnpr@<rev>` targets) — wiping it
-        // upfront (but never per-iteration) makes the hyperfine warmup the
-        // run that primes the server, so timed runs measure a warm
-        // long-running server even while the client is cold. `cold-mock-storage`
-        // (only the cold-pnpr scenario) is wiped here too so the warmup run
-        // starts cold even on a reused work-env, not just the timed iterations.
+        // store + cache (only present for `pnpr@<rev>` targets), wiping it
+        // upfront makes the hyperfine warmup the run that primes the server,
+        // so timed runs measure a warm long-running server even while the
+        // client is cold. Only `ColdPnprCache::Resolution` empties the
+        // server's cache per iteration, by restarting it. `cold-mock-storage`
+        // (only the cold-pnpr scenario) is wiped before the mock starts; timed
+        // iterations clear only its cache so its database stays open.
         for dir in self
             .benchmarked_ids()
             .map(|id| self.bench_dir(id))
@@ -364,7 +408,7 @@ impl WorkEnv {
 
         // Spawned before the GVS pre-warm below so a pnpr target
         // would have its server up if a scenario ever combines the two.
-        let _pnpr_servers = self.start_pnpr_servers(pnpr_server_registry);
+        let mut pnpr_servers = self.start_pnpr_servers(pnpr_server_registry);
 
         if scenario.enables_gvs() || scenario.prewarms_node_modules() {
             self.prewarm_install_state();
@@ -380,7 +424,7 @@ impl WorkEnv {
             self.prewarm_caches(&cleanup_command);
         }
 
-        self.run_hyperfine(&cleanup_command);
+        self.run_timed_iterations(scenario, &cleanup_command, &mut pnpr_servers);
         if scenario.uses_peer_heavy_fixture() {
             self.install_for_lockfile_comparison(&cleanup_command);
         }
@@ -389,7 +433,10 @@ impl WorkEnv {
         // events to `BENCHMARK_OUTPUT.ndjson` like the timed runs, and only
         // the timed runs' events may reach the diagnostics.
         if self.options.count_syscalls {
-            self.count_syscalls(&cleanup_command);
+            self.count_syscalls(
+                &cleanup_command,
+                resolution_cold_servers(scenario, &mut pnpr_servers),
+            );
             // The traced runs' cleanup removed the lockfiles the parity
             // check reads, so write them again.
             if scenario.uses_peer_heavy_fixture() {
@@ -398,27 +445,75 @@ impl WorkEnv {
         }
     }
 
-    fn run_hyperfine(&self, cleanup_command: &str) {
-        let mut command = Command::new("hyperfine");
-        command
-            .current_dir(self.root())
-            .arg("--prepare")
-            .arg(cleanup_command);
+    /// Run hyperfine, restarting the pnpr servers before every iteration when
+    /// the scenario empties their resolution cache.
+    fn run_timed_iterations(
+        &self,
+        scenario: BenchmarkScenario,
+        cleanup_command: &str,
+        pnpr_servers: &mut [PnprResolverServer],
+    ) {
+        let cold_servers = resolution_cold_servers(scenario, pnpr_servers);
+        if cold_servers.is_empty() {
+            self.run_hyperfine(&[cleanup_command.to_string()]);
+        } else {
+            self.run_hyperfine_restarting_pnpr_servers(cleanup_command, cold_servers);
+        }
+    }
+
+    /// Run hyperfine with each `pnpr@<rev>` command's own server restarted with
+    /// an empty cache before every iteration of that command. `servers` holds
+    /// one entry per pnpr target, in [`Self::benchmarked_ids`] order.
+    fn run_hyperfine_restarting_pnpr_servers(
+        &self,
+        cleanup_command: &str,
+        servers: &mut [PnprResolverServer],
+    ) {
+        let listener = PnprRestartListener::bind();
+        let mut pnpr_targets = 0;
+        let prepare_commands: Vec<String> = self
+            .benchmarked_ids()
+            .map(|id| {
+                if !id.is_pnpr() {
+                    return cleanup_command.to_string();
+                }
+                let restart = listener.prepare_command(pnpr_targets);
+                pnpr_targets += 1;
+                format!("{restart} && {cleanup_command}")
+            })
+            .collect();
+        listener.serve_during(
+            |server| {
+                let Some(resolver) = servers.get_mut(server) else { return false };
+                self.restart_pnpr_server_with_empty_cache(resolver);
+                true
+            },
+            || self.run_hyperfine(&prepare_commands),
+        );
+    }
+
+    /// `prepare_commands` holds either one step for every command or one step
+    /// per command, in [`Self::benchmarked_ids`] order.
+    fn run_hyperfine(&self, prepare_commands: &[String]) {
+        let mut command = Command::new("hyperfine").with_current_dir(self.root());
+        for prepare in prepare_commands {
+            command = command.with_arg("--prepare").with_arg(prepare);
+        }
 
         self.options.hyperfine_options.append_to(&mut command);
 
         for id in self.benchmarked_ids() {
-            command
-                .arg("--command-name")
-                .arg(id.to_string())
-                .arg(self.bash_command(id));
+            command = command
+                .with_arg("--command-name")
+                .with_arg(id.to_string())
+                .with_arg(self.bash_command(id));
         }
 
-        command
-            .arg("--export-json")
-            .arg(self.root().join("BENCHMARK_REPORT.json"))
-            .arg("--export-markdown")
-            .arg(self.root().join("BENCHMARK_REPORT.md"));
+        command = command
+            .with_arg("--export-json")
+            .with_arg(self.root().join("BENCHMARK_REPORT.json"))
+            .with_arg("--export-markdown")
+            .with_arg(self.root().join("BENCHMARK_REPORT.md"));
 
         executor("hyperfine")(&mut command);
     }
@@ -427,23 +522,31 @@ impl WorkEnv {
     /// from. Each round traces every target once, so drift across rounds
     /// reaches both revisions alike. A `pnpr@*` target's server was started
     /// before the trace, so its counts cover the client only.
-    fn count_syscalls(&self, cleanup_command: &str) {
+    /// `cold_servers` holds the pnpr servers to restart with an empty cache
+    /// before their target's trace, as in [`Self::run_timed_iterations`].
+    fn count_syscalls(&self, cleanup_command: &str, cold_servers: &mut [PnprResolverServer]) {
         for round in 0..SYSCALL_COUNT_ROUNDS {
+            let mut cold_servers = cold_servers.iter_mut();
             for id in self.benchmarked_ids() {
+                if id.is_pnpr()
+                    && let Some(server) = cold_servers.next()
+                {
+                    self.restart_pnpr_server_with_empty_cache(server);
+                }
                 Command::new("bash")
-                    .current_dir(self.root())
-                    .arg("-c")
-                    .arg(cleanup_command)
+                    .with_current_dir(self.root())
+                    .with_arg("-c")
+                    .with_arg(cleanup_command)
                     .pipe_mut(executor("syscall count cleanup"));
                 eprintln!("Counting syscalls for {id}, round {round}...");
                 Command::new("strace")
-                    .current_dir(self.root())
-                    .arg("--follow-forks")
-                    .arg("--summary-only")
-                    .arg("--output")
-                    .arg(self.syscall_counts_path(id, round))
-                    .arg("bash")
-                    .arg(self.script_path(id))
+                    .with_current_dir(self.root())
+                    .with_arg("--follow-forks")
+                    .with_arg("--summary-only")
+                    .with_arg("--output")
+                    .with_arg(self.syscall_counts_path(id, round))
+                    .with_arg("bash")
+                    .with_arg(self.script_path(id))
                     .pipe_mut(executor("strace install"));
             }
         }
@@ -457,14 +560,14 @@ impl WorkEnv {
         for id in self.benchmarked_ids() {
             eprintln!("Pre-warming the install state for {id}...");
             Command::new("bash")
-                .arg(self.script_path(id))
+                .with_arg(self.script_path(id))
                 .pipe_mut(executor("install.bash"));
         }
     }
 
-    /// Offline scenarios can't let hyperfine's warmup prime the caches — the
+    /// Offline scenarios can't let hyperfine's warmup prime the caches (the
     /// measured `--offline` command fails against the mirror the
-    /// pre-benchmark wipe just emptied — so the online priming script runs
+    /// pre-benchmark wipe just emptied) so the online priming script runs
     /// once per target first.
     ///
     /// The per-iteration cleanup runs before the priming too: a reused
@@ -477,9 +580,9 @@ impl WorkEnv {
         let scenario =
             self.options.selection.scenario.expect("scenario set when prewarm_caches() is reached");
         Command::new("bash")
-            .current_dir(self.root())
-            .arg("-c")
-            .arg(cleanup_command)
+            .with_current_dir(self.root())
+            .with_arg("-c")
+            .with_arg(cleanup_command)
             .pipe_mut(executor("prewarm cleanup"));
         for id in self.benchmarked_ids() {
             if scenario.uses_cargo_workspace_fixture() {
@@ -487,7 +590,7 @@ impl WorkEnv {
             }
             eprintln!("Pre-warming caches for {id}...");
             Command::new("bash")
-                .arg(self.prewarm_script_path(id))
+                .with_arg(self.prewarm_script_path(id))
                 .pipe_mut(executor(PREWARM_SCRIPT));
             if scenario.uses_cargo_workspace_fixture() {
                 cargo_workspace::verify_materialized_crates(&self.bench_dir(id));
@@ -500,13 +603,13 @@ impl WorkEnv {
     fn install_for_lockfile_comparison(&self, cleanup_command: &str) {
         eprintln!("Verifying peer-heavy lockfile parity...");
         Command::new("bash")
-            .current_dir(self.root())
-            .arg("-c")
-            .arg(cleanup_command)
+            .with_current_dir(self.root())
+            .with_arg("-c")
+            .with_arg(cleanup_command)
             .pipe_mut(executor("lockfile comparison cleanup"));
         for id in self.target_ids() {
             Command::new("bash")
-                .arg(self.script_path(id))
+                .with_arg(self.script_path(id))
                 .pipe_mut(executor("lockfile comparison install"));
         }
     }
@@ -537,3 +640,15 @@ impl WorkEnv {
 
 #[cfg(test)]
 mod tests;
+
+/// The pnpr servers a scenario restarts with an empty cache before every
+/// install it measures, in [`WorkEnv::benchmarked_ids`] order.
+fn resolution_cold_servers(
+    scenario: BenchmarkScenario,
+    pnpr_servers: &mut [PnprResolverServer],
+) -> &mut [PnprResolverServer] {
+    match scenario.cold_pnpr_cache() {
+        Some(ColdPnprCache::Resolution) => pnpr_servers,
+        Some(ColdPnprCache::Tarballs) | None => &mut [],
+    }
+}

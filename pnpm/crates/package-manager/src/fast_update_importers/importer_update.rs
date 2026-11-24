@@ -1,22 +1,41 @@
 use super::{
-    ImportersPlan, ManifestDependencies, importer_dependency, importer_dependency_mut,
+    ImportersPlan,
+    ManifestDependencies,
+    importer_dependency,
+    importer_dependency_mut,
     importer_group,
     locked_versions::{
-        LockedPick, LockedSnapshots, is_linked_from_a_survivor,
+        LockedPick,
+        LockedSnapshots,
+        is_linked_from_a_survivor,
         locked_version_resolution_would_pick,
     },
-    move_dependency, remove_dependencies_absent_from,
+    move_dependency,
+    remove_dependencies_absent_from,
 };
 use crate::{
-    dependencies_graph_to_lockfile::manifest_publish_config, fast_update_lockfile::GraphEdits,
+    dependencies_graph_to_lockfile::manifest_publish_config,
+    fast_update_lockfile::GraphEdits,
     fast_update_settings::is_directory_dependency,
 };
-use node_semver::{Range, Version};
+use node_semver::Version;
 use pnpm_lockfile::{
-    ImporterDepVersion, Lockfile, PackageKey, PkgName, ProjectSnapshot, ResolvedDependencySpec,
+    ImporterDepVersion,
+    Lockfile,
+    PackageKey,
+    PkgName,
+    ProjectSnapshot,
+    ResolvedDependencySpec,
 };
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use std::collections::{BTreeMap, HashMap};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_semver_include_prerelease::parse_strict_semver_range;
+use std::collections::{
+    BTreeMap,
+    HashMap,
+};
 
 /// The lockfile halves an importer edge is replayed against.
 #[derive(Clone, Copy)]
@@ -77,8 +96,12 @@ pub(super) fn apply_one_importer_update(
         manifest,
         manifest_dependencies,
     } = *entry;
-    let records_nothing = importers.get(importer_id.as_str()).is_none_or(records_no_dependencies);
-    if records_nothing && !manifest_dependencies.is_empty() {
+    let needs_a_new_importer = importers
+        .get(importer_id.as_str())
+        .is_none_or(|importer| {
+            records_no_dependencies(importer) && !manifest_dependencies.is_empty()
+        });
+    if needs_a_new_importer {
         let Some(new_importer) =
             importer_from_locked_versions(locked.snapshots, manifest, manifest_dependencies, plan)
         else {
@@ -135,8 +158,7 @@ pub(super) fn apply_importer_edge(
     true
 }
 /// Move a declared dependency onto the version its changed specifier resolves
-/// to. Safe without resolving because the target version is already in the
-/// lockfile, subtree and all.
+/// to, provided its locked subtree has no declared peers.
 pub(super) fn retarget_importer_dependency(
     dependency: &mut ResolvedDependencySpec,
     alias: &PkgName,
@@ -145,7 +167,7 @@ pub(super) fn retarget_importer_dependency(
     plan: &ImportersPlan<'_, '_>,
     edits: &mut GraphEdits,
 ) -> bool {
-    let Ok(range) = Range::parse(specifier) else {
+    let Some(range) = parse_strict_semver_range(specifier) else {
         return false;
     };
     let Some(ver_peer) = dependency.version.ver_peer() else {
@@ -168,7 +190,7 @@ pub(super) fn retarget_importer_dependency(
         return false;
     }
     if moves {
-        if recorded.suffix.peer() != "" {
+        if recorded.suffix.peer() != "" || plan.has_peer_dependent_subtree(alias, &wanted.version) {
             return false;
         }
         let Ok(moved) = wanted.version.to_string().parse() else {
@@ -199,7 +221,7 @@ pub(super) fn retarget_names_a_snapshot(
     }
     snapshots.is_some_and(|snapshots| snapshots.contains_key(recorded))
 }
-/// Whether the lockfile records no dependency of this project — the
+/// Whether the lockfile records no dependency of this project, the
 /// shape a project it has never seen arrives in, alongside an absent
 /// entry.
 pub(super) fn records_no_dependencies(importer: &ProjectSnapshot) -> bool {
@@ -227,14 +249,14 @@ pub(super) fn importer_from_locked_versions(
         if is_directory_dependency(&alias.to_string(), specifier, &plan.workspace_package_names) {
             return None;
         }
-        let range = Range::parse(specifier).ok()?;
+        let range = parse_strict_semver_range(specifier)?;
         let pick = locked_version_resolution_would_pick(
             snapshots,
             alias,
             &range,
             plan.resolution_picks_lowest,
         )?;
-        if pick.peer_suffixed {
+        if pick.peer_suffixed || plan.has_peer_dependent_subtree(alias, &pick.version) {
             return None;
         }
         let dependency = ResolvedDependencySpec {
@@ -287,7 +309,7 @@ pub(super) fn add_importer_edge(
     {
         return false;
     }
-    let Ok(range) = Range::parse(specifier) else {
+    let Some(range) = parse_strict_semver_range(specifier) else {
         return false;
     };
     let Some(wanted) = locked_version_resolution_would_pick(
@@ -298,7 +320,7 @@ pub(super) fn add_importer_edge(
     ) else {
         return false;
     };
-    if wanted.peer_suffixed {
+    if wanted.peer_suffixed || plan.has_peer_dependent_subtree(alias, &wanted.version) {
         return false;
     }
     let wanted = wanted.version;

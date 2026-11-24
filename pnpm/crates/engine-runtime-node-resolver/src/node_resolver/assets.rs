@@ -1,10 +1,25 @@
 use super::{
-    Arc, AuthHeaders, BTreeMap, BinaryArchive, BinaryResolution, BinarySpec, FetchShasumsFileError,
-    GetNodeArtifactAddressOptions, Integrity, LockfileResolution, NodeResolverError, Path,
-    PlatformAssetResolution, PlatformAssetTarget, ShasumsFileItem, ThrottledClient,
-    fetch_shasums_file_cached, fetch_shasums_file_cached_with_auth_headers,
+    Arc,
+    AuthHeaders,
+    BTreeMap,
+    BinaryArchive,
+    BinaryResolution,
+    BinarySpec,
+    FetchShasumsFileError,
+    GetNodeArtifactAddressOptions,
+    Integrity,
+    LockfileResolution,
+    NodeResolverError,
+    Path,
+    PlatformAssetResolution,
+    PlatformAssetTarget,
+    ShasumsFileItem,
+    ThrottledClient,
+    fetch_shasums_file_cached,
+    fetch_shasums_file_cached_with_auth_headers,
     fetch_verified_node_shasums_file_cached,
-    fetch_verified_node_shasums_file_cached_with_auth_headers, get_node_artifact_address,
+    fetch_verified_node_shasums_file_cached_with_auth_headers,
+    get_node_artifact_address,
 };
 use crate::normalize_arch::node_major;
 
@@ -173,19 +188,14 @@ fn platform_asset_targets(
     libc: Option<String>,
     version: &str,
 ) -> Vec<PlatformAssetTarget> {
-    let mut targets = vec![PlatformAssetTarget {
-        os: platform.to_string(),
-        cpu: arch.to_string(),
-        libc,
-        ..PlatformAssetTarget::default()
-    }];
+    let mut targets =
+        vec![PlatformAssetTarget { os: platform.to_string(), cpu: arch.to_string(), libc }];
     if let Some(major) = node_major(version) {
         if platform == "darwin" && arch == "x64" && major < 16 {
             targets.push(PlatformAssetTarget {
                 os: "darwin".to_string(),
                 cpu: "arm64".to_string(),
                 libc: None,
-                ..PlatformAssetTarget::default()
             });
         }
         if platform == "win32" && arch == "x64" && major < 20 {
@@ -193,7 +203,6 @@ fn platform_asset_targets(
                 os: "win32".to_string(),
                 cpu: "arm64".to_string(),
                 libc: None,
-                ..PlatformAssetTarget::default()
             });
         }
     }
@@ -207,7 +216,7 @@ pub(super) struct NodeFileName {
 }
 
 /// Match the nodejs.org artifact pattern
-/// `^node-v<version>-([^-.]+)-([^.-]+)(-musl)?\.(tar\.gz|zip)$` —
+/// `^node-v<version>-([^-.]+)-([^.-]+)(-musl)?\.(tar\.gz|zip)$`,
 /// implemented by hand so the resolver doesn't pay the regex crate
 /// dependency for a single pattern.
 pub(super) fn parse_node_file_name(file_name: &str, version: &str) -> Option<NodeFileName> {

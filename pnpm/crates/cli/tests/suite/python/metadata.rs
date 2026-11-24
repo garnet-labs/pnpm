@@ -1,5 +1,14 @@
-use super::{TINY_BACKEND, project, python, python_project, serve, serve_backends, wheel};
+use super::{
+    TINY_BACKEND,
+    project,
+    python,
+    python_project,
+    serve,
+    serve_backends,
+    wheel,
+};
 use assert_cmd::prelude::*;
+use command_extra::CommandExtra;
 use std::fs;
 
 #[tokio::test]
@@ -17,20 +26,20 @@ async fn requirements_only_projects_install_and_invalidate_the_frozen_lockfile()
     .unwrap();
     fs::write(root.path().join("base.txt"), "beta==1.0\n").unwrap();
     super::pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     python(root.path())
-        .args(["-c", "import alpha, beta"])
+        .with_args(["-c", "import alpha, beta"])
         .assert()
         .success();
     super::pacquet_in(root.path())
-        .args(["install", "--frozen-lockfile"])
+        .with_args(["install", "--frozen-lockfile"])
         .assert()
         .success();
     fs::write(root.path().join("base.txt"), "beta>=1.0\n").unwrap();
     super::pacquet_in(root.path())
-        .args(["install", "--frozen-lockfile"])
+        .with_args(["install", "--frozen-lockfile"])
         .assert()
         .failure();
     assert!(
@@ -50,11 +59,31 @@ async fn requirements_alongside_a_tool_only_manifest_install() {
     fs::write(root.path().join("pyproject.toml"), "[tool.ruff]\nline-length = 100\n").unwrap();
     fs::write(root.path().join("requirements.txt"), "alpha==1.0\n").unwrap();
     super::pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     python(root.path())
-        .args(["-c", "import alpha"])
+        .with_args(["-c", "import alpha"])
+        .assert()
+        .success();
+}
+
+#[tokio::test]
+async fn exec_uses_the_requirements_projects_environment_below_a_tool_manifest() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let _alpha = serve(&mut server, "alpha", &[("1.0", wheel("alpha", "1.0", "", &[]))]).await;
+    project(root.path(), &server.url(), &[]);
+    fs::write(root.path().join("pyproject.toml"), "[tool.ruff]\n").unwrap();
+    let worker = root.path().join("worker");
+    fs::create_dir(&worker).unwrap();
+    fs::write(worker.join("requirements.txt"), "alpha").unwrap();
+    super::pacquet_in(root.path())
+        .with_arg("install")
+        .assert()
+        .success();
+    super::pacquet_in(&worker)
+        .with_args(["exec", "python", "-c", "import alpha"])
         .assert()
         .success();
 }
@@ -69,7 +98,7 @@ fn unsupported_requirements_directives_and_cycles_fail_with_context() {
         fs::remove_file(root.path().join("pyproject.toml")).unwrap();
         fs::write(root.path().join("requirements.txt"), contents).unwrap();
         let output = super::pacquet_in(root.path())
-            .arg("install")
+            .with_arg("install")
             .assert()
             .failure()
             .get_output()
@@ -107,21 +136,21 @@ async fn dynamic_dependencies_use_the_metadata_hook_or_wheel_fallback() {
         python_project(root.path(), "app", "dynamic = ['dependencies']");
         fs::write(root.path().join("requirements.txt"), "alpha==1.0\n").unwrap();
         super::pacquet_in(root.path())
-            .args(["install", "--lockfile-only"])
+            .with_args(["install", "--lockfile-only"])
             .assert()
             .success();
         assert!(!root.path().join(".venv").exists());
         super::pacquet_in(root.path())
-            .args(["install", "--frozen-lockfile"])
+            .with_args(["install", "--frozen-lockfile"])
             .assert()
             .success();
         python(root.path())
-            .args(["-c", "import app, alpha"])
+            .with_args(["-c", "import app, alpha"])
             .assert()
             .success();
         fs::write(root.path().join("requirements.txt"), "alpha>=1.0\n").unwrap();
         super::pacquet_in(root.path())
-            .args(["install", "--frozen-lockfile"])
+            .with_args(["install", "--frozen-lockfile"])
             .assert()
             .failure();
     }
@@ -143,7 +172,7 @@ async fn dynamic_metadata_never_runs_an_unapproved_backend() {
     )
     .unwrap();
     let output = super::pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .failure()
         .get_output()
@@ -200,11 +229,11 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         "dynamic = ['dependencies']\n[tool.uv.sources]\nmylib = {workspace = true, editable = false}",
     );
     super::pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     python(&app)
-        .args(["-c", "import mylib; assert mylib.MARKER == 'workspace mylib'"])
+        .with_args(["-c", "import mylib; assert mylib.MARKER == 'workspace mylib'"])
         .assert()
         .success();
     assert_eq!(fs::read_to_string(library.join("wheel-build-count")).unwrap(), "1");
@@ -228,7 +257,7 @@ async fn static_local_projects_cannot_add_dependencies_after_resolution() {
     project(root.path(), &server.url(), &[]);
     python_project(root.path(), "app", "dependencies = []");
     super::assert_failure_contains(
-        super::pacquet_in(root.path()).arg("install"),
+        &mut super::pacquet_in(root.path()).with_arg("install"),
         "requires `helper`, which",
     );
 }
@@ -281,11 +310,11 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     )
     .unwrap();
     super::pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     python(root.path())
-        .args(["-c", "import mylib"])
+        .with_args(["-c", "import mylib"])
         .assert()
         .success();
 }
@@ -318,7 +347,7 @@ async fn dynamic_metadata_cannot_omit_or_change_static_dependencies() {
             )
             .unwrap();
             super::assert_failure_contains(
-                super::pacquet_in(root.path()).arg("install"),
+                &mut super::pacquet_in(root.path()).with_arg("install"),
                 "omits static project dependencies",
             );
             assert!(!root.path().join("pylock.toml").exists());
@@ -357,7 +386,7 @@ def prepare_metadata_for_build_wheel(directory, config_settings=None):
         project(root.path(), &server.url(), &[]);
         python_project(root.path(), "app", "dynamic = ['dependencies']");
         super::assert_failure_contains(
-            super::pacquet_in(root.path()).arg("install"),
+            &mut super::pacquet_in(root.path()).with_arg("install"),
             "differs from its prepared metadata",
         );
         assert!(!root.path().join("pylock.toml").exists());
@@ -380,7 +409,7 @@ async fn inactive_dynamic_dependencies_do_not_shadow_workspace_projects() {
     python_project(&root.path().join("packages/mylib"), "mylib", "dependencies = []");
     python_project(&root.path().join("packages/app"), "app", "dynamic = ['dependencies']");
     super::pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
 }
@@ -411,11 +440,11 @@ async fn a_dependency_extra_selects_dynamic_workspace_dependencies() {
         "dependencies = ['mylib[foo]']\n[tool.uv.sources]\nmylib = {workspace = true}",
     );
     super::pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     python(&root.path().join("packages/app"))
-        .args(["-c", "import beta; assert beta.MARKER == 'workspace beta'"])
+        .with_args(["-c", "import beta; assert beta.MARKER == 'workspace beta'"])
         .assert()
         .success();
 }
@@ -434,7 +463,7 @@ async fn dynamic_dependencies_cannot_change_static_python_support() {
     project(root.path(), &server.url(), &[]);
     python_project(root.path(), "app", "dynamic = ['dependencies']");
     super::assert_failure_contains(
-        super::pacquet_in(root.path()).args(["install", "--lockfile-only"]),
+        &mut super::pacquet_in(root.path()).with_args(["install", "--lockfile-only"]),
         "differs from static project requires-python",
     );
     assert!(!root.path().join("pylock.toml").exists());
@@ -467,7 +496,7 @@ async fn dynamic_versions_cannot_omit_rename_or_add_static_extras() {
         )
         .unwrap();
         super::assert_failure_contains(
-            super::pacquet_in(root.path()).args(["install", "--lockfile-only"]),
+            &mut super::pacquet_in(root.path()).with_args(["install", "--lockfile-only"]),
             "differs from static project extras",
         );
         assert!(!root.path().join("pylock.toml").exists());
@@ -512,8 +541,8 @@ def prepare_metadata_for_build_wheel(directory, config_settings=None):
     .unwrap();
     fs::write(root.path().join(".python-version"), "3.11\n").unwrap();
     super::pacquet_in(root.path())
-        .args(["install", "--lockfile-only", "--runtime-on-fail=error"])
-        .env("PATH", format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()))
+        .with_args(["install", "--lockfile-only", "--runtime-on-fail=error"])
+        .with_env("PATH", format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()))
         .assert()
         .success();
     assert_eq!(super::selected_python(root.path()), "3.12.7");
@@ -538,7 +567,78 @@ async fn the_final_wheel_must_preserve_static_dependencies() {
     project(root.path(), &server.url(), &[]);
     python_project(root.path(), "app", "dependencies = ['alpha']");
     super::assert_failure_contains(
-        super::pacquet_in(root.path()).arg("install"),
+        &mut super::pacquet_in(root.path()).with_arg("install"),
         "omits static project dependencies",
     );
+}
+
+#[test]
+fn a_virtual_workspace_root_leaves_its_requirements_and_environment_alone() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path(), "https://unused.invalid", &[]);
+    fs::write(
+        root.path().join("pyproject.toml"),
+        "[tool.uv.workspace]\nmembers = ['app']\nexclude = ['.']\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("requirements.txt"), "ruff==0.14.13\n").unwrap();
+    fs::create_dir(root.path().join(".venv")).unwrap();
+    fs::write(root.path().join(".venv/owned-by-user"), "preserve").unwrap();
+    let member = root.path().join("app");
+    fs::create_dir(&member).unwrap();
+    fs::write(
+        member.join("pyproject.toml"),
+        "[project]\nname = 'app'\nversion = '1.0'\nrequires-python = '>=3.10'\ndependencies = []\n",
+    )
+    .unwrap();
+    super::pacquet_in(root.path())
+        .with_args(["install", "--offline"])
+        .assert()
+        .success();
+    assert!(member.join(".venv").exists());
+    assert_eq!(fs::read_to_string(root.path().join(".venv/owned-by-user")).unwrap(), "preserve");
+    assert!(!root.path().join("pylock.toml").exists());
+}
+
+#[test]
+fn a_requirements_only_project_with_an_unmanaged_environment_is_skipped() {
+    for manifest in [None, Some("[tool.ruff]\nline-length = 100\n")] {
+        let root = tempfile::tempdir().unwrap();
+        project(root.path(), "https://unused.invalid", &[]);
+        match manifest {
+            Some(contents) => fs::write(root.path().join("pyproject.toml"), contents).unwrap(),
+            None => fs::remove_file(root.path().join("pyproject.toml")).unwrap(),
+        }
+        // An option pnpm does not read: the file is the user's, so it is
+        // never parsed.
+        fs::write(
+            root.path().join("requirements.txt"),
+            "--index-url https://example.com/simple\nruff==0.14.13\n",
+        )
+        .unwrap();
+        fs::create_dir(root.path().join(".venv")).unwrap();
+        fs::write(root.path().join(".venv/owned-by-user"), "preserve").unwrap();
+        for arguments in
+            [&["install", "--offline"][..], &["install", "--offline", "--frozen-lockfile"]]
+        {
+            let output = super::pacquet_in(root.path())
+                .with_args(arguments)
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let reported = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            eprintln!("{reported}");
+            assert!(reported.contains("Skipping the Python requirements in"));
+        }
+        assert_eq!(
+            fs::read_to_string(root.path().join(".venv/owned-by-user")).unwrap(),
+            "preserve",
+        );
+        assert!(!root.path().join("pylock.toml").exists());
+    }
 }

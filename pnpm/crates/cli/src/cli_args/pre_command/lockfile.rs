@@ -1,8 +1,27 @@
 use super::{
-    Config, Context, EnvLockfile, EnvLockfileSync, HashSet, Invocation, LockfileResolution,
-    PNPM_VERSION, PackageKey, PackageManagerToSync, PackageMetadata, Path, PathBuf, PinRoots,
-    PmOnFail, PreCommandPlan, SwitchProcessState, SwitchSource, Value, VersionPart,
-    is_package_manager_resolved, package_manager_to_sync_for_version, pnpm_package_to_install,
+    Config,
+    Context,
+    EnvLockfile,
+    EnvLockfileSync,
+    HashSet,
+    Invocation,
+    LockfileResolution,
+    PNPM_VERSION,
+    PackageKey,
+    PackageManagerToSync,
+    PackageMetadata,
+    Path,
+    PathBuf,
+    PinRoots,
+    PmOnFail,
+    PreCommandPlan,
+    SwitchProcessState,
+    SwitchSource,
+    Value,
+    VersionPart,
+    is_package_manager_resolved,
+    package_manager_to_sync_for_version,
+    pnpm_package_to_install,
     version_satisfies,
 };
 use pnpm_lockfile::SnapshotEntry;
@@ -25,7 +44,6 @@ pub(super) fn env_lockfile_sync_plan(
 pub(super) fn env_lockfile_sync_from_loaded(
     config: &Config,
     root_manifest: &Value,
-    roots: &PinRoots,
     on_fail: PmOnFail,
     env_lockfile: Option<&EnvLockfile>,
     running_version: &str,
@@ -34,12 +52,9 @@ pub(super) fn env_lockfile_sync_from_loaded(
     if !config.lockfile {
         return Ok(None);
     }
-    let Some(mut package_manager) = package_manager_to_sync_for_version(
-        root_manifest,
-        &roots.manifest,
-        Some(on_fail),
-        running_version,
-    ) else {
+    let Some(mut package_manager) =
+        package_manager_to_sync_for_version(root_manifest, Some(on_fail), running_version)
+    else {
         return Ok(None);
     };
     if keep_locked_range_version
@@ -70,7 +85,7 @@ pub(super) fn read_env_lockfile(root_dir: &Path) -> miette::Result<Option<EnvLoc
         })
 }
 
-/// Switch straight to the version the env lockfile records — unless its
+/// Switch straight to the version the env lockfile records, unless its
 /// entries don't satisfy the bootstrap rules (resolutions carrying
 /// tarball URLs written by an earlier pnpm, say). Those are not an
 /// error: they are discarded and re-resolved afresh through the trusted

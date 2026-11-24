@@ -16,7 +16,7 @@
 //!
 //! Everything here reads the lockfile and the already-materialized
 //! `node_modules`; nothing resolves or fetches. `--find-by` finders, which
-//! run JavaScript out of a `.pnpmfile.cjs`, stay in the CLI — this crate
+//! run JavaScript out of a `.pnpmfile.cjs`, stay in the CLI; this crate
 //! only consumes the verdicts they record (see [`search::Searcher`]).
 
 pub mod build;
@@ -29,7 +29,10 @@ pub mod pkg_info;
 pub mod render;
 pub mod search;
 
-use pnpm_lockfile::PkgNameVerPeer;
+use pnpm_lockfile::{
+    PackageMetadata,
+    PkgNameVerPeer,
+};
 
 /// Cap on every recursive walk over the dependency graph. The cycle
 /// guards bound the *output*, not the recursion depth, so a hostile
@@ -69,7 +72,7 @@ impl TreeNodeId {
     }
 }
 
-/// One materialized node of the forward dependency tree — the shape the
+/// One materialized node of the forward dependency tree, the shape the
 /// `list` renderers consume. Counterpart of the TypeScript
 /// [`DependencyNode`].
 #[derive(Debug, Default, Clone)]
@@ -128,4 +131,18 @@ pub fn peers_suffix_hash(dep_path: &PkgNameVerPeer) -> Option<String> {
     let mut hex = pnpm_crypto_hash::create_hex_hash(peer);
     hex.truncate(4);
     Some(hex)
+}
+
+/// Semver version recorded for `dep_path`: `metadata.version` when the
+/// lockfile `packages:` entry carries one (tarball/git deps), or the semver
+/// encoded in `dep_path` (including `runtime:` semver pins and
+/// registry-qualified versions, while excluding `file:` directory and other
+/// non-semver references).
+pub(crate) fn resolved_pkg_version(
+    metadata: Option<&PackageMetadata>,
+    dep_path: &PkgNameVerPeer,
+) -> Option<String> {
+    metadata
+        .and_then(|metadata| metadata.version.clone())
+        .or_else(|| dep_path.suffix.registry_version().map(ToString::to_string))
 }

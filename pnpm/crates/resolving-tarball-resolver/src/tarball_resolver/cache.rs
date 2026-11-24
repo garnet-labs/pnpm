@@ -1,12 +1,27 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::Arc,
+};
 
 use pnpm_reporter::SilentReporter;
-use pnpm_resolving_resolver_base::{ResolveError, ResolveResult, WantedDependency};
+use pnpm_resolving_resolver_base::{
+    ResolveError,
+    ResolveResult,
+    WantedDependency,
+};
 use pnpm_store_dir::store_index_key;
-use pnpm_tarball::{PrefetchResult, ResolvedTarball, TarballResolutionFetch};
+use pnpm_tarball::{
+    PrefetchResult,
+    ResolvedTarball,
+    TarballResolutionFetch,
+};
 
 use super::TarballResolver;
-use crate::http_cache::{self, Freshness, TarballResolutionRecord};
+use crate::http_cache::{
+    self,
+    Freshness,
+    TarballResolutionRecord,
+};
 
 impl TarballResolver {
     /// Resolve from the persistent URL → integrity record when its archive
@@ -107,8 +122,7 @@ impl TarballResolver {
         let Some(cache_dir) = self.http_cache_dir(normalized_bare_specifier) else {
             return;
         };
-        let tarball = cached_tarball_url(resolved_url, resolved);
-        if !self.may_cache(&tarball, normalized_bare_specifier)
+        if !self.may_cache(resolved_url, normalized_bare_specifier)
             || http_cache::varies_between_requests(&resolved.cache_headers)
         {
             http_cache::remove(cache_dir, normalized_bare_specifier);
@@ -118,7 +132,7 @@ impl TarballResolver {
             cache_dir,
             &TarballResolutionRecord::from_response(
                 normalized_bare_specifier.to_owned(),
-                tarball,
+                resolved_url.to_owned(),
                 resolved.final_url.clone(),
                 resolved.integrity.to_string(),
                 &resolved.cache_headers,
@@ -152,6 +166,10 @@ impl TarballResolver {
                 ctx.auth_headers
                     .for_url_with_package(url, Some(package_id))
                     .is_none()
+                    && matches!(
+                        ctx.auth_headers.metadata_scope(url, Some(package_id)),
+                        pnpm_network::MetadataCacheScope::Public,
+                    )
             })
     }
 
@@ -182,7 +200,7 @@ impl TarballResolver {
 /// The URL to record for a response fetched from `requested_url`: the
 /// final URL after redirects when the response is `immutable`, as the
 /// lockfile records it.
-fn cached_tarball_url(requested_url: &str, resolved: &ResolvedTarball) -> String {
+pub(super) fn cached_tarball_url(requested_url: &str, resolved: &ResolvedTarball) -> String {
     if resolved.cache_headers.cache_control
         .as_deref()
         .is_some_and(|header| http_cache::CacheControl::parse(header).immutable)

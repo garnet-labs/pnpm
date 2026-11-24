@@ -1,13 +1,19 @@
 //! `pnpm help --all` (`-a`).
 //!
 //! pnpm's `help` lists only its common commands unless `--all` is given
-//! (`pnpm11/pnpm/src/cmd/help.ts`). Clap's help subcommand already lists
+//! ([`pnpm11/pnpm/src/cmd/help.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/pnpm/src/cmd/help.ts)). Clap's help subcommand already lists
 //! every command and declares no options, so the flag is dropped before
 //! clap parses argv.
 
-use crate::flag_relocation::{ArgTable, find_positional};
+use crate::flag_relocation::{
+    ArgTable,
+    find_positional,
+};
 use clap::Command;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{
+    OsStr,
+    OsString,
+};
 
 /// Remove `--all`, `-a`, and the other spellings of the boolean (`--all=<value>`,
 /// `--no-all`) from the arguments of the `help` subcommand. Their value is

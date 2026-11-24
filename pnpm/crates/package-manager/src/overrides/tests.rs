@@ -1,19 +1,38 @@
 use super::VersionsOverrider;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config_parse_overrides::parse_overrides;
+use pnpm_config_parse_overrides::parse_overrides_iter;
 use pnpm_package_manifest::PackageManifest;
-use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
+use pnpm_workspace_projects_graph::{
+    BaseProject,
+    DependencyGroups,
+    DependencyRewriter,
+    GraphProject,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use std::path::{
+    Path,
+    PathBuf,
 };
 
+mod applied_selectors;
+mod catalog_references;
+mod specificity;
+
 fn parsed(map: &[(&str, &str)]) -> Vec<pnpm_config_parse_overrides::VersionOverride> {
-    let owned: HashMap<String, String> = map
+    let owned: Vec<(String, String)> = map
         .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect();
-    parse_overrides(&owned, &Catalogs::new()).expect("parse_overrides fixture")
+    parse_overrides_iter(
+        owned
+            .iter()
+            .map(|(key, value)| (key, value)),
+        &Catalogs::new(),
+    )
+    .expect("parse_overrides fixture")
 }
 
 /// Build an in-memory `PackageManifest` from a JSON value. The path
@@ -114,12 +133,18 @@ fn version_scoped_target_only_matches_intersecting_range() {
         "name": "my-app",
         "version": "1.0.0",
         "dependencies": { "foo": "^2" },
+        "devDependencies": { "foo": "npm:bar@>=1.0.0 <2.0.0" },
     }));
     overrider.apply(&mut non_intersecting, Some(Path::new("/workspace")));
     assert_eq!(
         dep_spec(&non_intersecting, "dependencies", "foo"),
         Some("^2"),
         "override is dormant when ranges don't intersect",
+    );
+    assert_eq!(
+        dep_spec(&non_intersecting, "devDependencies", "foo"),
+        Some("npm:bar@>=1.0.0 <2.0.0"),
+        "override does not match an npm alias with space-separated comparators",
     );
 }
 
@@ -397,13 +422,13 @@ fn convergence_override_skips_non_range_specifiers() {
     let mut manifest = manifest_from_value(json!({
         "dependencies": { "foo": "github:org/foo" },
         "devDependencies": { "foo": "workspace:^" },
-        "optionalDependencies": { "foo": "latest" },
+        "optionalDependencies": { "foo": "npm:bar@>=4.0.0 <5.0.0" },
     }));
     overrider.apply(&mut manifest, Some(Path::new("/workspace")));
 
     assert_eq!(dep_spec(&manifest, "dependencies", "foo"), Some("github:org/foo"));
     assert_eq!(dep_spec(&manifest, "devDependencies", "foo"), Some("workspace:^"));
-    assert_eq!(dep_spec(&manifest, "optionalDependencies", "foo"), Some("latest"));
+    assert_eq!(dep_spec(&manifest, "optionalDependencies", "foo"), Some("npm:bar@>=4.0.0 <5.0.0"));
 }
 
 #[test]
@@ -559,7 +584,6 @@ fn override_for_undeclared_dependency_applies_converge_only_within_range() {
     assert_eq!(undeclared(&overrider, "react", "^19.0.0"), None);
     assert!(overrider.converge_declared_ranges().is_empty());
 }
-
 /// An override is written once, at the workspace root, and applied to
 /// every package that matches. A bare path has to move with it the way
 /// its `link:` spelling does, or it names a directory inside whichever
@@ -626,7 +650,7 @@ fn workspace_path_override_is_reanchored_against_pkg_dir() {
 }
 
 #[test]
-fn workspace_path_override_is_kept_as_declared_without_a_pkg_dir() {
+fn workspace_path_override_is_anchored_without_a_pkg_dir() {
     let overrides = parsed(&[("foo", "workspace:./packages/foo")]);
     let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
 
@@ -637,7 +661,10 @@ fn workspace_path_override_is_kept_as_declared_without_a_pkg_dir() {
     }));
     overrider.apply(&mut manifest, None);
 
-    assert_eq!(dep_spec(&manifest, "dependencies", "foo"), Some("workspace:./packages/foo"));
+    assert_eq!(
+        dep_spec(&manifest, "dependencies", "foo"),
+        Some("workspace:/workspace/packages/foo"),
+    );
 }
 
 /// The shapes the resolver chain claims before the local resolver keep
@@ -795,4 +822,178 @@ fn wildcard_and_typed_overrides_respect_specificity() {
     }));
     overrider.apply(&mut mui_material, Some(Path::new("/workspace")));
     assert_eq!(dep_spec(&mui_material, "peerDependencies", "react"), Some("^18.2.0"));
+}
+
+#[test]
+fn version_scoped_override_matches_catalog_dependency_by_catalog_specifier() {
+    use super::DependencyGroup;
+    use std::collections::BTreeMap;
+
+    let mut catalogs = Catalogs::new();
+    catalogs.insert(
+        "default".to_string(),
+        BTreeMap::from([
+            ("ms".to_string(), "~2.1.0".to_string()),
+            ("foo".to_string(), "^1.1.0".to_string()),
+        ]),
+    );
+    catalogs.insert(
+        "legacy".to_string(),
+        BTreeMap::from([("ms".to_string(), "^1.0.0".to_string())]),
+    );
+    let overrides = parsed(&[("ms@^2.0.0", "2.1.1"), ("app>foo@^1.0.0", "1.2.3")]);
+    let overrider =
+        VersionsOverrider::new(&overrides, Path::new("/workspace")).with_catalogs(&catalogs);
+
+    let mut matching = manifest_from_value(json!({
+        "name": "app",
+        "version": "1.0.0",
+        "dependencies": {
+            "ms": "catalog:",
+            "foo": "catalog:",
+        },
+    }));
+    overrider.apply(&mut matching, Some(Path::new("/workspace")));
+    assert_eq!(dep_spec(&matching, "dependencies", "ms"), Some("2.1.1"));
+    assert_eq!(dep_spec(&matching, "dependencies", "foo"), Some("1.2.3"));
+
+    let mut non_matching = manifest_from_value(json!({
+        "name": "other",
+        "version": "1.0.0",
+        "dependencies": {
+            "ms": "catalog:legacy",
+            "foo": "catalog:",
+        },
+    }));
+    overrider.apply(&mut non_matching, Some(Path::new("/workspace")));
+    assert_eq!(dep_spec(&non_matching, "dependencies", "ms"), Some("catalog:legacy"));
+    assert_eq!(dep_spec(&non_matching, "dependencies", "foo"), Some("catalog:"));
+
+    let app_manifest = json!({ "name": "app", "version": "1.0.0" });
+    let matcher = overrider.dependency_matcher(&app_manifest);
+    assert!(matcher.matches(DependencyGroup::Prod, "ms", "catalog:"));
+    assert!(!matcher.matches(DependencyGroup::Prod, "ms", "catalog:legacy"));
+    assert!(matcher.matches(DependencyGroup::Prod, "foo", "catalog:"));
+
+    assert_eq!(undeclared(&overrider, "ms", "catalog:").as_deref(), Some("2.1.1"));
+    assert_eq!(undeclared(&overrider, "ms", "catalog:legacy"), None);
+}
+
+/// A workspace project as [`crate::overrides_dependency_rewriter`]'s
+/// hook sees it: a root dir, the manifest's `name` / `version`, and its
+/// dependency groups.
+struct GraphProjectFixture {
+    root_dir: PathBuf,
+    name: String,
+    groups: DependencyGroups,
+}
+
+impl BaseProject for GraphProjectFixture {
+    fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    fn manifest_name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+}
+
+impl GraphProject for GraphProjectFixture {
+    fn manifest_version(&self) -> Option<&str> {
+        Some("1.0.0")
+    }
+
+    fn dependency_groups(&self, _ignore_dev_deps: bool) -> DependencyGroups {
+        self.groups.clone()
+    }
+}
+
+fn pairs(dependencies: &[(&str, &str)]) -> Vec<(String, String)> {
+    dependencies
+        .iter()
+        .map(|(name, spec)| ((*name).to_string(), (*spec).to_string()))
+        .collect()
+}
+
+/// The merged dependency list `overrider` rewrites for the project `name`
+/// at `/workspace/packages/<name>`.
+fn rewritten(
+    overrider: &VersionsOverrider,
+    name: &str,
+    groups: DependencyGroups,
+) -> Vec<(String, String)> {
+    let project = GraphProjectFixture {
+        root_dir: PathBuf::from("/workspace/packages").join(name),
+        name: name.to_string(),
+        groups,
+    };
+    let mut groups = project.dependency_groups(false);
+    overrider.rewrite_dependencies(&project, &mut groups);
+    groups.merge()
+}
+
+fn prod_only(dependencies: &[(&str, &str)]) -> DependencyGroups {
+    DependencyGroups { prod: pairs(dependencies), ..DependencyGroups::default() }
+}
+
+#[test]
+fn rewrite_dependencies_applies_workspace_and_local_protocol_overrides() {
+    let overrides =
+        parsed(&[("lib", "workspace:*"), ("qar", "link:./packages/qar"), ("baz", "file:../baz")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    assert_eq!(
+        rewritten(
+            &overrider,
+            "app",
+            prod_only(&[("lib", "^1.0.0"), ("qar", "^2.0.0"), ("baz", "^3.0.0")]),
+        ),
+        pairs(&[("lib", "workspace:*"), ("qar", "link:../qar"), ("baz", "file:../../../baz")]),
+    );
+}
+
+#[test]
+fn rewrite_dependencies_drops_deleted_dependencies() {
+    let overrides = parsed(&[("qar", "-")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    assert_eq!(
+        rewritten(&overrider, "app", prod_only(&[("lib", "^1.0.0"), ("qar", "^2.0.0")])),
+        pairs(&[("lib", "^1.0.0")]),
+    );
+}
+
+#[test]
+fn rewrite_dependencies_applies_a_parent_scoped_override_to_its_parent_only() {
+    let overrides = parsed(&[("app>lib", "workspace:*")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    assert_eq!(
+        rewritten(&overrider, "app", prod_only(&[("lib", "^1.0.0")])),
+        pairs(&[("lib", "workspace:*")]),
+    );
+    assert_eq!(
+        rewritten(&overrider, "other", prod_only(&[("lib", "^1.0.0")])),
+        pairs(&[("lib", "^1.0.0")]),
+    );
+}
+
+#[test]
+fn rewrite_dependencies_applies_a_dependency_type_selector_to_its_group_only() {
+    let overrides = parsed(&[("lib:optional", "workspace:*")]);
+    let overrider = VersionsOverrider::new(&overrides, Path::new("/workspace"));
+
+    let groups = DependencyGroups {
+        optional: pairs(&[("lib", "^1.0.0")]),
+        prod: pairs(&[("other", "^1.0.0")]),
+        ..DependencyGroups::default()
+    };
+    assert_eq!(
+        rewritten(&overrider, "app", groups),
+        pairs(&[("lib", "workspace:*"), ("other", "^1.0.0")]),
+    );
+    assert_eq!(
+        rewritten(&overrider, "app", prod_only(&[("lib", "^1.0.0")])),
+        pairs(&[("lib", "^1.0.0")]),
+    );
 }

@@ -1,6 +1,9 @@
 //! The catalogs a command dereferences `catalog:` specifiers against.
 
-use miette::{Context, IntoDiagnostic};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
 use pnpm_catalogs_config::get_catalogs_from_workspace_manifest;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
@@ -9,13 +12,19 @@ use pnpm_workspace_projects_graph::WorkspaceCatalogs;
 
 /// The hook-injected set when an `updateConfig` pnpmfile provided one
 /// ([`Config::catalogs`] is `Some`), otherwise the `catalog:` /
-/// `catalogs:` tables of the workspace manifest — the same fallback the
+/// `catalogs:` tables of the workspace manifest, the same fallback the
 /// install performs. Empty outside a workspace, where no catalog can be
 /// declared.
 pub(crate) fn configured_catalogs(config: &Config) -> miette::Result<Catalogs> {
-    if let Some(catalogs) = &config.catalogs {
-        return Ok(catalogs.clone());
+    match &config.catalogs {
+        Some(catalogs) => Ok(catalogs.clone()),
+        None => workspace_manifest_catalogs(config),
     }
+}
+
+/// The `catalog:` / `catalogs:` tables of the workspace manifest, ignoring
+/// what an `updateConfig` hook made of them. Empty outside a workspace.
+pub(crate) fn workspace_manifest_catalogs(config: &Config) -> miette::Result<Catalogs> {
     let Some(workspace_dir) = config.workspace_dir.as_deref() else {
         return Ok(Catalogs::default());
     };

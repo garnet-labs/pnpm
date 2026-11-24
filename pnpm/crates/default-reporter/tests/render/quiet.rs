@@ -1,7 +1,21 @@
 use super::{
-    CWD, LifecycleLog, LifecycleMessage, LifecycleStdio, LockfileVerificationLog,
-    LockfileVerificationMessage, LogEvent, LogLevel, MaxLogLevel, Output, ReporterOptions,
-    emitted_lines, ignored_scripts, lifecycle_exit, lifecycle_line, lifecycle_script,
+    CWD,
+    ExecutionTimeLog,
+    LifecycleLog,
+    LifecycleMessage,
+    LifecycleStdio,
+    LockfileVerificationLog,
+    LockfileVerificationMessage,
+    LogEvent,
+    LogLevel,
+    MaxLogLevel,
+    Output,
+    ReporterOptions,
+    emitted_lines,
+    ignored_scripts,
+    lifecycle_exit,
+    lifecycle_line,
+    lifecycle_script,
     state_with_options,
 };
 
@@ -217,9 +231,16 @@ fn quiet_verification_prints_only_failures() {
         let events = [
             LockfileVerificationMessage::Started { entries: 2, lockfile_path: None },
             LockfileVerificationMessage::Cached { verified_at: None, lockfile_path: None },
-            LockfileVerificationMessage::Done { entries: 2, elapsed_ms: 100, lockfile_path: None },
+            LockfileVerificationMessage::Progress { entries: 2, checked: 1, lockfile_path: None },
+            LockfileVerificationMessage::Done {
+                entries: 2,
+                checked: 2,
+                elapsed_ms: 100,
+                lockfile_path: None,
+            },
             LockfileVerificationMessage::Failed {
                 entries: 2,
+                checked: 1,
                 elapsed_ms: 100,
                 lockfile_path: None,
             },
@@ -236,6 +257,20 @@ fn quiet_verification_prints_only_failures() {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("failed supply-chain policy check"), "{lines:?}");
         let lines = emitted_lines(&mut reporter, vec![ignored_scripts(&["esbuild"])]);
-        assert_eq!(!lines.is_empty(), max_log_level == MaxLogLevel::Warn);
+        assert!(lines.is_empty());
+        let lines = emitted_lines(
+            &mut reporter,
+            vec![LogEvent::ExecutionTime(ExecutionTimeLog {
+                level: LogLevel::Debug,
+                started_at: 0,
+                ended_at: 1,
+            })],
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .any(|line| line.contains("Packages awaiting approval")),
+            max_log_level == MaxLogLevel::Warn,
+        );
     }
 }

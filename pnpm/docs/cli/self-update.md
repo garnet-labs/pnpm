@@ -26,7 +26,7 @@ The behavior of `pnpm self-update` depends on the project context:
 
 ### In a project that pins pnpm
 
-When the project's manifest has a `packageManager` field set to pnpm (or a `devEngines.packageManager` entry for pnpm), `self-update` updates the pinned version in that manifest to the resolved one. In a workspace, this is the workspace root's manifest, even when the command runs in a workspace package. It also installs the resolved version globally, as it does outside a project. The pin is written after the global install, so a failed install leaves the project unchanged.
+When the project's manifest has a `packageManager` field set to pnpm (or a `devEngines.packageManager` entry for pnpm), `self-update` updates the pinned version in that manifest to the resolved one. In a workspace, this is the workspace root's manifest, even when the command runs in a workspace package. An `engines.pnpm` range in the same manifest moves to the resolved version too. An exact version, or a `^` or `~` range on a full version, keeps its form. Any other range stays as it is if it accepts the resolved version. If it does not, it moves to the resolved version with the operator its form implies. For example, `12.2` becomes `~13.0.0`. A comparator range such as `>=12.0.0 <13.0.0` becomes `^13.0.0`. It also installs the resolved version globally, as it does outside a project. The pin is written after the global install, so a failed install leaves the project unchanged.
 
 ### Outside a project (or when the pnpm pin is ignored)
 
@@ -35,6 +35,10 @@ If the project does not pin pnpm, or the pin is being ignored via [`pmOnFail: ig
 ### When Homebrew or Corepack manages pnpm
 
 If Homebrew installed pnpm or Corepack runs it, `pnpm self-update` leaves the global pnpm alone. In a project that pins pnpm, it still updates the pin. Outside such a project, it fails. Update a Homebrew install with `brew upgrade pnpm` (or `brew upgrade pnpm@<major>` for a versioned formula).
+
+### When another pnpm comes first on PATH
+
+After installing, `self-update` looks up `pnpm` on `PATH`. If another installer's copy comes before the global bin directory, your shell keeps running that copy, and `self-update` prints a warning that names it. If pnpm recognizes the installer, the warning gives the command that removes that copy. Otherwise it tells you to move the global bin directory ahead of it on `PATH`. [`pnpm setup`](./setup.md) prints the same warning. It skips the warning when it writes a shell configuration that puts the global bin directory first. On Windows it checks the saved system and user `Path` instead, and keeps the warning only when the other copy still comes first there.
 
 ## Project settings are ignored
 

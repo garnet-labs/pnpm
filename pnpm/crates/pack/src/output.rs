@@ -1,12 +1,23 @@
 use super::{
-    PackError, PackFile, PackOutputOptions, PackResult, PackResultJson, Path, PathBuf, Value,
-    lexical_normalize,
+    PackError,
+    PackFile,
+    PackOutputOptions,
+    PackResult,
+    PackResultJson,
+    Path,
+    PathBuf,
+    Value,
+    canonicalize_output_key,
+};
+use std::{
+    borrow::Cow,
+    ffi::OsStr,
 };
 
 /// Project a [`PackResult`] into its JSON shape.
 #[must_use]
 pub fn to_pack_result_json(result: &PackResult) -> PackResultJson {
-    let manifest = &result.published_manifest;
+    let manifest = &result.packed_manifest;
     PackResultJson {
         name: manifest
             .get("name")
@@ -19,14 +30,13 @@ pub fn to_pack_result_json(result: &PackResult) -> PackResultJson {
             .unwrap_or_default()
             .to_string(),
         filename: result.tarball_path.clone(),
-        tag: None,
-        targets: None,
         integrity: result.archive.as_ref().map(|archive| archive.integrity.clone()),
         size: result.archive.as_ref().map(|archive| archive.size),
         files: result.contents
             .iter()
             .map(|path| PackFile { path: path.clone() })
             .collect(),
+        manifest: manifest.clone(),
     }
 }
 
@@ -50,7 +60,7 @@ pub fn format_pack_output(results: &[PackResultJson], json: bool, unicode: bool)
         .map(|result| {
             // `name` / `version` / `filename` and the file paths are
             // manifest- and filesystem-derived, so strip control
-            // characters before they reach the terminal — a file named
+            // characters before they reach the terminal, a file named
             // with raw ANSI escapes would otherwise spoof the output.
             let files = result.files
                 .iter()
@@ -70,7 +80,7 @@ pub fn format_pack_output(results: &[PackResultJson], json: bool, unicode: bool)
 
 /// Strip control characters (keeping `\n` / `\t`) from text headed for the
 /// terminal, so a manifest- or filesystem-derived value can't emit raw
-/// escape sequences. JSON output is left untouched — it is data, not a
+/// escape sequences. JSON output is left untouched; it is data, not a
 /// terminal rendering.
 fn sanitize_for_terminal(text: &str) -> std::borrow::Cow<'_, str> {
     if text
@@ -134,42 +144,67 @@ fn resolve_output_values(
     // confusing OS error, so reject the option up front.
     let Some(tarball_name) = prepared_path
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+        .map(OsStr::to_string_lossy)
+        .map(Cow::into_owned)
     else {
         return Err(PackError::InvalidOut { out: out.to_owned() });
     };
     let parent = prepared_path
         .parent()
-        .map(|dir| dir.to_string_lossy().into_owned())
+        .map(Path::to_string_lossy)
+        .map(Cow::into_owned)
         .unwrap_or_default();
     let pack_destination =
         if parent.is_empty() { pack_destination.map(str::to_owned) } else { Some(parent) };
     Ok((tarball_name, pack_destination))
 }
 
+/// Compute the uncanonicalized destination directory and tarball filename for
+/// a project without probing the filesystem.
+pub fn pack_output_parts(
+    base_dir: &Path,
+    out: Option<&str>,
+    pack_destination: Option<&str>,
+    published_name: &str,
+    published_version: &str,
+) -> Result<(PathBuf, String), PackError> {
+    let normalized_name = normalize_tarball_name(published_name);
+    let version = strip_build_metadata(published_version);
+    let (tarball_name, destination) =
+        resolve_output_values(out, pack_destination, &normalized_name, version)?;
+    Ok((resolve_dest_dir_from_base(base_dir, destination.as_deref()), tarball_name))
+}
+
 /// Resolve the path a pack will write from the manifest identity and output
 /// options. Recursive callers use this before dispatch to keep projects that
 /// share a destination from packing concurrently.
 pub fn pack_output_path(
-    project_dir: &Path,
+    base_dir: &Path,
     out: Option<&str>,
     pack_destination: Option<&str>,
     published_name: &str,
     published_version: &str,
 ) -> Result<PathBuf, PackError> {
-    let normalized_name = normalize_tarball_name(published_name);
-    let version = strip_build_metadata(published_version);
-    let (tarball_name, destination) =
-        resolve_output_values(out, pack_destination, &normalized_name, version)?;
-    Ok(lexical_normalize(&resolve_dest_dir(project_dir, destination.as_deref()).join(tarball_name)))
+    let (dest_dir, tarball_name) =
+        pack_output_parts(base_dir, out, pack_destination, published_name, published_version)?;
+    Ok(canonicalize_output_key(&dest_dir).join(tarball_name))
 }
 
 /// Resolve the directory the tarball is written into.
-pub(super) fn resolve_dest_dir(dir: &Path, pack_destination: Option<&str>) -> PathBuf {
+pub(super) fn resolve_dest_dir(
+    source_dir: &Path,
+    output: &PackOutputOptions,
+    pack_destination: Option<&str>,
+) -> PathBuf {
+    let base_dir = output.base_dir.as_deref().unwrap_or(source_dir);
+    resolve_dest_dir_from_base(base_dir, pack_destination)
+}
+
+fn resolve_dest_dir_from_base(base_dir: &Path, pack_destination: Option<&str>) -> PathBuf {
     match pack_destination {
         Some(destination) if Path::new(destination).is_absolute() => PathBuf::from(destination),
-        Some(destination) => dir.join(destination),
-        None => dir.to_path_buf(),
+        Some(destination) => base_dir.join(destination),
+        None => base_dir.to_path_buf(),
     }
 }
 

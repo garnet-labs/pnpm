@@ -2,20 +2,31 @@ use std::{
     collections::HashSet,
     fs::File,
     io::Read,
-    path::{Path, PathBuf},
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
 };
 
 use indexmap::IndexMap;
-use pnpm_exportable_manifest::read_readme_file;
+use pnpm_exportable_manifest::{
+    PrivateWorkspaceDependencies,
+    read_readme_file,
+};
 use pnpm_package_manifest::safe_read_project_manifest_from_dir;
 use pnpm_package_name::is_valid_old_npm_package_name;
 use pnpm_reporter::Reporter;
 use serde_json::Value;
 
 use super::{
-    PackError, PackOptions,
+    PackError,
+    PackOptions,
     contents::executable_sources,
-    output::{normalize_tarball_name, strip_build_metadata},
+    output::{
+        normalize_tarball_name,
+        strip_build_metadata,
+    },
     prevent_bundled_dependencies_with_pnp,
 };
 
@@ -28,6 +39,7 @@ pub(super) struct PackSource {
     pub(super) normalized_name: String,
     pub(super) published_version: String,
     pub(super) bins: Vec<PathBuf>,
+    pub(super) private_workspace_dependencies: PrivateWorkspaceDependencies,
 }
 
 pub(super) async fn prepare_source<Reporter>(opts: &PackOptions) -> Result<PackSource, PackError>
@@ -36,6 +48,7 @@ where
 {
     let entry_manifest = read_manifest(&opts.dir)?;
     prevent_bundled_dependencies_with_pnp(opts.manifest.node_linker, &entry_manifest)?;
+    let dir = resolve_publish_directory(&opts.dir, &entry_manifest)?;
 
     if !opts.scripts.ignore {
         opts.scripts.run_if_present::<Reporter>(
@@ -45,23 +58,17 @@ where
         )?;
     }
 
-    // The publish directory may differ from the project root when
-    // `publishConfig.directory` redirects packing at a build output.
-    let dir = match publish_config_directory(&entry_manifest) {
-        Some(relative) => opts.dir.join(relative),
-        None => opts.dir.clone(),
-    };
-
     // Re-read the manifest from `dir`: a `prepack` / `prepare` script
     // may have rewritten it.
     let manifest = read_manifest(&dir)?;
     prevent_bundled_dependencies_with_pnp(opts.manifest.node_linker, &manifest)?;
 
-    let name = packed_identity(&manifest)?;
+    validate_source_identity(&manifest)?;
 
-    let mut publish_manifest = opts.manifest.export::<Reporter>(&opts.dir, &dir, &manifest).await?;
+    let (mut publish_manifest, private_workspace_dependencies) =
+        opts.manifest.export::<Reporter>(&opts.dir, &dir, &manifest).await?;
 
-    let (normalized_name, published_version) = published_identity(&mut publish_manifest, name)?;
+    let (normalized_name, published_version) = published_identity(&mut publish_manifest)?;
     let bins = executable_sources(&publish_manifest, &manifest, &dir);
     Ok(PackSource {
         entry_manifest,
@@ -70,34 +77,34 @@ where
         normalized_name,
         published_version,
         bins,
+        private_workspace_dependencies,
     })
 }
 
-/// The name the tarball is packed under, once the manifest's name *and*
-/// version are known to be publishable.
-///
-/// Both are interpolated into the default tarball filename
-/// (`<name>-<version>.tgz`) and the manifest is attacker-controlled, so a
-/// path separator in the version would let it smuggle path components into the
-/// join and write the tarball outside `dest_dir`. A real semver version never
-/// contains one. The version itself is read back off the publish manifest by
-/// [`published_identity`], which a `publishConfig` rename can change.
-fn packed_identity(manifest: &Value) -> Result<&str, PackError> {
-    let name = manifest
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-        .ok_or(PackError::PackageNameNotFound)?;
-    if !is_valid_old_npm_package_name(name) {
-        return Err(PackError::InvalidPackageName { name: name.to_string() });
-    }
+/// Check the source manifest before applying publish overrides and hooks.
+fn validate_source_identity(manifest: &Value) -> Result<(), PackError> {
+    package_name(manifest)?;
     let version = manifest
         .get("version")
         .and_then(Value::as_str)
         .filter(|version| !version.is_empty())
         .ok_or(PackError::PackageVersionNotFound)?;
-    if version.contains('/') || version.contains('\\') {
+    if is_invalid_tarball_version(version) {
         return Err(PackError::InvalidPackageVersion { version: version.to_string() });
+    }
+    Ok(())
+}
+
+fn package_name(manifest: &Value) -> Result<&str, PackError> {
+    let name = manifest.get("name").ok_or(PackError::PackageNameNotFound)?;
+    let name = name
+        .as_str()
+        .ok_or_else(|| PackError::InvalidPackageName { name: name.to_string() })?;
+    if name.is_empty() {
+        return Err(PackError::PackageNameNotFound);
+    }
+    if !is_valid_old_npm_package_name(name) {
+        return Err(PackError::InvalidPackageName { name: name.to_string() });
     }
     Ok(name)
 }
@@ -108,34 +115,35 @@ fn packed_identity(manifest: &Value) -> Result<&str, PackError> {
 /// name, the packed manifest and any registry metadata all agree on the
 /// version. See [pnpm/pnpm#11518](https://github.com/pnpm/pnpm/issues/11518).
 ///
-/// The name is read back off the publish manifest so a `publishConfig.name`
-/// rename reaches the filename too. That rename never went through
-/// [`packed_identity`], so it is validated here: it lands in the tarball
-/// filename, where a separator would smuggle path components into the join and
-/// write outside `dest_dir`.
-fn published_identity(
-    publish_manifest: &mut Value,
-    name: &str,
-) -> Result<(String, String), PackError> {
-    let published_version = strip_build_metadata(
-        publish_manifest
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    )
-    .to_string();
+/// The name and version are read back off the publish manifest so a
+/// `publishConfig.name` rename or a `beforePacking` hook modification reaches
+/// the filename too. Neither went through [`validate_source_identity`], so both are
+/// validated here: they land in the tarball path, where a separator or `.` /
+/// `..` segment would smuggle path components into the join and write outside
+/// `dest_dir`.
+fn published_identity(publish_manifest: &mut Value) -> Result<(String, String), PackError> {
+    let raw_version = publish_manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let published_version = strip_build_metadata(raw_version).to_string();
+    if is_invalid_tarball_version(&published_version) {
+        return Err(PackError::InvalidPackageVersion { version: raw_version.to_string() });
+    }
     if let Some(object) = publish_manifest.as_object_mut() {
         object.insert("version".to_string(), Value::String(published_version.clone()));
     }
-    let published_name = publish_manifest
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(name);
-    if !is_valid_old_npm_package_name(published_name) {
-        return Err(PackError::InvalidPackageName { name: published_name.to_string() });
-    }
+    let published_name = package_name(publish_manifest)?;
     Ok((normalize_tarball_name(published_name), published_version))
+}
+
+fn is_invalid_tarball_version(version: &str) -> bool {
+    version.is_empty()
+        || version == "."
+        || version == ".."
+        || version.contains('/')
+        || version.contains('\\')
+        || version.contains(':')
 }
 
 /// The readme is always reported as part of the published manifest, matching the npm CLI, so a
@@ -169,13 +177,58 @@ fn read_manifest(dir: &Path) -> Result<Value, PackError> {
     }
 }
 
-/// `publishConfig.directory`, when set to a non-empty string.
-fn publish_config_directory(manifest: &Value) -> Option<&str> {
-    manifest
+/// Resolve `publishConfig.directory` to a relative path inside `project_dir`.
+///
+/// Validation stays lexical so build outputs symlinked into the package keep
+/// packing (see [pnpm/pnpm#17390](https://github.com/pnpm/pnpm/issues/17390)).
+/// Root, prefix, and `..` segments are rejected so paths cannot escape
+/// `project_dir` or a symlink target.
+fn resolve_publish_directory(project_dir: &Path, manifest: &Value) -> Result<PathBuf, PackError> {
+    let Some(raw_value) = manifest
         .get("publishConfig")
         .and_then(|config| config.get("directory"))
-        .and_then(Value::as_str)
-        .filter(|directory| !directory.is_empty())
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(project_dir.to_path_buf());
+    };
+    let Some(relative) = raw_value.as_str() else {
+        return Err(PackError::InvalidPublishDirectory { dir: raw_value.to_string() });
+    };
+    if relative.is_empty() {
+        return Ok(project_dir.to_path_buf());
+    }
+    if is_invalid_publish_directory(relative) {
+        return Err(PackError::InvalidPublishDirectory { dir: relative.to_string() });
+    }
+    let mut dir = project_dir.to_path_buf();
+    for component in Path::new(relative).components() {
+        if let Component::Normal(segment) = component {
+            dir.push(segment);
+        }
+    }
+    Ok(dir)
+}
+
+fn is_invalid_publish_directory(raw: &str) -> bool {
+    let path = Path::new(raw);
+    if raw.contains(['\0', ':']) || path.is_absolute() || raw.starts_with(['/', '\\']) {
+        return true;
+    }
+    path.components()
+        .any(|component| {
+            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        })
+        || raw
+            .split(['/', '\\'])
+            .any(is_dot_traversal_segment)
+}
+
+fn is_dot_traversal_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment
+            .bytes()
+            .all(|byte| byte == b'.' || byte == b' ')
 }
 
 /// Reject a packed executable whose shebang line ends with CRLF, which Unix
@@ -195,7 +248,8 @@ pub(super) fn check_packed_bins_for_crlf(
         }
         let mut head = Vec::with_capacity(SHEBANG_SCAN_LEN as usize);
         File::open(source)
-            .and_then(|file| file.take(SHEBANG_SCAN_LEN).read_to_end(&mut head))
+            .map(|file| file.take(SHEBANG_SCAN_LEN))
+            .and_then(|mut take| take.read_to_end(&mut head))
             .map_err(|error| PackError::ReadFile {
                 path: source.display().to_string(),
                 source: error,

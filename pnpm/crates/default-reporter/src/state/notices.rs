@@ -1,69 +1,112 @@
 use super::{
-    BlockPlacement, Colors, DedupeCheckLog, DeprecationLog, ExecutionTimeLog, Frame, HookLog,
-    IgnoredScriptsLog, InstallingConfigDepsLog, InstallingConfigDepsStatus,
-    LockfileVerificationMessage, LogLevel, MAX_SHOWN_WARNINGS, MaxLogLevel, NoticeState,
-    PendingSkillsLog, ReporterState, RequestRetryLog, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalReason, UpdateCheckLog, Utc, cached_verdict,
-    detect_install_source, entries_label, is_strictly_newer, normalize, pretty_ms, relative,
-    update_command, zoom_out,
+    BTreeMap,
+    BTreeSet,
+    BlockPlacement,
+    Colors,
+    CommandOutcome,
+    DedupeCheckLog,
+    ExecutionTimeLog,
+    Frame,
+    HookLog,
+    IgnoredScriptsLog,
+    InstallingConfigDepsLog,
+    InstallingConfigDepsStatus,
+    LockfileVerificationMessage,
+    LogLevel,
+    MAX_SHOWN_WARNINGS,
+    MaxLogLevel,
+    NoticeState,
+    PendingSkillsLog,
+    RESOLUTION_SKIPPED,
+    ReporterState,
+    RequestRetryLog,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
+    UnusedOverrideLog,
+    UpdateCheckLog,
+    cached_verdict,
+    detect_install_source,
+    is_strictly_newer,
+    normalize,
+    pending_approval_packages,
+    pretty_ms,
+    progress_label,
+    relative,
+    update_command,
+    zoom_out,
 };
+use jiff::Timestamp;
 
-/// `name@version` as a deprecation warning prints it.
-///
-/// Both halves come from the resolved manifest, which a git or tarball
-/// dependency writes itself, so neither is a validated npm package name.
-fn pkg_label(log: &DeprecationLog) -> String {
-    pnpm_text_sanitize::sanitize_inline(&format!("{}@{}", log.pkg_name, log.pkg_version))
-        .into_owned()
-}
-
-/// What to move to, when the resolver found a version that is not deprecated.
-///
-/// The version is pnpm's own reading of the packument rather than anything the
-/// publisher wrote, so unlike the notice it is safe to print. Empty when every
-/// published version is deprecated, or when the resolution came from the
-/// lockfile and no packument was fetched.
-fn alternative_hint(log: &DeprecationLog) -> String {
-    let Some(alternative) = log.non_deprecated_alternative.as_ref() else {
-        return String::new();
-    };
-    let version = pnpm_text_sanitize::sanitize_inline(&alternative.version);
-    if alternative.outside_declared_range {
-        format!(". {version} is not deprecated, outside the range you declared.")
-    } else {
-        format!(". {version} is not deprecated.")
-    }
+fn format_pending_approval_packages(packages: &BTreeMap<String, BTreeSet<&str>>) -> String {
+    packages
+        .iter()
+        .map(|(name, capabilities)| {
+            format!(
+                "  {name}  {}",
+                capabilities
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl ReporterState {
     // --- misc one-liners --------------------------------------------------
 
     pub(super) fn on_ignored_scripts(&mut self, log: &IgnoredScriptsLog) {
-        if log.package_names.is_empty() {
-            return;
-        }
-        // Suppress the warning box under `strictDepBuilds` — the install
+        // Suppress the warning box under `strictDepBuilds`, the install
         // fails with `ERR_PNPM_IGNORED_BUILDS` instead, so the box would
         // only duplicate the error. The structured event still carries the
         // names for NDJSON consumers.
-        if log.strict_dep_builds {
-            return;
+        if !log.strict_dep_builds {
+            self.notices.approvals.add_builds(&log.package_names);
         }
-        let list = log.package_names.join(", ");
-        let instruction = self.options.ignored_builds_instruction_text.as_deref().unwrap_or(
-            r#"Run "pnpm approve-builds" to pick which dependencies should be allowed to run scripts."#,
-        );
-        self.display.frame.push_block(format!("Ignored build scripts: {list}.\n{instruction}"));
+        if !self.options.append_only {
+            self.render_pending_approvals();
+        }
     }
 
     pub(super) fn on_pending_skills(&mut self, log: &PendingSkillsLog) {
-        if log.package_names.is_empty() {
+        self.notices.approvals.add_skills(&log.package_names);
+        if !self.options.append_only {
+            self.render_pending_approvals();
+        }
+    }
+
+    pub(super) fn render_pending_approvals(&mut self) {
+        if self.options.append_only && self.notices.approvals.emitted {
             return;
         }
-        self.display.frame.push_block(format!(
-            "Agent skills awaiting approval: {}.\nRun \"pnpm approve\" to review them.",
-            log.package_names.join(", "),
-        ));
+        let packages = pending_approval_packages(
+            &self.notices.approvals.builds,
+            &self.notices.approvals.skills,
+        );
+        if packages.is_empty() {
+            return;
+        }
+        let list = format_pending_approval_packages(&packages);
+        let approve = r#"Run "pnpm approve" to review the packages awaiting approval."#;
+        let build_instruction = self.options.ignored_builds_instruction_text
+            .as_deref()
+            .filter(|_| !self.notices.approvals.builds.is_empty());
+        let instruction = match build_instruction {
+            Some(text) if self.notices.approvals.skills.is_empty() => text.to_string(),
+            Some(text) => format!("{text}\n{approve}"),
+            None => approve.to_string(),
+        };
+        self.display.frame.emit(
+            &mut self.notices.approvals.slot,
+            format!("Packages awaiting approval:\n{list}\n\n{instruction}"),
+            BlockPlacement::Scrolling,
+        );
+        if self.options.append_only {
+            self.notices.approvals.emitted = true;
+        }
     }
 
     /// pnpm's `reportUpdateCheck`: tell the user a newer pnpm exists and
@@ -74,7 +117,7 @@ impl ReporterState {
             return;
         }
         self.display.frame.push_block(format!(
-            "Update available! {current} \u{2192} {latest}.\n{changelog} https://pnpm.io/v/{version}\nTo update, run: {command}",
+            "Update available! {current} → {latest}.\n{changelog} https://pnpm.io/v/{version}\nTo update, run: {command}",
             current = self.rendering.colors.red(&log.current_version),
             latest = self.rendering.colors.green(&log.latest_version),
             changelog = self.rendering.colors.magenta("Changelog:"),
@@ -100,46 +143,69 @@ impl ReporterState {
         self.display.config_deps_slot = slot;
     }
 
+    /// A passing verdict goes to the checks footer, and the in-place
+    /// progress block is cleared.
     pub(super) fn on_lockfile_verification(&mut self, message: &LockfileVerificationMessage) {
-        let msg = match message {
-            LockfileVerificationMessage::Cached { verified_at, lockfile_path } => {
-                let path = self.lockfile_path_suffix(lockfile_path.as_deref());
-                format!(
-                    "{} Lockfile{path} passes supply-chain policies ({})",
-                    self.rendering.colors.green("✓"),
-                    cached_verdict(verified_at.as_deref(), Utc::now()),
-                )
-            }
-            LockfileVerificationMessage::Started { entries, lockfile_path } => {
-                let path = self.lockfile_path_suffix(lockfile_path.as_deref());
-                format!(
-                    "{} Verifying lockfile{path} against supply-chain policies ({})...",
-                    self.rendering.colors.cyan("?"),
-                    entries_label(*entries),
-                )
-            }
-            LockfileVerificationMessage::Done { entries, elapsed_ms, lockfile_path } => {
-                let path = self.lockfile_path_suffix(lockfile_path.as_deref());
-                format!(
-                    "{} Lockfile{path} passes supply-chain policies ({} in {})",
-                    self.rendering.colors.green("✓"),
-                    entries_label(*entries),
-                    pretty_ms(u128::from(*elapsed_ms)),
-                )
-            }
-            LockfileVerificationMessage::Failed { entries, elapsed_ms, lockfile_path } => {
-                let path = self.lockfile_path_suffix(lockfile_path.as_deref());
-                format!(
-                    "{} Lockfile{path} failed supply-chain policy check ({} in {})",
-                    self.rendering.colors.red("✗"),
-                    entries_label(*entries),
-                    pretty_ms(u128::from(*elapsed_ms)),
-                )
-            }
-        };
+        if matches!(
+            message,
+            LockfileVerificationMessage::Cached { .. } | LockfileVerificationMessage::Done { .. },
+        ) {
+            self.record_supply_chain_passed();
+            self.display.frame.clear(&mut self.display.lockfile_verification_slot);
+            return;
+        }
+        // Append-only output cannot erase a line, so it prints only a
+        // failure: progress would flood CI logs, and a passing verdict goes
+        // to the checks footer. In-place mode re-renders the block instead.
+        if self.options.append_only
+            && !matches!(message, LockfileVerificationMessage::Failed { .. })
+        {
+            return;
+        }
+        let msg = self.lockfile_verification_line(message);
         let mut slot = std::mem::take(&mut self.display.lockfile_verification_slot);
         self.display.frame.emit(&mut slot, msg, BlockPlacement::Scrolling);
         self.display.lockfile_verification_slot = slot;
+    }
+
+    fn lockfile_verification_line(&self, message: &LockfileVerificationMessage) -> String {
+        let lockfile_path = match message {
+            LockfileVerificationMessage::Cached { lockfile_path, .. }
+            | LockfileVerificationMessage::Started { lockfile_path, .. }
+            | LockfileVerificationMessage::Progress { lockfile_path, .. }
+            | LockfileVerificationMessage::Done { lockfile_path, .. }
+            | LockfileVerificationMessage::Failed { lockfile_path, .. } => lockfile_path,
+        };
+        let path = self.lockfile_path_suffix(lockfile_path.as_deref());
+        match message {
+            LockfileVerificationMessage::Cached { verified_at, .. } => format!(
+                "{} Lockfile{path} passes supply-chain policies ({})",
+                self.rendering.colors.green("✓"),
+                cached_verdict(verified_at.as_deref(), Timestamp::now()),
+            ),
+            LockfileVerificationMessage::Started { entries, .. } => format!(
+                "{} Verifying lockfile{path} against supply-chain policies ({})...",
+                self.rendering.colors.cyan("?"),
+                progress_label(0, *entries),
+            ),
+            LockfileVerificationMessage::Progress { entries, checked, .. } => format!(
+                "{} Verifying lockfile{path} against supply-chain policies ({})...",
+                self.rendering.colors.cyan("?"),
+                progress_label(*checked, *entries),
+            ),
+            LockfileVerificationMessage::Done { entries, checked, elapsed_ms, .. } => format!(
+                "{} Lockfile{path} passes supply-chain policies ({} in {})",
+                self.rendering.colors.green("✓"),
+                progress_label(*checked, *entries),
+                pretty_ms(u128::from(*elapsed_ms)),
+            ),
+            LockfileVerificationMessage::Failed { entries, checked, elapsed_ms, .. } => format!(
+                "{} Lockfile{path} failed supply-chain policy check ({} in {})",
+                self.rendering.colors.red("✗"),
+                progress_label(*checked, *entries),
+                pretty_ms(u128::from(*elapsed_ms)),
+            ),
+        }
     }
 
     pub(super) fn lockfile_path_suffix(&self, lockfile_path: Option<&str>) -> String {
@@ -154,6 +220,13 @@ impl ReporterState {
 
     pub(super) fn on_request_retry(&mut self, log: &RequestRetryLog) {
         let left = log.max_retries.saturating_sub(log.attempt);
+        #[cfg_attr(
+            dylint_lib = "perfectionist",
+            expect(
+                perfectionist::em_dash_prose,
+                reason = "the retry notice keeps its printed separator"
+            )
+        )]
         let msg = format!(
             "{} {} error ({}) {} {}\nWill retry in {}. {left} retries left.",
             log.method,
@@ -172,6 +245,9 @@ impl ReporterState {
     }
 
     pub(super) fn on_pnpm(&mut self, level: LogLevel, message: &str, prefix: &str) {
+        if level == LogLevel::Error && self.options.append_only {
+            self.render_pending_approvals();
+        }
         match level {
             LogLevel::Debug if self.options.max_log_level >= MaxLogLevel::Debug => {
                 self.display.frame.push_block(message.to_string());
@@ -198,16 +274,10 @@ impl ReporterState {
         if !prefix.is_empty() && prefix != self.rendering.cwd {
             return;
         }
-        if message == "Lockfile is up to date, resolution step is skipped" {
-            self.display.pending_lockfile_message = Some(message.to_string());
+        if message == RESOLUTION_SKIPPED {
+            self.record_resolution_skipped();
         } else {
             self.display.frame.push_block(message.to_string());
-        }
-    }
-
-    pub(super) fn flush_pending_lockfile_message(&mut self) {
-        if let Some(message) = self.display.pending_lockfile_message.take() {
-            self.display.frame.push_block(message);
         }
     }
 
@@ -216,6 +286,14 @@ impl ReporterState {
     }
 
     pub(super) fn on_execution_time(&mut self, log: &ExecutionTimeLog) {
+        self.render_up_to_date();
+        self.render_checks(CommandOutcome::Succeeded);
+        if self.options.append_only {
+            self.render_pending_approvals();
+        }
+        if self.options.max_log_level < MaxLogLevel::Info {
+            return;
+        }
         let elapsed = log.ended_at.saturating_sub(log.started_at);
         let msg =
             format!("Done in {} using pnpm v{}", pretty_ms(elapsed), crate::package_version());
@@ -281,46 +359,35 @@ impl ReporterState {
         );
     }
 
-    /// Matches pnpm's `reportDeprecations.ts`: only direct-dependency
-    /// deprecations render immediately; transitive ones wait for the
-    /// `resolution_done` summary.
-    pub(super) fn on_deprecation(&mut self, log: &DeprecationLog) {
-        if log.depth != 0 {
-            self.notices.deprecated_subdeps.push(log.clone());
-            return;
-        }
-        let msg = format!(
-            "{} {} {}{}",
-            self.rendering.colors.warn_label(),
-            self.rendering.colors.red("deprecated"),
-            pkg_label(log),
-            alternative_hint(log),
-        );
-        if !self.options.scope.recursive && log.prefix == self.rendering.cwd {
-            self.display.frame.push_block(msg);
-        } else {
-            self.display.frame.push_block(zoom_out(&self.rendering.cwd, &log.prefix, &msg));
-        }
+    pub(super) fn on_unused_override(&mut self, log: &UnusedOverrideLog) {
+        self.notices.unused_overrides.push(log.selector.clone());
     }
 
-    pub(super) fn flush_deprecated_subdeps(&mut self) {
-        if self.notices.deprecated_subdeps.is_empty() {
+    /// One grouped, sorted warning for every selector buffered since the
+    /// last `resolution_done`. Selectors come from `pnpm-workspace.yaml`, which
+    /// a contributor can edit, so they are sanitized before rendering.
+    pub(super) fn flush_unused_overrides(&mut self) {
+        if self.notices.unused_overrides.is_empty() {
             return;
         }
-        let mut names: Vec<String> = self.notices.deprecated_subdeps
+        let mut selectors: Vec<String> = std::mem::take(&mut self.notices.unused_overrides)
             .iter()
-            .map(pkg_label)
+            .map(String::as_str)
+            .map(pnpm_text_sanitize::sanitize_inline)
+            .map(std::borrow::Cow::into_owned)
             .collect();
-        names.sort();
-        let count = names.len();
-        let msg = format!(
-            "{} {} {}",
-            self.rendering.colors.warn_label(),
-            self.rendering.colors.red(&format!("{count} deprecated subdependencies found:")),
-            names.join(", "),
+        selectors.sort();
+        let head = if selectors.len() == 1 {
+            "1 override matched no dependency".to_string()
+        } else {
+            format!("{} overrides matched no dependency", selectors.len())
+        };
+        self.notices.push_warning(
+            self.rendering.colors,
+            &mut self.display.frame,
+            self.options.append_only,
+            &format!("{head}: {}", selectors.join(", ")),
         );
-        self.display.frame.emit(&mut self.notices.deprecated_slot, msg, BlockPlacement::Scrolling);
-        self.notices.deprecated_subdeps.clear();
     }
 
     /// Renders a `pnpm:hook` event as `hook: message`, matching pnpm's
@@ -334,26 +401,6 @@ impl ReporterState {
             let zoomed = zoom_out(&self.rendering.cwd, &log.prefix, &msg);
             self.display.frame.push_block(zoomed);
         }
-    }
-
-    /// Mirrors pnpm's `reportPeerDependencyIssues`: the detail lives in
-    /// the event payload, and the terminal gets one line naming the
-    /// command that prints it. Upstream `take(1)`s the stream, so a
-    /// recursive run that installs several projects still warns once.
-    pub(super) fn on_peer_dependency_issues(&mut self) {
-        if std::mem::replace(&mut self.notices.reported_peer_issues, true) {
-            return;
-        }
-        self.notices.push_warning(
-            self.rendering.colors,
-            &mut self.display.frame,
-            self.options.append_only,
-            if self.options.scope.is_global {
-                r#"Issues with peer dependencies found. Run "pnpm peers check -g" to list them."#
-            } else {
-                r#"Issues with peer dependencies found. Run "pnpm peers check" to list them."#
-            },
-        );
     }
 }
 

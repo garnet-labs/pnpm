@@ -1,15 +1,36 @@
 use super::{
-    ALIAS_TOKEN, AccessList, Duration, Footprint, HashMap, Identity,
-    MAX_RESOLUTION_CACHE_CANDIDATES_PER_KEY, Mutex, PrivateAccessDescriptor, ResolveRequest,
-    RouteContext, cached_resolution, config, config_for_registry, deps, lockfile,
-    private_alias_footprint, public_registry_config, registry_config, reject_inline_url_auth,
-    reject_invalid_patch_hashes, reject_off_allowlist_fetches, resolution_cache_key,
-    store_resolution, tarball_router, upstream_with_access, user,
+    AccessList,
+    Duration,
+    Footprint,
+    HashMap,
+    Identity,
+    MAX_RESOLUTION_CACHE_CANDIDATES_PER_KEY,
+    Mutex,
+    PrivateAccessDescriptor,
+    ResolveRequest,
+    RouteContext,
+    alias_credential,
+    cached_resolution,
+    config,
+    config_for_registry,
+    deps,
+    lockfile,
+    private_alias_footprint,
+    public_registry_config,
+    registry_config,
+    reject_inline_url_auth,
+    reject_invalid_patch_hashes,
+    reject_off_allowlist_fetches,
+    resolution_cache_key,
+    store_resolution,
+    tarball_router,
+    upstream_with_access,
+    user,
 };
 
 /// The `registries` map is keyed by URL and carries declarations only. The
 /// setting's older `<scope>: <url>` shape puts the URL in the *value*, where
-/// the boundary checks — which read a key as a fetch target — would not see
+/// the boundary checks (which read a key as a fetch target) would not see
 /// it, so a request in that shape must not parse at all.
 #[test]
 fn a_scope_routed_registries_map_does_not_parse() {
@@ -57,9 +78,9 @@ fn metadata_refreshes_bypass_the_resolution_cache() {
         ..ResolveRequest::default()
     };
 
-    assert!(resolution_cache_key(&config(), &ordinary).is_some());
-    assert!(resolution_cache_key(&config(), &refresh).is_none());
-    assert!(resolution_cache_key(&config(), &repair).is_none());
+    assert!(resolution_cache_key(&ordinary).is_some());
+    assert!(resolution_cache_key(&refresh).is_none());
+    assert!(resolution_cache_key(&repair).is_none());
 }
 
 #[test]
@@ -115,8 +136,14 @@ fn public_cached_resolution_matches_every_caller() {
 
 #[test]
 fn package_qualified_alias_descriptor_rechecks_upstream_rules_on_replay() {
-    use pnpr_policy::{PackageRule, PackageRules};
-    use pnpr_registry::{Ecosystem, PackagePattern};
+    use pnpr_policy::{
+        PackageRule,
+        PackageRules,
+    };
+    use pnpr_registry::{
+        Ecosystem,
+        PackagePattern,
+    };
 
     let cache = Mutex::new(HashMap::new());
     let key = "base".to_string();
@@ -126,7 +153,7 @@ fn package_qualified_alias_descriptor_rechecks_upstream_rules_on_replay() {
     let mut footprint = Footprint::default();
     footprint.add(PrivateAccessDescriptor::Alias {
         alias: "corp".to_string(),
-        credential_digest: pnpr_route::credential_digest(ALIAS_TOKEN),
+        credential_digest: alias_credential(),
         package: Some("@corp/secret".to_string()),
     });
     assert!(store_resolution(

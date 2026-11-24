@@ -1,19 +1,41 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
-    body::{Body, to_bytes},
-    http::{HeaderValue, Request, StatusCode, header},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        HeaderValue,
+        Request,
+        StatusCode,
+        header,
+    },
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use super::{app_with_config_and_token, record};
+use super::{
+    app_with_config_and_token,
+    record,
+};
 use crate::server::{
-    RequestId, ServerMetrics, generate_request_id, is_valid_request_id, metrics::DURATION_BUCKETS,
-    metrics_listener_router, state_and_router,
+    RequestId,
+    ServerMetrics,
+    generate_request_id,
+    is_valid_request_id,
+    metrics::DURATION_BUCKETS,
+    metrics_listener_router,
+    state_and_router,
 };
 use pnpr_auth::AuthState;
-use pnpr_config::{Config, MetricsConfig};
+use pnpr_config::{
+    Config,
+    MetricsConfig,
+};
 use pnpr_fixtures::MockConfigPresets;
 
 const METRICS_TOKEN: &str = "metrics-token-0123456789abcdef0123";
@@ -91,7 +113,7 @@ async fn a_metrics_listener_takes_metrics_off_the_main_listener_and_shares_its_c
         listen: Some("127.0.0.1:0".parse().unwrap()),
     };
     let config = config_with_metrics(&tmp, Some(metrics));
-    let auth = AuthState::in_memory_with_max_users(config.identity.auth.htpasswd.max_users);
+    let auth = AuthState::in_memory_with_max_users(config.identity.auth.users.max_users);
     let (state, app) = state_and_router(config, auth, None).unwrap();
     let metrics_app = metrics_listener_router(state);
 
@@ -142,7 +164,8 @@ async fn a_metrics_token_is_never_resolved_as_a_user_token() {
 async fn a_metrics_token_matches_without_its_surrounding_whitespace() {
     let tmp = TempDir::new().unwrap();
     let padded = format!("{METRICS_TOKEN}\n");
-    let app = app_with_metrics(&tmp, Some(MetricsConfig { token: Some(padded), listen: None }));
+    let app =
+        app_with_metrics(&tmp, Some(MetricsConfig { token: Some(padded.into()), listen: None }));
     let response = app
         .oneshot(scrape("/-/metrics", Some(METRICS_TOKEN)))
         .await
@@ -168,7 +191,7 @@ fn a_router_built_in_code_refuses_a_short_metrics_token() {
         &tmp,
         Some(MetricsConfig { token: Some("short".into()), listen: None }),
     );
-    let auth = AuthState::in_memory_with_max_users(config.identity.auth.htpasswd.max_users);
+    let auth = AuthState::in_memory_with_max_users(config.identity.auth.users.max_users);
     let err =
         crate::server::try_router_with_auth(config, auth).expect_err("a short token must fail");
     assert!(err.to_string().contains("metrics.token"), "{err}");
@@ -179,7 +202,7 @@ async fn a_metrics_listener_without_a_token_serves_any_scraper() {
     let tmp = TempDir::new().unwrap();
     let metrics = MetricsConfig { token: None, listen: Some("127.0.0.1:0".parse().unwrap()) };
     let config = config_with_metrics(&tmp, Some(metrics));
-    let auth = AuthState::in_memory_with_max_users(config.identity.auth.htpasswd.max_users);
+    let auth = AuthState::in_memory_with_max_users(config.identity.auth.users.max_users);
     let (state, _) = state_and_router(config, auth, None).unwrap();
     let response = metrics_listener_router(state)
         .oneshot(scrape("/metrics", None))

@@ -1,21 +1,32 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_modules_yaml::{Host as ModulesHost, read_modules_manifest, write_modules_manifest};
+use pnpm_modules_yaml::{
+    Host as ModulesHost,
+    read_modules_manifest,
+    write_modules_manifest,
+};
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     fs::is_symlink_or_junction,
 };
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::Command,
+};
 
 #[test]
 fn empty_node_options_preserves_dependency_lifecycle_environment() {
     let CommandTempCwd {
-        mut pacquet,
+        pacquet,
         root,
         workspace,
         npmrc_info,
         ..
     } = CommandTempCwd::init().add_mocked_registry();
+    let mut first_install = Some(pacquet);
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
     fs::write(
         workspace.join("package.json"),
@@ -29,17 +40,20 @@ fn empty_node_options_preserves_dependency_lifecycle_environment() {
 
     let mut lifecycle_options = Vec::new();
     for (frozen, inherited) in [(false, "--no-warnings"), (true, "--trace-warnings")] {
-        if frozen {
+        let pacquet = if frozen {
             fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
-            pacquet =
-                Command::cargo_bin("pnpm").expect("find pnpm binary").with_current_dir(&workspace);
-            pacquet.arg("--frozen-lockfile");
-        }
+            Command::cargo_bin("pnpm")
+                .expect("find pnpm binary")
+                .with_current_dir(&workspace)
+                .with_arg("--frozen-lockfile")
+        } else {
+            first_install.take().expect("the first install uses the fixture's command")
+        };
         pacquet
-            .env("NODE_OPTIONS", inherited)
-            .env_remove("PNPM_CONFIG_NODE_OPTIONS")
-            .env_remove("pnpm_config_node_options")
-            .arg("install")
+            .with_env("NODE_OPTIONS", inherited)
+            .without_env("PNPM_CONFIG_NODE_OPTIONS")
+            .without_env("pnpm_config_node_options")
+            .with_arg("install")
             .assert()
             .success();
         let dependency_env: serde_json::Value = serde_json::from_str(
@@ -187,14 +201,16 @@ assert.strictEqual(api.resolveVirtual(packageJson), null);",
         String::from_utf8_lossy(&undeclared.stderr).contains("isn't declared in your dependencies"),
     );
 
-    fs::remove_file(workspace.join(".pnp.cjs")).expect("remove PnP loader");
-    Command::cargo_bin("pnpm")
-        .expect("find pnpm binary")
-        .with_current_dir(&workspace)
-        .with_args(["install", "--frozen-lockfile"])
-        .assert()
-        .success();
-    assert!(workspace.join(".pnp.cjs").exists());
+    for frozen in [false, true] {
+        fs::remove_file(workspace.join(".pnp.cjs")).expect("remove PnP loader");
+        Command::cargo_bin("pnpm")
+            .expect("find pnpm binary")
+            .with_current_dir(&workspace)
+            .with_args(if frozen { vec!["install", "--frozen-lockfile"] } else { vec!["install"] })
+            .assert()
+            .success();
+        assert!(workspace.join(".pnp.cjs").exists());
+    }
 
     drop((root, mock_instance));
 }
@@ -219,6 +235,7 @@ fn pnp_loader_is_preloaded_for_lifecycle_run_and_exec_commands() {
                 "check-pnp": r#"node -e "require('@pnpm.e2e/pkg-with-1-dep'); require('fs').writeFileSync('run-pnp', '')""#,
             },
             "dependencies": {
+                "member": "workspace:*",
                 "@pnpm.e2e/pkg-with-1-dep": "100.0.0",
                 "@pnpm.e2e/write-lifecycle-env": "1.0.0",
             },
@@ -226,7 +243,7 @@ fn pnp_loader_is_preloaded_for_lifecycle_run_and_exec_commands() {
         .to_string(),
     )
     .expect("write package.json");
-    let member_dir = workspace.join("packages/member");
+    let member_dir = workspace.join("packages/member #%20");
     fs::create_dir_all(&member_dir).expect("create workspace member");
     fs::write(
         member_dir.join("package.json"),
@@ -315,7 +332,7 @@ fn pnp_loader_is_preloaded_for_lifecycle_run_and_exec_commands() {
             "exec",
             "node",
             "--eval",
-            "require('@pnpm.e2e/pkg-with-1-dep'); require('fs').writeFileSync('exec-pnp', '')",
+            "require('member/package.json'); require('@pnpm.e2e/pkg-with-1-dep'); require('fs').writeFileSync('exec-pnp', '')",
         ])
         .assert()
         .success();
@@ -541,7 +558,8 @@ fn expired_modules_cache_is_pruned_during_frozen_install() {
         .success();
     let entries = fs::read_dir(workspace.join("node_modules/.pnpm"))
         .expect("read virtual store")
-        .map(|entry| entry.expect("read entry").file_name())
+        .map(|entry| entry.expect("read entry"))
+        .map(|value| value.file_name())
         .collect::<Vec<_>>();
     assert!(!stale_slot.exists(), "the expired orphaned slot must be pruned: {entries:?}");
 
@@ -586,4 +604,73 @@ fn rewrites_node_modules_created_by_npm() {
     assert!(workspace.join("node_modules/.bin/hello-world-js-bin").exists());
 
     drop((root, mock_instance));
+}
+
+#[test]
+fn pnp_exports_load_from_a_custom_lockfile_directory() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let dependency = workspace.join("local-package");
+    fs::create_dir(&dependency).unwrap();
+    fs::write(dependency.join("package.json"), r#"{"name":"local-package","version":"1.0.0","exports":{".":"./entry.cjs","./sub":"./sub.cjs"}}"#).unwrap();
+    fs::write(dependency.join("entry.cjs"), "module.exports = 'root'").unwrap();
+    fs::write(dependency.join("sub.cjs"), "module.exports = 'sub'").unwrap();
+    fs::write(dependency.join("private.cjs"), "").unwrap();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "project",
+            "dependencies": {"local-package": "file:./local-package"},
+            "scripts": {"check": "node check.cjs"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("check.cjs"),
+        r"
+const assert = require('assert');
+assert.strictEqual(require('local-package'), 'root');
+assert.strictEqual(require('local-package/sub'), 'sub');
+assert.throws(() => require('local-package/private.cjs'), {code: 'ERR_PACKAGE_PATH_NOT_EXPORTED'});
+",
+    )
+    .unwrap();
+    let member = workspace.join("packages/member");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        member.join("package.json"),
+        serde_json::json!({
+            "name": "member",
+            "dependencies": {"local-package": "file:../../local-package"},
+            "scripts": {"check": "node check.cjs"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::copy(workspace.join("check.cjs"), member.join("check.cjs")).unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\nnodeLinker: pnp\nsymlink: false\nlockfileDir: ./lockfiles\n",
+    )
+    .unwrap();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    assert!(workspace.join("lockfiles/.pnp.cjs").is_file());
+    assert!(!workspace.join(".pnp.cjs").exists());
+    for args in [
+        ["run", "check"].as_slice(),
+        ["exec", "node", "check.cjs"].as_slice(),
+        ["-r", "run", "check"].as_slice(),
+        ["-r", "exec", "node", "check.cjs"].as_slice(),
+    ] {
+        Command::cargo_bin("pnpm")
+            .unwrap()
+            .with_current_dir(&workspace)
+            .with_args(args)
+            .assert()
+            .success();
+    }
+    drop(root);
 }

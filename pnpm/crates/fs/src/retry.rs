@@ -1,7 +1,11 @@
 use std::{
-    fs, io,
+    fs,
+    io,
     path::Path,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 const RETRY_BUDGET: Duration = Duration::from_mins(1);
@@ -117,7 +121,7 @@ pub(crate) fn retry_transient_removal_locks<Value>(
     }
 }
 
-fn retry_fs_operation<Func, Value, Classify>(
+pub(crate) fn retry_fs_operation<Func, Value, Classify>(
     operation: Func,
     is_transient: Classify,
 ) -> io::Result<Value>
@@ -126,6 +130,31 @@ where
     Classify: Fn(&io::Error) -> bool,
 {
     retry_fs_operation_within(operation, is_transient, PERMISSION_DENIED_RETRY_BUDGET)
+}
+
+/// Run `operation` until it succeeds, `is_transient` rejects its error, or
+/// `budget` has passed, with the backoff of [`rename_with_retry`].
+#[cfg(windows)]
+pub(crate) fn retry_fs_operation_for<Func, Value, Classify>(
+    operation: Func,
+    is_transient: Classify,
+    budget: Duration,
+) -> io::Result<Value>
+where
+    Func: FnMut() -> io::Result<Value>,
+    Classify: Fn(&io::Error) -> bool,
+{
+    let start = Instant::now();
+    retry_fs_operation_with_timing(
+        operation,
+        is_transient,
+        RetryTiming {
+            budget,
+            permission_denied_budget: budget,
+            elapsed: || start.elapsed(),
+            sleep: std::thread::sleep,
+        },
+    )
 }
 
 fn retry_fs_operation_within<Func, Value, Classify>(
@@ -190,7 +219,7 @@ where
 }
 
 /// Sleep out one backoff, capped to what is left of the budget. Reports
-/// whether the budget still allows another attempt — checked both before the
+/// whether the budget still allows another attempt, checked both before the
 /// sleep and after it, since the sleep itself consumes budget.
 fn wait_for_retry<Elapsed, Sleep>(
     timing: &mut RetryTiming<Elapsed, Sleep>,

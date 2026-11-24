@@ -2,52 +2,149 @@ pub mod package_configs;
 pub mod registries;
 pub use error::LoadWorkspaceYamlError;
 pub(crate) use includes::read_workspace_document;
-pub use machine::{MachineSettings, TrustedSettings};
-pub(crate) use parse_settings::parse_settings;
-pub use permissions::{
-    PackagePermissions, PermissionCapability, SkillsSettings, decided_permissions,
+pub use machine::{
+    MachineSettings,
+    TrustedSettings,
 };
-pub(crate) use readable::{read_readable_settings, select_settings};
+pub(crate) use parse_settings::{
+    parse_settings,
+    parse_settings_file,
+};
+pub use permissions::{
+    PackagePermissions,
+    PermissionCapability,
+    SkillsSettings,
+    decided_permissions,
+};
+pub(crate) use readable::{
+    read_readable_settings,
+    select_settings,
+};
 pub(crate) use sections::deserialize_tools;
 pub use sections::{
-    AllowBuild, AuditSettings, CargoSettings, DEFAULT_CARGO_INDEX_URL, DEFAULT_PYPI_INDEX_URL,
-    DEFAULT_PYTHON_DOWNLOAD_URL, DEFAULT_RUST_DIST_SERVER, LockfileSetting, PackageExtension,
-    PeerDependencyMeta, PeerDependencyRules, PnpmfileSetting, PythonSettings, RemoteCacheSettings,
-    RemoteSideEffectsCacheSettings, SideEffectsCacheSetting, SideEffectsCacheSettings,
-    SkillsPermission, TaskSettings, Tool, ToolSettings, UpdateConfig, UpdateSettings,
+    AllowBuild,
+    AuditSettings,
+    CargoSettings,
+    DEFAULT_CARGO_INDEX_URL,
+    DEFAULT_PYPI_INDEX_URL,
+    DEFAULT_PYTHON_DOWNLOAD_URL,
+    DEFAULT_RUST_DIST_SERVER,
+    LockfileSetting,
+    PackageExtension,
+    PeerDependencyMeta,
+    PeerDependencyRules,
+    PnpmfileSetting,
+    PythonSettings,
+    RemoteCacheSettings,
+    RemoteSideEffectsCacheSettings,
+    SideEffectsCacheSetting,
+    SideEffectsCacheSettings,
+    SkillsPermission,
+    TaskSettings,
+    Tool,
+    ToolSettings,
+    UpdateConfig,
+    UpdateSettings,
     decided_allow_builds,
 };
-pub use settings::{MacosBackupSettings, NodePackageMapSettings, WorkspaceSettings};
+pub use settings::{
+    MacosBackupSettings,
+    NodePackageMapSettings,
+    WorkspaceSettings,
+};
+pub use structured_validation::{
+    YamlConfigTarget,
+    render_yaml_top_level_field,
+    validate_structured_setting,
+};
 
 use crate::{
-    AuditConfig, AuditLevel, CatalogMode, Config, HoistingLimits, InitType, LinkWorkspacePackages,
-    NodeLinkerSetting, NodePackageMapMode, NodePackageMapType, PackageImportMethod, PmOnFail,
-    ResolutionMode, RuntimeOnFail, SaveWorkspaceProtocol, TrustPolicy, VerifyDepsBeforeRun,
+    AuditConfig,
+    AuditLevel,
+    CatalogMode,
+    Config,
+    HoistingLimits,
+    InitType,
+    LinkWorkspacePackages,
+    NodeLinkerSetting,
+    NodePackageMapMode,
+    NodePackageMapType,
+    PackageImportMethod,
+    PmOnFail,
+    ResolutionMode,
+    RuntimeOnFail,
+    SaveWorkspaceProtocol,
+    TrustPolicy,
+    VerifyDepsBeforeRun,
     VirtualStoreType,
-    api::{EnvVar, GetCurrentDir, GetHomeDir, LinkProbe},
+    api::{
+        EnvVar,
+        GetCurrentDir,
+        GetHomeDir,
+        LinkProbe,
+    },
     config_types::is_config_file_key,
-    known_settings::{SCHEMA_DIRECTIVE_KEY, annotate_unknown_setting, is_known_setting_key},
-    naming_cases::{is_camel_case, to_camel_case, to_kebab_case},
-    proxy_keys::{ProxyKeys, ProxyValue},
-    refused_keys::{is_refused_by_a_project_manifest, where_refused_key_belongs},
+    known_settings::{
+        SCHEMA_DIRECTIVE_KEY,
+        annotate_unknown_setting,
+        is_known_setting_key,
+    },
+    naming_cases::{
+        is_camel_case,
+        to_camel_case,
+        to_kebab_case,
+    },
+    proxy_keys::{
+        ProxyKeys,
+        ProxyValue,
+    },
+    refused_keys::{
+        is_refused_by_a_project_manifest,
+        where_refused_key_belongs,
+    },
     resolve_child_concurrency,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use indexmap::IndexMap;
 use miette::Diagnostic;
 use package_configs::PackageConfigsSetting;
-use pnpm_env_replace::{SystemEnv, env_replace_lossy, placeholder_ranges};
+use pnpm_env_replace::{
+    SentinelPlaceholders,
+    SystemEnv,
+    env_replace_lossy,
+};
 use pnpm_network::redact_and_sanitize;
 use pnpm_package_is_installable::SupportedArchitectures;
-use pnpm_store_dir::{StoreDir, StoreIndexFormat};
+use pnpm_store_dir::{
+    StoreDir,
+    StoreIndexFormat,
+};
 use pnpm_workspace_state::ConfigDependency;
 use registries::RegistryEntry;
-use serde::{Deserialize, Deserializer, de::IgnoredAny};
+use serde::{
+    Deserialize,
+    Deserializer,
+    de::IgnoredAny,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+        HashSet,
+    },
     fs,
-    io::{self, ErrorKind},
-    path::{Path, PathBuf},
+    io::{
+        self,
+        ErrorKind,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// The keys of a project's `pnpm-workspace.yaml` that set nothing, bucketed
@@ -217,7 +314,7 @@ impl DroppedKeys {
 macro_rules! identically_named_settings {
     ($mac:ident) => {
         $mac! {
-            bail, progress, update_notifier, color, embed_readme, ignore_workspace_root_check,
+            bail, progress, update_notifier, color, embed_readme, editor, ignore_workspace_root_check,
             optional, package_lock, pending, recursive_install, reverse,
             stream, aggregate_output, use_stderr, ignore_workspace, shell_emulator,
             skip_manifest_obfuscation, sort, use_beta_cli,
@@ -241,12 +338,14 @@ macro_rules! identically_named_settings {
             dedupe_peer_dependents, dedupe_peers, auto_dedupe,
             dedupe_direct_deps, dedupe_injected_deps,
             strict_peer_dependencies, ignore_compatibility_db, add_missing_peer_types,
-            resolve_peers_from_workspace_root, verify_store_integrity,
+            resolve_peers_from_workspace_root, project_scoped_optional_peers,
+            verify_store_integrity,
             strict_store_pkg_content_check, frozen_store, store_index_format,
             include_workspace_root, fail_if_no_match,
             ignore_workspace_cycles, disallow_workspace_cycles,
             verify_deps_before_run,
             block_exotic_subdeps,
+            warn_unused_overrides,
             link_workspace_packages,
             save_workspace_protocol,
             inject_workspace_packages,
@@ -333,7 +432,9 @@ fn explicit_or_default(
 fn explicit_pattern(config: &Config, key: &str) -> Option<Vec<String>> {
     config.explicit_settings
         .get(key)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .cloned()
+        .map(serde_json::from_value)
+        .and_then(Result::ok)
 }
 
 /// Warn that a file sets both the `audit` section and the deprecated
@@ -350,7 +451,7 @@ fn warn_deprecated_pairing(also_set: bool, deprecated: &str) {
 
 /// Join `fragment` onto `base` the way pnpm's `path.join` does: concatenate
 /// with the separator, then normalize. Node treats every argument after the
-/// first as a fragment, so [`Path::join`] is the wrong primitive here — it
+/// first as a fragment, so [`Path::join`] is the wrong primitive here; it
 /// lets a fragment that parses as rooted (`//bin`) or drive-prefixed
 /// (`C:bin`, drive-relative on Windows) replace `base` outright.
 fn join_fragment(base: &Path, fragment: &str) -> PathBuf {
@@ -377,7 +478,7 @@ pub(crate) fn find_workspace_manifest(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve the workspace root for a given starting directory — i.e. the
+/// Resolve the workspace root for a given starting directory, i.e. the
 /// directory containing the nearest ancestor `pnpm-workspace.yaml`.
 /// Returns `start` itself if no manifest is found, so callers can always
 /// use the result as a resolution base.
@@ -412,13 +513,16 @@ fn as_set<Setting: serde::de::DeserializeOwned>(config: &Config, key: &str) -> O
     config.explicit_settings
         .get(key)
         .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
+        .map(serde_json::from_value)
+        .and_then(Result::ok)
 }
 
 #[cfg(test)]
 mod tests;
 
 mod sections;
+
+mod structured_validation;
 
 mod validation;
 
@@ -431,9 +535,17 @@ use env::expand_home_prefix;
 
 mod environment_values;
 use environment_values::{
-    Placeholder, drop_placeholders, has_env_placeholder, no_proxy_scalar, resolvable_placeholders,
-    resolve_placeholders, substitute_json_string, substitute_optional_inner_string,
-    substitute_optional_string, substitute_optional_string_map, substitute_registry_entries,
+    DocumentPlaceholders,
+    Placeholder,
+    UnresolvedPlaceholders,
+    document_placeholders,
+    has_env_placeholder,
+    no_proxy_scalar,
+    substitute_json_string,
+    substitute_optional_inner_string,
+    substitute_optional_string,
+    substitute_optional_string_map,
+    substitute_registry_entries,
 };
 
 mod apply;
@@ -457,4 +569,7 @@ mod readable;
 mod error;
 
 mod credentials;
-use credentials::{redact_registry_url, registry_url_has_userinfo};
+use credentials::{
+    redact_registry_url,
+    registry_url_has_userinfo,
+};

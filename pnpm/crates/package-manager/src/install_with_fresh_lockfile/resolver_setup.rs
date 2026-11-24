@@ -7,27 +7,56 @@
 //! opened here and lent to both.
 
 use super::InstallWithFreshLockfileError;
-use crate::{PrefetchContext, PrefetchingResolver};
-use pnpm_config::{Config, Tool};
-use pnpm_engine_pm_yarn_resolver::YarnResolver;
-use pnpm_engine_runtime_bun_resolver::BunResolver;
-use pnpm_engine_runtime_deno_resolver::DenoResolver;
+#[cfg(feature = "runtime-provisioning")]
+mod runtime_resolvers;
+use crate::{
+    PrefetchContext,
+    PrefetchingResolver,
+};
+use pnpm_config::Config;
+#[cfg(feature = "runtime-provisioning")]
+use pnpm_config::Tool;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_runtime_node_resolver::NodeResolver;
 use pnpm_lockfile::DeclaredRegistryPrefixes;
 use pnpm_resolving_default_resolver::DefaultResolver;
-use pnpm_resolving_git_resolver::{GitFetchContext, GitResolver, RealGitProbe, RealGitRunner};
-use pnpm_resolving_local_resolver::{LocalPathResolver, LocalResolverContext, LocalSchemeResolver};
+use pnpm_resolving_git_resolver::{
+    GitFetchContext,
+    GitResolver,
+    RealGitProbe,
+    RealGitRunner,
+};
+use pnpm_resolving_local_resolver::{
+    LocalPathResolver,
+    LocalResolverContext,
+    LocalSchemeResolver,
+};
 use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, NamedRegistryResolver, NpmResolver, merge_named_registries,
-    shared_packument_fetch_locker, shared_picked_manifest_cache,
+    InMemoryPackageMetaCache,
+    NamedRegistryResolver,
+    NpmResolver,
+    merge_named_registries,
+    shared_packument_fetch_locker,
+    shared_picked_manifest_cache,
 };
 use pnpm_resolving_resolver_base::Resolver;
-use pnpm_resolving_tarball_resolver::{TarballFetchContext, TarballResolver};
+use pnpm_resolving_tarball_resolver::{
+    TarballFetchContext,
+    TarballResolver,
+};
 use pnpm_store_dir::{
-    SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreDir, StoreIndex, StoreIndexWriter,
+    SharedReadonlyStoreIndex,
+    SharedVerifiedFilesCache,
+    StoreDir,
+    StoreIndex,
+    StoreIndexWriter,
 };
 use pnpm_tarball::SharedReportedProgressKeys;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::Arc,
+};
 
 /// The store index the resolver chain and the install pass share, plus
 /// the batched writer both feed rows into.
@@ -79,7 +108,7 @@ impl StoreCaches {
 /// WAL / SHM sidecar under the read-only root).
 pub(super) async fn open_store_index_handles(
     config: &Config,
-    store_dir: &'static StoreDir,
+    store_dir: &StoreDir,
     caches: StoreCaches,
 ) -> StoreIndexHandles {
     let index = StoreIndex::open_shared(store_dir, config.frozen_store).await;
@@ -93,7 +122,7 @@ pub(super) struct Registries {
     /// Scope → registry URL, as `.npmrc` resolves them.
     pub by_scope: HashMap<String, String>,
     /// `pnpm-workspace.yaml#namedRegistries` folded together with
-    /// pacquet's built-in aliases — today `gh:` → GitHub Packages.
+    /// pacquet's built-in aliases, today `gh:` → GitHub Packages.
     pub named: HashMap<String, String>,
     /// See [`DeclaredRegistryPrefixes`].
     pub declared: DeclaredRegistryPrefixes,
@@ -143,7 +172,7 @@ pub(super) struct ResolverChainInputs<'a> {
     pub registry:
         crate::install_with_fresh_lockfile::resolution_inputs::ResolverRegistryContext<'a>,
     pub store: crate::install_with_fresh_lockfile::resolution_inputs::ResolverStoreContext<'a>,
-    pub config: &'static Config,
+    pub config: &'a Config,
 }
 
 /// The assembled resolver chain plus the pieces later install phases
@@ -173,7 +202,7 @@ pub(super) struct ResolverChain {
 ///
 /// The chain is then wrapped twice: [`PrefetchingResolver`] so each
 /// tarball-shaped result fires a background download while the tree walk
-/// continues, and — for the pnpr server only — [`crate::ObservingResolver`]
+/// continues, and (for the pnpr server only) [`crate::ObservingResolver`]
 /// so each resolution is reported to the client as it lands.
 pub(super) async fn build_resolver_chain<Reporter: pnpm_reporter::Reporter + 'static>(
     mut inputs: ResolverChainInputs<'_>,
@@ -261,7 +290,7 @@ impl ResolverChainInputs<'_> {
                 needs_full_metadata_for: Some(Arc::clone(&self.registry.needs_full_metadata)),
                 filter_metadata: self.config.requires_filtered_full_metadata(),
                 registry_options_by_url: Arc::new(self.config.registry_options_by_url.clone()),
-                minimum_release_age: self.config.resolved_minimum_release_age(),
+                minimum_release_age: self.config.release_age_window_from_now(),
             },
             cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
                 network: self.config.network_policy(),
@@ -273,8 +302,8 @@ impl ResolverChainInputs<'_> {
         })
     }
 
-    // A git dep's specifier names a repo, not a package, so its name —
-    // the `<name>@` half of every lockfile key it reaches — is only
+    // A git dep's specifier names a repo, not a package, so its name
+    // (the `<name>@` half of every lockfile key it reaches) is only
     // readable from the package's own `package.json`, in the host's
     // archive or (for a repo with no archive endpoint) a checkout. Hand
     // the resolver the handles to read it, on the same rationale as the
@@ -289,17 +318,17 @@ impl ResolverChainInputs<'_> {
         .with_fetch_context(GitFetchContext {
             source_cache: Arc::clone(self.fetching.git_sources),
             http_client: Arc::clone(self.fetching.http_client),
-            store_dir: self.store.dir,
+            store_dir: std::borrow::Cow::Owned(self.store.dir.clone()),
             store_index_writer: Some(Arc::clone(self.store.index_writer)),
             auth_headers: Arc::clone(self.fetching.auth_headers),
             retry_opts: self.retry_opts(),
-            tar_limits: self.config.tar_limits(),
+            tar_limits: pnpm_tarball::TarLimits::new(self.config.max_tarball_unpacked_size),
             git_shallow_hosts: self.config.git_shallow_hosts.clone(),
         })
     }
 
     // A remote (non-registry) tarball *direct* dependency carries no
-    // name/version/integrity at resolve time — they live in the
+    // name/version/integrity at resolve time; they live in the
     // tarball's `package.json`. The resolver downloads + extracts it here
     // (warming `tarball_mem_cache` under the hash it settles) so the
     // lockfile builder gets the manifest + integrity and the install pass
@@ -313,7 +342,7 @@ impl ResolverChainInputs<'_> {
                 mem_cache: Some(Arc::clone(self.fetching.tarballs)),
                 auth_headers: Arc::clone(self.fetching.auth_headers),
                 retry_opts: self.retry_opts(),
-                tar_limits: self.config.tar_limits(),
+                tar_limits: pnpm_tarball::TarLimits::new(self.config.max_tarball_unpacked_size),
                 prior_tarball_entries: Arc::new(prior_tarball_entries(
                     self.project.lockfile,
                     self.config.lockfile_integrity_target,
@@ -323,7 +352,7 @@ impl ResolverChainInputs<'_> {
                 store: pnpm_tarball::ArchiveStoreContext {
                     strict_pkg_content_check: false,
                     prefetched_cas_paths: None,
-                    dir: self.store.dir,
+                    dir: std::borrow::Cow::Owned(self.store.dir.clone()),
                     index_writer: Some(Arc::clone(self.store.index_writer)),
                     index: self.store.index.cloned(),
                     verify_integrity: self.config.verify_store_integrity,
@@ -333,6 +362,7 @@ impl ResolverChainInputs<'_> {
         }
     }
 
+    #[cfg(feature = "runtime-provisioning")]
     fn node_resolver(&self) -> NodeResolver {
         let mut node_resolver = NodeResolver::new_with_auth(
             Arc::clone(self.fetching.http_client),
@@ -373,7 +403,7 @@ impl ResolverChainInputs<'_> {
                 needs_full_metadata_for: Some(Arc::clone(&self.registry.needs_full_metadata)),
                 filter_metadata: self.config.requires_filtered_full_metadata(),
                 registry_options_by_url: Arc::new(self.config.registry_options_by_url.clone()),
-                minimum_release_age: self.config.resolved_minimum_release_age(),
+                minimum_release_age: self.config.release_age_window_from_now(),
             },
             cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
                 network: self.config.network_policy(),
@@ -395,7 +425,8 @@ impl ResolverChainInputs<'_> {
         chain.extend(
             custom_resolvers
                 .iter()
-                .filter(|custom| custom.has_can_resolve() && custom.has_resolve())
+                .filter(|custom| custom.has_can_resolve())
+                .filter(|custom| custom.has_resolve())
                 .map(|custom| {
                     Box::new(pnpm_hooks::custom_resolver_adapter::CustomResolverAdapter::new(
                         Arc::clone(custom),
@@ -407,28 +438,25 @@ impl ResolverChainInputs<'_> {
         let local_ctx = LocalResolverContext {
             preserve_absolute_paths: false,
             integrity_target: self.config.lockfile_integrity_target,
+            filesystem_policy: self.project.local_filesystem_policy,
         };
         chain.extend([
             Box::new(Arc::clone(npm_resolver)) as Box<dyn Resolver>,
             Box::new(self.git_resolver()),
             Box::new(self.tarball_resolver()),
             Box::new(LocalSchemeResolver::new(local_ctx)),
-            Box::new(self.node_resolver()),
-            Box::new(DenoResolver::new(
-                Arc::clone(self.fetching.http_client),
-                Arc::clone(npm_resolver),
-            )),
-            Box::new(
-                BunResolver::new(Arc::clone(self.fetching.http_client), Arc::clone(npm_resolver))
-                    .with_mirror(self.config.tool_mirror(Tool::Bun)),
-            ),
-            Box::new(YarnResolver::new(
-                Arc::clone(self.fetching.http_client),
-                self.config.tls.strict_ssl.unwrap_or(true),
-            )),
-            Box::new(self.named_registry_resolver(caches)),
-            Box::new(LocalPathResolver::new(local_ctx)),
         ]);
+        #[cfg(feature = "runtime-provisioning")]
+        chain.extend(runtime_resolvers::runtime_resolvers(self, npm_resolver));
+        #[cfg(not(feature = "runtime-provisioning"))]
+        chain.push(Box::new(pnpm_resolving_default_resolver::UnavailableToolResolver));
+        chain.push(Box::new(self.named_registry_resolver(caches)) as Box<dyn Resolver>);
+        match self.project.local_filesystem_policy {
+            pnpm_resolving_local_resolver::LocalFilesystemPolicy::HostFilesystem(_) => {
+                chain.push(Box::new(LocalPathResolver::new(local_ctx)) as Box<dyn Resolver>);
+            }
+            pnpm_resolving_local_resolver::LocalFilesystemPolicy::WorkspaceOnly => {}
+        }
         chain
     }
 
@@ -462,7 +490,7 @@ struct PnpmfileLoad {
     hook: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     custom_resolvers: Vec<Arc<dyn pnpm_hooks::CustomResolver>>,
     // Loaded alongside the custom resolvers (same worker, same fatality
-    // rule) and consumed by `CreateVirtualStore` — a custom resolver
+    // rule) and consumed by `CreateVirtualStore`, a custom resolver
     // typically writes the custom-typed resolutions its sibling fetcher
     // materializes.
     custom_fetcher_session: Option<Arc<pnpm_deps_restorer::CustomFetcherSession>>,

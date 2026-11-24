@@ -1,9 +1,9 @@
-//! `pacquet stage` — stage packages for publishing, deferring
+//! `pacquet stage`: stage packages for publishing, deferring
 //! proof-of-presence (2FA) approval to a later point in time.
 //!
 //! `stage publish` runs the regular publish pipeline (packing, lifecycle
 //! scripts, OIDC/OTP) against the registry's staging endpoint; the remaining
-//! subcommands — `list`, `view`, `approve`, `reject`, `download` — talk to
+//! subcommands (`list`, `view`, `approve`, `reject`, `download`) talk to
 //! the registry's `-/stage` API directly.
 
 pub use registry::StageRegistryError;
@@ -12,40 +12,82 @@ mod approve;
 mod summarize_tarball;
 
 use super::{
-    publish::{PublishArgs, PublishFlags},
+    publish::{
+        PublishArgs,
+        PublishFlags,
+    },
     sanitize::body_display_string,
 };
 use crate::cli_args::registry_client::{
-    build_registry_client, resolve_target_registry_for_package,
+    build_registry_client,
+    web_auth_fetch_options,
 };
 use clap::Args;
-use derive_more::{Display, Error};
-use miette::{Context, Diagnostic, IntoDiagnostic};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Context,
+    Diagnostic,
+    IntoDiagnostic,
+};
 use pnpm_config::Config;
 use pnpm_hooks::PnpmfileHooks;
 use pnpm_network::{
-    RetryOpts, ThrottledClient, normalize_registry_url, read_limited_body, redact_url_credentials,
+    RetryOpts,
+    ThrottledClient,
+    read_limited_body,
+    redact_url_credentials,
     send_with_retry,
 };
 use pnpm_network_web_auth::{
-    Host as WebAuthHost, OtpChallenge, OtpError, OtpErrorBody, OtpSession, WebAuthFetchOptions,
-    WebAuthRetryOptions, WithOtpError,
+    Host as WebAuthHost,
+    OtpChallenge,
+    OtpError,
+    OtpErrorBody,
+    OtpSession,
+    WebAuthFetchOptions,
+    WithOtpError,
 };
-use pnpm_publish::{Host, PublishSummary, resolve_otp_from_env};
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
+use pnpm_publish::{
+    Host,
+    PublishSummary,
+    resolve_otp_from_env,
+};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 
 use registry::{
-    StageContext, fetch_stage_items, fetch_stage_tarball, stage_endpoint_url, stage_json_request,
-    stage_request_in_session, stage_request_with_otp,
+    StageContext,
+    fetch_stage_items,
+    fetch_stage_tarball,
+    stage_endpoint_url,
+    stage_json_request,
+    stage_request_in_session,
+    stage_request_with_otp,
 };
 use render::{
-    json_pretty, render_stage_item, render_stage_publish_summary, render_tarball_summary,
+    json_pretty,
+    render_stage_item,
+    render_stage_publish_summary,
+    render_tarball_summary,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::{path::Path, sync::Arc};
-use summarize_tarball::{create_tarball_filename, summarize_tarball};
+use std::{
+    path::Path,
+    sync::Arc,
+};
+use summarize_tarball::{
+    create_tarball_filename,
+    summarize_tarball,
+};
 
 /// The staged-list page size; matches pnpm's paginated `-/stage` reads.
 const PER_PAGE: usize = 100;
@@ -64,10 +106,6 @@ const STAGE_SUBCOMMANDS: &str = "publish, list, view, approve, reject, download"
 pub struct StageArgs {
     /// Stage subcommand and arguments.
     pub params: Vec<String>,
-
-    /// The base URL of the npm registry.
-    #[clap(long)]
-    pub registry: Option<String>,
 
     #[clap(flatten)]
     pub flags: PublishFlags,
@@ -121,6 +159,12 @@ pub enum StageError {
     #[display("Could not read package.json from tarball")]
     #[diagnostic(code(ERR_PNPM_STAGE_TARBALL_MANIFEST_NOT_FOUND))]
     TarballManifestNotFound,
+
+    #[display(
+        "Specify --registry to use a one-time password with the registry selected by the current package."
+    )]
+    #[diagnostic(code(ERR_PNPM_STAGE_OTP_REGISTRY_REQUIRED))]
+    OtpRegistryRequired,
 
     #[display(
         "Cannot approve stages {first_stage_id} and {second_stage_id} together because both publish {package_name}@{version}"
@@ -180,10 +224,10 @@ impl StageArgs {
             Some("publish") => {
                 self.stage_publish::<Reporter>(dir, config, recursive, before_packing_hooks).await
             }
-            Some("list") => self.stage_list(config).await,
-            Some("view") => self.stage_view(config).await,
-            Some("approve") => approve::stage_approve::<Reporter>(&self, config).await,
-            Some("reject") => self.stage_reject::<Reporter>(config).await,
+            Some("list") => self.stage_list(dir, config).await,
+            Some("view") => self.stage_view(dir, config).await,
+            Some("approve") => approve::stage_approve::<Reporter>(&self, dir, config).await,
+            Some("reject") => self.stage_reject::<Reporter>(dir, config).await,
             Some("download") => self.stage_download(dir, config).await,
             None => Err(StageError::SubcommandRequired.into()),
             Some(other) => {
@@ -192,7 +236,7 @@ impl StageArgs {
         }
     }
 
-    /// `stage publish` — the regular publish pipeline against the staging
+    /// `stage publish`: the regular publish pipeline against the staging
     /// endpoint, rendered as `+ <pkg> (staged with id <id>)` lines or a
     /// name-keyed JSON object.
     async fn stage_publish<Reporter: self::Reporter>(
@@ -202,7 +246,7 @@ impl StageArgs {
         recursive: bool,
         before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     ) -> miette::Result<Option<String>> {
-        let StageArgs { params, flags, .. } = self;
+        let StageArgs { params, flags } = self;
         let json = flags.output.json;
         let dry_run = flags.dry_run;
         let publish = PublishArgs { package: params.get(1).cloned(), flags };
@@ -229,10 +273,10 @@ impl StageArgs {
         Ok(Some(lines.join("\n")))
     }
 
-    /// `stage list [<package-spec>]` — every staged version, paginated.
-    async fn stage_list(&self, config: &Config) -> miette::Result<Option<String>> {
+    /// `stage list [<package-spec>]`: every staged version, paginated.
+    async fn stage_list(&self, dir: &Path, config: &Config) -> miette::Result<Option<String>> {
         let package_filter = parse_package_filter(self.params.get(1))?;
-        let context = self.stage_context(config, package_filter.as_deref())?;
+        let context = self.stage_context(dir, config, package_filter.as_deref())?;
         let items = fetch_stage_items(&context, package_filter.as_deref()).await?;
 
         if self.flags.output.json {
@@ -251,10 +295,10 @@ impl StageArgs {
         Ok(Some(rendered.join("\n\n")))
     }
 
-    /// `stage view <stage-id>` — one staged version's metadata.
-    async fn stage_view(&self, config: &Config) -> miette::Result<Option<String>> {
+    /// `stage view <stage-id>`: one staged version's metadata.
+    async fn stage_view(&self, dir: &Path, config: &Config) -> miette::Result<Option<String>> {
         let stage_id = require_stage_id(&self.params, "view")?;
-        let context = self.stage_context(config, None)?;
+        let context = self.stage_context(dir, config, None)?;
         let url = stage_endpoint_url(&context.registry, &format!("-/stage/{stage_id}"))?;
         let item: Value =
             stage_json_request(&context, url.as_str(), &format!("view staged package {stage_id}"))
@@ -265,16 +309,18 @@ impl StageArgs {
         Ok(Some(render_stage_item(&item)))
     }
 
-    /// `stage reject <stage-id>` — permanently delete the staged version.
+    /// `stage reject <stage-id>`: permanently delete the staged version.
     async fn stage_reject<Reporter: self::Reporter>(
         &self,
+        dir: &Path,
         config: &Config,
     ) -> miette::Result<Option<String>> {
         let stage_id = require_stage_id(&self.params, "reject")?;
-        let context = self.stage_context(config, None)?;
+        let context = self.stage_context(dir, config, None)?;
         global_warn::<Reporter>(
             "Rejecting will permanently delete this staged publish record and tarball from the \
-             registry.",
+             registry."
+                .to_owned(),
         );
         let url = stage_endpoint_url(&context.registry, &format!("-/stage/{stage_id}"))?;
         stage_request_with_otp::<Reporter>(
@@ -287,11 +333,11 @@ impl StageArgs {
         Ok(Some(format!("Staged package {stage_id} has been rejected.")))
     }
 
-    /// `stage download <stage-id>` — fetch the staged tarball into `dir` and
+    /// `stage download <stage-id>`: fetch the staged tarball into `dir` and
     /// print its summary.
     async fn stage_download(&self, dir: &Path, config: &Config) -> miette::Result<Option<String>> {
         let stage_id = require_stage_id(&self.params, "download")?;
-        let context = self.stage_context(config, None)?;
+        let context = self.stage_context(dir, config, None)?;
         let tarball_data = fetch_stage_tarball(&context, stage_id).await?;
 
         let mut summary = summarize_tarball(&tarball_data)?;
@@ -302,7 +348,8 @@ impl StageArgs {
         // the write against any bare-basename assumption it might not cover.
         if output_path
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
+            .map(std::ffi::OsStr::to_string_lossy)
+            .map(std::borrow::Cow::into_owned)
             != Some(filename.clone())
             || output_path.parent() != Some(dir)
         {
@@ -328,43 +375,46 @@ impl StageArgs {
     /// client, and the configured OTP.
     fn stage_context(
         &self,
+        dir: &Path,
         config: &Config,
         package_name: Option<&str>,
     ) -> miette::Result<StageContext> {
-        let registries = crate::cli_args::registry_client::resolve_registries_with_override(
-            config,
-            self.registry.as_deref(),
-        );
-        let registry = match package_name {
-            Some(package) => resolve_target_registry_for_package(
-                &registries,
-                self.registry.as_deref(),
-                package,
-                None,
-            ),
-            None => registries
-                .get("default")
-                .cloned()
-                .unwrap_or_default(),
+        let infer_auth_scope = package_name.is_none() && config.auth_headers.uses_package_name();
+        let manifest = if config.cli.registry.is_none() || infer_auth_scope {
+            pnpm_package_manifest::safe_read_project_manifest_from_dir(dir)?
+        } else {
+            None
         };
-        let registry = normalize_registry_url(&registry).into_owned();
+        let local_name = manifest
+            .as_ref()
+            .and_then(|manifest| {
+                super::changelog::published_name(manifest)
+                    .or_else(|| manifest.get("name").and_then(Value::as_str))
+            });
+        let package_name = package_name.or(local_name);
+        let name = package_name.unwrap_or_default();
+        let publish_registry = manifest
+            .as_ref()
+            .filter(|_| package_name == local_name)
+            .and_then(|manifest| pnpm_publish::publish_config_registry(manifest, name));
+        let registry = pnpm_publish::find_registry_info(
+            name,
+            &config.registry,
+            &config.resolved_registries(),
+            config.cli.registry.as_deref().or(publish_registry),
+        )?
+        .to_string();
         let auth_header = config.auth_headers.for_url_with_package(&registry, package_name);
+        let otp_registry_confirmed = config.cli.registry.is_some()
+            || registry == pnpm_network::normalize_registry_url(&config.registry);
         Ok(StageContext {
+            otp_registry_confirmed,
             registry,
             auth_header,
             http_client: build_registry_client(config)?,
             retry_opts: config.retry_opts(),
             otp: resolve_otp_from_env::<Host>(self.flags.registry.otp.clone()),
-            web_auth_fetch_options: WebAuthFetchOptions {
-                timeout: Some(config.fetch_timeout),
-                retry: Some(WebAuthRetryOptions {
-                    factor: Some(f64::from(config.fetch_retry_factor)),
-                    max_timeout: Some(config.fetch_retry_maxtimeout),
-                    min_timeout: Some(config.fetch_retry_mintimeout),
-                    randomize: None,
-                    retries: Some(config.fetch_retries),
-                }),
-            },
+            web_auth_fetch_options: web_auth_fetch_options(config),
         })
     }
 }
@@ -429,18 +479,12 @@ fn key_by_package_name(summaries: &[PublishSummary]) -> serde_json::Map<String, 
     keyed
 }
 
-fn global_info<Reporter: self::Reporter>(message: &str) {
-    Reporter::emit(&LogEvent::Global(GlobalLog {
-        level: LogLevel::Info,
-        message: message.to_owned(),
-    }));
+fn global_info<Reporter: self::Reporter>(message: String) {
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Info, message }));
 }
 
-fn global_warn<Reporter: self::Reporter>(message: &str) {
-    Reporter::emit(&LogEvent::Global(GlobalLog {
-        level: LogLevel::Warn,
-        message: message.to_owned(),
-    }));
+fn global_warn<Reporter: self::Reporter>(message: String) {
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }));
 }
 
 #[cfg(test)]

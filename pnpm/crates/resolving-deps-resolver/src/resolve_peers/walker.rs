@@ -5,17 +5,38 @@
 
 pub(crate) use walk_context::MissingSummary;
 
+pub(super) use snapshot_budget::{
+    SnapshotBudget,
+    SubtreePaths,
+};
 pub(super) use walk_context::{
-    MissingPeerInfo, NodeOutput, NodeWalkContext, RootWalk, SubtreeMissingByPkg,
+    MissingPeerInfo,
+    NodeOutput,
+    NodeWalkContext,
+    RootWalk,
+    SubtreeMissingByPkg,
     index_peer_provider_children,
 };
 
-pub(crate) use missing_names::{MissingNames, children_scc_ids, index_missing_names};
+pub(crate) use missing_names::{
+    MissingNames,
+    children_scc_ids,
+    index_missing_names,
+};
 
+mod snapshot_budget;
 mod walk_context;
 use walk_context::{
-    ChildChains, ChildOutputs, ChildParentRefs, ChildrenWalk, DeferredChildren, NodeEntry,
-    NodePeers, NodePeersContext, SettledPeers, WalkResult,
+    ChildChains,
+    ChildOutputs,
+    ChildParentRefs,
+    ChildrenWalk,
+    DeferredChildren,
+    NodeEntry,
+    NodePeers,
+    NodePeersContext,
+    SettledPeers,
+    WalkResult,
 };
 
 mod missing_names;
@@ -25,34 +46,74 @@ mod peer_issues;
 
 mod peer_providers;
 
+mod canonical_cycles;
 mod child_walk;
 
 mod node_walk;
 
 use crate::{
     dependencies_graph::{
-        DependenciesGraph, MissingPeer, ParentChain, PeerDependencyIssue, PeerDependencyIssues,
+        DependenciesGraph,
+        MissingPeer,
+        ParentChain,
+        PeerDependencyIssue,
+        PeerDependencyIssues,
     },
     node_id::NodeId,
     resolve_peers::{
-        ResolvePeersOptions, ResolvePeersResult,
+        ResolvePeersOptions,
+        ResolvePeersResult,
         cache::{
-            CacheHitContext, DeferredChildContext, PeerProviderChildren, PeersCacheItem,
-            UndoRealize, merge_realize_undo,
+            CacheHitContext,
+            DeferredChildContext,
+            PeerProviderChildren,
+            PeersCacheItem,
+            UndoRealize,
+            merge_realize_undo,
         },
         context::{
-            ComparablePeerRange, CurrentProviderSource, ParentPkgInfo, ParentRef, ParentRefs,
-            SharedChain, importer_relative_link_dep_path, insert_parent_ref,
-            link_node_id_as_dep_path, peer_id_pair, remap_link_node_id,
+            ComparablePeerRange,
+            CurrentProviderSource,
+            ParentPkgInfo,
+            ParentRef,
+            ParentRefs,
+            SharedChain,
+            importer_relative_link_dep_path,
+            insert_parent_ref,
+            link_node_id_as_dep_path,
+            peer_id_pair,
+            remap_link_node_id,
         },
         discovery::PeerDiscoveryCaches,
-        finalize::{NodeRecord, PeerIdRecording, PendingPeerEdge, WalkedNode},
+        finalize::{
+            NodeRecord,
+            PeerIdRecording,
+            PendingPeerEdge,
+            WalkedNode,
+        },
     },
-    resolved_tree::{ChildEdge, DirectDep, PeerDep, ResolvedPackage, ResolvedTree, TreeChildren},
+    resolved_tree::{
+        ChildEdge,
+        DirectDep,
+        PeerDep,
+        ResolvedPackage,
+        ResolvedTree,
+        TreeChildren,
+    },
 };
-use pnpm_deps_path::{DepPath, PeerId, index_of_dep_path_suffix, link_path_to_peer_version};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::{collections::BTreeMap, sync::Arc};
+use pnpm_deps_path::{
+    DepPath,
+    PeerId,
+    link_path_to_peer_version,
+};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 pub(super) struct Walker<'tree> {
     pub(super) tree: &'tree mut ResolvedTree,
@@ -75,7 +136,7 @@ pub(super) struct PeerWalkOutput {
     pub(super) issues: PeerDependencyIssues,
     pub(super) missing_ancestor_pkg_ids: HashMap<String, Vec<SharedChain<Arc<str>>>>,
     /// Graph edges whose target `NodeId` had no `DepPath` yet at the
-    /// time we built the parent's `graph_children` map — typically
+    /// time we built the parent's `graph_children` map, typically
     /// because the target is a later sibling direct dep that the walker
     /// hasn't reached yet. `walk()` drains this list once every direct
     /// dep is walked and patches the recorded entries with the now-known
@@ -94,7 +155,7 @@ pub(super) struct PeerWalkOutput {
 }
 
 pub(super) struct PeerWalkNodes {
-    /// Peers each node and its subtree resolved against ancestors —
+    /// Peers each node and its subtree resolved against ancestors,
     /// the "unknown resolved peers" propagated up so a parent can fold
     /// its descendants' peer dependencies into its own peer suffix.
     /// Indexed by `NodeId`; value's keys are peer aliases.
@@ -114,7 +175,7 @@ pub(super) struct PeerWalkNodes {
 
 pub(super) struct PeerWalkTraversal {
     /// Stack of nodes currently being walked. Re-entry on a node here
-    /// is a cycle — the recursion bottoms out with a `name@version`
+    /// is a cycle, the recursion bottoms out with a `name@version`
     /// peer-id and the original visit drives the actual graph insert.
     pub(super) in_progress: HashSet<NodeId>,
     pub(super) mode: PeerWalkMode,
@@ -123,15 +184,19 @@ pub(super) struct PeerWalkTraversal {
     /// persistent [`PeerDiscoveryCaches`], so the pruned-provider
     /// fallback keeps its per-call meaning.
     pub(super) visited_this_call: HashSet<NodeId>,
+    /// Subset of [`Self::visited_this_call`] resolved inside an ancestor or
+    /// canonical subtree rather than at root fallback.
+    pub(super) visited_in_tree: HashSet<NodeId>,
     /// Canonical back-edge targets realized but not yet walked; the
     /// walk drivers drain this after their direct-dep loops.
     pub(super) pending_canonical_nodes: Vec<NodeId>,
     /// Set while [`Walker::drain_pending_canonical_nodes`] walks a shared
     /// back-edge target at importer context: those walks must not emit
-    /// missing-peer issues — every real position reports its own state,
+    /// missing-peer issues; every real position reports its own state,
     /// and an importer-context miss there would demand an auto-install
     /// the positions do not need.
     in_canonical_drain: bool,
+    pub(super) snapshot_budget: SnapshotBudget,
 }
 
 /// Which peer walk a [`Walker`] runs. The modes decide the same resolved
@@ -217,8 +282,10 @@ impl<'tree> Walker<'tree> {
                 in_progress: HashSet::default(),
                 mode,
                 visited_this_call: HashSet::default(),
+                visited_in_tree: HashSet::default(),
                 pending_canonical_nodes: Vec::new(),
                 in_canonical_drain: false,
+                snapshot_budget: SnapshotBudget::default(),
             },
             providers: PeerWalkProviders {
                 resolved_peer_providers_by_alias: BTreeMap::new(),
@@ -241,93 +308,8 @@ impl<'tree> Walker<'tree> {
         range
     }
 
-    pub(super) fn into_caches(self) -> PeerDiscoveryCaches {
-        self.caches
-    }
-
-    /// The children-graph SCC table behind the canonical cycle gate; see
-    /// [`CanonicalCycleGate::table`](super::discovery::CanonicalCycleGate::table).
-    pub(super) fn canonical_scc(&self) -> Arc<HashMap<Arc<str>, usize>> {
-        self.caches.canonical_cycles.table(self.tree, self.caches.view_generation())
-    }
-
-    /// Whether the peer walk drops the `pkg_id → child_pkg_id` edge:
-    /// a self-edge, or an intra-SCC edge whose target is not later in
-    /// package-id order — the same answer at every occurrence.
-    pub(super) fn cuts_cycle_edge(
-        scc_of: &HashMap<Arc<str>, usize>,
-        pkg_id: &str,
-        child_pkg_id: &str,
-    ) -> bool {
-        pkg_id == child_pkg_id
-            || match (scc_of.get(pkg_id), scc_of.get(child_pkg_id)) {
-                (Some(pkg_scc), Some(child_scc)) => pkg_scc == child_scc && child_pkg_id <= pkg_id,
-                _ => false,
-            }
-    }
-
-    /// The shared record-only node a canonical back-edge references;
-    /// created lazily and queued for the driver's importer-context
-    /// walk. See [`CanonicalCycleGate::backedge_nodes`](super::discovery::CanonicalCycleGate::backedge_nodes).
-    pub(super) fn canonical_backedge_node(&mut self, pkg_id: &Arc<str>, depth: i32) -> NodeId {
-        if self.tree.packages.get(&**pkg_id).is_some_and(|pkg| pkg.is_leaf) {
-            let node_id = NodeId::leaf(pkg_id);
-            if !self.tree.dependencies_tree.contains_key(&node_id) {
-                self.tree.dependencies_tree.insert(
-                    node_id.clone(),
-                    crate::resolved_tree::DependenciesTreeNode::new(
-                        Arc::clone(pkg_id),
-                        TreeChildren::Lazy,
-                        depth,
-                    ),
-                );
-            }
-            return node_id;
-        }
-        if let Some(node_id) = self.caches.canonical_cycles.backedge_nodes.get(&**pkg_id)
-            && self.tree.dependencies_tree.contains_key(node_id)
-        {
-            return node_id.clone();
-        }
-        let node_id = NodeId::next();
-        self.tree.dependencies_tree.insert(
-            node_id.clone(),
-            crate::resolved_tree::DependenciesTreeNode::new(
-                Arc::clone(pkg_id),
-                TreeChildren::Lazy,
-                depth,
-            ),
-        );
-        self.caches.canonical_cycles.backedge_nodes.insert(Arc::clone(pkg_id), node_id.clone());
-        self.traversal.pending_canonical_nodes.push(node_id.clone());
-        node_id
-    }
-
-    /// Walk every queued canonical back-edge target at importer-root
-    /// context. Targets realized during these walks queue more, so the
-    /// drain loops until quiet.
-    pub(super) fn drain_pending_canonical_nodes(
-        &mut self,
-        importer_parents: &Arc<ParentRefs>,
-        importer_parent_dep_paths: &Arc<HashMap<String, super::context::ParentPkgInfo>>,
-    ) {
-        self.traversal.in_canonical_drain = true;
-        while let Some(node_id) = self.traversal.pending_canonical_nodes.pop() {
-            if self.traversal.visited_this_call.contains(&node_id) {
-                continue;
-            }
-            self.resolve_node(
-                &node_id,
-                &NodeWalkContext {
-                    parent_refs: importer_parents,
-                    parent_dep_paths: importer_parent_dep_paths,
-                    chain_names: &SharedChain::default(),
-                    parent_node_ids: &SharedChain::default(),
-                    parent_pkg_ids: &SharedChain::default(),
-                },
-            );
-        }
-        self.traversal.in_canonical_drain = false;
+    pub(super) fn into_discovery_state(self) -> (PeerDiscoveryCaches, SnapshotBudget) {
+        (self.caches, self.traversal.snapshot_budget)
     }
 }
 
@@ -345,10 +327,12 @@ impl Walker<'_> {
         // suffix (the cycle fallback during the walk collapses peers
         // that are walk-ancestors), then rebuild the graph from the
         // per-node records keyed by the corrected depPaths.
-        let final_dep_paths = self.build_final_dep_paths(PeerIdRecording::Skip).by_node_id;
-        let direct_by_alias = self.importer_direct_dep_paths(&direct, &final_dep_paths);
-        let graph = self.build_final_graph(&final_dep_paths);
-        let paths_by_node_id = self.final_paths_by_node_id(&final_dep_paths);
+        let paths = self.build_final_dep_paths(PeerIdRecording::Skip);
+        let final_dep_paths = &paths.by_node_id;
+        let direct_by_alias = self.importer_direct_dep_paths(&direct, final_dep_paths);
+        let mut graph = self.build_final_graph(final_dep_paths);
+        paths.record_bindings(&mut graph);
+        let paths_by_node_id = self.final_paths_by_node_id(final_dep_paths);
         ResolvePeersResult {
             graph,
             direct_dependencies_by_alias: direct_by_alias,
@@ -376,6 +360,11 @@ impl Walker<'_> {
             );
         }
         for dep in &own_direct {
+            if self.traversal.snapshot_budget.poll_cancelled()
+                || self.traversal.snapshot_budget.is_stopped()
+            {
+                return;
+            }
             self.resolve_importer_dep(dep, &root.context());
         }
         self.drain_pending_canonical_nodes(&root.importer_parents, &root.parent_dep_paths);
@@ -416,7 +405,7 @@ impl Walker<'_> {
         }
     }
 
-    /// See [`crate::PeerResolutionScope::hoisted_peer_provider_node_ids`] — a
+    /// See [`crate::PeerResolutionScope::hoisted_peer_provider_node_ids`], a
     /// provider is normally resolved at its tree position during the main
     /// walk; only one whose position was pruned still needs this root-context
     /// fallback.
@@ -426,6 +415,11 @@ impl Walker<'_> {
         walk: &NodeWalkContext<'_>,
     ) {
         for dep in provider_direct {
+            if self.traversal.snapshot_budget.poll_cancelled()
+                || self.traversal.snapshot_budget.is_stopped()
+            {
+                break;
+            }
             if self.traversal.visited_this_call.contains(&dep.node_id) {
                 continue;
             }
@@ -459,8 +453,8 @@ impl Walker<'_> {
     /// `link:` direct deps whose target lives outside
     /// [`crate::PeerLinkOptions::lockfile_dir`] are seeded with a node id
     /// rewritten to `link:<rel-from-lockfile_dir-to-modules_dir>/<alias>`
-    /// when [`crate::PeerLinkOptions::exclude_links_from_lockfile`] is on
-    /// — keeping the peer-suffix segment stable across machines
+    /// when [`crate::PeerLinkOptions::exclude_links_from_lockfile`] is on,
+    /// keeping the peer-suffix segment stable across machines
     /// regardless of the absolute path of the external link.
     /// Whether a dependency installed under `alias` can provide a peer:
     /// its alias or its real package name (the two differ for npm-alias
@@ -480,7 +474,11 @@ impl Walker<'_> {
     /// The multi-importer
     /// [`resolve_peers_workspace`](fn@super::resolve_peers_workspace)
     /// supplies each importer's `direct` from outside [`ResolvedTree`].
-    pub(super) fn build_importer_parents_from(&self, direct_deps: &[DirectDep]) -> ParentRefs {
+    pub(super) fn build_importer_parents_from(
+        &self,
+        direct_deps: &[DirectDep],
+        hoisted_provider_node_ids: &HashSet<NodeId>,
+    ) -> ParentRefs {
         let mut refs = ParentRefs::default();
         for direct in direct_deps {
             let Some(tree_node) = self.tree.dependencies_tree.get(&direct.node_id) else {
@@ -494,7 +492,8 @@ impl Walker<'_> {
             }
             let parent_node_id = remap_link_node_id(&self.opts, &direct.alias, pkg.result())
                 .unwrap_or_else(|| direct.node_id.clone());
-            insert_parent_ref(&mut refs, &direct.alias, parent_node_id, pkg);
+            let hoisted_provider = hoisted_provider_node_ids.contains(&direct.node_id);
+            insert_parent_ref(&mut refs, &direct.alias, parent_node_id, pkg, hoisted_provider);
         }
         refs
     }
@@ -523,6 +522,7 @@ impl SettledPeers {
             ),
             missing_peers: self.all_missing,
             subtree_missing_by_pkg: self.subtree_missing_by_pkg,
+            subtree_dep_paths: None,
         }
     }
 }

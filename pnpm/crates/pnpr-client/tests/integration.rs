@@ -15,30 +15,65 @@
 
 use pnpr_fixtures::MockConfigPresets;
 use std::{
-    collections::{BTreeMap, HashSet},
-    net::{Ipv4Addr, SocketAddr},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+    },
     sync::Arc,
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::STANDARD as BASE64,
+};
 use p256::{
-    ecdsa::{SigningKey, signature::Signer as _},
+    ecdsa::{
+        SigningKey,
+        signature::Signer as _,
+    },
     pkcs8::EncodePublicKey as _,
 };
-use pnpm_config::RegistryDeclaration;
 use pnpm_pnpr_client::{
-    ArtifactBlobRequest, ArtifactBlobSource, ArtifactBlobUpload, ArtifactCandidate, ArtifactFile,
-    ArtifactManifest, ArtifactPayload, ArtifactPublication, ArtifactSubject, BuilderProfile,
-    CompatibilityConstraints, OwnerScope, PackageIdentity, PnprClient, PnprClientError,
-    PublishArtifactRequest, ResolveArtifactsOptions, ResolveOptions, ResolveProject,
-    ResolveProjectsOptions, SignedArtifactEnvelope, VerifyLockfileOptions,
+    ArtifactBlobRequest,
+    ArtifactBlobSource,
+    ArtifactBlobUpload,
+    ArtifactCandidate,
+    ArtifactFile,
+    ArtifactManifest,
+    ArtifactPayload,
+    ArtifactPublication,
+    ArtifactSubject,
+    BuilderProfile,
+    CompatibilityConstraints,
+    OwnerScope,
+    PackageIdentity,
+    PnprClient,
+    PnprClientError,
+    PublishArtifactRequest,
+    RegistryDeclaration,
+    ResolveArtifactsOptions,
+    ResolveOptions,
+    ResolveProject,
+    ResolveProjectsOptions,
+    SignedArtifactEnvelope,
+    VerifyLockfileOptions,
 };
 use pnpm_testing_utils::registry::TestRegistry;
-use sha2::{Digest as _, Sha512};
+use sha2::{
+    Digest as _,
+    Sha512,
+};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::{
+        AsyncReadExt as _,
+        AsyncWriteExt as _,
+    },
     net::TcpListener,
     sync::Barrier,
 };
@@ -47,7 +82,7 @@ use tokio::{
 /// `registry_url` as a public route so the client may resolve against it
 /// (off-allowlist registries are rejected at the request boundary). Returns
 /// the base URL, the bearer `Authorization` for the registered `pnpr-client`
-/// caller (pnpr only honors `_authToken` on requests — the resolver
+/// caller (pnpr only honors `_authToken` on requests, the resolver
 /// endpoints reject Basic credentials), and the storage guard.
 async fn start_pnpr(registry_url: &str) -> (String, String, TempDir) {
     start_pnpr_inner(None, Vec::new(), vec![registry_url.to_string()], false).await
@@ -87,18 +122,36 @@ async fn start_pnpr_inner(
 
     let mut config = pnpr::Config::proxy(addr, storage.path().to_path_buf());
     config.features.artifacts.enabled = artifacts_enabled;
-    config.features.artifacts.orgs.insert(
+    let accounts_path = storage.path().join("auth.sqlite");
+    let accounts = pnpr::SqliteAuth::open(&accounts_path, pnpr::MaxUsers::Unlimited).unwrap();
+    pnpr::UserBackend::create_user(&accounts, "pnpr-client", "password123")
+        .await
+        .unwrap();
+    pnpr::UserBackend::create_user(&accounts, "reader", "password123").await.unwrap();
+    let publisher_id = pnpr::UserBackend::account_id(&accounts, "pnpr-client")
+        .await
+        .unwrap()
+        .unwrap();
+    let reader_id = pnpr::UserBackend::account_id(&accounts, "reader").await.unwrap().unwrap();
+    config.identity.backend = pnpr::BackendConfig::Sqlite(accounts_path);
+
+    config.features.artifacts.owners.insert(
         "pnpr-client".to_string(),
         pnpr::StorageAccess {
-            access: pnpr::AccessList::from_tokens(["pnpr-client", "reader"]),
-            publish: pnpr::AccessList::from_tokens(["pnpr-client"]),
+            access: pnpr::AccessList::from_tokens([&publisher_id, &reader_id]),
+            publish: pnpr::AccessList::from_tokens([&publisher_id]),
         },
     );
-    config.http.public_url = public_url.unwrap_or_else(|| format!("http://{addr}"));
-    config.identity.auth.htpasswd.max_users = pnpr::MaxUsers::Unlimited;
+    // The test registries listen on other ports of 127.0.0.1, which pnpr
+    // refuses as other services of its own host when its public URL names
+    // that host too.
+    config.http.public_url =
+        public_url.unwrap_or_else(|| format!("http://localhost:{}", addr.port()));
+    config.identity.auth.users.max_users = pnpr::MaxUsers::Unlimited;
     config.routing.route_policy.allowed_private_networks = ["127.0.0.0/8", "::1"]
         .into_iter()
-        .map(|network| pnpr::IpNetwork::parse(network).expect("loopback network parses"))
+        .map(pnpr::IpNetwork::parse)
+        .map(|parsed| parsed.expect("loopback network parses"))
         .collect();
     for (name, upstream) in upstreams {
         config.routing.upstreams.insert(name, upstream);
@@ -133,23 +186,41 @@ fn registry_upstream(registry_url: &str, token: &str) -> (String, pnpr::Upstream
         reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
             .expect("valid authorization header"),
     );
-    (
-        "test-registry".to_string(),
-        pnpr::UpstreamConfig {
-            access: Some(pnpr::AccessList::from_tokens(["$authenticated"])),
-            ..pnpr::UpstreamConfig::with_defaults(registry_url.to_string(), headers)
-        },
-    )
+    let mut upstream = pnpr::UpstreamConfig::with_defaults(registry_url.to_string(), headers);
+    upstream.set_access(pnpr::AccessList::from_tokens(["$authenticated"]));
+    ("test-registry".to_string(), upstream)
 }
 
+/// Wait until the server answers the handshake, which every surface
+/// mounts. A bare TCP connect would not do: the kernel satisfies one from
+/// the accept backlog before the service is driving the connection, so a
+/// request sent on it can outrun the router.
 async fn wait_until_ready(addr: SocketAddr) {
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+    // reqwest has no total request timeout of its own, so an attempt
+    // against a server that accepted the connection and then went quiet
+    // would never come back and the loop would never reach its panic.
+    const ATTEMPT: Duration = Duration::from_millis(500);
+    // Bounds the wait as a whole: a count of attempts would not, since
+    // each one can spend `ATTEMPT` before the next begins.
+    const READY: Duration = Duration::from_secs(10);
+
+    let handshake = format!("http://{addr}/-/pnpr");
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + READY;
+    loop {
+        let answered = client
+            .get(&handshake)
+            .timeout(ATTEMPT)
+            .send()
+            .await
+            .map(|response| response.status())
+            .is_ok_and(|status| status.is_success());
+        if answered {
             return;
         }
+        assert!(std::time::Instant::now() < deadline, "pnpr server never became ready at {addr}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("pnpr server never became ready at {addr}");
 }
 
 fn parse_content_length(headers: &str) -> usize {
@@ -196,7 +267,7 @@ async fn capture_one_request_with_response(listener: TcpListener, response: Stri
         let buffer = read_full_request(&mut socket).await;
         let request_str = String::from_utf8_lossy(&buffer);
         if request_str.starts_with("GET /-/pnpr HTTP/") {
-            let body = r#"{"pnpr":{"versions":[0,1],"fixLockfile":[0,1]}}"#;
+            let body = r#"{"pnpr":{"protocols":{"resolver":{"versions":[0,1],"features":["projectTransforms","fixLockfile"]}}}}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len(),
@@ -272,13 +343,16 @@ fn options(
             dedupe_peers: None,
             exclude_links_from_lockfile: None,
             add_missing_peer_types: None,
-            resolution_mode: pnpm_config::ResolutionMode::default(),
+            project_scoped_optional_peers: None,
+            resolution_mode: pnpm_pnpr_client::ResolutionMode::default(),
+            dependency_graph: pnpm_pnpr_client::DependencyGraphSettings::default(),
         },
         reuse: pnpm_pnpr_client::LockfileReuseOptions {
             lockfile: None,
             frozen_lockfile: false,
             prefer_frozen_lockfile: None,
             update_patches: false,
+            update_checksums: false,
             ignore_manifest_check: false,
             trust_lockfile: false,
         },
@@ -286,7 +360,8 @@ fn options(
             minimum_release_age: None,
             minimum_release_age_exclude: None,
             minimum_release_age_ignore_missing_time: true,
-            trust_policy: pnpm_config::TrustPolicy::Off,
+            minimum_release_age_strict: false,
+            trust_policy: pnpm_pnpr_client::TrustPolicy::Off,
             trust_policy_exclude: None,
             trust_policy_ignore_after: None,
         },
@@ -327,7 +402,7 @@ fn signed_artifact_fixture_with_builder_id(builder_id: &str) -> SignedFixture {
 }
 
 /// One input key admits one artifact per set of compatibility constraints, so a
-/// test wanting several of them for one dependency varies the platform — which
+/// test wanting several of them for one dependency varies the platform, which
 /// is the only reason a second artifact for one input is legitimate.
 fn signed_artifact_fixture_for_platform(index: usize) -> SignedFixture {
     // Node major, not the glibc floor: two floors for one architecture and Node

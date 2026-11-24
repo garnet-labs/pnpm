@@ -10,7 +10,7 @@
 //! 4. Production callers turbofish [`Host`] explicitly.
 //!
 //! The seam covers only the final "write the tarball to disk" phase of
-//! [`crate::api`] — reading each packed file's bytes, inspecting file
+//! [`crate::api`], reading each packed file's bytes, inspecting file
 //! executability, measuring its size, creating the destination directory,
 //! and writing the archive.
 //! Manifest reading, the packlist walk, and bin resolution stay on real
@@ -19,7 +19,10 @@
 //! `PermissionDenied` / `ENOSPC` test needs a fake.
 
 use std::{
-    io::{self, Write},
+    io::{
+        self,
+        Write,
+    },
     path::Path,
 };
 
@@ -77,11 +80,10 @@ impl FsIsExecutable for Host {
     fn is_executable(path: &Path) -> io::Result<bool> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             match std::fs::metadata(path) {
-                Ok(metadata) => {
-                    Ok(pnpm_fs::file_mode::is_executable(metadata.permissions().mode()))
-                }
+                Ok(metadata) => Ok(pnpm_fs::file_mode::is_executable(
+                    pnpm_fs::FileMode::from_permissions(&metadata.permissions()),
+                )),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(error) => Err(error),
             }

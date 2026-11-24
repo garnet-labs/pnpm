@@ -5,14 +5,26 @@
 //! shell is rendered, and a `# <section>` ... `# <section> end` block is
 //! created in / appended to / replaced in the rc file.
 
+pub(in crate::cli_args::setup) use pwsh::pwsh_quote;
+
 use super::{
-    AddDirToEnvPathOpts, AddingPosition, ConfigFileChangeType, ConfigReport, PathExtenderError,
+    AddDirToEnvPathOpts,
+    AddingPosition,
+    ConfigFileChangeType,
+    ConfigReport,
+    PathExtenderError,
     PathExtenderReport,
 };
-use pnpm_text_section::{find_sections, wrap_section};
+use pnpm_text_section::{
+    find_sections,
+    wrap_section,
+};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 pub(super) fn add_dir_to_posix_env_path(
@@ -40,6 +52,7 @@ pub(in crate::cli_args::setup) fn render_shell_settings(
         "bash" | "zsh" | "ksh" | "dash" | "sh" => Some(render_posix_settings(&dir, opts)),
         "fish" => Some(render_fish_settings(&dir, opts)),
         "nu" => Some(render_nu_settings(&dir, opts)),
+        "pwsh" => Some(pwsh::render_pwsh_settings(&dir, opts)),
         _ => None,
     }
 }
@@ -61,7 +74,8 @@ pub(in crate::cli_args::setup) fn detect_current_shell() -> Option<String> {
     let shell = std::env::var("SHELL").ok()?;
     Path::new(&shell)
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+        .map(std::ffi::OsStr::to_string_lossy)
+        .map(std::borrow::Cow::into_owned)
 }
 
 fn update_shell(
@@ -75,6 +89,11 @@ fn update_shell(
         }
         Some("fish") => setup_fish_shell(pnpm_home_dir, opts),
         Some("nu") => setup_nu_shell(pnpm_home_dir, opts),
+        Some("pwsh") => {
+            let profile =
+                pwsh::profile_path(std::env::var_os("XDG_CONFIG_HOME"), pnpm_config::home_dir())?;
+            pwsh::setup_pwsh_shell(profile, pnpm_home_dir, opts)
+        }
         Some(other) => Err(PathExtenderError::UnsupportedShell { shell: other.to_string() }),
         None => Err(PathExtenderError::UnknownShell),
     }
@@ -118,7 +137,7 @@ enum PathGuard {
 ///
 /// `dir` is single-quote escaped before it is interpolated into the shell
 /// code. This hardens beyond pnpm's `@pnpm/os.env.path-extender`, which
-/// interpolates the directory into double quotes — where a value containing
+/// interpolates the directory into double quotes, where a value containing
 /// `$(...)` / backticks would execute when the rc file is sourced.
 fn render_posix_settings(dir: &str, opts: &AddDirToEnvPathOpts) -> String {
     render_posix_section(dir, opts, PathGuard::Positioned, sh_quote)
@@ -455,6 +474,8 @@ fn zdotdir_or_home() -> Result<PathBuf, PathExtenderError> {
         None => home_dir(),
     }
 }
+
+mod pwsh;
 
 #[cfg(test)]
 mod tests;

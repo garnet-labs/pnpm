@@ -1,5 +1,8 @@
 use super::{
-    LockfileSettingsCheck, PnpmfileChecksumCheck, StalenessReason, check_lockfile_settings,
+    LockfileSettingsCheck,
+    PnpmfileChecksumCheck,
+    StalenessReason,
+    check_lockfile_settings,
     satisfies_package_manifest,
 };
 use crate::Lockfile;
@@ -12,7 +15,7 @@ use text_block_macros::text_block;
 
 /// Build a `PackageManifest` from inline JSON. Writes it to a temp
 /// file so [`PackageManifest::from_path`] can parse it back through
-/// the normal load path — exercises the actual deserialize, not a
+/// the normal load path, exercises the actual deserialize, not a
 /// `serde_json::Value` shortcut.
 fn manifest_from_json(json: &str) -> (tempfile::TempDir, PackageManifest) {
     let tmp = tempdir().expect("create tempdir");
@@ -30,6 +33,7 @@ fn settings_check(catalogs: &Catalogs) -> LockfileSettingsCheck<'_> {
         package_extensions_checksum: None,
         ignored_optional_dependencies: None,
         patched_dependencies: None,
+        project_scoped_optional_peers: false,
         resolution: crate::freshness::ResolutionSettingsCheck {
             auto_install_peers: true,
             dedupe_peers: false,

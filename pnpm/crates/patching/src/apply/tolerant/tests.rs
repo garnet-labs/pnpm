@@ -1,4 +1,8 @@
-use super::{apply, drop_context_no_newline_markers, strip_cr_from_extended_headers};
+use super::{
+    apply,
+    drop_context_no_newline_markers,
+    strip_cr_from_extended_headers,
+};
 use diffy::Patch;
 use pretty_assertions::assert_eq;
 use text_block_macros::text_block_fnl;
@@ -113,7 +117,47 @@ fn adds_a_final_newline_when_only_the_deletion_is_annotated() {
     assert_eq!(applied(original, patch), "one\nTWO\n");
 }
 
-/// Context that matches nothing is still a failure — the tolerances
+/// `git diff --ignore-cr-at-eol` writes lines appended to a file without a
+/// final newline as context followed by the insertion.
+#[test]
+fn appends_after_an_unterminated_last_line_matched_as_context() {
+    let original = "function f() {\n  return 1;\n}\nmodule.exports = f;";
+    let patch = "\
+--- a/index.js
++++ b/index.js
+@@ -2,3 +2,6 @@ function f() {
+   return 1;
+ }
+ module.exports = f;
++function g() {
++  return 2;
++}
+\\ No newline at end of file
+";
+    assert_eq!(
+        applied(original, patch),
+        "function f() {\n  return 1;\n}\nmodule.exports = f;\nfunction g() {\n  return 2;\n}",
+    );
+}
+
+/// `pnpm patch-commit` strips the patch's final `\ No newline at end of
+/// file` marker, so an append that keeps the file without a final newline
+/// reaches the applier unmarked.
+#[test]
+fn keeps_an_unterminated_file_unterminated_after_an_unmarked_append() {
+    let original = "one\ntwo";
+    let patch = "\
+--- a/file.txt
++++ b/file.txt
+@@ -1,2 +1,3 @@
+ one
+ two
++three
+";
+    assert_eq!(applied(original, patch), "one\ntwo\nthree");
+}
+
+/// Context that matches nothing is still a failure, the tolerances
 /// widen what counts as a match, they don't make the applier accept a
 /// patch written against different content.
 #[test]

@@ -3,31 +3,39 @@
 //!
 //! pnpm is the source of truth (see
 //! [`pnpm/AGENTS.md`](../../AGENTS.md#the-cardinal-rule)). Its CLI
-//! defaults live in one object literal, `defaultOptions`, in
-//! `config/reader/src/index.ts`. This test reads that literal from
-//! source at test time and compares each value against
+//! defaults live in one object literal, `defaultOptions`. This test reads
+//! that literal from a copy of pnpm v11's source,
+//! `tests/fixtures/pnpm11-config-reader/defaultOptions.ts`, and compares each value against
 //! [`Config::default()`], so a drift on either side (pnpm changing a
-//! default, or pacquet hard-coding the wrong one — the
+//! default, or pacquet hard-coding the wrong one, the
 //! `dedupeDirectDeps` regression that broke the v11.5.1 release) fails
 //! here instead of in a release pipeline.
 //!
 //! Buckets classify every key in `defaultOptions`:
 //!
-//! - **mapped** — pacquet implements the setting with a directly
+//! - **mapped**, pacquet implements the setting with a directly
 //!   comparable literal default; the value is asserted equal.
-//! - **non-literal** — pacquet implements it, but pnpm's default is an
+//! - **non-literal**, pacquet implements it, but pnpm's default is an
 //!   environment / platform / CPU expression (`registry`,
 //!   `workspace-concurrency`, ...) with no source literal to compare.
-//! - **not ported** — pacquet has no `Config` field for it yet.
+//! - **not ported**, pacquet has no `Config` field for it yet.
 //!
 //! The completeness guard asserts the buckets exactly partition
 //! pnpm's key set, so a *new* pnpm setting (neither mapped nor skipped)
-//! fails the test until someone classifies it — which is how this test
+//! fails the test until someone classifies it, which is how this test
 //! keeps catching the next default that needs porting.
 
 use crate::{
-    CatalogMode, ColorMode, Config, InitType, LinkWorkspacePackages, NodeLinker,
-    NodePackageMapType, ResolutionMode, SaveWorkspaceProtocol, VerifyDepsBeforeRun,
+    CatalogMode,
+    ColorMode,
+    Config,
+    InitType,
+    LinkWorkspacePackages,
+    NodeLinker,
+    NodePackageMapType,
+    ResolutionMode,
+    SaveWorkspaceProtocol,
+    VerifyDepsBeforeRun,
 };
 use std::collections::BTreeSet;
 
@@ -40,7 +48,7 @@ enum Scalar {
     /// Order-insensitive list of strings (pnpm's array defaults carry
     /// no meaningful order).
     Set(BTreeSet<String>),
-    /// pnpm's `undefined` default — pacquet models it as a `None`
+    /// pnpm's `undefined` default, pacquet models it as a `None`
     /// `Option` field (e.g. `save-catalog-name`).
     Undefined,
 }
@@ -96,7 +104,10 @@ fn divergent_rows(cfg: &Config) -> Vec<(&'static str, Scalar, &'static str)> {
 /// test asserts each pacquet value equals the value pnpm's source
 /// records under the same key.
 fn mapped_rows(cfg: &Config) -> Vec<(&'static str, Scalar)> {
-    use Scalar::{Bool, Int};
+    use Scalar::{
+        Bool,
+        Int,
+    };
     vec![
         ("bail", Bool(cfg.bail)),
         ("color", color_mode_scalar(cfg.color)),
@@ -293,34 +304,20 @@ fn save_workspace_protocol_scalar(value: SaveWorkspaceProtocol) -> Scalar {
     }
 }
 
-/// The `defaultOptions` object literal, sliced out of pnpm's
-/// config-reader source. Read live so the test tracks pnpm rather than
-/// a checked-in copy that could silently drift.
+/// The `defaultOptions` object literal, sliced out of a copy of pnpm
+/// v11's config-reader source.
 fn read_pnpm_default_options() -> String {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../pnpm11/config/reader/src/getConfig/defaultOptions.ts",
-    );
-    let src = std::fs::read_to_string(path)
-        .unwrap_or_else(|err| {
-            panic!(
-                "read pnpm config-reader source at {path}: {err}. \
-             This contract test reads pnpm's `defaultOptions` from the TypeScript \
-             tree; if config/reader moved, update the path.",
-            )
-        });
+    let src = include_str!("../tests/fixtures/pnpm11-config-reader/defaultOptions.ts");
     let marker = "const defaultOptions: Partial<KebabCaseConfig> = {";
     let start = src
         .find(marker)
-        .unwrap_or_else(|| {
-            panic!("`{marker}` not found in config/reader/src/getConfig/defaultOptions.ts")
-        });
+        .unwrap_or_else(|| panic!("`{marker}` not found in defaultOptions.ts"));
     let body = &src[start + marker.len()..];
     // The block ends at the first line that is exactly the closing brace
     // at the object's indentation (`\n}`).
     let end = body
         .find("\n}")
-        .expect("unterminated `defaultOptions` object literal in config/reader/src/getConfig/defaultOptions.ts");
+        .expect("unterminated `defaultOptions` object literal in defaultOptions.ts");
     body[..end].to_string()
 }
 
@@ -389,7 +386,7 @@ fn strip_line_comment(line: &str) -> &str {
 
 /// Parse a raw pnpm value into a [`Scalar`]. Panics on a shape this
 /// test doesn't model (which only happens if a mapped key's value type
-/// changed — exactly the drift worth failing on).
+/// changed, exactly the drift worth failing on).
 fn parse_scalar(raw: &str, key: &str) -> Scalar {
     let raw = raw.trim();
     if raw == "undefined" {
@@ -408,14 +405,15 @@ fn parse_scalar(raw: &str, key: &str) -> Scalar {
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
-        // Strip comments per line *before* splitting on commas — a
+        // Strip comments per line *before* splitting on commas, a
         // comment line inside the array (e.g. the `git-shallow-hosts`
         // provenance note) shares no comma with the element below it.
         let items = inner
             .lines()
             .map(strip_line_comment)
             .flat_map(|line| line.split(','))
-            .map(|item| item.trim().trim_matches('\''))
+            .map(str::trim)
+            .map(|trimmed| trimmed.trim_matches('\''))
             .filter(|item| !item.is_empty())
             .map(str::to_string)
             .collect();
@@ -451,7 +449,7 @@ fn pacquet_defaults_match_pnpm_cli_defaults() {
         assert_eq!(
             pacquet_value, pnpm_value,
             "default for {key:?} diverges from pnpm: pacquet={pacquet_value:?}, pnpm={pnpm_value:?} \
-             (pnpm source: config/reader/src/index.ts)",
+             (pnpm source: tests/fixtures/pnpm11-config-reader/defaultOptions.ts)",
         );
     }
 }
@@ -473,7 +471,7 @@ fn intentional_divergences_still_diverge() {
         assert_ne!(
             pacquet_value, pnpm_value,
             "default for {key:?} no longer diverges from pnpm (both {pacquet_value:?}), \
-             so the `divergent_rows` entry is stale — move it into `mapped_rows`. \
+             so the `divergent_rows` entry is stale, move it into `mapped_rows`. \
              Recorded reason: {reason}",
         );
     }
@@ -502,7 +500,7 @@ fn every_pnpm_default_is_classified() {
         .map(|(key, _, _)| key.to_string())
         .collect();
 
-    // The buckets must be disjoint — a key can't be both mapped and
+    // The buckets must be disjoint, a key can't be both mapped and
     // skipped.
     for (a, b, label) in [
         (&mapped, &non_literal, "mapped ∩ non-literal"),

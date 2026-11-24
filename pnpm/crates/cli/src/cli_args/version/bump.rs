@@ -1,4 +1,9 @@
-use super::{Identifier, Path, Version, VersionError};
+use super::{
+    Identifier,
+    Path,
+    Version,
+    VersionError,
+};
 
 /// A parsed version argument: an exact version to set, or a release type to
 /// increment by.
@@ -19,11 +24,10 @@ pub(super) enum ReleaseType {
     Prerelease,
 }
 
-/// Parse the version argument: a valid semver version wins (like upstream's
-/// `semver.valid`, so a leading `v` is accepted and stripped), then the
+/// Parse the version argument: a valid semver version wins, then the
 /// release-type keywords.
 pub(super) fn parse_bump(raw: &str) -> Result<Bump, VersionError> {
-    if let Ok(version) = Version::parse(raw) {
+    if let Some((_, version)) = parse_exact_version(raw) {
         return Ok(Bump::Explicit(version));
     }
     let release = match raw {
@@ -39,12 +43,35 @@ pub(super) fn parse_bump(raw: &str) -> Result<Bump, VersionError> {
     Ok(Bump::Release(release))
 }
 
+/// Parse `raw` as node-semver's strict `semver.valid` does: surrounding
+/// whitespace and one leading `v` are dropped, and the version before any
+/// `+build` must already be in normal form. [`Version::parse`] alone also
+/// accepts loose input such as `1.2.3foo` or `01.2.3` and normalizes it into
+/// a different version. Build metadata is exempt because its numeric
+/// identifiers may keep leading zeros, which [`Version`] drops when it
+/// prints them. Returns the version text as given, without the `v`, and the
+/// parsed version.
+pub(crate) fn parse_exact_version(raw: &str) -> Option<(&str, Version)> {
+    let trimmed = raw.trim();
+    let text = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let core = text
+        .split_once('+')
+        .map(|(core, _build)| core)
+        .unwrap_or(text);
+    let version = Version::parse(text).ok()?;
+    let printed_core = Version { build: Vec::new(), ..version.clone() }.to_string();
+    (printed_core == core).then_some((text, version))
+}
+
 /// Increment `version` by `release`, following node-semver's `inc()` with its
 /// default identifier base of `0`: bumping from a prerelease of the next
 /// major/minor/patch merely finalizes it, the `pre*` types start a `.0`
 /// prerelease (prefixed with `preid` when given), and `prerelease` increments
 /// the right-most numeric identifier.
-pub(super) fn inc(version: &Version, release: ReleaseType, preid: Option<&str>) -> Version {
+pub(super) fn inc(version: &Version, release: ReleaseType, preid: Option<&str>) -> Option<Version> {
+    if !valid_preid(release, preid) {
+        return None;
+    }
     let mut next = version.clone();
     next.build = Vec::new();
     match release {
@@ -79,7 +106,14 @@ pub(super) fn inc(version: &Version, release: ReleaseType, preid: Option<&str>) 
         }
         ReleaseType::Prerelease => bump_prerelease(&mut next, preid),
     }
-    next
+    Some(next)
+}
+
+fn valid_preid(release: ReleaseType, preid: Option<&str>) -> bool {
+    match (release, preid) {
+        (ReleaseType::Major | ReleaseType::Minor | ReleaseType::Patch, _) | (_, None) => true,
+        (_, Some(id)) => semver::Prerelease::new(id).is_ok(),
+    }
 }
 
 /// Whether `version` is already a pre-release of the major it would be
@@ -113,8 +147,8 @@ fn initial_prerelease(preid: Option<&str>) -> Vec<Identifier> {
 }
 
 /// Increment a non-empty prerelease in place: bump the right-most numeric
-/// identifier (appending `.0` when there is none), then — when a preid is
-/// given — keep the result only if it is already `preid.<number>`, otherwise
+/// identifier (appending `.0` when there is none), then (when a preid is
+/// given) keep the result only if it is already `preid.<number>`, otherwise
 /// restart at `preid.0`.
 fn increment_prerelease(pre_release: &mut Vec<Identifier>, preid: Option<&str>) {
     let mut bumped = false;

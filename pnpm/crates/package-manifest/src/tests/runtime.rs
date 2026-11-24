@@ -1,6 +1,11 @@
 use super::{
-    DependencyGroup, PackageManifest, assert_eq, convert_engines_runtime_to_dependencies, json,
-    read_to_string, tempdir,
+    DependencyGroup,
+    PackageManifest,
+    assert_eq,
+    convert_engines_runtime_to_dependencies,
+    json,
+    read_to_string,
+    tempdir,
 };
 
 #[test]
@@ -134,7 +139,7 @@ fn save_prunes_only_removed_reified_runtime_entry_from_array() {
 }
 
 /// Reading a manifest with `devEngines.runtime` set must apply the
-/// reification automatically — that's the hook upstream wires into
+/// reification automatically; that's the hook upstream wires into
 /// `convertManifestAfterRead`. Verifies the `from_path` end of the
 /// pipeline, not just the standalone function.
 #[test]
@@ -269,4 +274,58 @@ fn save_preserves_runtime_when_explicit_user_dep_is_present() {
     let mut manifest = PackageManifest::from_path(path.clone()).unwrap();
     manifest.save().unwrap();
     assert_eq!(read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn local_ignore_policy_preserves_the_declaration_after_a_version_edit() {
+    let mut manifest = PackageManifest::from_value(
+        "package.json".into(),
+        json!({
+            "devEngines": { "runtime": { "name": "node", "version": "22", "onFail": "warn" } },
+        }),
+    );
+    manifest.apply_runtime_on_fail("ignore");
+    manifest.add_dependency("node", "runtime:24", DependencyGroup::Dev).unwrap();
+    manifest.add_dependency("deno", "runtime:2", DependencyGroup::Dev).unwrap();
+    assert_eq!(
+        manifest.written_value().unwrap()["devEngines"]["runtime"],
+        json!([
+            { "name": "node", "version": "24", "onFail": "warn" },
+            { "name": "deno", "version": "2", "onFail": "download" },
+        ]),
+    );
+}
+
+#[test]
+fn local_download_policy_preserves_runtime_edits_across_saves() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("package.json");
+    let mut manifest = PackageManifest::from_value(
+        path.clone(),
+        json!({
+            "devEngines": { "runtime": [
+                { "name": "bun", "version": "1" },
+                { "name": "node", "version": "22", "onFail": "warn" },
+                { "name": "deno", "version": "2" },
+            ] },
+        }),
+    );
+    manifest.apply_runtime_on_fail("download");
+    manifest.apply_runtime_on_fail("download");
+    manifest.remove_dependencies(&["bun".to_string()], Some(DependencyGroup::Dev));
+    manifest.add_dependency("node", "runtime:24", DependencyGroup::Dev).unwrap();
+    let written = manifest.save_and_get_written_value().unwrap();
+    assert_eq!(
+        written["devEngines"]["runtime"],
+        json!([
+            { "name": "node", "version": "24", "onFail": "warn" },
+            { "name": "deno", "version": "2" },
+        ]),
+    );
+    assert_eq!(manifest.value()["devDependencies"]["node"], "runtime:24");
+    assert_eq!(manifest.save_and_get_written_value().unwrap(), written);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read_to_string(path).unwrap()).unwrap(),
+        written,
+    );
 }

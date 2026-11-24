@@ -2,7 +2,10 @@ use crate::install_state::ProjectManifestsByDir;
 use pnpm_package_manifest::PackageManifest;
 use std::{
     borrow::Cow,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Each project's manifest as another importer's injected dependency reads
@@ -50,41 +53,47 @@ pub(crate) fn dependency_manifests_by_dir(
 /// from.
 pub(in crate::install::lockfile_freshness) struct InjectedDirectory<'a> {
     pub(in crate::install::lockfile_freshness) dir: &'a Path,
-    /// See [`super::LocalDepContext::declared_as_file`].
-    pub(in crate::install::lockfile_freshness) declared_as_file: bool,
+    /// Bounds the publishing project that describes `dir`, as it bounds the
+    /// resolver's search.
     pub(in crate::install::lockfile_freshness) workspace_root: &'a Path,
     pub(in crate::install::lockfile_freshness) manifests_by_dir: &'a ProjectManifestsByDir<'a>,
 }
 
-/// The manifest the resolver described the dependency with, before any hook.
-/// A workspace project injected as its `publishConfig.directory` is
-/// described by the project's own manifest, not by a `package.json` a build
-/// wrote into that directory. A `file:` dependency is described by the
-/// directory's `package.json`, and by the publishing project's only while
-/// that is missing.
+/// The manifest the resolver described the dependency with, before any hook,
+/// whichever spec declared it, in the resolver's order:
+///
+/// - the project inside the workspace that publishes from the directory
+///   (`publishConfig.directory`), so a `package.json` a build wrote there does
+///   not describe it;
+/// - the workspace project at the directory;
+/// - the directory's `package.json`;
+/// - without one, a publishing project outside the workspace, else the
+///   directory's name.
 pub(in crate::install::lockfile_freshness) fn unhooked_manifest(
     injected: &InjectedDirectory<'_>,
 ) -> Option<PackageManifest> {
-    let project_manifest = || {
-        injected.manifests_by_dir
-            .get(&pnpm_fs::lexical_normalize(injected.dir))
-            .map(|manifest| (*manifest).clone())
-    };
-    let on_disk = || pnpm_workspace::safe_read_project_manifest_only(injected.dir).ok().flatten();
-    let publishing_project = || manifest_of_project_publishing_from(injected);
-    let manifest = if injected.declared_as_file {
-        project_manifest().or_else(on_disk).or_else(publishing_project)
-    } else {
-        project_manifest().or_else(publishing_project).or_else(on_disk)
-    };
-    manifest.or_else(|| directory_name_manifest(injected.dir))
+    let workspace_root = pnpm_fs::lexical_normalize(injected.workspace_root);
+    let described = manifest_of_project_publishing_from(injected, Some(&workspace_root))
+        .or_else(|| {
+            injected.manifests_by_dir
+                .get(&pnpm_fs::lexical_normalize(injected.dir))
+                .map(|manifest| (*manifest).clone())
+        });
+    if described.is_some() {
+        return described;
+    }
+    match pnpm_workspace::safe_read_project_manifest_only(injected.dir) {
+        Ok(Some(manifest)) => Some(manifest),
+        Ok(None) => manifest_of_project_publishing_from(injected, None)
+            .or_else(|| directory_name_manifest(injected.dir)),
+        Err(_) => None,
+    }
 }
 
 /// The manifest the resolver gives an existing directory that nothing else
-/// describes: its name alone. A manifest that fails to read describes it
-/// too, so it gets none.
+/// describes: its name alone.
 fn directory_name_manifest(dir: &Path) -> Option<PackageManifest> {
-    if !dir.is_dir() || !matches!(pnpm_workspace::safe_read_project_manifest_only(dir), Ok(None)) {
+    if !dir.is_dir() {
         return None;
     }
     let name = dir
@@ -95,33 +104,28 @@ fn directory_name_manifest(dir: &Path) -> Option<PackageManifest> {
 }
 
 /// The manifest of the project whose `publishConfig.directory` is
-/// `injected.dir`: the project's entry in `manifests_by_dir` when it has one,
-/// else its `package.json`. Workspace dependencies only consider projects
-/// within the workspace root; `file:` dependencies walk every ancestor,
-/// matching [`pnpm_package_manifest::find_parent_publish_manifest`].
+/// `injected.dir`, among the ancestors inside `root` when it is given: the
+/// project's entry in `manifests_by_dir` when it has one, else its
+/// `package.json`. A manifest that fails to read is no such project.
 fn manifest_of_project_publishing_from(
     injected: &InjectedDirectory<'_>,
+    root: Option<&Path>,
 ) -> Option<PackageManifest> {
     let target = pnpm_fs::lexical_normalize(injected.dir);
-    let workspace_root = pnpm_fs::lexical_normalize(injected.workspace_root);
-    if !injected.declared_as_file && !target.starts_with(&workspace_root) {
-        return None;
-    }
-    for candidate in target.ancestors().skip(1) {
-        if !injected.declared_as_file && !candidate.starts_with(&workspace_root) {
-            return None;
-        }
-        let manifest = injected.manifests_by_dir
-            .get(candidate)
-            .map(|manifest| (*manifest).clone())
-            .or_else(|| pnpm_workspace::safe_read_project_manifest_only(candidate).ok().flatten());
-        if let Some(manifest) = manifest
-            && pnpm_package_manifest::publishes_from_directory(candidate, manifest.value(), &target)
-        {
-            return Some(manifest);
-        }
-    }
-    None
+    target
+        .ancestors()
+        .skip(1)
+        .take_while(|candidate| root.is_none_or(|root| candidate.starts_with(root)))
+        .find_map(|candidate| {
+            let manifest = injected.manifests_by_dir
+                .get(candidate)
+                .map(|manifest| (*manifest).clone())
+                .or_else(|| {
+                    pnpm_workspace::safe_read_project_manifest_only(candidate).ok().flatten()
+                })?;
+            pnpm_package_manifest::publishes_from_directory(candidate, manifest.value(), &target)
+                .then_some(manifest)
+        })
 }
 
 pub(super) fn workspace_path_matches_target(
@@ -195,14 +199,15 @@ fn loaded_project_boundary(
             .ok();
     }
     if std::fs::symlink_metadata(normalized_target)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        .map(|metadata| metadata.file_type())
+        .is_ok_and(|file_type| file_type.is_symlink())
     {
         return None;
     }
     target_dir_within_workspace(dirs.canonical_paths, normalized_target, target_dir).ok()
 }
 
-fn publishing_project_manifest<'a>(
+pub(super) fn publishing_project_manifest<'a>(
     dirs: &super::spec::SpecDirs<'a>,
     normalized_target: &Path,
 ) -> Option<Cow<'a, serde_json::Value>> {
@@ -281,7 +286,7 @@ pub(in crate::install::lockfile_freshness) fn is_deploy_file_url(
     matches!(
         key.suffix.version(),
         pnpm_lockfile::VersionPart::File(path)
-            if !pnpm_lockfile::is_local_tarball_path(path)
+            if !pnpm_local_spec::is_tarball_filename(path)
                 && (path.starts_with("///") || (path.starts_with("//") && path != directory)),
     )
 }

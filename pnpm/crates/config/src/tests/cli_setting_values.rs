@@ -1,4 +1,9 @@
-use super::{Config, HostNoHome, fs, tempdir};
+use super::{
+    Config,
+    HostNoHome,
+    fs,
+    tempdir,
+};
 use crate::esm_node_path_loader::esm_node_path_loader_import_flag;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
@@ -176,4 +181,20 @@ fn cli_registries_win_over_the_workspace_yaml() {
         Some("https://private.example/"),
     );
     assert!(config.cli_settings.contains("registry"));
+}
+
+/// Only `PNPM_CONFIG_ACCESS` is held to `public` / `restricted`. pnpm types the
+/// environment but not `--config.access`, so an unrecognized value still
+/// replaces the workspace's and goes to the registry to reject.
+#[test]
+fn a_cli_access_setting_is_applied_unchecked() {
+    let workspace = tempdir().expect("workspace tempdir");
+    fs::write(workspace.path().join("pnpm-workspace.yaml"), "access: public\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let config = config_with_cli_settings(&[("access", "restrictd")])
+        .current::<HostNoHome>(workspace.path())
+        .expect("loads");
+
+    assert_eq!(config.access.as_deref(), Some("restrictd"));
 }

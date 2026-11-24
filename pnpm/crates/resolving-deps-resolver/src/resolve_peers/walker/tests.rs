@@ -1,6 +1,9 @@
 //! Unit tests for reading a walk's subtree missing-peer summaries.
 
-use super::{MissingSummary, index_missing_names};
+use super::{
+    MissingSummary,
+    index_missing_names,
+};
 use rustc_hash::FxHashSet as HashSet;
 use std::sync::Arc;
 
@@ -64,8 +67,18 @@ fn occurrences_of_one_package_report_the_union_of_their_missing_peers() {
 
 #[test]
 fn discovery_reuses_nested_providers_with_retained_bindings() {
-    use super::{HashMap, NodeId, ParentRef, PeerWalkMode, WalkResult};
-    use crate::{ResolvedTree, resolve_peers::test_support::walker_for_tests};
+    use super::{
+        HashMap,
+        NodeId,
+        ParentRef,
+        ParentRefs,
+        PeerWalkMode,
+        WalkResult,
+    };
+    use crate::{
+        ResolvedTree,
+        resolve_peers::test_support::walker_for_tests,
+    };
     use pnpm_deps_path::DepPath;
 
     let mut tree = ResolvedTree::default();
@@ -86,6 +99,7 @@ fn discovery_reuses_nested_providers_with_retained_bindings() {
             node_id,
             &Arc::from("provider@1.0.0"),
             &WalkResult {
+                parent_refs: &ParentRefs::default(),
                 dep_path: &path,
                 all_resolved_peers: &bindings,
                 all_missing_peers: &missing,
@@ -93,6 +107,7 @@ fn discovery_reuses_nested_providers_with_retained_bindings() {
                 subtree_missing_by_pkg: &None,
                 is_pure: false,
             },
+            &mut Vec::new(),
         );
     }
     assert_eq!(walker.nodes.external_peers.len(), 2);
@@ -102,6 +117,7 @@ fn discovery_reuses_nested_providers_with_retained_bindings() {
         &NodeId::next(),
         &Arc::from("consumer@1.0.0"),
         &WalkResult {
+            parent_refs: &ParentRefs::default(),
             dep_path: &DepPath::from("consumer@1.0.0(provider@1.0.0(inner@1.0.0))"),
             all_resolved_peers: &consumer_peers,
             all_missing_peers: &missing,
@@ -109,10 +125,16 @@ fn discovery_reuses_nested_providers_with_retained_bindings() {
             subtree_missing_by_pkg: &None,
             is_pure: false,
         },
+        &mut Vec::new(),
     );
     let refs = HashMap::from_iter([(
         "provider".into(),
-        ParentRef { version: "1.0.0".into(), node_id: Some(providers[1].clone()), alias: None },
+        ParentRef {
+            version: "1.0.0".into(),
+            node_id: Some(providers[1].clone()),
+            alias: None,
+            hoisted_provider: false,
+        },
     )]);
     assert!(walker.find_hit(&refs, "consumer@1.0.0").is_some());
 }

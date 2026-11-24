@@ -1,18 +1,27 @@
 use crate::install_frozen_lockfile::LockfileVerificationOverride;
-use pnpm_config::{Config, NodeLinker};
-use pnpm_lockfile::{Lockfile, LockfileEntries};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileEntries,
+};
 use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_resolving_resolver_base::ResolutionVerifier;
 use pnpm_tarball::MemCache;
 use std::{
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
 #[derive(Clone, Copy)]
 pub struct FrozenInstallDrivers<'a> {
-    pub config: &'static Config,
+    pub config: &'a Config,
     pub http_client: &'a ThrottledClient,
     pub pnpmfile_hook: Option<&'a Arc<dyn pnpm_hooks::PnpmfileHooks>>,
 
@@ -90,9 +99,9 @@ pub struct FrozenLockfileInputs<'a> {
     /// the materialization closure. The verification gates read this one
     /// so a narrower install scope can never narrow what gets checked.
     pub verified: &'a Lockfile,
-    /// Absolute path of the lockfile being verified, for the on-disk
-    /// verification cache. `None` disables the cache.
-    pub path: Option<&'a Path>,
+    /// Path and read-time stat of the lockfile being verified, for the
+    /// on-disk verification cache.
+    pub source: Option<pnpm_lockfile_verification::LockfileCacheSource<'a>>,
     /// The previous install's persisted current lockfile, threaded
     /// through to the hoisted walker for `prev_graph` (orphan
     /// diff). `None` on a first install.
@@ -108,6 +117,7 @@ pub struct FrozenLockfileInputs<'a> {
     /// when verification is disabled (`trustLockfile`), in which case the
     /// gate is a no-op.
     pub resolution_verifiers: &'a [Arc<dyn ResolutionVerifier>],
+    pub policies: FrozenVerificationPolicies<'a>,
     /// Fetch-evidence cell `CreateVirtualStore` fills after its
     /// warm/cold partition so the concurrent verification fan-out's
     /// age gate can lean on this install's canonical tarball fetches.
@@ -116,15 +126,25 @@ pub struct FrozenLockfileInputs<'a> {
         Option<&'a pnpm_resolving_resolver_base::PlannedCanonicalFetches>,
 }
 
+/// The lockfile policies the frozen install's verification enforces beside
+/// [`FrozenLockfileInputs::resolution_verifiers`].
+#[derive(Clone, Copy)]
+pub struct FrozenVerificationPolicies<'a> {
+    pub exotic_subdeps: &'a pnpm_lockfile_verification::ExoticSubdepsPolicy,
+    /// Active workspace policy governing local (`directory`, `file:`, `link:`)
+    /// subdependencies on non-importer snapshots.
+    pub local_policy: Option<&'a pnpm_lockfile_verification::LocalResolutionPolicy>,
+}
+
 #[derive(Clone, Copy)]
 pub struct FrozenProjectInputs<'a> {
-    /// Install root — the directory containing `pnpm-lock.yaml`.
+    /// Install root, the directory containing `pnpm-lock.yaml`.
     /// For a real workspace, this is the workspace root (the dir
     /// containing `pnpm-workspace.yaml`); for a single-project
     /// install, it's the project dir.
     ///
     /// Reporter envelopes (`pnpm:stage`, `pnpm:summary`, `pnpm:lifecycle`)
-    /// use [`requester`], a lossy-UTF-8 string view of this path —
+    /// use [`requester`], a lossy-UTF-8 string view of this path,
     /// per-importer events like `pnpm:root` use the importer's own
     /// `rootDir` instead. Filesystem operations that need the real
     /// path (the per-importer `node_modules/` write under
@@ -161,9 +181,11 @@ pub struct FrozenPlatformOptions<'a> {
     /// supplied architecture overrides.
     pub supported_architectures: Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
 
+    pub runtime_provisioning: bool,
+
     /// When `true`, runtime dependencies (`node@runtime:`,
-    /// `deno@runtime:`, `bun@runtime:`) — i.e. packages whose
-    /// metadata resolution is `Binary` or `Variations` — are
+    /// `deno@runtime:`, `bun@runtime:`) (i.e. packages whose
+    /// metadata resolution is `Binary` or `Variations`) are
     /// added to the install-time skip set and the rest of the
     /// install ignores them. Computed at the CLI layer from
     /// `config.skip_runtimes || --no-runtime`.
@@ -238,7 +260,7 @@ pub struct FrozenInstallSeed<'a> {
     pub node_version: Option<String>,
     pub skipped: Option<Vec<String>>,
     /// When set, replaces the local `resolution_verifiers` fan-out as the
-    /// trust verdict — used by the pnpr client to delegate verification to
+    /// trust verdict, used by the pnpr client to delegate verification to
     /// the server's `/-/pnpr/v0/verify-lockfile` while the fetch runs locally. The
     /// same concurrent sequencing and build gate apply.
     pub lockfile_verification_override: Option<LockfileVerificationOverride<'a>>,

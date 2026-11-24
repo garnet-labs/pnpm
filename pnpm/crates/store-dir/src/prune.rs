@@ -2,14 +2,14 @@
 //!
 //! Mark-and-sweep over `<store_dir>/links/<scope>/<name>/<version>/<hash>`:
 //!
-//! 1. **Mark** — walk every registered project (see
+//! 1. **Mark**, walk every registered project (see
 //!    [`crate::get_registered_projects`]). For each project, find every
 //!    `node_modules/` directory (root + workspace packages), follow every
 //!    symlink it contains, and if the symlink target lands under
 //!    `<store_dir>/links/...` record the slot path
 //!    (`<scope>/<name>/<version>/<hash>`) as reachable. Then recurse
 //!    into the slot's own `node_modules/` for transitive deps.
-//! 2. **Sweep** — walk the four-level
+//! 2. **Sweep**, walk the four-level
 //!    `<scope>/<name>/<version>/<hash>` tree and remove every `<hash>`
 //!    that isn't in the reachable set. Empty `<version>/` and `<name>/`
 //!    parents are removed in a second pass.
@@ -20,16 +20,28 @@
 //! profiling shows it's worth the complexity.
 
 use crate::{
-    GetRegisteredProjectsError, StoreDir, StoreLockError, get_registered_projects,
+    GetRegisteredProjectsError,
+    StoreDir,
+    StoreLockError,
+    get_registered_projects,
     prune_cas::PruneCasError,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use std::{
     collections::HashSet,
     fs,
-    io::{self, ErrorKind},
-    path::{Path, PathBuf},
+    io::{
+        self,
+        ErrorKind,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 mod mark;
@@ -57,7 +69,7 @@ pub enum PruneError {
     #[diagnostic(transparent)]
     StoreLock(#[error(source)] StoreLockError),
 
-    /// Surface from the read-side of the project registry — stale
+    /// Surface from the read-side of the project registry, stale
     /// entries that can't be unlinked, inaccessible registry dirs,
     /// or projects whose `stat` returned a permission error.
     #[diagnostic(transparent)]
@@ -92,6 +104,14 @@ pub enum PruneError {
         error: io::Error,
     },
 
+    #[display("Failed to read project link during mark phase {path:?}: {error}")]
+    #[diagnostic(code(ERR_PNPM_STORE_DIR_PRUNE_READ_MARK_LINK))]
+    ReadMarkLink {
+        path: PathBuf,
+        #[error(source)]
+        error: io::Error,
+    },
+
     #[display("Failed to read cache directory {path:?}: {error}")]
     #[diagnostic(code(ERR_PNPM_STORE_DIR_PRUNE_READ_CACHE_DIR))]
     ReadCacheDir {
@@ -113,9 +133,9 @@ pub enum PruneError {
 }
 
 impl StoreDir {
-    /// Remove unreferenced packages from the global virtual store, the
-    /// registry metadata cached under `cache_dir`, and content-addressable
-    /// files that have no hard links outside the store. A metadata directory
+    /// Remove the directory-clone cache, unreferenced packages from the
+    /// global virtual store, registry metadata under `cache_dir`, and
+    /// content-addressable files that have no hard links outside the store. A metadata directory
     /// that is or holds one of `protected_dirs` is kept.
     ///
     /// Pacquet doesn't yet thread the install-time reporter into
@@ -142,6 +162,7 @@ impl StoreDir {
         let in_use = in_use()?;
         references.files.extend(in_use.files);
         self.prune_global_virtual_store(&references.package_roots, &in_use.modules_dirs)?;
+        remove_slot_dir(&self.dir_clone_cache())?;
         self.remove_cached_metadata(cache_dir, protected_dirs)?;
         let stats = crate::prune_cas::prune_cas_with_references(self, &references.files)
             .map_err(PruneError::PruneCas)?;
@@ -186,11 +207,14 @@ impl StoreDir {
             projects.len(),
         );
 
-        let reachable =
-            mark::mark_reachable_slots(&links_dir, &projects, loader_roots, modules_dirs)?;
-        // Projects without the global virtual store register too, so no link
-        // from any registered project leaves the slots' users as unknown as
-        // an empty registry does.
+        let reachable = mark::mark_reachable_slots::<mark::Host>(
+            &links_dir,
+            &projects,
+            loader_roots,
+            modules_dirs,
+        )?;
+        // Registration is best-effort, so no reachable slots does not prove
+        // that the global virtual store is unused.
         if reachable.is_empty() {
             pnpm_diagnostics::eprintln!("No registered project uses the global virtual store");
             return Ok(());
@@ -271,12 +295,37 @@ fn remove_unreachable_slots(
     let mut removed = 0usize;
     for hash in &hashes {
         if reachable.contains(&version_rel.join(hash)) {
+            remove_abandoned_staging(&slot_package_dir(&version_dir.join(hash), version_rel))?;
             continue;
         }
         remove_slot_dir(&version_dir.join(hash))?;
         removed += 1;
     }
     Ok((removed, removed == hashes.len() && !hashes.is_empty()))
+}
+
+/// The package directory of the slot at `slot_dir`, whose
+/// `<scope>/<name>/<version>` path is `version_rel`. An unscoped package
+/// sits under the `@` scope.
+fn slot_package_dir(slot_dir: &Path, version_rel: &Path) -> PathBuf {
+    let mut components = version_rel.components();
+    let (Some(scope), Some(name)) = (components.next(), components.next()) else {
+        return slot_dir.join("node_modules");
+    };
+    let modules_dir = slot_dir.join("node_modules");
+    if scope.as_os_str() == "@" {
+        modules_dir.join(name)
+    } else {
+        modules_dir.join(scope).join(name)
+    }
+}
+
+/// Remove what installs that died left in a reachable slot: the staging
+/// directories beside its package directory.
+fn remove_abandoned_staging(package_dir: &Path) -> Result<(), PruneError> {
+    crate::staging::remove_abandoned_staging_dirs(package_dir)
+        .map(drop)
+        .map_err(|error| PruneError::RemoveSlot { path: package_dir.to_path_buf(), error })
 }
 
 /// Returns the names of every directory entry under `dir`, swallowing
@@ -304,7 +353,7 @@ fn list_subdirs(dir: &Path) -> Result<Vec<std::ffi::OsString>, PruneError> {
 
 /// Recursively remove an unreferenced slot directory and everything
 /// under it (`<store>/links/<scope>/<name>/<version>/<hash>/`). Used
-/// for the actual sweep target — that subtree is known unreachable
+/// for the actual sweep target, that subtree is known unreachable
 /// at this point, so a recursive remove is safe.
 fn remove_slot_dir(path: &Path) -> Result<(), PruneError> {
     match fs::remove_dir_all(path) {
@@ -322,7 +371,7 @@ fn remove_slot_dir(path: &Path) -> Result<(), PruneError> {
 /// propagates any other I/O error.
 ///
 /// Pacquet deliberately diverges from pnpm here. pnpm recursively
-/// removes the empty `<version>/`, `<name>/`, and `<scope>/` parents —
+/// removes the empty `<version>/`, `<name>/`, and `<scope>/` parents,
 /// a concurrent install that materialises a fresh slot in the window
 /// between [`list_subdirs`] and the parent cleanup would have its
 /// just-written tree wiped by that recursive remove. Using

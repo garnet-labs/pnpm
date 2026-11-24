@@ -4,22 +4,41 @@ use crate::{
     cli_args::{
         pipelines::WorkspaceScope,
         recursive::{
-            AutoExcludeRoot, RecursiveSelection, filter_against, recursive_filter_options,
+            AutoExcludeRoot,
+            RecursiveSelection,
+            filter_graphs,
+            parse_configured_selectors,
+            recursive_filter_options,
             select_recursive_projects_deferring_no_match,
         },
     },
-    ecosystem_install::{EcosystemManifest, EcosystemWorkspaceInventory, python},
+    ecosystem_install::{
+        EcosystemManifest,
+        EcosystemWorkspaceInventory,
+        python,
+    },
 };
 use miette::Result;
 use pnpm_config::Config;
-use pnpm_workspace_projects_graph::{BaseProject, ProjectGraph, ProjectGraphNode};
+use pnpm_workspace_projects_graph::{
+    BaseProject,
+    ProjectGraph,
+    ProjectGraphNode,
+};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
+#[derive(Default)]
 pub(crate) struct StandaloneEcosystemSelection {
     pub(crate) discovered: usize,
     pub(crate) selected: Vec<PathBuf>,
@@ -77,7 +96,7 @@ pub(crate) async fn select_recursive_and_standalone_projects<'a>(
     workspace_root: &Path,
     prefix: &Path,
     projects: &'a [pnpm_workspace::Project],
-    config: &'static Config,
+    config: &Config,
 ) -> Result<(RecursiveSelection<'a>, Vec<PathBuf>)> {
     let (selection, unmatched) = select_recursive_projects_deferring_no_match(
         projects,
@@ -101,12 +120,21 @@ pub(crate) async fn select_recursive_and_standalone_projects<'a>(
         config,
     )
     .await?;
-    if let Some(unmatched) = unmatched
-        && standalone.selected.is_empty()
-    {
-        return Err(unmatched.counting(standalone.discovered).report());
+    Ok((selection, standalone.resolve(unmatched)?))
+}
+
+impl StandaloneEcosystemSelection {
+    pub(crate) fn resolve(
+        self,
+        unmatched: Option<crate::cli_args::recursive::UnmatchedFilters>,
+    ) -> Result<Vec<PathBuf>> {
+        if let Some(unmatched) = unmatched
+            && self.selected.is_empty()
+        {
+            return Err(unmatched.counting(self.discovered).report());
+        }
+        Ok(self.selected)
     }
-    Ok((selection, standalone.selected))
 }
 
 pub(crate) async fn select_standalone_ecosystem_dirs(
@@ -114,7 +142,7 @@ pub(crate) async fn select_standalone_ecosystem_dirs(
     prefix: &Path,
     npm_project_dirs: &HashSet<PathBuf>,
     selected_npm_dirs: &HashSet<PathBuf>,
-    config: &'static Config,
+    config: &Config,
 ) -> Result<StandaloneEcosystemSelection> {
     if !config.cargo.enabled && !config.python.enabled {
         return Ok(StandaloneEcosystemSelection { discovered: 0, selected: Vec::new() });
@@ -179,7 +207,8 @@ fn select_standalone_cargo_dirs(
     let matched = filter_standalone_graph(&all_graph, &prod_graph, config, prefix)?;
     let selected = dirs
         .into_iter()
-        .filter(|dir| !npm_project_dirs.contains(dir) && matched.contains(dir))
+        .filter(|dir| !npm_project_dirs.contains(dir))
+        .filter(|dir| matched.contains(dir))
         .collect();
     Ok((discovered, selected))
 }
@@ -281,33 +310,33 @@ fn resolve_cargo_edge_target(
         let norm = pnpm_fs::lexical_normalize(&dir.join(rel_path));
         return index.by_norm_dir.get(&norm).cloned();
     }
-    if dep_table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-        let ws_key = dep_table
-            .get("package")
-            .and_then(toml::Value::as_str)
-            .unwrap_or(key);
-        return resolve_workspace_cargo_edge(ws_key, dir, index);
+    if dep_table
+        .get("workspace")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let dep_package = dep_table.get("package").and_then(toml::Value::as_str);
+        return resolve_workspace_cargo_edge(key, dep_package, dir, index);
     }
     None
 }
 
 fn resolve_workspace_cargo_edge(
-    ws_key: &str,
+    dep_key: &str,
+    dep_package: Option<&str>,
     dir: &Path,
     index: &CargoWorkspaceIndex,
 ) -> Option<PathBuf> {
-    if let Some(spec) = workspace_dependency_spec(dir, ws_key) {
-        if let Some(rel_path) = spec.path {
-            let norm = pnpm_fs::lexical_normalize(&spec.workspace_root.join(rel_path));
-            if let Some(target) = index.by_norm_dir.get(&norm) {
-                return Some(target.clone());
-            }
-        }
-        if let Some(target) = index.by_name.get(&spec.package_name) {
+    let Some(spec) = workspace_dependency_spec(dir, dep_key, dep_package) else {
+        return index.by_name.get(dep_key).cloned();
+    };
+    if let Some(rel_path) = spec.path {
+        let norm = pnpm_fs::lexical_normalize(&spec.workspace_root.join(rel_path));
+        if let Some(target) = index.by_norm_dir.get(&norm) {
             return Some(target.clone());
         }
     }
-    index.by_name.get(ws_key).cloned()
+    index.by_name.get(&spec.package_name).cloned()
 }
 
 fn filter_standalone_graph<Pkg: BaseProject>(
@@ -317,36 +346,18 @@ fn filter_standalone_graph<Pkg: BaseProject>(
     prefix: &Path,
 ) -> Result<HashSet<PathBuf>> {
     let root_selector = AutoExcludeRoot::Disabled.root_selector(config, prefix);
-    let prod = !config.filter_prod.is_empty();
     let options = recursive_filter_options(config, prefix);
-    let mut selected: HashSet<PathBuf> = filter_against(
-        all_graph,
-        &config.filter,
-        root_selector.as_deref().filter(|_| !prod),
-        false,
-        prefix,
-        &options,
-    )?
-    .into_iter()
-    .collect();
-    if prod {
-        selected.extend(filter_against(
-            prod_graph,
-            &config.filter_prod,
-            root_selector.as_deref().filter(|_| prod),
-            true,
-            prefix,
-            &options,
-        )?);
-    }
-    Ok(selected)
+    let selectors = parse_configured_selectors(config, root_selector.as_deref(), prefix);
+    let prod = (!config.filter_prod.is_empty()).then_some(prod_graph);
+    let filtered = filter_graphs(all_graph, prod, &selectors, &options)?;
+    Ok(filtered.selected_projects.into_iter().collect())
 }
 
 async fn select_standalone_python_dirs(
     inventory: &EcosystemWorkspaceInventory,
     npm_project_dirs: &HashSet<PathBuf>,
     selected_npm_dirs: &HashSet<PathBuf>,
-    config: &'static Config,
+    config: &Config,
     prefix: &Path,
 ) -> Result<(usize, Vec<PathBuf>)> {
     let discovery = python::discover(config, inventory).await?;

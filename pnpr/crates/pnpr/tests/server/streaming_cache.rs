@@ -1,12 +1,27 @@
 use super::{
-    Body, Duration, Request, ServiceExt, StatusCode, TempDir, await_no_tgz, body_bytes, config_for,
-    json, mock_packument_for_tarball, public_cache_blob, public_cache_blobs, public_cache_pkg,
-    router, sha512_integrity, spawn_truncated_upstream, tarball_cache_entries,
+    Body,
+    Duration,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    await_no_tgz,
+    body_bytes,
+    config_for,
+    json,
+    mock_packument_for_tarball,
+    public_cache_blob,
+    public_cache_blobs,
+    public_cache_pkg,
+    router,
+    sha512_integrity,
+    spawn_truncated_upstream,
+    tarball_cache_entries,
 };
 
 /// Stale-if-error: once a cached packument is stale, a refetch that fails
 /// (transient upstream error) falls back to the last cached body rather than
-/// erroring — preserving availability without a cross-origin fall-through.
+/// erroring, preserving availability without a cross-origin fall-through.
 #[tokio::test]
 async fn stale_packument_is_served_when_upstream_refetch_fails() {
     let mut upstream = mockito::Server::new_async().await;
@@ -45,7 +60,7 @@ async fn stale_packument_is_served_when_upstream_refetch_fails() {
 
     // The entry goes stale and the upstream now fails every refetch. Staleness
     // is decided from the cache file's mtime, so sleep well past a coarse
-    // filesystem's timestamp granularity (~1s) plus the TTL — otherwise the
+    // filesystem's timestamp granularity (~1s) plus the TTL; otherwise the
     // entry could still read as fresh and the test would flake.
     let boom = upstream
         .mock("GET", "/foo")
@@ -74,7 +89,7 @@ async fn stale_packument_is_served_when_upstream_refetch_fails() {
 }
 
 /// Stale-if-error masks only *transient* failures: a 4xx (here `403`) is
-/// authoritative about this request, so the cached bytes must NOT be served —
+/// authoritative about this request, so the cached bytes must NOT be served,
 /// the error surfaces instead.
 #[tokio::test]
 async fn a_4xx_upstream_does_not_serve_stale_cache() {
@@ -206,8 +221,8 @@ async fn cache_tmp_open_failure_fails_closed() {
     std::fs::write(&blocked, b"already a file").unwrap();
 
     let mut config = config_for(&upstream.url(), blocked.clone());
-    config.storage.metadata =
-        pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite"));
+    config.storage.database =
+        pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite"));
     let app = router(config);
 
     let response = app
@@ -353,9 +368,9 @@ async fn tarball_is_not_gzipped_even_when_accepted() {
     mock.assert_async().await;
 }
 
-/// A per-upstream `maxage` shorter than the global `packument_ttl` governs
+/// A per-upstream `packument_ttl` shorter than the global `packument_ttl` governs
 /// freshness: with a generous global TTL the second request would be a
-/// cache hit, but `maxage: 0` forces a revalidation, so the upstream is
+/// cache hit, but `packument_ttl: 0` forces a revalidation, so the upstream is
 /// hit twice.
 #[tokio::test]
 async fn per_upstream_maxage_overrides_global_packument_ttl() {
@@ -371,10 +386,10 @@ async fn per_upstream_maxage_overrides_global_packument_ttl() {
 
     let tmp = TempDir::new().unwrap();
     let mut config = config_for(&upstream.url(), tmp.path().to_path_buf());
-    // Global TTL stays generous (a minute); the per-upstream maxage of zero
+    // Global TTL stays generous (a minute); the per-upstream packument_ttl of zero
     // is what must take effect and make every read stale.
     config.http.packument_ttl = Duration::from_mins(1);
-    config.routing.upstreams.get_mut("npmjs").expect("default `npmjs` upstream").maxage =
+    config.routing.upstreams.get_mut("npmjs").expect("default `npmjs` upstream").packument_ttl =
         Some(Duration::from_millis(0));
     let app = router(config);
 

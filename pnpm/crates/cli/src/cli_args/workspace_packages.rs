@@ -1,29 +1,44 @@
-use crate::cli_args::{install::resolve_bool_override, publish::PublishManifestArgs};
+use crate::cli_args::{
+    install::resolve_bool_override,
+    publish::PublishManifestArgs,
+};
 use pnpm_config::Config;
 use pnpm_hooks::PnpmfileHooks;
-use pnpm_pack::{PackManifestOptions, WorkspacePackageManifest};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use pnpm_pack::{
+    PackManifestOptions,
+    WorkspacePackageManifest,
+};
+use std::{
+    collections::{
+        HashMap,
+        HashSet,
+        hash_map::Entry,
+    },
+    path::Path,
+    sync::Arc,
+};
 
 pub fn build_workspace_package_manifest_map(
     projects: &[pnpm_workspace::Project],
 ) -> HashMap<String, WorkspacePackageManifest> {
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, WorkspacePackageManifest> = HashMap::new();
     for project in projects {
-        let manifest = project.manifest.value();
-        if let Some(name) = manifest.get("name").and_then(|val| val.as_str()) {
-            let version = manifest
-                .get("version")
-                .and_then(|val| val.as_str())
-                .unwrap_or("");
-            let entry = map
-                .entry(name.to_string())
-                .or_insert_with(|| WorkspacePackageManifest {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                });
-            if entry.version.is_empty() && !version.is_empty() {
-                entry.version = version.to_string();
+        let manifest = WorkspacePackageManifest::from_manifest(project.manifest.value());
+        if manifest.name.is_empty() {
+            continue;
+        }
+        match map.entry(manifest.name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(manifest);
             }
+            Entry::Occupied(mut entry)
+                if entry.get().version.is_empty() && !manifest.version.is_empty() =>
+            {
+                let mut manifest = manifest;
+                manifest.private |= entry.get().private;
+                entry.insert(manifest);
+            }
+            Entry::Occupied(_) => {}
         }
     }
     map
@@ -42,8 +57,9 @@ pub fn discover_workspace_package_manifests(
 pub fn create_publish_pack_manifest_options(
     manifest_flags: &PublishManifestArgs,
     config: &Config,
-    before_packing_hooks: &[Arc<dyn PnpmfileHooks>],
+    before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     workspace_packages: Option<Arc<HashMap<String, WorkspacePackageManifest>>>,
+    bumped_packages: Option<&Arc<HashSet<String>>>,
 ) -> miette::Result<PackManifestOptions> {
     Ok(PackManifestOptions {
         catalogs: crate::cli_args::catalogs::configured_catalogs(config)?,
@@ -59,8 +75,9 @@ pub fn create_publish_pack_manifest_options(
             manifest_flags.no_skip_manifest_obfuscation,
             config.skip_manifest_obfuscation,
         ),
-        before_packing_hooks: before_packing_hooks.to_vec(),
+        before_packing_hooks,
         workspace_packages,
+        bumped_workspace_packages: bumped_packages.map(Arc::clone),
     })
 }
 

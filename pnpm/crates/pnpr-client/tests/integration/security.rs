@@ -1,6 +1,12 @@
 use super::{
-    BTreeMap, Ipv4Addr, PnprClient, ResolveProject, ResolveProjectsOptions, TcpListener,
-    capture_one_request_with_response, options,
+    BTreeMap,
+    Ipv4Addr,
+    PnprClient,
+    ResolveProject,
+    ResolveProjectsOptions,
+    TcpListener,
+    capture_one_request_with_response,
+    options,
 };
 
 /// The resolved lockfile is merged into the caller's `pnpm-lock.yaml`, so
@@ -13,6 +19,7 @@ async fn an_importer_outside_the_request_is_rejected() {
     let addr = listener.local_addr().expect("capture addr");
     let done = serde_json::json!({
         "type": "done",
+        "lockfileFormat": "pnpm-lock/9.0",
         "lockfile": {
             "lockfileVersion": "9.0",
             "importers": {
@@ -41,6 +48,7 @@ async fn an_importer_outside_the_request_is_rejected() {
         dev_dependencies: BTreeMap::new(),
         optional_dependencies: BTreeMap::new(),
         peer_dependencies: BTreeMap::new(),
+        dependencies_meta: None,
     }];
 
     let error = match client.resolve_projects(opts).await {

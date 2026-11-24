@@ -1,9 +1,16 @@
 use crate::{
-    CreateVirtualStoreError, DependenciesGraphToLockfileError, InstallPackageFromRegistryError,
-    LinkRootComponentMembersError, LinkVirtualStoreBinsError, SymlinkDirectDependenciesError,
+    CreateVirtualStoreError,
+    DependenciesGraphToLockfileError,
+    InstallPackageFromRegistryError,
+    LinkRootComponentMembersError,
+    LinkVirtualStoreBinsError,
+    SymlinkDirectDependenciesError,
     VersionPolicyError,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_cmd_shim::LinkBinsError;
 use pnpm_lockfile::SaveLockfileError;
@@ -52,14 +59,14 @@ pub enum InstallWithFreshLockfileError {
 
     /// Surfaces failures from [`crate::lockfile_to_hoisted_dep_graph`]
     /// when a fresh install runs under `nodeLinker: hoisted`. Same
-    /// shape the frozen-lockfile path surfaces — see
+    /// shape the frozen-lockfile path surfaces; see
     /// `InstallFrozenLockfileError::HoistedDepGraph`.
     #[diagnostic(transparent)]
     HoistedDepGraph(#[error(source)] crate::HoistedDepGraphError),
 
     /// Surfaces failures from [`crate::link_hoisted_modules()`] while
     /// materializing the on-disk hoisted tree on the fresh path. Same
-    /// shape the frozen-lockfile path surfaces — see
+    /// shape the frozen-lockfile path surfaces; see
     /// `InstallFrozenLockfileError::LinkHoistedModules`.
     #[diagnostic(transparent)]
     LinkHoistedModules(#[error(source)] crate::LinkHoistedModulesError),
@@ -133,12 +140,12 @@ pub enum InstallWithFreshLockfileError {
 
     /// `allowBuilds` patterns in `pnpm-workspace.yaml` couldn't be
     /// parsed. Same `VersionPolicyError` shape the frozen-lockfile
-    /// path surfaces — see `InstallFrozenLockfileError::VersionPolicy`.
+    /// path surfaces; see `InstallFrozenLockfileError::VersionPolicy`.
     #[diagnostic(transparent)]
     AllowBuildsPolicy(#[error(source)] VersionPolicyError),
 
     /// Surfaces any failure from the shared lifecycle-script build
-    /// phase — `patchedDependencies` resolution, the `BuildModules`
+    /// phase, `patchedDependencies` resolution, the `BuildModules`
     /// run, or the post-build top-level bin link. Shared with the
     /// frozen-lockfile path via `run_build_phase`.
     #[diagnostic(transparent)]
@@ -184,9 +191,7 @@ pub enum InstallWithFreshLockfileError {
     /// at install start, not at the first per-manifest match, so the
     /// user sees the bad selector before any tarballs are fetched.
     #[diagnostic(transparent)]
-    InvalidPackageExtensionSelector(
-        #[error(source)] crate::package_extender::InvalidPackageExtensionSelector,
-    ),
+    InvalidPackageExtensionSelector(#[error(source)] crate::InvalidPackageExtensionSelector),
 
     /// A value in `pnpm.overrides` couldn't be parsed before the
     /// fresh resolver's read-package hook was built.
@@ -220,6 +225,11 @@ pub enum InstallWithFreshLockfileError {
     #[diagnostic(code(ERR_PNPM_PNPMFILE_FAIL))]
     AfterAllResolvedHook(#[error(not(source))] pnpm_hooks::HookError),
 
+    /// The `afterAllResolved` pnpmfile hook returned `undefined`, `null`, or a
+    /// value that is not a serializable lockfile object.
+    #[diagnostic(code(ERR_PNPM_BAD_AFTER_ALL_RESOLVED_RETURN))]
+    BadAfterAllResolvedReturn(#[error(not(source))] pnpm_hooks::HookError),
+
     /// The freshly-built lockfile could not be serialized to JSON to pass to
     /// the `afterAllResolved` pnpmfile hook.
     #[display("Failed to serialize lockfile for the afterAllResolved hook: {_0}")]
@@ -243,6 +253,19 @@ pub enum InstallWithFreshLockfileError {
     #[diagnostic(code(ERR_PNPM_PNPMFILE_FAIL))]
     CustomResolverForceResolve(#[error(not(source))] pnpm_hooks::HookError),
 }
+impl From<pnpm_deps_restorer::EnrichLocalPolicyError> for InstallWithFreshLockfileError {
+    fn from(err: pnpm_deps_restorer::EnrichLocalPolicyError) -> Self {
+        match err {
+            pnpm_deps_restorer::EnrichLocalPolicyError::ReadPackageHook(err) => {
+                Self::PnpmfileHook(err)
+            }
+            pnpm_deps_restorer::EnrichLocalPolicyError::InvalidPackageExtensionSelector(err) => {
+                Self::InvalidPackageExtensionSelector(err)
+            }
+        }
+    }
+}
+
 impl From<crate::install_frozen_lockfile::HoistedLinkerError> for InstallWithFreshLockfileError {
     fn from(error: crate::install_frozen_lockfile::HoistedLinkerError) -> Self {
         use crate::install_frozen_lockfile::HoistedLinkerError;

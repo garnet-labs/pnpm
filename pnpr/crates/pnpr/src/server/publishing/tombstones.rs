@@ -3,7 +3,10 @@ use serde_json::Value;
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_policy::Identity;
-use pnpr_storage::{PackageTombstone, Storage};
+use pnpr_storage::{
+    PackageTombstone,
+    Storage,
+};
 
 use super::attachments::ValidatedPublish;
 use crate::server::AppState;
@@ -33,14 +36,15 @@ pub(super) async fn check_staged_tombstone(
     storage: &Storage,
     doc: &ValidatedPublish,
     package_exists: bool,
-) -> Result<(), RegistryError> {
+) -> Result<Option<PackageTombstone>, RegistryError> {
     let Some(tombstone) = storage.read_tombstone(&doc.name).await? else {
-        return Ok(());
+        return Ok(None);
     };
     if !package_exists {
         check_may_reclaim(state, &doc.publisher, &tombstone, &doc.name)?;
     }
-    check_unpublished_versions(&tombstone, &doc.name, &doc.incoming)
+    check_unpublished_versions(&tombstone, &doc.name, &doc.incoming)?;
+    Ok(Some(tombstone))
 }
 
 fn check_may_reclaim(
@@ -49,7 +53,7 @@ fn check_may_reclaim(
     tombstone: &PackageTombstone,
     name: &CanonicalPackageName,
 ) -> Result<(), RegistryError> {
-    let username = identity.username();
+    let username = identity.user_id();
     let is_admin =
         username.is_some_and(|user| state.inner.config.identity.admins.contains(user));
     let is_former_maintainer = username.is_some_and(|user| {

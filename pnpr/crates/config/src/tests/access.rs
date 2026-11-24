@@ -1,47 +1,46 @@
 use super::{
-    Config, Identity, Path, RegistryError, hosted_rules_config, hosted_rules_err, listen, user,
+    Config,
+    Identity,
+    Path,
+    RegistryError,
+    listen,
+    load_with_graph,
+    user,
 };
 
-/// A hosted `org` becomes a storage path segment, so a traversal-y value —
+/// A hosted `namespace` becomes a storage path segment, so a traversal-y value,
 /// including a Windows drive-relative prefix, which `PathBuf::join` treats as
-/// a new path rather than a child — must be rejected at load rather than
+/// a new path rather than a child, must be rejected at load rather than
 /// reach the filesystem.
 #[test]
-fn from_yaml_str_rejects_hosted_org_path_traversal() {
-    for org in ["../../etc", "C:acme", "a/b"] {
-        let yaml =
-            format!("storage: ./s\nregistries:\n  evil:\n    type: hosted\n    org: {org}\n");
-        let err = Config::from_yaml_str(&yaml, Path::new("/x"), listen(), None)
-            .expect_err("a traversal-y hosted org must be rejected");
-        assert!(err.to_string().contains("path-safe"), "unexpected error for {org:?}: {err}");
+fn from_yaml_str_rejects_hosted_namespace_path_traversal() {
+    for namespace in ["../../etc", "C:acme", "a/b"] {
+        let yaml = format!(
+            "storage: ./s\nregistries:\n  evil:\n    type: hosted\n    namespace: {namespace}\n",
+        );
+        let err = load_with_graph(&yaml, Path::new("/x"), listen(), None)
+            .expect_err("a traversal-y hosted namespace must be rejected");
+        assert!(err.to_string().contains("path-safe"), "unexpected error for {namespace:?}: {err}");
     }
 }
 
 #[test]
-fn auth_block_resolves_htpasswd_relative_to_config_dir() {
-    let yaml = "\
-storage: ./s
-auth:
-  htpasswd:
-    file: ./htpasswd
-";
-    let config = Config::from_yaml_str(yaml, Path::new("/etc/pnpr"), listen(), None).unwrap();
-    assert_eq!(
-        config.identity.auth.htpasswd.file.as_deref(),
-        Some(Path::new("/etc/pnpr/./htpasswd")),
-    );
-    // Tokens default to the htpasswd sibling.
-    assert_eq!(config.identity.auth.tokens.file.as_deref(), Some(Path::new("/etc/pnpr/tokens.db")));
+fn auth_account_and_token_files_are_not_config_keys() {
+    for yaml in
+        ["auth:\n  users:\n    file: ./users.json\n", "auth:\n  tokens:\n    file: ./tokens.db\n"]
+    {
+        let error = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None)
+            .expect_err("accounts and tokens live in the database");
+        assert!(matches!(error, RegistryError::InvalidConfig { .. }), "{error:?}");
+    }
 }
 
 #[test]
 fn auth_block_absent_disables_registration_by_default() {
     let yaml = "storage: ./s\n";
     let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    assert!(config.identity.auth.htpasswd.file.is_none());
-    assert!(config.identity.auth.tokens.file.is_none());
     // Registration is opt-in: an omitted cap denies new sign-ups.
-    assert_eq!(config.identity.auth.htpasswd.max_users, super::super::MaxUsers::Disabled);
+    assert_eq!(config.identity.auth.users.max_users, super::super::MaxUsers::Disabled);
 }
 
 #[test]
@@ -49,28 +48,10 @@ fn auth_max_users_absent_disables_registration() {
     let yaml = "\
 storage: ./s
 auth:
-  htpasswd:
-    file: ./htpasswd
+  users:
 ";
     let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    assert_eq!(config.identity.auth.htpasswd.max_users, super::super::MaxUsers::Disabled);
-}
-
-#[test]
-fn auth_tokens_file_explicit_override_wins_over_sibling_default() {
-    let yaml = "\
-storage: ./s
-auth:
-  htpasswd:
-    file: ./htpasswd
-  tokens:
-    file: /var/lib/pnpr/tokens.sqlite
-";
-    let config = Config::from_yaml_str(yaml, Path::new("/etc/pnpr"), listen(), None).unwrap();
-    assert_eq!(
-        config.identity.auth.tokens.file.as_deref(),
-        Some(Path::new("/var/lib/pnpr/tokens.sqlite")),
-    );
+    assert_eq!(config.identity.auth.users.max_users, super::super::MaxUsers::Disabled);
 }
 
 #[test]
@@ -78,12 +59,11 @@ fn auth_max_users_negative_one_means_disabled() {
     let yaml = "\
 storage: ./s
 auth:
-  htpasswd:
-    file: ./htpasswd
+  users:
     maxUsers: -1
 ";
     let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    assert_eq!(config.identity.auth.htpasswd.max_users, super::super::MaxUsers::Disabled);
+    assert_eq!(config.identity.auth.users.max_users, super::super::MaxUsers::Disabled);
 }
 
 #[test]
@@ -91,234 +71,61 @@ fn auth_max_users_positive_is_a_hard_cap() {
     let yaml = "\
 storage: ./s
 auth:
-  htpasswd:
-    file: ./htpasswd
+  users:
     maxUsers: 5
 ";
     let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    assert_eq!(config.identity.auth.htpasswd.max_users, super::super::MaxUsers::Limited(5));
+    assert_eq!(config.identity.auth.users.max_users, super::super::MaxUsers::Limited(5));
 }
 
 #[test]
-fn registry_level_access_is_the_default_for_omitted_fields() {
-    let yaml = "\
-storage: ./s
-registries:
-  local:
-    type: hosted
-    access: team
-    packages:
-      '@team/*': {}
-      '@team/open':
-        access: $all
-";
-    let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    let rules = &config.routing.hosted["local"].rules;
-    // Omitted `access` falls back to the registry-level default...
-    assert!(
-        rules
-            .snapshot()
-            .for_package("@team/x")
-            .access
-            .allows(&user("team")),
-    );
-    assert!(
-        !rules
-            .snapshot()
-            .for_package("@team/x")
-            .access
-            .allows(&user("carol")),
-    );
-    // ...while the more specific key overrides it.
-    assert!(
-        rules
-            .snapshot()
-            .for_package("@team/open")
-            .access
-            .allows(&Identity::Anonymous),
-    );
-}
-
-#[test]
-fn rule_usernames_grant_per_user_access() {
-    // Bare names are usernames/groups, not a config error.
-    let config = hosted_rules_config(
-        "      '@team/*':\n        access: [alice, bob]\n        publish: alice\n",
-    );
-    let table = config.routing.hosted["local"].rules.snapshot();
-    let team = table.for_package("@team/x");
-    assert!(team.access.allows(&user("alice")));
-    assert!(team.access.allows(&user("bob")));
-    assert!(!team.access.allows(&user("carol")));
-    assert!(!team.access.allows(&Identity::Anonymous));
-    assert!(team.publish.allows(&user("alice")));
-    assert!(!team.publish.allows(&user("bob")));
-}
-
-#[test]
-fn teams_are_scoped_to_their_registry() {
-    // `corp` cannot reference `local`'s team: an access list resolves only
-    // against the owning registry's `teams:` map, so cross-registry reuse
-    // is a loud config error (share a roster with a YAML anchor instead).
-    let yaml = r"
-registries:
-  local:
-    type: hosted
-    teams:
-      platform: [alice]
-    packages:
-      '@team/*':
-        access: team:platform
-  corp:
-    type: hosted
-    org: corp
-    packages:
-      '@corp/*':
-        access: team:platform
-";
-    let err = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            RegistryError::InvalidConfig { reason }
-                if reason.contains(r#"registry "corp""#)
-                    && reason.contains("does not declare")
-                    && reason.contains("no `teams:`"),
-        ),
-        "unexpected error: {err}",
-    );
-}
-
-#[test]
-fn bare_token_matching_a_team_name_stays_a_username() {
-    // A bare token is a username even when a team of the same name exists;
-    // only the explicit `team:` form reaches the member set.
-    let yaml = r"
-registries:
-  local:
-    type: hosted
-    teams:
-      platform: [alice]
-    packages:
-      '@team/*':
-        access: platform
-";
-    let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    let table = config.routing.hosted["local"].rules.snapshot();
-    let access = table.for_package("@team/x").access;
-    assert!(access.allows(&Identity::user("platform")));
-    assert!(!access.allows(&Identity::user("alice")));
-}
-
-#[test]
-fn undeclared_team_reference_names_the_declared_teams() {
-    let yaml = r"
-registries:
-  local:
-    type: hosted
-    teams:
-      platform: [alice]
-      release: [carol]
-    packages:
-      '@team/*':
-        access: team:platfrm
-";
-    let err = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            RegistryError::InvalidConfig { reason }
-                if reason.contains("team:platfrm")
-                    && reason.contains(r#""platform", "release""#),
-        ),
-        "unexpected error: {err}",
-    );
-}
-
-#[test]
-fn rule_scalar_access_value_is_one_token() {
-    let config = hosted_rules_config("      '@team/*':\n        access: alice\n");
-    let table = config.routing.hosted["local"].rules.snapshot();
-    let access = table.for_package("@team/x").access;
-    assert!(access.allows(&user("alice")));
-    assert!(!access.allows(&user("bob")));
-}
-
-#[test]
-fn rule_space_separated_access_list_is_a_config_error() {
-    // Verdaccio's space-separated form must not be silently misread as a
-    // single token that admits nobody; the error points at the YAML
-    // sequence spelling.
-    for packages in [
-        "      '@team/*':\n        access: alice bob\n",
-        "      '@team/*':\n        access: [alice bob]\n",
-    ] {
-        let err = hosted_rules_err(packages);
-        assert!(
-            matches!(
-                &err,
-                RegistryError::InvalidConfig { reason }
-                    if reason.contains(r#""alice bob""#) && reason.contains("[alice, bob]"),
-            ),
-            "unexpected error for {packages:?}: {err}",
-        );
+fn auth_token_lifetimes_are_intervals() {
+    use std::time::Duration;
+    let config_with = |key: &str, lifetime: &str| {
+        let yaml = format!("storage: ./s\nauth:\n  tokens:\n    {key}: {lifetime}\n");
+        Config::from_yaml_str(&yaml, Path::new("/x"), listen(), None)
+    };
+    let tokens = config_with("maxLifetime", "90d").unwrap().identity.auth.tokens;
+    assert_eq!(tokens.max_lifetime, Some(Duration::from_hours(90 * 24)));
+    let tokens = config_with("maxLifetime", "1m").unwrap().identity.auth.tokens;
+    assert_eq!(tokens.max_lifetime, Some(Duration::from_mins(1)));
+    let tokens = config_with("defaultLifetime", "1w").unwrap().identity.auth.tokens;
+    assert_eq!(tokens.default_lifetime, Duration::from_hours(7 * 24));
+    for key in ["defaultLifetime", "maxLifetime"] {
+        for invalid in ["0", "0d", "0.0004s", "59s", "soon"] {
+            let error = config_with(key, invalid)
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("auth.tokens.{key}")),
+                "{invalid}: {error}",
+            );
+        }
     }
+    let config = Config::from_yaml_str("storage: ./s\n", Path::new("/x"), listen(), None).unwrap();
+    assert_eq!(config.identity.auth.tokens.default_lifetime, Duration::from_hours(90 * 24));
+    assert_eq!(config.identity.auth.tokens.max_lifetime, None);
 }
 
 #[test]
-fn registry_level_access_list_is_validated_too() {
-    let yaml = "\
-storage: ./s
-registries:
-  local:
-    type: hosted
-    access: all
-";
-    let err = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            RegistryError::InvalidConfig { reason }
-                if reason.contains(r#"registry "local""#) && reason.contains("$all"),
-        ),
-        "unexpected error: {err}",
-    );
-}
-
-#[test]
-fn team_declarations_are_validated() {
-    // A team member list is one username per entry — never a
-    // space-separated string.
-    let split_members = "    teams:\n      platform: alice bob\n";
-    // A team name is spliced into `team:<name>` tokens, so a name the
-    // grammar cannot express is rejected at declaration.
-    let sigil_name = "    teams:\n      $all: [alice]\n";
-    let colon_name = "    teams:\n      'a:b': [alice]\n";
-    // A member is a plain username: a built-in group — in any spelling —
-    // would silently become a user nobody is named after, and a `team:`
-    // reference would be an unsupported nested team.
-    let builtin_member = "    teams:\n      platform: [$all]\n";
-    let alias_member = "    teams:\n      platform: [authenticated]\n";
-    let at_alias_member = "    teams:\n      platform: ['@all']\n";
-    let nested_team_member = "    teams:\n      platform: ['team:release']\n";
-    for (teams, needle) in [
-        (split_members, r#""alice bob""#),
-        (sigil_name, "cannot contain `:` or start with `$`"),
-        (colon_name, "cannot contain `:` or start with `$`"),
-        (builtin_member, "built-in groups belong in the access lists"),
-        (alias_member, "built-in groups belong in the access lists"),
-        (at_alias_member, "built-in groups belong in the access lists"),
-        (nested_team_member, "cannot include another team"),
+fn team_and_member_names_are_validated() {
+    for name in ["$all", "a:b", "two words", ""] {
+        assert!(crate::validate_team_name(name).is_err(), "accepted the team name {name:?}");
+    }
+    crate::validate_team_name("platform").unwrap();
+    // A member is one account: a built-in group in any spelling would be an
+    // account nobody has, and a `team:` reference a nested team.
+    for (member, needle) in [
+        ("alice bob", r#""alice bob""#),
+        ("$all", "built-in groups belong in the access lists"),
+        ("authenticated", "built-in groups belong in the access lists"),
+        ("@all", "built-in groups belong in the access lists"),
+        ("team:release", "cannot include another team"),
     ] {
-        let yaml = format!("storage: ./s\nregistries:\n  local:\n    type: hosted\n{teams}");
-        let err = Config::from_yaml_str(&yaml, Path::new("/x"), listen(), None).unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                RegistryError::InvalidConfig { reason } if reason.contains(needle),
-            ),
-            "unexpected error for {yaml:?}: {err}",
-        );
+        let reason = crate::validate_member_name(member).unwrap_err();
+        assert!(reason.contains(needle), "unexpected error for {member:?}: {reason}");
     }
 }
 
@@ -349,128 +156,75 @@ auth:
       login:
         users:
           - subject: sub-123
-            username: oidc_bob
+            userId: oidc_bob
       workloads:
         - identity:
             subject: repo:pnpm/pnpm
-            username: workload_carol
+            userId: workload_carol
           registry: local
           packages: ['@pnpm/*']
 registries:
   local:
     type: hosted
 ";
-    let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
-    assert!(config.identity.is_reserved_name("admin_alice"));
-    assert!(config.identity.is_reserved_name("oidc_bob"));
-    assert!(config.identity.is_reserved_name("workload_carol"));
-    assert!(!config.identity.is_reserved_name("dan"));
+    let config = load_with_graph(yaml, Path::new("/x"), listen(), None).unwrap();
+    assert!(config.identity.is_admin(&pnpr_policy::Identity::account(
+        "admin_alice",
+        "renamed-admin"
+    )));
+    assert!(!config.identity.is_admin(&pnpr_policy::Identity::account(
+        "different-id",
+        "admin_alice"
+    )));
 }
 
 #[test]
-fn teams_managed_by_is_hosted_only() {
-    let hosted = "storage: ./s\nregistries:\n  local:\n    type: hosted\n    teamsManagedBy: api\n";
-    let config = Config::from_yaml_str(hosted, Path::new("/x"), listen(), None).unwrap();
-    assert_eq!(config.routing.hosted["local"].teams_managed_by, super::super::Management::Api);
-
-    let upstream = "storage: ./s\nregistries:\n  up:\n    type: upstream\n    \
-                    url: https://registry.npmjs.org/\n    public: true\n    teamsManagedBy: api\n";
-    Config::from_yaml_str(upstream, Path::new("/x"), listen(), None)
-        .expect_err("an upstream has no roster to manage");
-
-    for eco in ["cargo", "pypi", "oci"] {
-        let yaml = format!(
-            "storage: ./s\nregistries:\n  local:\n    type: hosted\n    ecosystem: {eco}\n    teamsManagedBy: api\n",
-        );
-        let err = Config::from_yaml_str(&yaml, Path::new("/x"), listen(), None)
-            .expect_err("teamsManagedBy: api is only valid for npm");
+fn removed_managed_by_keys_are_unknown_fields() {
+    for key in ["teamsManagedBy", "rulesManagedBy"] {
+        let yaml =
+            format!("storage: ./s\nregistries:\n  local:\n    type: hosted\n    {key}: api\n");
+        let err = load_with_graph(&yaml, Path::new("/x"), listen(), None)
+            .expect_err("the overlay switches were removed");
         match err {
             RegistryError::InvalidConfig { reason } => {
-                assert!(
-                    reason.contains("only available for npm registries"),
-                    "unexpected error for {eco}: {reason}",
-                );
+                assert!(reason.contains("unknown field"), "unexpected error for {key}: {reason}");
+                assert!(reason.contains(key), "unexpected error for {key}: {reason}");
             }
-            other => panic!("expected InvalidConfig for {eco}, got {other:?}"),
+            other => panic!("expected InvalidConfig for {key}, got {other:?}"),
         }
     }
 }
 
 #[test]
-fn unpublish_rule_rejected_on_cargo_and_pypi_but_accepted_on_oci() {
-    for eco in ["cargo", "pypi"] {
-        let yaml = format!(
-            "storage: ./s\nregistries:\n  local:\n    type: hosted\n    ecosystem: {eco}\n    packages:\n      pkg:\n        unpublish: $authenticated\n",
-        );
-        let err = Config::from_yaml_str(&yaml, Path::new("/x"), listen(), None)
-            .expect_err("unpublish is not supported on cargo/pypi");
-        match err {
-            RegistryError::InvalidConfig { reason } => {
-                assert!(
-                    reason.contains("does not support unpublishing"),
-                    "unexpected error for {eco}: {reason}",
-                );
-            }
-            other => panic!("expected InvalidConfig for {eco}, got {other:?}"),
-        }
+fn access_tokens_follow_one_grammar() {
+    for token in ["$all", "$authenticated", "$anonymous", "$owners", "alice", "team:platform"] {
+        crate::validate_access_token(token).unwrap();
     }
-
-    let oci_yaml = "storage: ./s\nregistries:\n  images:\n    type: hosted\n    ecosystem: oci\n    packages:\n      image:\n        unpublish: $authenticated\n";
-    let oci_config = Config::from_yaml_str(oci_yaml, Path::new("/x"), listen(), None).unwrap();
-    assert!(oci_config.routing.hosted.contains_key("images"));
+    for (token, needle) in [
+        ("$everyone", "unknown built-in access token"),
+        ("all", r#"did you mean "$all""#),
+        ("@authenticated", r#"did you mean "$authenticated""#),
+        ("group:platform", r#"did you mean "team:platform""#),
+        ("org:corp", "the only typed token is `team:<id>`"),
+        ("team:", "names no team"),
+        ("team:a:b", "a team name cannot contain `:`"),
+        ("alice bob", "contains whitespace"),
+        ("", "an empty string is not a token"),
+    ] {
+        let reason = crate::validate_access_token(token).unwrap_err();
+        assert!(reason.contains(needle), "unexpected error for {token:?}: {reason}");
+    }
 }
 
 #[test]
-fn owners_token_rejected_in_read_access_and_accepted_in_publish() {
-    let bad_package_access = "\
-storage: ./s
-registries:
-  local:
-    type: hosted
-    packages:
-      '**':
-        access: $owners
-        publish: $authenticated
-";
-    let err = Config::from_yaml_str(bad_package_access, Path::new("/x"), listen(), None)
-        .expect_err("$owners cannot be used for read access");
-    assert!(err.to_string().contains("$owners"), "{err}");
-
-    let bad_registry_access = "\
-storage: ./s
-registries:
-  local:
-    type: hosted
-    access: $owners
-";
-    let err = Config::from_yaml_str(bad_registry_access, Path::new("/x"), listen(), None)
-        .expect_err("$owners cannot be used for registry access");
-    assert!(err.to_string().contains("$owners"), "{err}");
-
-    let good_publish_unpublish = "\
-storage: ./s
-registries:
-  local:
-    type: hosted
-    packages:
-      '**':
-        access: $all
-        publish: $owners
-        unpublish: $owners
-";
-    let config =
-        Config::from_yaml_str(good_publish_unpublish, Path::new("/x"), listen(), None).unwrap();
-    let snapshot = config.routing.hosted["local"].rules.snapshot();
-    assert!(
-        snapshot.rules()[0].publish
-            .as_ref()
-            .unwrap()
-            .references_owners(),
-    );
-    assert!(
-        snapshot.rules()[0].unpublish
-            .as_ref()
-            .unwrap()
-            .references_owners(),
-    );
+fn a_registry_declares_no_access_lists() {
+    for registry in [
+        "type: hosted\n    access: $all",
+        "type: hosted\n    packages:\n      '@acme/*': { publish: $authenticated }",
+        "type: upstream\n    url: https://registry.example/\n    access: $authenticated",
+    ] {
+        let yaml = format!("registries:\n  example:\n    {registry}\n");
+        let error = load_with_graph(&yaml, Path::new("/x"), listen(), None).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{registry:?}: {error}");
+    }
 }

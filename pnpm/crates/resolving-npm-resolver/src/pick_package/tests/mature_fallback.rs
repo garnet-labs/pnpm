@@ -1,8 +1,15 @@
 use super::{
-    PACKAGE_BODY, VersionSelectorEntry, VersionSelectorType, VersionSelectors, parse_cutoff,
+    PACKAGE_BODY,
+    VersionSelectorEntry,
+    VersionSelectorType,
+    VersionSelectors,
+    parse_cutoff,
     range_spec,
 };
-use crate::pick_package::version_pick::{PickerOpts, pick_matching_version_fast};
+use crate::pick_package::version_pick::{
+    PickerOpts,
+    pick_matching_version_fast,
+};
 
 #[test]
 fn fallback_preserves_the_first_pick_and_preferred_versions() {
@@ -32,6 +39,7 @@ fn fallback_preserves_the_first_pick_and_preferred_versions() {
             published_by_exclude: None,
             pick_lowest_version: false,
             include_latest_tag: false,
+            current_version: None,
             ignore_missing_time_field: false,
         };
         let picked = pick_matching_version_fast(&opts, &range_spec("acme", "^1.0.0"), &meta)

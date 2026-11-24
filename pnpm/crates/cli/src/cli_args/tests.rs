@@ -1,35 +1,54 @@
 use super::{
     CliArgs,
     add::AddArgs,
-    cli_command::{CliCommand, options::WorkspaceRootError},
-    config::{ConfigLocation, ConfigSubcommand},
+    cli_command::{
+        CliCommand,
+        options::WorkspaceRootError,
+    },
+    config::{
+        ConfigLocation,
+        ConfigSubcommand,
+    },
     dedupe::DedupeArgs,
-    install::{InstallArgs, resolve_bool_override},
+    install::{
+        InstallArgs,
+        resolve_bool_override,
+    },
     list::RecursionLimit,
     package_manager::{
-        current_source_pnpm_version, package_manager_to_sync_for_version, parse_package_manager,
+        package_manager_to_sync_for_version,
+        parse_package_manager,
         read_manifest_json,
     },
     parse_depth_limit,
     remove::RemoveArgs,
-    reporter::{LogLevelSetting, ReporterType},
+    reporter::{
+        LogLevelSetting,
+        ReporterType,
+    },
     store::StoreCommand,
-    tasks::{TasksArgs, TasksCommand},
+    tasks::{
+        TasksArgs,
+        TasksCommand,
+    },
     unlink::UnlinkArgs,
     version::VersionArgs,
 };
 use clap::Parser;
-use pnpm_config::{ColorMode, PNPM_VERSION, PmOnFail};
+use pnpm_config::{
+    ColorMode,
+    PNPM_VERSION,
+    PmOnFail,
+};
 use pnpm_default_reporter::SummaryScope;
 use std::path::Path;
 use tempfile::TempDir;
 
 fn package_manager_to_sync(
     manifest: &serde_json::Value,
-    root_dir: &Path,
     on_fail: Option<PmOnFail>,
 ) -> Option<super::package_manager::PackageManagerToSync> {
-    package_manager_to_sync_for_version(manifest, root_dir, on_fail, PNPM_VERSION)
+    package_manager_to_sync_for_version(manifest, on_fail, PNPM_VERSION)
 }
 
 fn install_args(argv: &[&str]) -> InstallArgs {
@@ -129,6 +148,57 @@ fn store_dir_accepts_an_explicit_empty_value() {
     let parsed = CliArgs::try_parse_from(["pacquet", "store", "path", "--store-dir="])
         .expect("parses empty global --store-dir");
     assert_eq!(parsed.paths.store_dir.as_deref(), Some(Path::new("")));
+}
+
+#[test]
+fn state_dir_accepts_an_explicit_empty_value_and_resets_from_config_override() {
+    let parsed = CliArgs::try_parse_from(["pacquet", "config", "get", "state-dir", "--state-dir="])
+        .expect("parses empty global --state-dir");
+    assert_eq!(parsed.paths.state_dir.as_deref(), Some(Path::new("")));
+
+    let raw = ["pacquet", "--config.stateDir=", "config", "get", "state-dir"];
+    let argv = raw.map(std::ffi::OsString::from);
+    let (_overrides, remaining) = crate::config_overrides::ConfigOverrides::extract(argv);
+    let parsed = CliArgs::try_parse_from(&remaining).expect("parses override");
+    let state_dir = parsed.paths.state_dir;
+    let state_dir = state_dir.expect("state_dir present");
+    assert_eq!(state_dir.as_path(), Path::new(""));
+
+    let mut config = pnpm_config::Config {
+        state_dir: std::path::PathBuf::from("custom-state"),
+        ..pnpm_config::Config::default()
+    };
+    crate::config_overrides::apply_state_dir_override::<pnpm_config::Host>(
+        &mut config,
+        &state_dir,
+        Path::new("/workspace"),
+    );
+    assert_eq!(
+        config.state_dir,
+        pnpm_config::default_state_dir::<pnpm_config::Host>().unwrap_or_default(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn state_dir_accepts_non_utf8_os_paths() {
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::OsStringExt as _,
+    };
+
+    let non_utf8 = OsString::from_vec(b"custom-\xff-state".to_vec());
+    let raw = [
+        OsString::from("pacquet"),
+        OsString::from("--state-dir"),
+        non_utf8.clone(),
+        OsString::from("config"),
+        OsString::from("get"),
+        OsString::from("state-dir"),
+    ];
+    let parsed = CliArgs::try_parse_from(raw).expect("parses non-UTF-8 state-dir");
+    let state_dir = parsed.paths.state_dir;
+    assert_eq!(state_dir.as_deref(), Some(Path::new(&non_utf8)));
 }
 
 #[test]
@@ -279,18 +349,12 @@ fn package_manager_to_sync_preserves_dev_engine_specifier() {
     .expect("write manifest");
 
     let manifest = read_manifest_json(&manifest_path).expect("read manifest").expect("manifest");
-    let package_manager =
-        package_manager_to_sync(&manifest, root.path(), None).expect("sync package manager");
+    let package_manager = package_manager_to_sync(&manifest, None).expect("sync package manager");
 
     assert_eq!(package_manager.specifier, ">=0.0.0");
-    assert_eq!(
-        package_manager.version,
-        current_source_pnpm_version().expect("source pnpm version"),
-    );
+    assert_eq!(package_manager.version, pnpm_config::PNPM_VERSION);
 }
 
-/// The range is built from `PNPM_VERSION` so the source checkout's version
-/// (a different major) can never satisfy it and answer first.
 #[test]
 fn package_manager_to_sync_records_the_running_version_for_a_satisfied_range_pin() {
     let root = TempDir::new().expect("tmp dir");
@@ -305,8 +369,7 @@ fn package_manager_to_sync_records_the_running_version_for_a_satisfied_range_pin
     .expect("write manifest");
 
     let manifest = read_manifest_json(&manifest_path).expect("read manifest").expect("manifest");
-    let package_manager =
-        package_manager_to_sync(&manifest, root.path(), None).expect("sync package manager");
+    let package_manager = package_manager_to_sync(&manifest, None).expect("sync package manager");
 
     assert_eq!(package_manager.specifier, range);
     assert_eq!(package_manager.version, pnpm_config::PNPM_VERSION);
@@ -323,13 +386,13 @@ fn package_manager_to_sync_records_nothing_for_a_pin_nothing_satisfies() {
     .expect("write manifest");
 
     let manifest = read_manifest_json(&manifest_path).expect("read manifest").expect("manifest");
-    assert_eq!(package_manager_to_sync(&manifest, root.path(), None), None);
+    assert_eq!(package_manager_to_sync(&manifest, None), None);
 }
 
 #[test]
 fn resolve_bool_override_tri_state() {
     // force_on wins, force_off wins over a config `true`, and an unset
-    // pair falls through to config — in both config polarities.
+    // pair falls through to config, in both config polarities.
     assert!(resolve_bool_override(true, false, false), "force_on over config false");
     assert!(resolve_bool_override(true, false, true), "force_on over config true");
     assert!(!resolve_bool_override(false, true, true), "force_off over config true");
@@ -422,7 +485,7 @@ fn config_merged_boolean_negations_parse() {
     ]);
     assert!(args.network_cache.no_offline);
     assert!(args.network_cache.no_prefer_offline);
-    assert!(args.materialization.no_frozen_store);
+    assert!(args.materialization.store.no_frozen_store);
     assert!(args.scripts.no_ignore);
 }
 
@@ -681,7 +744,6 @@ fn the_unimplemented_npm_commands_parse_instead_of_falling_through_to_a_script()
         command(&["pacquet", "token", "create", "--read-only"]),
         CliCommand::Token(_),
     ));
-    assert!(matches!(command(&["pacquet", "xmas"]), CliCommand::Xmas(_)));
 }
 
 #[test]
@@ -783,7 +845,7 @@ fn force_help_says_platform_mismatched_optionals_stay_skipped() {
 }
 
 /// `--production` is the setting name behind `--prod`, and pnpm accepts
-/// it wherever `--prod` selects dependency groups — in a command line
+/// it wherever `--prod` selects dependency groups, in a command line
 /// typed by hand as much as in the install the verify-deps-before-run
 /// gate reproduces
 /// ([pnpm/pnpm#14147](https://github.com/pnpm/pnpm/issues/14147)).

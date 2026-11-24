@@ -1,23 +1,55 @@
 use super::{
-    PatchCandidate, PatchTarget, WritePackageForPatch, WritePackageForPatchError,
-    compare_candidates, default_patch_target, patch_candidates_from_lockfile, resolution_kind,
+    PatchCandidate,
+    PatchTarget,
+    WritePackageForPatch,
+    WritePackageForPatchError,
+    compare_candidates,
+    default_patch_target,
+    patch_candidates_from_lockfile,
+    resolution_kind,
 };
 use pnpm_lockfile::{
-    BinaryArchive, BinaryResolution, BinarySpec, ComVer, GitResolution, Lockfile,
-    LockfileResolution, LockfileVersion, PackageKey, PackageMetadata, RegistryResolution,
-    TarballResolution, VariationsResolution,
+    BinaryArchive,
+    BinaryResolution,
+    BinarySpec,
+    ComVer,
+    GitResolution,
+    Lockfile,
+    LockfileResolution,
+    LockfileVersion,
+    PackageKey,
+    PackageMetadata,
+    RegistryResolution,
+    TarballResolution,
+    VariationsResolution,
 };
-use pnpm_network::{RetryOpts, ThrottledClient};
+use pnpm_network::{
+    RetryOpts,
+    ThrottledClient,
+};
 use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, NpmResolver, shared_packument_fetch_locker,
+    InMemoryPackageMetaCache,
+    NpmResolver,
+    shared_packument_fetch_locker,
     shared_picked_manifest_cache,
 };
-use pnpm_resolving_resolver_base::{ResolveOptions, Resolver, WantedDependency};
-use pnpm_store_dir::{StoreDir, StoreIndex, store_index_key};
+use pnpm_resolving_resolver_base::{
+    ResolveOptions,
+    Resolver,
+    WantedDependency,
+};
+use pnpm_store_dir::{
+    StoreDir,
+    StoreIndex,
+    store_index_key,
+};
 use pnpm_testing_utils::registry::TestRegistry;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+};
 
 const GIT_HOSTED_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -88,6 +120,16 @@ fn patch_candidate_exact_version_selects_matching_installed_version() {
     assert_eq!(target.version, "1.0.0");
     assert_eq!(target.bare_specifier, "1.0.0");
     assert!(!target.apply_to_all);
+}
+
+#[test]
+fn patch_candidate_named_registry_key_matches_its_bare_version() {
+    let lockfile = lockfile_with_packages(&["is-positive@work:1.0.0"]);
+
+    let target = patch_target("is-positive@1.0.0", &lockfile);
+
+    assert_eq!(target.version, "1.0.0");
+    assert_eq!(target.package_key.to_string(), "is-positive@work:1.0.0");
 }
 
 #[test]
@@ -269,6 +311,7 @@ async fn patch_extract_records_download_in_store_index() {
     let lockfile = lockfile_with_package_metadata(
         &package_id,
         PackageMetadata {
+            specifiers: None,
             resolution: resolved.resolution,
             version: None,
             engines: None,
@@ -506,10 +549,7 @@ fn resolution_kind_names_non_patchable_resolution_shapes() {
     });
     assert_eq!(resolution_kind(&binary), "binary");
 
-    let variations = LockfileResolution::Variations(VariationsResolution {
-        variants: Vec::new(),
-        revision: None,
-    });
+    let variations = LockfileResolution::Variations(VariationsResolution { variants: Vec::new() });
     assert_eq!(resolution_kind(&variations), "variations");
 }
 
@@ -541,8 +581,14 @@ impl PatchExtractFixture {
         use_git_hosted_url: bool,
         git_hosted_flag: bool,
     ) -> Self {
-        use pnpm_tarball::{CacheValue, CachedTarball};
-        use std::{collections::HashMap, sync::Arc};
+        use pnpm_tarball::{
+            CacheValue,
+            CachedTarball,
+        };
+        use std::{
+            collections::HashMap,
+            sync::Arc,
+        };
 
         let tmp = tempfile::tempdir().expect("temp dir");
         let store_dir = tmp.path().join("store");

@@ -1,32 +1,105 @@
 pub mod presets;
-pub use metadata::{
-    deprecate_version, read_hosted_document, read_packument, remove_version, set_dist_tag,
-    write_hosted_document, write_packuments, write_packuments_into,
+pub use database::{
+    deprecate_version,
+    read_hosted_document,
+    read_hosted_file,
+    read_packument,
+    remove_version,
+    set_dist_tag,
+    tarball_path,
+    write_hosted_document,
+    write_hosted_file,
+    write_packuments,
+    write_packuments_into,
 };
 pub use presets::{
-    MockConfigPresets, REGISTRY_MOCK_LOCAL_PATTERNS, TAR_REGISTRY, proxy_config,
-    registry_mock_graph, registry_mock_rules, static_serve_config, with_tar_registry,
+    MockConfigPresets,
+    REGISTRY_MOCK_LOCAL_PATTERNS,
+    REGISTRY_MOCK_UPSTREAM_TIMEOUT,
+    TAR_REGISTRY,
+    proxy_config,
+    registry_mock_graph,
+    registry_mock_rules,
+    static_serve_config,
+    with_tar_registry,
+};
+pub use registries::{
+    MOCK_GRANTS_YAML,
+    MOCK_REGISTRIES_YAML,
+    load_seeded_config,
+    registries_routing,
+    registry_mock_routing,
+    seed_registries,
+    split_graph,
+    store_document,
+    write_document,
+    write_graph,
 };
 
-mod metadata;
+mod database;
+mod registries;
+mod rules;
 mod tarball;
-use tarball::{build_tarball, fixture_files};
+use tarball::{
+    build_tarball,
+    fixture_files,
+};
 
-use base64::{Engine, engine::general_purpose};
-use flate2::{Compression, write::GzEncoder};
-use node_semver::{Range, Version};
+use base64::{
+    Engine,
+    engine::general_purpose,
+};
+use flate2::{
+    Compression,
+    write::GzEncoder,
+};
+use node_semver::{
+    Range,
+    Version,
+};
 use pnpr_registry::Ecosystem;
-use pnpr_storage::layout::{local_blob_path, write_local_layout_marker};
-use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256, Sha512};
+use pnpr_storage::{
+    BlobId,
+    database::{
+        ArtifactBlob,
+        BlobRef,
+    },
+    layout::{
+        local_archive_path,
+        write_local_layout_marker,
+    },
+};
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
+use sha2::{
+    Digest,
+    Sha256,
+    Sha512,
+};
 use std::{
-    collections::{BTreeMap, HashMap},
-    env, fs,
-    io::{self, Write},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    env,
+    fs,
+    io::{
+        self,
+        Write,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         LazyLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
     },
 };
 use walkdir::WalkDir;
@@ -58,11 +131,11 @@ pub fn ensure_storage() -> &'static Path {
     STORAGE.as_path()
 }
 
-/// The metadata database of the fixture storage at `storage`, the one pnpr
+/// The database of the fixture storage at `storage`, the one pnpr
 /// reads by default.
 #[must_use]
-pub fn metadata_path(storage: &Path) -> PathBuf {
-    pnpr_config::default_metadata_path(storage)
+pub fn database_path(storage: &Path) -> PathBuf {
+    pnpr_config::default_database_path(storage)
 }
 
 #[must_use]
@@ -72,7 +145,7 @@ pub fn packages_dir() -> PathBuf {
 
 /// Build registry storage from the raw package fixtures in `packages` into
 /// `out`, replacing any existing contents: the tarballs as hosted blobs and
-/// the packuments in the `SQLite` metadata database pnpr reads by default.
+/// the packuments in the `SQLite` database pnpr reads by default.
 /// Used by the `pnpr-prepare` binary so the JS test harness can serve the
 /// moved fixtures; pacquet's own tests use [`ensure_storage`]
 /// (process-global, cached) instead.
@@ -116,13 +189,6 @@ pub fn build_storage_at_with_edits(
     build_storage(packages, out, substitutions, removed_fields);
 }
 
-/// Where a built storage tree holds the tarball of `package@version`.
-#[must_use]
-pub fn tarball_path(storage: &Path, package: &str, version: &str) -> PathBuf {
-    let file = format!("{}-{version}.tgz", tarball_basename(package));
-    local_blob_path(storage, "", Ecosystem::Npm, package, &file)
-}
-
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -132,7 +198,9 @@ fn workspace_root() -> PathBuf {
 }
 
 fn target_dir(workspace: &Path) -> PathBuf {
-    env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace.join("target"), PathBuf::from)
+    env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target"))
 }
 
 fn ensure_storage_for_fingerprint(packages: &Path, generated: &Path, storage: &Path) {
@@ -151,7 +219,7 @@ fn ensure_storage_for_fingerprint(packages: &Path, generated: &Path, storage: &P
 /// Move a freshly built `temp` tree into place at `storage`.
 ///
 /// Publishers race: the loser's rename fails because the winner's tree is
-/// already there, which is harmless — the completion marker proves the
+/// already there, which is harmless, the completion marker proves the
 /// content arrived. A tree *without* the marker is a different matter. It
 /// is a half-finished publish, or a build cache restored without the
 /// marker, and no reader may touch it; left alone it wedges every later
@@ -191,8 +259,8 @@ fn discard_unusable_storage(generated: &Path, storage: &Path) {
 /// Put a claimed tree back after it turned out to be complete.
 ///
 /// The claim leaves `storage` free, so a publisher can land its own tree
-/// there before the restore runs. Its content is the same — the path is
-/// addressed by a fingerprint of the fixtures — so a claim that can no
+/// there before the restore runs. Its content is the same (the path is
+/// addressed by a fingerprint of the fixtures) so a claim that can no
 /// longer go back is redundant rather than lost, and gets dropped.
 fn restore_claimed_storage(claimed: &Path, storage: &Path) {
     if fs::rename(claimed, storage).is_err() {
@@ -220,8 +288,8 @@ fn try_publish_storage(temp: &Path, storage: &Path) -> io::Result<()> {
     }
 }
 
-/// A scratch directory name no other publisher — in this process or any
-/// concurrent one — can collide with.
+/// A scratch directory name no other publisher (in this process or any
+/// concurrent one) can collide with.
 fn scratch_name(prefix: &str) -> String {
     format!("{prefix}.{}.{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
@@ -231,10 +299,15 @@ fn fixture_fingerprint(root: &Path) -> String {
     // A storage tree built in another layout, or with metadata in another
     // schema, must not be reused.
     hasher.update(pnpr_storage::layout::LAYOUT_VERSION.to_le_bytes());
-    hasher.update(pnpr_storage::metadata::SqlMetadata::SCHEMA_VERSION.as_bytes());
-    hasher.update([0]);
+    hasher.update(MOCK_REGISTRIES_YAML.as_bytes());
+    hasher.update(MOCK_GRANTS_YAML.as_bytes());
+    hasher.update(pnpr_storage::database::SqlDatabase::SCHEMA_VERSION.to_le_bytes());
+    for statements in pnpr_storage::database::SqlDatabase::SCHEMA_STATEMENTS {
+        hasher.update(statements.as_bytes());
+        hasher.update([0]);
+    }
     hasher.update(
-        local_blob_path(Path::new(""), "", Ecosystem::Npm, "@scope/name", "name-1.0.0.tgz")
+        local_archive_path(PathBuf::new(), "", Ecosystem::Npm, "sha512-00.1")
             .to_string_lossy()
             .as_bytes(),
     );
@@ -266,17 +339,30 @@ fn build_storage(
     }
     assert!(!packages.is_empty(), "no registry package fixtures found under {fixtures_root:?}");
     let mut packuments = Vec::with_capacity(packages.len());
+    let mut archives = Vec::new();
     for package in packages.values_mut() {
         package.latest =
             latest_version(package.versions.keys()).expect("package has at least one version");
-        package.write_blobs(storage_root);
+        archives.extend(package.write_blobs(storage_root));
         packuments.push((package.name.clone(), package.packument()));
     }
     for removed in removed_fields {
         remove_version_field(&mut packuments, removed);
     }
     write_local_layout_marker(storage_root).expect("write registry fixture layout marker");
-    write_packuments(storage_root, packuments);
+    database::write_packuments_with_archives(storage_root, packuments, archives);
+    seed_storage_registries(storage_root, MOCK_REGISTRIES_YAML);
+    database::run(rules::replace(&database::open(storage_root), MOCK_GRANTS_YAML));
+}
+
+/// Store the registries document `yaml` in the database of the
+/// fixture storage at `storage`.
+///
+/// # Panics
+///
+/// The document does not parse or cannot be stored.
+pub fn seed_storage_registries(storage: &Path, yaml: &str) {
+    registries::store_into(&database::open(storage), &registries::parse_document(yaml));
 }
 
 fn remove_version_field(packuments: &mut [(String, Value)], removed: &RemovedVersionField<'_>) {
@@ -305,23 +391,31 @@ impl Package {
         Self { name, latest: String::new(), versions: BTreeMap::new() }
     }
 
-    fn write_blobs(&self, storage_root: &Path) {
-        let blobs = local_blob_path(storage_root, "", Ecosystem::Npm, &self.name, "-");
-        fs::create_dir_all(blobs.parent().expect("blob has a directory"))
-            .expect("create test registry package storage dir");
+    /// Store every version's tarball as the first incarnation of its bytes,
+    /// and return the mapping of each to them, which the metadata commits.
+    fn write_blobs(&self, storage_root: &Path) -> Vec<ArtifactBlob> {
+        let mut archives = Vec::with_capacity(self.versions.len());
+        let name = pnpr_package_name::CanonicalPackageName::parse(&self.name, Ecosystem::Npm)
+            .unwrap_or_else(|error| panic!("package name {:?}: {error}", self.name));
         for version in self.versions.values() {
-            fs::write(
-                local_blob_path(
-                    storage_root,
-                    "",
-                    Ecosystem::Npm,
-                    &self.name,
-                    &version.tarball_name,
-                ),
-                &version.tarball,
-            )
-            .expect("write fixture tarball to test registry storage");
+            let blob =
+                BlobRef { id: BlobId::of_bytes(Ecosystem::Npm, &version.tarball), incarnation: 1 };
+            let path =
+                local_archive_path(storage_root.to_path_buf(), "", Ecosystem::Npm, &blob.key());
+            fs::create_dir_all(path.parent().expect("an archive has a directory"))
+                .expect("create test registry archive dir");
+            fs::write(&path, &version.tarball)
+                .expect("write fixture tarball to test registry storage");
+            archives.push(ArtifactBlob {
+                ecosystem: Ecosystem::Npm,
+                name: name.as_str().to_string(),
+                version: version.version.clone(),
+                artifact: version.tarball_name.clone(),
+                blob,
+                size: version.tarball.len() as u64,
+            });
         }
+        archives
     }
 
     fn packument(&self) -> Value {
@@ -446,7 +540,8 @@ fn with_dist(mut packument_manifest: Value, tarball_url: &str, integrity: &str) 
 fn is_version_dir(dir: Option<&Path>) -> bool {
     dir.and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .is_some_and(|name| Version::parse(name).is_ok())
+        .map(Version::parse)
+        .is_some_and(|parsed| parsed.is_ok())
 }
 
 fn tarball_basename(name: &str) -> String {

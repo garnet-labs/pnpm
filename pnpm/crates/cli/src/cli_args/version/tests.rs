@@ -1,4 +1,8 @@
-use super::{Bump, inc, parse_bump};
+use super::{
+    Bump,
+    inc,
+    parse_bump,
+};
 use crate::cli_args::version::bump::ReleaseType;
 use node_semver::Version;
 
@@ -33,7 +37,7 @@ fn inc_matches_node_semver() {
         ("1.0.0+build.5", ReleaseType::Patch, None, "1.0.1"),
     ];
     for (current, release, preid, expected) in cases {
-        let bumped = inc(&version(current), *release, *preid).to_string();
+        let bumped = inc(&version(current), *release, *preid).unwrap().to_string();
         assert_eq!(&bumped, expected, "inc({current}, {release:?}, {preid:?})");
     }
 }
@@ -63,4 +67,18 @@ fn parse_bump_strips_a_leading_v() {
         panic!("v1.2.3 should parse as an explicit version");
     };
     assert_eq!(explicit.to_string(), "1.2.3");
+}
+
+#[test]
+fn parse_bump_accepts_build_metadata_with_a_leading_zero() {
+    assert!(matches!(parse_bump("1.2.3+01"), Ok(Bump::Explicit(_))));
+}
+
+/// `semver.valid` is strict: loose input that `Version::parse` would
+/// normalize into another version is not a version argument.
+#[test]
+fn parse_bump_rejects_loose_versions() {
+    for raw in ["1.2.3foo", "01.2.3", "V1.2.3", "1.2.3-01"] {
+        assert!(parse_bump(raw).is_err(), "{raw} must be rejected");
+    }
 }

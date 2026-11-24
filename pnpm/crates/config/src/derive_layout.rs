@@ -1,10 +1,118 @@
 use super::{
-    Config, EnvVar, EnvVarOs, ExplicitPaths, GLOBAL_LAYOUT_VERSION, GetCurrentDir, GetHomeDir,
-    HashMap, LinkProbe, LoadWorkspaceYamlError, NodeLinker, NpmrcAuth, default_pnpm_home_dir,
+    Config,
+    EnvVar,
+    EnvVarOs,
+    ExplicitPaths,
+    GLOBAL_LAYOUT_VERSION,
+    GetCurrentDir,
+    GetHomeDir,
+    HashMap,
+    LinkProbe,
+    LoadWorkspaceYamlError,
+    NodeLinker,
+    NpmrcAuth,
+    Path,
+    PathBuf,
+    default_pnpm_home_dir,
     esm_node_path_loader,
 };
 
 impl Config {
+    /// pnpm-managed directories that workspace project discovery must
+    /// never report projects from: the store, cache, and state roots
+    /// plus the install-target directories. Entries may be absolute or
+    /// relative to the workspace root; discovery resolves them the way
+    /// [`pnpm_workspace::find_workspace_inventory`] resolves its
+    /// `ignored_directories`.
+    #[must_use]
+    pub fn managed_directories(&self) -> Vec<PathBuf> {
+        vec![
+            self.store_dir.root().to_path_buf(),
+            self.cache_dir.clone(),
+            self.state_dir.clone(),
+            self.modules_dir.clone(),
+            self.install_state_dir.clone(),
+            self.global_virtual_store_dir.clone(),
+        ]
+    }
+
+    pub(crate) fn default_lockfile_dir_for<'a>(&'a self, project_dir: &'a Path) -> &'a Path {
+        if self.shared_workspace_lockfile {
+            self.workspace_dir.as_deref().unwrap_or(project_dir)
+        } else {
+            project_dir
+        }
+    }
+
+    /// Whether pinning `dir` leaves the layout as it is without a pin.
+    /// A pin inside a workspace that keeps per-project lockfiles is never
+    /// default: it makes the workspace share one lockfile.
+    pub(crate) fn lockfile_dir_is_default(&self, dir: &Path, project_dir: &Path) -> bool {
+        if self.workspace_dir.is_some() && !self.shared_workspace_lockfile {
+            return false;
+        }
+        let dir = pnpm_fs::lexical_normalize(dir);
+        let default = pnpm_fs::lexical_normalize(self.default_lockfile_dir_for(project_dir));
+        dir == default
+            || (cfg!(windows)
+                && dir
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&default.to_string_lossy())
+                && same_file::is_same_file(&dir, &default).unwrap_or(false))
+    }
+
+    pub fn refresh_node_path_after_lockfile_dir_change<Sys>(
+        &mut self,
+        previous_node_path_dirs: [&Path; 2],
+        hook_node_path: Option<Option<String>>,
+        hook_node_options: Option<Option<String>>,
+    ) where
+        Sys: EnvVar,
+    {
+        if hook_node_path.is_none() {
+            self.remove_previous_global_virtual_store_node_path(previous_node_path_dirs);
+        }
+        if hook_node_path.is_none()
+            && cfg!(any(unix, target_os = "wasi"))
+            && self.prefer_symlinked_executables.unwrap_or(false)
+        {
+            remove_node_paths(&mut self.extra_env, previous_node_path_dirs);
+            let hidden_modules_dir =
+                pnpm_fs::lexical_normalize(&self.install_state_dir.join("node_modules"));
+            append_node_path(&mut self.extra_env, &hidden_modules_dir);
+        }
+        self.apply_global_virtual_store_node_path::<Sys>();
+        if let Some(node_path) = hook_node_path {
+            set_extra_env_value(&mut self.extra_env, "NODE_PATH", node_path);
+        }
+        if let Some(node_options) = hook_node_options {
+            let previous_node_options = self.extra_env.get("NODE_OPTIONS").map(String::as_str);
+            let node_options = match node_options {
+                Some(node_options) => Some(esm_node_path_loader::keep_esm_node_path_loader_option(
+                    &node_options,
+                    previous_node_options,
+                )),
+                None if previous_node_options.is_some_and(|value| {
+                    value.contains(esm_node_path_loader::esm_node_path_loader_import_flag())
+                }) =>
+                {
+                    Some(esm_node_path_loader::esm_node_path_loader_import_flag().to_string())
+                }
+                None => None,
+            };
+            set_extra_env_value(&mut self.extra_env, "NODE_OPTIONS", node_options);
+        }
+    }
+
+    fn remove_previous_global_virtual_store_node_path(&mut self, previous_dirs: [&Path; 2]) {
+        if self.enable_global_virtual_store
+            && self.extend_node_path
+            && self.node_linker == NodeLinker::Isolated
+        {
+            remove_node_paths(&mut self.extra_env, previous_dirs);
+        }
+    }
+
     /// The directory layout and environment every spawned process sees,
     /// derived once every source has had its say.
     pub(super) fn apply_layout_derivations<Sys>(&mut self)
@@ -43,17 +151,16 @@ impl Config {
         // resolution help moves to the environment: expose the virtual
         // store's hidden `node_modules` to every spawned child process.
         // `install_state_dir` is already anchored at the workspace root
-        // by the re-anchor above — pnpm builds this from
+        // by the re-anchor above, pnpm builds this from
         // `lockfileDir ?? dir` to the same effect
         // (pnpm/pnpm#13912). Unix only, like pnpm; and only an explicit
         // `true` fires.
-        if cfg!(any(unix, target_os = "wasi")) && self.prefer_symlinked_executables == Some(true) {
+        if cfg!(any(unix, target_os = "wasi"))
+            && self.prefer_symlinked_executables.unwrap_or(false)
+        {
             let hidden_modules_dir =
                 pnpm_fs::lexical_normalize(&self.install_state_dir.join("node_modules"));
-            self.extra_env.insert(
-                "NODE_PATH".to_string(),
-                hidden_modules_dir.display().to_string(),
-            );
+            append_node_path(&mut self.extra_env, &hidden_modules_dir);
         }
         self.apply_prefer_symlinked_executables_derivation();
 
@@ -66,7 +173,7 @@ impl Config {
     /// `node_modules`. Expose both through `NODE_PATH` for every child
     /// process pnpm spawns, and register the ESM loader that restores
     /// `NODE_PATH` lookups for ESM imports. Mirrors the pnpm config reader
-    /// (`pnpm11/config/reader/src/index.ts`).
+    /// ([`pnpm11/config/reader/src/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/config/reader/src/index.ts)).
     pub fn apply_global_virtual_store_node_path<Sys>(&mut self)
     where
         Sys: EnvVar,
@@ -100,11 +207,13 @@ impl Config {
             "NODE_PATH".to_string(),
             node_paths.join(&path_delimiter.to_string()),
         );
+        let node_options = self.extra_env
+            .get("NODE_OPTIONS")
+            .cloned()
+            .or_else(|| Sys::var("NODE_OPTIONS"));
         self.extra_env.insert(
             "NODE_OPTIONS".to_string(),
-            esm_node_path_loader::add_esm_node_path_loader_option(
-                Sys::var("NODE_OPTIONS").as_deref(),
-            ),
+            esm_node_path_loader::add_esm_node_path_loader_option(node_options.as_deref()),
         );
     }
 
@@ -123,6 +232,13 @@ impl Config {
             self.lockfile = self.package_lock;
         }
 
+        let lockfile_dir_is_default = self.lockfile_dir
+            .as_ref()
+            .is_some_and(|lockfile_dir| self.lockfile_dir_is_default(lockfile_dir, start_dir));
+        if lockfile_dir_is_default {
+            self.lockfile_dir = None;
+        }
+
         // A pinned `lockfileDir` moves the root `node_modules` and the
         // virtual store with it. Applied after every source has had its
         // say so the anchor uses the final value, and before the
@@ -137,7 +253,7 @@ impl Config {
         // Build the per-URI auth-header lookup. Credentials were already
         // pinned to their source file's registry by `rescope_unscoped`,
         // so this is independent of the final `config.registry` (which
-        // yaml may have overridden) — the security boundary holds even
+        // yaml may have overridden), the security boundary holds even
         // when the workspace points the default registry elsewhere.
         std::mem::take(npmrc_auth).build_auth_headers(self)?;
 
@@ -146,6 +262,9 @@ impl Config {
         // `PNPM_CONFIG_STORE_DIR`) set it.
         if explicit.store_dir {
             self.store_dir_placement_skipped = false;
+        } else if self.cli.command_target == crate::CommandTarget::Dlx {
+            let store_anchor = self.cache_dir.clone();
+            self.resolve_default_store_dir::<Sys>(&store_anchor);
         } else {
             self.resolve_default_store_dir::<Sys>(start_dir);
         }
@@ -178,6 +297,9 @@ impl Config {
     }
 
     fn workspace_root_bin_paths(&self) -> Vec<std::path::PathBuf> {
+        if self.cli.command_target == crate::CommandTarget::Dlx {
+            return Vec::new();
+        }
         self.workspace_dir
             .as_deref()
             .map_or_else(Vec::new, |dir| {
@@ -185,10 +307,7 @@ impl Config {
                     .applies_package_configs()
                     .then(|| pnpm_workspace::read_project_name(dir))
                     .flatten();
-                vec![
-                    dir.join(self.modules_dir_name_for(dir, root_name.as_deref()))
-                        .join(".bin"),
-                ]
+                vec![self.project_modules_dir(dir, root_name.as_deref()).join(".bin")]
             })
     }
 
@@ -214,5 +333,46 @@ impl Config {
             extra_env.insert("NODE_OPTIONS".to_string(), node_options);
         }
         extra_env
+    }
+}
+
+fn append_node_path(extra_env: &mut HashMap<String, String>, dir: &Path) {
+    let delimiter = if cfg!(windows) { ';' } else { ':' };
+    let dir = pnpm_fs::lexical_normalize(dir).display().to_string();
+    let mut paths = extra_env
+        .get("NODE_PATH")
+        .map(|value| {
+            value
+                .split(delimiter)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !paths.contains(&dir) {
+        paths.push(dir);
+    }
+    extra_env.insert("NODE_PATH".to_string(), paths.join(&delimiter.to_string()));
+}
+
+fn remove_node_paths(extra_env: &mut HashMap<String, String>, dirs: [&Path; 2]) {
+    let Some(node_path) = extra_env.get("NODE_PATH").cloned() else { return };
+    let delimiter = if cfg!(windows) { ';' } else { ':' };
+    let removed = dirs.map(|dir| pnpm_fs::lexical_normalize(dir).display().to_string());
+    let node_paths = node_path
+        .split(delimiter)
+        .filter(|path| !removed.iter().any(|dir| dir == path))
+        .collect::<Vec<_>>();
+    set_extra_env_value(
+        extra_env,
+        "NODE_PATH",
+        (!node_paths.is_empty()).then(|| node_paths.join(&delimiter.to_string())),
+    );
+}
+
+fn set_extra_env_value(extra_env: &mut HashMap<String, String>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        extra_env.insert(key.to_string(), value);
+    } else {
+        extra_env.remove(key);
     }
 }

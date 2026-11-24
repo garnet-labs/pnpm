@@ -1,9 +1,36 @@
 use super::{
-    AddedRoot, BrokenModulesLog, ContextLog, DedupeCheckLog, DependencyType, DeprecationLog,
-    Envelope, GetHostName, GlobalLog, HookLog, Host, LockfileLog, LogEvent, LogLevel,
-    PackageImportMethod, PackageImportMethodLog, Pipe, PnpmErrorLog, PnpmLog, PromptAction,
-    PromptLog, RemovedRoot, RequestRetryError, RequestRetryLog, RootLog, RootMessage, Stage,
-    StageLog, StatsLog, StatsMessage, Value, assert_eq,
+    AddedRoot,
+    BrokenModulesLog,
+    ContextLog,
+    DedupeCheckLog,
+    DependencyType,
+    DeprecationLog,
+    Envelope,
+    GetHostName,
+    GlobalLog,
+    HookLog,
+    Host,
+    LockfileLog,
+    LogEvent,
+    LogLevel,
+    PackageImportMethod,
+    PackageImportMethodLog,
+    Pipe,
+    PnpmErrorLog,
+    PnpmLog,
+    PromptAction,
+    PromptLog,
+    RemovedRoot,
+    RequestRetryError,
+    RequestRetryLog,
+    RootLog,
+    RootMessage,
+    Stage,
+    StageLog,
+    StatsLog,
+    StatsMessage,
+    Value,
+    assert_eq,
 };
 use crate::NonDeprecatedAlternative;
 
@@ -78,7 +105,7 @@ fn stage_event_matches_pnpm_wire_shape() {
 }
 
 /// Generic-channel (`name: "pnpm"`) log carries the bare `pnpm`
-/// channel name — without a `:`-suffix — matching the shape pnpm's
+/// channel name, without a `:`-suffix, matching the shape pnpm's
 /// global logger writes. `@pnpm/cli.default-reporter` routes these
 /// records through the "other" stream branch; a typo on the channel
 /// name would silently fail to render.
@@ -164,7 +191,7 @@ fn dedupe_check_event_matches_pnpm_wire_shape() {
 }
 
 /// Global-channel (`name: "pnpm:global"`) log carries the
-/// `pnpm:global` channel name and a bare `message` with no `prefix` —
+/// `pnpm:global` channel name and a bare `message` with no `prefix`,
 /// matching pnpm's `bole('pnpm:global')` writes. A `prefix` field would
 /// diverge from the upstream shape `@pnpm/cli.default-reporter` parses.
 #[test]
@@ -253,8 +280,8 @@ fn package_import_method_event_matches_pnpm_wire_shape() {
 
 /// `pnpm:root` is presence-tagged on `added` / `removed`. The JS
 /// reporter accumulates `added` events and renders them in the
-/// `pnpm:summary` "+N -M" block. Optional fields skip when absent
-/// — emitting them as JSON `null` would put `null` in the rendered
+/// `pnpm:summary` "+N -M" block. Optional fields skip when absent,
+/// emitting them as JSON `null` would put `null` in the rendered
 /// version string.
 #[test]
 fn root_event_matches_pnpm_wire_shape() {
@@ -270,6 +297,7 @@ fn root_event_matches_pnpm_wire_shape() {
                 id: None,
                 latest: None,
                 linked_from: None,
+                registry_package: None,
             },
         },
     });
@@ -287,7 +315,7 @@ fn root_event_matches_pnpm_wire_shape() {
     assert_eq!(json["added"]["version"], "4.0.0");
     assert_eq!(json["added"]["dependencyType"], "prod");
     // Optional fields skip when None so the JS reporter doesn't see
-    // `id: null` etc. — pnpm's emit also omits them when absent.
+    // `id: null` etc. pnpm's emit also omits them when absent.
     for k in ["id", "latest", "linkedFrom"] {
         assert!(json["added"].get(k).is_none(), "added.{k} should be absent, got {json:?}");
     }
@@ -301,6 +329,7 @@ fn root_event_matches_pnpm_wire_shape() {
                 name: "fastify".to_string(),
                 version: None,
                 dependency_type: None,
+                registry_package: None,
             },
         },
     });
@@ -325,7 +354,7 @@ fn root_event_matches_pnpm_wire_shape() {
 
 /// `pnpm:stats` is presence-tagged on `added` / `removed`. pnpm
 /// emits each from a separate site, so an event carries one or the
-/// other — never both.
+/// other, never both.
 #[test]
 fn stats_event_matches_pnpm_wire_shape() {
     let event = LogEvent::Stats(StatsLog {
@@ -474,6 +503,7 @@ fn deprecation_event_matches_pnpm_wire_shape() {
             version: "1.0.0".to_string(),
             outside_declared_range: true,
         }),
+        already_installed: true,
     });
     let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
     let json: Value = envelope
@@ -495,6 +525,7 @@ fn deprecation_event_matches_pnpm_wire_shape() {
     );
     assert_eq!(json["nonDeprecatedAlternative"]["version"], "1.0.0");
     assert_eq!(json["nonDeprecatedAlternative"]["outsideDeclaredRange"], true);
+    assert_eq!(json["alreadyInstalled"], true);
 }
 
 /// Transitive deprecation events (`depth > 0`) also match the wire shape.
@@ -508,6 +539,7 @@ fn deprecation_event_transitive_matches_pnpm_wire_shape() {
         prefix: "/projects/x".to_string(),
         depth: 3,
         non_deprecated_alternative: None,
+        already_installed: false,
     });
     let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
     let json: Value = envelope
@@ -518,4 +550,5 @@ fn deprecation_event_transitive_matches_pnpm_wire_shape() {
     assert_eq!(json["name"], "pnpm:deprecation");
     assert_eq!(json["pkgName"], "request");
     assert_eq!(json["depth"], 3);
+    assert!(json.get("alreadyInstalled").is_none(), "{json}");
 }

@@ -1,9 +1,23 @@
 use super::{
-    Arc, Host, LinkBinsOptions, PackageBinSource, Path, Value, create_dir_all, json,
-    link_bins_of_packages, read_file, read_to_string, tempdir, write_file,
+    Arc,
+    Host,
+    LinkBinsOptions,
+    PackageBinSource,
+    Path,
+    Value,
+    create_dir_all,
+    json,
+    link_bins_of_packages,
+    read_file,
+    read_to_string,
+    tempdir,
+    write_file,
 };
 #[cfg(unix)]
-use super::{is_sh_shim_hardened, is_shim_pointing_at};
+use super::{
+    is_sh_shim_hardened,
+    is_shim_pointing_at,
+};
 #[cfg(unix)]
 use crate::shim::generate_sh_shim;
 #[cfg(unix)]
@@ -173,7 +187,7 @@ fn prefer_symlinked_executables_links_a_bin_whose_target_is_missing() {
     )
     .unwrap();
 
-    // A dangling symlink is still created — pnpm warns and keeps it,
+    // A dangling symlink is still created, pnpm warns and keeps it,
     // so a later step can materialize the target.
     assert_eq!(
         std::fs::read_link(bins_dir.join("foo")).expect("dangling bin symlink must exist"),
@@ -469,8 +483,7 @@ fn a_reinstall_replaces_a_shim_whose_helpers_have_no_path_fallback() {
     let outdated = generate_sh_shim(&target, &shim, None, &[], None)
         .replace("run_helper readlink", "command -p readlink")
         .replace("run_helper printf", "command -p printf")
-        .replace("run_helper sed", "command -p sed")
-        .replace("run_helper uname", "command -p uname");
+        .replace("run_helper sed", "command -p sed");
     write_file(&shim, &outdated).unwrap();
     assert!(
         is_shim_pointing_at(&outdated, &shim, &target),

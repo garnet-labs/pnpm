@@ -1,6 +1,9 @@
+#[macro_use]
+extern crate pnpr_sql;
+
 pub mod layout;
 
-pub mod metadata;
+pub mod database;
 
 pub mod publish;
 
@@ -11,11 +14,28 @@ pub mod transparency_log;
 
 pub mod upload;
 
+pub use bounded_cache::BoundedCache;
+
 pub use atomic_write::{
-    remove_atomic_write_temps, unique_tmp_path, write_atomic, write_atomic_new,
+    TempSweep,
+    count_stale_temps,
+    is_atomic_write_temp_path,
+    remove_atomic_write_temps,
+    sweep_stale_temps,
+    unique_tmp_path,
+    write_atomic,
+    write_atomic_new,
 };
 
-pub use blob_write::{BlobSlot, BlobWrite, SealedBlob};
+pub use s3::cache_staging_tmp_base;
+
+pub use blob_write::{
+    BlobSlot,
+    BlobWrite,
+    SealedBlob,
+    TempFileGuard,
+    is_active_temp as is_active_blob_temp,
+};
 
 pub(crate) use local_store::read_dir_if_present;
 
@@ -23,36 +43,54 @@ pub use object_store::GetRange;
 
 pub(crate) use self::backend::HostedBackend;
 
-pub use self::backend::{BlobFinalize, HostedDocumentForUpdate, HostedDocumentVersion};
+pub use self::backend::{
+    HostedDocumentForUpdate,
+    HostedDocumentVersion,
+};
 
-pub use registry_records::{RegistryRecord, SCIM_DIRECTORY};
+pub use archives::{
+    PackageRemoval,
+    PromotedArchive,
+    archive_temp_bases,
+};
+pub use blob_id::{
+    BlobId,
+    parse_blob_key,
+};
 
 pub use staged_archives::{
-    INCOMPLETE_MAX_AGE, STAGED_ARCHIVE_MAX_AGE, STAGED_ARCHIVE_RENEWAL_MARGIN, StagedArchiveKey,
+    INCOMPLETE_MAX_AGE,
+    STAGED_ARCHIVE_MAX_AGE,
+    STAGED_ARCHIVE_RENEWAL_MARGIN,
+    StagedArchiveKey,
     StagedArchiveUsage,
 };
 
 pub use staged_records::PipelineRunKey;
 
-pub use tombstones::{PackageTombstone, TOMBSTONES_NAMESPACE};
+pub use tombstones::PackageTombstone;
 
 pub use layout_state::HostedLayout;
 
 pub use pnpr_package_name::Ecosystem;
 
 pub use tar_integrities::DerivedTar;
+pub use upstream_cache::PURGED_UPSTREAM_DIR;
 
+mod archive_verification;
+mod bounded_cache;
 mod tar_integrities;
 mod upstream_cache;
 
+mod archives;
+mod blob_id;
+
 mod layout_state;
-use layout_state::namespace;
+use layout_state::slice;
 
 mod staged_records;
 
 mod staged_archives;
-
-mod registry_records;
 
 mod atomic_write;
 use atomic_write::create_tmp_file;
@@ -72,35 +110,62 @@ use async_trait::async_trait;
 use axum::body::Body;
 use futures_util::{
     StreamExt,
-    stream::{self, BoxStream},
+    stream::{
+        self,
+        BoxStream,
+    },
 };
 use pnpr_config::{
-    HostedStoreConfig, MetadataBackend, StorageConfig, build_s3_store, normalize_key_prefix,
+    DatabaseBackend,
+    HostedStoreConfig,
+    StorageConfig,
+    build_s3_store,
+    normalize_key_prefix,
 };
-use pnpr_error::{RegistryError, Result};
+use pnpr_error::{
+    RegistryError,
+    Result,
+};
 use pnpr_package_name::CanonicalPackageName;
 use std::{
-    io::{ErrorKind, SeekFrom},
-    path::{Path, PathBuf},
+    io::{
+        ErrorKind,
+        SeekFrom,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
     },
-    time::{Duration, SystemTime},
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{
+        AsyncReadExt,
+        AsyncSeekExt,
+        AsyncWriteExt,
+    },
 };
 
 use layout::{
-    BLOBS_DIR, DOCUMENT_FILE, PACKAGES_DIR, blob_segment, decode_blob_segment,
-    decode_package_segments, package_segments,
+    ARCHIVES_DIR,
+    BLOBS_DIR,
+    DOCUMENT_FILE,
+    PACKAGES_DIR,
+    blob_segment,
+    package_segments,
 };
 pub const DOCUMENT_WRITE_RETRIES: usize = 8;
-/// Retries a tombstone write allows: higher than the request-path budget
-/// because the write has to converge while every replica may be racing it.
-pub(crate) const COMMIT_DOCUMENT_WRITE_RETRIES: usize = 32;
 const DOCUMENT_WRITE_CONFLICT_DELAY_MS: u64 = 5;
 const MAX_DOCUMENT_WRITE_CONFLICT_DELAY_MS: u64 = 250;
 
@@ -111,15 +176,15 @@ pub(crate) fn document_write_conflict_delay(attempt: usize) -> Duration {
     Duration::from_millis(delay)
 }
 
-pub(crate) async fn wait_after_document_write_conflict(attempt: usize) {
+pub async fn wait_after_document_write_conflict(attempt: usize) {
     tokio::time::sleep(document_write_conflict_delay(attempt)).await;
 }
 
 /// A cached upstream document, read at a granularity that avoids loading the
 /// (potentially multi-MB) body when it isn't needed:
 ///
-/// * `Fresh` — within the TTL; the body is read and ready to serve.
-/// * `Stale` — past the TTL. The body is left on disk; a per-registry cache
+/// * `Fresh`, within the TTL; the body is read and ready to serve.
+/// * `Stale`, past the TTL. The body is left on disk; a per-registry cache
 ///   refetches a stale entry rather than revalidating it, so the caller treats
 ///   `Stale` as a miss.
 #[derive(Debug)]
@@ -130,35 +195,37 @@ pub enum CachedDocument {
 
 /// Storage split into two stores with different durability guarantees:
 ///
-/// * `hosted` — the authoritative source of truth: packages this
+/// * `hosted`, the authoritative source of truth: packages this
 ///   server hosts directly (published through its API) plus the content
 ///   served in static mode. Served as-is and never overwritten by an
 ///   upstream refresh, so a hosted version can't be masked or lost.
 ///   Backed by a local directory by default, or an S3-compatible
-///   object store (S3, Cloudflare R2, `MinIO`, ...) when the YAML `s3:`
-///   block is set — see the S3 backend.
-/// * `cached` — the disposable mirror of upstream registries. Safe to
+///   object store (S3, Cloudflare R2, `MinIO`, ...) when the YAML `storage.s3`
+///   block is set; see the S3 backend.
+/// * `cached`, the disposable mirror of upstream registries. Safe to
 ///   wipe at any time; it self-heals on the next request. Always local,
 ///   on scratch/ephemeral disk.
 ///
 /// Both lay out packages as [`layout`] describes. A `Storage` addresses one
-/// hosted namespace, the default one unless [`Storage::for_hosted`] picked
-/// an org's, and the records every namespace shares.
+/// hosted `(namespace, ecosystem)` slice, the default npm one unless
+/// [`Storage::for_hosted`] picked another, and the records every namespace
+/// shares.
 #[derive(Debug, Clone)]
 pub struct Storage {
     /// The whole hosted store: its layout marker and the shared records.
     pub(crate) root: Arc<dyn HostedBackend>,
-    /// One namespace of `root`.
+    /// One `(namespace, ecosystem)` slice of `root`.
     hosted: Arc<dyn HostedBackend>,
     cached: Store,
-    /// The hosted backend's tar-integrity namespace, shared by every
-    /// organization; see [`Storage::read_tar_integrities`].
+    /// The hosted backend's tar-integrity record directory, shared by every
+    /// namespace; see [`Storage::read_tar_integrities`].
     tar_integrities: Arc<dyn HostedBackend>,
     tar_integrity_cache: Arc<tar_integrities::TarIntegrityCache>,
-    /// The metadata database every namespace shares.
-    database: Arc<metadata::SqlMetadata>,
-    /// The metadata of `hosted`'s namespace.
-    metadata: metadata::PackageMetadata,
+    purged_upstream: Arc<upstream_cache::PurgedUpstreamPackages>,
+    /// The database every namespace shares.
+    database: Arc<database::SqlDatabase>,
+    /// The metadata of `hosted`'s `(namespace, ecosystem)` slice.
+    metadata: database::PackageMetadata,
 }
 
 /// A partial blob read, including the full size needed for HTTP range headers.
@@ -167,13 +234,12 @@ pub enum RangedBlob {
     Unsatisfiable { size: u64 },
 }
 
-/// A file in the hosted namespace, for offline maintenance.
-#[derive(Debug)]
-pub struct HostedBlobFile {
-    /// The package or repository the file belongs to.
-    pub package: String,
-    /// The blob's file name, or `None` for the package's document.
-    pub blob: Option<String>,
+/// A name stored where a hosted namespace keeps its archives: the key of an
+/// archive pnpr stored (see [`parse_blob_key`]), or anything else found
+/// there.
+#[derive(Debug, Clone)]
+pub struct StoredArchive {
+    pub name: String,
     pub modified: SystemTime,
     pub size: u64,
 }
@@ -214,7 +280,7 @@ impl Storage {
         hosted: &HostedStoreConfig,
         storage: PathBuf,
         cache_storage: PathBuf,
-        metadata: &MetadataBackend,
+        metadata: &DatabaseBackend,
     ) -> Result<Self> {
         let cached = Store::new(cache_storage.clone());
         let root: Arc<dyn HostedBackend> = match hosted {
@@ -230,7 +296,7 @@ impl Storage {
                 cache_storage,
             )),
         };
-        Ok(Self::from_parts(root, cached, metadata::open(metadata)?))
+        Ok(Self::from_parts(root, cached, database::open(metadata)?))
     }
 
     /// A [`Storage`] over the hosted store `root` and the proxy cache
@@ -239,17 +305,18 @@ impl Storage {
     pub(crate) fn from_parts(
         root: Arc<dyn HostedBackend>,
         cached: Store,
-        database: Arc<metadata::SqlMetadata>,
+        database: Arc<database::SqlDatabase>,
     ) -> Self {
         let tar_integrities = root.namespaced(tar_integrities::NAMESPACE);
-        let hosted = namespace(&root, "", Ecosystem::Npm);
-        let metadata = database.view("", Ecosystem::Npm);
+        let hosted = slice(&root, "", Ecosystem::Npm);
+        let metadata = database.view(String::new(), Ecosystem::Npm);
         Self {
             root,
             hosted,
             cached,
             tar_integrities,
             tar_integrity_cache: Arc::default(),
+            purged_upstream: Arc::default(),
             database,
             metadata,
         }
@@ -261,15 +328,14 @@ impl Storage {
             &config.hosted_backend,
             config.hosted_dir.clone(),
             config.cache_dir.clone(),
-            &config.metadata,
+            &config.database,
         )
     }
 
-    /// Inventory all regular files, including repositories with no document
-    /// and repositories nested below another. Only for offline maintenance.
-    #[must_use]
-    pub fn hosted_blob_files(&self) -> BoxStream<'_, Result<HostedBlobFile>> {
-        self.hosted.list_blob_files()
+    /// Every name stored where this namespace keeps its archives, for
+    /// maintenance that compares the store with its metadata.
+    pub fn hosted_archives(&self) -> BoxStream<'_, Result<StoredArchive>> {
+        self.hosted.list_archives()
     }
 
     /// Check that the hosted backend and the cache directory are reachable
@@ -290,17 +356,16 @@ impl Storage {
         self.metadata.package_names().await
     }
 
-    pub async fn hosted_package_blobs(
-        &self,
-        canonical: &CanonicalPackageName,
-    ) -> Result<Vec<String>> {
-        self.hosted.list_package_blobs(canonical).await
+    /// The names of every hosted package that has at least one published
+    /// version, sorted.
+    pub async fn hosted_published_package_names(&self) -> Result<Vec<String>> {
+        self.metadata.published_package_names().await
     }
 
     // --- Authoritative (hosted) store -----------------------------------
 
     /// Read the authoritative document for `name`, fresh or stale.
-    /// Hosted content has no TTL — it is the source of truth.
+    /// Hosted content has no TTL; it is the source of truth.
     pub async fn read_hosted_document(
         &self,
         name: &CanonicalPackageName,
@@ -343,68 +408,7 @@ impl Storage {
     where
         Build: FnMut(Option<&[u8]>) -> Result<Option<Vec<u8>>>,
     {
-        metadata::update_with_retry(&self.metadata, name, retries, principal, build).await
-    }
-
-    /// Open a blob from the authoritative hosted store. Hosted
-    /// publish writes verify their SRI before finalization, and static
-    /// storage remains operator-controlled rather than an upstream cache.
-    pub async fn open_hosted_blob(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<Option<(Body, Option<u64>)>> {
-        self.hosted.open_blob(name, filename).await
-    }
-
-    /// Open only the requested bytes, without reading the preceding content.
-    pub async fn open_hosted_blob_range(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-        range: &GetRange,
-    ) -> Result<Option<RangedBlob>> {
-        self.hosted.open_blob_range(name, filename, range).await
-    }
-
-    /// Reserve a staging slot for a blob this server hosts. The
-    /// publish flow streams the decode + hash + write through
-    /// `std::fs` inside `spawn_blocking` and only needs the path;
-    /// finalize with [`Self::finalize_blob_slot`].
-    pub async fn reserve_hosted_blob(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<BlobSlot> {
-        let tmp_path = self.hosted.reserve_blob_tmp(name, filename).await?;
-        Ok(BlobSlot { tmp_path, name: name.clone(), filename: filename.to_string() })
-    }
-
-    /// Remove a hosted blob without changing any proxy-cache namespace.
-    pub async fn remove_hosted_blob(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<bool> {
-        self.hosted.remove_blob(name, filename).await
-    }
-
-    /// Remove a single blob from the hosted store.
-    pub async fn remove_blob(&self, name: &CanonicalPackageName, filename: &str) -> Result<bool> {
-        self.remove_hosted_blob(name, filename).await
-    }
-
-    /// Remove the package's metadata and archives from the hosted store.
-    pub async fn remove_package(&self, name: &CanonicalPackageName) -> Result<bool> {
-        let had_metadata = self.metadata.remove_package(name).await?;
-        let had_files = self.hosted.remove_package(name).await?;
-        Ok(had_metadata || had_files)
-    }
-
-    /// Promote a tmp blob written by the publish flow to its final
-    /// home: a rename on the fs backend, an upload on the S3 backend.
-    pub async fn finalize_blob_slot(&self, slot: BlobSlot) -> Result<BlobFinalize> {
-        self.hosted.finalize_blob(&slot.tmp_path, &slot.name, &slot.filename).await
+        database::update_with_retry(&self.metadata, name, retries, principal, build).await
     }
 
     /// Where this namespace stages locally: the namespace's directory on the
@@ -414,18 +418,6 @@ impl Storage {
     pub fn hosted_scratch_root(&self) -> &Path {
         self.hosted.local_scratch_root()
     }
-
-    // --- Staged publishes (`-/stage`) -------------------------------------
-    //
-    // A staged publish is a publish document held back until it is approved
-    // (`POST /-/stage/:id/approve`) or rejected (`DELETE /-/stage/:id`). Each
-    // record is two objects in the hosted backend, keyed by the stage id:
-    // a small metadata JSON (listed and served as-is) and the full original
-    // publish body (replayed through the regular publish flow on approval).
-    // Records live under the reserved `.staged/` namespace of the *root*
-    // hosted store — never a per-org view — because the stage id is the only
-    // thing a later `view`/`approve`/`reject` request carries; the record's
-    // metadata remembers which registry the stage was addressed through.
 
     // --- Pipeline runs (`/-/pnpr/v0/pipeline`) ----------------------------
     //
@@ -453,3 +445,39 @@ fn validated_record_name(name: &str) -> Result<&str> {
 
 #[cfg(test)]
 mod tests;
+
+/// An authoritative record and the generation a conditional write replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataRecord {
+    pub bytes: Vec<u8>,
+    pub generation: i64,
+}
+
+/// Mark the local hosted store at `root` as being in [`layout::LAYOUT_VERSION`]
+/// and bind its default `SQLite` database to the same `store_id`.
+///
+/// # Errors
+///
+/// Writing the marker or binding the database failed.
+pub fn write_local_layout_marker(root: &Path) -> std::io::Result<()> {
+    if !root.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("hosted store directory '{}' does not exist", root.display()),
+        ));
+    }
+    let existing = std::fs::read(root.join(layout::LAYOUT_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<layout::LayoutMarker>(&bytes).ok())
+        .and_then(|marker| marker.store_id)
+        .filter(|id| !id.is_empty());
+    let candidate = existing.unwrap_or_else(layout::new_store_id);
+    let database = database::SqlDatabase::open_sqlite(&pnpr_config::default_database_path(root))
+        .map_err(std::io::Error::other)?;
+    let store_id = database.claim_store_id_sync(&candidate).map_err(std::io::Error::other)?;
+    let marker = serde_json::to_vec(&layout::LayoutMarker {
+        layout: layout::LAYOUT_VERSION,
+        store_id: Some(store_id),
+    })?;
+    std::fs::write(root.join(layout::LAYOUT_FILE), marker)
+}

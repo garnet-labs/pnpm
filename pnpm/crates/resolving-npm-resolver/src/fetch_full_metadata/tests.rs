@@ -1,15 +1,27 @@
-use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
+use pnpm_network::{
+    AuthHeaders,
+    RetryOpts,
+    ThrottledClient,
+};
 use std::time::Duration;
 
 use super::{
-    ABBREVIATED_META_CONTENT_TYPE, ACCEPT_ABBREVIATED_DOC, FetchFullMetadataOptions,
-    FetchFullMetadataOutcome, fetch_full_metadata, metadata_response_is_uncacheable,
+    ABBREVIATED_META_CONTENT_TYPE,
+    ACCEPT_ABBREVIATED_DOC,
+    FetchFullMetadataOptions,
+    FetchFullMetadataOutcome,
+    fetch_full_metadata,
+    metadata_response_is_uncacheable,
     warn_if_request_is_slow,
 };
 
 #[test]
 fn any_cache_control_field_can_forbid_reuse() {
-    use reqwest::header::{CACHE_CONTROL, HeaderMap, HeaderValue};
+    use reqwest::header::{
+        CACHE_CONTROL,
+        HeaderMap,
+        HeaderValue,
+    };
 
     let mut headers = HeaderMap::new();
     headers.append(CACHE_CONTROL, HeaderValue::from_static("public"));
@@ -23,7 +35,11 @@ fn any_cache_control_field_can_forbid_reuse() {
 
 #[test]
 fn cache_control_directives_match_the_typescript_parser() {
-    use reqwest::header::{CACHE_CONTROL, HeaderMap, HeaderValue};
+    use reqwest::header::{
+        CACHE_CONTROL,
+        HeaderMap,
+        HeaderValue,
+    };
 
     let is_uncacheable = |value: &'static str| {
         let mut headers = HeaderMap::new();
@@ -298,6 +314,77 @@ async fn fetch_full_metadata_uses_package_scope_auth() {
 }
 
 #[tokio::test]
+async fn custom_registry_headers_are_scoped_to_the_metadata_origin() {
+    struct PrivateRegistry;
+    impl pnpm_network::UpstreamRouteHook for PrivateRegistry {
+        fn authorize(&self, _: &str, _: Option<&str>) -> Option<String> {
+            None
+        }
+
+        fn request_headers(&self, _: &str, _: Option<&str>) -> reqwest::header::HeaderMap {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-api-key", reqwest::header::HeaderValue::from_static("example-key"));
+            headers
+        }
+    }
+
+    let mut registry = mockito::Server::new_async().await;
+    let mut mirror = mockito::Server::new_async().await;
+    let destination = mirror
+        .mock("GET", "/pkg")
+        .match_header("x-api-key", mockito::Matcher::Missing)
+        .with_status(304)
+        .expect(1)
+        .create_async()
+        .await;
+    let source = registry
+        .mock("GET", "/pkg")
+        .match_header("x-api-key", "example-key")
+        .with_status(302)
+        .with_header("location", "/metadata/pkg")
+        .expect(2)
+        .create_async()
+        .await;
+    let metadata = registry
+        .mock("GET", "/metadata/pkg")
+        .match_header("x-api-key", "example-key")
+        .with_status(302)
+        .with_header("location", &format!("{}/pkg", mirror.url()))
+        .expect(2)
+        .create_async()
+        .await;
+    let auth = AuthHeaders::default().with_route_hook(std::sync::Arc::new(PrivateRegistry));
+    for allow_mirror in [false, true] {
+        let registry_origin = reqwest::Url::parse(&registry.url()).unwrap().origin();
+        let http = ThrottledClient::new_for_installs_with_redirect_guard(move |url| {
+            allow_mirror || url.origin() == registry_origin
+        });
+        let options = FetchFullMetadataOptions {
+            registry: &registry.url(),
+            full_metadata: false,
+            etag: Some("example"),
+            modified: None,
+            http: crate::MetadataHttpClient {
+                http_client: &http,
+                auth_headers: &auth,
+                retry_opts: no_retry_opts(),
+            },
+        };
+        let result = fetch_full_metadata("pkg", &options).await;
+        if allow_mirror {
+            assert!(matches!(result, Ok(FetchFullMetadataOutcome::NotModified)));
+        } else {
+            assert!(
+                matches!(result, Err(crate::FetchMetadataError::Network { error, .. }) if error.is_redirect()),
+            );
+        }
+    }
+    metadata.assert_async().await;
+    source.assert_async().await;
+    destination.assert_async().await;
+}
+
+#[tokio::test]
 async fn fetch_full_metadata_surfaces_5xx_as_network_error() {
     let mut server = mockito::Server::new_async().await;
     let mock = server
@@ -424,7 +511,7 @@ async fn fetch_full_metadata_retries_transient_status() {
 
 /// The mirror's `modified` value is the packument's ISO-8601
 /// `time.modified`, but `If-Modified-Since` must carry an HTTP-date
-/// (RFC 9110 §8.8.3) — the same conversion the TypeScript CLI does with
+/// (RFC 9110 §8.8.3), the same conversion the TypeScript CLI does with
 /// `toUTCString()`, keeping the two stacks byte-identical on the wire.
 #[tokio::test]
 async fn fetch_full_metadata_sends_if_modified_since_as_http_date() {
@@ -461,7 +548,7 @@ async fn fetch_full_metadata_sends_if_modified_since_as_http_date() {
 }
 
 /// A `modified` value that is neither ISO-8601 nor an HTTP-date cannot be
-/// turned into a valid header, so it is dropped rather than sent — and it
+/// turned into a valid header, so it is dropped rather than sent, and it
 /// must not count as a validator, or an unsolicited 304 would be
 /// misattributed to it instead of triggering the no-cache retry.
 #[tokio::test]
@@ -545,7 +632,7 @@ fn to_http_date_rejects_unparsable_values() {
 }
 
 /// A `Content-Encoding: gzip` header over a body that isn't gzip makes
-/// reqwest fail while *decoding the response body* — the same class of
+/// reqwest fail while *decoding the response body*, the same class of
 /// failure as a connection reset mid-transfer, surfacing as reqwest's
 /// "error decoding response body". This is the error the CI benchmark
 /// hit against the live registry and that `send_with_retry` can't see,
@@ -829,7 +916,42 @@ async fn fetch_full_metadata_surfaces_decode_failure_distinctly() {
 
 #[tokio::test]
 async fn fetch_full_metadata_returns_not_modified_on_304() {
+    conditional_metadata(MetadataRoute::Remote, MetadataResponses::NotModified).await;
+}
+
+#[tokio::test]
+async fn local_metadata_preserves_conditional_headers() {
+    conditional_metadata(MetadataRoute::Local, MetadataResponses::NotModified).await;
+}
+
+#[tokio::test]
+async fn local_metadata_retries_transient_statuses() {
+    conditional_metadata(MetadataRoute::Local, MetadataResponses::TransientThenNotModified).await;
+}
+
+enum MetadataRoute {
+    Remote,
+    Local,
+}
+
+enum MetadataResponses {
+    NotModified,
+    TransientThenNotModified,
+}
+
+async fn conditional_metadata(route: MetadataRoute, responses: MetadataResponses) {
     let mut server = mockito::Server::new_async().await;
+    let failed = match responses {
+        MetadataResponses::TransientThenNotModified => Some(
+            server
+                .mock("GET", "/acme")
+                .with_status(503)
+                .expect(1)
+                .create_async()
+                .await,
+        ),
+        MetadataResponses::NotModified => None,
+    };
     let mock = server
         .mock("GET", "/acme")
         .match_header("if-none-match", r#"W/"fresh""#)
@@ -841,16 +963,25 @@ async fn fetch_full_metadata_returns_not_modified_on_304() {
 
     let registry = format!("{}/", server.url());
     let http_client = ThrottledClient::default();
-    let auth_headers = AuthHeaders::default();
+    let (auth_headers, registry) = match route {
+        MetadataRoute::Local => (
+            AuthHeaders::default()
+                .with_route_hook(std::sync::Arc::new(LocalMetadata {
+                    target: format!("{registry}acme"),
+                })),
+            "https://local.invalid/",
+        ),
+        MetadataRoute::Remote => (AuthHeaders::default(), registry.as_str()),
+    };
     let opts = FetchFullMetadataOptions {
-        registry: &registry,
+        registry,
         full_metadata: true,
         etag: Some(r#"W/"fresh""#),
         modified: Some("Wed, 15 Jan 2025 12:00:00 GMT"),
         http: crate::MetadataHttpClient {
             http_client: &http_client,
             auth_headers: &auth_headers,
-            retry_opts: no_retry_opts(),
+            retry_opts: fast_retry_opts(),
         },
     };
 
@@ -860,13 +991,45 @@ async fn fetch_full_metadata_returns_not_modified_on_304() {
         "expected NotModified, got: {outcome:?}",
     );
     mock.assert_async().await;
+    if let Some(failed) = failed {
+        failed.assert_async().await;
+    }
+}
+
+struct LocalMetadata {
+    target: String,
+}
+
+impl pnpm_network::UpstreamRouteHook for LocalMetadata {
+    fn authorize(&self, _: &str, _: Option<&str>) -> Option<String> {
+        None
+    }
+
+    fn fetch_local(
+        &self,
+        _: &str,
+        headers: reqwest::header::HeaderMap,
+    ) -> Option<pnpm_network::LocalResponse> {
+        let target = self.target.clone();
+        Some(Box::pin(async move {
+            reqwest::Client::new()
+                .get(target)
+                .headers(headers)
+                .send()
+                .await
+                .unwrap()
+        }))
+    }
 }
 
 /// A registry that accepts each connection, reads the request, writes
 /// `response` (possibly nothing, or a head promising more body than it
 /// sends), and then holds the socket open without sending another byte.
 async fn start_stalled_registry(response: &'static [u8]) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("local address");
     tokio::spawn(async move {

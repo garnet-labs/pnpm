@@ -1,27 +1,69 @@
 use super::{
-    LoginReturn, MetadataFreshness, OidcState, SessionUser,
+    LoginReturn,
+    MetadataFreshness,
+    OidcState,
+    SessionUser,
     groups::granted_teams,
-    token_payload, verify_workload,
-    workload::{binding_matches, validate_times},
+    rejected,
+    token_payload,
+    verify_workload,
+    workload::{
+        binding_matches,
+        validate_times,
+    },
 };
 use axum::{
-    Json, Router,
-    extract::{Form, State},
-    routing::{get, post},
+    Json,
+    Router,
+    extract::{
+        Form,
+        State,
+    },
+    routing::{
+        get,
+        post,
+    },
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD};
-use chrono::Utc;
+use base64::{
+    Engine as _,
+    engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+};
+use jiff::Timestamp;
 use openidconnect::core::CoreJsonWebKeySet;
-use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
-use pnpr_config::oidc::{
-    OidcBinding, OidcGroups, OidcLogin, OidcProvider, OidcTeamGrant, OidcWorkload,
+use p256::ecdsa::{
+    Signature,
+    SigningKey,
+    signature::Signer as _,
 };
-use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
+use pnpr_config::oidc::{
+    OidcBinding,
+    OidcGroups,
+    OidcLogin,
+    OidcProvider,
+    OidcTeamGrant,
+    OidcWorkload,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use sha2::{
+    Digest as _,
+    Sha256,
+};
 use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    sync::{
+        Arc,
+        Mutex,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 use url::Url;
 
@@ -53,7 +95,7 @@ fn config(issuer: &str) -> OidcProvider {
         workloads: vec![OidcWorkload {
             identity: OidcBinding {
                 subject: "repo:org/repo:ref:refs/heads/main".to_string(),
-                username: "ci".to_string(),
+                user_id: "ci".to_string(),
                 claims: BTreeMap::from([("repository_id".to_string(), "123".to_string())]),
             },
             registry: "private".to_string(),
@@ -63,7 +105,7 @@ fn config(issuer: &str) -> OidcProvider {
 }
 
 fn payload(issuer: &str) -> Value {
-    let now = Utc::now().timestamp();
+    let now = Timestamp::now().as_second();
     json!({"iss": issuer, "aud": "pnpr-ci", "sub": "repo:org/repo:ref:refs/heads/main",
         "repository_id": "123", "groups": ["platform-eng", "sales"],
         "iat": now, "nbf": now, "exp": now + 300})
@@ -96,8 +138,8 @@ fn verifies_signature_issuer_audience_and_times() {
         ("iss", json!("https://attacker.example")),
         ("aud", json!("other")),
         ("exp", json!(0)),
-        ("nbf", json!(Utc::now().timestamp() + 100)),
-        ("iat", json!(Utc::now().timestamp() + 100)),
+        ("nbf", json!(Timestamp::now().as_second() + 100)),
+        ("iat", json!(Timestamp::now().as_second() + 100)),
         ("nbf", json!("tomorrow")),
         ("azp", json!("another-client")),
     ] {
@@ -235,7 +277,7 @@ async fn discovers_caches_and_enforces_workload_bindings() {
                 .unwrap()
                 .unwrap()
                 .identity
-                .username,
+                .user_id,
             "ci",
         );
     }
@@ -266,61 +308,11 @@ async fn discovers_caches_and_enforces_workload_bindings() {
     task.abort();
 }
 
-#[tokio::test]
-async fn browser_login_uses_pkce_nonce_cookie_binding_and_single_use_state() {
-    let (provider, task) = mock_provider().await;
-    let mut config = config(&provider.issuer);
-    config.login = Some(OidcLogin {
-        client_secret: Some("secret".to_string()),
-        users: vec![config.workloads.remove(0).identity],
-        groups: Some(groups(&[("platform-eng", "platform"), ("finance", "finance")])),
-    });
-    let state = OidcState::new(&[config], "https://registry.example").unwrap();
-    let start = state.start("example", LoginReturn::Token).await.unwrap();
-    let url = Url::parse(&start.url).unwrap();
-    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-    assert_eq!(query["response_type"], "code");
-    assert_eq!(query["code_challenge_method"], "S256");
-    assert_eq!(query["redirect_uri"], "https://registry.example/-/oidc/example/callback");
-    *provider.nonce.lock().unwrap() = Some(query["nonce"].clone());
-    *provider.challenge.lock().unwrap() = Some(query["code_challenge"].clone());
-    let session =
-        state.finish("example", &start.state, &start.browser_secret, "code").await.unwrap();
-    let user = state
-        .session(&session.token)
-        .unwrap()
-        .unwrap();
-    assert_eq!(user.username, "ci");
-    let teams: Vec<&str> = user.teams
-        .iter()
-        .map(|grant| grant.team.as_str())
-        .collect();
-    assert_eq!(teams, ["platform"]);
-    assert!(session.expires <= Utc::now().timestamp() + 300);
-    assert_eq!(session.returns_to, LoginReturn::Token);
-    assert!(state.finish("example", &start.state, &start.browser_secret, "code").await.is_err());
-    assert!(state.revoke_session(&session.token));
-    assert!(state.session(&session.token).is_err());
-    let start = state.start("example", LoginReturn::Ui).await.unwrap();
-    assert!(state.finish("example", &start.state, "other-browser", "code").await.is_err());
-    let query: HashMap<_, _> = Url::parse(&start.url)
-        .unwrap()
-        .query_pairs()
-        .into_owned()
-        .collect();
-    *provider.nonce.lock().unwrap() = Some(query["nonce"].clone());
-    *provider.challenge.lock().unwrap() = Some(query["code_challenge"].clone());
-    let session =
-        state.finish("example", &start.state, &start.browser_secret, "code").await.unwrap();
-    assert_eq!(session.returns_to, LoginReturn::Ui);
-    task.abort();
-}
-
 #[test]
 fn revoking_a_user_drops_only_that_users_sessions() {
     let state = OidcState::new(&[], "http://localhost").unwrap();
-    let user = |name: &str| SessionUser { username: name.to_string(), teams: Vec::new() };
-    let expires = Utc::now().timestamp() + 60;
+    let user = |name: &str| SessionUser { user_id: name.to_string(), teams: Vec::new() };
+    let expires = Timestamp::now().as_second() + 60;
     let alice = state
         .issue_session(user("alice"), expires, LoginReturn::Token)
         .unwrap();
@@ -339,7 +331,7 @@ fn revoking_a_user_drops_only_that_users_sessions() {
             .session(&bob.token)
             .unwrap()
             .unwrap()
-            .username,
+            .user_id,
         "bob",
     );
 }
@@ -347,14 +339,14 @@ fn revoking_a_user_drops_only_that_users_sessions() {
 #[test]
 fn sessions_expire_and_configuration_fails_closed() {
     let state = OidcState::new(&[], "http://localhost").unwrap();
-    let alice = || SessionUser { username: "alice".to_string(), teams: Vec::new() };
+    let alice = || SessionUser { user_id: "alice".to_string(), teams: Vec::new() };
     assert!(
         state
             .issue_session(alice(), 0, LoginReturn::Token)
             .is_err(),
     );
     let session = state
-        .issue_session(alice(), Utc::now().timestamp() + 60, LoginReturn::Token)
+        .issue_session(alice(), Timestamp::now().as_second() + 60, LoginReturn::Token)
         .unwrap();
     state.browser.sessions
         .lock()
@@ -380,9 +372,10 @@ async fn workloads_verify_against_issuers_without_an_authorization_endpoint() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(workload.identity.username, "ci");
+    assert_eq!(workload.identity.user_id, "ci");
     let mut login = config(&provider.issuer);
     login.login = Some(OidcLogin {
+        scim: false,
         client_secret: None,
         users: vec![login.workloads.remove(0).identity],
         groups: None,
@@ -429,7 +422,7 @@ async fn workloads_verify_after_the_signing_key_rotates() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(workload.identity.username, "ci");
+    assert_eq!(workload.identity.user_id, "ci");
     assert_eq!(*provider.key_requests.lock().unwrap(), 2);
     task.abort();
 }
@@ -458,7 +451,10 @@ async fn refresh_is_bounded_and_recovers_after_expiration() {
 fn verifies_rs256_workload_tokens() {
     use openidconnect::{
         PrivateSigningKey as _,
-        core::{CoreJwsSigningAlgorithm, CoreRsaPrivateSigningKey},
+        core::{
+            CoreJwsSigningAlgorithm,
+            CoreRsaPrivateSigningKey,
+        },
     };
     let key = CoreRsaPrivateSigningKey::from_pem(
         include_str!("../../tests/fixtures/oidc-test-key.pem"),
@@ -481,6 +477,7 @@ async fn rejects_expired_state_and_wrong_nonce() {
     let (provider, task) = mock_provider().await;
     let mut config = config(&provider.issuer);
     config.login = Some(OidcLogin {
+        scim: false,
         client_secret: None,
         users: vec![config.workloads.remove(0).identity],
         groups: None,
@@ -494,7 +491,14 @@ async fn rejects_expired_state_and_wrong_nonce() {
         .collect();
     *provider.nonce.lock().unwrap() = Some("wrong-nonce".to_string());
     *provider.challenge.lock().unwrap() = Some(query["code_challenge"].clone());
-    assert!(state.finish("example", &start.state, &start.browser_secret, "code").await.is_err());
+    assert!(
+        state
+            .finish("example", &start.state, &start.browser_secret, "code", |_| Err::<String, _>(
+                rejected()
+            ))
+            .await
+            .is_err(),
+    );
     assert!(
         state.browser.sessions
             .lock()
@@ -503,9 +507,16 @@ async fn rejects_expired_state_and_wrong_nonce() {
     );
     let start = state.start("example", LoginReturn::Token).await.unwrap();
     let mut login = state.open_login(&start.browser_secret).unwrap();
-    login.expires = Utc::now().timestamp() - 1;
+    login.expires = Timestamp::now().as_second() - 1;
     let expired_cookie = state.seal_login(&login).unwrap();
-    assert!(state.finish("example", &start.state, &expired_cookie, "code").await.is_err());
+    assert!(
+        state
+            .finish("example", &start.state, &expired_cookie, "code", |_| Err::<String, _>(
+                rejected()
+            ))
+            .await
+            .is_err(),
+    );
     task.abort();
 }
 
@@ -514,7 +525,8 @@ async fn selects_client_secret_post_from_discovery() {
     let (provider, task) = mock_provider().await;
     let mut config = config(&provider.issuer);
     config.login = Some(OidcLogin {
-        client_secret: Some("secret".to_string()),
+        scim: false,
+        client_secret: Some("secret".to_string().into()),
         users: vec![config.workloads.remove(0).identity],
         groups: None,
     });
@@ -528,7 +540,12 @@ async fn selects_client_secret_post_from_discovery() {
         .collect();
     *provider.nonce.lock().unwrap() = Some(query["nonce"].clone());
     *provider.challenge.lock().unwrap() = Some(query["code_challenge"].clone());
-    state.finish("example", &start.state, &start.browser_secret, "code").await.unwrap();
+    state
+        .finish("example", &start.state, &start.browser_secret, "code", |_| {
+            Err::<String, _>(rejected())
+        })
+        .await
+        .unwrap();
     task.abort();
 }
 
@@ -537,6 +554,7 @@ async fn anonymous_login_starts_cannot_exhaust_or_evict_active_flows() {
     let (provider, task) = mock_provider().await;
     let mut config = config(&provider.issuer);
     config.login = Some(OidcLogin {
+        scim: false,
         client_secret: None,
         users: vec![config.workloads.remove(0).identity],
         groups: None,
@@ -559,8 +577,20 @@ async fn anonymous_login_starts_cannot_exhaust_or_evict_active_flows() {
             .unwrap()
             .is_empty(),
     );
-    state.finish("example", &start.state, &start.browser_secret, "code").await.unwrap();
-    assert!(state.finish("example", &start.state, &start.browser_secret, "code").await.is_err());
+    state
+        .finish("example", &start.state, &start.browser_secret, "code", |_| {
+            Err::<String, _>(rejected())
+        })
+        .await
+        .unwrap();
+    assert!(
+        state
+            .finish("example", &start.state, &start.browser_secret, "code", |_| Err::<String, _>(
+                rejected()
+            ))
+            .await
+            .is_err(),
+    );
     task.abort();
 }
 
@@ -595,18 +625,35 @@ async fn failed_callbacks_are_rejected_on_repeated_and_concurrent_attempts() {
     let (provider, task) = mock_provider().await;
     let mut config = config(&provider.issuer);
     config.login = Some(OidcLogin {
+        scim: false,
         client_secret: None,
         users: vec![config.workloads.remove(0).identity],
         groups: None,
     });
     let state = OidcState::new(&[config], "https://registry.example").unwrap();
     let start = state.start("example", LoginReturn::Token).await.unwrap();
-    let first = state.finish("example", &start.state, &start.browser_secret, "invalid");
-    let concurrent = state.finish("example", &start.state, &start.browser_secret, "invalid");
+    let first = state.finish("example", &start.state, &start.browser_secret, "invalid", |_| {
+        Err::<String, _>(rejected())
+    });
+    let concurrent =
+        state.finish("example", &start.state, &start.browser_secret, "invalid", |_| {
+            Err::<String, _>(rejected())
+        });
     let (first, concurrent) = tokio::join!(first, concurrent);
     assert!(first.is_err());
     assert!(concurrent.is_err());
-    assert!(state.finish("example", &start.state, &start.browser_secret, "invalid").await.is_err());
+    assert!(
+        state
+            .finish(
+                "example",
+                &start.state,
+                &start.browser_secret,
+                "invalid",
+                |_| Err::<String, _>(rejected())
+            )
+            .await
+            .is_err(),
+    );
     assert_eq!(*provider.token_requests.lock().unwrap(), 1);
     assert!(
         state.browser.sessions
@@ -622,6 +669,7 @@ async fn callback_capacity_recovers_without_blocking_unattempted_logins() {
     let (provider, task) = mock_provider().await;
     let mut config = config(&provider.issuer);
     config.login = Some(OidcLogin {
+        scim: false,
         client_secret: None,
         users: vec![config.workloads.remove(0).identity],
         groups: None,
@@ -635,7 +683,18 @@ async fn callback_capacity_recovers_without_blocking_unattempted_logins() {
     }
     assert_eq!(state.attempts.lock().unwrap().len(), super::MAX_ENTRIES);
     let permits = state.exchanges.try_acquire_many(16).unwrap();
-    assert!(state.finish("example", &start.state, &start.browser_secret, "invalid").await.is_err());
+    assert!(
+        state
+            .finish(
+                "example",
+                &start.state,
+                &start.browser_secret,
+                "invalid",
+                |_| Err::<String, _>(rejected())
+            )
+            .await
+            .is_err(),
+    );
     assert_eq!(*provider.token_requests.lock().unwrap(), 0);
     drop(permits);
     let query: HashMap<_, _> = Url::parse(&start.url)
@@ -645,7 +704,12 @@ async fn callback_capacity_recovers_without_blocking_unattempted_logins() {
         .collect();
     *provider.nonce.lock().unwrap() = Some(query["nonce"].clone());
     *provider.challenge.lock().unwrap() = Some(query["code_challenge"].clone());
-    state.finish("example", &start.state, &start.browser_secret, "code").await.unwrap();
+    state
+        .finish("example", &start.state, &start.browser_secret, "code", |_| {
+            Err::<String, _>(rejected())
+        })
+        .await
+        .unwrap();
     assert_eq!(*provider.token_requests.lock().unwrap(), 1);
     task.abort();
 }
@@ -659,15 +723,13 @@ impl DiscoveryGate {
     }
 }
 
-/// Groups config granting, for each `(group, team)`, `team` on registry
-/// `private`.
+/// Groups config granting `team` for each `(group, team)`.
 fn groups(grants: &[(&str, &str)]) -> OidcGroups {
     let teams = grants
         .iter()
         .map(|(group, team)| OidcTeamGrant {
             group: (*group).to_string(),
-            registry: "private".to_string(),
-            team: (*team).to_string(),
+            team_id: (*team).to_string(),
         })
         .collect();
     OidcGroups { claim: "groups".to_string(), teams }
@@ -676,6 +738,7 @@ fn groups(grants: &[(&str, &str)]) -> OidcGroups {
 #[test]
 fn a_groups_claim_grants_the_teams_of_the_groups_it_lists() {
     let login = OidcLogin {
+        scim: false,
         client_secret: None,
         users: Vec::new(),
         groups: Some(groups(&[("eng", "platform"), ("eng", "release"), ("ops", "ops")])),
@@ -683,7 +746,7 @@ fn a_groups_claim_grants_the_teams_of_the_groups_it_lists() {
     let teams = |payload: Value| -> Vec<String> {
         granted_teams(&login, &payload)
             .into_iter()
-            .map(|grant| grant.team)
+            .map(|grant| grant.team_id)
             .collect()
     };
     assert_eq!(teams(json!({"groups": ["eng"]})), ["platform", "release"]);
@@ -698,9 +761,9 @@ fn a_groups_claim_grants_the_teams_of_the_groups_it_lists() {
 #[test]
 fn a_handoff_code_redeems_its_session_once() {
     let state = OidcState::new(&[], "https://registry.example").unwrap();
-    let alice = SessionUser { username: "alice".to_string(), teams: Vec::new() };
+    let alice = SessionUser { user_id: "alice".to_string(), teams: Vec::new() };
     let session = state
-        .issue_session(alice, Utc::now().timestamp() + 60, LoginReturn::Ui)
+        .issue_session(alice, Timestamp::now().as_second() + 60, LoginReturn::Ui)
         .unwrap();
     let token = session.token.clone();
     let code = state.hand_off(session).unwrap();
@@ -716,10 +779,11 @@ fn a_handoff_code_redeems_its_session_once() {
 fn empty_client_secret_is_rejected() {
     let mut config = config("https://issuer.example");
     config.login = Some(OidcLogin {
-        client_secret: Some("   ".to_string()),
+        scim: false,
+        client_secret: Some("   ".to_string().into()),
         users: vec![OidcBinding {
             subject: "user-1".to_string(),
-            username: "alice".to_string(),
+            user_id: "alice".to_string(),
             claims: BTreeMap::new(),
         }],
         groups: None,
@@ -729,3 +793,7 @@ fn empty_client_secret_is_rejected() {
     };
     assert!(err.to_string().contains("client secret cannot be empty"), "{err}");
 }
+
+mod password_cleanup;
+
+mod browser_login;

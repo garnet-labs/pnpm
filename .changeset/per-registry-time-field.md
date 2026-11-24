@@ -1,10 +1,4 @@
 ---
-"@pnpm/config.normalize-registries": minor
-"@pnpm/store.connection-manager": minor
-"@pnpm/resolving.npm-resolver": minor
-"@pnpm/config.reader": minor
-"@pnpm/types": minor
-"pacquet": minor
 "pnpm": minor
 ---
 

@@ -1,9 +1,56 @@
-use super::{DependencyGroup, PackageSelector, ResolvedOverride, VersionsOverrider};
-use node_semver::{Range, Version};
+use super::{
+    DependencyGroup,
+    PackageSelector,
+    ResolvedOverride,
+    VersionsOverrider,
+};
+use node_semver::{
+    Range,
+    Version,
+};
+use pnpm_catalogs_resolver::{
+    CatalogAnchor,
+    CatalogResolutionResult,
+    WantedDependency,
+    resolve_from_catalog,
+};
+use pnpm_catalogs_types::Catalogs;
 use pnpm_config_parse_overrides::OverrideDependencyType;
 use pnpm_matcher::WildcardMatcher;
+use pnpm_semver_include_prerelease::{
+    ParsedSemverRange,
+    parse_strict_semver_range,
+};
+use serde_json::Value;
+use std::borrow::Cow;
 
 impl VersionsOverrider {
+    pub(super) fn applicable_parent_scoped<'b>(
+        &'b self,
+        manifest: &Value,
+    ) -> Vec<&'b ResolvedOverride> {
+        let Some(manifest_name) = manifest.get("name").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let manifest_version = manifest.get("version").and_then(Value::as_str);
+
+        self.parent_scoped
+            .iter()
+            .filter(|entry| {
+                let Some(parent) = entry.inner.parent_pkg.as_ref() else { return false };
+                let name_matches = entry.parent_name_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.matches(manifest_name));
+                let range_matches = match (parent.bare_specifier.as_deref(), manifest_version) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(range), Some(version)) => semver_satisfies(version, range),
+                };
+                name_matches && range_matches
+            })
+            .collect()
+    }
+
     pub(super) fn choose_override<'b>(
         &'b self,
         group: Option<DependencyGroup>,
@@ -11,8 +58,9 @@ impl VersionsOverrider {
         dep_name: &str,
         dep_spec: &str,
     ) -> Option<&'b ResolvedOverride> {
-        Self::pick_most_specific(group, applicable_parent_scoped, dep_name, dep_spec)
-            .or_else(|| self.pick_most_specific_generic(group, dep_name, dep_spec))
+        let effective_spec = resolve_catalog_spec(&self.catalogs, dep_name, dep_spec);
+        Self::pick_most_specific(group, applicable_parent_scoped, dep_name, &effective_spec)
+            .or_else(|| self.pick_most_specific_generic(group, dep_name, &effective_spec))
     }
 
     fn pick_most_specific<'b>(
@@ -21,13 +69,12 @@ impl VersionsOverrider {
         dep_name: &str,
         dep_spec: &str,
     ) -> Option<&'b ResolvedOverride> {
-        let mut matching: Vec<&'b ResolvedOverride> = candidates
+        let matching: Vec<&'b ResolvedOverride> = candidates
             .iter()
             .copied()
             .filter(|entry| matches_resolved_target(entry, group, dep_name, dep_spec))
             .collect();
-        sort_by_specificity(&mut matching);
-        matching.into_iter().next()
+        pick_most_specific_match(&matching)
     }
 
     fn pick_most_specific_generic(
@@ -36,39 +83,62 @@ impl VersionsOverrider {
         dep_name: &str,
         dep_spec: &str,
     ) -> Option<&ResolvedOverride> {
-        let mut matching: Vec<&ResolvedOverride> = self.generic
+        let matching: Vec<&ResolvedOverride> = self.generic
             .iter()
             .filter(|entry| matches_resolved_target(entry, group, dep_name, dep_spec))
             .collect();
-        sort_by_specificity(&mut matching);
-        matching.into_iter().next()
+        pick_most_specific_match(&matching)
     }
 }
 
 /// Parse a dependency edge's declared spec for the convergence
-/// consult. Only plain semver ranges participate — `workspace:`,
+/// consult. Only plain semver ranges participate, `workspace:`,
 /// `catalog:`, `npm:`, git/URL, and dist-tag specifiers have no
 /// defined "satisfies" relation and yield `None`. An empty declared
 /// spec counts as `*`.
 pub(crate) fn parse_declared_range(spec: &str) -> Option<Range> {
-    if spec.is_empty() {
-        return Some(Range::any());
-    }
-    Range::parse(spec).ok()
+    parse_strict_semver_range(spec)
 }
 
 /// A target matches when its dependency-type filter (if any) matches
 /// `group`, its name pattern matches `dep_name`, and its range
-/// intersects `dep_spec`.
+/// intersects `dep_spec` (dereferenced through `catalogs` when `dep_spec`
+/// uses the `catalog:` protocol).
 pub(crate) fn matches_target(
     target: &PackageSelector,
     group: Option<DependencyGroup>,
     dep_name: &str,
     dep_spec: &str,
+    catalogs: &Catalogs,
 ) -> bool {
     matches_dep_type(target.dep_type, group)
         && WildcardMatcher::new(&target.name).matches(dep_name)
-        && is_intersecting_range(target.bare_specifier.as_deref(), dep_spec)
+        && is_intersecting_range(
+            target.bare_specifier.as_deref(),
+            &resolve_catalog_spec(catalogs, dep_name, dep_spec),
+        )
+}
+
+/// The specifier a `catalog:` reference resolves to in `catalogs`, or
+/// `dep_spec` when it is not a `catalog:` reference or has no valid entry.
+fn resolve_catalog_spec<'a>(
+    catalogs: &'a Catalogs,
+    dep_name: &str,
+    dep_spec: &'a str,
+) -> Cow<'a, str> {
+    if catalogs.is_empty() || !dep_spec.starts_with("catalog:") {
+        return Cow::Borrowed(dep_spec);
+    }
+    match resolve_from_catalog(
+        catalogs,
+        &WantedDependency { alias: dep_name.to_string(), bare_specifier: dep_spec.to_string() },
+        CatalogAnchor::AsWritten,
+    ) {
+        CatalogResolutionResult::Found(found) => Cow::Owned(found.resolution.specifier),
+        CatalogResolutionResult::Misconfiguration(_) | CatalogResolutionResult::Unused => {
+            Cow::Borrowed(dep_spec)
+        }
+    }
 }
 
 pub(super) fn matches_resolved_target(
@@ -113,36 +183,81 @@ fn specificity_key(entry: &ResolvedOverride) -> Specificity {
     Specificity { has_wildcard_parent, has_wildcard_target, is_untyped_target }
 }
 
-fn compare_range_specificity(lhs: &ResolvedOverride, rhs: &ResolvedOverride) -> std::cmp::Ordering {
-    let lhs_spec = lhs.inner.target_pkg.bare_specifier.as_deref().unwrap_or("");
-    let rhs_spec = rhs.inner.target_pkg.bare_specifier.as_deref().unwrap_or("");
-    // Rust's `sort_by` requires a total order, so the comparison
-    // widens to a 3-way result: `lhs` is
-    // strictly more specific when `rhs ⊇ lhs` but not vice versa,
-    // strictly less specific in the mirror case, and equal when
-    // both ranges cover each other (e.g. identical strings, or
-    // mutually-intersecting unions). The `Equal` arm is what keeps
-    // `sort_by`'s preconditions satisfied.
-    let rhs_covers_lhs = is_intersecting_range(Some(rhs_spec), lhs_spec);
-    let lhs_covers_rhs = is_intersecting_range(Some(lhs_spec), rhs_spec);
-    match (rhs_covers_lhs, lhs_covers_rhs) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => std::cmp::Ordering::Equal,
+/// Pre-parsed range constraint on an override selector half (`parent` or `target`),
+/// constructed once per override so manifest dependency lookups compare interval
+/// bounds without reparsing range strings or retaining quadratic edge tables.
+pub(super) enum SelectorBound {
+    Unbounded,
+    Semver(ParsedSemverRange),
+    NonSemver(String),
+}
+
+impl SelectorBound {
+    pub(super) fn parse(specifier: Option<&str>) -> Self {
+        let Some(trimmed) = specifier
+            .map(str::trim)
+            .filter(|range| !range.is_empty())
+        else {
+            return Self::Unbounded;
+        };
+        match ParsedSemverRange::parse(trimmed) {
+            Some(parsed) => Self::Semver(parsed),
+            None => Self::NonSemver(trimmed.to_string()),
+        }
+    }
+
+    fn covers(&self, narrow: &Self) -> bool {
+        match (self, narrow) {
+            (Self::Unbounded, _) => true,
+            (_, Self::Unbounded) => false,
+            (Self::Semver(dom), Self::Semver(sub)) => dom.covers(sub),
+            (Self::NonSemver(lhs), Self::NonSemver(rhs)) => lhs == rhs,
+            (Self::Semver(_), Self::NonSemver(_)) | (Self::NonSemver(_), Self::Semver(_)) => false,
+        }
     }
 }
 
-/// Sort overrides so the most specific one sorts first:
+/// Select the first most-specific override among `matching`:
 /// 1. Exact parent name before wildcard parent name.
 /// 2. Exact target name before wildcard target name.
 /// 3. Dependency-type-qualified target (`:peer`, `:optional`, `:prod`) before untyped.
-/// 4. Narrower target semver range (`b ⊃ a ⇒ a sorts before b`).
-pub(super) fn sort_by_specificity(matching: &mut [&ResolvedOverride]) {
-    matching.sort_by(|lhs, rhs| {
-        specificity_key(lhs)
-            .cmp(&specificity_key(rhs))
-            .then_with(|| compare_range_specificity(lhs, rhs))
-    });
+/// 4. Narrower `(parent, target)` semver range (`b ⊃ a ⇒ a beats b`),
+///    regardless of declaration order.
+fn pick_most_specific_match<'b>(matching: &[&'b ResolvedOverride]) -> Option<&'b ResolvedOverride> {
+    if matching.len() <= 1 {
+        return matching.first().copied();
+    }
+    let best_key = matching
+        .iter()
+        .map(|entry| specificity_key(entry))
+        .min()?;
+    let top_tier: Vec<&'b ResolvedOverride> = matching
+        .iter()
+        .copied()
+        .filter(|entry| specificity_key(entry) == best_key)
+        .collect();
+    if top_tier.len() <= 1 {
+        return top_tier.first().copied();
+    }
+    top_tier
+        .iter()
+        .copied()
+        .find(|candidate| {
+            !top_tier
+                .iter()
+                .any(|other| {
+                    !std::ptr::eq(*other, *candidate) && is_strictly_narrower(other, candidate)
+                })
+        })
+}
+
+fn is_strictly_narrower(lhs: &ResolvedOverride, rhs: &ResolvedOverride) -> bool {
+    selector_covers(rhs, lhs) && !selector_covers(lhs, rhs)
+}
+
+fn selector_covers(broad: &ResolvedOverride, narrow: &ResolvedOverride) -> bool {
+    broad.parent_bound.covers(&narrow.parent_bound)
+        && broad.target_bound.covers(&narrow.target_bound)
 }
 
 /// An absent `range1` (or empty target spec) matches everything. An
@@ -153,17 +268,17 @@ fn is_intersecting_range(range1: Option<&str>, range2: &str) -> bool {
     if range1_str.is_empty() || range2 == range1_str {
         return true;
     }
-    let Ok(parsed1) = range1_str.parse::<Range>() else { return false };
-    let Ok(parsed2) = range2.parse::<Range>() else { return false };
+    let Some(parsed1) = parse_strict_semver_range(range1_str) else { return false };
+    let Some(parsed2) = parse_strict_semver_range(range2) else { return false };
     parsed1.allows_any(&parsed2)
 }
 
 /// True when `version` (parsed as a concrete semver) satisfies
 /// `range`, the guard in the parent-scoped filter.
-/// A non-parseable version OR range fails the match conservatively —
+/// A non-parseable version OR range fails the match conservatively,
 /// the parent constraint is treated as not applying.
 pub(super) fn semver_satisfies(version: &str, range: &str) -> bool {
     let Ok(parsed_version) = version.parse::<Version>() else { return false };
-    let Ok(parsed_range) = range.parse::<Range>() else { return false };
+    let Some(parsed_range) = parse_strict_semver_range(range) else { return false };
     parsed_range.satisfies(&parsed_version)
 }

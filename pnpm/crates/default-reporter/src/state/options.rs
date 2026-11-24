@@ -1,4 +1,7 @@
-use crate::{MaxLogLevel, SummaryScope};
+use crate::{
+    MaxLogLevel,
+    SummaryScope,
+};
 
 /// Rendering settings that cannot be recovered from the event stream.
 #[derive(Debug, Clone)]
@@ -7,14 +10,12 @@ pub struct ReporterOptions {
     pub append_only: bool,
     /// Verbosity ceiling from pnpm's `--loglevel` setting.
     pub max_log_level: MaxLogLevel,
-    /// Replaces the second line of the ignored-builds box — the one that
-    /// tells the user how to approve a build. pnpm's
+    /// Replaces the build instruction in the approval notice. pnpm's
     /// `approveBuildsInstructionText`, for embedders whose users approve
-    /// builds through the embedder's own configuration rather than
-    /// `pnpm approve-builds`.
+    /// builds through the embedder's own configuration rather than pnpm.
     pub ignored_builds_instruction_text: Option<String>,
     /// Package-name patterns whose *linked* entries are left out of the
-    /// packages-diff summary — an entry is linked when it carries a
+    /// packages-diff summary, an entry is linked when it carries a
     /// `from`, i.e. it is symlinked in rather than materialized from the
     /// store. The Rust counterpart of the TypeScript reporter's
     /// `filterPkgsDiff` callback: an embedder that links its own runtime
@@ -43,7 +44,7 @@ pub struct LifecycleOptions {
     /// whole run as one block. pnpm's `aggregateOutput`.
     pub aggregate_output: bool,
     /// Drop the project prefix from streamed script output lines. pnpm's
-    /// `hideLifecyclePrefix` — the `$ <script>` and `Done` / `Failed`
+    /// `hideLifecyclePrefix`, the `$ <script>` and `Done` / `Failed`
     /// lines keep theirs.
     pub hide_prefix: bool,
 }
@@ -69,6 +70,10 @@ pub struct ScopeOptions {
     pub reports_scope: bool,
     /// Whether direct dependency warnings use workspace-relative prefixes.
     pub recursive: bool,
+    /// Whether the command edits the manifests of the projects it installs.
+    /// Only then does a workspace summary infer which dependencies of a
+    /// project with no previous install the command asked for.
+    pub edits_manifests: bool,
 }
 
 impl Default for ReporterOptions {
@@ -90,6 +95,7 @@ impl Default for ReporterOptions {
                 reports_scope: false,
                 recursive: false,
                 is_global: false,
+                edits_manifests: false,
             },
         }
     }
@@ -102,6 +108,7 @@ impl Default for ScopeOptions {
             reports_scope: false,
             recursive: false,
             is_global: false,
+            edits_manifests: false,
         }
     }
 }

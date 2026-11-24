@@ -1,18 +1,34 @@
 use super::{
-    super::{LockfileToHoistedDepGraphOptions, lockfile_to_hoisted_dep_graph},
-    dep_key, directory_resolution, lockfile_with, metadata_stub, pkg_name, resolved_dep, ver_peer,
+    super::{
+        LockfileToHoistedDepGraphOptions,
+        lockfile_to_hoisted_dep_graph,
+    },
+    dep_key,
+    directory_resolution,
+    lockfile_with,
+    metadata_stub,
+    pkg_name,
+    resolved_dep,
+    ver_peer,
     workspace_lockfile,
 };
 use pnpm_lockfile::{
-    Lockfile, PackageMetadata, ResolvedDependencyMap, ResolvedDependencySpec, SnapshotDepRef,
+    Lockfile,
+    PackageMetadata,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
     SnapshotEntry,
 };
 use pnpm_modules_yaml::DepPath;
 use pretty_assertions::assert_eq;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+};
 
 /// A peer-suffixed reference (`b@1.0.0(peer@2.0.0)`) must resolve its
-/// metadata through the peer-stripped `packages:` key (`b@1.0.0`) —
+/// metadata through the peer-stripped `packages:` key (`b@1.0.0`),
 /// lockfile `packages:` keys never carry peer suffixes. Before the
 /// fallback in `lookup_package_metadata`, the walker silently dropped
 /// every peered node and its whole subtree from the graph, so the
@@ -41,7 +57,7 @@ fn walker_resolves_peered_reference_via_peerless_packages_key() {
     let lockfile = lockfile_with(root_deps, packages, snapshots);
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -60,11 +76,11 @@ fn walker_resolves_peered_reference_via_peerless_packages_key() {
     // The peer itself is a plain dep of the root and must be there too.
     assert!(result.graph.contains_key(&lockfile_dir.join("node_modules").join("peer")));
 }
-/// The hoister collapses every peer variant of one package version onto
-/// a single node keyed by the first snapshot key it sees, so the graph
-/// holds no entry under the other variants' keys. Edges declared against
-/// one of those — an importer's own dependency, or a sibling package's —
-/// still have to resolve to the copy that node produced.
+/// Peer variants of one package version can deduplicate into one
+/// directory, whose graph node carries the first variant's key. Edges
+/// declared against another of them (an importer's own dependency, or a
+/// sibling package's) still have to resolve to that directory, which the
+/// hoister lists as serving the variant.
 #[test]
 fn walker_wires_edges_declared_against_a_collapsed_peer_variant() {
     let mut root_deps = ResolvedDependencyMap::new();
@@ -106,7 +122,7 @@ fn walker_wires_edges_declared_against_a_collapsed_peer_variant() {
     );
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -123,9 +139,70 @@ fn walker_wires_edges_declared_against_a_collapsed_peer_variant() {
         "a snapshot edge on the collapsed variant resolves to the surviving copy",
     );
 }
+/// Two directories hold `b@1.0.0`, since the root's slot goes to `b@2.0.0`:
+/// one under `x`, walked first, and one under `y`. The second also serves
+/// the variant `z` declares, which was deduplicated into it. `z`'s edge has
+/// to lead there, to the copy next to it, not to the first directory of
+/// the package.
+#[test]
+fn walker_wires_an_edge_to_the_directory_that_serves_its_variant() {
+    let mut root_deps = ResolvedDependencyMap::new();
+    for (name, version) in [("b", "2.0.0"), ("x", "1.0.0"), ("y", "1.0.0"), ("z", "2.0.0")] {
+        root_deps.insert(pkg_name(name), resolved_dep(version));
+    }
+
+    let mut packages = HashMap::new();
+    let mut snapshots = HashMap::new();
+    let leaves = [
+        ("b", "1.0.0", "1.0.0(peer@1.0.0)"),
+        ("b", "1.0.0", "1.0.0(peer@2.0.0)"),
+        ("b", "1.0.0", "1.0.0(peer@3.0.0)"),
+        ("b", "2.0.0", "2.0.0"),
+        ("z", "2.0.0", "2.0.0"),
+    ];
+    for (name, version, suffix) in leaves {
+        packages.insert(dep_key(name, version), metadata_stub());
+        snapshots.insert(dep_key(name, suffix), SnapshotEntry::default());
+    }
+    let dependents = [
+        ("x", vec![("b", "1.0.0(peer@1.0.0)")]),
+        ("y", vec![("b", "1.0.0(peer@2.0.0)"), ("z", "1.0.0")]),
+        ("z", vec![("b", "1.0.0(peer@3.0.0)")]),
+    ];
+    for (name, dependencies) in dependents {
+        let dependencies = dependencies
+            .into_iter()
+            .map(|(alias, version)| (pkg_name(alias), SnapshotDepRef::Plain(ver_peer(version))))
+            .collect();
+        packages.insert(dep_key(name, "1.0.0"), metadata_stub());
+        snapshots.insert(
+            dep_key(name, "1.0.0"),
+            SnapshotEntry { dependencies: Some(dependencies), ..SnapshotEntry::default() },
+        );
+    }
+
+    let lockfile =
+        workspace_lockfile(vec![(Lockfile::ROOT_IMPORTER_KEY, root_deps)], packages, snapshots);
+    let lockfile_dir = PathBuf::from("/repo");
+    let opts = LockfileToHoistedDepGraphOptions {
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
+        ..LockfileToHoistedDepGraphOptions::default()
+    };
+    let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
+
+    let modules = lockfile_dir.join("node_modules");
+    let first = modules.join("x/node_modules/b");
+    let serving = modules.join("y/node_modules/b");
+    assert!(result.graph.contains_key(&first), "{:?}", result.graph.keys().collect::<Vec<_>>());
+    assert_eq!(
+        result.graph[&modules.join("y/node_modules/z")].children.get("b"),
+        Some(&serving),
+        "the edge leads to the copy that serves the variant",
+    );
+}
 /// Peer variants of an injected directory dependency are exempt from
 /// the collapse (see [`pnpm_real_hoist::pkg_id`]), so the walk has to
-/// keep a location — and a direct-dependency entry — per variant,
+/// keep a location (and a direct-dependency entry) per variant,
 /// where every collapsed package funnels into one.
 #[test]
 fn walker_keeps_file_dep_peer_variants_apart() {
@@ -177,7 +254,7 @@ fn walker_keeps_file_dep_peer_variants_apart() {
         snapshots,
     );
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: PathBuf::from("/repo"),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(std::path::Path::new("/repo")),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -233,8 +310,11 @@ fn walker_places_root_packages_in_the_configured_modules_dir() {
     let lockfile = lockfile_with(root_deps, packages, snapshots);
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
-        root_modules_dir: "deps/vendor".into(),
+        modules_dirs: crate::ImporterModulesDirs::new(
+            &lockfile_dir,
+            std::path::Path::new("deps/vendor"),
+            std::ffi::OsString::from("deps/vendor"),
+        ),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");

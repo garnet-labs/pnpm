@@ -1,15 +1,44 @@
 //! Lockfile-backed dependency graph shared by the forward (`list`) and
 //! reverse (`why`) tree builders.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 
 use pnpm_lockfile::{
-    Lockfile, PeerEdgeOptions, PeerSatisfactionEdges, PkgNameVerPeer, ProjectSnapshot,
+    BoundProviders,
+    Lockfile,
+    PeerEdgeOptions,
+    PeerSatisfactionEdges,
+    PkgNameVerPeer,
+    ProjectSnapshot,
     SnapshotEntry,
 };
 use pnpm_modules_yaml::IncludedDependencies;
 
 use super::TreeNodeId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DepField {
+    #[serde(rename = "dependencies")]
+    Dependencies,
+    #[serde(rename = "devDependencies")]
+    DevDependencies,
+    #[serde(rename = "optionalDependencies")]
+    OptionalDependencies,
+}
+
+impl DepField {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DepField::Dependencies => "dependencies",
+            DepField::DevDependencies => "devDependencies",
+            DepField::OptionalDependencies => "optionalDependencies",
+        }
+    }
+}
 
 /// One outgoing dependency edge of a graph node.
 #[derive(Debug, Clone)]
@@ -28,6 +57,14 @@ pub struct GraphEdge {
     /// be traversed (links outside the workspace, links from external
     /// packages).
     pub target: Option<TreeNodeId>,
+    /// The selected importer declaration, retained after group filtering.
+    pub importer_dependency: Option<ImporterDependency>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImporterDependency {
+    pub field: DepField,
+    pub specifier: String,
 }
 
 impl GraphEdge {
@@ -50,7 +87,7 @@ impl GraphEdge {
 #[derive(Debug, Default)]
 pub struct GraphNode {
     pub edges: Vec<GraphEdge>,
-    /// Names declared in this package's `peerDependencies` — a child
+    /// Names declared in this package's `peerDependencies`, a child
     /// edge whose alias is in this set is a peer dependency.
     pub peers: HashSet<String>,
 }
@@ -67,17 +104,29 @@ pub struct BuildGraphOptions<'a> {
     /// How the graph classifies the peer-satisfaction edges it leaves out
     /// while `include` excludes a group.
     pub peer_edges: PeerEdgeOptions,
+    pub bound_peer_edges: BoundPeerEdges,
+}
+
+/// What the graph does with the edges through which a package receives the
+/// peers its key binds. A dependency that is declared as a peer but not bound
+/// by the key is the package's own and is always followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundPeerEdges {
+    Follow,
+    /// Leave them out, so packages reachable only as a peer are not in the
+    /// graph.
+    Skip,
 }
 
 /// Breadth-first walk from `root_ids`, recording every reachable node
 /// and its outgoing edges. Mirrors the TypeScript `buildDependencyGraph`.
 #[must_use]
 pub fn build_dependency_graph(
-    root_ids: &[TreeNodeId],
+    root_ids: Vec<TreeNodeId>,
     opts: &BuildGraphOptions<'_>,
 ) -> DependencyGraph {
     let mut graph = DependencyGraph::default();
-    let mut queue: Vec<TreeNodeId> = root_ids.to_vec();
+    let mut queue = root_ids;
     let mut queue_idx = 0;
     let mut visited: HashSet<TreeNodeId> = HashSet::new();
     let skipped_peer_edges = if opts.include.excludes_a_group() {
@@ -94,23 +143,68 @@ pub fn build_dependency_graph(
             continue;
         }
 
-        let edges = node_edges(&node_id, opts, &skipped_peer_edges, &publish_dirs);
-        let peers = match &node_id {
-            TreeNodeId::Package(dep_path) => peer_names(opts.lockfile, dep_path),
-            TreeNodeId::Importer(_) => HashSet::new(),
-        };
-
+        let node = graph_node(&node_id, opts, &skipped_peer_edges, &publish_dirs);
         queue.extend(
-            edges
+            node.edges
                 .iter()
                 .filter_map(|edge| edge.target.as_ref())
                 .filter(|target| !visited.contains(*target))
                 .cloned(),
         );
-        graph.nodes.insert(node_id, GraphNode { edges, peers });
+        graph.nodes.insert(node_id, node);
     }
 
     graph
+}
+
+fn graph_node(
+    node_id: &TreeNodeId,
+    opts: &BuildGraphOptions<'_>,
+    skipped_peer_edges: &PeerSatisfactionEdges,
+    publish_dirs: &HashMap<String, String>,
+) -> GraphNode {
+    let mut edges = node_edges(node_id, opts, skipped_peer_edges, publish_dirs);
+    let peers = match node_id {
+        TreeNodeId::Package(dep_path) => peer_names(opts.lockfile, dep_path),
+        TreeNodeId::Importer(_) => HashSet::new(),
+    };
+    match opts.bound_peer_edges {
+        BoundPeerEdges::Follow => {}
+        BoundPeerEdges::Skip => {
+            if let TreeNodeId::Package(dep_path) = node_id {
+                drop_bound_peer_edges(&mut edges, dep_path, &peers, opts.lockfile);
+            }
+        }
+    }
+    GraphNode { edges, peers }
+}
+
+/// A key without a peer suffix binds nothing, so every dependency of that
+/// package is its own, even one whose name it also declares as a peer.
+fn drop_bound_peer_edges(
+    edges: &mut Vec<GraphEdge>,
+    dep_path: &PkgNameVerPeer,
+    peers: &HashSet<String>,
+    lockfile: &Lockfile,
+) {
+    if peers.is_empty() || dep_path.suffix.peer().is_empty() {
+        return;
+    }
+    let providers = BoundProviders::of_snapshot(lockfile.into(), dep_path);
+    edges.retain(|edge| !is_bound_peer_edge(edge, peers, &providers));
+}
+
+/// An edge without a virtual-store target counts as bound when its alias is a
+/// declared peer, since there is no key to check the bindings against.
+fn is_bound_peer_edge(
+    edge: &GraphEdge,
+    peers: &HashSet<String>,
+    providers: &BoundProviders,
+) -> bool {
+    peers.contains(&edge.alias)
+        && edge.dep_path
+            .as_ref()
+            .is_none_or(|target| providers.binds(target))
 }
 
 /// The outgoing edges of one node. A node the lockfile does not describe has
@@ -153,16 +247,8 @@ fn importer_edges(
     publish_dirs: &HashMap<String, String>,
 ) -> Vec<GraphEdge> {
     let mut edges = Vec::new();
-    let groups: [(bool, Option<&pnpm_lockfile::ResolvedDependencyMap>); 3] = [
-        (opts.include.dependencies, importer.dependencies.as_ref()),
-        (opts.include.dev_dependencies, importer.dev_dependencies.as_ref()),
-        (opts.include.optional_dependencies, importer.optional_dependencies.as_ref()),
-    ];
-    for (included, group) in groups {
-        if !included {
-            continue;
-        }
-        for (alias, spec) in group.into_iter().flatten() {
+    for (field, group) in importer_dependency_groups(importer, &opts.include) {
+        for (alias, spec) in group {
             let dep_path = spec.version.resolved_key(alias);
             let link_target = spec.version.as_link_target().map(str::to_string);
             let target = edge_target(
@@ -177,6 +263,10 @@ fn importer_edges(
                 dep_path,
                 link_target,
                 target,
+                importer_dependency: Some(ImporterDependency {
+                    field,
+                    specifier: spec.specifier.clone(),
+                }),
             };
             if opts.only_projects
                 && !edge.leads_to_project(&TreeNodeId::Importer(importer_id.to_string()))
@@ -187,6 +277,25 @@ fn importer_edges(
         }
     }
     edges
+}
+
+fn importer_dependency_groups<'a>(
+    importer: &'a ProjectSnapshot,
+    include: &IncludedDependencies,
+) -> impl Iterator<Item = (DepField, &'a pnpm_lockfile::ResolvedDependencyMap)> {
+    [
+        (include.dependencies, DepField::Dependencies, importer.dependencies.as_ref()),
+        (include.dev_dependencies, DepField::DevDependencies, importer.dev_dependencies.as_ref()),
+        (
+            include.optional_dependencies,
+            DepField::OptionalDependencies,
+            importer.optional_dependencies.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(included, field, dependencies)| {
+        if included { dependencies.map(|dependencies| (field, dependencies)) } else { None }
+    })
 }
 
 fn package_edges(
@@ -214,6 +323,7 @@ fn package_edges(
             dep_path,
             link_target,
             target,
+            importer_dependency: None,
         });
     }
     edges
@@ -250,7 +360,7 @@ fn edge_target(
 fn publish_directory_importers(lockfile: &Lockfile) -> HashMap<String, String> {
     lockfile.importers
         .iter()
-        .filter(|(_, importer)| importer.link_directory != Some(false))
+        .filter(|(_, importer)| importer.link_directory.unwrap_or(true))
         .filter_map(|(importer_id, importer)| {
             let publish_directory = importer.publish_directory.as_deref()?;
             let linked_importer_id = normalize_importer_path(importer_id, publish_directory)?;
@@ -266,7 +376,8 @@ fn publish_directory_importers(lockfile: &Lockfile) -> HashMap<String, String> {
 pub fn normalize_importer_path(base: &str, relative: &str) -> Option<String> {
     let mut parts: Vec<&str> = base
         .split('/')
-        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .filter(|segment| !segment.is_empty())
+        .filter(|segment| *segment != ".")
         .collect();
     let normalized = relative.replace('\\', "/");
     for part in normalized.split('/') {
@@ -280,3 +391,6 @@ pub fn normalize_importer_path(base: &str, relative: &str) -> Option<String> {
     }
     if parts.is_empty() { Some(".".to_string()) } else { Some(parts.join("/")) }
 }
+
+#[cfg(test)]
+mod tests;

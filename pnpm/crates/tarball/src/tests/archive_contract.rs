@@ -1,13 +1,39 @@
-use super::{build_zip, fast_retry_opts, gzipped_tar, store_paths, tempdir_with_leaked_path};
-use crate::{ArchiveStoreProjection, IngestTarballToStore, IngestZipArchiveToStore, TarballError};
+use super::{
+    build_zip,
+    fast_retry_opts,
+    gzipped_tar,
+    store_paths,
+    tempdir_with_leaked_path,
+};
+use crate::{
+    ArchiveStoreProjection,
+    IngestTarballToStore,
+    IngestZipArchiveToStore,
+    TarballError,
+};
 use pnpm_fs::EnsureFileError;
-use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
-use pnpm_reporter::{LogEvent, Reporter, SilentReporter};
-use pnpm_store_dir::{StoreIndex, StoreIndexWriter, WriteCasFileError};
+use pnpm_network::{
+    AuthHeaders,
+    RetryOpts,
+    ThrottledClient,
+};
+use pnpm_reporter::{
+    LogEvent,
+    Reporter,
+    SilentReporter,
+};
+use pnpm_store_dir::{
+    StoreIndex,
+    StoreIndexWriter,
+    WriteCasFileError,
+};
 use ssri::Integrity;
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 
 #[tokio::test]
@@ -237,7 +263,7 @@ async fn archive_requests_do_not_downgrade_secure_credentials_to_plain_http() {
         .build()
         .unwrap();
     let client = ThrottledClient::from_clients(client, no_redirects);
-    let mut auth = AuthHeaders::default().with_secure_transport();
+    let mut auth = AuthHeaders::default();
     auth.insert_url_header(
         &format!("https://registry.example:{}/simple/", address.port()),
         "Basic secret".to_string(),
@@ -350,7 +376,7 @@ fn zip_ingestion<'a>(input: &'a IngestTarballToStore<'a>) -> IngestZipArchiveToS
             id: input.package.id,
         },
         store: crate::ArchiveStoreContext {
-            dir: input.store.dir,
+            dir: input.store.dir.clone(),
             index: input.store.index.clone(),
             index_writer: input.store.index_writer.clone(),
             verify_integrity: input.store.verify_integrity,
@@ -425,7 +451,7 @@ async fn formats_share_projection_offline_replay_and_missing_blob_validation() {
                     id: "fixture@1.0.0",
                 },
                 store: crate::ArchiveStoreContext {
-                    dir: store,
+                    dir: std::borrow::Cow::Borrowed(store),
                     index: None,
                     index_writer: Some(Arc::clone(&writer)),
                     verify_integrity: true,
@@ -505,7 +531,7 @@ async fn formats_share_retry_classification_and_never_publish_failed_integrity()
                     id: "fixture@1.0.0",
                 },
                 store: crate::ArchiveStoreContext {
-                    dir: store,
+                    dir: std::borrow::Cow::Borrowed(store),
                     index: None,
                     index_writer: Some(Arc::clone(&writer)),
                     verify_integrity: true,
@@ -581,7 +607,10 @@ async fn zip_download_limits_cover_content_lengths_and_chunked_bodies() {
 
 #[tokio::test]
 async fn request_archive_quick_retries_transient_connection_reset() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

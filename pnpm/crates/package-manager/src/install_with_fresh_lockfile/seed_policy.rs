@@ -1,12 +1,20 @@
-use pnpm_lockfile::{Lockfile, PkgName};
-use pnpm_resolving_deps_resolver::{UpdateDepth, UpdateTargets};
+use pnpm_lockfile::Lockfile;
+use pnpm_lockfile_verification::ReplacedCandidate;
+use pnpm_resolving_deps_resolver::{
+    UpdateDepth,
+    UpdateTargets,
+};
 use pnpm_resolving_resolver_base::PreferredVersions;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashSet,
+    },
     sync::Arc,
 };
 
-/// Caller-supplied version preferences layered onto the resolution seed.
+/// Caller-supplied version preferences and direct requests layered onto the resolution seed.
 ///
 /// `shared` applies to every importer. `by_importer` replaces the concrete
 /// version selectors of one importer for the package names it lists, which
@@ -15,11 +23,13 @@ use std::{
 pub struct PreferredVersionsOverride {
     pub shared: PreferredVersions,
     pub by_importer: BTreeMap<String, PreferredVersions>,
+    /// Explicitly added aliases, scoped to the importers the command selected.
+    pub requested_direct_dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl From<PreferredVersions> for PreferredVersionsOverride {
     fn from(shared: PreferredVersions) -> Self {
-        Self { shared, by_importer: BTreeMap::new() }
+        Self { shared, ..Default::default() }
     }
 }
 
@@ -29,7 +39,7 @@ impl From<PreferredVersions> for PreferredVersionsOverride {
 ///
 /// A name whose pin is withheld no longer carries its previously-locked
 /// version at the existing-version weight, so the resolver falls back to
-/// picking the highest version satisfying the manifest range — the
+/// picking the highest version satisfying the manifest range, the
 /// compatible re-resolution `pacquet update` performs. This is the
 /// `update: 'compatible'` resolver mode, which ignores the lockfile
 /// version for the dependency being updated.
@@ -54,12 +64,12 @@ pub enum UpdateSeedPolicy {
     /// current revision without allowing semver movement.
     RefreshRevisions,
     /// Withhold every lockfile pin. `pacquet update` with no package
-    /// selectors — the whole graph re-resolves to highest-in-range.
+    /// selectors, the whole graph re-resolves to highest-in-range.
     DropAll {
         max_depth: UpdateDepth,
     },
-    /// Withhold only the update targets' pins. `pacquet update <pattern>`
-    /// — a matched name re-resolves while everything else keeps its pin,
+    /// Withhold only the update targets' pins. `pacquet update <pattern>`,
+    /// a matched name re-resolves while everything else keeps its pin,
     /// and a selector that pinned an exact version narrows the target to
     /// that version line. Keyed by package name (scope included); see
     /// [`UpdateTargets`].
@@ -76,16 +86,25 @@ pub enum UpdateSeedPolicy {
 /// preference for it.
 ///
 /// A version named on the command line has to reach the lockfile even when
-/// the specifier written to the manifest doesn't carry it — a `catalog:`
+/// the specifier written to the manifest doesn't carry it, a `catalog:`
 /// entry keeps the version in the catalog, so without this the entry's
 /// recorded resolution is reused and the request is dropped silently.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the name is copied only for a valid semver version, and every caller keeps using its own"
+    )
+)]
 pub(crate) fn prefer_requested_version(
     preferred: &mut pnpm_resolving_resolver_base::PreferredVersions,
     name: &str,
     version: &str,
 ) {
     use pnpm_resolving_resolver_base::{
-        REQUESTED_VERSION_SELECTOR_WEIGHT, VersionSelectorEntry, VersionSelectorType,
+        REQUESTED_VERSION_SELECTOR_WEIGHT,
+        VersionSelectorEntry,
+        VersionSelectorType,
         VersionSelectorWithWeight,
     };
 
@@ -104,7 +123,7 @@ pub(crate) fn prefer_requested_version(
         );
 }
 impl UpdateSeedPolicy {
-    /// Withhold every pin at every depth — the re-resolve `pacquet
+    /// Withhold every pin at every depth, the re-resolve `pacquet
     /// dedupe` / `pacquet import` and the napi install perform, none of
     /// which expose a `--depth`.
     #[must_use]
@@ -124,6 +143,16 @@ impl UpdateSeedPolicy {
         }
     }
 
+    pub(super) fn locked_runtime_reuse(&self) -> pnpm_resolving_deps_resolver::LockedRuntimeReuse {
+        use pnpm_resolving_deps_resolver::LockedRuntimeReuse;
+
+        if matches!(self, UpdateSeedPolicy::KeepAllResolveAll) {
+            LockedRuntimeReuse::Keep
+        } else {
+            LockedRuntimeReuse::Repick
+        }
+    }
+
     /// Matches the update targets whose pins every importer of `lockfile`
     /// withholds at every depth, so none of their locked versions is
     /// reused. `None` when a locked version of a target may survive: a
@@ -134,13 +163,8 @@ impl UpdateSeedPolicy {
         lockfile: &Lockfile,
         requested_importer_ids: Option<&HashSet<String>>,
     ) -> Option<crate::IsReplaced> {
-        if self.max_depth() != UpdateDepth::UNLIMITED {
-            return None;
-        }
-        if let Some(requested_importer_ids) = requested_importer_ids
-            && !lockfile.importers
-                .keys()
-                .all(|id| requested_importer_ids.contains(id))
+        if self.max_depth() != UpdateDepth::UNLIMITED
+            || !covers_all_importers(lockfile, requested_importer_ids)
         {
             return None;
         }
@@ -163,14 +187,87 @@ impl UpdateSeedPolicy {
             return None;
         }
         let targets: Vec<UpdateTargets> = targets.into_iter().cloned().collect();
-        Some(Arc::new(move |name: &PkgName, version: &str| {
-            let Ok(version) = node_semver::Version::parse(version) else { return false };
-            let name = name.to_string();
+        Some(Arc::new(move |candidate: ReplacedCandidate<'_>| {
+            let Ok(version) = node_semver::Version::parse(candidate.version) else {
+                return false;
+            };
+            let name = candidate.name.to_string();
             targets
                 .iter()
                 .all(|targets| targets.covers(&name, Some(&version)))
         }))
     }
+
+    /// Entries the fresh resolution discards rather than reuses: explicit
+    /// update targets ([`Self::replaced_update_targets`]), plus plain semver
+    /// keys whose scope route moved since the lockfile was resolved (when
+    /// every recorded importer is part of this resolution). Registry-qualified
+    /// keys name their registry and may still be reused, so they are kept.
+    pub(crate) fn replaced_fresh_lockfile_entries(
+        &self,
+        lockfile: &Lockfile,
+        requested_importer_ids: Option<&HashSet<String>>,
+        config: &pnpm_config::Config,
+        locked_registries: Option<&BTreeMap<String, String>>,
+    ) -> Option<crate::IsReplaced> {
+        let update_targets = self.replaced_update_targets(lockfile, requested_importer_ids);
+        let moved_routes = replaced_moved_registry_entries(
+            lockfile,
+            requested_importer_ids,
+            config,
+            locked_registries,
+        );
+        match (update_targets, moved_routes) {
+            (Some(update_targets), Some(moved_routes)) => Some(Arc::new(move |candidate| {
+                update_targets(candidate) || moved_routes(candidate)
+            })),
+            (Some(replaced), None) | (None, Some(replaced)) => Some(replaced),
+            (None, None) => None,
+        }
+    }
+}
+
+fn covers_all_importers(
+    lockfile: &Lockfile,
+    requested_importer_ids: Option<&HashSet<String>>,
+) -> bool {
+    requested_importer_ids.is_none_or(|requested| {
+        lockfile.importers
+            .keys()
+            .all(|id| requested.contains(id))
+    })
+}
+
+fn replaced_moved_registry_entries(
+    lockfile: &Lockfile,
+    requested_importer_ids: Option<&HashSet<String>>,
+    config: &pnpm_config::Config,
+    locked_registries: Option<&BTreeMap<String, String>>,
+) -> Option<crate::IsReplaced> {
+    let locked_registries = locked_registries?;
+    if !covers_all_importers(lockfile, requested_importer_ids) {
+        return None;
+    }
+    let locked = locked_registries
+        .iter()
+        .map(|(route, url)| (route.clone(), url.clone()))
+        .collect();
+    let registries = config
+        .registry_context()
+        .with_locked_registries(Some(locked));
+    pnpm_lockfile::check_lockfile_registry_routes(lockfile, &registries).err()?;
+    Some(Arc::new(move |candidate: ReplacedCandidate<'_>| {
+        if candidate.registry_name.is_some()
+            || node_semver::Version::parse(candidate.version).is_err()
+        {
+            return false;
+        }
+        let name = candidate.name.to_string();
+        !pnpm_lockfile::same_registry(
+            registries.locked_registry(&name),
+            registries.routed_registry(&name),
+        )
+    }))
 }
 #[derive(Debug, Clone)]
 pub enum ImporterUpdateSeedPolicy {
@@ -211,8 +308,11 @@ pub(super) fn update_reuse_scopes(
         ),
     }
 }
+/// Whether the resolve pass reads every package manifest, so that nothing
+/// locked is reused. A `--depth` limit keeps the subtrees below it locked.
 pub(super) fn full_resolution_required<'a>(
     has_reusable_seed: bool,
+    max_depth: UpdateDepth,
     importer_ids: impl IntoIterator<Item = &'a str>,
     default_scope: &pnpm_resolving_deps_resolver::UpdateReuseScope,
     scopes_by_importer: &BTreeMap<String, pnpm_resolving_deps_resolver::UpdateReuseScope>,
@@ -220,14 +320,15 @@ pub(super) fn full_resolution_required<'a>(
     use pnpm_resolving_deps_resolver::UpdateReuseScope;
 
     !has_reusable_seed
-        || importer_ids
-            .into_iter()
-            .all(|importer_id| {
-                let scope = if matches!(default_scope, UpdateReuseScope::None) {
-                    default_scope
-                } else {
-                    scopes_by_importer.get(importer_id).unwrap_or(default_scope)
-                };
-                matches!(scope, UpdateReuseScope::None)
-            })
+        || max_depth == UpdateDepth::UNLIMITED
+            && importer_ids
+                .into_iter()
+                .all(|importer_id| {
+                    let scope = if matches!(default_scope, UpdateReuseScope::None) {
+                        default_scope
+                    } else {
+                        scopes_by_importer.get(importer_id).unwrap_or(default_scope)
+                    };
+                    matches!(scope, UpdateReuseScope::None)
+                })
 }

@@ -15,9 +15,19 @@ The version picked is the highest one satisfying the peer range. Since an automa
 
 #### Optional peer dependencies
 
-pnpm installs a missing optional peer dependency only if the workspace already has a version of it that satisfies the optional peer range. In that case, pnpm resolves the optional peer to that version. That version can come from any project in the workspace, including another project's `devDependencies`. For example, if one project depends on `webpack` and another has `webpack-cli` in its `devDependencies`, both projects get the `webpack` instance that has `webpack-cli` as its optional peer.
+pnpm installs a missing optional peer dependency only if a version of it that satisfies the optional peer range is already installed. In that case, pnpm resolves the optional peer to that version.
 
-pnpm also resolves optional peers this way when [`dedupePeerDependents`](#dedupepeerdependents) is `true`. To stop it, set both `autoInstallPeers` and `dedupePeerDependents` to `false`.
+When [`dedupePeerDependents`](#dedupepeerdependents) is `true`, that version can come from any project in the workspace, including another project's `devDependencies`. For example, if one project depends on `webpack` and another has `webpack-cli` in its `devDependencies`, both projects get the `webpack` instance that has `webpack-cli` as its optional peer.
+
+When `dedupePeerDependents` is `false`, or [`projectScopedOptionalPeers`](#projectscopedoptionalpeers) is `true`, that version must come from the project's own dependencies. The workspace root's dependencies also count if [`resolvePeersFromWorkspaceRoot`](#resolvepeersfromworkspaceroot) is `true`.
+
+pnpm skips that version if installing it would leave the project with an unmet peer dependency. This covers the version's own peers, the required peers that pnpm would install with it, and their peers in turn. `dedupePeerDependents` does not give the skipped peer back to the project by sharing another project's instance of the package that declares it.
+
+pnpm also resolves optional peers this way when `autoInstallPeers` is `false` and `dedupePeerDependents` is `true`. To stop it, set both settings to `false`.
+
+When selecting a workspace provider for a new project, pnpm prefers compatible optional peer versions already pinned in the lockfile.
+
+When you change or remove a direct dependency, its previous peer versions no longer guide optional peer selection. Unchanged dependencies can still retain their locked peer versions. A removed provider that remains only in the old lockfile does not prevent deduplication with the providers still installed.
 
 #### Version conflicts
 
@@ -33,6 +43,8 @@ In case of a version conflict, you'll need to evaluate which version of the peer
 * Type: **Boolean**
 
 When set to `true`, pnpm joins conflicting peer dependency ranges with `||` and installs the highest version that satisfies any of them. For example, if one dependency requires `react@^16.0.0` and another requires `react@^17.0.0`, pnpm installs the highest `react@17`.
+
+Only semver ranges can be joined. Conflicting paths, aliases, or tags leave the peer dependency missing. Identical non-semver specifiers are preserved.
 
 ### dedupePeerDependents
 
@@ -98,7 +110,26 @@ project2
 
 In this case, we cannot dedupe `webpack` as `webpack` has `react` in its peer dependencies and `react` is resolved from two different versions in the context of the two projects.
 
+### projectScopedOptionalPeers
+
+Added in: v12.19.0
+
+* Default: **false**
+* Type: **Boolean**
+
+When `true`, a project gets a missing optional peer dependency only if the project's own dependencies already install a version of it. The workspace root's dependencies also count if [`resolvePeersFromWorkspaceRoot`](#resolvepeersfromworkspaceroot) is `true`. A version that only another workspace project installs does not count.
+
+[`dedupePeerDependents`](#dedupepeerdependents) keeps working for everything else. It still deduplicates packages across projects, unless deduplicating would give a project an optional peer its own dependencies don't install. Required peers are not affected.
+
+In the [`dedupePeerDependents`](#dedupepeerdependents) example, `project1` keeps the `webpack` instance without `esbuild`.
+
+This setting has no effect when `dedupePeerDependents` is `false`, because optional peers are already resolved only from the project's own dependencies then.
+
+Changing this setting changes the lockfile. pnpm records it in the lockfile's `settings` while it takes effect, so the next install resolves the lockfile again.
+
 ### dedupePeers
+
+Deprecated. Remove this setting. For lockfile references without peer suffixes, use [`lockfile.format: v13`](./store.md#lockfileformat).
 
 * Default: **false**
 * Type: **Boolean**

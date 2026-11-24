@@ -1,25 +1,40 @@
-use super::{AddError, AddResolveInputs, normalized_save_specifier};
+use super::{
+    AddError,
+    AddResolveInputs,
+    normalized_save_specifier,
+};
 use pnpm_config::Config;
-use pnpm_network::{ThrottledClient, redact_and_sanitize, redact_url_for_display};
+use pnpm_network::{
+    ThrottledClient,
+    redact_and_sanitize,
+    redact_url_for_display,
+};
 use pnpm_package_manifest::PackageManifest;
 use pnpm_package_name::is_valid_dependency_alias;
 use pnpm_resolving_git_resolver::{
-    GitFetchContext, GitResolver, HostedGit, RealGitProbe, RealGitRunner,
+    GitFetchContext,
+    GitResolver,
+    HostedGit,
+    RealGitProbe,
+    RealGitRunner,
 };
 use pnpm_resolving_local_resolver::{
-    LocalResolverContext, LocalResolverOptions, LocalResolverUpdate, WantedLocalDependency,
-    is_local_filesystem_specifier, resolve_from_local_path, resolve_from_local_scheme,
+    LocalResolverContext,
+    LocalResolverOptions,
+    LocalResolverUpdate,
+    WantedLocalDependency,
+    is_local_filesystem_specifier,
+    resolve_from_local_path,
+    resolve_from_local_scheme,
 };
 use pnpm_resolving_resolver_base::GitResolveError;
-use pnpm_resolving_tarball_resolver::{TarballFetchContext, TarballResolver};
-use pnpm_store_dir::SharedVerifiedFilesCache;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 /// The package name and manifest specifier for an add selector that names
 /// no alias: a git URL, a remote tarball URL, or a local directory /
 /// tarball. Such a selector is the whole specifier, and the package's name
-/// lives only in its own manifest — inside the archive, the checkout, or
-/// the directory — so it has to be read from there before the manifest
+/// lives only in its own manifest (inside the archive, the checkout, or
+/// the directory) so it has to be read from there before the manifest
 /// entry can be written.
 pub(super) struct AliaslessDependency {
     pub(super) package_name: String,
@@ -41,19 +56,40 @@ pub(super) async fn resolve_aliasless_specifier(
     if pnpm_resolving_git_resolver::parse_bare_specifier(specifier).is_some() {
         return resolve_aliasless_git(specifier, inputs).await.map(Some);
     }
-    if specifier.starts_with("http:") || specifier.starts_with("https:") {
+    if let Some(url) = pnpm_resolving_tarball_resolver::remote_tarball_id(specifier) {
+        let url = url.map_err(|error| AddError::ResolveTarball {
+            specifier: redact_url_for_display(specifier),
+            reason: redacted_error_chain(error.as_ref()),
+        })?;
         return resolve_aliasless_tarball(
-            specifier,
+            url,
             inputs.add.config,
             &inputs.owned.http_client_arc,
+            &inputs.owned.tarball_mem_cache,
         )
         .await
         .map(Some);
     }
-    resolve_aliasless_local(specifier, manifest).await
+    let search_root = publish_search_root(inputs.add.config, manifest);
+    resolve_aliasless_local(specifier, manifest, Some(search_root)).await
+}
+
+/// The root the install stops at when it looks for a project publishing
+/// from a `file:` directory: the workspace root, else the lockfile root.
+pub(super) fn publish_search_root<'a>(
+    config: &'a Config,
+    manifest: &'a PackageManifest,
+) -> &'a std::path::Path {
+    let manifest_dir = manifest
+        .path()
+        .parent()
+        .expect("manifest path always has a parent dir");
+    config.workspace_dir
+        .as_deref()
+        .unwrap_or_else(|| config.lockfile_dir_for(manifest_dir))
 }
 /// Resolve a local directory or tarball selector by reading the package's
-/// own manifest — off disk for a directory, out of the archive for a
+/// own manifest, off disk for a directory, out of the archive for a
 /// tarball.
 ///
 /// `link:` / `file:` are claimed by their scheme, everything else by path
@@ -61,6 +97,7 @@ pub(super) async fn resolve_aliasless_specifier(
 pub(super) async fn resolve_aliasless_local(
     specifier: &str,
     manifest: &PackageManifest,
+    publish_search_root: Option<&std::path::Path>,
 ) -> Result<Option<AliaslessDependency>, AddError> {
     if !is_local_filesystem_specifier(specifier) {
         return Ok(None);
@@ -78,6 +115,10 @@ pub(super) async fn resolve_aliasless_local(
         // The name and the normalized specifier are all this resolve is
         // after, and neither is measured from the lockfile root.
         lockfile_dir: None,
+        // The install bounds a `file:` directory's publishing project by
+        // the workspace root, else the lockfile root, so the name read here
+        // uses the same bound.
+        workspace_dir: publish_search_root.map(std::path::Path::to_path_buf),
         current_pkg: None,
         update: LocalResolverUpdate::On,
         // `is_local_filesystem_specifier` above never claims a `workspace:`
@@ -102,73 +143,44 @@ pub(super) async fn resolve_aliasless_local(
 /// Resolve a remote (non-registry) tarball URL by downloading and
 /// extracting it: a tarball's name lives in the `package.json` it bundles,
 /// and nothing in the URL is required to spell it.
-///
-/// No store-index row is written here. The install that follows re-resolves
-/// the dependency with the writer it owns, keyed by the same `pkg_id`, so a
-/// row from this pass would only duplicate that one.
-pub(super) async fn resolve_aliasless_tarball(
-    specifier: &str,
-    config: &'static Config,
-    http_client: &Arc<ThrottledClient>,
+async fn resolve_aliasless_tarball(
+    url: String,
+    config: &Config,
+    http_client: &ThrottledClient,
+    mem_cache: &pnpm_tarball::MemCache,
 ) -> Result<AliaslessDependency, AddError> {
-    let resolver = aliasless_tarball_resolver(config, http_client);
-    let wanted = pnpm_resolving_resolver_base::WantedDependency {
-        bare_specifier: Some(specifier.to_string()),
-        ..pnpm_resolving_resolver_base::WantedDependency::default()
-    };
-    let result = pnpm_resolving_resolver_base::Resolver::resolve(
-        &resolver,
-        &wanted,
-        &pnpm_resolving_resolver_base::ResolveOptions::default(),
-    )
-    .await
-    .map_err(|source| match source.downcast::<pnpm_tarball::TarballError>() {
-        Ok(tarball) => AddError::TarballResolve(tarball),
-        Err(source) => AddError::ResolveTarball {
-            specifier: redact_url_for_display(specifier),
-            reason: redacted_error_chain(source.as_ref()),
+    let fetch = pnpm_tarball::FetchTarballForResolution {
+        http_client,
+        store: pnpm_tarball::ResolutionStore { dir: &config.store_dir, index_writer: None },
+        package: pnpm_tarball::TarballPackage {
+            integrity_kind: config.lockfile_integrity_target.into(),
+            integrity: None,
+            unpacked_size: None,
+            file_count: None,
+            url: url.as_str(),
+            id: url.as_str(),
         },
-    })?
-    .ok_or_else(|| AddError::MissingPackageName { specifier: redact_url_for_display(specifier) })?;
-    let manifest_specifier =
-        result.normalized_bare_specifier.unwrap_or_else(|| normalized_save_specifier(specifier));
-    let package_name = aliasless_package_name(result.package.manifest.as_deref(), specifier)?;
-    Ok(AliaslessDependency { package_name, manifest_specifier, linked_manifest: None })
-}
-
-fn aliasless_tarball_resolver(
-    config: &'static Config,
-    http_client: &Arc<ThrottledClient>,
-) -> TarballResolver {
-    TarballResolver {
-        http_client: Arc::clone(http_client),
-        fetch_context: Some(TarballFetchContext {
-            mem_cache: None,
-            auth_headers: Arc::clone(&config.auth_headers),
-            retry_opts: config.retry_opts(),
-            tar_limits: config.tar_limits(),
-            prior_tarball_entries: Arc::new(HashMap::new()),
-            cache_dir: Some(config.cache_dir.clone()),
-            integrity_target: config.lockfile_integrity_target,
-            store: pnpm_tarball::ArchiveStoreContext {
-                strict_pkg_content_check: false,
-                prefetched_cas_paths: None,
-                dir: &config.store_dir,
-                index_writer: None,
-                index: None,
-                verify_integrity: config.verify_store_integrity,
-                verified_files_cache: SharedVerifiedFilesCache::default(),
-            },
-        }),
-    }
+        auth_headers: &config.auth_headers,
+        retry_opts: config.retry_opts(),
+        tar_limits: pnpm_tarball::TarLimits::new(config.max_tarball_unpacked_size),
+        manifest_subdir: None,
+        revision_addressed: false,
+    };
+    let manifest = fetch
+        .prepare_add(mem_cache)
+        .await
+        .map_err(Box::new)
+        .map_err(AddError::TarballResolve)?;
+    let package_name = aliasless_package_name(manifest.as_ref(), &url)?;
+    Ok(AliaslessDependency { package_name, manifest_specifier: url, linked_manifest: None })
 }
 /// Flatten an error chain into one line, with every URL in it cut back to
 /// its display-safe form.
 ///
 /// `reqwest` echoes the request URL back in its own message and redacts
 /// only the userinfo, while a signed tarball URL carries its token in the
-/// query string — which [`redact_and_sanitize`] keeps too. The scrub is
-/// URL-agnostic rather than keyed to the specifier: the HEAD request
+/// query string, which [`redact_and_sanitize`] keeps too. The scrub is
+/// URL-agnostic rather than keyed to the specifier: the archive request
 /// follows redirects, so the URL a failure names may be a signed storage
 /// URL the caller never saw.
 pub(super) fn redacted_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -213,7 +225,7 @@ pub(super) fn strip_url_query_and_fragment(text: &str) -> String {
     out
 }
 /// Where the URL at the start of `text` ends: at whitespace, at one of the
-/// marks a message wraps a URL in, or at a `": "` — which cannot occur
+/// marks a message wraps a URL in, or at a `": "`, which cannot occur
 /// inside a URL, and is how a message punctuates the URL from what follows
 /// it (`GET <url>: 404`). Without that last case, cutting the query would
 /// swallow the message's own separator.
@@ -230,8 +242,8 @@ pub(super) fn url_token_len(text: &str) -> usize {
 /// would leave credential material behind.
 ///
 /// A password containing `?` or `#` defeats the userinfo scan that runs
-/// before this — the scan reads the `?` as the end of the authority and
-/// leaves the whole `user:pa?ss@host` in place — so cutting there would
+/// before this, the scan reads the `?` as the end of the authority and
+/// leaves the whole `user:pa?ss@host` in place, so cutting there would
 /// publish the password's prefix. The authority is therefore checked on the
 /// *uncut* token: any `@` still in front of the path means the userinfo
 /// survived, and the token fails closed instead.
@@ -283,8 +295,8 @@ pub(super) fn aliasless_package_name(
     Ok(name.to_string())
 }
 /// The name an alias-less git selector's package is added under: the one
-/// its own manifest declares, or — for a repository that ships no manifest
-/// — one synthesized from the repository's host identity.
+/// its own manifest declares, or (for a repository that ships no manifest)
+/// one synthesized from the repository's host identity.
 ///
 /// `None` when neither is available: the repository declares no name and
 /// its URL names a host pacquet cannot read an owner and project out of.
@@ -345,11 +357,11 @@ pub(super) fn aliasless_git_resolver(
     .with_fetch_context(GitFetchContext {
         source_cache: Arc::clone(inputs.git_source_cache),
         http_client: Arc::clone(http_client),
-        store_dir: &config.store_dir,
+        store_dir: std::borrow::Cow::Borrowed(&config.store_dir),
         store_index_writer: None,
         auth_headers: Arc::clone(&config.auth_headers),
         retry_opts: config.retry_opts(),
-        tar_limits: config.tar_limits(),
+        tar_limits: pnpm_tarball::TarLimits::new(config.max_tarball_unpacked_size),
         git_shallow_hosts: config.git_shallow_hosts.clone(),
     })
 }

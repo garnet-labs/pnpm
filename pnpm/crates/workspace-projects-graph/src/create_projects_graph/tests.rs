@@ -1,11 +1,24 @@
 use crate::{
-    base_project::{BaseProject, GraphProject},
+    base_project::{
+        BaseProject,
+        DependencyGroups,
+        GraphProject,
+    },
     create_projects_graph::{
-        CreateProjectsGraphOptions, Unmatched, WorkspaceCatalogs, create_projects_graph,
+        CreateProjectsGraphOptions,
+        Unmatched,
+        WorkspaceCatalogs,
+        create_projects_graph,
+    },
+    dependency_rewriter::DependencyRewriter,
+};
+use std::{
+    borrow::Cow,
+    path::{
+        Path,
+        PathBuf,
     },
 };
-use indexmap::IndexMap;
-use std::path::{Path, PathBuf};
 
 struct TestProject {
     root_dir: PathBuf,
@@ -25,28 +38,21 @@ impl BaseProject for TestProject {
         self.name.as_deref()
     }
     fn merged_dependencies(&self, ignore_dev_deps: bool) -> Vec<(String, String)> {
-        let mut map: IndexMap<String, String> = IndexMap::new();
-        for (name, spec) in &self.peer {
-            map.insert(name.clone(), spec.clone());
-        }
-        if !ignore_dev_deps {
-            for (name, spec) in &self.dev {
-                map.insert(name.clone(), spec.clone());
-            }
-        }
-        for (name, spec) in &self.optional {
-            map.insert(name.clone(), spec.clone());
-        }
-        for (name, spec) in &self.prod {
-            map.insert(name.clone(), spec.clone());
-        }
-        map.into_iter().collect()
+        self.dependency_groups(ignore_dev_deps).merge()
     }
 }
 
 impl GraphProject for TestProject {
     fn manifest_version(&self) -> Option<&str> {
         self.version.as_deref()
+    }
+    fn dependency_groups(&self, ignore_dev_deps: bool) -> DependencyGroups {
+        DependencyGroups {
+            peer: self.peer.clone(),
+            dev: (!ignore_dev_deps).then(|| self.dev.clone()),
+            optional: self.optional.clone(),
+            prod: self.prod.clone(),
+        }
     }
 }
 
@@ -68,7 +74,8 @@ fn project(root: &str, name: &str, version: &str, prod: &[(&str, &str)]) -> Test
 fn edges(graph: &crate::ProjectGraph<TestProject>, key: &str) -> Vec<String> {
     graph[Path::new(key)].dependencies
         .iter()
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| path.to_string_lossy())
+        .map(Cow::into_owned)
         .collect()
 }
 
@@ -81,6 +88,18 @@ fn workspace_star_resolves_to_versioned_sibling() {
     let result = create_projects_graph(projects, &CreateProjectsGraphOptions::default());
     assert_eq!(edges(&result.graph, "/ws/a"), vec!["/ws/b".to_string()]);
     assert_eq!(edges(&result.graph, "/ws/b"), Vec::<String>::new());
+    assert!(result.unmatched.is_empty());
+}
+
+#[test]
+fn workspace_union_with_a_caret_branch_resolves_like_workspace_star() {
+    let projects = vec![
+        project("/ws/a", "a", "1.0.0", &[("b", "workspace:^ || ^2.0.0")]),
+        project("/ws/b-stable", "b", "2.0.0", &[]),
+        project("/ws/b-next", "b", "3.0.0-beta.1", &[]),
+    ];
+    let result = create_projects_graph(projects, &CreateProjectsGraphOptions::default());
+    assert_eq!(edges(&result.graph, "/ws/a"), vec!["/ws/b-next".to_string()]);
     assert!(result.unmatched.is_empty());
 }
 
@@ -191,7 +210,12 @@ fn strict_link_workspace_packages_still_links_workspace_specs() {
 #[test]
 fn registry_protocols_contribute_no_edge() {
     let projects = vec![
-        project("/ws/a", "a", "1.0.0", &[("b", "npm:other@1.0.0"), ("c", "github:o/r")]),
+        project(
+            "/ws/a",
+            "a",
+            "1.0.0",
+            &[("b", "npm:other@1.0.0"), ("b-spaced", "reg:b@>=2.0.0 <3.0.0"), ("c", "github:o/r")],
+        ),
         project("/ws/b", "b", "2.0.0", &[]),
     ];
     let result = create_projects_graph(projects, &CreateProjectsGraphOptions::default());
@@ -240,7 +264,6 @@ fn dependency_on_unknown_name_is_silently_skipped() {
     assert_eq!(edges(&result.graph, "/ws/a"), Vec::<String>::new());
     assert!(result.unmatched.is_empty());
 }
-
 #[test]
 fn catalog_specs_resolve_through_the_workspace_catalogs() {
     let projects = vec![
@@ -290,9 +313,9 @@ fn npm_alias_resolves_to_the_sibling_it_names() {
                 "a",
                 "1.0.0",
                 &[
-                    ("b-alias", "npm:b@^2.0.0"),
+                    ("b-alias", "npm:b@>=2.0.0 <3.0.0"),
                     ("c-alias", "npm:c@^9.0.0"),
-                    ("d", "npm:^4.0.0"),
+                    ("d", "npm:>=4.0.0 <5.0.0"),
                     ("e-alias", "npm:b"),
                     ("f-alias", "npm:c@file:../c"),
                     ("g-alias", "npm:c@link:../c"),
@@ -320,6 +343,77 @@ fn npm_alias_resolves_to_the_sibling_it_names() {
         },
     );
     assert_eq!(edges(&strict.graph, "/ws/a"), Vec::<String>::new());
+}
+
+/// Rewrites every `b` dependency to `workspace:*` and drops every `c`,
+/// the way `overrides: { b: 'workspace:*', c: '-' }` would.
+struct WorkspaceOverride;
+
+impl DependencyRewriter for WorkspaceOverride {
+    fn rewrite_dependencies(&self, _project: &dyn GraphProject, groups: &mut DependencyGroups) {
+        groups.prod.retain(|(name, _)| name != "c");
+        for (name, spec) in &mut groups.prod {
+            if name == "b" {
+                *spec = "workspace:*".to_string();
+            }
+        }
+    }
+}
+
+#[test]
+fn dependency_rewriter_edges_follow_the_rewritten_specifiers() {
+    let projects = vec![
+        project("/ws/a", "a", "1.0.0", &[("b", "^9.0.0"), ("c", "1.0.0")]),
+        project("/ws/b", "b", "2.0.0", &[]),
+        project("/ws/c", "c", "1.0.0", &[]),
+    ];
+    let result = create_projects_graph(
+        vec_clone(&projects),
+        &CreateProjectsGraphOptions {
+            link_workspace_packages: Some(false),
+            dependency_rewriter: Some(&WorkspaceOverride),
+            ..CreateProjectsGraphOptions::default()
+        },
+    );
+    assert_eq!(edges(&result.graph, "/ws/a"), vec!["/ws/b".to_string()]);
+    assert!(result.unmatched.is_empty());
+
+    let unrewritten = create_projects_graph(
+        projects,
+        &CreateProjectsGraphOptions {
+            link_workspace_packages: Some(false),
+            ..CreateProjectsGraphOptions::default()
+        },
+    );
+    assert_eq!(edges(&unrewritten.graph, "/ws/a"), Vec::<String>::new());
+}
+
+/// Deletes `b` from `dependencies` only, the way `overrides: { 'b:prod': '-' }`
+/// claims one declaration and not its namesake in another group.
+struct DeleteProdScoped;
+
+impl DependencyRewriter for DeleteProdScoped {
+    fn rewrite_dependencies(&self, _project: &dyn GraphProject, groups: &mut DependencyGroups) {
+        groups.prod.retain(|(name, _)| name != "b");
+    }
+}
+
+#[test]
+fn a_group_scoped_rewrite_leaves_the_namesake_in_another_group() {
+    let mut importer = project("/ws/a", "a", "1.0.0", &[("b", "^2.0.0")]);
+    importer.peer = vec![("b".to_string(), "workspace:*".to_string())];
+    let projects = vec![importer, project("/ws/b", "b", "2.0.0", &[])];
+
+    let result = create_projects_graph(
+        projects,
+        &CreateProjectsGraphOptions {
+            link_workspace_packages: Some(false),
+            dependency_rewriter: Some(&DeleteProdScoped),
+            ..CreateProjectsGraphOptions::default()
+        },
+    );
+    assert_eq!(edges(&result.graph, "/ws/a"), vec!["/ws/b".to_string()]);
+    assert!(result.unmatched.is_empty());
 }
 
 fn vec_clone(projects: &[TestProject]) -> Vec<TestProject> {

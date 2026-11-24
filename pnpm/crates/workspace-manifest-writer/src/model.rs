@@ -6,6 +6,11 @@
 
 use indexmap::IndexMap;
 use serde::Deserialize;
+use serde_saphyr::granit_parser::{
+    Scanner,
+    StrInput,
+    TokenType,
+};
 use std::collections::HashSet;
 
 /// The `catalog:` / `catalogs:` slice of a `pnpm-workspace.yaml`, decoded
@@ -15,7 +20,7 @@ use std::collections::HashSet;
 pub(crate) struct Manifest {
     /// `configDependencies:` clean-specifier entries. Object-form
     /// entries (the legacy `{ tarball?, integrity }` shape) are dropped
-    /// here — they're only consulted to detect a no-op write of an
+    /// here, they're only consulted to detect a no-op write of an
     /// already-present clean specifier.
     pub(crate) config_dependencies: Option<IndexMap<String, String>>,
     /// `allowBuilds:` boolean entries. Consulted to detect a no-op write
@@ -46,6 +51,9 @@ pub(crate) struct ManifestDocument {
     /// as judged by [`crate::edit::uses_blank_line_style`] on the original
     /// text. New blocks are inserted in the same style.
     pub(crate) blank_lines: bool,
+    /// The text before any edit, before scalar aliases were expanded.
+    /// [`Self::into_text`] judges the quote style of added scalars on it.
+    original: String,
 }
 
 #[derive(Default)]
@@ -61,7 +69,7 @@ pub(crate) struct SecurityExceptions {
     /// `auditConfig.ignoreGhsas:` list. Consulted to detect a no-op write
     /// of an already-present list.
     pub(crate) legacy_audit_ghsas: Option<Vec<String>>,
-    /// `audit.ignore:` list — the canonical spelling, which wins over
+    /// `audit.ignore:` list, the canonical spelling, which wins over
     /// `auditConfig.ignoreGhsas` when both are present.
     pub(crate) audit: Option<Vec<String>>,
     /// `minimumReleaseAgeExclude:` list. Consulted to detect a no-op write
@@ -119,7 +127,7 @@ struct AuditData {
 
 /// An `allowBuilds` value, tolerant of the string form pnpm also accepts
 /// (a version spec) so decoding a manifest that uses it doesn't fail. Only
-/// the boolean shape is retained — the only shape `pnpm approve-builds`
+/// the boolean shape is retained, the only shape `pnpm approve-builds`
 /// writes.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
@@ -153,7 +161,8 @@ enum OverrideValue {
 impl Manifest {
     /// Parse `original` (the file's contents, or `None` when the file is
     /// absent). An empty or whitespace/comment-only document decodes to an
-    /// empty manifest, matching pnpm treating a nil parse as `{}`.
+    /// empty manifest. An explicit null root is rejected because the edits
+    /// require a mapping.
     pub(crate) fn parse(original: Option<&str>) -> Result<Self, Box<serde_saphyr::Error>> {
         let text = original.unwrap_or_default().to_string();
 
@@ -164,19 +173,16 @@ impl Manifest {
             });
         }
 
-        let top: Option<IndexMap<String, serde::de::IgnoredAny>> =
-            serde_saphyr::from_str(&text).map_err(Box::new)?;
-        let top_level_keys: Vec<String> = top
-            .map(|map| map.into_keys().collect())
-            .unwrap_or_default();
+        let top_level_keys = parse_top_level_keys(&text)?;
         let blank_line_style = crate::edit::uses_blank_line_style(&text, &top_level_keys);
 
         let data: CatalogData = serde_saphyr::from_str::<Option<CatalogData>>(&text)
             .map_err(Box::new)?
             .unwrap_or_default();
         let (overrides, non_scalar_overrides) = split_overrides(data.overrides);
-        let (text, aliases) = pnpm_yaml_document_sync::ScalarAliases::expand(&text)
-            .map_err(|error| Box::new(<serde_saphyr::Error as serde::de::Error>::custom(error)))?;
+        let (expanded, aliases) = pnpm_yaml_document_sync::ScalarAliases::expand(&text)
+            .map_err(<serde_saphyr::Error as serde::de::Error>::custom)
+            .map_err(Box::new)?;
 
         Ok(Manifest {
             config_dependencies: data.config_dependencies.map(clean_config_dependencies),
@@ -185,10 +191,11 @@ impl Manifest {
             overrides,
             non_scalar_overrides,
             document: crate::model::ManifestDocument {
-                text,
+                text: expanded,
                 aliases,
                 keys: top_level_keys,
                 blank_lines: blank_line_style,
+                original: text,
             },
             catalogs: crate::model::CatalogEntries { default: data.catalog, named: data.catalogs },
             exceptions: crate::model::SecurityExceptions {
@@ -199,6 +206,24 @@ impl Manifest {
             },
         })
     }
+}
+
+fn parse_top_level_keys(text: &str) -> Result<Vec<String>, Box<serde_saphyr::Error>> {
+    let top: Option<IndexMap<String, serde::de::IgnoredAny>> =
+        serde_saphyr::from_str(text).map_err(Box::new)?;
+    if let Some(map) = top {
+        return Ok(map.into_keys().collect());
+    }
+    for token in Scanner::new(StrInput::new(text)) {
+        let token =
+            token.map_err(<serde_saphyr::Error as serde::de::Error>::custom)?.into_parts().1;
+        if matches!(token, TokenType::Scalar(..) | TokenType::Tag(..) | TokenType::Anchor(..)) {
+            return Err(Box::new(<serde_saphyr::Error as serde::de::Error>::custom(
+                "expected a mapping, found a null root",
+            )));
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn clean_config_dependencies(
@@ -257,6 +282,10 @@ impl ManifestDocument {
     }
 
     pub(crate) fn into_text(self) -> Result<String, Box<yamlpatch::Error>> {
-        self.aliases.restore(&self.text)
+        let text = self.aliases.restore(&self.text)?;
+        if text == self.original {
+            return Ok(text);
+        }
+        Ok(crate::render::AddedQuotes::detect(&self.original).apply(text))
     }
 }

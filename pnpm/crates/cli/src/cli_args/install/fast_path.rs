@@ -1,11 +1,17 @@
 use super::{
-    InstallArgs, NodeLinkerArg, UpToDateFastPathCheck, install_already_up_to_date,
-    install_already_up_to_date_from_records, install_already_up_to_date_per_project,
-    read_root_manifest_json, warn_deprecated_override_version_references,
+    InstallArgs,
+    NodeLinkerArg,
+    UpToDateFastPathCheck,
+    install_already_up_to_date,
+    install_already_up_to_date_from_records,
+    install_already_up_to_date_per_project,
+    read_root_manifest_json,
+    warn_deprecated_override_version_references,
     warn_ignored_pnpm_manifest_fields,
 };
 use crate::cli_args::yarn_workspaces_field::{
-    converts_yarn_workspaces, warn_about_workspaces_field,
+    converts_yarn_workspaces,
+    warn_about_workspaces_field,
 };
 
 /// Which up-to-date attempt runs.
@@ -31,6 +37,28 @@ fn warn_about_config(
     warn_deprecated_override_version_references(config, emit);
 }
 
+/// Check what the projects `up_to_date` covers require of the host, as the
+/// install does. The root project is checked here only before the config
+/// setup, which checks it otherwise. Returns the warnings about the other
+/// projects, so that a declined fast path emits none of them.
+fn check_host_requirements(
+    manifest_path: &std::path::Path,
+    config: &pnpm_config::Config,
+    up_to_date: &pnpm_package_manager::UpToDateWorkspace,
+    attempt: Attempt,
+    emit: fn(&pnpm_reporter::LogEvent),
+) -> Result<Vec<pnpm_reporter::LogEvent>, &'static str> {
+    let root_dir = crate::state::root_project_dir(manifest_path, config);
+    let project_warnings = crate::state::ProjectHost::new(config, root_dir)
+        .check_projects(&up_to_date.host_requirements)
+        .map_err(|_| "a workspace project's host requirements are not met")?;
+    if matches!(attempt, Attempt::BeforeConfig) {
+        crate::state::check_root_project_engine(manifest_path, config, emit)
+            .map_err(|_| "root project engine check failed")?;
+    }
+    Ok(project_warnings)
+}
+
 fn report_up_to_date_install(
     config: &pnpm_config::Config,
     up_to_date: &pnpm_package_manager::UpToDateWorkspace,
@@ -45,7 +73,8 @@ fn report_up_to_date_install(
         total: up_to_date.project_count,
         workspace_prefix: config.workspace_dir
             .as_deref()
-            .map(|dir| dir.to_string_lossy().into_owned()),
+            .map(std::path::Path::to_string_lossy)
+            .map(std::borrow::Cow::into_owned),
     }));
     let prefix = up_to_date.root.to_string_lossy().into_owned();
     emit(&pnpm_reporter::LogEvent::Pnpm(pnpm_reporter::PnpmLog {
@@ -56,6 +85,8 @@ fn report_up_to_date_install(
     emit(&pnpm_reporter::LogEvent::Summary(pnpm_reporter::SummaryLog {
         level: pnpm_reporter::LogLevel::Debug,
         prefix,
+        new_projects: None,
+        project_names: None,
     }));
 }
 
@@ -72,7 +103,7 @@ impl InstallArgs {
     /// cannot change that answer
     /// ([pnpm/pnpm#13904](https://github.com/pnpm/pnpm/issues/13904)).
     ///
-    /// `false` means "not decided" — the caller proceeds with the full
+    /// `false` means "not decided", the caller proceeds with the full
     /// install path, which re-runs the same check cheaply and
     /// reproduces any error with its established shape. The
     /// `pacquet::install` trace says why the path was not taken.
@@ -142,8 +173,9 @@ impl InstallArgs {
         // pnpmfile declares custom fetchers, which may serve a directory that
         // changed with the lockfile unchanged. Asking means loading the hooks,
         // which is the install's job.
-        let node_linker =
-            self.materialization.node_linker.map_or(config.node_linker, NodeLinkerArg::into_config);
+        let node_linker = self.materialization.node_linker
+            .map(NodeLinkerArg::into_config)
+            .unwrap_or(config.node_linker);
         if node_linker == pnpm_config::NodeLinker::Hoisted && uses_pnpmfile(config, config_root) {
             return false;
         }
@@ -190,10 +222,11 @@ impl InstallArgs {
         if !manifest_path.is_file() {
             return Err("there is no package.json");
         }
-        let manifest = pnpm_package_manifest::PackageManifest::from_path(manifest_path)
+        let manifest = pnpm_package_manifest::PackageManifest::from_path(manifest_path.clone())
             .map_err(|_| "package.json cannot be parsed")?;
-        let node_linker =
-            self.materialization.node_linker.map_or(config.node_linker, NodeLinkerArg::into_config);
+        let node_linker = self.materialization.node_linker
+            .map(NodeLinkerArg::into_config)
+            .unwrap_or(config.node_linker);
         // Each project keeps its own lockfile and state, so each is decided
         // from its own record.
         let per_project = !config.shares_one_lockfile() && config.workspace_dir.is_some();
@@ -211,9 +244,12 @@ impl InstallArgs {
                 config.supported_architectures.clone(),
             ),
         })?;
+        let project_warnings =
+            check_host_requirements(&manifest_path, config, &up_to_date, attempt, emit)?;
         if matches!(attempt, Attempt::BeforeConfig) {
             warn_about_config(root_manifest.as_ref(), config, emit);
         }
+        project_warnings.iter().for_each(emit);
         report_up_to_date_install(config, &up_to_date, emit);
         Ok(())
     }
@@ -227,6 +263,10 @@ impl InstallArgs {
         config: &pnpm_config::Config,
     ) -> Option<&'static str> {
         let gates = [
+            (
+                self.materialization.entry_mode.is_clean_install(),
+                "pnpm ci cleans before installing",
+            ),
             (self.effective_frozen_lockfile(config), "the lockfile is frozen"),
             (self.lockfile.only, "--lockfile-only"),
             (self.lockfile.fix, "--fix-lockfile"),

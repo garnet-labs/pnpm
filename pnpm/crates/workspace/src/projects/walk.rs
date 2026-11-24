@@ -1,14 +1,29 @@
 pub(super) use glob::collect_glob_manifests;
 
 use super::{
-    BTreeSet, DirEntry, ErrorKind, FindWorkspaceProjectsError, Glob, MergePatterns,
-    PROJECT_MANIFEST_BASENAMES, Path, PathBuf, WorkspacePattern, fs,
+    BTreeSet,
+    DirEntry,
+    ErrorKind,
+    FindWorkspaceProjectsError,
+    Glob,
+    MergePatterns,
+    PROJECT_MANIFEST_BASENAMES,
+    Path,
+    PathBuf,
+    WorkspacePattern,
+    fs,
     managed::is_under_ignored_directory,
-    negations::{is_negated_directory, is_pruned_by_subtree_negation},
+    negations::{
+        is_negated_directory,
+        is_pruned_by_subtree_negation,
+    },
 };
 use ancestors::AncestorStack;
 use glob::WalkContext;
-use std::{ffi::OsStr, path::Component};
+use std::{
+    ffi::OsStr,
+    path::Component,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SpecializedPattern<'pattern> {
@@ -67,7 +82,7 @@ pub(super) fn entry_is_directory(
     walk_root: &Path,
 ) -> Result<Option<bool>, FindWorkspaceProjectsError> {
     let Some(file_type) = ignore_not_found_or_loop(entry.file_type())
-        .map_err(|source| workspace_walk_error(walk_root, source))?
+        .map_err(|source| workspace_walk_error(walk_root.to_path_buf(), source))?
     else {
         return Ok(None);
     };
@@ -76,7 +91,7 @@ pub(super) fn entry_is_directory(
     }
     if file_type.is_symlink() {
         let Some(metadata) = ignore_not_found_or_loop(fs::metadata(entry.path()))
-            .map_err(|source| workspace_walk_error(walk_root, source))?
+            .map_err(|source| workspace_walk_error(walk_root.to_path_buf(), source))?
         else {
             return Ok(None);
         };
@@ -90,7 +105,7 @@ pub(super) fn entry_is_file(
     walk_root: &Path,
 ) -> Result<bool, FindWorkspaceProjectsError> {
     let Some(file_type) = ignore_not_found_or_loop(entry.file_type())
-        .map_err(|source| workspace_walk_error(walk_root, source))?
+        .map_err(|source| workspace_walk_error(walk_root.to_path_buf(), source))?
     else {
         return Ok(false);
     };
@@ -99,7 +114,7 @@ pub(super) fn entry_is_file(
     }
     if file_type.is_symlink() {
         let Some(metadata) = ignore_not_found_or_loop(fs::metadata(entry.path()))
-            .map_err(|source| workspace_walk_error(walk_root, source))?
+            .map_err(|source| workspace_walk_error(walk_root.to_path_buf(), source))?
         else {
             return Ok(false);
         };
@@ -165,11 +180,11 @@ pub(super) fn for_each_directory_entry(
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(source) => return Err(workspace_walk_error(walk_root, source)),
+        Err(source) => return Err(workspace_walk_error(walk_root.to_path_buf(), source)),
     };
     for entry in entries {
         if let Some(entry) = ignore_not_found_or_loop(entry)
-            .map_err(|source| workspace_walk_error(walk_root, source))?
+            .map_err(|source| workspace_walk_error(walk_root.to_path_buf(), source))?
         {
             visit(entry)?;
         }
@@ -177,8 +192,8 @@ pub(super) fn for_each_directory_entry(
     Ok(())
 }
 
-fn workspace_walk_error(walk_root: &Path, source: std::io::Error) -> FindWorkspaceProjectsError {
-    FindWorkspaceProjectsError::Walk { root: walk_root.to_path_buf(), source }
+fn workspace_walk_error(walk_root: PathBuf, source: std::io::Error) -> FindWorkspaceProjectsError {
+    FindWorkspaceProjectsError::Walk { root: walk_root, source }
 }
 
 fn is_ignored_manifest_directory(
@@ -226,8 +241,8 @@ fn is_manifest_basename(name: &OsStr) -> bool {
 /// Strip the pattern's leading `../` components, walking `workspace_root`
 /// up one directory for each. wax globs cannot express parent traversal,
 /// so a pattern such as `../shared/*` only matches when the walk starts
-/// from the ancestor it names. `None` — the traversal climbs past the
-/// filesystem root — matches nothing.
+/// from the ancestor it names. `None` (the traversal climbs past the
+/// filesystem root) matches nothing.
 pub(super) fn split_parent_prefix<'root, 'pattern>(
     workspace_root: &'root Path,
     pattern: &'pattern str,
@@ -280,7 +295,8 @@ fn compile_walk_ignores(
         .iter()
         .copied()
         .chain(dot_ignores)
-        .map(|pattern| Glob::new(pattern).map(Glob::into_owned))
+        .map(Glob::new)
+        .map(|value| value.map(Glob::into_owned))
         .collect::<Result<Vec<_>, _>>()?;
     wax::any(patterns)
 }
@@ -357,7 +373,7 @@ const IGNORE_PATTERNS: &[&str] = &["**/node_modules/**", "**/bower_components/**
 
 /// Prunes every path with a dot-prefixed component, so a wildcard cannot
 /// descend into `.git`, `.cache`, and friends. Applied only to patterns that
-/// do not name a dot component themselves — see [`positional_dot_ignores`].
+/// do not name a dot component themselves; see [`positional_dot_ignores`].
 const DOT_COMPONENT_IGNORE_PATTERN: &str = "**/.*/**";
 
 mod ancestors;

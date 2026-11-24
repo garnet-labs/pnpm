@@ -2,10 +2,15 @@
 mod tests;
 
 use super::{
-    Config, HoistedLinkerError, NodeLinker, Path, PathBuf, SymlinkDirectDependenciesError,
+    Config,
+    HoistedLinkerError,
+    NodeLinker,
+    Path,
+    PathBuf,
+    SymlinkDirectDependenciesError,
     SymlinkPackageError,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub(super) fn link_selected_hoisted_direct_dependencies(
     config: &Config,
@@ -13,10 +18,10 @@ pub(super) fn link_selected_hoisted_direct_dependencies(
     project_manifests: &[(PathBuf, &pnpm_package_manifest::PackageManifest)],
     direct_dependencies_by_importer_id: &crate::DirectDependenciesByImporterId,
     initial_sources: &crate::HoistedBinSources,
-    claimed_commands: &mut HashMap<PathBuf, HashSet<String>>,
+    claimed_commands: &mut crate::ClaimedCommands,
 ) -> Result<HashSet<PathBuf>, HoistedLinkerError> {
-    let modules_dir_name = config.modules_dir_name();
-    let root_modules_dir = pnpm_fs::lexical_normalize(&config.modules_dir);
+    let modules_dirs = crate::ImporterModulesDirs::from_config(config, lockfile_dir);
+    let root_modules_dir = modules_dirs.root().to_path_buf();
     let link_options = crate::shim_link_options(config, NodeLinker::Hoisted);
     let mut changed_dirs = HashSet::new();
     for (project_dir, _) in project_manifests {
@@ -27,11 +32,7 @@ pub(super) fn link_selected_hoisted_direct_dependencies(
         let scope = HoistedLinkScope {
             importer_id: pnpm_workspace::importer_id_from_root_dir(lockfile_dir, project_dir),
             root_modules_dir: &root_modules_dir,
-            modules_dir: if is_workspace_root {
-                root_modules_dir.clone()
-            } else {
-                project_dir.join(modules_dir_name)
-            },
+            modules_dir: modules_dirs.of(project_dir),
             is_workspace_root,
         };
         let (changed, linked_commands) = scope.link_direct_dependencies_claiming(
@@ -40,10 +41,7 @@ pub(super) fn link_selected_hoisted_direct_dependencies(
             initial_sources.get(&scope.modules_dir).map(AsRef::as_ref),
         )?;
         if let Some(commands) = linked_commands {
-            claimed_commands
-                .entry(pnpm_fs::lexical_normalize(&scope.modules_dir))
-                .or_default()
-                .extend(commands);
+            claimed_commands.claim(&scope.modules_dir, commands);
         }
         if changed {
             changed_dirs.insert(scope.modules_dir);
@@ -116,13 +114,17 @@ impl HoistedLinkScope<'_> {
         if !changed && self.already_linked(&linked_names, initial_sources) {
             return Ok((false, None));
         }
-        crate::link_direct_dep_bins_before_builds(&self.modules_dir, &linked_names, link_options)
-            .map_err(|source| {
-                HoistedLinkerError::SymlinkDirectDependencies(
-                    SymlinkDirectDependenciesError::LinkBins(source),
-                )
-            })
-            .map(|outcome| (changed, Some(outcome.linked_commands)))
+        crate::link_bins_dir(
+            &self.modules_dir,
+            crate::BinCandidates::Aliases(&linked_names),
+            crate::BinsDirPass::new(link_options).with_targets(crate::BinTargets::MayBeBuilt),
+        )
+        .map_err(|source| {
+            HoistedLinkerError::SymlinkDirectDependencies(SymlinkDirectDependenciesError::LinkBins(
+                source,
+            ))
+        })
+        .map(|outcome| (changed, Some(outcome.linked_commands)))
     }
 
     // Both passes precede lifecycle execution and use identical hoisted shim options.
@@ -145,7 +147,10 @@ impl HoistedLinkScope<'_> {
         let link_path =
             crate::safe_join_modules_dir::safe_join_modules_dir(&self.modules_dir, alias)
                 .map_err(|source| {
-                    self.symlink_failure(alias, SymlinkPackageError::InvalidAlias(source))
+                    self.symlink_failure(
+                        alias.to_owned(),
+                        SymlinkPackageError::InvalidAlias(source),
+                    )
                 })?;
         // A dependency that won the workspace-root slot is reached by
         // walking up from the project, exactly as it is under pnpm.
@@ -163,13 +168,13 @@ impl HoistedLinkScope<'_> {
             return Ok(DirectLink::Unchanged);
         }
         crate::symlink_package(target, &link_path)
-            .map_err(|source| self.symlink_failure(alias, source))?;
+            .map_err(|source| self.symlink_failure(alias.to_owned(), source))?;
         Ok(DirectLink::Created)
     }
 
     /// An install that predates the walk-up rule, or one where the
     /// version had lost the root slot, leaves a link shadowing the root
-    /// copy — the duplicate the rule exists to avoid. A real directory
+    /// copy, the duplicate the rule exists to avoid. A real directory
     /// is the pruner's to remove, and only ever belongs to a version
     /// that lost the slot.
     fn remove_root_shadow(
@@ -182,22 +187,36 @@ impl HoistedLinkScope<'_> {
         // `lstat` surfaces instead of reading as "no link".
         let stale_link = match pnpm_fs::is_symlink_or_junction(link_path) {
             Ok(is_link) => is_link,
-            // Nothing to clean up — the common case.
+            // Nothing to clean up, the common case.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(self.symlink_dir_failure(alias, target, link_path, error)),
+            Err(error) => {
+                return Err(self.symlink_dir_failure(
+                    alias.to_owned(),
+                    target.to_path_buf(),
+                    link_path.to_path_buf(),
+                    error,
+                ));
+            }
         };
         if !stale_link {
             return Ok(());
         }
         pnpm_fs::remove_symlink_dir(link_path)
-            .map_err(|error| self.symlink_dir_failure(alias, target, link_path, error))
+            .map_err(|error| {
+                self.symlink_dir_failure(
+                    alias.to_owned(),
+                    target.to_path_buf(),
+                    link_path.to_path_buf(),
+                    error,
+                )
+            })
     }
 
-    fn symlink_failure(&self, alias: &str, source: SymlinkPackageError) -> HoistedLinkerError {
+    fn symlink_failure(&self, alias: String, source: SymlinkPackageError) -> HoistedLinkerError {
         HoistedLinkerError::SymlinkDirectDependencies(
             SymlinkDirectDependenciesError::SymlinkPackage {
                 importer_id: self.importer_id.clone(),
-                name: alias.to_owned(),
+                name: alias,
                 source,
             },
         )
@@ -205,16 +224,16 @@ impl HoistedLinkScope<'_> {
 
     fn symlink_dir_failure(
         &self,
-        alias: &str,
-        target: &Path,
-        link_path: &Path,
+        alias: String,
+        target: PathBuf,
+        link_path: PathBuf,
         error: std::io::Error,
     ) -> HoistedLinkerError {
         self.symlink_failure(
             alias,
             SymlinkPackageError::SymlinkDir {
-                symlink_target: target.to_path_buf(),
-                symlink_path: link_path.to_path_buf(),
+                symlink_target: target,
+                symlink_path: link_path,
                 error,
             },
         )

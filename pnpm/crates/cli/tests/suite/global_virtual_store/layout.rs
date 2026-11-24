@@ -1,7 +1,19 @@
 use super::{
-    AddMockedRegistry, CommandExtra, CommandTempCwd, Path, append_workspace_yaml_key,
-    assert_no_post_import_linking, fs, gvs_root, harness_store_and_cache_yaml, pacquet,
-    pkg_in_slot, pkg_version_dir, read_modules_manifest, set_gvs_workspace_yaml, sole_hash_dir,
+    AddMockedRegistry,
+    CommandExtra,
+    CommandTempCwd,
+    Path,
+    append_workspace_yaml_key,
+    assert_no_post_import_linking,
+    fs,
+    gvs_root,
+    harness_store_and_cache_yaml,
+    pacquet,
+    pkg_in_slot,
+    pkg_version_dir,
+    read_modules_manifest,
+    set_gvs_workspace_yaml,
+    sole_hash_dir,
     write_manifest,
 };
 use assert_cmd::assert::OutputAssertExt;
@@ -114,7 +126,7 @@ fn virtual_store_only_with_no_modules_dir_works_when_gvs_is_enabled() {
     fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
     fs::remove_dir_all(gvs_root(&store_dir)).expect("remove the GVS root");
 
-    eprintln!("Now virtualStoreOnly + enableModulesDir=false + GVS — must not throw...");
+    eprintln!("Now virtualStoreOnly + enableModulesDir=false + GVS, must not throw...");
     set_gvs_workspace_yaml(&workspace, "virtualStoreOnly: true\nenableModulesDir: false\n");
     pacquet(&workspace)
         .with_args(["install", "--frozen-lockfile"])
@@ -275,7 +287,7 @@ fn virtual_store_only_suppresses_hoisting_even_with_explicit_hoist_pattern() {
 }
 
 /// A `virtualStoreOnly` install must leave the project in a state a
-/// following ordinary install completes rather than purges — the empty
+/// following ordinary install completes rather than purges, the empty
 /// hoist patterns it records are deliberate, not drift.
 ///
 /// Pacquet-only: upstream encodes this as the `!modules.virtualStoreOnly`
@@ -329,8 +341,8 @@ fn ordinary_install_after_virtual_store_only_completes_the_linking() {
 /// cannot reach the private hoist. Scripts must receive `NODE_PATH` plus
 /// the ESM `NODE_PATH` loader flag in `NODE_OPTIONS`, so both CJS and ESM
 /// phantom imports keep resolving. Mirrors the TS coverage in
-/// `pnpm11/config/reader/test/index.ts` and
-/// `pnpm11/exec/esm-node-path-loader/test/index.ts`.
+/// [`pnpm11/config/reader/test/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/config/reader/test/index.ts) and
+/// [`pnpm11/exec/esm-node-path-loader/test/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/exec/esm-node-path-loader/test/index.ts).
 #[test]
 fn scripts_resolve_phantom_esm_imports_through_the_private_hoist() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
@@ -370,7 +382,8 @@ fn scripts_resolve_phantom_esm_imports_through_the_private_hoist() {
     assert!(
         node_path
             .split(path_delimiter)
-            .any(|entry| Path::new(entry).ends_with("node_modules/.pnpm/node_modules")),
+            .map(Path::new)
+            .any(|value| value.ends_with("node_modules/.pnpm/node_modules")),
         "NODE_PATH must carry the private hoist dir: {node_path}",
     );
     let node_options =
@@ -392,7 +405,7 @@ fn scripts_resolve_phantom_esm_imports_through_the_private_hoist() {
 /// run the main entry point through the ESM loader. An entry point that
 /// only a CJS require hook can load, like ts-node's `.ts` entry point,
 /// must still run. Mirrors the TS coverage in
-/// `pnpm11/exec/esm-node-path-loader/test/index.ts`.
+/// [`pnpm11/exec/esm-node-path-loader/test/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/exec/esm-node-path-loader/test/index.ts).
 #[test]
 fn scripts_run_entry_points_loaded_by_commonjs_require_hooks() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
@@ -461,17 +474,15 @@ fn virtual_store_type_selects_where_packages_are_materialized() {
 
         let project_local_slot =
             workspace.join("node_modules/.pnpm/@pnpm.e2e+pkg-with-1-dep@100.0.0");
-        // On macOS a project-local install still materializes the
-        // canonical slots as the directory-clone cache
-        // (`pnpm-deps-restorer/src/dir_clone_cache.rs`), so the links
-        // root exists in every row there; where the *install* lives is
-        // pinned by the project-local-slot assertion below.
-        let expect_links_root = expect_shared || cfg!(target_os = "macos");
         assert_eq!(
             gvs_root(&store_dir).is_dir(),
-            expect_links_root,
-            "the shared store is populated only when asked for (or as the macOS \
-             directory-clone cache); yaml: {yaml}",
+            expect_shared,
+            "the shared store is populated only when asked for; yaml: {yaml}",
+        );
+        assert_eq!(
+            pnpm_store_dir::StoreDir::new(&store_dir).dir_clone_cache().is_dir(),
+            cfg!(target_os = "macos") && !expect_shared,
+            "only macOS project-local installs populate the clone cache; yaml: {yaml}",
         );
         assert_eq!(
             project_local_slot.is_dir(),
@@ -490,7 +501,7 @@ fn virtual_store_type_selects_where_packages_are_materialized() {
 /// a previous install left: `pnpm run` finds the file by existence, so
 /// a map kept across a dependency change would describe a `node_modules`
 /// that has moved on. A repeat install with nothing to do never reaches
-/// the link phase and so leaves the file alone, which is harmless —
+/// the link phase and so leaves the file alone, which is harmless,
 /// with the setting off nothing reads it, and it still matches the
 /// installed tree.
 #[test]
@@ -604,11 +615,12 @@ fn install_through_a_symlinked_modules_dir_writes_links_that_resolve() {
     for file in ["package.json", "pnpm-lock.yaml"] {
         fs::copy(workspace.join(file), nested.join(file)).expect("copy the project files");
     }
-    let workspace_yaml = fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
-        .expect("read pnpm-workspace.yaml")
-        .replace("../pacquet-", "../../pacquet-");
-    fs::write(nested.join("pnpm-workspace.yaml"), workspace_yaml)
-        .expect("write the nested pnpm-workspace.yaml");
+    for file in [".npmrc", "pnpm-workspace.yaml"] {
+        let config = fs::read_to_string(workspace.join(file))
+            .expect("read workspace config")
+            .replace("../pacquet-", "../../pacquet-");
+        fs::write(nested.join(file), config).expect("write the nested workspace config");
+    }
     pnpm_fs::symlink_dir(&workspace.join("node_modules"), &nested.join("node_modules"))
         .expect("symlink the nested project's node_modules");
 

@@ -2,7 +2,10 @@
 //! uses for its `ci` default. Keeping the two in step keeps frozen
 //! installs and prompt suppression consistent across both CLIs.
 
-use crate::api::{EnvVar, Host};
+use crate::api::{
+    EnvVar,
+    Host,
+};
 use std::sync::OnceLock;
 
 /// Variables whose non-empty value marks a CI environment: `ci-info`'s
@@ -29,6 +32,7 @@ pub const CI_ENV_VARS: &[&str] = &[
     "BITRISE_IO",
     "BUDDY_WORKSPACE_ID",
     "BUILDKITE",
+    "CAPAWESOME_CLOUD",
     "CIRCLECI",
     "CIRRUS_CI",
     "CF_PAGES",
@@ -54,6 +58,7 @@ pub const CI_ENV_VARS: &[&str] = &[
     "PROW_JOB_ID",
     "RELEASE_BUILD_ID",
     "RENDER",
+    "RWX",
     "SAILCI",
     "SCREWDRIVER",
     "SEMAPHORE",

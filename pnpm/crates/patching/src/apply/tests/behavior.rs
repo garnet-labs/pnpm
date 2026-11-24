@@ -1,10 +1,21 @@
 use super::{
-    FILE_TXT_PATCH_HEADER, IS_POSITIVE_PATCH, PatchApplyError, applied_hunk, apply_patch_to_dir,
-    assert_eq, fs, tempdir, text_block_fnl, write_patch,
+    FILE_TXT_PATCH_HEADER,
+    IS_POSITIVE_PATCH,
+    PatchApplyError,
+    applied_hunk,
+    apply_patch_to_dir,
+    assert_eq,
+    fs,
+    tempdir,
+    text_block_fnl,
+    write_patch,
 };
 
 #[cfg(unix)]
-use super::{IS_POSITIVE_INDEX_JS, IS_POSITIVE_INDEX_JS_PATCHED};
+use super::{
+    IS_POSITIVE_INDEX_JS,
+    IS_POSITIVE_INDEX_JS_PATCHED,
+};
 
 #[test]
 fn applies_patch_with_crlf_line_endings() {
@@ -223,7 +234,10 @@ fn mode_change_patch_is_idempotent() {
 #[cfg(unix)]
 #[test]
 fn mode_change_does_not_mutate_hardlinked_store_file() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{
+        MetadataExt,
+        PermissionsExt,
+    };
 
     let store = tempdir().unwrap();
     let store_file = store.path().join("tool.sh");
@@ -277,7 +291,10 @@ fn mode_change_does_not_mutate_hardlinked_store_file() {
 #[cfg(unix)]
 #[test]
 fn idempotent_mode_change_does_not_mutate_hardlinked_store_file() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{
+        MetadataExt,
+        PermissionsExt,
+    };
 
     let store = tempdir().unwrap();
     let store_file = store.path().join("run.sh");
@@ -331,7 +348,10 @@ fn idempotent_mode_change_does_not_mutate_hardlinked_store_file() {
 #[cfg(unix)]
 #[test]
 fn mode_change_on_symlink_does_not_mutate_target_outside_package() {
-    use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+    use std::os::unix::fs::{
+        self as unix_fs,
+        PermissionsExt,
+    };
 
     let outside = tempdir().unwrap();
     let victim = outside.path().join("victim.sh");
@@ -390,7 +410,10 @@ fn mode_change_on_symlink_does_not_mutate_target_outside_package() {
 #[cfg(unix)]
 #[test]
 fn directory_symlink_pointing_outside_package_is_rejected() {
-    use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+    use std::os::unix::fs::{
+        self as unix_fs,
+        PermissionsExt,
+    };
 
     let outside = tempdir().unwrap();
     let victim = outside.path().join("victim.sh");
@@ -560,7 +583,7 @@ diff --git a/blob.txt b/blob.txt
 --- a/blob.txt
 +++ b/blob.txt
 @@ -1 +1,2 @@
- \u{fffd}\u{fffd}\u{fffd}
+ ���
 +added line
 ",
     );
@@ -621,7 +644,7 @@ fn delete_patch_leaving_non_empty_result_errors_without_unlinking() {
     let patched = tempdir().unwrap();
     let target = patched.path().join("partial.txt");
     // Two lines on disk. The patch below claims to delete the file
-    // but only removes the first line — `diffy::apply` applies the
+    // but only removes the first line, `diffy::apply` applies the
     // single hunk and returns the unpatched tail (`stay\n`), which
     // is non-empty, so the implementation must error.
     fs::write(&target, "going away\nstay\n").unwrap();
@@ -741,4 +764,189 @@ fn modify_does_not_destroy_target_on_write_failure() {
         IS_POSITIVE_INDEX_JS,
         "target must NOT be destroyed when the rewrite can't finish",
     );
+}
+
+#[test]
+fn mode_only_patch_keeps_the_bytes_of_a_non_utf8_file() {
+    let patched = tempdir().unwrap();
+    let target = patched.path().join("tool");
+    let bytes = b"\x7fELF\x02\x01\x01\x00\xff\xfe\xfd\x80\x81\x90\x00";
+    fs::write(&target, bytes).unwrap();
+    let patch_dir = tempdir().unwrap();
+    let patch = text_block_fnl! {
+        "diff --git a/tool b/tool"
+        "old mode 100644"
+        "new mode 100755"
+    };
+    let patch = write_patch(patch_dir.path(), patch);
+
+    apply_patch_to_dir(patched.path(), &patch).expect("apply must succeed");
+
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+}
+
+#[test]
+fn rename_with_a_mode_change_keeps_the_bytes_of_a_non_utf8_file() {
+    let patched = tempdir().unwrap();
+    let bytes = b"\xff\xfe\x00\x80";
+    fs::write(patched.path().join("a.bin"), bytes).unwrap();
+    let patch_dir = tempdir().unwrap();
+    let patch = text_block_fnl! {
+        "diff --git a/a.bin b/b.bin"
+        "old mode 100644"
+        "new mode 100755"
+        "similarity index 100%"
+        "rename from a.bin"
+        "rename to b.bin"
+    };
+    let patch = write_patch(patch_dir.path(), patch);
+
+    apply_patch_to_dir(patched.path(), &patch).expect("apply must succeed");
+
+    assert_eq!(fs::read(patched.path().join("b.bin")).unwrap(), bytes);
+}
+
+/// An editor that strips trailing whitespace turns a blank context line
+/// into a bare line break.
+#[test]
+fn applies_a_crlf_patch_with_a_blank_context_line_stripped_of_its_space() {
+    let original = "one\n\ntwo\n";
+    let hunk = text_block_fnl! {
+        "@@ -1,3 +1,4 @@"
+        " one"
+        ""
+        "+added"
+        " two"
+    };
+    let patched = tempdir().unwrap();
+    let target = patched.path().join("file.txt");
+    fs::write(&target, original).unwrap();
+    let patch_dir = tempdir().unwrap();
+    let crlf_patch = format!("{FILE_TXT_PATCH_HEADER}{hunk}").replace('\n', "\r\n");
+    let patch = write_patch(patch_dir.path(), &crlf_patch);
+
+    apply_patch_to_dir(patched.path(), &patch).expect("apply must succeed");
+
+    assert_eq!(fs::read_to_string(target).unwrap(), "one\n\nadded\r\ntwo\n");
+}
+
+#[test]
+fn applies_a_unified_diff_without_diff_git_lines() {
+    let patched = tempdir().unwrap();
+    let target = patched.path().join("file.txt");
+    fs::write(&target, "one\ntwo\n").unwrap();
+    let patch_dir = tempdir().unwrap();
+    let patch = text_block_fnl! {
+        "--- a/file.txt"
+        "+++ b/file.txt"
+        "@@ -1,2 +1,3 @@"
+        " one"
+        "+added"
+        " two"
+    };
+    let patch = write_patch(patch_dir.path(), patch);
+
+    apply_patch_to_dir(patched.path(), &patch).expect("apply must succeed");
+
+    assert_eq!(fs::read_to_string(target).unwrap(), "one\nadded\ntwo\n");
+}
+
+#[test]
+fn rejects_a_patch_that_creates_a_symlink() {
+    let patched = tempdir().unwrap();
+    let patch_dir = tempdir().unwrap();
+    let patch = text_block_fnl! {
+        "diff --git a/link b/link"
+        "new file mode 120000"
+        "--- /dev/null"
+        "+++ b/link"
+        "@@ -0,0 +1 @@"
+        "+target.js"
+        r"\ No newline at end of file"
+    };
+    let patch = write_patch(patch_dir.path(), patch);
+
+    let err = apply_patch_to_dir(patched.path(), &patch).expect_err("apply must fail");
+
+    let PatchApplyError::InvalidPatch { message, .. } = err else {
+        panic!("expected InvalidPatch, got: {err:?}");
+    };
+    assert_eq!(message, "Unexpected file mode string: 120000");
+    assert!(
+        patched
+            .path()
+            .join("link")
+            .symlink_metadata()
+            .is_err(),
+    );
+}
+
+#[test]
+fn create_over_a_file_whose_bytes_differ_from_the_created_content_errors() {
+    let patched = tempdir().unwrap();
+    let target = patched.path().join("file.txt");
+    fs::write(&target, b"\xff\n").unwrap();
+    let patch_dir = tempdir().unwrap();
+    let patch = text_block_fnl! {
+        "diff --git a/file.txt b/file.txt"
+        "new file mode 100644"
+        "--- /dev/null"
+        "+++ b/file.txt"
+        "@@ -0,0 +1 @@"
+        "+�"
+    };
+    let patch = write_patch(patch_dir.path(), patch);
+
+    let err = apply_patch_to_dir(patched.path(), &patch).expect_err("apply must fail");
+
+    assert!(matches!(err, PatchApplyError::PatchFailed { .. }), "got: {err:?}");
+    assert_eq!(fs::read(&target).unwrap(), b"\xff\n");
+}
+
+#[test]
+fn applies_adjacent_unified_diff_records_after_no_newline_markers() {
+    let patched = tempdir().unwrap();
+    fs::write(patched.path().join("first.txt"), "old").unwrap();
+    fs::write(patched.path().join("second.txt"), "one\n").unwrap();
+    let patch_dir = tempdir().unwrap();
+    let patch = text_block_fnl! {
+        "--- a/first.txt"
+        "+++ b/first.txt"
+        "@@ -1 +1 @@"
+        "-old"
+        r"\ No newline at end of file"
+        "+new"
+        r"\ No newline at end of file"
+        "--- a/second.txt"
+        "+++ b/second.txt"
+        "@@ -1 +1,2 @@"
+        " one"
+        "+two"
+    };
+    let patch = write_patch(patch_dir.path(), patch);
+
+    apply_patch_to_dir(patched.path(), &patch).expect("apply must succeed");
+
+    assert_eq!(fs::read_to_string(patched.path().join("first.txt")).unwrap(), "new");
+    assert_eq!(fs::read_to_string(patched.path().join("second.txt")).unwrap(), "one\ntwo\n");
+}
+
+#[test]
+fn applies_a_unified_diff_hunk_whose_lines_look_like_file_headers() {
+    let patched = tempdir().unwrap();
+    let target = patched.path().join("file.txt");
+    fs::write(&target, "-- old\n").unwrap();
+    let patch_dir = tempdir().unwrap();
+    let patch = text_block_fnl! {
+        "--- a/file.txt"
+        "+++ b/file.txt"
+        "@@ -1 +1 @@"
+        "--- old"
+        "+++ new"
+    };
+    let patch = write_patch(patch_dir.path(), patch);
+
+    apply_patch_to_dir(patched.path(), &patch).expect("apply must succeed");
+
+    assert_eq!(fs::read_to_string(target).unwrap(), "++ new\n");
 }

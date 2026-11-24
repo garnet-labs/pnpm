@@ -2,17 +2,35 @@ use super::HoistedDirCloneCache;
 use crate::{
     DirCloneCache,
     dir_clone_cache::EngineNameSource,
-    link_hoisted_modules::{LinkHoistedModulesOpts, import_node, tests::make_node},
+    link_hoisted_modules::{
+        LinkHoistedModulesOpts,
+        import_node,
+        tests::make_node,
+    },
 };
-use pnpm_config::{Config, NodeLinker, PackageImportMethod};
-use pnpm_lockfile::{PackageKey, PackageMetadata, SnapshotEntry};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+    PackageImportMethod,
+};
+use pnpm_lockfile::{
+    PackageKey,
+    PackageMetadata,
+    SnapshotEntry,
+};
 use pnpm_patching::PatchInfo;
 use pnpm_reporter::SilentReporter;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     fs,
     path::Path,
-    sync::{Arc, atomic::AtomicU8},
+    sync::{
+        Arc,
+        atomic::AtomicU8,
+    },
 };
 
 fn metadata() -> PackageMetadata {
@@ -41,6 +59,7 @@ fn cache<'a>(
         &Config {
             enable_global_virtual_store: false,
             global_virtual_store_dir: root.join("links"),
+            store_dir: pnpm_store_dir::StoreDir::new(root.join("store")),
             modules_dir: root.join("project/node_modules"),
             package_import_method: PackageImportMethod::Clone,
             ..Config::default()
@@ -178,11 +197,11 @@ fn local_tarball_imports_updated_content_despite_an_existing_canonical() {
     let opts = LinkHoistedModulesOpts {
         dir_clone_cache: Some(&cache),
         graph: &BTreeMap::new(),
-        prev_graph: None,
+        previous_dirs: &std::collections::BTreeSet::new(),
         hierarchy: &BTreeMap::new(),
         cas_paths_by_pkg_id: &cas_index,
         import: import(&logged),
-        confine_root: temp.path(),
+        modules_dirs: &crate::ImporterModulesDirs::node_modules(temp.path()),
         link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
     };
     assert!(import_node::<SilentReporter>(&node, &opts).expect("fallback import"));
@@ -296,11 +315,11 @@ fn occupied_hoisted_parent_falls_back_without_losing_nested_dependencies() {
     let opts = LinkHoistedModulesOpts {
         dir_clone_cache: Some(&cache),
         graph: &BTreeMap::new(),
-        prev_graph: None,
+        previous_dirs: &std::collections::BTreeSet::new(),
         hierarchy: &BTreeMap::new(),
         cas_paths_by_pkg_id: &cas_index,
         import: import(&logged),
-        confine_root: temp.path(),
+        modules_dirs: &crate::ImporterModulesDirs::node_modules(temp.path()),
         link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
     };
     assert!(import_node::<SilentReporter>(&node, &opts).expect("fallback import"));

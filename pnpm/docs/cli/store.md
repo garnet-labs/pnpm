@@ -29,24 +29,29 @@ store directly without modifying any projects or files outside of the store.
 pnpm store add express@4
 ```
 
-It also takes package tarballs that were downloaded some other way. This
-prepares the store for an install without network access, such as a sandboxed
-build that downloads its sources ahead of time:
+It also takes package tarballs or directories of tarballs that were downloaded
+some other way, searching directories recursively for `.tgz`, `.tar.gz`, and
+`.tar` archives. This prepares the store for an install without network access,
+such as a sandboxed build that downloads its sources ahead of time:
 
 ```sh
-pnpm store add ./tarballs/*.tgz
+pnpm store add ./tarballs
 pnpm install --offline --frozen-lockfile
 ```
 
-An install takes a registry package from such a tarball when its lockfile entry
-names the same package and version and pins that tarball. The entry's
-`integrity` can be the tarball's sha512 or sha1, or the hash of the uncompressed
-tar inside it, which
+An install takes a package from such a tarball when its lockfile entry pins
+that tarball. The entry's `integrity` can be the tarball's sha512 or sha1, or the
+hash of the uncompressed tar inside it, which
 [`lockfile.integrityTarget: tar`](../settings/store.md#lockfileintegritytarget)
 records.
 
-For a package from a [named registry](../package-sources.md#named-registries)
-that the project declares, run `pnpm store add` in that project.
+Run `pnpm store add` in the project it prepares the store for. It then reads the
+project's lockfile and prepares each tarball for every entry that pins it. This
+covers a dependency on a tarball URL, a package from a
+[named registry](../package-sources.md#named-registries), and a dependency on a
+git host such as GitHub when its entry records an `integrity`. Outside a project,
+a tarball only serves registry entries that name the package and version in its
+`package.json`.
 
 [`pnpm add`]: ./add.md
 
@@ -90,6 +95,18 @@ number of undecodable entries in the summary. Pruning continues for other entrie
 Keeping an index entry does not preserve its unreferenced files. A later install
 downloads the package again if it cannot reuse the stored files.
 
+`pnpm store prune` keeps the wheels and source distributions that the
+`pylock.toml` of each registered Python project pins, so a later
+`pnpm install --offline` can recreate its environment. Unless `frozenStore`
+is enabled, an install tries to register each Python project that has an
+environment, even one whose store is inside it. A failed registration does
+not fail the install. A project installed by an earlier pnpm version is not
+registered until it is installed again. Pruning stops if a registered
+project's `pylock.toml` cannot be parsed.
+
+`pnpm store prune` fails with `ERR_PNPM_FROZEN_STORE_WRITE` when
+[`frozenStore`](../settings/store.md#frozenstore) is enabled.
+
 Since v12.7.0, `pnpm store prune` also removes private copies of pnpm or a
 runtime that a killed pnpm process left behind. pnpm makes such a copy when a
 project pins a version that another pnpm process is installing at that moment.
@@ -98,7 +115,11 @@ project pins a version that another pnpm process is installing at that moment.
 
 Without the global virtual store, an install with `--frozen-store` or `enableModulesDir: false` does not write the registry. Neither do `--lockfile-only` and `--dry-run` installs.
 
-When the [global virtual store] is enabled, `pnpm store prune` also performs mark-and-sweep garbage collection on the global virtual store's `links/` directory. It walks the registered projects to find the packages still in use and removes the rest. If no registered project links into `links/`, prune leaves it unchanged.
+`pnpm store prune` removes the directory-clone cache used by local installs on macOS. Installed packages remain available, and later installs recreate the cache as needed. The cache requires the store and project to be on the same volume. A frozen store uses per-file imports when its cache is missing.
+
+When the [global virtual store] is enabled, `pnpm store prune` also performs mark-and-sweep garbage collection on its `links/` directory. It walks the registered projects to find the packages still in use and removes the rest. If no registered project links into `links/`, prune leaves it unchanged.
+
+Pruning stops if a dependency link cannot be read.
 
 [global virtual store]: ../settings/node-modules.md#enableglobalvirtualstore
 

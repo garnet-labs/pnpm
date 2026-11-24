@@ -1,12 +1,26 @@
 use super::{
-    CliArgs, CliCommand, CommandFactory, Diagnostic, Display, Error, ErrorKind, Pipe, ReporterType,
+    CliArgs,
+    CliCommand,
+    CommandFactory,
+    Diagnostic,
+    Display,
+    Error,
+    ErrorKind,
+    Pipe,
+    ReporterType,
 };
 
 use crate::{
     cli_args::reporter::ReporterFlags,
-    config_overrides::{ConfigOverrides, GlobalConflict},
+    config_overrides::{
+        ConfigOverrides,
+        GlobalConflict,
+    },
 };
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 /// Error type of [`CliArgs::apply_workspace_root`].
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -119,7 +133,7 @@ impl CliArgs {
     /// project. pnpm's `config.dir` is that prefix, so a command run from
     /// a plain subdirectory of a project acts on the project rather than
     /// on the subdirectory. Which manifests count as a project depends on
-    /// the command — see [`CliCommand::acts_on_the_npm_project`]. Call
+    /// the command; see [`CliCommand::acts_on_the_npm_project`]. Call
     /// before anything reads `--dir`.
     ///
     /// A cwd that cannot be read leaves `--dir` at its default, which the
@@ -152,7 +166,7 @@ impl CliArgs {
     /// The fallback resolves `..` itself rather than leaving the components
     /// in place. [`pnpm_workspace::find_workspace_dir`] walks ancestors
     /// lexically, so a `--dir` that climbs out of the workspace and lands
-    /// on a directory that does not exist — `../../elsewhere` — would
+    /// on a directory that does not exist (`../../elsewhere`) would
     /// otherwise walk right back up through its own `..` components and
     /// select the workspace the user pointed away from.
     pub fn apply_workspace_root(&mut self) -> Result<(), WorkspaceRootError> {
@@ -187,6 +201,7 @@ impl CliArgs {
         // were workspace projects.
         if !self.workspace.recursive
             && !self.paths.ignore_workspace
+            && !self.command.is_global()
             && self.command.recursive_by_default()
             && let Ok(Some(workspace_dir)) = pnpm_workspace::find_workspace_dir(&dir)
         {
@@ -200,7 +215,7 @@ impl CliArgs {
     }
 
     /// `restart` also runs scripts and accepts its own `--if-present`,
-    /// so the top-level spelling is valid for it too — unlike the
+    /// so the top-level spelling is valid for it too, unlike the
     /// recursive-only flags, which `restart` rejects. `exec` is the
     /// reverse: it takes the recursive-only flags but runs arbitrary
     /// commands rather than scripts, so pnpm rejects `--if-present`
@@ -290,19 +305,19 @@ impl super::CliNetworkArgs {
         );
         if let Some(https_proxy) = &self.https_proxy {
             config.cli_settings.insert("httpsProxy".to_string());
-            push_cli_token(config, "https-proxy", https_proxy);
+            push_cli_token(config, "https-proxy", https_proxy.clone());
         }
         if let Some(http_proxy) = &self.http_proxy {
             config.cli_settings.insert("httpProxy".to_string());
-            push_cli_token(config, "http-proxy", http_proxy);
+            push_cli_token(config, "http-proxy", http_proxy.clone());
         }
         if let Some(no_proxy) = &self.no_proxy {
             config.cli_settings.insert("noProxy".to_string());
             config.cli_settings.insert("noproxy".to_string());
-            push_cli_token(config, "no-proxy", no_proxy);
+            push_cli_token(config, "no-proxy", no_proxy.clone());
         }
         if let Some(registry) = self.registry.as_deref() {
-            push_cli_token(config, "registry", registry);
+            push_cli_token(config, "registry", registry.to_owned());
         }
     }
 }
@@ -310,13 +325,13 @@ impl super::CliNetworkArgs {
 pub(in crate::cli_args) fn push_cli_token(
     config: &mut pnpm_config::Config,
     key: &str,
-    value: &str,
+    value: String,
 ) {
     config.cli.npmrc_tokens.retain(|(existing, _)| {
         let normalized = pnpm_config::naming_cases::to_kebab_case(existing);
         normalized != key && !(key == "no-proxy" && normalized == "noproxy")
     });
-    config.cli.npmrc_tokens.push((key.to_string(), value.to_string()));
+    config.cli.npmrc_tokens.push((key.to_string(), value));
 }
 
 pub(crate) fn find_workspace_root_dir(dir: &Path) -> Result<PathBuf, WorkspaceRootError> {
@@ -326,7 +341,7 @@ pub(crate) fn find_workspace_root_dir(dir: &Path) -> Result<PathBuf, WorkspaceRo
 }
 
 fn resolve_real_dir(dir: &Path) -> PathBuf {
-    dunce::canonicalize(dir)
+    pnpm_fs::canonicalize_preserving_mapped_drive(dir)
         .or_else(|_| std::path::absolute(dir))
         .unwrap_or_else(|_| dir.to_path_buf())
         .pipe_deref(pnpm_fs::lexical_normalize)

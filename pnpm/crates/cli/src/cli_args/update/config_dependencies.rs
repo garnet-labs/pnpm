@@ -8,7 +8,10 @@ use pnpm_matcher::create_matcher;
 use pnpm_package_manager::parse_update_param;
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::UpdateBehavior;
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+};
 
 impl UpdateArgs {
     /// Update the config dependencies [`Self::config_dependency_updates`]
@@ -20,8 +23,7 @@ impl UpdateArgs {
     ) -> miette::Result<()> {
         // The options the update itself rejects later must not have
         // written anything by then.
-        self.check_patches_options()?;
-        self.check_interactive_peer_options()?;
+        self.check_flag_combinations()?;
         self.check_workspace_option(config.workspace_dir.as_deref())?;
         let updates = self.config_dependency_updates(config);
         config_deps::update_config_dependencies::<Reporter>(config, config_root, &updates).await
@@ -31,7 +33,7 @@ impl UpdateArgs {
     /// selectors name, or every one when there are none. Each keeps the
     /// declared specifier's operator, as a project dependency does.
     ///
-    /// None with `--interactive`, `--patches`, `--no-save`, `--filter`, or a
+    /// None with `--interactive`, `--patches`, `--tag`, `--no-save`, `--filter`, or a
     /// flag that narrows the dependency groups: each of those scopes the
     /// update to project dependencies. A versioned selector names a
     /// project dependency.
@@ -44,8 +46,9 @@ impl UpdateArgs {
             range_spec_style: self.range_spec_style(config),
         };
         let groups = &self.dependency_options;
-        let narrowed = self.selection.interactive
+        let narrowed = self.selection.display.interactive
             || self.selection.patches
+            || self.selection.tag.is_some()
             || self.save.no_save
             || !config.filter.is_empty()
             || !config.filter_prod.is_empty()

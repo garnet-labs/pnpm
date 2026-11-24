@@ -1,7 +1,19 @@
 use super::{
-    Arc, BlobFinalize, Body, CanonicalPackageName, DocumentWrite, Ecosystem, HostedBackend,
-    HostedDocumentForUpdate, HostedDocumentVersion, ObjectPath, ObjectStoreExt, Path, PathBuf,
-    Result, S3Store, StreamExt, async_trait, fs,
+    Arc,
+    Body,
+    CanonicalPackageName,
+    DocumentWrite,
+    Ecosystem,
+    HostedBackend,
+    HostedDocumentForUpdate,
+    HostedDocumentVersion,
+    ObjectPath,
+    Path,
+    PathBuf,
+    Result,
+    S3Store,
+    async_trait,
+    fs,
 };
 
 /// The S3-compatible object-store backend. Document writes are
@@ -69,7 +81,9 @@ impl HostedBackend for S3Store {
             Some(HostedDocumentVersion::Unversioned) | None => None,
             // The object store never hands one out, so the document it names
             // is not the one stored here.
-            Some(HostedDocumentVersion::Generation(_)) => return Ok(DocumentWrite::Conflict),
+            Some(HostedDocumentVersion::Generation(_) | HostedDocumentVersion::Tombstone(_)) => {
+                return Ok(DocumentWrite::Conflict);
+            }
         };
         if S3Store::write_document_if_current(self, name, bytes, version).await? {
             Ok(DocumentWrite::Written)
@@ -78,101 +92,38 @@ impl HostedBackend for S3Store {
         }
     }
 
-    async fn open_blob(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<Option<(Body, Option<u64>)>> {
-        S3Store::open_blob(self, name, filename).await
+    async fn open_archive(&self, key: &str) -> Result<Option<(Body, Option<u64>)>> {
+        S3Store::open_archive(self, key).await
     }
 
-    async fn open_blob_range(
+    async fn open_archive_range(
         &self,
-        name: &CanonicalPackageName,
-        filename: &str,
+        key: &str,
         requested: &object_store::GetRange,
     ) -> Result<Option<crate::RangedBlob>> {
-        let key = self.blob_key(name, filename);
-        let meta = match self.store.head(&key).await {
-            Ok(meta) => meta,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let size = meta.size;
-        let Ok(range) = requested.as_range(size) else {
-            return Ok(Some(crate::RangedBlob::Unsatisfiable { size }));
-        };
-        if range.is_empty() {
-            return Ok(Some(crate::RangedBlob::Unsatisfiable { size }));
-        }
-        let options = object_store::GetOptions {
-            range: Some(object_store::GetRange::Bounded(range.clone())),
-            if_match: meta.e_tag,
-            ..Default::default()
-        };
-        let result = match self.store.get_opts(&key, options).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let body = Body::from_stream(result.into_stream());
-        Ok(Some(crate::RangedBlob::Read { body, range, size }))
+        self.read_archive_range(key, requested).await
     }
 
-    async fn reserve_blob_tmp(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<PathBuf> {
-        self.staging_tmp_path(name, filename).await
+    async fn reserve_archive_tmp(&self) -> Result<PathBuf> {
+        self.staging_tmp_path().await
     }
 
-    async fn finalize_blob(
-        &self,
-        tmp_path: &Path,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<BlobFinalize> {
-        let outcome = self.upload_blob(tmp_path, name, filename).await?;
-        // Keep the staged tmp on a Conflict for the caller, which reports the
-        // conflict and removes it; once the object is ours there is nothing
-        // left to promote.
-        if outcome != BlobFinalize::Conflict {
-            let _ = fs::remove_file(tmp_path).await;
-        }
-        Ok(outcome)
+    fn archive_tmp_base(&self) -> PathBuf {
+        self.staging_tmp_base()
     }
 
-    async fn remove_blob(&self, name: &CanonicalPackageName, filename: &str) -> Result<bool> {
-        S3Store::remove_blob(self, name, filename).await
+    async fn put_archive(&self, tmp_path: &Path, key: &str) -> Result<()> {
+        let uploaded = self.upload_archive(tmp_path, key).await;
+        let _ = fs::remove_file(tmp_path).await;
+        uploaded
     }
 
-    async fn remove_package(&self, name: &CanonicalPackageName) -> Result<bool> {
-        S3Store::remove_package(self, name).await
+    async fn remove_archive(&self, key: &str) -> Result<bool> {
+        S3Store::remove_archive(self, key).await
     }
 
-    fn list_blob_files(
-        &self,
-    ) -> futures_util::stream::BoxStream<'_, Result<crate::HostedBlobFile>> {
-        self.list_package_files()
-            .map(|file| {
-                let (package, file, meta) = file?;
-                let blob = match file {
-                    super::PackageFile::Document => None,
-                    super::PackageFile::Blob(blob) => Some(blob),
-                };
-                Ok(crate::HostedBlobFile {
-                    package,
-                    blob,
-                    modified: meta.last_modified.into(),
-                    size: meta.size,
-                })
-            })
-            .boxed()
-    }
-
-    async fn list_package_blobs(&self, name: &CanonicalPackageName) -> Result<Vec<String>> {
-        S3Store::list_package_blobs(self, name).await
+    fn list_archives(&self) -> futures_util::stream::BoxStream<'_, Result<crate::StoredArchive>> {
+        self.list_archive_objects()
     }
 
     async fn list_top_level_dirs(&self) -> Result<Vec<String>> {
@@ -197,6 +148,10 @@ impl HostedBackend for S3Store {
 
     async fn read_record(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
         S3Store::read_record(self, namespace, key).await
+    }
+
+    async fn has_any_record(&self, namespace: &str) -> Result<bool> {
+        S3Store::has_any_record(self, namespace).await
     }
 
     async fn create_record(&self, namespace: &str, key: &str, bytes: &[u8]) -> Result<bool> {

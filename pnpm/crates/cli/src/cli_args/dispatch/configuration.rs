@@ -1,10 +1,29 @@
 use super::{
-    CliArgs, CliCommand, Config, ConfigWarnings, Context, DefaultReporterSetup, Host,
-    IntoDiagnostic, Path, PathBuf, ReporterType, SummaryScope, configure_default_reporter,
-    configure_max_log_level, default_pnpm_home_dir, now_millis, prepare_config, prints_json_errors,
-    seed_config, warn_shared_workspace_lockfile_outside_workspace,
+    CliArgs,
+    CliCommand,
+    Config,
+    ConfigWarnings,
+    Context,
+    DefaultReporterSetup,
+    Host,
+    IntoDiagnostic,
+    Path,
+    PathBuf,
+    ReporterType,
+    SummaryScope,
+    configure_default_reporter,
+    configure_max_log_level,
+    default_pnpm_home_dir,
+    now_millis,
+    prepare_config,
+    seed_config,
+    warn_shared_workspace_lockfile_outside_workspace,
 };
-use crate::{cli_args::reporter::CliReporter, config_overrides::ConfigOverrides};
+use crate::{
+    cli_args::reporter::CliReporter,
+    config_overrides::ConfigOverrides,
+};
+use pnpm_config::CommandTarget;
 use pnpm_hooks::PnpmfileHooks;
 use std::sync::Arc;
 
@@ -20,7 +39,7 @@ pub(super) struct RunAnchors {
     /// TLS / registry decisions of a *global* install. Mirror that by
     /// anchoring the global-install config at the pnpm home (resolved from
     /// `PNPM_HOME` / platform defaults, never the project). Falls back to
-    /// the `--dir` anchor when the home can't be determined — the global
+    /// the `--dir` anchor when the home can't be determined, the global
     /// command then fails at the missing-global-bin-dir check regardless.
     pub(super) global_config: PathBuf,
 }
@@ -35,7 +54,7 @@ impl RunAnchors {
     /// becomes `config.dir` (used as the install `lockfileDir`, threaded
     /// into every event's `prefix`).
     pub(super) fn resolve(args: &CliArgs) -> miette::Result<Self> {
-        let dir = dunce::canonicalize(&args.paths.dir)
+        let dir = pnpm_fs::canonicalize_preserving_mapped_drive(&args.paths.dir)
             .into_diagnostic()
             .wrap_err_with(|| {
                 format!("canonicalizing the `--dir` argument: {}", args.paths.dir.display())
@@ -43,7 +62,9 @@ impl RunAnchors {
         let cli_dir = if args.paths.dir_from_command_line {
             dir.clone()
         } else {
-            std::env::current_dir().and_then(dunce::canonicalize).unwrap_or_else(|_| dir.clone())
+            std::env::current_dir()
+                .and_then(|cwd| pnpm_fs::canonicalize_preserving_mapped_drive(&cwd))
+                .unwrap_or_else(|_| dir.clone())
         };
         let manifest_path = pnpm_workspace::project_manifest_path(&dir);
         let global_config = default_pnpm_home_dir::<Host>().unwrap_or_else(|| dir.clone());
@@ -93,7 +114,7 @@ impl RunSetup {
                     | CliCommand::PatchCommit(_)
                     | CliCommand::PatchRemove(_),
             ),
-            print_json_errors: prints_json_errors(&args.command),
+            print_json_errors: args.command.prints_json_errors(),
             recursive_by_default: args.command.recursive_by_default(),
             summary_scope: args.command.default_reporter_summary_scope(),
             reports_scope: args.command.reports_scope(args.workspace.recursive),
@@ -108,6 +129,7 @@ impl RunSetup {
 pub(super) struct ConfigTarget<'a> {
     pub(super) anchor: &'a Path,
     pub(super) is_global: bool,
+    pub(super) command_target: CommandTarget,
     pub(super) store_use: StoreUse,
     pub(super) warnings: crate::cli_args::config_warnings::ConfigWarnings,
 }
@@ -207,9 +229,11 @@ impl StoreUse {
 pub(super) struct ProjectSelectors<'a> {
     pub(super) recursive: bool,
     pub(super) recursive_from_command_line: bool,
+    pub(super) no_recursive_from_command_line: bool,
     pub(super) recursive_by_default_command: bool,
     pub(super) filter: &'a [String],
     pub(super) filter_prod: &'a [String],
+    pub(super) filter_order: &'a [pnpm_config::FilterSource],
     pub(super) workspace_root: bool,
 }
 
@@ -217,6 +241,10 @@ pub(super) fn apply_project_selectors(cfg: &mut Config, selectors: &ProjectSelec
     cfg.recursive = selectors.recursive;
     cfg.filter = selectors.filter.to_vec();
     cfg.filter_prod = selectors.filter_prod.to_vec();
+    cfg.filter_order = selectors.filter_order.to_vec();
+    if selectors.recursive_from_command_line || selectors.no_recursive_from_command_line {
+        cfg.cli_settings.insert("recursive".to_string());
+    }
     if !cfg.filter.is_empty() {
         cfg.cli_settings.insert("filter".to_string());
     }
@@ -256,7 +284,7 @@ pub(super) fn apply_output_overrides(cfg: &mut Config, overrides: &OutputOverrid
         cfg.cli_settings.insert("workspacePackagePatterns".to_string());
         cfg.workspace_package_patterns = Some(overrides.workspace_packages.to_vec());
     }
-    // Unlike the CLI-only selectors, these two are genuine config keys —
+    // Unlike the CLI-only selectors, these two are genuine config keys,
     // the flag overrides yaml / env only when actually given.
     if !overrides.test_pattern.is_empty() {
         cfg.cli_settings.insert("testPattern".to_string());
@@ -277,12 +305,12 @@ pub(super) fn apply_output_overrides(cfg: &mut Config, overrides: &OutputOverrid
 
 /// Install the project's config dependencies and apply their `updateConfig`
 /// pnpmfile hooks to `config` before a command spawns anything, so a hook's
-/// settings — `extraEnv` and `extraBinPaths` among them — reach the child
+/// settings (`extraEnv` and `extraBinPaths` among them) reach the child
 /// processes the command starts. pnpm applies them once per invocation,
 /// whatever the command.
 ///
 /// Every [`CommandLoaders::config`](super::CommandLoaders::config) call yields a fresh `Config`, so the pass has to
-/// run on the instance the handler goes on to use — it cannot be hoisted ahead
+/// run on the instance the handler goes on to use; it cannot be hoisted ahead
 /// of [`route`](super::routing::route). The install family and pack/publish apply the same pass at
 /// their own entry points, where they already hold that instance.
 pub(in super::super) async fn apply_update_config(
@@ -290,6 +318,17 @@ pub(in super::super) async fn apply_update_config(
     dir: &Path,
 ) -> miette::Result<Vec<Arc<dyn PnpmfileHooks>>> {
     prepare_config::<CliReporter>(config, dir).await
+}
+
+/// Apply `updateConfig` hooks from the global pnpmfile (or the global packages
+/// directory's pnpmfile) without touching the caller's project directory.
+pub(in super::super) async fn apply_global_update_config(
+    config: &mut Config,
+) -> miette::Result<()> {
+    if let Some(global_pkg_dir) = config.global_pkg_dir.clone() {
+        crate::config_deps::run_update_config_hooks::<CliReporter>(config, &global_pkg_dir).await?;
+    }
+    Ok(())
 }
 
 pub(super) fn warn_fast_path_config(config_overrides: &ConfigOverrides, config: &Config) {
@@ -395,6 +434,7 @@ impl CliArgs {
     pub(super) fn load_config_at(
         &self,
         anchor: &Path,
+        command_target: CommandTarget,
         place_store: bool,
         config_overrides: &ConfigOverrides,
         warnings: ConfigWarnings,
@@ -406,6 +446,7 @@ impl CliArgs {
             self.network.registry.as_deref(),
         );
         seed.skip_store_dir_resolution = !place_store;
+        seed.cli.command_target = command_target;
         seed.current_keeping_warnings::<Host>(anchor)
             .map_err(|failure| {
                 warnings.report_failed_load(&failure.warnings);

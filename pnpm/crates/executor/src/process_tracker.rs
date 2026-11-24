@@ -1,15 +1,27 @@
 use std::{
     collections::HashMap,
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 #[cfg(unix)]
-use std::{os::unix::process::CommandExt, path::Path, ptr, time::Duration};
+use std::{
+    path::Path,
+    time::{
+        Duration,
+        Instant,
+    },
+};
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "shell-emulator", not(target_family = "wasm")))]
 use tokio::sync::watch;
 
-use crate::process::{Child, Command};
+use crate::process::{
+    Child,
+    Command,
+};
 #[cfg(unix)]
 pub(crate) use grace::finish_cancellations;
 #[cfg(unix)]
@@ -58,7 +70,7 @@ enum RunningExecution {
     /// keeps its id from being reused.
     #[cfg(unix)]
     Group { leader: u32 },
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "shell-emulator", not(target_family = "wasm")))]
     Emulated(watch::Sender<bool>),
 }
 
@@ -86,10 +98,25 @@ impl RunningExecution {
             }
             #[cfg(unix)]
             Self::Group { leader } => signal::signal_group(*leader, stop),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(feature = "shell-emulator", not(target_family = "wasm")))]
             Self::Emulated(sender) => {
                 let _ = sender.send(true);
             }
+        }
+    }
+}
+
+impl RunningExecution {
+    /// What a trace names the execution by.
+    fn describe(&self) -> String {
+        match self {
+            Self::Process { pid, separate_process_group, .. } => {
+                format!("process {pid} (own group: {separate_process_group})")
+            }
+            #[cfg(unix)]
+            Self::Group { leader } => format!("group {leader}"),
+            #[cfg(all(feature = "shell-emulator", not(target_family = "wasm")))]
+            Self::Emulated(_) => "emulated".to_owned(),
         }
     }
 }
@@ -122,10 +149,6 @@ impl ProcessTracker {
     /// thread of its own kills those still running once the grace has
     /// passed, so the caller does not wait it out. pnpm waits for that thread
     /// before it exits (see [`crate::before_exit`]).
-    #[expect(
-        clippy::must_use_candidate,
-        reason = "clippy does not see the state's interior mutability through its `Arc`; most callers cancel without needing to know whether they were first"
-    )]
     pub fn cancel(&self) -> bool {
         let executions = {
             let mut state = self.state.lock().expect("process tracker lock is not poisoned");
@@ -133,10 +156,16 @@ impl ProcessTracker {
                 return false;
             }
             state.cancelled = true;
-            state.executions
+            let executions = state.executions
                 .iter()
                 .map(|(&id, execution)| (id, execution.clone()))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                target: "pacquet::process_tracker",
+                executions = ?executions.iter().map(|(id, execution)| (id, execution.describe())).collect::<Vec<_>>(),
+                "cancel",
+            );
+            executions
         };
         #[cfg(unix)]
         grace::stop_gracefully(&self.state, executions);
@@ -152,7 +181,7 @@ impl ProcessTracker {
         self.state.lock().expect("process tracker lock is not poisoned").cancelled
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "shell-emulator", not(target_family = "wasm")))]
     pub(crate) fn track_emulated(&self) -> EmulatedCancellation<'_> {
         let (sender, receiver) = watch::channel(false);
         let registration = self.register(RunningExecution::Emulated(sender));
@@ -165,10 +194,21 @@ impl ProcessTracker {
             // A task that starts after the cancellation has done no work yet
             // that a graceful stop would save.
             drop(state);
+            tracing::debug!(
+                target: "pacquet::process_tracker",
+                execution = execution.describe(),
+                "kill an execution registered after the cancellation",
+            );
             execution.kill();
             return Registration { tracker: self, id: None };
         }
         let id = state.next_id;
+        tracing::debug!(
+            target: "pacquet::process_tracker",
+            id,
+            execution = execution.describe(),
+            "register",
+        );
         state.next_id += 1;
         state.executions.insert(id, execution);
         Registration { tracker: self, id: Some(id) }
@@ -196,18 +236,30 @@ pub fn spawn_child<'tracker>(
     if separate_process_group {
         prepare_command(command);
     }
-    let child = spawn(command)?;
+    // Only Unix gives a child a process group of its own, and only then
+    // must a relayed signal address that group rather than the child.
+    let own_process_group = cfg!(unix) && separate_process_group;
+    // The child joins the relay only once it exists, and the watchdog's
+    // first `sh` widens the gap. What reaches pnpm from here on is relayed
+    // by `SpawningChild::joined` rather than by the handler, which cannot
+    // see a child that has not joined.
+    let mut spawning = crate::interrupt::spawning_child();
+    #[cfg(unix)]
+    let group_watchdog::ChildWatch { child, watched } = if own_process_group {
+        group_watchdog::spawn(command)?
+    } else {
+        group_watchdog::ChildWatch { child: command.spawn()?, watched: false }
+    };
+    #[cfg(not(unix))]
+    let child = command.spawn()?;
+    spawning.spawned();
     crate::job_control::assign_child(&child);
     // A task a bail may cancel gets a job of its own, so the cancellation
     // reaches everything the task started.
     #[cfg(windows)]
     let job = process_tracker.and_then(|_| crate::job_control::TaskJob::contain(&child));
-    // Only Unix gives a child a process group of its own, and only then
-    // must a relayed signal address that group rather than the child.
-    let own_process_group = cfg!(unix) && separate_process_group;
-    #[cfg(unix)]
-    let (child, watched) = watch_process_group(child, own_process_group)?;
-    let relay = crate::interrupt::relay_to_child(child.id(), own_process_group);
+    let relay = spawning.relay_to_child(child.id(), own_process_group);
+    spawning.joined(&relay);
     let registration = process_tracker.map(|tracker| {
         tracker.register(RunningExecution::Process {
             pid: child.id(),
@@ -224,35 +276,6 @@ pub fn spawn_child<'tracker>(
         #[cfg(unix)]
         watched,
     })
-}
-
-/// Have the watchdog watch `child`'s group when the child leads one.
-/// Returns whether the group is watched.
-///
-/// A child left unwatched would be the very orphan the watchdog exists to
-/// prevent, so if the watch cannot be set up the child's group is killed
-/// before the failure is returned.
-#[cfg(unix)]
-fn watch_process_group(mut child: Child, own_process_group: bool) -> io::Result<(Child, bool)> {
-    if !own_process_group {
-        return Ok((child, false));
-    }
-    match group_watchdog::watch(child.id()) {
-        Ok(watched) => Ok((child, watched)),
-        Err(error) => {
-            terminate_process(child.id(), true, Stop::Forced);
-            let _ = child.wait();
-            Err(error)
-        }
-    }
-}
-
-/// Spawn `command` so that it cannot race the start of the group watchdog.
-/// Every Unix spawn of this crate but the watchdog's goes through here.
-pub(crate) fn spawn(command: &mut Command) -> io::Result<Child> {
-    #[cfg(unix)]
-    let _spawning = group_watchdog::spawning();
-    command.spawn()
 }
 
 #[cfg(unix)]
@@ -286,6 +309,13 @@ impl SpawnedChild<'_> {
     /// exit.
     pub fn wait(&mut self) -> io::Result<crate::process::ExitStatus> {
         let status = self.child.wait()?;
+        tracing::debug!(
+            target: "pacquet::process_tracker",
+            pid = self.child.id(),
+            %status,
+            relayed = self.relay.relayed(),
+            "reaped",
+        );
         // The pid is free for reuse from here on. A bail may still stop the
         // rest of the child's group, which the wait below sits on, but no
         // longer anything by the child's pid.
@@ -305,12 +335,28 @@ impl SpawnedChild<'_> {
     }
 }
 
-/// Block until no process of the group led by `leader` is still running.
+/// How long the process group of a signalled child is given to drain.
+///
+/// Every process in the group was sent the signal pnpm relayed, so one
+/// still running at the end of this has declined to stop, and waiting on
+/// it is waiting on something that has already refused.
+#[cfg(unix)]
+const PROCESS_GROUP_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Block until no process of the group led by `leader` is still running,
+/// or [`PROCESS_GROUP_SHUTDOWN_GRACE`] has passed.
 #[cfg(unix)]
 fn wait_for_process_group(leader: u32) {
     let Ok(leader) = i32::try_from(leader) else { return };
     let table = cfg!(target_os = "linux").then(|| Path::new("/proc"));
+    let deadline = Instant::now() + PROCESS_GROUP_SHUTDOWN_GRACE;
     while group_is_running(leader, table) {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "a process the script started has not stopped, so pnpm stops waiting for it",
+            );
+            return;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -329,24 +375,17 @@ fn wait_for_process_group(_: u32) {}
 /// are still shutting down.
 #[cfg(unix)]
 fn group_is_running(leader: i32, table: Option<&Path>) -> bool {
-    let group = -leader;
-    // SAFETY: `group` names the process group pnpm created for the
-    // child. `waitpid` with `WNOHANG` never blocks, and `kill` with
-    // signal 0 only probes; `ESRCH` says the group is empty.
-    let empty = unsafe {
-        while libc::waitpid(group, ptr::null_mut(), libc::WNOHANG) > 0 {}
-        libc::kill(group, 0) != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    };
-    !empty && table.is_none_or(|table| process_table::has_running_member(table, leader))
+    u32::try_from(leader).is_ok_and(pnpm_ffi_signal::group_has_members)
+        && table.is_none_or(|table| process_table::has_running_member(table, leader))
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "shell-emulator", not(target_family = "wasm")))]
 pub(crate) struct EmulatedCancellation<'tracker> {
     receiver: watch::Receiver<bool>,
     _registration: Registration<'tracker>,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "shell-emulator", not(target_family = "wasm")))]
 impl EmulatedCancellation<'_> {
     pub(crate) fn to_receiver(&self) -> watch::Receiver<bool> {
         self.receiver.clone()
@@ -376,11 +415,9 @@ impl Registration<'_> {
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
         let Some(id) = self.id else { return };
-        self.tracker.state
-            .lock()
-            .expect("process tracker lock is not poisoned")
-            .executions
-            .remove(&id);
+        let mut state = self.tracker.state.lock().expect("process tracker lock is not poisoned");
+        state.executions.remove(&id);
+        tracing::debug!(target: "pacquet::process_tracker", id, "deregister");
     }
 }
 

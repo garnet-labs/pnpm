@@ -4,10 +4,20 @@
 //! and in either lockfile layout.
 
 use crate::_utils::{
-    ManifestDeps, WorkspaceFixture, assert_success, ndjson_records, write_manifest_value,
+    ManifestDeps,
+    WorkspaceFixture,
+    assert_success,
+    ndjson_records,
+    write_manifest_value,
 };
-use serde_json::{Value, json};
-use std::{fs, path::Path};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    fs,
+    path::Path,
+};
 
 /// A workspace whose `app` depends on `ext`, a `file:` directory outside the
 /// workspace patterns, so no project describes it.
@@ -90,20 +100,20 @@ fn ignored_optional_dependency_of_a_file_dependency_does_not_resolve_again() {
     }
 }
 
-/// A `file:` dependency on another package's `publishConfig.directory` reads
-/// the directory's own `package.json`. The publishing package's manifest is
-/// what a workspace spec would read, so the check does not hook it.
+/// A `file:` dependency on another package's `publishConfig.directory` is
+/// described by the publishing package's manifest, as a workspace spec is,
+/// so a `package.json` a build writes into the directory is not hooked.
 #[test]
-fn file_dependency_on_a_publish_directory_hooks_only_its_own_manifest() {
+fn file_dependency_on_a_publish_directory_hooks_the_publishing_manifest() {
     let fixture = WorkspaceFixture::new();
     fixture.write_root_manifest("root", ManifestDeps::default());
     write_package(
         &fixture.workspace.join("ext"),
-        &json!({ "name": "ext-src", "version": "1.0.0", "publishConfig": { "directory": "dist" } }),
+        &json!({ "name": "ext", "version": "1.0.0", "publishConfig": { "directory": "dist" } }),
     );
     write_package(
         &fixture.workspace.join("ext/dist"),
-        &json!({ "name": "ext", "version": "1.0.0" }),
+        &json!({ "name": "ext", "version": "1.0.0", "description": "built" }),
     );
     write_package(
         &fixture.workspace.join("packages/app"),
@@ -112,7 +122,7 @@ fn file_dependency_on_a_publish_directory_hooks_only_its_own_manifest() {
     fs::write(
         fixture.workspace.join(".pnpmfile.cjs"),
         "module.exports = { hooks: { readPackage(pkg) {\n\
-           if (pkg.name === 'ext-src') throw new Error('ext-src is not a dependency');\n\
+           if (pkg.description === 'built') throw new Error('the built manifest describes ext');\n\
            return pkg;\n\
          } } };\n",
     )

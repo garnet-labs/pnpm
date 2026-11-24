@@ -1,12 +1,26 @@
 use super::{
-    COMPLETE_FILE, RemovedVersionField, build_storage_at, build_storage_at_with_edits,
-    build_storage_at_with_substitutions, deprecate_version, discard_unusable_storage,
-    ensure_storage, latest_version, metadata::read_packument, packages_dir, publish_storage,
-    remove_tree, remove_version, restore_claimed_storage, set_dist_tag,
+    COMPLETE_FILE,
+    RemovedVersionField,
+    build_storage_at,
+    build_storage_at_with_edits,
+    build_storage_at_with_substitutions,
+    database::read_packument,
+    deprecate_version,
+    discard_unusable_storage,
+    ensure_storage,
+    latest_version,
+    packages_dir,
+    publish_storage,
+    remove_tree,
+    remove_version,
+    restore_claimed_storage,
+    set_dist_tag,
 };
-use pnpr_registry::Ecosystem;
-use pnpr_storage::layout::local_blob_path;
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+};
 use tempfile::TempDir;
 
 fn tarball_entries(tarball: &Path) -> BTreeSet<String> {
@@ -52,11 +66,9 @@ fn latest_version_uses_semver_prerelease_order() {
 fn ensure_storage_generates_packuments_and_tarballs() {
     let storage = ensure_storage();
     assert!(packages_dir().join("@pnpm.e2e/abc/1.0.0/package.json").exists());
-    assert!(pnpr_config::default_metadata_path(storage).is_file());
+    assert!(pnpr_config::default_database_path(storage).is_file());
     assert_eq!(read_packument(storage, "@pnpm.e2e/abc")["name"], "@pnpm.e2e/abc");
-    assert!(
-        local_blob_path(storage, "", Ecosystem::Npm, "@pnpm.e2e/abc", "abc-1.0.0.tgz").exists(),
-    );
+    assert!(crate::tarball_path(storage, "@pnpm.e2e/abc", "1.0.0").exists());
     assert!(storage.join(pnpr_storage::layout::LAYOUT_FILE).exists());
 }
 
@@ -74,13 +86,7 @@ fn per_run_substitutions_update_packuments_and_tarballs() {
     let name = "@pnpm.e2e/has-aliased-git-dependency";
     let packument = read_packument(out.path(), name);
     assert_eq!(packument["versions"]["1.0.0"]["dependencies"]["say-hi"], "git+file:///tmp/hi#main");
-    let manifest = tarball_package_manifest(&local_blob_path(
-        out.path(),
-        "",
-        Ecosystem::Npm,
-        name,
-        "has-aliased-git-dependency-1.0.0.tgz",
-    ));
+    let manifest = tarball_package_manifest(&crate::tarball_path(out.path(), name, "1.0.0"));
     assert_eq!(manifest["dependencies"]["say-hi"], "git+file:///tmp/hi#main");
 }
 
@@ -89,12 +95,10 @@ fn per_run_substitutions_update_packuments_and_tarballs() {
 #[test]
 fn case_colliding_files_are_composed_in_memory() {
     let storage = ensure_storage();
-    let entries = tarball_entries(&local_blob_path(
+    let entries = tarball_entries(&crate::tarball_path(
         storage,
-        "",
-        Ecosystem::Npm,
         "@pnpm.e2e/with-same-file-in-different-cases",
-        "with-same-file-in-different-cases-1.0.0.tgz",
+        "1.0.0",
     ));
     assert!(entries.contains("package/Foo.js"), "{entries:?}");
     assert!(entries.contains("package/foo.js"), "{entries:?}");
@@ -106,24 +110,20 @@ fn case_colliding_files_are_composed_in_memory() {
 #[test]
 fn bundle_dependencies_embed_node_modules() {
     let storage = ensure_storage();
-    let bundled = tarball_entries(&local_blob_path(
+    let bundled = tarball_entries(&crate::tarball_path(
         storage,
-        "",
-        Ecosystem::Npm,
         "@pnpm.e2e/pkg-with-bundle-dependencies",
-        "pkg-with-bundle-dependencies-1.0.0.tgz",
+        "1.0.0",
     ));
     assert!(
         bundled.contains("package/node_modules/@pnpm.e2e/hello-world-js-bin/package.json"),
         "{bundled:?}",
     );
 
-    let not_bundled = tarball_entries(&local_blob_path(
+    let not_bundled = tarball_entries(&crate::tarball_path(
         storage,
-        "",
-        Ecosystem::Npm,
         "@pnpm.e2e/pkg-with-bundle-dependencies-false",
-        "pkg-with-bundle-dependencies-false-1.0.0.tgz",
+        "1.0.0",
     ));
     assert!(
         !not_bundled
@@ -138,21 +138,13 @@ fn bundle_dependencies_embed_node_modules() {
 #[test]
 fn root_license_is_injected_except_for_self_contained_workspaces() {
     let storage = ensure_storage();
-    let abc = tarball_entries(&local_blob_path(
-        storage,
-        "",
-        Ecosystem::Npm,
-        "@pnpm.e2e/abc",
-        "abc-1.0.0.tgz",
-    ));
+    let abc = tarball_entries(&crate::tarball_path(storage, "@pnpm.e2e/abc", "1.0.0"));
     assert!(abc.contains("package/LICENSE"), "{abc:?}");
 
-    let bundled = tarball_entries(&local_blob_path(
+    let bundled = tarball_entries(&crate::tarball_path(
         storage,
-        "",
-        Ecosystem::Npm,
         "@pnpm.e2e/pkg-with-bundled-dependencies",
-        "pkg-with-bundled-dependencies-1.0.0.tgz",
+        "1.0.0",
     ));
     assert!(!bundled.contains("package/LICENSE"), "{bundled:?}");
 }
@@ -227,8 +219,8 @@ fn discarding_leaves_a_tree_that_completed_after_the_claim_was_decided() {
 }
 
 /// The claim frees `storage`, so a publisher can take it before the
-/// restore runs. That tree is equivalent — the path is keyed by a
-/// fingerprint of the fixtures — so the claim is dropped, not forced back.
+/// restore runs. That tree is equivalent (the path is keyed by a
+/// fingerprint of the fixtures) so the claim is dropped, not forced back.
 #[test]
 fn restoring_yields_to_a_publisher_that_took_the_freed_path() {
     let root = TempDir::new().expect("create temp dir");
@@ -315,13 +307,8 @@ fn a_removed_field_leaves_the_metadata_but_not_the_tarball() {
 
     let packument = read_packument(out.path(), "@pnpm.e2e/deprecated");
     assert!(packument["versions"]["1.0.0"].get("deprecated").is_none(), "{packument}");
-    let manifest = tarball_package_manifest(&local_blob_path(
-        out.path(),
-        "",
-        Ecosystem::Npm,
-        "@pnpm.e2e/deprecated",
-        "deprecated-1.0.0.tgz",
-    ));
+    let manifest =
+        tarball_package_manifest(&crate::tarball_path(out.path(), "@pnpm.e2e/deprecated", "1.0.0"));
     assert!(manifest.get("deprecated").is_some(), "{manifest}");
 
     deprecate_version(out.path(), "@pnpm.e2e/deprecated", "1.0.0", "Gone.");
@@ -356,15 +343,21 @@ fn removing_a_tree_takes_out_its_whole_subtree() {
 fn proxy_constructor_serves_fixtures_locally_and_proxies_the_rest() {
     use super::MockConfigPresets;
     use pnpr_config::Config;
-    use pnpr_registry::{ConcreteKind, Ecosystem, Resolved};
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use pnpr_registry::{
+        ConcreteKind,
+        Ecosystem,
+        Resolved,
+    };
+    use std::{
+        net::SocketAddr,
+        path::PathBuf,
+    };
 
     let listen: SocketAddr = "127.0.0.1:7677".parse().unwrap();
     let config = Config::proxy(listen, PathBuf::from("/tmp"));
     assert!(config.routing.upstreams.contains_key("npmjs"));
     assert_eq!(config.routing.registries.default_registry(), Some("main"));
-    assert_eq!(config.routing.hosted["local"].org, "");
+    assert_eq!(config.routing.hosted["local"].namespace, "");
     assert_eq!(
         config.routing.registries.resolve_default(
             Ecosystem::Npm,
@@ -386,14 +379,20 @@ fn proxy_constructor_serves_fixtures_locally_and_proxies_the_rest() {
 fn static_constructor_serves_everything_from_one_hosted() {
     use super::MockConfigPresets;
     use pnpr_config::Config;
-    use pnpr_registry::{ConcreteKind, Ecosystem, Resolved};
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use pnpr_registry::{
+        ConcreteKind,
+        Ecosystem,
+        Resolved,
+    };
+    use std::{
+        net::SocketAddr,
+        path::PathBuf,
+    };
 
     let listen: SocketAddr = "127.0.0.1:7677".parse().unwrap();
     let config = Config::static_serve(listen, PathBuf::from("/tmp"));
     assert!(config.routing.upstreams.is_empty());
-    assert_eq!(config.routing.hosted["local"].org, "");
+    assert_eq!(config.routing.hosted["local"].namespace, "");
     assert_eq!(
         config.routing.registries.resolve_default(Ecosystem::Npm, "anything"),
         Resolved::Concrete { registry: "local", kind: ConcreteKind::Hosted },
@@ -402,10 +401,17 @@ fn static_constructor_serves_everything_from_one_hosted() {
 
 #[test]
 fn mock_config_yaml_enforces_registry_mock_protections() {
-    use super::{MOCK_CONFIG_YAML, mock_config_path};
+    use super::{
+        MOCK_CONFIG_YAML,
+        mock_config_path,
+    };
     use pnpr_config::Config;
     use pnpr_policy::Identity;
-    use pnpr_registry::{ConcreteKind, Ecosystem, Resolved};
+    use pnpr_registry::{
+        ConcreteKind,
+        Ecosystem,
+        Resolved,
+    };
     use std::net::SocketAddr;
 
     let path = mock_config_path();
@@ -413,7 +419,8 @@ fn mock_config_yaml_enforces_registry_mock_protections() {
     assert!(!MOCK_CONFIG_YAML.is_empty());
 
     let listen: SocketAddr = "127.0.0.1:7677".parse().unwrap();
-    let config = Config::from_yaml(&path, listen, None).unwrap();
+    let mut config = Config::from_yaml(&path, listen, None).unwrap();
+    config.routing = super::registry_mock_routing(&config);
     let rules = &config.routing.hosted["local"].rules;
     let table = rules.snapshot();
     let needs_auth = table.for_package("@pnpm.e2e/needs-auth");
@@ -437,4 +444,24 @@ fn mock_config_yaml_enforces_registry_mock_protections() {
         config.routing.registries.resolve_default(Ecosystem::Npm, "lodash"),
         Resolved::Concrete { registry: "npmjs", kind: ConcreteKind::Upstream },
     );
+}
+
+#[test]
+fn mock_config_yaml_and_proxy_preset_share_the_npm_upstream_timeout() {
+    use super::{
+        MockConfigPresets,
+        REGISTRY_MOCK_UPSTREAM_TIMEOUT,
+        mock_config_path,
+    };
+    use pnpr_config::Config;
+    use std::net::SocketAddr;
+
+    let listen: SocketAddr = "127.0.0.1:7677".parse().unwrap();
+    let from_yaml = Config::from_yaml(&mock_config_path(), listen, None).unwrap();
+    let preset = Config::proxy(listen, std::env::temp_dir());
+    assert_eq!(
+        super::registry_mock_routing(&from_yaml).upstreams["npmjs"].requests.timeout,
+        REGISTRY_MOCK_UPSTREAM_TIMEOUT,
+    );
+    assert_eq!(preset.routing.upstreams["npmjs"].requests.timeout, REGISTRY_MOCK_UPSTREAM_TIMEOUT);
 }

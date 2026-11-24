@@ -1,15 +1,33 @@
 use crate::{
-    StoreDir, StoreIndex, StoreIndexError, decode_package_files_index,
+    CafsFileInfo,
+    PackageFilesIndex,
+    StoreDir,
+    StoreIndex,
+    StoreIndexError,
+    decode_package_files_index,
     private_install::PRIVATE_INSTALLS_DIR,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
+use pnpm_fs::{
+    FileMode,
+    file_mode::is_executable,
+};
 use std::{
     collections::HashSet,
     ffi::OsStr,
     fs,
-    io::{self, ErrorKind},
-    path::{Path, PathBuf},
+    io::{
+        self,
+        ErrorKind,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -72,7 +90,7 @@ pub(crate) fn prune_cas_with_references(
     remove_tmp(store_dir)?;
 
     let mut stats = PruneCasStats::default();
-    let mut removed_hashes = HashSet::new();
+    let mut removed_files = RemovedFiles::default();
     for shard in read_entries(store_dir.files_dir())? {
         if !shard
             .file_type()
@@ -81,31 +99,26 @@ pub(crate) fn prune_cas_with_references(
         {
             continue;
         }
-        prune_shard(
-            &shard.path(),
-            &shard.file_name(),
-            &mut removed_hashes,
-            &mut stats,
-            referenced,
-        )?;
+        prune_shard(&shard.path(), &shard.file_name(), &mut removed_files, &mut stats, referenced)?;
     }
 
-    prune_index(store_dir, &removed_hashes, &mut stats)?;
+    prune_index(store_dir, &removed_files, &mut stats)?;
     Ok(stats)
 }
 
 fn prune_index(
     store_dir: &StoreDir,
-    removed_hashes: &HashSet<String>,
+    removed_files: &RemovedFiles,
     stats: &mut PruneCasStats,
 ) -> Result<(), PruneCasError> {
     let mut index = StoreIndex::open_in(store_dir).map_err(PruneCasError::StoreIndex)?;
     let mut rows_to_delete = Vec::new();
+    let mut rows_to_rewrite = Vec::new();
     index.for_each_raw(|key, data| {
         // A row another pnpm version wrote in a shape this one can't read
         // stays: without its file list there is no telling whether it
         // references a removed file.
-        let package = match decode_package_files_index(&data) {
+        let mut package = match decode_package_files_index(&data) {
             Ok(package) => package,
             Err(error) => {
                 tracing::debug!(target: "pacquet::store", ?key, ?error, "keeping an undecodable package_index row");
@@ -113,23 +126,48 @@ fn prune_index(
                 return Ok(());
             }
         };
-        if package.files
-            .get("package.json")
-            .is_some_and(|file| removed_hashes.contains(&file.digest))
-        {
+        // A row missing any of its own files cannot be imported, and a row
+        // of an archive that is not an npm package has no `package.json`.
+        if package.files.values().any(|file| removed_files.contains(file)) {
             rows_to_delete.push(key);
+        } else if remove_broken_side_effects(&mut package, removed_files) {
+            rows_to_rewrite.push((key, package));
         }
         Ok::<_, PruneCasError>(())
     })?;
     stats.packages = rows_to_delete.len();
     index.delete_many(&rows_to_delete).map_err(PruneCasError::StoreIndex)?;
+    index.set_many(rows_to_rewrite).map_err(PruneCasError::StoreIndex)?;
     Ok(())
+}
+
+/// Removes each cached build that adds a removed file, keeping the
+/// package's other builds. Returns whether it removed any.
+fn remove_broken_side_effects(
+    package: &mut PackageFilesIndex,
+    removed_files: &RemovedFiles,
+) -> bool {
+    let Some(side_effects) = package.side_effects.as_mut() else {
+        return false;
+    };
+    let before = side_effects.len();
+    side_effects.retain(|_, diff| {
+        !diff.added
+            .iter()
+            .flat_map(|added| added.values())
+            .any(|file| removed_files.contains(file))
+    });
+    let removed_any = side_effects.len() != before;
+    if side_effects.is_empty() {
+        package.side_effects = None;
+    }
+    removed_any
 }
 
 fn prune_shard(
     shard_dir: &Path,
     shard_name: &OsStr,
-    removed_hashes: &mut HashSet<String>,
+    removed_files: &mut RemovedFiles,
     stats: &mut PruneCasStats,
     referenced: &HashSet<PathBuf>,
 ) -> Result<(), PruneCasError> {
@@ -141,12 +179,37 @@ fn prune_shard(
         let Some(bytes) = remove_unlinked_file(&path)? else { continue };
         stats.files += 1;
         stats.bytes += bytes;
-        let shard = shard_name.to_string_lossy();
-        let file = entry.file_name();
-        let file = file.to_string_lossy();
-        removed_hashes.insert(format!("{shard}{}", file.strip_suffix("-exec").unwrap_or(&file)));
+        removed_files.insert(shard_name, &entry.file_name());
     }
     Ok(())
+}
+
+/// The digests of the removed files, by whether the file was the
+/// executable copy: a digest can be stored as both.
+#[derive(Default)]
+struct RemovedFiles {
+    regular: HashSet<String>,
+    executable: HashSet<String>,
+}
+
+impl RemovedFiles {
+    fn insert(&mut self, shard_name: &OsStr, file_name: &OsStr) {
+        let shard = shard_name.to_string_lossy();
+        let file = file_name.to_string_lossy();
+        match file.strip_suffix("-exec") {
+            Some(rest) => self.executable.insert(format!("{shard}{rest}")),
+            None => self.regular.insert(format!("{shard}{file}")),
+        };
+    }
+
+    fn contains(&self, file: &CafsFileInfo) -> bool {
+        let digests = if is_executable(FileMode::from_mode(file.mode)) {
+            &self.executable
+        } else {
+            &self.regular
+        };
+        digests.contains(&file.digest)
+    }
 }
 
 fn remove_unlinked_file(path: &Path) -> Result<Option<u64>, PruneCasError> {
@@ -235,25 +298,9 @@ fn hard_link_count(_path: &Path, metadata: &fs::Metadata) -> Result<u64, PruneCa
 
 #[cfg(windows)]
 fn hard_link_count(path: &Path, _metadata: &fs::Metadata) -> Result<u64, PruneCasError> {
-    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    let file = fs::File::open(path)
-        .map_err(|error| PruneCasError::InspectFile { path: path.to_path_buf(), error })?;
-    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    // SAFETY: `file` owns a valid handle and `info` points to writable storage
-    // of the structure initialized by `GetFileInformationByHandle`.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr()) } == 0 {
-        return Err(PruneCasError::InspectFile {
-            path: path.to_path_buf(),
-            error: io::Error::last_os_error(),
-        });
-    }
-    // SAFETY: a successful `GetFileInformationByHandle` initializes `info`.
-    let info = unsafe { info.assume_init() };
-    Ok(u64::from(info.nNumberOfLinks))
+    pnpm_ffi_fs::file_information(path)
+        .map(|info| u64::from(info.hard_links))
+        .map_err(|error| PruneCasError::InspectFile { path: path.to_path_buf(), error })
 }
 
 #[cfg(not(any(unix, windows, target_os = "wasi")))]

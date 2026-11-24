@@ -22,7 +22,7 @@ drizzle-kit  build, skills
 esbuild      build
 ```
 
-Without arguments, the packages are chosen in an interactive prompt. The packages you do not select are denied. For a package you approve that ships several skills, a follow-up prompt lists them and you choose which ones to link. A skill you leave out is neither linked nor offered again: the recorded list names the only skills pnpm may link. When your project approves skills for the first time, pnpm also asks which agent skill directories to link into, and records your choices as [`skills.dirs`](../settings/build.md#skillsdirs). Leave every directory unselected and the detected directories decide instead.
+Without package arguments or `--all`, the packages are chosen in an interactive prompt. In CI or without an interactive terminal, running `pnpm approve` without package arguments or `--all` fails with `ERR_PNPM_APPROVE_NON_INTERACTIVE` when packages are awaiting approval. The packages you do not select are denied. For a package you approve that ships several skills, a follow-up prompt lists them and you choose which ones to link. A skill you leave out is neither linked nor offered again: the recorded list names the only skills pnpm may link. When your project approves skills for the first time, pnpm also asks which agent skill directories to link into, and records your choices as [`skills.dirs`](../settings/build.md#skillsdirs). Leave every directory unselected and the detected directories decide instead.
 
 You can also pass package names, prefixing a name with `!` to deny it:
 
@@ -31,6 +31,16 @@ pnpm approve drizzle-kit !esbuild
 ```
 
 A named package is approved or denied for everything it requests, including every skill it ships. A package that is not awaiting approval yet is decided for every capability.
+
+Each Git package appears once per repository. Press **Space** to approve its pending commits, or **R** to include future commits. Press **Enter** to save. To approve a single revision, pass its full commit selector to `pnpm approve`. `--all` approves only pending commits.
+
+To approve a Git package across updates without a prompt, pass its package name and exact `git+` repository URL without a commit or branch suffix. For a `github:` dependency, the URL ends in `.git`. See the [repository matching rules](../settings/build.md#allowbuilds).
+
+```sh
+pnpm approve 'example@git+https://github.com/example/project.git'
+```
+
+This approves the requested capabilities for any commit from that repository. If a bare name or branch selector cannot match a pending Git package, pnpm lists the valid selectors and saves no decisions.
 
 After the decision is written, pnpm rebuilds the packages approved to build and links the approved agent skills.
 

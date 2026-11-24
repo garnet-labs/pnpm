@@ -1,14 +1,21 @@
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_reporter::LifecycleStdio;
 use std::io;
 
 /// Failure to run a script under the `shellEmulator` setting. A script
-/// that runs and exits non-zero is not an error here — the exit code is
+/// that runs and exits non-zero is not an error here, the exit code is
 /// returned to the caller, which decides what a failure means.
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum ShellEmulatorError {
+    #[display("Shell emulation is not enabled in this build.")]
+    #[diagnostic(code(ERR_PNPM_EXECUTOR_SHELL_EMULATOR_UNSUPPORTED))]
+    Unsupported,
+
     #[display("Failed to parse `{script}` with the shell emulator: {message}")]
     #[diagnostic(code(ERR_PNPM_EXECUTOR_SHELL_EMULATOR_PARSE))]
     Parse { script: String, message: String },

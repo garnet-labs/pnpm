@@ -1,4 +1,8 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{
+    Component,
+    Path,
+    PathBuf,
+};
 
 fn is_safe_part(part: &str) -> bool {
     matches!(Path::new(part).components().next(), Some(Component::Normal(_))) && !part.contains(':')
@@ -9,12 +13,12 @@ fn is_safe_part(part: &str) -> bool {
 /// platform's separator. `None` for a location that could leave
 /// `lockfile_dir`.
 #[must_use]
-pub fn hoisted_dir(lockfile_dir: &Path, location: &str) -> Option<PathBuf> {
+pub fn hoisted_dir(lockfile_dir: PathBuf, location: &str) -> Option<PathBuf> {
     if location.starts_with('/') || location.starts_with('\\') || Path::new(location).is_absolute()
     {
         return None;
     }
-    let mut dir = lockfile_dir.to_path_buf();
+    let mut dir = lockfile_dir;
     for part in location.split(['/', '\\']) {
         if part.is_empty() || part == "." {
             continue;

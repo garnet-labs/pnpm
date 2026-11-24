@@ -1,9 +1,30 @@
 use super::{
-    CWD, ContextLog, LockfileVerificationLog, LockfileVerificationMessage, LogEvent, LogLevel,
-    Output, PackageImportMethod, PackageImportMethodLog, PnpmLog, ReporterOptions,
-    SkippedOptionalDependencyLog, SkippedOptionalPackage, SkippedOptionalParent,
-    SkippedOptionalReason, Stage, StageLog, StatsLog, StatsMessage, deprecation, render,
-    resolution_done, state, state_with_options, summary,
+    CWD,
+    ContextLog,
+    LockfileVerificationLog,
+    LockfileVerificationMessage,
+    LogEvent,
+    LogLevel,
+    Output,
+    PackageImportMethod,
+    PackageImportMethodLog,
+    PnpmLog,
+    ReporterOptions,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalParent,
+    SkippedOptionalReason,
+    Stage,
+    StageLog,
+    StatsLog,
+    StatsMessage,
+    deprecation,
+    flush_checks,
+    render,
+    resolution_done,
+    state,
+    state_with_options,
+    summary,
 };
 
 #[test]
@@ -53,9 +74,9 @@ fn context_block_suppressed_when_lockfile_exists() {
 }
 
 #[test]
-fn lockfile_policy_verdict_precedes_the_frozen_install_message() {
+fn passing_lockfile_policy_verdict_moves_to_the_checks_footer() {
     let mut reporter = state(false);
-    let frame = render(
+    render(
         &mut reporter,
         vec![
             LogEvent::Pnpm(PnpmLog {
@@ -77,15 +98,62 @@ fn lockfile_policy_verdict_precedes_the_frozen_install_message() {
             }),
         ],
     );
+    let Output::Frame(frame) = flush_checks(&mut reporter) else {
+        panic!("the footer renders");
+    };
     assert_eq!(
         frame,
-        "✓ Lockfile passes supply-chain policies (previously verified)\n\
-Lockfile is up to date, resolution step is skipped",
+        "\n✓ Lockfile passes supply-chain policies\n\
+         · Lockfile is up to date, resolution step is skipped\n",
     );
 }
 
+/// A skipped resolution is why the deprecation and peer checks are missing
+/// from the footer, so the footer says so.
 #[test]
-fn append_only_waits_for_a_terminal_lockfile_policy_verdict() {
+fn skipped_resolution_is_explained_in_the_checks_footer() {
+    let mut reporter = state(false);
+    let frame = render(
+        &mut reporter,
+        vec![LogEvent::Pnpm(PnpmLog {
+            level: LogLevel::Info,
+            message: "Lockfile is up to date, resolution step is skipped".to_string(),
+            prefix: CWD.to_string(),
+        })],
+    );
+    assert_eq!(frame, "");
+    let Output::Frame(frame) = flush_checks(&mut reporter) else {
+        panic!("the footer renders");
+    };
+    assert_eq!(frame, "\n· Lockfile is up to date, resolution step is skipped\n");
+}
+
+#[test]
+fn in_place_verification_block_is_cleared_by_a_passing_verdict() {
+    let mut reporter = state(false);
+    let frame = render(
+        &mut reporter,
+        vec![
+            LogEvent::LockfileVerification(LockfileVerificationLog {
+                level: LogLevel::Debug,
+                message: LockfileVerificationMessage::Started { entries: 2, lockfile_path: None },
+            }),
+            LogEvent::LockfileVerification(LockfileVerificationLog {
+                level: LogLevel::Debug,
+                message: LockfileVerificationMessage::Done {
+                    entries: 2,
+                    checked: 2,
+                    elapsed_ms: 100,
+                    lockfile_path: None,
+                },
+            }),
+        ],
+    );
+    assert_eq!(frame, "");
+}
+
+#[test]
+fn append_only_holds_the_skipped_resolution_for_the_footer() {
     let mut reporter =
         state_with_options(ReporterOptions { append_only: true, ..ReporterOptions::default() });
     let pending = reporter.handle(&LogEvent::Pnpm(PnpmLog {
@@ -117,38 +185,120 @@ fn append_only_waits_for_a_terminal_lockfile_policy_verdict() {
         level: LogLevel::Debug,
         message: LockfileVerificationMessage::Started { entries: 2, lockfile_path: None },
     }));
-    match started {
-        Output::Lines(lines) => {
-            assert_eq!(
-                lines,
-                ["? Verifying lockfile against supply-chain policies (2 entries)..."],
-            );
-        }
-        _ => panic!("started verification should emit only its progress line"),
-    }
+    assert!(matches!(started, Output::None), "a line append-only output cannot erase");
 
     let done = reporter.handle(&LogEvent::LockfileVerification(LockfileVerificationLog {
         level: LogLevel::Debug,
         message: LockfileVerificationMessage::Done {
             entries: 2,
+            checked: 2,
             elapsed_ms: 100,
             lockfile_path: None,
         },
     }));
-    match done {
-        Output::Lines(lines) => assert_eq!(
-            lines,
-            [
-                "✓ Lockfile passes supply-chain policies (2 entries in 100ms)",
-                "Lockfile is up to date, resolution step is skipped",
-            ],
-        ),
-        _ => panic!("completed verification should emit its verdict before the frozen message"),
+    assert!(matches!(done, Output::None), "a passing verdict goes to the checks footer");
+}
+
+#[test]
+fn in_place_verification_block_shows_running_progress() {
+    let mut reporter = state(false);
+    let frame = render(
+        &mut reporter,
+        vec![
+            LogEvent::LockfileVerification(LockfileVerificationLog {
+                level: LogLevel::Debug,
+                message: LockfileVerificationMessage::Started { entries: 12, lockfile_path: None },
+            }),
+            LogEvent::LockfileVerification(LockfileVerificationLog {
+                level: LogLevel::Debug,
+                message: LockfileVerificationMessage::Progress {
+                    entries: 12,
+                    checked: 7,
+                    lockfile_path: None,
+                },
+            }),
+        ],
+    );
+    assert_eq!(frame, "? Verifying lockfile against supply-chain policies (7/12 entries)...");
+}
+
+#[test]
+fn append_only_prints_no_passing_verification() {
+    let mut reporter =
+        state_with_options(ReporterOptions { append_only: true, ..ReporterOptions::default() });
+    let started = reporter.handle(&LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Started { entries: 12, lockfile_path: None },
+    }));
+    assert!(matches!(started, Output::None), "a line append-only output cannot erase");
+
+    let progress = reporter.handle(&LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Progress {
+            entries: 12,
+            checked: 7,
+            lockfile_path: None,
+        },
+    }));
+    assert!(matches!(progress, Output::None), "progress must not flood append-only output");
+
+    let done = reporter.handle(&LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Done {
+            entries: 12,
+            checked: 12,
+            elapsed_ms: 100,
+            lockfile_path: None,
+        },
+    }));
+    assert!(matches!(done, Output::None), "a passing verdict goes to the checks footer");
+}
+
+#[test]
+fn failure_verdict_renders_checked_and_total_counts() {
+    let mut reporter = state(false);
+    let frame = render(
+        &mut reporter,
+        vec![LogEvent::LockfileVerification(LockfileVerificationLog {
+            level: LogLevel::Debug,
+            message: LockfileVerificationMessage::Failed {
+                entries: 12,
+                checked: 7,
+                elapsed_ms: 100,
+                lockfile_path: None,
+            },
+        })],
+    );
+    assert_eq!(frame, "✗ Lockfile failed supply-chain policy check (7/12 entries in 100ms)");
+}
+
+#[test]
+fn append_only_renders_failure_with_checked_count() {
+    let mut reporter =
+        state_with_options(ReporterOptions { append_only: true, ..ReporterOptions::default() });
+    let failed = reporter.handle(&LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Failed {
+            entries: 12,
+            checked: 7,
+            elapsed_ms: 100,
+            lockfile_path: None,
+        },
+    }));
+    match failed {
+        Output::Lines(lines) => {
+            assert_eq!(lines.len(), 1);
+            assert_eq!(
+                lines[0],
+                "✗ Lockfile failed supply-chain policy check (7/12 entries in 100ms)",
+            );
+        }
+        _ => panic!("the failure verdict must always render"),
     }
 }
 
 #[test]
-fn install_summary_flushes_the_frozen_message_without_a_policy_verdict() {
+fn append_only_prints_the_skipped_resolution_with_the_footer() {
     let mut reporter =
         state_with_options(ReporterOptions { append_only: true, ..ReporterOptions::default() });
     let pending = reporter.handle(&LogEvent::Pnpm(PnpmLog {
@@ -157,14 +307,12 @@ fn install_summary_flushes_the_frozen_message_without_a_policy_verdict() {
         prefix: CWD.to_string(),
     }));
     assert!(matches!(pending, Output::None));
-
-    let summary = reporter.handle(&summary());
-    match summary {
+    assert!(matches!(reporter.handle(&summary()), Output::None));
+    match flush_checks(&mut reporter) {
         Output::Lines(lines) => {
-            dbg!(&lines);
-            assert_eq!(lines, ["Lockfile is up to date, resolution step is skipped"]);
+            assert_eq!(lines, ["\n· Lockfile is up to date, resolution step is skipped\n"]);
         }
-        _ => panic!("the install summary should flush the frozen message"),
+        _ => panic!("the footer should print the skipped resolution"),
     }
 }
 
@@ -211,17 +359,22 @@ fn skipped_optional_resolution_failure_renders_only_top_level() {
 }
 
 #[test]
-fn transitive_deprecations_flush_as_a_summary_at_resolution_done() {
+fn transitive_deprecations_wait_for_the_checks_footer() {
     let mut reporter = state(false);
     let frame = render(
         &mut reporter,
-        vec![deprecation("uuid", "3.4.0", 2, CWD), deprecation("request", "2.88.2", 3, CWD)],
+        vec![
+            deprecation("uuid", "3.4.0", 2, CWD),
+            deprecation("request", "2.88.2", 3, CWD),
+            resolution_done(),
+        ],
     );
-    assert!(
-        frame.is_empty(),
-        "transitive deprecations must buffer until resolution_done: {frame:?}",
-    );
+    assert!(frame.is_empty(), "deprecations must wait for the footer: {frame:?}");
 
-    let frame = render(&mut reporter, vec![resolution_done()]);
-    assert_eq!(frame, "[WARN] 2 deprecated subdependencies found: request@2.88.2, uuid@3.4.0");
+    let frame = render(&mut reporter, vec![summary()]);
+    assert!(frame.is_empty(), "deprecations must wait for the footer: {frame:?}");
+    let Output::Frame(frame) = flush_checks(&mut reporter) else {
+        panic!("the footer renders");
+    };
+    assert_eq!(frame, "\n✗ 2 packages are deprecated: request@2.88.2 and uuid@3.4.0\n");
 }

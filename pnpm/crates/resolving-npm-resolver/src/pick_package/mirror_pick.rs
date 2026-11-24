@@ -1,15 +1,38 @@
 use super::{
-    Arc, DateTime, MetadataCacheScope, Package, PackageMetaCache, PickPackageContext,
-    PickPackageError, PickPackageOptions, PickPackageResult, PickState, RegistryPackageSpec, Utc,
-    cached_meta_misses_preferred_version, dominant_lockfile_version, get_file_mtime,
-    load_meta_async, pick_from_meta, pick_from_meta_fast, pick_from_meta_offline,
+    Arc,
+    MetadataCacheScope,
+    Package,
+    PackageMetaCache,
+    PickPackageContext,
+    PickPackageError,
+    PickPackageOptions,
+    PickPackageResult,
+    PickState,
+    RegistryPackageSpec,
+    Timestamp,
+    cached_meta_misses_preferred_version,
+    dominant_lockfile_version,
+    get_file_mtime,
+    load_meta_async,
+    pick_from_meta,
+    pick_from_meta_fast,
+    pick_from_meta_offline,
     pick_stable_cached_range_version,
-    route::{MirrorShortcuts, RouteInputs, RouteRequest, unvalidated_mirror_is_fresh},
+    route::{
+        MirrorShortcuts,
+        RouteInputs,
+        RouteRequest,
+        unvalidated_mirror_is_fresh,
+    },
 };
 use crate::{
     errors::legacy_mirror_hint,
     metadata_cache_policy::mirror_may_answer,
-    mirror::{MetaHeaders, find_legacy_pkg_mirror, load_meta_headers_async},
+    mirror::{
+        MetaHeaders,
+        find_legacy_pkg_mirror,
+        load_meta_headers_async,
+    },
 };
 
 impl PickState<'_> {
@@ -73,7 +96,7 @@ impl PickState<'_> {
     /// exact pinned version.
     ///
     /// The fast picker can throw `MissingTime` when publishedBy is active
-    /// and the cache is abbreviated — that is swallowed and falls through to
+    /// and the cache is abbreviated, that is swallowed and falls through to
     /// a network fetch, which would upgrade abbreviated→full. Pacquet's
     /// fetcher is always full so this shouldn't fire today, but the
     /// swallow-and-fall-through keeps the behavior intact.
@@ -161,7 +184,7 @@ impl PickState<'_> {
         disk_meta: &mut Option<Arc<Package>>,
     ) -> Option<PickPackageResult> {
         let mtime = self.pkg_mirror.as_deref().and_then(get_file_mtime)?;
-        if !unvalidated_mirror_is_fresh(mtime, Utc::now()) {
+        if !unvalidated_mirror_is_fresh(mtime, Timestamp::now()) {
             return None;
         }
         let meta = self.mirror_meta(disk_meta).await?;
@@ -196,7 +219,7 @@ impl PickState<'_> {
         ctx: &PickPackageContext<'_, Cache>,
         spec: &RegistryPackageSpec,
         opts: &PickPackageOptions<'_>,
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
         disk_meta: &mut Option<Arc<Package>>,
     ) -> Option<PickPackageResult> {
         let mtime = self.pkg_mirror.as_deref().and_then(get_file_mtime)?;
@@ -212,11 +235,7 @@ impl PickState<'_> {
         if picked_meta.versions.corrupt_mirror_fragment_found() {
             return None;
         }
-        // Same rationale as the version-spec fast path — promote the
-        // disk-loaded packument into the install-scoped in-memory cache.
-        if !opts.request.dry_run {
-            ctx.metadata.meta_cache.set(self.cache_key.clone(), meta);
-        }
+        self.promote_mirror(ctx, opts, &meta, Some(mtime));
         Some(PickPackageResult { meta: picked_meta, picked_package: Some(picked) })
     }
 
@@ -225,7 +244,7 @@ impl PickState<'_> {
     /// `spawn_blocking` + multi-MB `serde_json::from_str` this pick paid.
     ///
     /// The cache is rebuilt per install, so populating it here can't outlive
-    /// the freshness window the disk read already accepted — the next install
+    /// the freshness window the disk read already accepted, the next install
     /// starts a fresh cache and re-evaluates the disk shortcut.
     pub(super) fn promote_unverified<Cache: PackageMetaCache>(
         &self,
@@ -233,8 +252,24 @@ impl PickState<'_> {
         opts: &PickPackageOptions<'_>,
         meta: &Arc<Package>,
     ) {
+        self.promote_mirror(ctx, opts, meta, None);
+    }
+
+    /// [`Self::promote_unverified`] for a pick that read the mirror's mtime
+    /// (see [`PackageMetaCache::set_unverified`]).
+    fn promote_mirror<Cache: PackageMetaCache>(
+        &self,
+        ctx: &PickPackageContext<'_, Cache>,
+        opts: &PickPackageOptions<'_>,
+        meta: &Arc<Package>,
+        written_at: Option<Timestamp>,
+    ) {
         if !opts.request.dry_run {
-            ctx.metadata.meta_cache.set_unverified(self.cache_key.clone(), Arc::clone(meta));
+            ctx.metadata.meta_cache.set_unverified(
+                self.cache_key.clone(),
+                Arc::clone(meta),
+                written_at,
+            );
         }
     }
 

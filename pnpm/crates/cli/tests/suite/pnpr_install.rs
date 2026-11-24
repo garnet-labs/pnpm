@@ -10,35 +10,61 @@
 
 use crate::{
     _utils::{
-        CONFLICTED_DEPENDENCY, assert_merged_conflicted_lockfile, write_conflicted_lockfile_fixture,
+        CONFLICTED_DEPENDENCY,
+        assert_merged_conflicted_lockfile,
+        write_conflicted_lockfile_fixture,
     },
     cargo_install::crate_archive,
 };
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_lockfile::{Lockfile, PkgName, ProjectSnapshot, SnapshotEntry};
-use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
-    fs::{get_all_files, is_symlink_or_junction},
+use pnpm_lockfile::{
+    Lockfile,
+    PkgName,
+    ProjectSnapshot,
+    SnapshotEntry,
 };
-use pnpr::{Ecosystem, Registries, Registry, TokenBackend, UpstreamConfig, UserBackend};
+use pnpm_testing_utils::{
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
+    fs::{
+        get_all_files,
+        is_symlink_or_junction,
+    },
+};
+use pnpr::{
+    Ecosystem,
+    Registries,
+    Registry,
+    TokenBackend,
+    UpstreamConfig,
+    UserBackend,
+};
 use pnpr_fixtures::MockConfigPresets;
 use reqwest::header::HeaderMap;
-use sha2::{Digest, Sha256};
+use sha2::{
+    Digest,
+    Sha256,
+};
 use std::{
     fmt::Write as _,
     fs,
     io::Write as _,
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        TcpListener,
+        TcpStream,
+    },
     path::Path,
     process::Command,
     thread,
     time::Duration,
 };
 
-const IS_POSITIVE_PATCH: &str = include_str!(
-    "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0.patch"
-);
+const IS_POSITIVE_PATCH: &str = include_str!("../fixtures/patches/is-positive@1.0.0.patch");
 
 /// Start an in-process pnpr with the fast-path endpoints on a detached
 /// thread, allowlisting `registry_url` as a public route so the client may
@@ -56,23 +82,29 @@ fn start_pnpr_for(registry_urls: &[&str]) -> (String, String) {
         .map(ToString::to_string)
         .collect();
     let server = PnprServer::bind("pnpr");
-    let tokens_path = server.storage.join("tokens.db");
-    let htpasswd_path = server.storage.join("htpasswd");
+    let auth_path = server.storage.join("auth.sqlite");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("token setup runtime");
     let token = runtime.block_on(async {
-        let users = pnpr::UserStore::open(htpasswd_path.clone(), pnpr::MaxUsers::Disabled)
-            .expect("open user store");
+        let users = pnpr::SqliteAuth::open(&auth_path, pnpr::MaxUsers::Disabled)
+            .expect("open pnpr auth database");
         users.create_user("pacquet-test", "password").await.expect("store pnpr test account");
-        let tokens = pnpr::TokenStore::open(tokens_path.clone()).expect("open token store");
-        tokens.issue("pacquet-test").await.expect("issue pnpr test token")
+        users
+            .issue(
+                &users
+                    .account_id("pacquet-test")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .await
+            .expect("issue pnpr test token")
     });
 
     let addr = server.serve(move |config| {
-        config.identity.auth.htpasswd.file = Some(htpasswd_path);
-        config.identity.auth.tokens.file = Some(tokens_path);
+        config.identity.backend = pnpr::BackendConfig::Sqlite(auth_path);
         config.routing.route_policy.public.extend(
             registry_urls
                 .into_iter()
@@ -112,20 +144,21 @@ fn start_pnpr_registry_with(
                 )]),
                 Some(name.to_string()),
             )
-            .with_ecosystem(name, ecosystem);
+            .with_ecosystem(name.to_owned(), ecosystem);
             configure(config);
         });
     format!("http://{addr}/{ecosystem}/")
 }
 
 /// A bound port and storage directory waiting for [`Self::serve`] to start
-/// pnpr on them. Binding first lets a caller seed storage — a token store,
-/// say — with the address the server will answer on already known.
+/// pnpr on them. Binding first lets a caller seed storage (a token store,
+/// say) with the address the server will answer on already known.
 /// The test registries pnpr resolves from listen on loopback.
 fn loopback_networks() -> Vec<pnpr::IpNetwork> {
     ["127.0.0.0/8", "::1"]
         .into_iter()
-        .map(|network| pnpr::IpNetwork::parse(network).expect("loopback network parses"))
+        .map(pnpr::IpNetwork::parse)
+        .map(|parsed| parsed.expect("loopback network parses"))
         .collect()
 }
 
@@ -161,7 +194,10 @@ impl PnprServer {
                     .expect("pnpr runtime");
                 runtime.block_on(async move {
                     let mut config = pnpr::Config::proxy(addr, storage);
-                    config.http.public_url = format!("http://{addr}");
+                    // The registries it resolves from listen on other ports of
+                    // 127.0.0.1, which pnpr refuses as other services of its own
+                    // host when its public URL names that host too.
+                    config.http.public_url = format!("http://localhost:{}", addr.port());
                     config.routing.route_policy.allowed_private_networks = loopback_networks();
                     configure(&mut config);
                     let listener =
@@ -437,7 +473,9 @@ fn assert_standard_workspace_pnpr_from(project: Option<&str>) {
     let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
-    let cwd = project.map_or_else(|| workspace.clone(), |project| workspace.join(project));
+    let cwd = project
+        .map(|project| workspace.join(project))
+        .unwrap_or_else(|| workspace.clone());
     pacquet_at(&cwd)
         .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
         .with_args(["install", "--pnpr-server", &pnpr_url])
@@ -575,13 +613,17 @@ fn seed_filtered_repair_workspace(workspace: &Path, registry_url: &str) {
         .success();
 }
 
-fn selected_only_pnpr_lockfile(mut lockfile: Lockfile) -> Lockfile {
+fn selected_only_pnpr_lockfile(lockfile: Lockfile) -> Lockfile {
+    selected_only_pnpr_lockfile_for(lockfile, WORKSPACE_HELLO)
+}
+
+fn selected_only_pnpr_lockfile_for(mut lockfile: Lockfile, package_name: &str) -> Lockfile {
     lockfile.importers.retain(|id, _| id == "packages/selected");
     if let Some(packages) = lockfile.packages.as_mut() {
-        packages.retain(|key, _| key.to_string().contains(WORKSPACE_HELLO));
+        packages.retain(|key, _| key.to_string().contains(package_name));
     }
     if let Some(snapshots) = lockfile.snapshots.as_mut() {
-        snapshots.retain(|key, _| key.to_string().contains(WORKSPACE_HELLO));
+        snapshots.retain(|key, _| key.to_string().contains(package_name));
     }
     lockfile
 }
@@ -589,24 +631,37 @@ fn selected_only_pnpr_lockfile(mut lockfile: Lockfile) -> Lockfile {
 fn mock_filtered_repair_response(
     server: &mut mockito::Server,
     lockfile: &Lockfile,
+    allowed_picks: &[String],
 ) -> (mockito::Mock, mockito::Mock) {
     let handshake = server
         .mock("GET", "/-/pnpr")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"pnpr":{"versions":[0],"fixLockfile":[0]}}"#)
+        .with_body(r#"{"pnpr":{"protocols":{"resolver":{"versions":[0],"features":["projectTransforms","fixLockfile"]}}}}"#)
         .expect(1)
         .create();
     let response = serde_json::json!({
         "type": "done",
         "lockfile": lockfile,
         "stats": { "totalPackages": 0 },
+        "allowedPicks": allowed_picks,
     });
+    let expects_release_age = !allowed_picks.is_empty();
     let resolve = server
         .mock("POST", "/-/pnpr/v0/resolve")
         .with_status(200)
         .with_header("content-type", "application/x-ndjson")
-        .with_body(format!("{response}\n"))
+        .with_body_from_request(move |request| {
+            if expects_release_age {
+                let request_body: serde_json::Value =
+                    serde_json::from_slice(request.body().unwrap()).unwrap();
+                assert!(
+                    request_body["minimumReleaseAge"].as_u64().is_some(),
+                    "allowed-pick test request did not include minimumReleaseAge: {request_body}",
+                );
+            }
+            pnpr_done_frame(request, response.clone())
+        })
         .expect(1)
         .create();
     (handshake, resolve)
@@ -722,8 +777,11 @@ fn cargo_install_uses_a_configured_pnpr_registry_and_accelerator() {
     download_mock.assert();
 }
 
+mod hosted;
+mod optional_peers;
 mod publish_retry;
 mod workspace;
+mod workspace_settings;
 
 mod revisions;
 
@@ -733,4 +791,47 @@ mod resolution;
 
 mod pnpmfile;
 
-mod variants_only;
+mod local_specs;
+mod lockfile_verification;
+
+fn pnpr_done_frame(request: &mockito::Request, mut frame: serde_json::Value) -> Vec<u8> {
+    use serde_json::{
+        Value,
+        json,
+    };
+
+    let request: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+    let mut policies = json!({
+        "autoInstallPeers": true,
+        "dedupePeers": false,
+        "excludeLinksFromLockfile": false,
+        "addMissingPeerTypes": false,
+        "projectScopedOptionalPeers": false,
+        "frozenLockfile": false,
+        "resolutionMode": "highest",
+        "trustLockfile": false,
+        "minimumReleaseAge": null,
+        "minimumReleaseAgeExclude": [],
+        "minimumReleaseAgeIgnoreMissingTime": true,
+        "minimumReleaseAgeStrict": false,
+        "trustPolicy": null,
+        "trustPolicyExclude": [],
+        "trustPolicyIgnoreAfter": null,
+    });
+    for (name, value) in policies.as_object_mut().unwrap() {
+        if let Some(requested) = request.get(name) {
+            *value = requested.clone();
+        }
+    }
+    for name in ["minimumReleaseAgeExclude", "trustPolicyExclude"] {
+        if policies[name].is_null() {
+            policies[name] = json!([]);
+        }
+    }
+    if policies["trustPolicy"] == "off" {
+        policies["trustPolicy"] = Value::Null;
+    }
+    frame["appliedPolicies"] = policies;
+    frame["lockfileFormat"] = json!("pnpm-lock/9.0");
+    format!("{frame}\n").into_bytes()
+}

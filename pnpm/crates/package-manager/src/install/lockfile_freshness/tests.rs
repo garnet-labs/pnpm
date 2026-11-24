@@ -1,10 +1,65 @@
-use super::{WantedLockfileSatisfactionCheck, wanted_lockfile_satisfies_workspace};
+use super::{
+    WantedLockfileSatisfactionCheck,
+    wanted_lockfile_satisfies_workspace,
+};
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::PackageManifest;
 use std::fs;
 use tempfile::tempdir;
+
+pub(crate) async fn check_frozen_fixture(
+    check: &WantedLockfileSatisfactionCheck<'_>,
+    manifests: &[(String, PackageManifest)],
+) -> Result<(), String> {
+    let manifests: Vec<_> = manifests
+        .iter()
+        .map(|(id, manifest)| (id.clone(), manifest))
+        .collect();
+    let declared: Vec<_> = manifests
+        .iter()
+        .map(|(_, manifest)| {
+            (
+                manifest
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf(),
+                *manifest,
+            )
+        })
+        .collect();
+    let unresolved = super::check_lockfile_freshness(
+        check.lockfile,
+        &super::LockfileFreshnessInputs {
+            lockfile_dir: check.config.workspace_dir.as_deref().unwrap(),
+            manifests: &manifests,
+            workspace_packages: None,
+            dependency_manifests: super::DependencyManifestSources {
+                declared: &declared,
+                injected: None,
+            },
+            config: check.config,
+            catalogs: check.catalogs,
+            pnpmfile_hook: None,
+            scope: super::FreshnessScope {
+                fetch_only: false,
+                ignore_manifest_check: false,
+                ignore_settings_check: false,
+                allow_missing_dependency_free_importers: false,
+                frozen_lockfile: true,
+                prune_stale_importers: true,
+                patches_only: false,
+                locked_registries: None,
+            },
+        },
+    )
+    .await
+    .map_err(|error| format!("{error:?}"))?;
+    assert!(unresolved.is_empty());
+    Ok(())
+}
 
 #[tokio::test]
 async fn workspace_satisfaction_uses_pinned_lockfile_dir_for_local_overrides() {
@@ -112,6 +167,7 @@ importers:
             importer_id: ".",
             config,
             workspace: super::WorkspaceProjects {
+                peer_children: Box::leak(Box::default()),
                 packages: None,
                 manifests_by_dir: Box::leak(Box::default()),
                 directory_manifests: crate::install::DirectoryManifests::none(),
@@ -120,7 +176,7 @@ importers:
                 registries: Box::leak(Box::default()),
             },
             optional_exclusions: super::OptionalDependencyExclusions { ignored, frozen_lockfile },
-            parsed_overrides: None,
+            overrider: None,
         }
     }
     let fixture = (&lockfile, root.path(), &config);

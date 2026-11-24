@@ -1,9 +1,29 @@
 use crate::{
-    ArchiveIntegrity, ArchiveStoreProjection, CachedCasPaths, FetchedTarball, IgnoreEntryFilter,
-    SharedReportedProgressKeys, TarballError, apply_append_manifest, apply_placeholder_manifest,
-    archive_integrity::{ArchiveVerification, IntegrityKind},
-    download::{download_priority, fetch_and_extract_archive_with_retry, store_index_cache_key},
-    emit_progress_found_in_store, load_cached_cas_paths, load_legacy_synthesized_cas_paths,
+    ArchiveIntegrity,
+    ArchiveStoreProjection,
+    CachedCasPaths,
+    FetchedLocalTarball,
+    FetchedTarball,
+    IgnoreEntryFilter,
+    SharedReportedProgressKeys,
+    TarballError,
+    apply_append_manifest,
+    apply_placeholder_manifest,
+    archive_integrity::{
+        ArchiveVerification,
+        IntegrityKind,
+    },
+    download::{
+        ExtractedFiles,
+        download_priority,
+        emit_progress_fetched,
+        fetch_and_extract_archive_with_retry,
+        fetch_local_tarball_with_sha1,
+        store_index_cache_key,
+    },
+    emit_progress_found_in_store,
+    load_cached_cas_paths,
+    load_legacy_synthesized_cas_paths,
     local_file_tarball_path,
     zip_archive::fetch_and_extract_zip_with_retry,
 };
@@ -11,7 +31,11 @@ use pnpm_package_manifest::PackageBin;
 use pnpm_reporter::Reporter;
 use pnpm_store_dir::PackageFilesIndex;
 use ssri::Integrity;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::Arc,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ArchiveFormat<'a> {
@@ -76,14 +100,14 @@ impl ArchiveIngestion<'_> {
                 target: "pacquet::download",
                 package_url = ?self.package.url,
                 package_id = ?self.package.id,
-                "Reusing prefetched CAFS entry — skipping download",
+                "Reusing prefetched CAFS entry, skipping download",
             );
             emit_progress_found_in_store::<Reporter>(self.package.id, self.requester, progress_key);
             return Ok(Some(CachedCasPaths::files_only(Arc::clone(cas_paths))));
         }
         if let Some(cached) = load_cached_cas_paths::<Reporter>(
             self.store.index.clone(),
-            self.store.dir,
+            &self.store.dir,
             cache_key.clone(),
             self.store.verify_integrity,
             self.store_projection.package_content_check(self.store.strict_pkg_content_check),
@@ -91,14 +115,15 @@ impl ArchiveIngestion<'_> {
         )
         .await?
         {
-            tracing::info!(target: "pacquet::download", package_url = ?self.package.url, package_id = ?self.package.id, "Reusing cached CAFS entry — skipping download");
+            tracing::info!(target: "pacquet::download", package_url = ?self.package.url, package_id = ?self.package.id, "Reusing cached CAFS entry, skipping download");
             emit_progress_found_in_store::<Reporter>(self.package.id, self.requester, progress_key);
             return Ok(Some(cached));
         }
         Ok(self
             .load_legacy_cache::<Reporter>(progress_key)
             .await?
-            .map(|files| CachedCasPaths::files_only(Arc::new(files))))
+            .map(Arc::new)
+            .map(CachedCasPaths::files_only))
     }
 
     pub(crate) async fn ingest_zip_buffer(
@@ -117,7 +142,7 @@ impl ArchiveIngestion<'_> {
             ignore_file_pattern: self.ignore_file_pattern.clone(),
             limits: self.fetching.tar_limits,
         }
-        .run(self.store.dir)
+        .run(&self.store.dir)
         .await?;
         self.project_files(&mut paths, &mut index)?;
         if let Some(index_key) = self.cache_key() {
@@ -137,7 +162,7 @@ impl ArchiveIngestion<'_> {
         {
             let cached = load_legacy_synthesized_cas_paths::<Reporter>(
                 self.store.index.clone(),
-                self.store.dir,
+                &self.store.dir,
                 &package_integrity.to_string(),
                 self.package.id,
                 self.store.verify_integrity,
@@ -146,7 +171,7 @@ impl ArchiveIngestion<'_> {
             )
             .await?;
             if let Some(cas_paths) = cached {
-                tracing::info!(target: "pacquet::download", package_url = ?self.package.url, package_id = ?self.package.id, "Reusing compatible legacy CAFS entry — skipping download");
+                tracing::info!(target: "pacquet::download", package_url = ?self.package.url, package_id = ?self.package.id, "Reusing compatible legacy CAFS entry, skipping download");
                 emit_progress_found_in_store::<Reporter>(
                     self.package.id,
                     self.requester,
@@ -171,19 +196,11 @@ impl ArchiveIngestion<'_> {
 
         tracing::info!(target: "pacquet::download", package_url = ?self.package.url, "New cache");
 
-        let (computed, mut cas_paths, mut pkg_files_idx, bins) = self.fetch_archive::<Reporter>(
+        let extracted = self.fetch_archive::<Reporter>(
             self.progress_reported.as_ref().zip(cache_key.as_deref()),
         )
         .await?;
-        self.project_files(&mut cas_paths, &mut pkg_files_idx)?;
-
-        let manifest = pkg_files_idx.manifest.clone();
-        let requires_build = match self.format {
-            ArchiveFormat::TarGz { .. } => pkg_files_idx.requires_build.expect(
-                "fresh tarball extraction records build requirement",
-            ),
-            ArchiveFormat::Zip { .. } => pkg_files_idx.requires_build.unwrap_or(false),
-        };
+        let (tarball, computed, pkg_files_idx) = self.finalize_fetched(extracted)?;
         if cache_key.is_some() || record_computed_integrity {
             self.queue_computed_rows(&computed, pkg_files_idx);
         } else {
@@ -194,15 +211,54 @@ impl ArchiveIngestion<'_> {
                 "resolution carries no integrity; skipping index row for this archive",
             );
         }
+        Ok(tarball)
+    }
 
-        Ok(FetchedTarball {
-            integrity: computed.resource,
-            tar_integrity: computed.tar,
+    pub(crate) async fn ingest_local_tarball<Reporter: self::Reporter>(
+        &self,
+        path: &Path,
+    ) -> Result<FetchedLocalTarball, TarballError> {
+        let cache_key = self.cache_key();
+        let progress_key = self.progress_reported.as_ref().zip(cache_key.as_deref());
+        let (extracted, sha1_integrity) = fetch_local_tarball_with_sha1::<Reporter>(
+            path,
+            &ArchiveVerification::new(self.package.integrity, self.package.integrity_kind),
+            self.package.unpacked_size,
+            self.fetching.tar_limits,
+            self.package.url,
+            self.package.id,
+            &self.store.dir,
+            self.ignore_file_pattern.clone(),
+        )
+        .await?;
+        emit_progress_fetched::<Reporter>(self.package.id, self.requester, progress_key);
+        let (tarball, computed, pkg_files_idx) = self.finalize_fetched(extracted)?;
+        self.queue_computed_rows(&computed, pkg_files_idx);
+        Ok(FetchedLocalTarball { tarball, sha1_integrity })
+    }
+
+    fn finalize_fetched(
+        &self,
+        (computed, mut cas_paths, mut pkg_files_idx, bins): ExtractedFiles,
+    ) -> Result<(FetchedTarball, ArchiveIntegrity, PackageFilesIndex), TarballError> {
+        self.project_files(&mut cas_paths, &mut pkg_files_idx)?;
+
+        let manifest = pkg_files_idx.manifest.clone();
+        let requires_build = match self.format {
+            ArchiveFormat::TarGz { .. } => pkg_files_idx.requires_build.expect(
+                "fresh tarball extraction records build requirement",
+            ),
+            ArchiveFormat::Zip { .. } => pkg_files_idx.requires_build.unwrap_or(false),
+        };
+        let tarball = FetchedTarball {
+            integrity: computed.resource.clone(),
+            tar_integrity: computed.tar.clone(),
             files_map: cas_paths,
             manifest,
             requires_build,
             bins: bins.map(Arc::new),
-        })
+        };
+        Ok((tarball, computed, pkg_files_idx))
     }
 
     fn check_offline_availability(&self) -> Result<(), TarballError> {
@@ -253,7 +309,7 @@ impl ArchiveIngestion<'_> {
                     download_priority(unpacked_size, file_count),
                     self.package.id,
                     self.requester,
-                    self.store.dir,
+                    &self.store.dir,
                     self.fetching.retry_opts,
                     self.fetching.auth_headers,
                     self.ignore_file_pattern.clone(),
@@ -282,7 +338,7 @@ impl ArchiveIngestion<'_> {
             integrity,
             self.package.id,
             self.requester,
-            self.store.dir,
+            &self.store.dir,
             self.fetching.retry_opts,
             self.fetching.auth_headers,
             prefix,
@@ -303,13 +359,13 @@ impl ArchiveIngestion<'_> {
             ArchiveStoreProjection::Package { append_manifest } => {
                 if let Some(manifest_bytes) = append_manifest {
                     apply_append_manifest(
-                        self.store.dir,
+                        &self.store.dir,
                         manifest_bytes,
                         cas_paths,
                         pkg_files_idx,
                     )?;
                 }
-                apply_placeholder_manifest(self.store.dir, cas_paths, pkg_files_idx)
+                apply_placeholder_manifest(&self.store.dir, cas_paths, pkg_files_idx)
             }
             ArchiveStoreProjection::RawArchive => Ok(()),
         }

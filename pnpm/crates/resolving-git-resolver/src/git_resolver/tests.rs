@@ -1,19 +1,44 @@
-use super::{AllowlistedProbe, GitProbe, GitResolver, ProbeFuture};
-use crate::resolve_ref::{GitCommandRunner, GitRunError};
+use super::{
+    AllowlistedProbe,
+    GitProbe,
+    GitResolver,
+    ProbeFuture,
+};
+use crate::resolve_ref::{
+    GitCommandRunner,
+    GitRunError,
+};
 use miette::Diagnostic;
-use pnpm_lockfile::LockfileResolution;
-use pnpm_network::{AuthHeaders, UpstreamRouteHook};
+use pnpm_lockfile::{
+    GitResolution,
+    LockfileResolution,
+};
+use pnpm_network::{
+    AuthHeaders,
+    UpstreamRouteHook,
+};
 use pnpm_resolving_resolver_base::{
-    GitResolveError, ResolveOptions, ResolveResult, Resolver, WantedDependency,
+    CurrentPkg,
+    GitResolveError,
+    PkgResolutionId,
+    ResolutionRefreshOptions,
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
+    UpdateBehavior,
+    WantedDependency,
 };
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 
 struct FakeProbe {
-    /// Whether the anonymous HEAD of the archive URL succeeds — the
+    /// Whether the anonymous HEAD of the archive URL succeeds, the
     /// public/private axis of the repo under test.
     archive_ok: bool,
     calls: Mutex<Vec<String>>,
@@ -55,7 +80,7 @@ impl GitCommandRunner for FakeRunner {
     }
 }
 
-/// Stands in for a git that cannot reach the remote at all — a machine
+/// Stands in for a git that cannot reach the remote at all, a machine
 /// without the host's CA certificates, without an SSH key, offline.
 struct UnreachableRunner {
     stderr: String,
@@ -518,6 +543,87 @@ async fn a_failed_resolution_is_retried_by_the_next_request() {
         .expect("claimed");
 
     assert_eq!(*runner.calls.lock().unwrap(), 2);
+    let LockfileResolution::Git(git) = &result.resolution else {
+        panic!("expected a git resolution, got {:?}", result.resolution);
+    };
+    assert_eq!(git.commit, COMMIT);
+}
+
+fn locked_opts(update: UpdateBehavior) -> ResolveOptions {
+    const LOCKED: &str = "0000000000000000000000000000000000000001";
+    ResolveOptions {
+        refresh: ResolutionRefreshOptions {
+            current_pkg: Some(CurrentPkg {
+                id: PkgResolutionId::from(format!(
+                    "foo@git+https://example.com/foo/bar.git#{LOCKED}",
+                )),
+                name: Some("foo".to_string()),
+                version: Some("1.0.0".to_string()),
+                resolution: LockfileResolution::Git(GitResolution {
+                    repo: "https://example.com/foo/bar.git".to_string(),
+                    commit: LOCKED.to_string(),
+                    integrity: None,
+                    path: None,
+                }),
+                published_at: None,
+                manifest: Some(Arc::new(serde_json::json!({
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "peerDependencies": { "peer": "^1.0.0" },
+                }))),
+            }),
+            update,
+            ..ResolutionRefreshOptions::default()
+        },
+        ..ResolveOptions::default()
+    }
+}
+
+/// <https://github.com/pnpm/pnpm/issues/18104>
+#[tokio::test]
+async fn a_locked_resolution_is_kept_without_ls_remote() {
+    let runner = Arc::new(runner(""));
+    let resolver = GitResolver::new(Arc::new(FakeProbe::new(false)), Arc::clone(&runner));
+    let wanted = wanted("foo", "git+https://example.com/foo/bar.git#v1.0.0");
+
+    let result = resolver
+        .resolve(&wanted, &locked_opts(UpdateBehavior::Off))
+        .await
+        .unwrap()
+        .expect("claimed");
+
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        result.id.as_str(),
+        "git+https://example.com/foo/bar.git#0000000000000000000000000000000000000001",
+    );
+    assert_eq!(result.alias.as_deref(), Some("foo"));
+    assert_eq!(
+        result.normalized_bare_specifier.as_deref(),
+        Some("git+https://example.com/foo/bar.git#v1.0.0"),
+    );
+    assert_eq!(
+        result.package.manifest
+            .as_deref()
+            .and_then(|manifest| manifest.get("peerDependencies")),
+        Some(&serde_json::json!({ "peer": "^1.0.0" })),
+    );
+}
+
+#[tokio::test]
+async fn an_update_resolves_a_locked_ref_again() {
+    const COMMIT: &str = "163360a8d3ae6bee9524541043197ff356f8ed99";
+    let runner = Arc::new(runner(&format!("{COMMIT}\trefs/tags/v1.0.0\n")));
+    let resolver = GitResolver::new(Arc::new(FakeProbe::new(false)), Arc::clone(&runner));
+    let wanted = wanted("foo", "git+https://example.com/foo/bar.git#v1.0.0");
+
+    let result = resolver
+        .resolve(&wanted, &locked_opts(UpdateBehavior::Latest))
+        .await
+        .unwrap()
+        .expect("claimed");
+
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
     let LockfileResolution::Git(git) = &result.resolution else {
         panic!("expected a git resolution, got {:?}", result.resolution);
     };

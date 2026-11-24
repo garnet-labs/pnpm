@@ -1,34 +1,73 @@
 use crate::{
     State,
     cli_args::patch_state::{
-        EditDirState, StateFileError, read_all_edit_dir_states, read_edit_dir_state,
+        EditDirState,
+        StateFileError,
+        read_all_edit_dir_states,
+        read_edit_dir_state,
     },
 };
-use clap::Args;
-use derive_more::{Display, Error};
+use clap::{
+    Args,
+    ValueHint,
+};
+use derive_more::{
+    Display,
+    Error,
+};
 use indexmap::IndexMap;
 use lockfile_update::update_lockfile_snapshots;
 use miette::Diagnostic;
 use paths::{
-    PatchFileWriteContext, clean_source_dir, cleanup_after_diff, normalize_patches_dir_name,
-    path_from_forward_slash, remove_dir_if_exists,
+    PatchFileWriteContext,
+    clean_source_dir,
+    cleanup_after_diff,
+    normalize_patches_dir_name,
+    path_from_forward_slash,
+    remove_dir_if_exists,
 };
 use pnpm_crypto_hash::create_short_hash;
-use pnpm_fs::{is_subdir, lexical_normalize};
-use pnpm_lockfile::{LoadLockfileError, Lockfile, PackageKey, SaveLockfileError};
+use pnpm_fs::{
+    is_subdir,
+    lexical_normalize,
+};
+use pnpm_lockfile::{
+    LoadLockfileError,
+    Lockfile,
+    PackageKey,
+    SaveLockfileError,
+};
 use pnpm_package_manager::{
-    PatchCandidate, PatchCandidateSet, PatchTarget, PatchTargetError, PkgFilesForDiff,
-    WritePackageForPatch, WritePackageForPatchError, diff_folders, patch_candidates_from_lockfile,
+    PatchCandidate,
+    PatchCandidateSet,
+    PatchTarget,
+    PatchTargetError,
+    PkgFilesForDiff,
+    WritePackageForPatch,
+    WritePackageForPatchError,
+    diff_folders,
+    patch_candidates_from_lockfile,
     prepare_pkg_files_for_diff,
 };
-use pnpm_package_manifest::{PackageManifest, PackageManifestError};
+use pnpm_package_manifest::{
+    PackageManifest,
+    PackageManifestError,
+};
 use pnpm_reporter::Reporter;
 use pnpm_workspace_manifest_writer::UpdateWorkspaceManifestError;
-use resolution::{format_candidates, resolve_patch_dir};
+use resolution::{
+    format_candidates,
+    resolve_patch_dir,
+};
 use serde_json::Value;
 use std::{
-    fs, io,
-    path::{Component, Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
 };
 
 #[derive(Debug, Args)]
@@ -36,7 +75,7 @@ pub struct PatchCommitArgs {
     /// Directory created by `pnpm patch` or package name/specifier.
     pub patch_dir: PathBuf,
     /// The generated patch file will be saved to this directory.
-    #[clap(long = "patches-dir", value_name = "dir")]
+    #[clap(long = "patches-dir", value_name = "dir", value_hint = ValueHint::DirPath)]
     pub patches_dir: Option<String>,
 }
 
@@ -198,12 +237,14 @@ impl PatchCommitArgs {
         patch_content: &str,
     ) -> Result<IndexMap<String, String>, PatchCommitError> {
         let workspace_dir = state.config.workspace_dir.clone().unwrap_or_else(|| dir.to_path_buf());
-        let patches_dir_name = normalize_patches_dir_name(
-            self.patches_dir
-                .as_deref()
-                .or(state.config.patches_dir.as_deref())
-                .unwrap_or("patches"),
-        );
+        let patches_dir_setting = self.patches_dir
+            .as_deref()
+            .or(state.config.patches_dir.as_deref())
+            .unwrap_or("patches");
+        let patches_dir_name = normalize_patches_dir_name(patches_dir_setting)
+            .ok_or_else(|| PatchCommitError::PatchesDirOutsideProject {
+                patches_dir: patches_dir_setting.to_string(),
+            })?;
         let patches_dir = workspace_dir.join(path_from_forward_slash(&patches_dir_name));
         fs::create_dir_all(&patches_dir)
             .map_err(|source| PatchCommitError::CreatePatchesDir {

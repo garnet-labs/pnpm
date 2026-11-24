@@ -1,4 +1,4 @@
-//! `pack` — build a publishable `.tgz` from a project directory.
+//! `pack`: build a publishable `.tgz` from a project directory.
 //!
 //! Wraps [`pnpm_pack::api`], replacing Bit's side-load of
 //! `@pnpm/releasing.commands`' internal `publish/pack.js`. The Rust `api` is
@@ -7,16 +7,26 @@
 //! scripts, so it runs on a blocking pool. Lifecycle-script output is
 //! forwarded to the optional `onLog` sink through [`NodeBridgeReporter`].
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+};
 
 use napi_derive::napi;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{NodeLinker, PNPM_VERSION};
+use pnpm_config::{
+    NodeLinker,
+    PNPM_VERSION,
+};
 
 use crate::{
     error::to_napi_error,
     install::engine_call_lock,
-    reporter_bridge::{EngineCallGuard, LogSink, NodeBridgeReporter},
+    reporter_bridge::{
+        EngineCallGuard,
+        LogSink,
+        NodeBridgeReporter,
+    },
 };
 
 /// Inputs for [`pack`].
@@ -113,10 +123,12 @@ fn pack_options(options: PackOptions) -> pnpm_pack::PackOptions {
             // loads no `beforePacking` pnpmfiles, so the hook loop is a no-op.
             before_packing_hooks: Vec::new(),
             workspace_packages: None,
+            bumped_workspace_packages: None,
         },
         output: pnpm_pack::PackOutputOptions {
             gzip_level: options.pack_gzip_level,
             dry_run: options.dry_run.unwrap_or(false),
+            base_dir: None,
             destination: options.pack_destination,
             out: options.out,
             // Bit composes and injects changelogs itself; the pack bridge does not.

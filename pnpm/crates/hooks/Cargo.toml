@@ -12,6 +12,7 @@ repository.workspace = true
 
 [dependencies]
 pnpm-crypto-hash = { workspace = true }
+pnpm-process = { path = "../process" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -28,10 +29,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio = { workspace = true, features = ["net", "process", "signal"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
+pnpm-ffi-process = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-pnpm-process = { path = "../process" }
 
 [lints]
 workspace = true

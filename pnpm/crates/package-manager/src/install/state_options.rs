@@ -1,7 +1,20 @@
 use super::{
-    Arc, Catalogs, Config, HashSet, IncludedDependencies, Lockfile, Modules, NodeLinker,
-    PackageManifest, Path, PathBuf, ProjectMutation, RebuildOptions, ResolutionVerifier,
-    WorkspaceInstallSelection, WorkspaceState,
+    Arc,
+    Catalogs,
+    Config,
+    HashSet,
+    IncludedDependencies,
+    Lockfile,
+    Modules,
+    NodeLinker,
+    PackageManifest,
+    Path,
+    PathBuf,
+    ProjectMutation,
+    RebuildOptions,
+    ResolutionVerifier,
+    WorkspaceInstallSelection,
+    WorkspaceState,
 };
 use pnpm_store_dir::VerifiedFileIntegrity;
 
@@ -42,13 +55,13 @@ pub(crate) struct PendingProjectScripts<'a, 'selection> {
     pub(crate) root_preinstall_ran: bool,
 }
 
-pub(crate) struct ApplyCompletionContext {
+pub(crate) struct ApplyCompletionContext<'a> {
     pub(crate) prefix: String,
     pub(crate) workspace_manifest_dir: PathBuf,
     pub(crate) catalogs: Catalogs,
     pub(crate) catalog_context_present: bool,
     pub(crate) verified_file_integrity_baseline: VerifiedFileIntegrity,
-    pub(crate) config: &'static Config,
+    pub(crate) config: &'a Config,
     /// Whether the run may write the workspace state. See
     /// `InstallSaveOptions::workspace_state`.
     pub(crate) save_workspace_state: bool,
@@ -68,13 +81,14 @@ pub(crate) struct ApplyResolutionState<'a> {
     pub(crate) existing_wanted: Option<&'a Lockfile>,
     pub(crate) loaded: Option<&'a Lockfile>,
     pub(crate) frozen: bool,
+    pub(crate) trust_lockfile: bool,
     /// See `LoadedWorkspace::locked_registry_routes`.
     pub(crate) locked_registry_routes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct ModulesTreeContext<'a> {
-    pub(crate) config: &'static Config,
+    pub(crate) config: &'a Config,
     pub(crate) workspace_root: &'a Path,
     pub(crate) node_linker: NodeLinker,
     pub(crate) included: IncludedDependencies,
@@ -126,7 +140,7 @@ pub(crate) struct ProjectScriptSelection<'a, 'selection> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct CompletionWorkspace<'a> {
-    pub(crate) config: &'static Config,
+    pub(crate) config: &'a Config,
     pub(crate) catalogs: Option<&'a Catalogs>,
     pub(crate) workspace_root: &'a Path,
     pub(crate) workspace_manifest_dir: &'a Path,
@@ -155,8 +169,11 @@ pub(crate) struct SelectedImporters<'a> {
 
 pub(crate) struct LockfileVerificationInputs<'a, 'install> {
     pub(crate) verifiers: &'a [Arc<dyn ResolutionVerifier>],
-    pub(crate) path: Option<&'a Path>,
+    pub(crate) exotic_subdeps: &'a pnpm_lockfile_verification::ExoticSubdepsPolicy,
+    pub(crate) source: Option<pnpm_lockfile_verification::LockfileCacheSource<'a>>,
+    pub(crate) local_policy: pnpm_lockfile_verification::LocalResolutionPolicy,
     pub(crate) override_check: Option<super::LockfileVerificationOverride<'install>>,
+    pub(crate) trust_lockfile: bool,
 }
 
 #[derive(Clone, Copy)]

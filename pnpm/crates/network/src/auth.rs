@@ -17,29 +17,57 @@
 //! `.npmrc`; if it redirects across hosts, no header is attached.
 
 pub use redaction::{
-    hide_auth_information, redact_and_sanitize, redact_and_sanitize_multiline, redact_npm_auth_key,
-    redact_url_credentials, redact_url_for_display,
+    hide_auth_information,
+    redact_and_sanitize,
+    redact_and_sanitize_multiline,
+    redact_npm_auth_key,
+    redact_url_credentials,
+    redact_url_for_display,
 };
-pub use url::{base64_encode, base64_encode_bytes, is_url_secure_for_credentials, nerf_dart};
+pub use url::{
+    base64_encode,
+    base64_encode_bytes,
+    is_url_secure_for_credentials,
+    nerf_dart,
+    strip_insecure_url_credentials,
+};
 
 use crate::{
     AddressGuard,
-    token_helper::{TokenHelperRunner, execute_token_helper, run_token_helper_command},
+    token_helper::{
+        TokenHelperRunner,
+        execute_token_helper,
+        run_token_helper_command,
+    },
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     fmt,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc,
+        Mutex,
+        OnceLock,
+    },
 };
 
 pub const DEFAULT_REGISTRY_SCOPE: &str = "@";
 
 pub type AuthHeadersByScope = BTreeMap<String, BTreeMap<String, String>>;
 
+/// A response served without opening a network connection.
+pub type LocalResponse = std::pin::Pin<Box<dyn Future<Output = reqwest::Response> + Send>>;
+
+/// An in-process GET handler. `None` delegates to the network transport.
+pub type LocalFetch =
+    dyn Fn(&str, reqwest::header::HeaderMap) -> Option<LocalResponse> + Send + Sync;
+
 /// Server-side override for upstream auth selection.
 ///
 /// A plain [`AuthHeaders`] answers "what `Authorization` header does the
-/// client's `.npmrc` attach to this URL?" — the right question for the
+/// client's `.npmrc` attach to this URL?", the right question for the
 /// pnpm CLI, which fetches as the user. A server (pnpr) that resolves on
 /// behalf of many callers must instead answer "what credential does *this
 /// deployment's route policy* attach to this fetch, for this caller?" and
@@ -53,18 +81,32 @@ pub type AuthHeadersByScope = BTreeMap<String, BTreeMap<String, String>>;
 /// (returning `None` for an anonymous/public fetch) and records the
 /// route. A `None` hook (the CLI case) leaves lookup behavior unchanged.
 pub trait UpstreamRouteHook: Send + Sync {
+    /// Serve a deployment-owned URL in process, retaining the caller identity.
+    fn fetch_local(
+        &self,
+        _url: &str,
+        _headers: reqwest::header::HeaderMap,
+    ) -> Option<LocalResponse> {
+        None
+    }
+
     /// Decide the `Authorization` header value for a fetch to `url` for
     /// package `package` (`None` for non-package fetches), and record the
     /// route the decision selected. `None` means fetch anonymously.
     fn authorize(&self, url: &str, package: Option<&str>) -> Option<String>;
+
+    /// Headers owned by the selected route. Callers reselect them for each redirect.
+    fn request_headers(&self, url: &str, package: Option<&str>) -> reqwest::header::HeaderMap {
+        authorization_headers(self.authorize(url, package).as_deref())
+    }
 
     /// Whether this deployment may fetch `url` at all.
     ///
     /// A server resolves on behalf of callers who describe their own
     /// registries, so a URL it was told about is not automatically one it may
     /// reach. Answered at the fetch itself rather than when the request is
-    /// read, so a registry a caller merely configures — a scope it never
-    /// resolves a package from — costs nothing, while one it does resolve
+    /// read, so a registry a caller merely configures (a scope it never
+    /// resolves a package from) costs nothing, while one it does resolve
     /// from is refused before the request leaves the process.
     ///
     /// Defaults to `true` for hooks with no such policy (the CLI fetches as
@@ -82,8 +124,8 @@ pub trait UpstreamRouteHook: Send + Sync {
 
     /// Classify the metadata cache scope for a fetch to `url` for package
     /// `package` (`None` for non-package fetches). Unlike [`Self::authorize`]
-    /// this is a read-only query — it must **not** record into the resolve's
-    /// footprint — so the resolver can pick the on-disk mirror namespace and
+    /// this is a read-only query (it must **not** record into the resolve's
+    /// footprint) so the resolver can pick the on-disk mirror namespace and
     /// in-memory/fetch-lock keys without double-counting a route.
     ///
     /// Defaults to [`MetadataCacheScope::Public`] for hooks that don't
@@ -160,7 +202,7 @@ struct TokenHelpers {
     /// Memoizes each resolved `tokenHelper`: a helper runs at most once
     /// per process, keyed by its map key. Each key maps to a per-key
     /// [`OnceLock`] so the resolving subprocess runs without the shared
-    /// [`Mutex`] held — one slow helper can't block another registry's
+    /// [`Mutex`] held; one slow helper can't block another registry's
     /// lookup. `Some(header)` on success, `None` on failure (so a failed
     /// helper is never retried and never falls back to sending a different
     /// credential). Shared across [`Clone`]s so the memo survives an `Arc`
@@ -174,7 +216,7 @@ struct TokenHelpers {
 
 /// One resolved credential slot: either a baked header value or a
 /// `tokenHelper` command still to be executed. Keeping both in the same
-/// map preserves pnpm's single longest-path-prefix lookup — a
+/// map preserves pnpm's single longest-path-prefix lookup, a
 /// `tokenHelper` at `//host/` and a static token at `//host/path/`
 /// compete by prefix length exactly as two static tokens would.
 #[derive(Clone)]
@@ -214,9 +256,13 @@ impl AuthHeaders {
     /// authorization for any URL.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.by_uri.is_empty()
-            && self.scoped_by_scope.is_empty()
-            && self.route_hook.is_none()
+        self.by_uri.is_empty() && !self.uses_package_name()
+    }
+
+    /// Whether credential selection can depend on the package name.
+    #[must_use]
+    pub fn uses_package_name(&self) -> bool {
+        !self.scoped_by_scope.is_empty() || self.route_hook.is_some()
     }
 
     /// Overlay a ready-to-send `Authorization` header at `url`.
@@ -244,7 +290,7 @@ impl AuthHeaders {
     /// honored at the URI it is keyed under. Callers pin an unscoped
     /// credential to the registry its own source declared before it gets
     /// here (see `NpmrcAuth::rescope_unscoped`), so the resolved default
-    /// registry — which repository-controlled config can move — never
+    /// registry (which repository-controlled config can move) never
     /// decides where a credential is sent. An entry with an empty URI is
     /// dropped.
     pub fn from_creds_map<Iter>(headers: Iter) -> Self
@@ -410,8 +456,8 @@ impl AuthHeaders {
     /// this lookup, suitable for forwarding to a pnpr resolver.
     #[must_use]
     pub fn to_by_scope(&self) -> AuthHeadersByScope {
-        // A `tokenHelper` entry has no static string to forward — it would
-        // have to be executed — so it is skipped here. This map feeds the
+        // A `tokenHelper` entry has no static string to forward (it would
+        // have to be executed) so it is skipped here. This map feeds the
         // pnpr wire shape, which carries only resolved header strings.
         let mut result = AuthHeadersByScope::new();
         for (uri, entry) in &self.by_uri {
@@ -442,7 +488,7 @@ impl AuthHeaders {
     /// 2. Otherwise nerf-dart the URL and walk parent path prefixes
     ///    down to the host-only key.
     /// 3. If the URL carried any explicit port, retry the lookup with
-    ///    the port stripped — stripping *any* port (not just protocol
+    ///    the port stripped, stripping *any* port (not just protocol
     ///    defaults) and retrying iff the URL changed.
     #[must_use]
     pub fn for_url(&self, url: &str) -> Option<String> {
@@ -461,15 +507,73 @@ impl AuthHeaders {
     #[must_use]
     pub fn for_secure_url_with_package(&self, url: &str, pkg_name: Option<&str>) -> Option<String> {
         if !is_url_secure_for_credentials(url) {
+            self.record_route(url, pkg_name);
             return None;
         }
         self.for_url_with_package(url, pkg_name)
     }
 
+    /// Select the deployment's headers for each hop within the original credential scope.
+    pub(crate) fn managed_request_headers<'a>(
+        &'a self,
+        start: &'a str,
+        package: Option<&'a str>,
+    ) -> Option<impl Fn(&str) -> reqwest::header::HeaderMap + 'a> {
+        let hook = self.route_hook.as_ref()?;
+        let origin = reqwest::Url::parse(start).ok().map(|url| url.origin());
+        let headers = if self.require_secure_transport && !is_url_secure_for_credentials(start) {
+            reqwest::header::HeaderMap::new()
+        } else {
+            hook.request_headers(start, package)
+        };
+        Some(move |url: &str| {
+            if url == start {
+                return headers.clone();
+            }
+            if !headers.is_empty()
+                && reqwest::Url::parse(url).is_ok_and(|url| Some(url.origin()) == origin)
+                && self.metadata_scope(start, package) == self.metadata_scope(url, package)
+            {
+                return hook.request_headers(url, package);
+            }
+            reqwest::header::HeaderMap::new()
+        })
+    }
+
+    pub(crate) fn secure_request_auth<'a>(
+        &'a self,
+        start: &'a str,
+    ) -> impl Fn(reqwest::RequestBuilder, &str) -> reqwest::RequestBuilder + 'a {
+        let managed = self.managed_request_headers(start, None);
+        move |request, url| {
+            if !is_url_secure_for_credentials(url) {
+                return request;
+            }
+            match &managed {
+                Some(headers) => request.headers(headers(url)),
+                None => apply_authorization(request, self.for_url(url)),
+            }
+        }
+    }
+
+    /// Dispatch a GET locally when the route hook owns its destination.
+    #[must_use]
+    pub fn fetch_local(
+        &self,
+        url: &str,
+        package: Option<&str>,
+        headers: reqwest::header::HeaderMap,
+    ) -> Option<LocalResponse> {
+        let hook = self.route_hook.as_ref()?;
+        let response = hook.fetch_local(url, headers)?;
+        hook.authorize(url, package);
+        Some(response)
+    }
+
     /// Attach a server-side [`UpstreamRouteHook`] that takes over auth
     /// selection. The returned [`AuthHeaders`] keeps its
     /// client-forwarded credentials (so [`Self::to_by_scope`] still
-    /// reflects them) but no longer consults them on lookup — the hook
+    /// reflects them) but no longer consults them on lookup, the hook
     /// decides. Used by pnpr to resolve as the deployment's route policy
     /// rather than as the calling client.
     #[must_use]
@@ -479,7 +583,7 @@ impl AuthHeaders {
     }
 
     /// Whether the fetch to `url` is permitted, per an attached
-    /// [`UpstreamRouteHook`]. Always true without one — see
+    /// [`UpstreamRouteHook`]. Always true without one; see
     /// [`UpstreamRouteHook::allows_fetch`].
     #[must_use]
     pub fn allows_fetch(&self, url: &str) -> bool {
@@ -504,7 +608,7 @@ impl AuthHeaders {
     ///
     /// No-op when no route hook is installed (the CLI case): a fetch that
     /// never happens needs no `Authorization` header, and the CLI keeps no
-    /// footprint. Idempotent for the hook — recording the same route more
+    /// footprint. Idempotent for the hook, recording the same route more
     /// than once collapses to one footprint entry.
     pub fn record_route(&self, url: &str, pkg_name: Option<&str>) {
         if let Some(hook) = &self.route_hook {
@@ -515,7 +619,7 @@ impl AuthHeaders {
     /// The metadata cache scope a fetch to `url` for `pkg_name` belongs to.
     /// A server route hook owns the decision; without one (the CLI case)
     /// every fetch is [`MetadataCacheScope::Public`], leaving the global
-    /// mirror unchanged. Read-only — never records into a footprint.
+    /// mirror unchanged. Read-only, never records into a footprint.
     #[must_use]
     pub fn metadata_scope(&self, url: &str, pkg_name: Option<&str>) -> MetadataCacheScope {
         match &self.route_hook {
@@ -523,6 +627,24 @@ impl AuthHeaders {
             None => MetadataCacheScope::Public,
         }
     }
+}
+
+pub(super) fn apply_authorization(
+    request: reqwest::RequestBuilder,
+    value: Option<String>,
+) -> reqwest::RequestBuilder {
+    match value {
+        Some(value) => request.header(reqwest::header::AUTHORIZATION, value),
+        None => request,
+    }
+}
+
+fn authorization_headers(authorization: Option<&str>) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(value) = authorization.map(str::parse).and_then(Result::ok) {
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    headers
 }
 
 /// Canonicalize an auth-map key to the trailing-slash form the lookup

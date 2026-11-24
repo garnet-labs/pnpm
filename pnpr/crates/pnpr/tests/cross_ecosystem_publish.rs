@@ -1,26 +1,57 @@
-//! Integration tests for `PUT /-/pnpr/v0/publish` — one publish transaction
+//! Integration tests for `PUT /-/pnpr/v0/publish`; one publish transaction
 //! carrying packages of more than one ecosystem. Static-mode (no upstream) to
 //! keep the tests hermetic.
 
-use crate::{npm, storage::object_key};
+use crate::npm;
 
 use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+    },
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use npm::{npm_tgz, publishable_tgz, sri_sha512};
+use base64::{
+    Engine,
+    engine::general_purpose::STANDARD as BASE64,
+};
+use npm::{
+    npm_tgz,
+    publishable_tgz,
+    sri_sha512,
+};
 use pnpr::{
-    AccessList, AuthState, Config, Ecosystem, HostedConfig, MaxUsers, PackagePattern, PackageRules,
-    Registries, Registry, router_with_auth,
+    AccessList,
+    AuthState,
+    Config,
+    Ecosystem,
+    HostedConfig,
+    MaxUsers,
+    PackagePattern,
+    PackageRules,
+    Registries,
+    Registry,
+    router_with_auth,
 };
 use pnpr_fixtures::MockConfigPresets;
-use pnpr_storage::layout::local_blob_path;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::{
+    Value,
+    json,
+};
+use sha2::{
+    Digest,
+    Sha256,
+};
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::{Path, PathBuf},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
+    path::PathBuf,
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -32,12 +63,12 @@ fn tri_ecosystem_config(storage: PathBuf) -> Config {
     let listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873));
     let mut config = Config::static_serve(listen, storage);
     config.http.public_url = "http://pnpr.test".to_string();
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
-    for (name, org) in [("crates", ""), ("python", "")] {
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
+    for (name, namespace) in [("crates", ""), ("python", "")] {
         config.routing.hosted.insert(
             name.to_string(),
             HostedConfig::new(
-                org,
+                namespace,
                 PackageRules::new(Vec::new(), Some(AccessList::from_tokens(["$all"]))),
             ),
         );
@@ -70,8 +101,8 @@ fn tri_ecosystem_config(storage: PathBuf) -> Config {
         Registry::Router { sources: ["local", "crates", "python"].map(str::to_string).to_vec() },
     );
     let registries = Registries::new(graph, Some("main".to_string()))
-        .with_ecosystem("crates", Ecosystem::Cargo)
-        .with_ecosystem("python", Ecosystem::Pypi);
+        .with_ecosystem("crates".to_owned(), Ecosystem::Cargo)
+        .with_ecosystem("python".to_owned(), Ecosystem::Pypi);
     registries.validate().expect("the three-ecosystem graph is valid");
     config.routing.registries = registries;
     config
@@ -187,7 +218,7 @@ async fn token_for(app: &axum::Router, username: &str) -> String {
     let body = json!({
         "_id": format!("org.couchdb.user:{username}"),
         "name": username,
-        "password": "secret",
+        "password": "secret123",
         "email": "foo@bar.net",
         "type": "user",
         "roles": [],
@@ -214,7 +245,7 @@ async fn publishes_a_package_a_crate_and_a_wheel_in_one_transaction() {
     let token = token_for(&app, "alice").await;
     let tarball = &npm_tgz("mixed-pkg", "1.0.0", b"npm-tarball-bytes");
     let archive = crate_archive("demo", "0.1.0");
-    let wheel = b"PK\x03\x04 pretend wheel";
+    let wheel = &crate::ecosystem::python_wheel("demo-pkg", "1.0.0");
 
     let body = json!({
         "packages": [
@@ -291,6 +322,7 @@ async fn publishes_a_package_a_crate_and_a_wheel_in_one_transaction() {
     assert_eq!(page.status(), StatusCode::OK);
     assert_eq!(body_json(page.into_body()).await["files"][0]["filename"], WHEEL);
     let file = app
+        .clone()
         .oneshot(
             Request::get(format!("/pypi/files/demo-pkg/{WHEEL}"))
                 .body(Body::empty())
@@ -298,7 +330,20 @@ async fn publishes_a_package_a_crate_and_a_wheel_in_one_transaction() {
         )
         .await
         .unwrap();
-    assert_eq!(body_bytes(file.into_body()).await, wheel);
+    assert_eq!(body_bytes(file.into_body()).await, wheel.as_slice());
+    let metadata =
+        pnpr_pypi::archive::metadata_from_zip(wheel, WHEEL, pnpr_pypi::DistributionKind::Wheel)
+            .unwrap();
+    let sidecar = app
+        .oneshot(
+            Request::get(format!("/pypi/files/demo-pkg/{WHEEL}.metadata"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sidecar.status(), StatusCode::OK);
+    assert_eq!(body_bytes(sidecar.into_body()).await, metadata);
 
     // One transaction, and it left nothing behind.
 }
@@ -309,7 +354,7 @@ async fn a_batch_with_one_bad_entry_publishes_none_of_it() {
     let storage = tmp.path().to_path_buf();
     let app = router_with_auth(tri_ecosystem_config(storage.clone()), AuthState::in_memory());
     let token = token_for(&app, "alice").await;
-    let wheel = b"PK\x03\x04 pretend wheel";
+    let wheel = &crate::ecosystem::python_wheel("demo-pkg", "1.0.0");
 
     // The archive belongs to another version than the metadata claims, which
     // the Cargo surface refuses.
@@ -342,93 +387,6 @@ async fn a_batch_with_one_bad_entry_publishes_none_of_it() {
     assert_eq!(staged_files(&storage), Vec::<PathBuf>::new());
 }
 
-/// A blob whose immutable slot another writer already owns is the one thing a
-/// batch cannot roll back: the bytes that won are someone's published release.
-/// The package that lost is reported, nothing of the batch commits, and the
-/// bytes that won stay where they are.
-#[tokio::test]
-async fn a_package_that_loses_its_blob_is_reported_and_nothing_commits() {
-    use object_store::{ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
-    use pnpr::HostedStoreConfig;
-    use std::sync::Arc;
-
-    let tmp = TempDir::new().unwrap();
-    let storage = tmp.path().to_path_buf();
-    let store = Arc::new(InMemory::new());
-    // Another writer already published this tarball, with other bytes.
-    store
-        .put(
-            &ObjectPath::from(object_key(&local_blob_path(
-                Path::new(""),
-                "",
-                pnpr_storage::Ecosystem::Npm,
-                "mixed-pkg",
-                "mixed-pkg-1.0.0.tgz",
-            ))),
-            axum::body::Bytes::from_static(b"the winning tarball").into(),
-        )
-        .await
-        .unwrap();
-    let mut config = tri_ecosystem_config(storage.clone());
-    config.storage.hosted_backend = HostedStoreConfig::ObjectStore {
-        store: Arc::<InMemory>::clone(&store),
-        prefix: String::new(),
-    };
-    let app = router_with_auth(config, AuthState::in_memory());
-    let token = token_for(&app, "alice").await;
-
-    let body = json!({
-        "packages": [
-            npm_entry("mixed-pkg", "1.0.0", b"the losing tarball"),
-            cargo_entry("demo", "0.1.0", &crate_archive("demo", "0.1.0")),
-        ],
-    });
-    let response = app
-        .clone()
-        .oneshot(publish_request("/-/pnpr/v0/publish", &body, Some(&token)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let reason = String::from_utf8(body_bytes(response.into_body()).await).unwrap();
-    assert!(reason.contains("mixed-pkg"), "{reason}");
-
-    let packument = app
-        .clone()
-        .oneshot(
-            Request::get("/npm/mixed-pkg")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(packument.status(), StatusCode::NOT_FOUND, "the version that lost is not served");
-    let index = app
-        .oneshot(
-            Request::get("/cargo/index/de/mo/demo")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(index.status(), StatusCode::NOT_FOUND, "the crate beside it does not commit");
-    assert_eq!(
-        store
-            .get(&ObjectPath::from(object_key(&local_blob_path(
-                Path::new(""),
-                "",
-                pnpr_storage::Ecosystem::Npm,
-                "mixed-pkg",
-                "mixed-pkg-1.0.0.tgz",
-            ))))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap(),
-        "the winning tarball",
-    );
-}
-
 /// The failure that matters most is the one after other packages have already
 /// staged their blobs: an npm tarball that does not match its declared
 /// integrity is caught while staging, and every blob staged before it has to
@@ -445,7 +403,7 @@ async fn a_failure_while_staging_takes_the_staged_blobs_with_it() {
     let body = json!({
         "packages": [
             cargo_entry("demo", "0.1.0", &crate_archive("demo", "0.1.0")),
-            pypi_entry("demo-pkg", "1.0.0", WHEEL, b"PK\x03\x04 pretend wheel"),
+            pypi_entry("demo-pkg", "1.0.0", WHEEL, &crate::ecosystem::python_wheel("demo-pkg", "1.0.0")),
             broken,
         ],
     });
@@ -581,7 +539,7 @@ async fn an_uppercase_digest_is_accepted() {
     let app =
         router_with_auth(tri_ecosystem_config(tmp.path().to_path_buf()), AuthState::in_memory());
     let token = token_for(&app, "alice").await;
-    let wheel = b"PK\x03\x04 pretend wheel";
+    let wheel = &crate::ecosystem::python_wheel("demo-pkg", "1.0.0");
     let mut entry = pypi_entry("demo-pkg", "1.0.0", WHEEL, wheel);
     entry["sha256_digest"] = json!(sha256_hex(wheel).to_uppercase());
 
@@ -668,7 +626,8 @@ fn staged_files(root: &std::path::Path) -> Vec<PathBuf> {
             staged.extend(staged_files(&path));
         } else if path
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().contains(".tmp."))
+            .map(std::ffi::OsStr::to_string_lossy)
+            .is_some_and(|text| text.contains(".tmp."))
         {
             staged.push(path);
         }
@@ -680,11 +639,11 @@ fn staged_files(root: &std::path::Path) -> Vec<PathBuf> {
 async fn another_file_of_a_published_python_version_takes_no_publish_time_note() {
     let tmp = TempDir::new().unwrap();
     let mut config = tri_ecosystem_config(tmp.path().to_path_buf());
-    config.storage.metadata =
-        pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite"));
+    config.storage.database =
+        pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite"));
     let app = router_with_auth(config, AuthState::in_memory());
     let token = token_for(&app, "alice").await;
-    let first = json!({ "packages": [pypi_entry("demo-pkg", "1.0.0", WHEEL, b"PK\x03\x04 one")] });
+    let first = json!({ "packages": [pypi_entry("demo-pkg", "1.0.0", WHEEL, &crate::ecosystem::python_wheel("demo-pkg", "1.0.0"))] });
     let published = app
         .clone()
         .oneshot(publish_request("/-/pnpr/v0/publish", &first, Some(&token)))
@@ -692,7 +651,12 @@ async fn another_file_of_a_published_python_version_takes_no_publish_time_note()
         .unwrap();
     assert_eq!(published.status(), StatusCode::CREATED);
 
-    let mut sdist = pypi_entry("demo-pkg", "1.0.0", "demo_pkg-1.0.0.tar.gz", b"sdist bytes");
+    let mut sdist = pypi_entry(
+        "demo-pkg",
+        "1.0.0",
+        "demo_pkg-1.0.0.tar.gz",
+        &crate::ecosystem::python_sdist("demo-pkg", "1.0.0"),
+    );
     sdist["filetype"] = json!("sdist");
     sdist["notes"] = json!("- late\n");
     let second = json!({ "packages": [sdist] });
@@ -715,4 +679,120 @@ async fn another_file_of_a_published_python_version_takes_no_publish_time_note()
         .await
         .unwrap();
     assert_eq!(accepted.status(), StatusCode::CREATED);
+}
+
+#[cfg(feature = "backend-libsql")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsynced_libsql_replica_serves_cargo_and_pypi_archives_from_the_primary() {
+    use object_store::{
+        ObjectStore,
+        memory::InMemory,
+    };
+    use pnpr::HostedStoreConfig;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (primary, address, server) =
+        pnpr_libsql::testing::serve_primary(tmp.path().join("primary.db")).await;
+    let instance = |name: &str| {
+        let mut config = tri_ecosystem_config(tmp.path().join(name));
+        config.storage.hosted_backend =
+            HostedStoreConfig::ObjectStore { store: Arc::clone(&store), prefix: String::new() };
+        config.storage.database =
+            pnpr_config::DatabaseBackend::Libsql(pnpr_config::LibsqlSettings {
+                url: format!("http://{address}"),
+                auth_token: None,
+                replica_path: Some(tmp.path().join(name).join("replica.db")),
+                sync_interval_secs: Some(3600),
+                max_connections: None,
+            });
+        router_with_auth(config, AuthState::in_memory())
+    };
+    let writer = instance("writer");
+    let reader = instance("reader");
+    let token = token_for(&writer, "alice").await;
+
+    let crate_v1 = crate_archive("demo", "1.0.0");
+    let wheel_v1 = crate::ecosystem::python_wheel("demo-pkg", "1.0.0");
+    let first = json!({
+        "packages": [
+            cargo_entry("demo", "1.0.0", &crate_v1),
+            pypi_entry("demo-pkg", "1.0.0", WHEEL, &wheel_v1),
+        ],
+    });
+    let published = writer
+        .clone()
+        .oneshot(publish_request("/-/pnpr/v0/publish", &first, Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+    let bootstrap = reader
+        .clone()
+        .oneshot(
+            Request::get("/cargo/index/de/mo/demo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bootstrap.status(), StatusCode::OK);
+
+    let crate_v2 = crate_archive("demo", "2.0.0");
+    let wheel_v2 = crate::ecosystem::python_wheel("demo-pkg", "2.0.0");
+    let wheel_v2_name = "demo_pkg-2.0.0-py3-none-any.whl";
+    let second = json!({
+        "packages": [
+            cargo_entry("demo", "2.0.0", &crate_v2),
+            pypi_entry("demo-pkg", "2.0.0", wheel_v2_name, &wheel_v2),
+        ],
+    });
+    let published = writer
+        .clone()
+        .oneshot(publish_request("/-/pnpr/v0/publish", &second, Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let crate_dl = reader
+        .clone()
+        .oneshot(
+            Request::get("/cargo/api/v1/crates/demo/2.0.0/download")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(crate_dl.status(), StatusCode::OK);
+    assert_eq!(body_bytes(crate_dl.into_body()).await, crate_v2);
+
+    let pypi_dl = reader
+        .clone()
+        .oneshot(
+            Request::get(format!("/pypi/files/demo-pkg/{wheel_v2_name}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pypi_dl.status(), StatusCode::OK);
+    assert_eq!(body_bytes(pypi_dl.into_body()).await, wheel_v2);
+
+    let pypi_metadata = reader
+        .clone()
+        .oneshot(
+            Request::get(format!("/pypi/files/demo-pkg/{wheel_v2_name}.metadata"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pypi_metadata.status(), StatusCode::OK);
+    assert_eq!(
+        pypi_metadata.headers()[axum::http::header::CONTENT_TYPE],
+        "text/plain; charset=utf-8",
+    );
+
+    drop(primary);
+    server.abort();
 }

@@ -7,16 +7,39 @@ use std::{
     fmt::Write as _,
     io::Read,
     mem,
-    process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+    process::{
+        Child,
+        Command,
+        ExitStatus,
+        Output,
+        Stdio,
     },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        Mutex,
+        PoisonError,
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
+    },
+    thread::{
+        self,
+        JoinHandle,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 use sysinfo::{
-    Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind,
+    Pid,
+    Process,
+    ProcessRefreshKind,
+    ProcessStatus,
+    ProcessesToUpdate,
+    System,
+    UpdateKind,
 };
 
 /// Below nextest's `terminate-after`, so the report is printed before
@@ -103,8 +126,9 @@ fn fail_stalled(stall: Stall) -> ! {
         None => "was still running".to_string(),
     };
     panic!(
-        "the command {state} after {deadline:?}; its processes:\n{report}\
+        "the command {state} after {deadline:?}; its processes:\n{report}{}\
          stdout so far:\n{}\nstderr so far:\n{}",
+        crate::registry_activity::report(),
         String::from_utf8_lossy(&stdout.take()),
         String::from_utf8_lossy(&stderr.take()),
     );
@@ -170,7 +194,7 @@ struct RunProcesses {
 impl RunProcesses {
     /// `details` is what to read of each process beyond its environment.
     fn find(run: &OsString, root: Option<Pid>, details: ProcessRefreshKind) -> Self {
-        let mut system = System::new();
+        let mut system = System::new().expect("read the process table");
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,

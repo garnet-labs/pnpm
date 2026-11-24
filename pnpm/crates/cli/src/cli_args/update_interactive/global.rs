@@ -1,13 +1,28 @@
 use super::{
-    Config, DependencyGroup, HashSet, OutdatedQuery, Path, PromptRow, PromptStyle, Reporter,
-    TargetVersion, UpdatePrompt, collect_outdated_for_importer, has_pnpm_cli_dependency,
-    ignored_dependencies_matcher, miette, report_cancelled, sanitize_inline, selected_packages,
+    Config,
+    DependencyGroup,
+    HashSet,
+    OutdatedQuery,
+    Path,
+    PromptRow,
+    PromptStyle,
+    Reporter,
+    TargetVersion,
+    UpdatePrompt,
+    collect_outdated_for_importer,
+    has_pnpm_cli_dependency,
+    ignored_dependencies_matcher,
+    miette,
+    report_cancelled,
+    sanitize_inline,
+    selected_packages,
 };
+use miette::WrapErr;
 
 pub(crate) async fn select_global_package_groups<Reporter: self::Reporter>(
     base_config: &'static Config,
     packages: &[String],
-    latest: bool,
+    target_version: TargetVersion<'_>,
     prompt: UpdatePrompt,
 ) -> miette::Result<Option<HashSet<String>>> {
     let global_pkg_dir = base_config.global_pkg_dir
@@ -20,20 +35,13 @@ pub(crate) async fn select_global_package_groups<Reporter: self::Reporter>(
         })?;
     let config = global_update_config(base_config);
     let ignored = ignored_dependencies_matcher(config);
-    let query = OutdatedQuery {
-        target_version: if latest { TargetVersion::Latest } else { TargetVersion::WithinRange },
-        include_direct: &[DependencyGroup::Prod],
-        match_names: None,
-        ignore_names: ignored.as_ref(),
-        include_deprecated: false,
-        full_metadata: false,
-    };
+    let query = global_outdated_query(target_version, ignored.as_ref());
     let Some(matched_packages) = matching_global_packages(&global_pkg_dir, packages)? else {
         return Ok(None);
     };
     let rows = outdated_group_rows(matched_packages, config, &query).await?;
     if rows.is_empty() {
-        super::print_up_to_date(latest);
+        super::print_up_to_date(!matches!(target_version, TargetVersion::WithinRange));
         return Ok(None);
     }
     let Some(selected_indices) = prompt.select(
@@ -52,6 +60,22 @@ pub(crate) async fn select_global_package_groups<Reporter: self::Reporter>(
     Ok(Some(selected))
 }
 
+fn global_outdated_query<'a>(
+    target_version: TargetVersion<'a>,
+    ignored: Option<&'a pnpm_matcher::Matcher>,
+) -> OutdatedQuery<'a> {
+    OutdatedQuery {
+        target_version,
+        include_direct: &[DependencyGroup::Prod],
+        match_names: None,
+        ignore_names: ignored,
+        include_deprecated: false,
+        full_metadata: false,
+        apply_trust_policy: false,
+        follow_prerelease_channels: false,
+    }
+}
+
 /// One prompt row per global group that has an update available, labelled
 /// with the packages the group would move.
 async fn outdated_group_rows(
@@ -62,11 +86,9 @@ async fn outdated_group_rows(
     let mut rows = Vec::new();
     for pkg in matched_packages {
         let state = crate::State::init(pkg.install_dir.join("package.json"), config, false)
-            .map_err(|err| miette::Report::new(err).wrap_err("initialize global state"))?;
-        let lockfile = state.lockfile
-            .get()
-            .map_err(|err| miette::Report::new(err).wrap_err("load the lockfile"))?;
-        let outdated = collect_outdated_for_importer(
+            .wrap_err("initialize global state")?;
+        let lockfile = state.lockfile.get().wrap_err("load the lockfile")?;
+        let mut outdated = collect_outdated_for_importer(
             &state.manifest,
             lockfile,
             pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY,
@@ -75,6 +97,9 @@ async fn outdated_group_rows(
             query,
         )
         .await?;
+        // A global update never moves a package backwards, so a `--tag`
+        // target below the installed version would be pinned back to it.
+        outdated.retain(|package| package.target >= package.current);
         if outdated.is_empty() {
             continue;
         }
@@ -148,6 +173,7 @@ fn global_update_config(base_config: &Config) -> &'static Config {
     let mut config = base_config.clone();
     config.workspace_dir = None;
     config.shared_workspace_lockfile = false;
+    config.configured_lockfile_dir = None;
     config.lockfile_dir = None;
     // A group's lockfile is written unconditionally (`run_group_install`
     // forces it) because it is where the installed versions are recorded, so

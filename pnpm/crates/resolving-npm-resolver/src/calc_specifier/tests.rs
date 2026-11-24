@@ -1,7 +1,14 @@
 use node_semver::Version;
-use pnpm_registry::{PackageVersion, RangeSpecStyle};
+use pnpm_registry::{
+    PackageVersion,
+    RangeSpecStyle,
+};
 
-use super::{calc_prefixed_specifier, calc_specifier, calc_version_range};
+use super::{
+    calc_prefixed_specifier,
+    calc_specifier,
+    calc_version_range,
+};
 
 fn picked(version: &str) -> PackageVersion {
     serde_json::from_value(serde_json::json!({
@@ -67,6 +74,16 @@ fn rewraps_an_npm_alias_around_the_new_range() {
             RangeSpecStyle::Major,
         ),
         "npm:@types/table@7.0.0",
+    );
+    assert_eq!(
+        calc_specifier(
+            "npm:bar@>=7.0.0 <8.0.0",
+            Some("npm:bar@>=7.0.0 <8.0.0"),
+            Some("foo"),
+            &picked("7.0.0"),
+            RangeSpecStyle::Major,
+        ),
+        "npm:bar@>=7.0.0 <8.0.0",
     );
 }
 

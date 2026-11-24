@@ -2,17 +2,28 @@
 // call) are scoped to it; the whole module compiles to nothing elsewhere.
 #![cfg(target_os = "macos")]
 
-use super::{is_native_binary, remove_quarantine, remove_quarantine_from_native_binaries};
-use std::{collections::HashMap, fs, path::Path, process::Command};
+use command_extra::CommandExtra;
+
+use super::{
+    is_native_binary,
+    remove_quarantine,
+    remove_quarantine_from_native_binaries,
+};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    process::Command,
+};
 
 const QUARANTINE_ATTR: &str = "com.apple.quarantine";
 
 fn set_quarantine(path: &Path) {
     let status = Command::new("/usr/bin/xattr")
-        .arg("-w")
-        .arg(QUARANTINE_ATTR)
-        .arg("0083;00000000;TestApp;")
-        .arg(path)
+        .with_arg("-w")
+        .with_arg(QUARANTINE_ATTR)
+        .with_arg("0083;00000000;TestApp;")
+        .with_arg(path)
         .status()
         .expect("spawn xattr -w");
     assert!(status.success(), "failed to set quarantine on {path:?}");
@@ -20,8 +31,8 @@ fn set_quarantine(path: &Path) {
 
 fn list_xattrs(path: &Path) -> String {
     let output = Command::new("/usr/bin/xattr")
-        .arg("-l")
-        .arg(path)
+        .with_arg("-l")
+        .with_arg(path)
         .output()
         .expect("spawn xattr -l");
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -77,10 +88,10 @@ fn removes_from_a_batch_while_preserving_other_xattrs() {
     fs::write(&clean, b"b").unwrap();
     set_quarantine(&quarantined);
     Command::new("/usr/bin/xattr")
-        .arg("-w")
-        .arg("com.example.custom")
-        .arg("keep")
-        .arg(&quarantined)
+        .with_arg("-w")
+        .with_arg("com.example.custom")
+        .with_arg("keep")
+        .with_arg(&quarantined)
         .status()
         .expect("spawn xattr -w custom");
 

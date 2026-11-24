@@ -1,7 +1,15 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use std::{ffi::OsStr, fs, path::Path, process::Command};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
 /// Published at 100.0.0, 100.1.0, and 101.0.0.
@@ -86,7 +94,7 @@ fn assert_ran(workspace: &Path, expected: &[&str], all: &[&str]) {
 
 /// A targeted `update <selector>` is pnpm's `installSome`: the project
 /// it was run in does not run its own lifecycle scripts. The workspace
-/// root still does — the selection left it out, so it is mutated as a
+/// root still does, the selection left it out, so it is mutated as a
 /// plain full install, and here root plus the lone member is the whole
 /// workspace, which is what puts the partial mutation under the
 /// `mutation === 'install'` filter.
@@ -102,7 +110,7 @@ fn targeted_update_in_the_only_member_runs_only_the_workspace_root_scripts() {
 }
 
 /// Once a member the command never touched is left over, the mutated
-/// set covers only part of the workspace — the case pnpm materializes
+/// set covers only part of the workspace, the case pnpm materializes
 /// the rest of the workspace for, and where every mutated project runs
 /// its own scripts whatever its mutation. The targeted member runs
 /// them too; only the untouched member stays silent.
@@ -118,7 +126,7 @@ fn targeted_update_in_a_larger_workspace_runs_the_mutated_projects_scripts() {
 }
 
 /// A selector-less `update` is a full install of the project it was
-/// run in, so that project runs its own scripts — and so does the
+/// run in, so that project runs its own scripts, and so does the
 /// unselected workspace root. The workspace members the command never
 /// touched stay silent.
 #[test]
@@ -157,7 +165,7 @@ fn update_at_the_workspace_root_runs_only_the_root_scripts() {
 }
 
 /// `-r` mutates every project, so nothing is left for the workspace
-/// root to be pushed in for — and a targeted update makes all of those
+/// root to be pushed in for, and a targeted update makes all of those
 /// mutations partial. No project runs its own scripts.
 #[test]
 fn recursive_targeted_update_runs_no_project_scripts() {
@@ -185,7 +193,7 @@ fn recursive_bare_update_runs_every_project_scripts() {
 
 /// `add` is `installSome` like a targeted update, and follows the same
 /// rule: in a workspace it leaves the rest of the members untouched
-/// while the root — mutated as a full install — runs its scripts. The
+/// while the root (mutated as a full install) runs its scripts. The
 /// member the `add` ran in runs its own scripts too, because the
 /// mutated set covers only part of the workspace.
 #[test]
@@ -304,4 +312,65 @@ fn add_in_a_member_does_not_save_manifest_when_preinstall_fails() {
     );
 
     drop((root, anchor));
+}
+
+/// A `prepare` that appends `name` to `order.txt` in the workspace
+/// root (`INIT_CWD`) after `delay_ms`.
+fn append_order_after(name: &str, delay_ms: u32) -> String {
+    format!(
+        r#"node -e "setTimeout(() => require('fs').appendFileSync(process.env.INIT_CWD + '/order.txt', '{name}\n'), {delay_ms})""#,
+    )
+}
+
+/// The dependency's script sleeps and the dependent's does not, so
+/// `order.txt` records the sequencing rather than the script
+/// durations: without the edge `app` would finish first.
+#[test]
+fn override_to_a_workspace_sibling_orders_the_project_scripts() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    fs::write(
+        &yaml_path,
+        format!(
+            "{}\npackages:\n  - 'packages/*'\noverrides:\n  lib: 'workspace:*'\n",
+            yaml.trim_end(),
+        ),
+    )
+    .expect("write pnpm-workspace.yaml");
+    fs::write(workspace.join("package.json"), r#"{ "name": "root" }"#)
+        .expect("write the root package.json");
+    for (dir, manifest) in [
+        (
+            "lib",
+            serde_json::json!({
+                "name": "lib",
+                "version": "1.0.0",
+                "scripts": { "prepare": append_order_after("lib", 500) },
+            }),
+        ),
+        (
+            "app",
+            serde_json::json!({
+                "name": "app",
+                "version": "1.0.0",
+                "dependencies": { "lib": "^1.0.0" },
+                "scripts": { "prepare": append_order_after("app", 0) },
+            }),
+        ),
+    ] {
+        let dir = workspace.join("packages").join(dir);
+        fs::create_dir_all(&dir).expect("create the member dir");
+        fs::write(dir.join("package.json"), manifest.to_string())
+            .expect("write the member package.json");
+    }
+
+    pacquet(&workspace, ["install"]).assert().success();
+
+    let order = fs::read_to_string(workspace.join("order.txt")).expect("read order.txt");
+    assert_eq!(order.lines().collect::<Vec<_>>(), ["lib", "app"]);
+
+    drop((root, npmrc_info));
 }

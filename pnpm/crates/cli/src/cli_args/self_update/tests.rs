@@ -1,23 +1,39 @@
 use super::{
     externally_managed::homebrew_formula,
     global_bin::{
-        finish_retirement, link_into_global_bin, link_into_legacy_home_dir, refresh_global_shims,
+        finish_retirement,
+        link_into_global_bin,
+        link_into_legacy_home_dir,
+        refresh_global_shims,
         retire_standalone_executable,
     },
-    handler, install_pnpm, is_installed_globally, join_messages, version_lt,
+    handler,
+    install_pnpm,
+    is_installed_globally,
+    join_messages,
+    version_lt,
 };
 use crate::{
     cli_args::self_update::project_pin::{
-        NoUpgradeKind, implicit_latest_no_upgrade_message, package_manager_pin_specifier,
+        NoUpgradeKind,
+        implicit_latest_no_upgrade_message,
+        package_manager_pin_specifier,
         update_version_constraint,
     },
-    shim_dispatch::{ShimTarget, native_shim::install_native_shim_from, native_shim_target},
+    shim_dispatch::{
+        ShimTarget,
+        native_shim::install_native_shim_from,
+        native_shim_target,
+    },
 };
 use pnpm_config::Config;
 use pnpm_reporter::SilentReporter;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[test]
@@ -59,6 +75,9 @@ fn version_constraint_preserves_pinning_style() {
     assert_eq!(update_version_constraint(Some("1.0.0"), "2.0.0"), "2.0.0");
     // A complex multi-comparator range falls back to a caret range.
     assert_eq!(update_version_constraint(Some(">=1.0.0 <2.0.0"), "3.0.0"), "^3.0.0");
+    // A prerelease is checked against the range as is, not as its release.
+    assert_eq!(update_version_constraint(Some(">=1.0.0"), "2.0.0-rc.1"), ">=1.0.0");
+    assert_eq!(update_version_constraint(Some(">=2.0.0 <3.0.0"), "2.0.0-rc.1"), "^2.0.0-rc.1");
 }
 
 fn seed_global_engine(global_dir: &Path, package_name: &str, version: &str) {
@@ -493,7 +512,7 @@ fn self_update_to_pnpm_without_native_shims_leaves_the_global_shims_alone() {
 }
 
 /// The engine is a native binary, so building a runnable and a non-runnable one
-/// means writing real executables — hence the unix gate, matching the `/bin/sh`
+/// means writing real executables, hence the unix gate, matching the `/bin/sh`
 /// shims the rest of this crate's tests use.
 #[cfg(unix)]
 fn seed_engine_executable(install_dir: &Path, contents: &str) {
@@ -629,7 +648,7 @@ async fn registry_with_fresh_latest(mature: &str, fresh: &str) -> mockito::Serve
     };
     let body = format!(
         r#"{{"name":"pnpm","dist-tags":{{"latest":"{fresh}"}},"time":{{"{mature}":"2024-01-10T08:30:00.000Z","{fresh}":"{now}"}},"versions":{{"{mature}":{mature_dist},"{fresh}":{fresh_dist}}}}}"#,
-        now = chrono::Utc::now().to_rfc3339(),
+        now = pnpm_time::format_rfc3339(jiff::Timestamp::now()),
         mature_dist = dist(mature),
         fresh_dist = dist(fresh),
     );

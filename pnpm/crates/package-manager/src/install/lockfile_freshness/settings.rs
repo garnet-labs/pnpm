@@ -3,8 +3,13 @@
 //! of the settings only the patches decide what it builds.
 
 use super::{
-    super::{Config, Lockfile},
-    FreshnessCheckError, FreshnessScope, LockfileFreshnessInputs,
+    super::{
+        Config,
+        Lockfile,
+    },
+    FreshnessCheckError,
+    FreshnessScope,
+    LockfileFreshnessInputs,
 };
 use crate::RebuildOptions;
 use pnpm_catalogs_types::Catalogs;
@@ -35,6 +40,9 @@ pub(super) async fn check_settings(
         return parse_overrides(lockfile.overrides.as_ref(), inputs.catalogs);
     }
     let parsed_overrides = parse_config_overrides(inputs.config, inputs.catalogs)?;
+    if inputs.scope.ignore_settings_check {
+        return Ok(parsed_overrides);
+    }
     let pnpmfile_checksum = pnpm_hooks::current_pnpmfile_checksum(
         inputs.pnpmfile_hook,
         lockfile.pnpmfile_checksum.as_deref(),
@@ -45,6 +53,7 @@ pub(super) async fn check_settings(
         inputs.config,
         inputs.catalogs,
         CheckLockfileSettingsDriftOptions {
+            fetch_only: inputs.scope.fetch_only,
             parsed_overrides: parsed_overrides.as_deref(),
             pnpmfile_checksum: super::super::pnpmfile_checksum_check(
                 inputs,
@@ -53,6 +62,21 @@ pub(super) async fn check_settings(
         },
     )?;
     Ok(parsed_overrides)
+}
+
+pub(super) fn freshness_overrider(
+    inputs: &LockfileFreshnessInputs<'_, '_>,
+    parsed_overrides: Option<&[VersionOverride]>,
+) -> Option<std::sync::Arc<crate::VersionsOverrider>> {
+    parsed_overrides.map(|parsed| {
+        std::sync::Arc::new(
+            crate::VersionsOverrider::new(
+                parsed,
+                inputs.config.root_project_manifest_dir(inputs.lockfile_dir),
+            )
+            .with_catalogs(inputs.catalogs),
+        )
+    })
 }
 
 /// The lockfile's `patchedDependencies` must match the configured patch
@@ -66,7 +90,7 @@ fn check_lockfile_patches(lockfile: &Lockfile, config: &Config) -> Result<(), Fr
 
 /// Parse `pnpm.overrides` from the config. Values can use the
 /// `catalog:` protocol, which pnpm resolves against the workspace's
-/// catalogs *before* writing them to `pnpm-lock.yaml#overrides` —
+/// catalogs *before* writing them to `pnpm-lock.yaml#overrides`,
 /// resolving here keeps an override declared as `"foo": "catalog:"`
 /// comparable to the lockfile's already-resolved `"foo": "<concrete>"`.
 pub(crate) fn parse_config_overrides(
@@ -102,6 +126,7 @@ fn parse_overrides(
 /// [`PnpmfileChecksumCheck::Skip`].
 #[derive(Clone, Copy)]
 pub(crate) struct CheckLockfileSettingsDriftOptions<'a> {
+    pub fetch_only: bool,
     pub parsed_overrides: Option<&'a [VersionOverride]>,
     pub pnpmfile_checksum: PnpmfileChecksumCheck<'a>,
 }
@@ -112,20 +137,24 @@ pub(crate) fn check_lockfile_settings_drift(
     catalogs: &Catalogs,
     opts: CheckLockfileSettingsDriftOptions<'_>,
 ) -> Result<(), FreshnessCheckError> {
-    let CheckLockfileSettingsDriftOptions { parsed_overrides, pnpmfile_checksum } = opts;
-    let overrides_map: Option<std::collections::HashMap<String, String>> =
-        parsed_overrides.map(pnpm_config_parse_overrides::create_overrides_map_from_parsed);
-    let package_extensions_checksum =
-        crate::install_with_fresh_lockfile::compute_package_extensions_checksum(config);
-    // `calcPatchHashes(opts.patchedDependencies)` — reading the patch
-    // files here lets `check_lockfile_settings` catch an edited patch
-    // whose hash (and thus its `(patch_hash=...)` depPath suffix) drifted
-    // from what the lockfile recorded.
     let patched_dependency_hashes =
         config.patched_dependency_hashes().map_err(FreshnessCheckError::CalcPatchHashes)?;
-    let resolution_settings = config.lockfile_include_resolution_settings.then(|| {
-        crate::fast_update_settings::resolution_settings_from_config(config)
-    });
+    if opts.fetch_only {
+        return pnpm_lockfile::check_fetch_settings(
+            lockfile,
+            patched_dependency_hashes.as_ref(),
+            config.lockfile_integrity_target,
+        )
+        .map_err(FreshnessCheckError::Stale);
+    }
+    let overrides_map: Option<std::collections::HashMap<String, String>> = opts
+        .parsed_overrides
+        .map(pnpm_config_parse_overrides::create_overrides_map_from_parsed);
+    let package_extensions_checksum =
+        crate::install_with_fresh_lockfile::compute_package_extensions_checksum(config);
+    let resolution_settings = config
+        .lockfile_records_resolution_settings()
+        .then(|| crate::fast_update_settings::resolution_settings_from_config(config));
     pnpm_lockfile::check_lockfile_settings(
         lockfile,
         pnpm_lockfile::LockfileSettingsCheck {
@@ -135,17 +164,30 @@ pub(crate) fn check_lockfile_settings_drift(
             package_extensions_checksum: package_extensions_checksum.as_deref(),
             ignored_optional_dependencies: config.ignored_optional_dependencies.as_deref(),
             patched_dependencies: patched_dependency_hashes.as_ref(),
-            resolution: pnpm_lockfile::ResolutionSettingsCheck {
-                auto_install_peers: config.auto_install_peers,
-                dedupe_peers: config.dedupe_peers,
-                exclude_links_from_lockfile: config.exclude_links_from_lockfile,
-                add_missing_peer_types: config.add_missing_peer_types,
-                inject_workspace_packages: config.inject_workspace_packages,
-                peers_suffix_max_length: config.peers_suffix_max_length,
-                pnpmfile_checksum,
-                resolution_settings: resolution_settings.as_ref(),
-            },
+            project_scoped_optional_peers: config.project_scoped_optional_peers_take_effect(),
+            resolution: resolution_settings_check(
+                config,
+                opts.pnpmfile_checksum,
+                resolution_settings.as_ref(),
+            ),
         },
     )
     .map_err(FreshnessCheckError::Stale)
+}
+
+fn resolution_settings_check<'a>(
+    config: &Config,
+    pnpmfile_checksum: PnpmfileChecksumCheck<'a>,
+    resolution_settings: Option<&'a pnpm_lockfile::ResolutionSettings>,
+) -> pnpm_lockfile::ResolutionSettingsCheck<'a> {
+    pnpm_lockfile::ResolutionSettingsCheck {
+        auto_install_peers: config.auto_install_peers,
+        dedupe_peers: config.dedupe_peers,
+        exclude_links_from_lockfile: config.exclude_links_from_lockfile,
+        add_missing_peer_types: config.add_missing_peer_types,
+        inject_workspace_packages: config.inject_workspace_packages,
+        peers_suffix_max_length: config.peers_suffix_max_length,
+        pnpmfile_checksum,
+        resolution_settings,
+    }
 }

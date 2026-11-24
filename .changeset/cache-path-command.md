@@ -1,6 +1,4 @@
 ---
-"@pnpm/cache.commands": minor
-"pacquet": minor
 "pnpm": minor
 ---
 

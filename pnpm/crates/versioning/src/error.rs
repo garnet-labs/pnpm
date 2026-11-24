@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 
 /// Errors of the versioning engine. Codes and messages match the TypeScript
-/// implementation's `PnpmError`s — they are part of the shared CLI contract.
+/// implementation's `PnpmError`s; they are part of the shared CLI contract.
 #[derive(Debug, Display, Error, Diagnostic)]
 pub enum VersioningError {
     #[display("Change intent file {} has no YAML frontmatter", file_path.display())]
@@ -49,7 +52,7 @@ pub enum VersioningError {
     UnreleasablePackage { file_path: PathBuf, pkg_name: String, bump_type: String },
 
     #[display(
-        "Package {pkg_name} declares the internal dependency {alias} in {field} as \"{spec}\". Internal dependencies must use the workspace: protocol so that dependency ranges never need rewriting at release time."
+        "Package {pkg_name} declares the internal dependency {alias} in {field} as \"{spec}\". Internal dependencies must use the workspace: protocol."
     )]
     #[diagnostic(code(ERR_PNPM_VERSIONING_INTERNAL_RANGE))]
     InternalRange { pkg_name: String, alias: String, field: String, spec: String },

@@ -1,10 +1,24 @@
 use super::MemoryTree;
 use crate::{
-    cycles::{self, CycleReport},
-    layers::Problem,
-    lexer::{self, Token},
+    cycles::{
+        self,
+        CycleReport,
+    },
+    lexer::{
+        self,
+        Token,
+    },
     modules::CrateModules,
-    use_tree::{self, UsePath},
+    problem::{
+        Metric,
+        Mismatch,
+        Problem,
+    },
+    ratchet,
+    use_tree::{
+        self,
+        UsePath,
+    },
 };
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
@@ -89,7 +103,7 @@ fn module_graph_follows_reexports_and_nested_supers_and_skips_tests() {
 #[test]
 fn reports_the_largest_cycle() {
     let graph = CrateModules::read(&crate_tree(), "lib").unwrap().top_level_graph();
-    let report = CycleReport::new("lib", &graph);
+    let report = CycleReport::new("lib".to_owned(), &graph);
     dbg!(&report);
     assert_eq!(report.size(), 2);
     assert_eq!(report.module_count, 3);
@@ -101,21 +115,22 @@ fn reports_the_largest_cycle() {
 #[test]
 fn the_baseline_only_goes_down() {
     let graph = CrateModules::read(&crate_tree(), "lib").unwrap().top_level_graph();
-    let reports = [CycleReport::new("lib", &graph)];
+    let reports = [CycleReport::new("lib".to_owned(), &graph)];
     let check = |entries: &[(&str, usize)]| {
         let baseline = entries
             .iter()
             .map(|(name, size)| ((*name).to_owned(), *size))
             .collect();
-        cycles::check_baseline(&reports, &baseline)
+        ratchet::check(Metric::ModuleCycle, &cycles::sizes(&reports), &baseline)
+    };
+    let problem = |crate_name: &str, measured, baseline| {
+        let crate_name = crate_name.to_owned();
+        Problem::Ratchet(Mismatch { metric: Metric::ModuleCycle, crate_name, measured, baseline })
     };
     assert_eq!(check(&[("lib", 2)]), vec![]);
-    let grew = Problem::ModuleCycleGrew { crate_name: "lib".to_owned(), size: 2, baseline: 1 };
-    assert_eq!(check(&[("lib", 1)]), vec![grew]);
-    let shrank = Problem::ModuleCycleShrank { crate_name: "lib".to_owned(), size: 2, baseline: 3 };
-    assert_eq!(check(&[("lib", 3)]), vec![shrank]);
-    let removed =
-        Problem::ModuleCycleShrank { crate_name: "gone".to_owned(), size: 0, baseline: 2 };
+    assert_eq!(check(&[("lib", 1)]), vec![problem("lib", 2, 1)]);
+    assert_eq!(check(&[("lib", 3)]), vec![problem("lib", 2, 3)]);
+    let removed = problem("gone", 0, 2);
     assert_eq!(check(&[("lib", 2), ("gone", 2)]), vec![removed]);
 }
 

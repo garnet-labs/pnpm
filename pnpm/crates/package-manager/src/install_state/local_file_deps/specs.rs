@@ -1,10 +1,13 @@
 use pnpm_catalogs_resolver::{
-    CatalogAnchor, CatalogResolutionResult, WantedDependency, resolve_from_catalog,
+    CatalogAnchor,
+    CatalogResolutionResult,
+    WantedDependency,
+    resolve_from_catalog,
 };
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_config_parse_overrides::VersionOverride;
-use pnpm_lockfile::is_local_tarball_path;
+use pnpm_local_spec::is_tarball_filename;
 use pnpm_modules_yaml::IncludedDependencies;
 use pnpm_package_manifest::DependencyGroup;
 
@@ -50,10 +53,11 @@ pub(crate) fn is_effective_local_file_dep(
     spec: &str,
 ) -> bool {
     (is_local_file_spec(spec) || catalog_resolves_to_local_file(catalogs, alias, spec))
-        && !is_dep_replaced_by_override(overrides, group, alias, spec)
+        && !is_dep_replaced_by_override(catalogs, overrides, group, alias, spec)
 }
 
 pub(crate) fn is_dep_replaced_by_override(
+    catalogs: &Catalogs,
     overrides: &[VersionOverride],
     group: DependencyGroup,
     alias: &str,
@@ -64,7 +68,13 @@ pub(crate) fn is_dep_replaced_by_override(
         .any(|entry| {
             !entry.converge
                 && entry.parent_pkg.is_none()
-                && crate::overrides::matches_target(&entry.target_pkg, Some(group), alias, spec)
+                && crate::overrides::matches_target(
+                    &entry.target_pkg,
+                    Some(group),
+                    alias,
+                    spec,
+                    catalogs,
+                )
         })
 }
 
@@ -116,7 +126,7 @@ pub(crate) fn has_local_file_package_extension(
 /// git shorthand at this layer, and matching it would disable the
 /// repeat-install fast path for every project with git dependencies.
 /// Such specs (and anything else carrying a protocol or URL) stay on
-/// the fast path. `catalog:` specs also return `false` here — callers
+/// the fast path. `catalog:` specs also return `false` here, callers
 /// dereference them through the workspace catalogs first, because a
 /// catalog entry may itself hold a local path.
 pub(crate) fn is_local_file_spec(spec: &str) -> bool {
@@ -126,7 +136,7 @@ pub(crate) fn is_local_file_spec(spec: &str) -> bool {
     if spec.contains([':', '#']) {
         return false;
     }
-    is_local_tarball_path(spec)
+    is_tarball_filename(spec)
 }
 
 pub(crate) fn is_unambiguous_local_file_spec(spec: &str) -> bool {

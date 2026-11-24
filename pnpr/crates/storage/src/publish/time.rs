@@ -1,18 +1,26 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{
+    SystemTime,
+    UNIX_EPOCH,
+};
 
 /// Generate the current time as an ISO-8601 string, matching
 /// the shape npm and verdaccio use in `time.modified`.
 #[must_use]
 pub fn now_iso() -> String {
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    iso_from_unix_millis(since_epoch.as_millis() as i64)
+    iso_from_unix_millis(now_millis())
+}
+
+/// The application clock in milliseconds since the Unix epoch.
+pub(crate) fn now_millis() -> i64 {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Format a unix-millis timestamp as an ISO-8601 / RFC-3339 string
 /// with millisecond precision. The token-listing endpoint surfaces
-/// `TokenRecord::created_at` (seconds since epoch) through this same
-/// helper so both `time.modified` on packuments and `created` on
-/// tokens render with identical shape.
+/// `TokenRecord::created_at` through this same helper so both
+/// `time.modified` on packuments and `created` on tokens render with
+/// identical shape.
 #[must_use]
 pub fn iso_from_unix_millis(millis: i64) -> String {
     // Civil-time conversion without pulling in `chrono`.

@@ -1,14 +1,4 @@
 ---
-"@pnpm/constants": major
-"@pnpm/config.pick-registry-for-package": minor
-"@pnpm/config.normalize-registries": minor
-"@pnpm/config.reader": minor
-"@pnpm/types": minor
-"@pnpm/deps.compliance.sbom": patch
-"@pnpm/installing.deps-resolver": patch
-"@pnpm/lockfile.utils": patch
-"@pnpm/resolving.npm-resolver": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

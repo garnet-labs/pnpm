@@ -1,30 +1,43 @@
+use jiff::{
+    SignedDuration,
+    Timestamp,
+};
+
 use super::{
-    IgnoredAny, IndexMap, LoadWorkspaceYamlError, NAMED_UNRECOGNIZED_SETTINGS, Path,
-    RemoteSideEffectsCacheSettings, SCHEMA_DIRECTIVE_KEY, SideEffectsCacheSetting, TaskSettings,
-    UnrecognizedSettings, WorkspaceKeyIssues, WorkspaceSettings, is_camel_case,
-    is_known_setting_key, is_refused_by_a_project_manifest, registries,
+    IgnoredAny,
+    IndexMap,
+    LoadWorkspaceYamlError,
+    NAMED_UNRECOGNIZED_SETTINGS,
+    Path,
+    RemoteSideEffectsCacheSettings,
+    SCHEMA_DIRECTIVE_KEY,
+    SentinelPlaceholders,
+    SideEffectsCacheSetting,
+    TaskSettings,
+    UnrecognizedSettings,
+    WorkspaceKeyIssues,
+    WorkspaceSettings,
+    is_camel_case,
+    is_known_setting_key,
+    is_refused_by_a_project_manifest,
+    registries,
 };
 
 impl WorkspaceSettings {
-    /// Reject a `registries` map pnpm would read as something other than what
-    /// it says. See [`registries::validate`] for the rules.
-    ///
-    /// Checked after parsing rather than in a `Deserialize` impl on purpose:
-    /// `serde_saphyr` renders the offending source line verbatim under its
-    /// errors, so rejecting at parse time would print the very credential
-    /// being rejected into the terminal and any CI log.
-    /// Validate the sections the checks below cover. With `skip_invalid`, a
-    /// section that fails is left out instead, so one this pnpm rejects does
-    /// not take the file's other settings with it (see
-    /// [`crate::Config::settings_read`]).
-    pub(super) fn validate_sections(
-        &mut self,
-        skip_invalid: bool,
-    ) -> Result<(), LoadWorkspaceYamlError> {
-        if !skip_invalid {
-            self.validate_registries()?;
-            self.validate_tasks()?;
-            return self.validate_pipelines();
+    /// Validate every post-parse section (`noProxy`, `registries`, `tasks`, `pipelines`).
+    pub(super) fn validate_all_sections(&self) -> Result<(), LoadWorkspaceYamlError> {
+        self.validate_no_proxy()?;
+        self.validate_registries()?;
+        self.validate_tasks()?;
+        self.validate_pipelines()
+    }
+
+    /// Clear any section [`Self::validate_all_sections`] rejects so one
+    /// unreadable section does not take the file's other settings with it
+    /// (see [`crate::Config::settings_read`]).
+    pub(super) fn drop_invalid_sections(&mut self) {
+        if self.validate_no_proxy().is_err() {
+            self.no_proxy = None;
         }
         if self.validate_registries().is_err() {
             self.registries = None;
@@ -35,16 +48,49 @@ impl WorkspaceSettings {
         if self.validate_pipelines().is_err() {
             self.pipelines = None;
         }
-        Ok(())
     }
 
+    pub(super) fn validate_no_proxy(&self) -> Result<(), LoadWorkspaceYamlError> {
+        let received_type = match self.no_proxy.as_ref() {
+            None
+            | Some(
+                serde_json::Value::Null | serde_json::Value::String(_) | serde_json::Value::Bool(_),
+            ) => return Ok(()),
+            Some(serde_json::Value::Number(_)) => "number",
+            Some(serde_json::Value::Array(_)) => "array",
+            Some(serde_json::Value::Object(_)) => "object",
+        };
+        Err(LoadWorkspaceYamlError::InvalidNoProxy { received_type })
+    }
+
+    /// Reject a `registries` map pnpm would read as something other than what
+    /// it says. See [`registries::validate`] for the rules.
+    ///
+    /// Checked after parsing rather than in a `Deserialize` impl on purpose:
+    /// `serde_saphyr` renders the offending source line verbatim under its
+    /// errors, so rejecting at parse time would print the very credential
+    /// being rejected into the terminal and any CI log.
     pub(super) fn validate_registries(&self) -> Result<(), LoadWorkspaceYamlError> {
         let Some(entries) = self.registries.as_ref() else { return Ok(()) };
         registries::validate(entries)
     }
 
+    /// `referenceTime` must be an RFC 3339 timestamp no later than the
+    /// current time: a later one would waive the release-age cutoff. Checked
+    /// for a project `pnpm-workspace.yaml` only, since the global
+    /// `config.yaml` drops the setting.
+    pub(super) fn validate_reference_time(&self) -> Result<(), LoadWorkspaceYamlError> {
+        let Some(value) = self.reference_time.as_deref() else { return Ok(()) };
+        parse_reference_time(value)
+            .map(|_| ())
+            .map_err(|reason| LoadWorkspaceYamlError::InvalidReferenceTime {
+                value: value.to_string(),
+                reason,
+            })
+    }
+
     /// The `tasks` section feeds the task-graph builder of `pnpm -r run`,
-    /// which reads it without further checks — a malformed entry has to be
+    /// which reads it without further checks, a malformed entry has to be
     /// rejected here rather than surface as a scheduling bug far from the
     /// setting that produced it.
     pub(super) fn validate_tasks(&self) -> Result<(), LoadWorkspaceYamlError> {
@@ -58,7 +104,7 @@ impl WorkspaceSettings {
     /// One task's settings: a non-positive concurrency, a group name that
     /// cannot be a slot directory, a non-integer `priority`, or an empty
     /// `dependsOn` entry is a hard error. A field this version does not
-    /// read is not — see [`Self::take_unknown_task_settings`].
+    /// read is not; see [`Self::take_unknown_task_settings`].
     pub(super) fn validate_task(
         task: &str,
         settings: &TaskSettings,
@@ -138,8 +184,8 @@ impl WorkspaceSettings {
     /// Reject every remote side-effects field a committed file may not set.
     ///
     /// A workspace declares which organization and packages are eligible and
-    /// nothing else: the rest describes the act of signing — which key signs,
-    /// what provenance the signature attests, and whether to publish at all —
+    /// nothing else: the rest describes the act of signing (which key signs,
+    /// what provenance the signature attests, and whether to publish at all)
     /// so it belongs to the machine holding the key. Letting a repository set
     /// `publish` would turn a key the machine holds for its own builds into a
     /// signing oracle any clone could aim at a registry of its choosing.
@@ -166,12 +212,31 @@ impl WorkspaceSettings {
             let Some(settings) = setting else { continue };
             Self::reject_machine_only_fields(settings, prefix, path)?;
         }
-        self.reject_machine_only_remote_cache_fields(path)
+        self.reject_machine_only_remote_cache_fields(path)?;
+        self.reject_committed_editor(path)
+    }
+
+    /// `editor` names the executable `pnpm edit` runs, so, like `tokenHelper`,
+    /// only the machine's own configuration may choose it.
+    fn reject_committed_editor(&self, path: &Path) -> Result<(), LoadWorkspaceYamlError> {
+        match self.editor {
+            Some(Some(_)) => {
+                Err(LoadWorkspaceYamlError::WorkspaceEditor { path: path.to_path_buf() })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The token and everything that describes signing belong to the
     /// machine, for the reasons [`Self::reject_repo_controlled_trust_material`]
     /// gives for `sideEffectsCache.remote`.
+    #[cfg_attr(
+        dylint_lib = "perfectionist",
+        expect(
+            perfectionist::needless_borrowed_parameters,
+            reason = "the path is copied only into the error, so the success path stays allocation-free"
+        )
+    )]
     fn reject_machine_only_remote_cache_fields(
         &self,
         path: &Path,
@@ -189,6 +254,13 @@ impl WorkspaceSettings {
         Err(LoadWorkspaceYamlError::WorkspaceRemoteCacheTrust { path: path.to_path_buf(), field })
     }
 
+    #[cfg_attr(
+        dylint_lib = "perfectionist",
+        expect(
+            perfectionist::needless_borrowed_parameters,
+            reason = "the path is copied only into the error, and callers check several settings against the same path"
+        )
+    )]
     pub(super) fn reject_machine_only_fields(
         settings: &RemoteSideEffectsCacheSettings,
         prefix: &'static str,
@@ -218,7 +290,7 @@ impl WorkspaceSettings {
     /// under the project-file rules: refused values, keys naming no setting
     /// any supported pnpm reads, kebab-case spellings of known settings, and
     /// the `tasks` entries' own unknown fields.
-    /// Reporting is the caller's job — how severe an unrecognized key is
+    /// Reporting is the caller's job, how severe an unrecognized key is
     /// depends on whether the running pnpm is the project's pinned version,
     /// which only the CLI layer knows.
     pub fn collect_key_issues(&mut self, text: &str) {
@@ -237,24 +309,19 @@ impl WorkspaceSettings {
         if !Self::may_have_key_issues(text) {
             return issues;
         }
-        let Ok(document) = serde_saphyr::from_str::<IndexMap<String, Option<IgnoredAny>>>(text)
-        else {
+        let Some(keys) = parse_present_top_level_keys(text) else {
             return issues;
         };
-        for key in document
-            .iter()
-            .filter(|(_, value)| value.is_some())
-            .map(|(key, _)| key)
-        {
+        for key in keys {
             if key == SCHEMA_DIRECTIVE_KEY {
                 continue;
             }
-            if is_refused_by_a_project_manifest(key) {
-                issues.refused.push(key.clone());
-            } else if !is_known_setting_key(key) {
-                issues.unrecognized.push(key.clone());
-            } else if !is_camel_case(key) {
-                issues.non_camel_case.push(key.clone());
+            if is_refused_by_a_project_manifest(&key) {
+                issues.refused.push(key);
+            } else if !is_known_setting_key(&key) {
+                issues.unrecognized.push(key);
+            } else if !is_camel_case(&key) {
+                issues.non_camel_case.push(key);
             }
         }
         issues
@@ -264,7 +331,7 @@ impl WorkspaceSettings {
     /// would report, answered without parsing the file a second time.
     ///
     /// Serde keeps no record of the keys it dropped, so collecting them means
-    /// re-reading the document — which costs as much as the parse that
+    /// re-reading the document, which costs as much as the parse that
     /// produced the settings, on every command, to find nothing in the
     /// overwhelmingly common case of a file that is correct.
     ///
@@ -310,6 +377,13 @@ impl WorkspaceSettings {
     }
 }
 
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the task name is copied only into the error, which most tasks never produce"
+    )
+)]
 fn invalid_task_concurrency(task: &str, settings: &TaskSettings) -> Option<LoadWorkspaceYamlError> {
     let concurrency = settings.concurrency
         .filter(|concurrency| *concurrency < 1)
@@ -322,7 +396,7 @@ fn invalid_task_concurrency(task: &str, settings: &TaskSettings) -> Option<LoadW
 /// state directory, so it is held to a portable file name that cannot
 /// leave that directory: the Windows device names are refused whatever
 /// follows their first dot, and a trailing dot would be dropped there.
-fn is_valid_concurrency_group_name(group: &str) -> bool {
+pub(super) fn is_valid_concurrency_group_name(group: &str) -> bool {
     !group.is_empty()
         && !group.ends_with('.')
         && group
@@ -342,4 +416,43 @@ fn is_windows_device_name(stem: &str) -> bool {
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.ends_with(|char: char| char.is_ascii_digit() && char != '0'))
+}
+
+fn parse_present_top_level_keys(text: &str) -> Option<Vec<String>> {
+    if let Ok(document) = serde_saphyr::from_str::<IndexMap<String, Option<IgnoredAny>>>(text) {
+        return Some(
+            document
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|_| key))
+                .collect(),
+        );
+    }
+    let sentinels = SentinelPlaceholders::new(text)?;
+    let replaced = sentinels.replace_all(text);
+    let document = serde_saphyr::from_str::<IndexMap<String, Option<IgnoredAny>>>(&replaced).ok()?;
+    let mut keys = Vec::new();
+    for (mut key, value) in document {
+        if !sentinels.try_restore_in_place(text, &mut key) {
+            return None;
+        }
+        if value.is_some() {
+            keys.push(key);
+        }
+    }
+    Some(keys)
+}
+
+/// How far ahead of this machine's clock a `referenceTime` may be, so
+/// a value another machine wrote from its own clock still loads here.
+const CLOCK_SKEW_ALLOWANCE: SignedDuration = jiff::SignedDuration::from_mins(10);
+
+/// Parse a `referenceTime` value: an RFC 3339 timestamp no later than
+/// the current time, give or take [`CLOCK_SKEW_ALLOWANCE`]. The error is the
+/// reason, worded to follow the value.
+pub(super) fn parse_reference_time(value: &str) -> Result<Timestamp, &'static str> {
+    let time = pnpm_time::parse_rfc3339(value).map_err(|_| "is not an RFC 3339 timestamp")?;
+    if time > Timestamp::now() + CLOCK_SKEW_ALLOWANCE {
+        return Err("is later than the current time");
+    }
+    Ok(time)
 }

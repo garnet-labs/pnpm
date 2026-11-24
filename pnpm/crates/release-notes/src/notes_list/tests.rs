@@ -1,5 +1,8 @@
 use super::{
-    MAX_PUBLICATION_NAME_BYTES, NotesList, is_in_upgrade_range, is_publication_name,
+    MAX_PUBLICATION_NAME_BYTES,
+    NotesList,
+    is_in_upgrade_range,
+    is_publication_name,
     is_publication_segment,
 };
 use node_semver::Version;
@@ -41,7 +44,7 @@ fn parses_the_rfc_example_document() {
               "text": "- `install` reads lockfiles from 11.x.\n",
               "initialDigest": "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
               "publication": {
-                "org": "example",
+                "namespace": "example",
                 "id": "9f2c41",
                 "name": "v12.0.0",
                 "url": "/-/publications/example/9f2c41/notes"

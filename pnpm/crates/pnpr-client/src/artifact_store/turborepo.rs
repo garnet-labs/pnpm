@@ -17,18 +17,44 @@
 //! a replacement serves the machines its own build serves.
 
 use super::super::{
-    ARTIFACT_REQUEST_TIMEOUT, ArtifactBlobRequest, ArtifactCandidate, ArtifactPublication,
-    BTreeMap, PnprClientError, ResolveArtifactsOptions, ResolveArtifactsResponse,
+    ARTIFACT_REQUEST_TIMEOUT,
+    ArtifactBlobRequest,
+    ArtifactCandidate,
+    ArtifactPublication,
+    BTreeMap,
+    PnprClientError,
+    ResolveArtifactsOptions,
+    ResolveArtifactsResponse,
     SignedArtifactEnvelope,
-    blob_transfer::{BlobBody, blob_body, blob_timeout, read_blob, write_blob},
+    blob_transfer::{
+        BlobBody,
+        blob_body,
+        blob_timeout,
+        read_blob,
+        write_blob,
+    },
     response_body_bounded,
 };
-use futures_util::{StreamExt as _, TryStreamExt as _, stream};
-use pnpm_shared_artifact_protocol::{
-    ArtifactVariant, CompatibilityConstraints, CompatibilityScopes, MAX_ENCODED_SIGNATURE_SIZE,
-    MAX_ENCODED_SIGNED_PAYLOAD_SIZE, OwnerScope, ResolvedArtifact, compatibility_scopes,
+use futures_util::{
+    StreamExt as _,
+    TryStreamExt as _,
+    stream,
 };
-use reqwest::{Client, StatusCode, redirect::Policy};
+use pnpm_shared_artifact_protocol::{
+    ArtifactVariant,
+    CompatibilityConstraints,
+    CompatibilityScopes,
+    MAX_ENCODED_SIGNATURE_SIZE,
+    MAX_ENCODED_SIGNED_PAYLOAD_SIZE,
+    OwnerScope,
+    ResolvedArtifact,
+    compatibility_scopes,
+};
+use reqwest::{
+    Client,
+    StatusCode,
+    redirect::Policy,
+};
 use std::path::Path;
 
 /// The scope of an artifact that applies to every machine.
@@ -84,7 +110,7 @@ impl TurborepoArtifactStore {
         &self,
         opts: &ResolveArtifactsOptions,
     ) -> Result<ResolveArtifactsResponse, PnprClientError> {
-        let scopes = consumer_scopes(&opts.supported_tags);
+        let scopes = consumer_scopes(opts.supported_tags.clone());
         // Owned, so the stream's futures borrow nothing but `self`, which
         // keeps them `Send` for every caller.
         let lookups: Vec<(ArtifactCandidate, String)> = opts.candidates
@@ -156,7 +182,10 @@ impl TurborepoArtifactStore {
         request: &ArtifactBlobRequest,
         size: u64,
     ) -> Result<reqwest::Response, PnprClientError> {
-        request.validate().map_err(|err| PnprClientError::Protocol(err.to_string()))?;
+        request
+            .validate()
+            .map_err(|err| err.to_string())
+            .map_err(PnprClientError::Protocol)?;
         let url = self.artifact_url(&blob_hash(&request.owner, &request.integrity));
         let response = self
             .authorize(self.http.get(url))
@@ -199,7 +228,8 @@ impl TurborepoArtifactStore {
             .try_collect::<()>()
             .await?;
         let envelope = serde_json::to_vec(&publication.envelope)
-            .map_err(|err| PnprClientError::Protocol(err.to_string()))?;
+            .map_err(|err| err.to_string())
+            .map_err(PnprClientError::Protocol)?;
         let envelopes: Vec<_> = publication_scopes(&payload.compatibility)
             .iter()
             .map(|scope| self.artifact_url(&envelope_hash(owner, &publication.key, scope)))
@@ -331,8 +361,8 @@ fn blob_hash(owner: &OwnerScope, integrity: &str) -> String {
 
 /// The scopes a consumer with these supported tags falls in, which always
 /// include the one universal artifacts are stored in.
-fn consumer_scopes(supported_tags: &[String]) -> Vec<String> {
-    let tagged = CompatibilityConstraints::Tagged { tags: supported_tags.to_vec() };
+fn consumer_scopes(supported_tags: Vec<String>) -> Vec<String> {
+    let tagged = CompatibilityConstraints::Tagged { tags: supported_tags };
     let mut scopes = match compatibility_scopes(&tagged) {
         CompatibilityScopes::These(scopes) => scopes.into_iter().collect(),
         CompatibilityScopes::Every => Vec::new(),

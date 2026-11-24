@@ -1,6 +1,18 @@
-use super::{Inputs, Registry, environment::PythonPrepare, manifest};
-use derive_more::{Display, Error};
-use pnpm_diagnostics::miette::{Diagnostic, IntoDiagnostic, Result};
+use super::{
+    Inputs,
+    Registry,
+    environment::PythonPrepare,
+    manifest,
+};
+use derive_more::{
+    Display,
+    Error,
+};
+use pnpm_diagnostics::miette::{
+    Diagnostic,
+    IntoDiagnostic,
+    Result,
+};
 
 pub(crate) struct Index {
     pub(crate) url: url::Url,
@@ -50,7 +62,8 @@ impl Index {
     pub(super) fn cache_key(&self, url: &url::Url) -> String {
         let key = self.auth
             .for_secure_url(url.as_str())
-            .map_or_else(|| url.to_string(), |header| format!("{url}\0{header}"));
+            .map(|header| format!("{url}\0{header}"))
+            .unwrap_or_else(|| url.to_string());
         pnpm_crypto_hash::create_hex_hash(&key)
     }
 }
@@ -97,7 +110,7 @@ impl PythonPrepare<'_> {
             .chain(&rules.tool.uv.constraints)
             .map(|requirement| parse_rule(requirement))
             .collect::<Result<_>>()?;
-        inputs.set_resolution_settings(&[], &packages.overrides, &packages.constraints);
+        inputs.set_resolution_settings(Vec::new(), &packages.overrides, &packages.constraints);
         if !self.index.can_resolve_remotely() {
             inputs.set_registry_packages(self.index.package_routes());
         }
@@ -110,12 +123,12 @@ impl PythonPrepare<'_> {
         if self.environments.declared {
             Inputs::declared(
                 requirements,
-                &self.environments.platforms,
-                &self.environments.python_versions,
-                self.index.url.as_str(),
+                self.environments.platforms.clone(),
+                self.environments.python_versions.clone(),
+                self.index.url.as_str().to_owned(),
             )
         } else {
-            Inputs::new(requirements, &self.interpreter.target, self.index.url.as_str())
+            Inputs::new(requirements, &self.interpreter.target, self.index.url.as_str().to_owned())
         }
     }
 }

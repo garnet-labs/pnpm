@@ -1,6 +1,21 @@
 use super::{
-    Body, Config, Request, ServiceExt, StatusCode, TempDir, Value, add_user_and_get_token,
-    body_bytes, body_json, common, json, npm_tgz, publish_doc, router, sri_sha512, static_config,
+    Body,
+    Config,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    Value,
+    add_user_and_get_token,
+    body_bytes,
+    body_json,
+    common,
+    json,
+    npm_tgz,
+    publish_doc,
+    router,
+    sri_sha512,
+    static_config,
 };
 use pnpr_fixtures::MockConfigPresets;
 
@@ -8,7 +23,7 @@ use pnpr_fixtures::MockConfigPresets;
 async fn anonymous_request_to_protected_package_returns_401() {
     let storage = common::build_storage();
     let app = router(static_config(storage.path().to_path_buf()));
-    // The fixture publishes @pnpm.e2e/needs-auth — but our access
+    // The fixture publishes @pnpm.e2e/needs-auth, but our access
     // policy still requires auth for it because the package name
     // matches the `@pnpm.e2e/needs-auth` policy rule.
     let response = app
@@ -27,7 +42,7 @@ async fn update_packument_rejects_a_non_string_dist_integrity() {
     let tmp = TempDir::new().unwrap();
     let storage = tmp.path().to_path_buf();
     let app = router(static_config(storage.clone()));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     let publish = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
@@ -53,10 +68,10 @@ async fn update_packument_rejects_a_non_string_dist_integrity() {
         .await
         .unwrap();
     let mut packument = body_json(get.into_body()).await;
-    // A present-but-non-string integrity must be rejected — otherwise it slips
+    // A present-but-non-string integrity must be rejected; otherwise it slips
     // past the string-only immutability check and breaks tarball serving.
     packument["versions"]["1.0.0"]["dist"]["integrity"] = json!(null);
-    let request = Request::put("/npm/mypkg/-rev/1-0")
+    let request = Request::put(format!("/npm/mypkg/-rev/{}", packument["_rev"].as_str().unwrap()))
         .header("content-type", "application/json")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&packument).unwrap()))
@@ -77,7 +92,7 @@ async fn deprecating_an_existing_version_without_an_attachment_is_allowed() {
     let tmp = TempDir::new().unwrap();
     let storage = tmp.path().to_path_buf();
     let app = router(static_config(storage.clone()));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     let first = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
@@ -110,6 +125,7 @@ async fn deprecating_an_existing_version_without_an_attachment_is_allowed() {
         Some(sri_sha512(&npm_tgz("mypkg", "1.0.0", b"original")).as_str()),
     );
     let body = json!({
+        "_rev": hosted["_rev"],
         "_id": "mypkg",
         "name": "mypkg",
         "dist-tags": { "latest": "1.0.0" },
@@ -154,12 +170,12 @@ async fn deprecating_an_existing_version_without_an_attachment_is_allowed() {
 #[tokio::test]
 async fn malformed_version_entry_cannot_corrupt_a_hosted_version() {
     // A metadata-only PUT that sends a non-object (e.g. `null`) for a hosted
-    // version must not overwrite — and thereby erase the `dist` of — that
+    // version must not overwrite (and thereby erase the `dist` of) that
     // version. The hosted manifest is kept untouched.
     let tmp = TempDir::new().unwrap();
     let storage = tmp.path().to_path_buf();
     let app = router(static_config(storage.clone()));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     let first = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
@@ -194,17 +210,15 @@ async fn malformed_version_entry_cannot_corrupt_a_hosted_version() {
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
-    // Accepted (no integrity change to reject) but the malformed entry is ignored.
     assert_eq!(
         app.clone()
             .oneshot(malformed)
             .await
             .unwrap()
             .status(),
-        StatusCode::CREATED,
+        StatusCode::BAD_REQUEST,
     );
 
-    // The hosted version is intact — its `dist` was not erased.
     let after = body_json(
         app.oneshot(
             Request::get("/npm/mypkg")
@@ -223,12 +237,12 @@ async fn malformed_version_entry_cannot_corrupt_a_hosted_version() {
 #[tokio::test]
 async fn metadata_put_cannot_inject_a_tarball_less_version() {
     // A metadata-only PUT must not be able to add a brand-new version entry
-    // with no attachment — that would advertise a version with no hosted
+    // with no attachment, that would advertise a version with no hosted
     // tarball (installs 404) and block a later real publish of it (409).
     let tmp = TempDir::new().unwrap();
     let storage = tmp.path().to_path_buf();
     let app = router(static_config(storage.clone()));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     let first = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
@@ -289,13 +303,13 @@ async fn metadata_put_cannot_inject_a_tarball_less_version() {
 }
 
 /// When the same tarball filename exists in both stores, `open_hosted_blob`
-/// serves the hosted copy — a stale proxied copy can't shadow it.
+/// serves the hosted copy, a stale proxied copy can't shadow it.
 #[tokio::test]
 async fn hosted_tarball_is_preferred_over_a_cached_copy() {
     let tmp = TempDir::new().unwrap();
     let storage = tmp.path().to_path_buf();
     let app = router(static_config(storage.clone()));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     let hosted_bytes = &npm_tgz("pref-pkg", "1.0.0", b"hosted-bytes");
     let body = publish_doc("pref-pkg", "1.0.0", hosted_bytes);
@@ -389,7 +403,7 @@ async fn search_filters_protected_packages_for_anonymous_callers() {
     assert_eq!(body["total"], names.len(), "total must reflect post-filter count");
 
     // Authenticated: same query should return the package.
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
     let response = app
         .oneshot(
             Request::get("/npm/-/v1/search?text=needs-auth&size=20")
@@ -440,7 +454,11 @@ async fn search_returns_empty_for_made_up_query() {
 #[tokio::test]
 async fn search_augment_skips_when_upstream_404s() {
     use std::{
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        net::{
+            Ipv4Addr,
+            SocketAddr,
+            SocketAddrV4,
+        },
         time::Duration,
     };
 
@@ -511,7 +529,7 @@ async fn publish_followed_by_dist_tag_set_works() {
     let tmp = TempDir::new().unwrap();
     let storage = tmp.path().to_path_buf();
     let app = router(static_config(storage.clone()));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     // First publish 1.0.0
     let body = publish_doc("tagpkg", "1.0.0", b"v1");
@@ -552,8 +570,8 @@ async fn publish_followed_by_dist_tag_set_works() {
     let tags_body = body_json(tags.into_body()).await;
     assert_eq!(tags_body["latest"], "1.0.0");
 
-    // PUT a new "beta" tag pointing at 2.0.0.
-    let request = Request::put("/npm/-/package/tagpkg/dist-tags/beta")
+    // PUT a new "beta+r0" tag pointing at 2.0.0.
+    let request = Request::put("/npm/-/package/tagpkg/dist-tags/beta+r0")
         .header("content-type", "application/json")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_string("2.0.0").unwrap()))
@@ -576,14 +594,14 @@ async fn publish_followed_by_dist_tag_set_works() {
         .await
         .unwrap();
     let tags_body = body_json(tags.into_body()).await;
-    assert_eq!(tags_body["beta"], "2.0.0");
+    assert_eq!(tags_body["beta+r0"], "2.0.0");
     assert_eq!(tags_body["latest"], "1.0.0");
 
     // And via the version-manifest endpoint resolving the tag.
     let manifest = app
         .clone()
         .oneshot(
-            Request::get("/npm/tagpkg/beta")
+            Request::get("/npm/tagpkg/beta+r0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -593,7 +611,7 @@ async fn publish_followed_by_dist_tag_set_works() {
     assert_eq!(manifest_body["version"], "2.0.0");
 
     // Now DELETE it.
-    let request = Request::delete("/npm/-/package/tagpkg/dist-tags/beta")
+    let request = Request::delete("/npm/-/package/tagpkg/dist-tags/beta+r0")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -613,7 +631,7 @@ async fn publish_followed_by_dist_tag_set_works() {
         .await
         .unwrap();
     let tags_body = body_json(tags.into_body()).await;
-    assert!(tags_body.get("beta").is_none(), "beta tag should be removed");
+    assert!(tags_body.get("beta+r0").is_none(), "beta+r0 tag should be removed");
 }
 
 #[tokio::test]
@@ -621,7 +639,7 @@ async fn dist_tag_mutations_refresh_time_modified() {
     let tmp = TempDir::new().unwrap();
     let storage = tmp.path().to_path_buf();
     let app = router(static_config(storage.clone()));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     let body = publish_doc("time-mod-pkg", "1.0.0", b"x");
     let request = Request::put("/npm/time-mod-pkg")
@@ -759,7 +777,7 @@ async fn preauthorize_publish_rejects_unauthorized_package_without_reading_body(
         "  'forbidden-pkg':\n    publish: bob\n    access: $all",
     );
     let app = router(config);
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
+    let (app, token) = add_user_and_get_token(app, "alice", "secret123").await;
 
     let make_pending_body = || {
         let stream =

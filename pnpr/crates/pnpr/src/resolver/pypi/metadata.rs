@@ -1,8 +1,11 @@
 use super::{
-    BTreeMap, Cursor, MAX_METADATA_BYTES, Offered, Target, WheelMetadata, candidates_from_page,
+    BTreeMap,
+    Offered,
+    Target,
+    WheelMetadata,
+    candidates_from_page,
 };
 use pnpm_python_resolver::matches_published_digest;
-use std::io::Read;
 
 /// What a project page offers, refusing a page that is not one. The
 /// releases it leaves out travel with the candidates: they are what a
@@ -48,8 +51,8 @@ pub(super) fn project_page_url(index: &url::Url, canonical_name: &str) -> Result
 /// page's links resolve against where it landed, not where it was asked
 /// for.
 ///
-/// The body is text, which is what both cached documents are — a Simple
-/// API page and a `METADATA` file — and what keeps the cache entry the
+/// The body is text, which is what both cached documents are (a Simple
+/// API page and a `METADATA` file) and what keeps the cache entry the
 /// size of the document rather than the decimal array JSON would make of
 /// its bytes.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -84,46 +87,4 @@ pub(super) fn verify_digest(
         ));
     }
     Ok(())
-}
-
-/// The `METADATA` inside a wheel, for an index that publishes no metadata
-/// file of its own.
-pub(super) fn metadata_from_wheel(wheel: &[u8], filename: &str) -> Result<Vec<u8>, String> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(wheel))
-        .map_err(|err| format!("read the wheel {filename}: {err}"))?;
-    let entry = (0..archive.len())
-        .filter_map(|index| {
-            Some(
-                archive
-                    .by_index(index)
-                    .ok()?
-                    .name()
-                    .ok()?
-                    .into_owned(),
-            )
-        })
-        .find(|name| {
-            let mut segments = name.split('/');
-            segments
-                .next()
-                .is_some_and(|directory| directory.ends_with(".dist-info"))
-                && segments.next() == Some("METADATA")
-                && segments.next().is_none()
-        })
-        .ok_or_else(|| format!("the wheel {filename} has no dist-info METADATA"))?;
-    let mut document = Vec::new();
-    archive
-        .by_name(&entry)
-        .map_err(|err| format!("read {entry} from {filename}: {err}"))?
-        // One byte past the cap, so a document that reaches it is refused
-        // rather than read as a whole one: a `METADATA` cut short still
-        // names its distribution, and the requirements after the cut would
-        // silently not exist.
-        .take(MAX_METADATA_BYTES as u64 + 1)
-        .read_to_end(&mut document)
-        .map_err(|err| format!("read {entry} from {filename}: {err}"))?;
-    if document.len() > MAX_METADATA_BYTES {
-        return Err(format!("the metadata in {filename} exceeds {MAX_METADATA_BYTES} bytes"));
-    }
-    Ok(document)
 }

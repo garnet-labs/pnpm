@@ -1,13 +1,46 @@
 mod hosted_backend;
 
 use super::{
-    Arc, AsyncReadExt, AsyncSeekExt, BLOBS_DIR, BlobFinalize, BlobWrite, Body, BoxStream,
-    CachedDocument, CanonicalPackageName, DOCUMENT_FILE, DocumentStamp, DocumentWrite, Duration,
-    Ecosystem, ErrorKind, GetRange, HostedBackend, HostedBlobFile, HostedDocumentForUpdate,
-    HostedDocumentVersion, PACKAGES_DIR, Path, PathBuf, RangedBlob, RegistryError, Result,
-    SeekFrom, StreamExt, SystemTime, async_trait, blob_segment, create_tmp_file,
-    decode_blob_segment, decode_package_segments, fs, package_segments, stream, streaming,
-    unique_tmp_path, write_atomic, write_atomic_new,
+    ARCHIVES_DIR,
+    Arc,
+    AsyncReadExt,
+    AsyncSeekExt,
+    BLOBS_DIR,
+    BlobWrite,
+    Body,
+    BoxStream,
+    CachedDocument,
+    CanonicalPackageName,
+    DOCUMENT_FILE,
+    DocumentStamp,
+    DocumentWrite,
+    Duration,
+    Ecosystem,
+    ErrorKind,
+    GetRange,
+    HostedBackend,
+    HostedDocumentForUpdate,
+    HostedDocumentVersion,
+    PACKAGES_DIR,
+    Path,
+    PathBuf,
+    RangedBlob,
+    RegistryError,
+    Result,
+    SeekFrom,
+    StoredArchive,
+    StreamExt,
+    SystemTime,
+    async_trait,
+    blob_segment,
+    create_tmp_file,
+    fs,
+    package_segments,
+    stream,
+    streaming,
+    unique_tmp_path,
+    write_atomic,
+    write_atomic_new,
 };
 
 /// One on-disk store rooted at a single directory, laid out as
@@ -36,8 +69,14 @@ impl Store {
     /// private `/~<name>/` route its own cache namespace so its documents
     /// and blobs never collide with the public mirror or another upstream.
     pub(super) fn namespaced(&self, prefix: &str) -> Store {
+        let mut root = self.root.clone();
+        root.extend(
+            prefix
+                .split('/')
+                .filter(|segment| !segment.is_empty()),
+        );
         Store {
-            root: self.root.join(prefix),
+            root,
             ecosystem: self.ecosystem,
             record_write_lock: Arc::clone(&self.record_write_lock),
         }
@@ -158,35 +197,6 @@ impl Store {
         Ok(BlobWrite { file: Some(file), tmp_path: Some(tmp_path), final_path })
     }
 
-    /// Reserve a tmp path in the destination package directory so the
-    /// publish flow can write there and [`Self::finalize_blob`] can
-    /// rename within the same directory (atomic on POSIX).
-    pub(super) async fn reserve_blob_tmp(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<PathBuf> {
-        let final_path = self.blob_path(name, filename);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        Ok(unique_tmp_path(&final_path))
-    }
-
-    pub(super) async fn finalize_blob(
-        &self,
-        tmp_path: &Path,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<()> {
-        let final_path = self.blob_path(name, filename);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::rename(tmp_path, &final_path).await?;
-        Ok(())
-    }
-
     /// Remove the entire package directory. Returns `Ok(false)` if it
     /// didn't exist (treat as a no-op success, matching what verdaccio
     /// does on a duplicate DELETE).
@@ -221,6 +231,13 @@ impl Store {
         dir
     }
 
+    /// Where the hosted archive stored under `key` is.
+    pub(super) fn archive_path(&self, key: &str) -> PathBuf {
+        let mut path = self.root.clone();
+        path.extend(crate::layout::archive_object_path(key).split('/'));
+        path
+    }
+
     pub(super) fn document_path(&self, name: &CanonicalPackageName) -> PathBuf {
         self.package_dir(name).join(DOCUMENT_FILE)
     }
@@ -231,11 +248,12 @@ impl Store {
             .join(blob_segment(name.as_str(), filename))
     }
 
-    /// A record's path. The key's `/` separators become path components, so a
-    /// key never rides into a path as one string on a platform that would read
-    /// it differently.
+    /// A record's path. The namespace's and key's `/` separators become path
+    /// components, so neither rides into a path as one string on a platform
+    /// that would read it differently.
     pub(super) fn record_path(&self, namespace: &str, key: &str) -> PathBuf {
-        let mut path = self.root.join(namespace);
+        let mut path = self.root.clone();
+        path.extend(namespace.split('/'));
         path.extend(key.split('/'));
         path
     }
@@ -246,6 +264,25 @@ impl Store {
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    pub(super) async fn has_any_record(&self, namespace: &str) -> Result<bool> {
+        let mut root = self.root.clone();
+        root.extend(namespace.split('/'));
+        let mut pending = vec![root];
+        while let Some(dir) = pending.pop() {
+            let Some(mut entries) = read_dir_if_present(&dir).await? else {
+                continue;
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_type().await?.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub(super) async fn create_record(
@@ -289,7 +326,8 @@ impl Store {
     }
 
     pub(super) async fn list_record_keys(&self, namespace: &str) -> Result<Vec<String>> {
-        let root = self.root.join(namespace);
+        let mut root = self.root.clone();
+        root.extend(namespace.split('/'));
         let mut keys = Vec::new();
         let mut pending = vec![(root, String::new())];
         while let Some((dir, prefix)) = pending.pop() {
@@ -306,83 +344,6 @@ impl Store {
             }
         }
         Ok(keys)
-    }
-}
-
-/// Every package directory below `packages`, with its decoded name.
-/// `file_type` does not follow a symlink, so a link cannot lead a listing, or
-/// the deletions that act on it, out of the store.
-pub(super) async fn package_dirs(
-    packages: &Path,
-    ecosystem: Ecosystem,
-) -> Result<Vec<(String, PathBuf)>> {
-    let mut dirs = Vec::new();
-    let mut pending = Vec::new();
-    for (segment, dir) in subdirs(packages).await? {
-        if segment.starts_with(crate::layout::MARKER) {
-            pending.push((vec![segment], dir));
-        }
-    }
-    while let Some((segments, parent_dir)) = pending.pop() {
-        for (segment, dir) in subdirs(&parent_dir).await? {
-            visit_package_entry(ecosystem, &segments, segment, dir, &mut pending, &mut dirs);
-        }
-    }
-    Ok(dirs)
-}
-
-fn visit_package_entry(
-    ecosystem: Ecosystem,
-    segments: &[String],
-    segment: String,
-    dir: PathBuf,
-    pending: &mut Vec<(Vec<String>, PathBuf)>,
-    dirs: &mut Vec<(String, PathBuf)>,
-) {
-    let mut next = segments.to_vec();
-    let is_prefix = segment.starts_with(crate::layout::MARKER);
-    next.push(segment);
-    if is_prefix {
-        if ecosystem == Ecosystem::Oci && next.len() < 128 {
-            pending.push((next, dir));
-        }
-        return;
-    }
-    let refs: Vec<&str> = next
-        .iter()
-        .map(String::as_str)
-        .collect();
-    if let Some(name) = decode_package_segments(ecosystem, &refs) {
-        dirs.push((name, dir));
-    }
-}
-
-/// The directories directly in `dir` with UTF-8 names.
-async fn subdirs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let mut dirs = Vec::new();
-    let Some(mut entries) = read_dir_if_present(dir).await? else {
-        return Ok(dirs);
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir()
-            && let Ok(name) = entry.file_name().into_string()
-        {
-            dirs.push((name, entry.path()));
-        }
-    }
-    Ok(dirs)
-}
-
-/// Whether `path` is a directory, not following a symlink.
-pub(super) async fn is_real_dir(path: &Path) -> Result<bool> {
-    Ok(symlink_metadata_if_present(path).await?.is_some_and(|metadata| metadata.is_dir()))
-}
-
-async fn symlink_metadata_if_present(path: &Path) -> Result<Option<std::fs::Metadata>> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
     }
 }
 

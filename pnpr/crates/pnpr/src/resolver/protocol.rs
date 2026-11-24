@@ -5,10 +5,17 @@ use std::collections::BTreeMap;
 
 use indexmap::IndexMap;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{PackageExtension, RegistryDeclaration};
+use pnpm_config::{
+    PackageExtension,
+    RegistryDeclaration,
+};
 use pnpm_network::AuthHeadersByScope;
 use pnpr_registry::Ecosystem;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+    de::IgnoredAny,
+};
 
 pub type DepMap = BTreeMap<String, String>;
 
@@ -27,19 +34,24 @@ pub struct EcosystemProbe {
 }
 
 /// Body of `POST /-/pnpr/v0/resolve` with `"ecosystem": "cargo"`.
+/// Refuses unknown fields, like [`ResolveRequest`].
 ///
-/// Cargo resolution reads one input only the client has — its workspace
-/// manifests — so the request carries them as a `cargo metadata`
-/// document, and the server runs the same resolver the client would have
-/// run locally against index files it fetches (and caches) itself. pnpm
-/// sends the document reduced to the dependency graph, but a full
-/// `cargo metadata` output resolves the same way.
+/// Cargo resolution uses the client's workspace dependency graph and
+/// lockfile preferences. The server resolves them against index files it
+/// fetches (and caches) itself.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CargoResolveRequest {
+    /// Read by [`EcosystemProbe`] before this type.
+    #[serde(rename = "ecosystem", default)]
+    pub _ecosystem: IgnoredAny,
     /// `cargo metadata --no-deps --format-version 1` output for the
     /// workspace being resolved.
     pub metadata: String,
+    /// Registry versions the client's `Cargo.lock` records, by crate name.
+    /// The resolver keeps each one that still fits.
+    #[serde(default)]
+    pub preferred_versions: BTreeMap<String, Vec<String>>,
     /// The sparse index to resolve against. Falls back to the crates.io
     /// sparse index when absent; either way the server fetches it only if
     /// its route policy allows that origin.
@@ -52,10 +64,14 @@ pub struct CargoResolveRequest {
 /// A Python resolution is for one interpreter: the same requirements
 /// resolve differently against a different marker environment or a
 /// different set of wheel tags, so the client's own travel with the
-/// request and the lockfile that comes back records them.
+/// request and the lockfile that comes back records them. Refuses unknown
+/// fields, like [`ResolveRequest`].
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PypiResolveRequest {
+    /// Read by [`EcosystemProbe`] before this type.
+    #[serde(rename = "ecosystem", default)]
+    pub _ecosystem: IgnoredAny,
     /// PEP 508 requirement strings, as the project's manifest spells them.
     pub requirements: Vec<String>,
     /// The interpreter the environment is for.
@@ -69,14 +85,21 @@ pub struct PypiResolveRequest {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectPublishConfig {
     pub directory: Option<String>,
     pub link_directory: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "pnpr resolution request wire format is flat"
+    )
+)]
 pub struct ResolveRequestProject {
     /// The importer's directory relative to the lockfile dir, in POSIX
     /// form (`.` for the root, `packages/foo` for a workspace member).
@@ -98,6 +121,10 @@ pub struct ResolveRequestProject {
     /// enables `autoInstallPeers`.
     #[serde(default)]
     pub peer_dependencies: DepMap,
+    /// The project's `dependenciesMeta`. Its `injected` entries change how
+    /// workspace dependencies resolve, and the lockfile importer records it.
+    #[serde(default)]
+    pub dependencies_meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 fn root_dir() -> String {
@@ -108,11 +135,13 @@ fn root_dir() -> String {
 /// resolution configuration so the server resolves against the same
 /// registries the client would, and the policy fields carry the
 /// client's verification policy so the server verifies the input
-/// `lockfile` under it before resolving. Unknown fields (`node_version`,
-/// `os`, `arch`) are accepted and ignored so older/newer clients still
-/// parse.
+/// `lockfile` under it before resolving.
+///
+/// Unknown fields are refused with [`UNSUPPORTED_REQUEST_FIELD_CODE`]: a
+/// field this server does not know may be a setting that changes what the
+/// client would resolve, and dropping it would return a different lockfile.
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(
     dylint_lib = "perfectionist",
     expect(
@@ -121,6 +150,9 @@ fn root_dir() -> String {
     )
 )]
 pub struct ResolveRequest {
+    /// Read by [`EcosystemProbe`] before this type.
+    #[serde(rename = "ecosystem", default)]
+    pub _ecosystem: IgnoredAny,
     #[serde(default)]
     pub dependencies: Option<DepMap>,
     #[serde(default)]
@@ -137,7 +169,7 @@ pub struct ResolveRequest {
     /// The registries the client declares, keyed by URL, in the shape of
     /// its `registries` setting: the scopes routed to each, the
     /// bare-specifier prefix each answers to, and each one's tarball
-    /// layout. The default registry is not among them — it arrives as
+    /// layout. The default registry is not among them; it arrives as
     /// [`Self::registry`].
     ///
     /// Declarations only, never the setting's older `<scope>: <url>` shape:
@@ -189,13 +221,24 @@ pub struct ResolveRequest {
     pub exclude_links_from_lockfile: Option<bool>,
     #[serde(default)]
     pub add_missing_peer_types: Option<bool>,
+    #[serde(default)]
+    pub project_scoped_optional_peers: Option<bool>,
+    /// The client's `injectWorkspacePackages`.
+    #[serde(default)]
+    pub inject_workspace_packages: bool,
+    /// The client's `dedupeInjectedDeps`. `None` keeps the default.
+    #[serde(default)]
+    pub dedupe_injected_deps: Option<bool>,
+    /// The client's `ignoredOptionalDependencies`.
+    #[serde(default)]
+    pub ignored_optional_dependencies: Option<Vec<String>>,
     /// The client's existing on-disk lockfile, when present. Sent both
     /// as the verification target (the server verifies it under the
     /// client's policy before resolving) and as the resolution-reuse
     /// seed. Absent on a true first install (nothing to verify).
     #[serde(default)]
     pub lockfile: Option<pnpm_lockfile::Lockfile>,
-    /// Governs *resolution behavior* only — frozen (use the lockfile
+    /// Governs *resolution behavior* only, frozen (use the lockfile
     /// as-is) vs reuse-and-update. Does not affect whether the input
     /// lockfile is verified.
     #[serde(default)]
@@ -209,6 +252,10 @@ pub struct ResolveRequest {
     /// version. Omitted by older clients and false for ordinary resolves.
     #[serde(default)]
     pub update_patches: bool,
+    /// `--update-checksums`: refresh the integrity of every locked package
+    /// from the registry. Omitted by older clients.
+    #[serde(default)]
+    pub update_checksums: bool,
     /// Re-resolve every edge while preserving compatible locked versions and
     /// regenerating derived lockfile fields.
     #[serde(default)]
@@ -243,6 +290,9 @@ pub struct ResolveRequest {
     /// client default (`true`).
     #[serde(default)]
     pub minimum_release_age_ignore_missing_time: Option<bool>,
+    /// Whether an immature fallback is rejected instead of being returned.
+    #[serde(default)]
+    pub minimum_release_age_strict: Option<bool>,
     /// The client's supply-chain trust policy. Defaults to `off`.
     #[serde(default)]
     pub trust_policy: pnpm_config::TrustPolicy,
@@ -253,10 +303,51 @@ pub struct ResolveRequest {
     /// check.
     #[serde(default)]
     pub trust_policy_ignore_after: Option<u64>,
-    /// Lockfile formats the client accepts (e.g. `["9.0"]`). The server
-    /// renders the highest compatible format it supports.
+    /// The [`LockfileFormat`]s the client reads, by their wire names. The
+    /// request is refused when none is one the server renders. Absent means
+    /// [`LockfileFormat::PnpmLockV9`].
     #[serde(default)]
     pub accepted_lockfile_formats: Option<Vec<String>>,
+    /// Sent by the pnpm v11 client. Resolution does not read them: the
+    /// lockfile records the packages for every platform and the client's
+    /// install picks its own.
+    #[serde(rename = "nodeVersion", default)]
+    pub _node_version: IgnoredAny,
+    #[serde(rename = "os", default)]
+    pub _os: IgnoredAny,
+    #[serde(rename = "arch", default)]
+    pub _arch: IgnoredAny,
+}
+
+/// Error code of a request that names a field the server does not know.
+pub const UNSUPPORTED_REQUEST_FIELD_CODE: &str = "ERR_PNPR_UNSUPPORTED_REQUEST_FIELD";
+
+/// Error code of a request whose `acceptedLockfileFormats` names no format
+/// the server renders.
+pub const INCOMPATIBLE_LOCKFILE_FORMAT_CODE: &str = "ERR_PNPR_INCOMPATIBLE_LOCKFILE_FORMAT";
+
+/// The shape of a `done` frame's `lockfile`, named by the frame's
+/// `lockfileFormat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockfileFormat {
+    /// A `pnpm-lock.yaml` document with `lockfileVersion: '9.0'`, as JSON.
+    PnpmLockV9,
+    /// A `Cargo.lock` document, as a TOML string.
+    CargoLock,
+    /// A `pylock.toml` document, as JSON.
+    Pylock,
+}
+
+impl LockfileFormat {
+    /// The format's name in `acceptedLockfileFormats` and `lockfileFormat`.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            LockfileFormat::PnpmLockV9 => "pnpm-lock/9.0",
+            LockfileFormat::CargoLock => "cargo-lock",
+            LockfileFormat::Pylock => "pylock",
+        }
+    }
 }
 
 /// The policies the server applied to a resolution, echoed in the `done`
@@ -264,17 +355,29 @@ pub struct ResolveRequest {
 /// policies were actually enforced by the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields mirror the `applied` object of the pnpr `done` frame."
+    )
+)]
 pub struct AppliedPolicies {
     pub auto_install_peers: bool,
     pub dedupe_peers: bool,
     pub exclude_links_from_lockfile: bool,
     pub add_missing_peer_types: bool,
+    pub project_scoped_optional_peers: bool,
     pub frozen_lockfile: bool,
     pub resolution_mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_lockfile: bool,
     pub minimum_release_age: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_release_age_exclude: Vec<String>,
+    pub minimum_release_age_ignore_missing_time: bool,
+    pub minimum_release_age_strict: bool,
     pub trust_policy: Option<String>,
+    pub trust_policy_exclude: Vec<String>,
+    pub trust_policy_ignore_after: Option<u64>,
 }
 
 impl AppliedPolicies {
@@ -291,10 +394,21 @@ impl AppliedPolicies {
             pnpm_config::TrustPolicy::NoDowngrade => Some("no-downgrade".to_string()),
         };
         Self {
+            minimum_release_age_exclude: request.minimum_release_age_exclude
+                .clone()
+                .unwrap_or_default(),
+            minimum_release_age_ignore_missing_time: request
+                .minimum_release_age_ignore_missing_time
+                .unwrap_or(true),
+            minimum_release_age_strict: request.minimum_release_age_strict.unwrap_or(false),
+            trust_policy_exclude: request.trust_policy_exclude.clone().unwrap_or_default(),
+            trust_policy_ignore_after: request.trust_policy_ignore_after,
+            trust_lockfile: request.trust_lockfile,
             auto_install_peers: settings.auto_install_peers,
             dedupe_peers: settings.dedupe_peers,
             exclude_links_from_lockfile: settings.exclude_links_from_lockfile,
             add_missing_peer_types: settings.add_missing_peer_types,
+            project_scoped_optional_peers: settings.project_scoped_optional_peers,
             frozen_lockfile: request.frozen_lockfile,
             resolution_mode,
             minimum_release_age: request.minimum_release_age,
@@ -305,6 +419,13 @@ impl AppliedPolicies {
 
 /// One project's importer dir and its dependency maps, normalized
 /// across the legacy single-project body and the `projects` array.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "one field per field of the flat `ResolveRequestProject`"
+    )
+)]
 pub struct ProjectDeps {
     pub dir: String,
     pub name: Option<String>,
@@ -314,6 +435,7 @@ pub struct ProjectDeps {
     pub dev_dependencies: DepMap,
     pub optional_dependencies: DepMap,
     pub peer_dependencies: DepMap,
+    pub dependencies_meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ResolveRequest {
@@ -337,6 +459,7 @@ impl ResolveRequest {
                     dev_dependencies: project.dev_dependencies.clone(),
                     optional_dependencies: project.optional_dependencies.clone(),
                     peer_dependencies: project.peer_dependencies.clone(),
+                    dependencies_meta: project.dependencies_meta.clone(),
                 })
                 .collect();
         }
@@ -349,6 +472,7 @@ impl ResolveRequest {
             dev_dependencies: self.dev_dependencies.clone().unwrap_or_default(),
             optional_dependencies: self.optional_dependencies.clone().unwrap_or_default(),
             peer_dependencies: self.peer_dependencies.clone().unwrap_or_default(),
+            dependencies_meta: None,
         }]
     }
 }

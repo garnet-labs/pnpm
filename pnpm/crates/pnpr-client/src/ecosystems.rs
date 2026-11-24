@@ -1,19 +1,32 @@
 use super::{
-    CargoResolveOptions, Deserialize, MAX_ERROR_BODY_SIZE, PnprClient, PnprClientError,
-    PypiResolveOptions, RenderedViolation, VerifyError, VerifyLockfileOptions, read_ndjson_frames,
+    CargoResolveOptions,
+    Deserialize,
+    NdjsonLimits,
+    PnprClient,
+    PnprClientError,
+    PypiResolveOptions,
+    RenderedViolation,
+    VerifyError,
+    VerifyLockfileOptions,
+    lockfile_format::{
+        CARGO_LOCK,
+        PYLOCK,
+        expect_sole_lockfile_format,
+    },
+    read_ndjson_frames,
     response_body_bounded,
 };
 
 fn parse_pypi_frame(line: &[u8]) -> Result<PypiFrame, PnprClientError> {
-    serde_json::from_slice(line).map_err(|err| PnprClientError::Protocol(err.to_string()))
+    serde_json::from_slice(line).map_err(|err| err.to_string()).map_err(PnprClientError::Protocol)
 }
 
 fn parse_cargo_frame(line: &[u8]) -> Result<CargoFrame, PnprClientError> {
-    serde_json::from_slice(line).map_err(|err| PnprClientError::Protocol(err.to_string()))
+    serde_json::from_slice(line).map_err(|err| err.to_string()).map_err(PnprClientError::Protocol)
 }
 
 fn parse_verify_frame(line: &[u8]) -> Result<VerifyFrame, PnprClientError> {
-    serde_json::from_slice(line).map_err(|err| PnprClientError::Protocol(err.to_string()))
+    serde_json::from_slice(line).map_err(|err| err.to_string()).map_err(PnprClientError::Protocol)
 }
 
 /// The Cargo ecosystem's name in a resolve request body and in the
@@ -28,6 +41,18 @@ pub const PYPI_ECOSYSTEM: &str = "pypi";
 /// or a `pylock.toml`, each a few megabytes for the largest projects.
 const MAX_TERMINAL_RESPONSE_SIZE: usize = 32 * 1024 * 1024;
 
+/// Cap on one NDJSON frame from `/-/pnpr/v0/verify-lockfile`, matching the
+/// server's terminal NDJSON frame ceiling so large `violations` payloads
+/// surface as [`PnprClientError::Verification`] rather than framing errors.
+const MAX_VERIFY_FRAME_BYTES: usize = MAX_TERMINAL_RESPONSE_SIZE;
+
+/// Cap on NDJSON lines read from `/-/pnpr/v0/verify-lockfile`, which settles
+/// with a single terminal frame.
+const MAX_VERIFY_LINES: usize = 64;
+
+const VERIFY_NDJSON_LIMITS: NdjsonLimits =
+    NdjsonLimits { max_line_bytes: MAX_VERIFY_FRAME_BYTES, max_lines: MAX_VERIFY_LINES };
+
 /// One NDJSON frame from a Cargo `/-/pnpr/v0/resolve`. Cargo resolution
 /// yields nothing before it yields everything, so the response is a
 /// single terminal frame: the rendered `Cargo.lock`, or the failure.
@@ -36,6 +61,8 @@ const MAX_TERMINAL_RESPONSE_SIZE: usize = 32 * 1024 * 1024;
 enum CargoFrame {
     Done {
         lockfile: String,
+        #[serde(rename = "lockfileFormat", default)]
+        lockfile_format: Option<String>,
     },
     Error {
         message: String,
@@ -52,7 +79,11 @@ enum CargoFrame {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PypiFrame {
     /// Boxed: the lockfile dwarfs the other variant.
-    Done { lockfile: Box<pnpm_python_resolver::Lockfile> },
+    Done {
+        lockfile: Box<pnpm_python_resolver::Lockfile>,
+        #[serde(rename = "lockfileFormat", default)]
+        lockfile_format: Option<String>,
+    },
     Error {
         message: String,
         #[serde(default)]
@@ -65,7 +96,10 @@ enum PypiFrame {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum VerifyFrame {
-    Done,
+    Done {
+        #[serde(rename = "appliedPolicies")]
+        applied_policies: super::AppliedPolicies,
+    },
     Error {
         message: String,
         #[serde(default)]
@@ -116,11 +150,13 @@ fn intern_violation_code(code: &str) -> &'static str {
     match code {
         "MINIMUM_RELEASE_AGE_VIOLATION" => "MINIMUM_RELEASE_AGE_VIOLATION",
         "TRUST_DOWNGRADE" => "TRUST_DOWNGRADE",
+        "EXOTIC_SUBDEP" => "EXOTIC_SUBDEP",
         "TARBALL_URL_MISMATCH" => "TARBALL_URL_MISMATCH",
         "TARBALL_REVISION_MISMATCH" => "TARBALL_REVISION_MISMATCH",
         "MISSING_NAMED_REGISTRY" => "MISSING_NAMED_REGISTRY",
         "MISSING_TARBALL_INTEGRITY" => "MISSING_TARBALL_INTEGRITY",
         "RESOLUTION_SHAPE_MISMATCH" => "RESOLUTION_SHAPE_MISMATCH",
+        "LOCAL_SUBDEP_NOT_ALLOWED" => "LOCAL_SUBDEP_NOT_ALLOWED",
         _ => "LOCKFILE_RESOLUTION_VERIFICATION",
     }
 }
@@ -144,7 +180,10 @@ impl PnprClient {
         });
         let frame = self.terminal_frame(&request, opts.authorization.as_deref()).await?;
         match parse_pypi_frame(&frame)? {
-            PypiFrame::Done { lockfile } => Ok(*lockfile),
+            PypiFrame::Done { lockfile, lockfile_format } => {
+                expect_sole_lockfile_format(lockfile_format.as_deref(), PYLOCK)?;
+                Ok(*lockfile)
+            }
             PypiFrame::Error { message, code } => Err(PnprClientError::Server { message, code }),
             PypiFrame::Ignored => Err(PnprClientError::Protocol(
                 "unexpected non-terminal frame in pypi resolve response".to_string(),
@@ -163,11 +202,15 @@ impl PnprClient {
         let request = serde_json::json!({
             "ecosystem": CARGO_ECOSYSTEM,
             "metadata": opts.metadata,
+            "preferredVersions": opts.preferred_versions,
             "registry": opts.registry,
         });
         let frame = self.terminal_frame(&request, opts.authorization.as_deref()).await?;
         match parse_cargo_frame(&frame)? {
-            CargoFrame::Done { lockfile } => Ok(lockfile),
+            CargoFrame::Done { lockfile, lockfile_format } => {
+                expect_sole_lockfile_format(lockfile_format.as_deref(), CARGO_LOCK)?;
+                Ok(lockfile)
+            }
             CargoFrame::Error { message, code } => Err(PnprClientError::Server { message, code }),
             CargoFrame::Ignored => Err(PnprClientError::Protocol(
                 "unexpected non-terminal frame in cargo resolve response".to_string(),
@@ -189,25 +232,9 @@ impl PnprClient {
         request: &serde_json::Value,
         authorization: Option<&str>,
     ) -> Result<Vec<u8>, PnprClientError> {
-        let mut post = self.http
-            .post(format!("{}-/pnpr/v0/resolve", self.base_url))
-            .json(request);
-        if let Some(authorization) = authorization {
-            post = post.header("authorization", authorization);
-        }
+        let post = self.resolution_post("-/pnpr/v0/resolve", authorization).await?.json(request);
         let response = post.send().await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response_body_bounded(response, MAX_ERROR_BODY_SIZE).await?;
-            let code = extract_error_code(&body);
-            return Err(PnprClientError::Server {
-                message: format!(
-                    "/-/pnpr/v0/resolve returned {status}: {}",
-                    String::from_utf8_lossy(&body),
-                ),
-                code,
-            });
-        }
+        let response = super::check_status(response, "/-/pnpr/v0/resolve").await?;
         let body = response_body_bounded(response, MAX_TERMINAL_RESPONSE_SIZE).await?;
         find_terminal_frame(&body)
     }
@@ -219,30 +246,9 @@ impl PnprClient {
         &self,
         opts: VerifyLockfileOptions,
     ) -> Result<(), PnprClientError> {
-        let request = serde_json::to_value(&opts).expect("verification request serializes to JSON");
-
-        let mut post = self.http
-            .post(format!("{}-/pnpr/v0/verify-lockfile", self.base_url))
-            .json(&request);
-        if let Some(authorization) = opts.routing.authorization.as_deref() {
-            post = post.header("authorization", authorization);
-        }
-        let response = post.send().await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(PnprClientError::server(format!(
-                "/-/pnpr/v0/verify-lockfile returned {status}: {body}",
-            )));
-        }
-
-        let done = read_ndjson_frames(response, |line| match parse_verify_frame(line)? {
-            VerifyFrame::Done => Ok(Some(())),
-            VerifyFrame::Error { message, code } => Err(PnprClientError::Server { message, code }),
-            VerifyFrame::Violations { violations } => {
-                Err(PnprClientError::Verification(build_verify_error(violations)))
-            }
-            VerifyFrame::Ignored => Ok(None),
+        let response = self.send_verify_request(&opts).await?;
+        let done = read_ndjson_frames(response, VERIFY_NDJSON_LIMITS, |line| {
+            handle_verify_frame(line, &opts)
         })
         .await?;
         done.ok_or_else(|| {
@@ -251,12 +257,40 @@ impl PnprClient {
             )
         })
     }
+
+    async fn send_verify_request(
+        &self,
+        opts: &VerifyLockfileOptions,
+    ) -> Result<reqwest::Response, PnprClientError> {
+        let request = serde_json::to_value(opts).expect("verification request serializes to JSON");
+        let post = self
+            .resolution_post("-/pnpr/v0/verify-lockfile", opts.routing.authorization.as_deref())
+            .await?
+            .json(&request);
+        let response = post.send().await?;
+        super::check_status(response, "/-/pnpr/v0/verify-lockfile").await
+    }
 }
 
-fn extract_error_code(body: &[u8]) -> Option<String> {
-    let payload = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    let code_val = payload.get("code")?.as_str()?;
-    Some(code_val.to_string())
+fn handle_verify_frame(
+    line: &[u8],
+    opts: &VerifyLockfileOptions,
+) -> Result<Option<()>, PnprClientError> {
+    match parse_verify_frame(line)? {
+        VerifyFrame::Done { applied_policies } => {
+            super::resolve::applied_policies::assert_verification_policies(
+                &applied_policies,
+                &opts.verification,
+                opts.trust_lockfile,
+            )?;
+            Ok(Some(()))
+        }
+        VerifyFrame::Error { message, code } => Err(PnprClientError::Server { message, code }),
+        VerifyFrame::Violations { violations } => {
+            Err(PnprClientError::Verification(build_verify_error(violations)))
+        }
+        VerifyFrame::Ignored => Ok(None),
+    }
 }
 
 fn is_terminal_frame(line: &[u8]) -> bool {

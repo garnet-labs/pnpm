@@ -1,12 +1,37 @@
-use super::{AppState, private_no_cache};
-use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+use super::{
+    AppState,
+    private_no_cache,
 };
-use pnpr_auth::oidc::{HANDOFF_TTL, LoginReturn, LoginSession, OidcState};
+use axum::{
+    Json,
+    Router,
+    extract::{
+        Path,
+        Query,
+        State,
+    },
+    http::{
+        HeaderMap,
+        HeaderValue,
+        StatusCode,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Redirect,
+        Response,
+    },
+    routing::{
+        get,
+        post,
+    },
+};
+use pnpr_auth::oidc::{
+    HANDOFF_TTL,
+    LoginReturn,
+    LoginSession,
+    OidcState,
+};
 use pnpr_error::RegistryError;
 use serde::Deserialize;
 use serde_json::json;
@@ -40,7 +65,6 @@ pub(super) fn routes(ui_served: bool) -> Router<AppState> {
 pub(super) struct LoginQuery {
     #[serde(rename = "return")]
     returns_to: Option<String>,
-    session: Option<String>,
 }
 
 async fn login(
@@ -52,29 +76,32 @@ async fn login(
     let returns_to = match query.returns_to.as_deref() {
         None => LoginReturn::Token,
         Some("ui") if ui_served => LoginReturn::Ui,
-        Some("ui") => return bad_request("this pnpr does not serve the web UI"),
-        Some("cli") => {
-            let Some(session) = query.session.as_deref() else {
-                return bad_request("session query parameter required for return=cli");
-            };
-            if !is_valid_state(session) || !state.inner.identity.oidc.is_valid_web_login(session) {
-                return bad_request("invalid or expired web login session");
-            }
-            LoginReturn::Cli { session: session.to_string() }
-        }
-        Some(_) => return bad_request("return must be ui"),
+        Some("ui") => return bad_request("this pnpr does not serve the web UI".to_owned()),
+        Some(_) => return bad_request("return must be ui".to_owned()),
     };
-    let response = match state.inner.identity.oidc.start(&provider, returns_to).await {
-        Ok(start) => with_cookie(
-            Redirect::to(&start.url).into_response(),
-            &format!(
-                "__Host-pnpr-oidc-{}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=300",
-                start.state, start.browser_secret,
-            ),
+    redirect_to_provider(&state.inner.identity.oidc, &provider, returns_to)
+        .await
+        .map_err(axum::response::IntoResponse::into_response)
+        .unwrap_or_else(protect)
+}
+
+/// Send the browser to `provider` to sign in. Only this browser can finish
+/// the sign-in, because the callback requires the cookie set here. `Err`
+/// means the sign-in did not start, so no browser can finish it.
+pub(super) async fn redirect_to_provider(
+    oidc: &OidcState,
+    provider: &str,
+    returns_to: LoginReturn,
+) -> Result<Response, RegistryError> {
+    let start = oidc.start(provider, returns_to).await?;
+    let response = with_cookie(
+        Redirect::to(&start.url).into_response(),
+        &format!(
+            "__Host-pnpr-oidc-{}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=300",
+            start.state, start.browser_secret,
         ),
-        Err(err) => err.into_response(),
-    };
-    protect(response)
+    );
+    Ok(protect(response))
 }
 
 #[derive(Deserialize)]
@@ -90,7 +117,7 @@ async fn callback(
     headers: HeaderMap,
 ) -> Response {
     if !is_valid_state(&query.state) {
-        return bad_request("invalid OIDC state");
+        return bad_request("invalid OIDC state".to_owned());
     }
     let cookie_name = format!("__Host-pnpr-oidc-{}", query.state);
     let response = if let Some(secret) = browser_secret(&headers, &cookie_name) {
@@ -99,10 +126,11 @@ async fn callback(
             &query.state,
             secret,
             query.code.as_deref().unwrap_or(""),
+            |subject| super::scim::resolve_subject(&state, subject),
         )
         .await
         {
-            Ok(session) => signed_in(&state.inner.identity.oidc, &query.state, session),
+            Ok(session) => finish_sign_in(&state, (&provider, &query.state), session).await,
             Err(err) => err.into_response(),
         }
     } else {
@@ -128,8 +156,8 @@ fn signed_in(oidc: &OidcState, flow: &str, session: LoginSession) -> Response {
             Err(err) => err.into_response(),
         };
     }
-    if let LoginReturn::Cli { session: ref session_id } = session.returns_to {
-        return match oidc.fulfill_web_login(session_id, session.token) {
+    if let LoginReturn::Cli { ref login_id } = session.returns_to {
+        return match oidc.fulfill_web_login(login_id, session.token) {
             Ok(()) => {
                 let html = r#"<!doctype html>
 <html>
@@ -167,7 +195,7 @@ async fn redeem_handoff(
     headers: HeaderMap,
 ) -> Response {
     if !is_valid_state(&query.flow) {
-        return bad_request("invalid sign-in flow");
+        return bad_request("invalid sign-in flow".to_owned());
     }
     redeem(&state.inner.identity.oidc, &query.flow, &headers)
 }
@@ -210,9 +238,11 @@ fn browser_secret<'h>(headers: &'h HeaderMap, cookie_name: &str) -> Option<&'h s
     let mut cookies = headers
         .get_all(header::COOKIE)
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .map(HeaderValue::to_str)
+        .filter_map(Result::ok)
         .flat_map(|value| value.split(';'))
-        .filter_map(|cookie| cookie.trim().split_once('='))
+        .map(str::trim)
+        .filter_map(|trimmed| trimmed.split_once('='))
         .filter(|(name, _)| *name == cookie_name);
     let secret = cookies.next().map(|(_, value)| value)?;
     cookies
@@ -237,8 +267,8 @@ fn with_cookie(mut response: Response, cookie: &str) -> Response {
     }
 }
 
-fn bad_request(reason: &str) -> Response {
-    protect(RegistryError::BadRequest { reason: reason.to_string() }.into_response())
+fn bad_request(reason: String) -> Response {
+    protect(RegistryError::BadRequest { reason }.into_response())
 }
 
 pub(super) fn protect(response: Response) -> Response {
@@ -258,18 +288,21 @@ pub(super) fn protect(response: Response) -> Response {
     response
 }
 
-pub(super) fn validate_workloads(config: &pnpr_config::Config) -> Result<(), RegistryError> {
+pub(super) fn validate_workloads(
+    config: &pnpr_config::Config,
+    routing: &pnpr_config::RoutingConfig,
+) -> Result<(), RegistryError> {
     for workload in config.identity.auth.oidc.iter().flat_map(|provider| &provider.workloads) {
-        validate_single_workload(config, workload)?;
+        validate_single_workload(routing, workload)?;
     }
     Ok(())
 }
 
 fn validate_single_workload(
-    config: &pnpr_config::Config,
+    routing: &pnpr_config::RoutingConfig,
     workload: &pnpr_config::oidc::OidcWorkload,
 ) -> Result<(), RegistryError> {
-    if !is_hosted_npm_registry(config, &workload.registry) || workload.packages.is_empty() {
+    if !is_hosted_npm_registry(routing, &workload.registry) || workload.packages.is_empty() {
         return Err(RegistryError::InvalidConfig {
             reason: "OIDC workloads require a hosted npm registry and explicit packages".to_string(
             ),
@@ -278,13 +311,12 @@ fn validate_single_workload(
     validate_workload_packages(&workload.packages)
 }
 
-fn is_hosted_npm_registry(config: &pnpr_config::Config, registry: &str) -> bool {
-    let Some(key) = config.routing.registries.addressed(registry, pnpr_registry::Ecosystem::Npm)
-    else {
+fn is_hosted_npm_registry(routing: &pnpr_config::RoutingConfig, registry: &str) -> bool {
+    let Some(key) = routing.registries.addressed(registry, pnpr_registry::Ecosystem::Npm) else {
         return false;
     };
-    matches!(config.routing.registries.get(key), Some(pnpr_registry::Registry::Hosted { .. }))
-        && config.routing.registries.ecosystem(key) == Some(pnpr_registry::Ecosystem::Npm)
+    matches!(routing.registries.get(key), Some(pnpr_registry::Registry::Hosted { .. }))
+        && routing.registries.ecosystem(key) == Some(pnpr_registry::Ecosystem::Npm)
 }
 
 fn validate_workload_packages(packages: &[String]) -> Result<(), RegistryError> {
@@ -301,22 +333,22 @@ fn validate_workload_packages(packages: &[String]) -> Result<(), RegistryError> 
     Ok(())
 }
 
-/// The routes besides its own packages' publish that a workload may call,
-/// under the server root, the npm base, or its registry's address:
-/// staging a release archive, and committing a publish that references
-/// staged archives. The commit is scoped to the workload's packages by
-/// [`WorkloadScope`].
-const WORKLOAD_PROTOCOL_ROUTES: [(&str, &[axum::http::Method]); 2] = [
-    ("/-/pnpr/v0/artifacts/blob", &[axum::http::Method::PUT, axum::http::Method::HEAD]),
-    ("/-/pnpr/v0/publish", &[axum::http::Method::PUT]),
-];
+/// The publish commit a workload may call besides its own packages' publish,
+/// under the server root, the npm base, or its registry's address. The
+/// commit is scoped to the workload's packages by [`WorkloadScope`].
+const WORKLOAD_PUBLISH_ROUTE: &str = "/-/pnpr/v0/publish";
+
+/// Where a workload stages the release archives its commit references, one
+/// archive per path segment below it, under the same bases as
+/// [`WORKLOAD_PUBLISH_ROUTE`].
+const WORKLOAD_ARCHIVES_ROUTE: &str = "/-/pnpr/v0/publish/archives";
 
 pub(super) fn check_workload_request(
     workload: &pnpr_config::oidc::OidcWorkload,
     method: &axum::http::Method,
     path: &str,
 ) -> Result<(), RegistryError> {
-    let decoded = pnpr_search::percent_decode(path);
+    let decoded = pnpm_network::percent_decode_str(path);
     let base = pnpr_registry::Ecosystem::Npm.base_path();
     let local = pnpr_registry::Registries::local_name(&workload.registry);
     let registry_base = format!("{base}/~{local}");
@@ -327,19 +359,27 @@ pub(super) fn check_workload_request(
     {
         return Ok(());
     }
-    let protocol = WORKLOAD_PROTOCOL_ROUTES
-        .iter()
-        .any(|(route, methods)| {
-            methods.contains(method)
-                && ["", base.as_str(), registry_base.as_str()]
-                    .iter()
-                    .any(|prefix| decoded == format!("{prefix}{route}"))
-        });
-    if protocol {
+    let prefixes = ["", base.as_str(), registry_base.as_str()];
+    let publish = *method == axum::http::Method::PUT
+        && prefixes
+            .iter()
+            .any(|prefix| decoded == format!("{prefix}{WORKLOAD_PUBLISH_ROUTE}"));
+    // The parent is compared as sent, as the router matches it, so the
+    // percent-encoded archive segment cannot stand for more than one.
+    let staging = matches!(*method, axum::http::Method::PUT | axum::http::Method::HEAD)
+        && path
+            .rsplit_once('/')
+            .is_some_and(|(parent, archive)| {
+                !archive.is_empty()
+                    && prefixes
+                        .iter()
+                        .any(|prefix| parent == format!("{prefix}{WORKLOAD_ARCHIVES_ROUTE}"))
+            });
+    if publish || staging {
         return Ok(());
     }
     Err(RegistryError::Forbidden {
-        user: workload.identity.username.clone(),
+        user: workload.identity.user_id.clone(),
         action: "use",
         resource: "workload credentials outside the configured npm publish targets".to_string(),
     })
@@ -354,22 +394,22 @@ pub(super) struct WorkloadScope {
     /// The serving key of the workload's registry, as a publish resolves it.
     registry: String,
     packages: Vec<String>,
-    username: String,
+    user_id: String,
 }
 
 impl WorkloadScope {
     pub(super) fn new(
-        config: &pnpr_config::Config,
+        routing: &pnpr_config::RoutingConfig,
         workload: &pnpr_config::oidc::OidcWorkload,
     ) -> Self {
-        let registry = config.routing.registries
+        let registry = routing.registries
             .addressed(&workload.registry, pnpr_registry::Ecosystem::Npm)
             .unwrap_or(&workload.registry)
             .to_string();
         WorkloadScope {
             registry,
             packages: workload.packages.clone(),
-            username: workload.identity.username.clone(),
+            user_id: workload.identity.user_id.clone(),
         }
     }
 
@@ -403,7 +443,7 @@ impl WorkloadScope {
 
     fn refusal(&self, resource: &str) -> RegistryError {
         RegistryError::Forbidden {
-            user: self.username.clone(),
+            user: self.user_id.clone(),
             action: "publish",
             resource: format!("{resource} with workload credentials"),
         }
@@ -412,3 +452,41 @@ impl WorkloadScope {
 
 #[cfg(test)]
 mod tests;
+
+async fn finish_sign_in(
+    state: &AppState,
+    (provider, flow): (&str, &str),
+    session: LoginSession,
+) -> Response {
+    let verified = async {
+        let user = state.inner.identity.oidc
+            .session(&session.token)?
+            .ok_or_else(|| RegistryError::Unauthenticated {
+                resource: "OIDC browser session".to_string(),
+            })?;
+        let name = super::authentication::active_account_name(state, &user.user_id).await?;
+        if super::scim::is_deprovisioned(state, &user.user_id)? {
+            return Err(RegistryError::Unauthenticated {
+                resource: "an inactive account".to_string(),
+            });
+        }
+        Ok((user.user_id, name))
+    }
+    .await;
+    let (id, name) = match verified {
+        Ok(account) => account,
+        Err(err) => {
+            state.inner.identity.oidc.revoke_session(&session.token);
+            return err.into_response();
+        }
+    };
+    let actor = crate::audit::Actor { id: &id, name: &name };
+    crate::audit!(
+        actor,
+        "auth.sign_in",
+        method = "oidc",
+        provider = %provider,
+        "signed in",
+    );
+    signed_in(&state.inner.identity.oidc, flow, session)
+}

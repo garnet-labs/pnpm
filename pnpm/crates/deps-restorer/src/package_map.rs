@@ -1,13 +1,24 @@
 pub use hoisted::dependencies_graph_to_package_map;
+pub(crate) use node_options::find_execution_file;
 pub use node_options::{
-    make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
+    make_node_package_map_option,
+    make_node_require_option,
+    package_map_path_for_execution,
 };
 
 mod dependencies;
 use dependencies::{
-    LinkBase, LinkReference, LinkTarget, PhysicalPackageIndex, add_importer_dependencies,
-    add_loose_dependencies, add_physical_importer_dependencies, add_physical_snapshot_dependencies,
-    add_snapshot_dependencies, get_node_modules_path, resolve_link_target,
+    LinkBase,
+    LinkReference,
+    LinkTarget,
+    PhysicalPackageIndex,
+    add_importer_dependencies,
+    add_loose_dependencies,
+    add_physical_importer_dependencies,
+    add_physical_snapshot_dependencies,
+    add_snapshot_dependencies,
+    get_node_modules_path,
+    resolve_link_target,
 };
 
 mod hoisted;
@@ -17,13 +28,22 @@ mod node_options;
 use crate::LockfileToDepGraphResult;
 use pnpm_config::NodePackageMapType;
 use pnpm_fs::lexical_normalize;
-use pnpm_lockfile::{Lockfile, PackageKey};
+use pnpm_lockfile::{
+    Lockfile,
+    PackageKey,
+};
 use pnpm_package_manifest::PackageManifest;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
     fmt::Write as _,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 pub const PACKAGE_MAP_FILENAME: &str = ".package-map.json";
@@ -242,7 +262,7 @@ fn add_snapshot_package(
     let mut dependencies = BTreeMap::new();
     dependencies.insert(key.name.to_string(), id.clone());
     let package_dir = pnpm_fs::join_slash_separated_path(
-        &opts.layout.slot_dir(key).join("node_modules"),
+        opts.layout.slot_dir(key).join("node_modules"),
         &key.name.to_string(),
     );
     for group in [snapshot.dependencies.as_ref(), snapshot.optional_dependencies.as_ref()] {
@@ -280,7 +300,7 @@ fn add_metadata_only_package(
     let id = key.to_string();
     let package_dir = || {
         pnpm_fs::join_slash_separated_path(
-            &opts.layout.slot_dir(key).join("node_modules"),
+            opts.layout.slot_dir(key).join("node_modules"),
             &key.name.to_string(),
         )
     };
@@ -366,7 +386,8 @@ fn to_relative_url(from: &Path, to: &Path) -> String {
     let Some(relative) = pathdiff::diff_paths(to, from) else {
         return absolute_package_url(to);
     };
-    let relative = normalize_path(&relative);
+    let relative = relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let relative = encode_url_path(&relative, b"!$&'()*+,;=@");
     let relative = if relative.is_empty() { ".".to_string() } else { relative };
     if relative == "."
         || relative == ".."
@@ -404,22 +425,24 @@ fn graph_package_id(package_dir: &Path, modules_dir: &Path) -> String {
 
 fn absolute_package_url(path: &Path) -> String {
     let normalized = normalize_path(path);
+    let encoded = encode_url_path(&normalized, b"");
     if cfg!(windows) && normalized.starts_with("//") {
-        format!("file:{}", encode_url_path(&normalized))
+        format!("file:{encoded}")
     } else if cfg!(windows) && !normalized.starts_with('/') {
-        format!("file:///{}", encode_url_path(&normalized))
+        format!("file:///{encoded}")
     } else {
-        format!("file://{}", encode_url_path(&normalized))
+        format!("file://{encoded}")
     }
 }
 
-fn encode_url_path(path: &str) -> String {
+fn encode_url_path(path: &str, additional_safe: &[u8]) -> String {
     let mut encoded = String::with_capacity(path.len());
     for byte in path.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
                 encoded.push(byte as char);
             }
+            byte if additional_safe.contains(&byte) => encoded.push(byte as char),
             _ => write!(encoded, "%{byte:02X}").expect("writing to a string cannot fail"),
         }
     }

@@ -10,25 +10,50 @@
 //! Only the variants pacquet currently emits live in [`LogEvent`]. New
 //! channels are added incrementally as the surrounding code starts using
 //! them.
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
 
 pub use fatal_error::FatalErrorLog;
 
 pub use dependencies::{
-    AddedRoot, DependencyType, PackageManifestLog, PackageManifestMessage, RemovedRoot, RootLog,
-    RootMessage, SkippedOptionalDependencyLog, SkippedOptionalPackage, SkippedOptionalParent,
+    AddedRoot,
+    DependencyType,
+    PackageManifestLog,
+    PackageManifestMessage,
+    RemovedRoot,
+    RootLog,
+    RootMessage,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalParent,
     SkippedOptionalReason,
 };
 pub use progress::{
-    ContextLog, FetchingProgressLog, FetchingProgressMessage, PackageImportMethod,
-    PackageImportMethodLog, ProgressLog, ProgressMessage, PromptAction, PromptLog, Stage, StageLog,
-    StatsLog, StatsMessage, SummaryLog,
+    ContextLog,
+    FetchingProgressLog,
+    FetchingProgressMessage,
+    PYTHON_ENVIRONMENT_REQUESTER,
+    PackageImportMethod,
+    PackageImportMethodLog,
+    ProgressLog,
+    ProgressMessage,
+    PromptAction,
+    PromptLog,
+    Stage,
+    StageLog,
+    StatsLog,
+    StatsMessage,
+    SummaryLog,
 };
 
 use serde::Serialize;
 use std::{
     io::Write,
     sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 /// One log channel from `@pnpm/core-loggers`.
@@ -89,7 +114,7 @@ pub enum LogEvent {
     /// Project manifest snapshots (`pnpm:package-manifest`). Two
     /// presence-tagged shapes per pnpm's union: `initial` (emitted
     /// once at install start with the on-disk manifest) and
-    /// `updated` (emitted after the manifest is rewritten — e.g.
+    /// `updated` (emitted after the manifest is rewritten, e.g.
     /// `pacquet add` saves a new dependency entry).
     #[serde(rename = "pnpm:package-manifest")]
     PackageManifest(PackageManifestLog),
@@ -144,6 +169,17 @@ pub enum LogEvent {
     #[serde(rename = "pnpm:skipped-optional-dependency")]
     SkippedOptionalDependency(SkippedOptionalDependencyLog),
 
+    /// One per override selector that matched no resolved dependency
+    /// (`pnpm:unused-override`). The default reporter buffers these
+    /// against `pnpm:stage { stage: "resolution_done" }` and emits a
+    /// single grouped warning.
+    #[serde(rename = "pnpm:unused-override")]
+    UnusedOverride(UnusedOverrideLog),
+
+    /// Package compatibility warning (`pnpm:install-check`).
+    #[serde(rename = "pnpm:install-check")]
+    InstallCheck(PnpmLog),
+
     /// Bracketing events for the configurational-dependency install
     /// (`pnpm:installing-config-deps`): a `started` before any
     /// fetch/link work, then a single `done` carrying the installed
@@ -165,7 +201,7 @@ pub enum LogEvent {
     /// One `started` event before the fan-out, followed by exactly one
     /// terminal `done` (success) or `failed` (policy violation or
     /// unexpected throw). Fires only when the candidate set is
-    /// non-empty — a lockfile whose snapshots all fail name/version
+    /// non-empty, a lockfile whose snapshots all fail name/version
     /// extraction produces no events.
     #[serde(rename = "pnpm:lockfile-verification")]
     LockfileVerification(LockfileVerificationLog),
@@ -177,7 +213,7 @@ pub enum LogEvent {
     Lockfile(LockfileLog),
 
     /// Generic global-logger message (`name: "pnpm"`). Carries a
-    /// `{ message, prefix }` payload — for example, the "Lockfile is
+    /// `{ message, prefix }` payload, for example, the "Lockfile is
     /// up to date, resolution step is skipped" line the frozen-install
     /// short-circuit prints. `@pnpm/cli.default-reporter` routes these
     /// into the "other" log stream.
@@ -193,7 +229,7 @@ pub enum LogEvent {
     DedupeCheck(DedupeCheckLog),
 
     /// Global-logger message (`name: "pnpm:global"`). Written to a
-    /// `bole('pnpm:global')` logger with just a message string — no
+    /// `bole('pnpm:global')` logger with just a message string, no
     /// `prefix`, unlike [`LogEvent::Pnpm`].
     /// `@pnpm/cli.default-reporter` routes these into the "other"
     /// log stream.
@@ -259,7 +295,7 @@ pub struct RequestRetryLog {
 /// `err.message` directly still work.
 ///
 /// Plain backticks (not an intra-doc link) because `pnpm-reporter`
-/// cannot depend on `pnpm-tarball` — the dependency runs the
+/// cannot depend on `pnpm-tarball`, the dependency runs the
 /// other way.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,9 +377,9 @@ pub enum LifecycleStdio {
 pub struct IgnoredScriptsLog {
     pub level: LogLevel,
     pub package_names: Vec<String>,
-    /// `strictDepBuilds` at emit time. Carried in-memory only —
+    /// `strictDepBuilds` at emit time. Carried in-memory only,
     /// `#[serde(skip)]` keeps it out of the `pnpm:ignored-scripts` NDJSON
-    /// wire shape — so the default reporter can suppress the warning box
+    /// wire shape, so the default reporter can suppress the warning box
     /// under strict mode (where the install fails with
     /// `ERR_PNPM_IGNORED_BUILDS` instead) without relying on a stale
     /// global flag. The structured event itself is always emitted with
@@ -430,9 +466,10 @@ pub struct LockfileLog {
 }
 
 /// `pnpm:lockfile-verification` discriminated payload. `Started`
-/// fires once before the per-candidate fan-out begins; exactly one
-/// terminal `Done` or `Failed` fires after, with `elapsed_ms`
-/// measured against the matching `Started`. `Cached` fires instead
+/// fires once before the per-candidate fan-out begins; throttled
+/// `Progress` events may fire while it runs; exactly one terminal
+/// `Done` or `Failed` fires after, with `elapsed_ms` measured
+/// against the matching `Started`. `Cached` fires instead
 /// of the pair when the verification cache short-circuits the gate;
 /// it carries no `entries` count because the short-circuit happens
 /// before candidates are collected.
@@ -449,8 +486,17 @@ pub enum LockfileVerificationMessage {
         #[serde(rename = "lockfilePath", skip_serializing_if = "Option::is_none")]
         lockfile_path: Option<String>,
     },
+    Progress {
+        entries: u64,
+        /// Number of entries that have completed verification so far.
+        checked: u64,
+        #[serde(rename = "lockfilePath", skip_serializing_if = "Option::is_none")]
+        lockfile_path: Option<String>,
+    },
     Done {
         entries: u64,
+        /// Number of entries that were checked, which on success is all of them.
+        checked: u64,
         #[serde(rename = "elapsedMs")]
         elapsed_ms: u64,
         #[serde(rename = "lockfilePath", skip_serializing_if = "Option::is_none")]
@@ -458,6 +504,10 @@ pub enum LockfileVerificationMessage {
     },
     Failed {
         entries: u64,
+        /// Number of entries that were checked before the failure. It
+        /// equals `entries` when the run finished and found violations,
+        /// and is lower when the run was aborted.
+        checked: u64,
         #[serde(rename = "elapsedMs")]
         elapsed_ms: u64,
         #[serde(rename = "lockfilePath", skip_serializing_if = "Option::is_none")]
@@ -520,8 +570,8 @@ pub struct PeerDependencyIssuesLog {
 /// `pnpm:scope` payload: how many workspace projects the command
 /// selected, out of how many the workspace has.
 ///
-/// `total` accompanies a workspace-wide run — including a `--filter` that
-/// narrowed it to one project — and is absent from the single-project
+/// `total` accompanies a workspace-wide run (including a `--filter` that
+/// narrowed it to one project) and is absent from the single-project
 /// shape a command targeting only the project it was run in reports.
 /// `workspace_prefix` is absent outside a workspace, which is what makes
 /// the reporter say "projects" rather than "workspace projects". Both are
@@ -537,7 +587,7 @@ pub struct ScopeLog {
 }
 
 /// Global-channel (`name: "pnpm:global"`) payload. Carries only a
-/// severity and a message — pnpm's `bole('pnpm:global')` logger takes a
+/// severity and a message, pnpm's `bole('pnpm:global')` logger takes a
 /// bare string, with no `prefix`, so this struct has none either.
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalLog {
@@ -572,7 +622,7 @@ pub struct ExecutionTimeLog {
 }
 
 /// `pnpm:deprecation` payload. Field names match the `DeprecationMessage`
-/// wire shape in `pnpm11/core/core-loggers/src/deprecationLogger.ts` so
+/// wire shape in [`pnpm11/core/core-loggers/src/deprecationLogger.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/core/core-loggers/src/deprecationLogger.ts) so
 /// `@pnpm/cli.default-reporter` dispatches on them unchanged.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -585,6 +635,19 @@ pub struct DeprecationLog {
     pub depth: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_deprecated_alternative: Option<NonDeprecatedAlternative>,
+    /// Whether the previous install already installed this package, so the
+    /// deprecation is not news. Skipped from the wire when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub already_installed: bool,
+}
+
+/// `pnpm:unused-override` payload. `prefix` is the workspace root (`lockfileDir`); `selector` is the raw override key
+/// (`foo`, `parent>child`, `foo@^1`).
+#[derive(Debug, Clone, Serialize)]
+pub struct UnusedOverrideLog {
+    pub level: LogLevel,
+    pub prefix: String,
+    pub selector: String,
 }
 
 /// A version of the same package that is not deprecated, as the resolver read
@@ -625,7 +688,7 @@ pub enum LogLevel {
 /// swallowed so a reporter problem can never crash an install.
 ///
 /// **Thread safety.** `emit` may be invoked concurrently from
-/// arbitrary threads — pacquet's import path runs `link_file` from a
+/// arbitrary threads, pacquet's import path runs `link_file` from a
 /// rayon `par_iter`, and tarball download / store-index work runs
 /// across tokio workers, all of which can fire reporter events at
 /// once. Implementations must therefore guard any shared state they
@@ -648,6 +711,13 @@ pub trait Reporter: Send + Sync + 'static {
 }
 
 /// Adapt a [`Reporter`] into the warning callback used by the network client.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the network client's `set_warning_handler` takes it as a `fn(&str)`"
+    )
+)]
 pub fn emit_global_warning<Sink: Reporter>(message: &str) {
     Sink::emit(&LogEvent::Global(GlobalLog {
         level: LogLevel::Warn,

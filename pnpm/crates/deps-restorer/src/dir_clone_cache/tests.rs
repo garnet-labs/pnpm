@@ -1,5 +1,22 @@
-use super::DirCloneCache;
-use pnpm_config::{Config, NodeLinker, PackageImportMethod};
+use super::{
+    DirCloneCache,
+    content_slot_dir,
+    retires_dir_clone,
+};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+    PackageImportMethod,
+};
+use pnpm_fs::LinkFailure;
+
+#[test]
+fn a_failed_clone_retires_the_cache_only_when_the_volume_is_at_fault() {
+    for failure in LinkFailure::ALL {
+        let retires = matches!(failure, LinkFailure::CrossDevice | LinkFailure::Unsupported);
+        assert_eq!(retires_dir_clone(&failure.sample_error()), retires, "{failure:?}");
+    }
+}
 
 #[test]
 fn eligible_for_clone_capable_local_materialization() {
@@ -35,22 +52,63 @@ fn eligible_for_clone_capable_local_materialization() {
 }
 
 #[test]
-fn not_eligible_when_the_canonical_root_is_the_virtual_store() {
+fn not_eligible_when_deploy_uses_the_virtual_store_as_the_global_store() {
     let config = Config { enable_global_virtual_store: false, ..Config::default() };
     let config = Config { global_virtual_store_dir: config.install_state_dir.clone(), ..config };
     assert!(
         !DirCloneCache::eligible(&config, NodeLinker::Isolated),
-        "canonical slots under the virtual store would be a second copy of every package",
+        "deploy installs must not populate the shared materialization cache",
     );
+}
+
+#[test]
+fn content_slot_tracks_file_names_and_cas_paths() {
+    let root = std::path::Path::new("dir-clone-cache");
+    let manifest =
+        ("package.json".to_string(), std::path::PathBuf::from("files/ab/manifest").into());
+    let script = ("cli.js".to_string(), std::path::PathBuf::from("files/cd/script").into());
+    let files = pnpm_fs::CasPaths::from([manifest.clone(), script.clone()]);
+    let slot = content_slot_dir(root, &files);
+
+    let reordered = pnpm_fs::CasPaths::from([script.clone(), manifest.clone()]);
+    assert_eq!(slot, content_slot_dir(root, &reordered));
+
+    let renamed = pnpm_fs::CasPaths::from([manifest.clone(), ("other.js".into(), script.1)]);
+    assert_ne!(slot, content_slot_dir(root, &renamed));
+
+    for path in ["files/ef/changed-script", "files/cd/script-exec"] {
+        let changed = pnpm_fs::CasPaths::from([
+            manifest.clone(),
+            (script.0.clone(), std::path::PathBuf::from(path).into()),
+        ]);
+        assert_ne!(slot, content_slot_dir(root, &changed), "CAS path {path}");
+    }
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{Config, DirCloneCache, NodeLinker, PackageImportMethod};
+    use super::{
+        Config,
+        DirCloneCache,
+        NodeLinker,
+        PackageImportMethod,
+        content_slot_dir,
+    };
     use crate::dir_clone_cache::EngineNameSource;
-    use pnpm_lockfile::{PackageKey, SnapshotEntry};
-    use pnpm_reporter::{LogEvent, Reporter};
-    use std::{collections::HashMap, fs, path::PathBuf, sync::atomic::AtomicU8};
+    use pnpm_lockfile::{
+        PackageKey,
+        SnapshotEntry,
+    };
+    use pnpm_reporter::{
+        LogEvent,
+        Reporter,
+    };
+    use std::{
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+        sync::atomic::AtomicU8,
+    };
     use tempfile::tempdir;
 
     struct NullReporter;
@@ -62,22 +120,22 @@ mod macos {
         HashMap::from([(key.clone(), SnapshotEntry::default())])
     }
 
-    /// Build a cache whose canonical root is `links_root`, with
+    /// Build a cache whose canonical root is `cache_root`, with
     /// `snapshots` so the layout precomputes their hashed slots. The
-    /// virtual-store dir is pinned next to the links root so the
-    /// capability probe in `build` clones within one volume — the
+    /// virtual-store dir is pinned next to the cache root so the
+    /// capability probe in `build` clones within one volume, the
     /// default would point at the crate's working directory, which may
     /// live on another volume than the temp root.
     fn cache_for_snapshots<'a>(
-        links_root: &std::path::Path,
+        cache_root: &std::path::Path,
         snapshots: &'a HashMap<PackageKey, SnapshotEntry>,
         engine: EngineNameSource,
     ) -> DirCloneCache<'a> {
         let config = Config {
             enable_global_virtual_store: false,
             package_import_method: PackageImportMethod::Clone,
-            global_virtual_store_dir: links_root.to_path_buf(),
-            install_state_dir: links_root.with_file_name("probe-virtual-store"),
+            store_dir: pnpm_store_dir::StoreDir::new(cache_root.parent().unwrap()),
+            install_state_dir: cache_root.with_file_name("probe-virtual-store"),
             ..Config::default()
         };
         DirCloneCache::build(
@@ -112,7 +170,7 @@ mod macos {
         ]);
 
         let key: PackageKey = "foo@1.0.0".parse().expect("valid snapshot key");
-        let links_root = dir.path().join("links");
+        let cache_root = pnpm_store_dir::StoreDir::new(dir.path()).dir_clone_cache();
         let snapshots = one_snapshot(&key);
         let engine_slot = std::sync::Arc::new(std::sync::OnceLock::new());
         let probe = std::thread::spawn({
@@ -123,7 +181,7 @@ mod macos {
             }
         });
         let cache = cache_for_snapshots(
-            &links_root,
+            &cache_root,
             &snapshots,
             EngineNameSource::Pending(std::sync::Arc::clone(&engine_slot)),
         );
@@ -146,26 +204,15 @@ mod macos {
             b"module.exports = 1",
         );
 
-        let canonical_manifests = walk_files(&links_root)
+        let canonical_manifests = walk_files(&cache_root)
             .into_iter()
             .filter(|path| path.ends_with("node_modules/foo/package.json"))
             .count();
         assert_eq!(canonical_manifests, 1, "one canonical slot for the one snapshot");
-        let expected_slot = crate::VirtualStoreLayout::global(
-            links_root.clone(),
-            Config::default().virtual_store_dir_max_length as usize,
-            Some("node-22"),
-            Some(&snapshots),
-            None,
-            None,
-            None,
-            &crate::host_platform_selector(),
-        )
-        .hashed_slot_dir(&key)
-        .expect("hashed slot for the one snapshot");
+        let expected_slot = content_slot_dir(&cache_root, &cas_paths);
         assert!(
             expected_slot.join("node_modules/foo/package.json").is_file(),
-            "the canonical slot must be the one the delivered engine name selects: {expected_slot:?}",
+            "the canonical slot must be the one the package's files key: {expected_slot:?}",
         );
 
         fs::remove_file(&lib_blob).expect("remove CAS blob");
@@ -196,7 +243,7 @@ mod macos {
         let key: PackageKey = "foo@1.0.0".parse().expect("valid snapshot key");
         let snapshots = one_snapshot(&key);
         let cache = cache_for_snapshots(
-            &dir.path().join("links"),
+            &pnpm_store_dir::StoreDir::new(dir.path()).dir_clone_cache(),
             &snapshots,
             EngineNameSource::Ready(None),
         );
@@ -212,8 +259,6 @@ mod macos {
         ));
     }
 
-    /// See [`crate::VirtualStoreLayout::hashed_slot_dir`] for why the
-    /// flat-name fallback must never serve the cache.
     #[test]
     fn try_import_declines_a_snapshot_without_a_hashed_slot() {
         let dir = tempdir().expect("tempdir");
@@ -221,7 +266,7 @@ mod macos {
         let other: PackageKey = "bar@2.0.0".parse().expect("valid snapshot key");
         let snapshots = one_snapshot(&key);
         let cache = cache_for_snapshots(
-            &dir.path().join("links"),
+            &pnpm_store_dir::StoreDir::new(dir.path()).dir_clone_cache(),
             &snapshots,
             EngineNameSource::Ready(None),
         );
@@ -235,6 +280,65 @@ mod macos {
             &target,
             &HashMap::new(),
         ));
+    }
+
+    /// Peer variants of one package version hold the same files, so the
+    /// second variant must clone the slot the first one populated rather
+    /// than materialize its own.
+    #[test]
+    fn peer_variants_share_one_canonical_slot() {
+        let dir = tempdir().expect("tempdir");
+        let store = dir.path().join("cas");
+        fs::create_dir_all(&store).expect("create fake CAS");
+        let manifest_blob = store.join("manifest-blob");
+        let lib_blob = store.join("lib-blob");
+        fs::write(&manifest_blob, br#"{"name":"foo"}"#).expect("write manifest blob");
+        fs::write(&lib_blob, b"module.exports = 1").expect("write lib blob");
+        let cas_paths: pnpm_fs::CasPaths = HashMap::from([
+            ("package.json".to_string(), manifest_blob.into()),
+            ("lib/index.js".to_string(), lib_blob.clone().into()),
+        ]);
+
+        let with_react_17: PackageKey = "foo@1.0.0(react@17.0.2)".parse().expect("valid key");
+        let with_react_18: PackageKey = "foo@1.0.0(react@18.3.1)".parse().expect("valid key");
+        let cache_root = pnpm_store_dir::StoreDir::new(dir.path()).dir_clone_cache();
+        let snapshots = HashMap::from([
+            (with_react_17.clone(), SnapshotEntry::default()),
+            (with_react_18.clone(), SnapshotEntry::default()),
+        ]);
+        let cache = cache_for_snapshots(&cache_root, &snapshots, EngineNameSource::Ready(None));
+        let logged = AtomicU8::new(0);
+
+        let first_target = dir.path().join("first/node_modules/foo");
+        fs::create_dir_all(first_target.parent().unwrap()).expect("create slot node_modules");
+        assert!(cache.try_import::<NullReporter>(
+            &logged,
+            PackageImportMethod::Clone,
+            &with_react_17,
+            &first_target,
+            &cas_paths,
+        ));
+        // Without its CAS blob, the second variant can only be served by a
+        // clone of the slot the first variant populated.
+        fs::remove_file(&lib_blob).expect("remove CAS blob");
+        let second_target = dir.path().join("second/node_modules/foo");
+        fs::create_dir_all(second_target.parent().unwrap()).expect("create slot node_modules");
+        assert!(cache.try_import::<NullReporter>(
+            &logged,
+            PackageImportMethod::Clone,
+            &with_react_18,
+            &second_target,
+            &cas_paths,
+        ));
+        assert_eq!(
+            fs::read(second_target.join("lib/index.js")).expect("cloned file"),
+            b"module.exports = 1",
+        );
+        let canonical_manifests = walk_files(&cache_root)
+            .into_iter()
+            .filter(|path| path.ends_with("node_modules/foo/package.json"))
+            .count();
+        assert_eq!(canonical_manifests, 1, "both variants share one canonical slot");
     }
 
     fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {

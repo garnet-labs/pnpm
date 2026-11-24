@@ -2,64 +2,134 @@ pub use errors::InstallWithFreshLockfileError;
 pub(crate) use lockfile_build::compute_package_extensions_checksum;
 pub(crate) use manifest_transforms::resolver_manifest_hooks;
 pub(crate) use seed_policy::prefer_requested_version;
-pub use seed_policy::{ImporterUpdateSeedPolicy, PreferredVersionsOverride, UpdateSeedPolicy};
+pub use seed_policy::{
+    ImporterUpdateSeedPolicy,
+    PreferredVersionsOverride,
+    UpdateSeedPolicy,
+};
 
 mod persist;
 use persist::{
-    LockfileOnlyOptions, finish_lockfile_only, fix_lockfile_copy, importers_consuming_linked_peers,
-    persist_fresh_lockfile, verify_repair_if_filtered,
+    LockfileOnlyOptions,
+    finish_lockfile_only,
+    fix_lockfile_copy,
+    importers_consuming_linked_peers,
+    persist_fresh_lockfile,
+    verify_repair_if_filtered,
 };
 
 mod lockfile_build;
 
 use lockfile_build::{
-    build_lockfile_phase, compose_manifest_hooks, ignored_optional_dependencies_match,
-    overrides_match, parse_config_overrides, resolved_overrides_map,
+    build_lockfile_phase,
+    compose_manifest_hooks,
+    ignored_optional_dependencies_match,
+    overrides_match,
+    parse_config_overrides,
+    resolved_overrides_map,
 };
 
 mod on_disk;
 use crate::install::state_options::ResolveOnly;
-use on_disk::{OnDiskInputs, OnDiskOutput, finish_early_materialization, run_on_disk_phases};
+use on_disk::{
+    OnDiskInputs,
+    OnDiskOutput,
+    finish_early_materialization,
+    run_on_disk_phases,
+};
 
 mod plan;
 use plan::{
-    FinalScope, FreshPlan, HostProbeInputs, LockfileViews, MaterializationScope, PlanLockfiles,
-    PlanScope, include_transitive_optional_dependencies, is_partial_workspace_selection,
+    FinalScope,
+    FreshPlan,
+    HostProbeInputs,
+    LockfileViews,
+    MaterializationScope,
+    PlanLockfiles,
+    PlanScope,
+    include_transitive_optional_dependencies,
+    is_partial_workspace_selection,
     plan_fresh_materialization,
 };
 
 mod resolution;
-use resolution::{ManifestSlots, Resolved, resolve_graph, start_early_materialization};
+use resolution::{
+    ManifestSlots,
+    Resolved,
+    resolve_graph,
+    start_early_materialization,
+};
 
 mod setup;
-use setup::{InstallShape, ResolverSetup, set_up_resolvers};
+use setup::{
+    InstallShape,
+    ResolverSetup,
+    set_up_resolvers,
+};
 
 mod materialization;
+mod override_warnings;
 use materialization::finish_resolved_install;
 
 mod errors;
 
 mod seed_policy;
 
-use crate::{PolicyExcludes, SkippedSnapshots};
+fn report_importing_done<Report: Reporter + 'static>(
+    observer: Option<&dyn crate::ResolutionObserver>,
+    requester: String,
+) {
+    if let Some(observer) = observer {
+        observer.flush_progress();
+    }
+    Report::emit(&LogEvent::Stage(pnpm_reporter::StageLog {
+        level: LogLevel::Debug,
+        prefix: requester,
+        stage: pnpm_reporter::Stage::ImportingDone,
+    }));
+}
+
+use crate::{
+    PolicyExcludes,
+    SkippedSnapshots,
+};
 use dashmap::DashMap;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{Config, NodeLinker};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+};
 use pnpm_lockfile::Lockfile;
 use pnpm_modules_yaml::IncludedDependencies;
 use pnpm_network::ThrottledClient;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::{
-    DeprecationLog, GlobalLog, HookLog, LogEvent, LogLevel, Reporter, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalParent, SkippedOptionalReason,
+    DeprecationLog,
+    HookLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalParent,
+    SkippedOptionalReason,
 };
 use pnpm_resolving_npm_resolver::InMemoryPackageMetaCache;
 use pnpm_resolving_resolver_base::ResolutionVerifier;
 use pnpm_tarball::MemCache;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
     path::Path,
-    sync::{Arc, atomic::AtomicU8},
+    sync::{
+        Arc,
+        atomic::AtomicU8,
+    },
 };
 use tokio::sync::watch;
 
@@ -75,7 +145,7 @@ mod resolver_setup;
 /// writer's materialization is complete, `save_path` is on disk).
 /// Second visitors subscribe to the sender before issuing their
 /// per-parent symlink so they don't race ahead of the first writer's
-/// `import_indexed_dir` — critical on Windows where `symlink_package`
+/// `import_indexed_dir`, critical on Windows where `symlink_package`
 /// may fall back to a junction, which requires the target directory
 /// to exist at creation time. Mirrors the implicit "wait until the
 /// shared slot is on disk" sequencing pnpm gets from running one
@@ -92,7 +162,7 @@ pub struct InstallWithFreshLockfile<'a> {
     pub(crate) owned: OwnedInputs,
     /// One entry per importer to resolve, keyed by the lockfile
     /// importer id (`"."` for the workspace root, POSIX-relative path
-    /// for sibling projects — see
+    /// for sibling projects; see
     /// [`pnpm_workspace::importer_id_from_root_dir`]). For a
     /// non-workspace install this carries a single `"."` entry
     /// pointing at the only project.
@@ -121,7 +191,7 @@ pub(crate) struct FreshInputs<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct FreshInstallDrivers<'a> {
     pub(crate) http_client: &'a ThrottledClient,
-    pub(crate) config: &'static Config,
+    pub(crate) config: &'a Config,
     /// Install-scoped dedupe state for `pnpm:package-import-method`.
     /// See `link_file::log_method_once`.
     pub(crate) logged_methods: &'a AtomicU8,
@@ -149,7 +219,7 @@ pub(crate) struct FreshInstallProjects<'a> {
     pub(crate) supported_architectures:
         Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
     /// A full workspace install versus a partial one (`pacquet add` and the
-    /// package installs built on it — `dlx`, global add, the engine install).
+    /// package installs built on it, `dlx`, global add, the engine install).
     /// See [`crate::ProjectMutation::is_full_install`]. Gates the `--no-optional`
     /// exclusion: only a full install's `dependency_groups` carries that
     /// intent, so a partial run must not drop transitive optionals.
@@ -192,7 +262,7 @@ pub(crate) struct FreshInstallExecution {
     pub(crate) policy_excludes: PolicyExcludes,
     /// pnpm's `saveLockfile`: whether the freshly built lockfile may be
     /// written to `<lockfile_dir>/pnpm-lock.yaml`. `false` leaves that
-    /// file untouched — the resolved graph is still returned and still
+    /// file untouched, the resolved graph is still returned and still
     /// drives `<install_state_dir>/lock.yaml`. See
     /// [`crate::Install::run_legacy_deploy`].
     pub(crate) save_lockfile: bool,
@@ -206,11 +276,19 @@ impl FreshInstallExecution {
     pub(crate) fn fetches_into_store(self) -> bool {
         self.resolve_only == Some(ResolveOnly::FetchIntoStore)
     }
+
+    /// Whether resolution reports each package's `resolved` progress. Every
+    /// other install reports it from the paths that fetch or link the
+    /// package, and a lockfile-only run has none.
+    pub(crate) fn reports_resolved_packages(self) -> bool {
+        self.resolve_only == Some(ResolveOnly::LockfileOnly)
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct FreshManifestOptions<'a> {
     pub(crate) deploy_hook: bool,
+    pub(crate) overrides_root_dir: Option<&'a Path>,
     /// The declared ranges `pacquet update` asks this run to move onto the
     /// versions it resolves, and the sink it reports them back through.
     /// `None` for every other install.
@@ -247,8 +325,8 @@ pub(crate) struct FreshPriorInstall<'a> {
 pub(crate) struct FreshLockfileSeeds<'a> {
     /// Existing `pnpm-lock.yaml` to seed `getPreferredVersionsFromLockfileAndManifests`
     /// with already-pinned `(name, version)` pairs. `Some` on the
-    /// stale-lockfile / `preferFrozenLockfile: false` rewrite path
-    /// — the resolver biases toward the seeded versions when they
+    /// stale-lockfile / `preferFrozenLockfile: false` rewrite path,
+    /// the resolver biases toward the seeded versions when they
     /// still satisfy the spec so unrelated dependencies keep their
     /// pins. `None` on the no-lockfile path. Corresponds to the
     /// `update: false` resolver mode.
@@ -331,11 +409,49 @@ pub(crate) struct OwnedInputs {
 
 /// The install's handles on the wanted lockfile: the background verification
 /// of the one on disk, and where a check run sends the one it would write.
+/// How a verification of the wanted lockfile an install saved can be
+/// recorded for the next install to find.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedLockfileRecord {
+    /// The file on disk is not the typed lockfile: it was not written, or
+    /// an `afterAllResolved` hook result replaced it. Record nothing.
+    Unrecordable,
+    /// Saved, but the platform kept no handle to read the written file's
+    /// metadata from. Record by content hash.
+    ByContent,
+    /// Saved at `path`, with `stat` read from the handle that wrote it.
+    /// A lockfile format that omits fields, such as v13 dropping
+    /// `deprecated`, reads back with a different content hash, so only this
+    /// record lets the next install skip verification.
+    AtPath { path: std::path::PathBuf, stat: pnpm_lockfile_verification::LockfileStat },
+}
+
+impl SavedLockfileRecord {
+    pub(crate) fn of_saved_file(
+        path: &std::path::Path,
+        metadata: Option<std::fs::Metadata>,
+    ) -> Self {
+        match metadata {
+            Some(metadata) => SavedLockfileRecord::AtPath {
+                path: path.to_path_buf(),
+                stat: pnpm_lockfile_verification::stat_from_metadata(&metadata),
+            },
+            None => SavedLockfileRecord::ByContent,
+        }
+    }
+
+    #[must_use]
+    pub fn is_recordable(&self) -> bool {
+        !matches!(self, SavedLockfileRecord::Unrecordable)
+    }
+}
+
 pub(crate) struct WantedLockfileHandles {
     /// The pre-resolve verification of the existing lockfile, running in
     /// the background while this install resolves and materializes. See
     /// [`crate::LockfileVerificationGate`].
     pub(crate) verification_gate: Option<crate::LockfileVerificationGate>,
+    pub(crate) exotic_subdeps: pnpm_lockfile_verification::ExoticSubdepsPolicy,
     /// Where a `lockfileCheck` run delivers the wanted lockfile instead of
     /// writing it. See [`crate::Install::run_lockfile_check`].
     pub(crate) check_sink: Option<crate::LockfileCheckSink>,
@@ -381,7 +497,7 @@ pub(crate) struct FreshProjectInputs {
     /// sees a `workspace:` spec. `None` when this install isn't inside
     /// a `pnpm-workspace.yaml` workspace; the resolver then errors out
     /// on any `workspace:` spec via
-    /// `ResolveFromWorkspaceError::WorkspacePackagesNotLoaded` — the
+    /// `ResolveFromWorkspaceError::WorkspacePackagesNotLoaded`, the
     /// `Cannot resolve package from workspace because opts.workspacePackages is not defined`
     /// behavior.
     pub(crate) workspace_packages: Option<Arc<pnpm_resolving_resolver_base::WorkspacePackages>>,
@@ -397,8 +513,8 @@ pub struct InstallWithFreshLockfileResult {
     pub hoisted: pnpm_deps_restorer::InstalledHoistedState,
     /// Importers the resolution left a peer-dependency issue under.
     /// Install completion renders its report from
-    /// [`Self::wanted_lockfile`] — which carries the resolved versions
-    /// the resolver's parent chains leave out — but walks only these
+    /// [`Self::wanted_lockfile`] (which carries the resolved versions
+    /// the resolver's parent chains leave out) but walks only these
     /// importers.
     pub peer_issue_importer_ids: HashSet<String>,
     /// The resolved [`Lockfile`] for the install. Retained in-memory to
@@ -406,19 +522,16 @@ pub struct InstallWithFreshLockfileResult {
     /// even when disk persistence of the wanted `pnpm-lock.yaml` is skipped
     /// (`config.lockfile=false` or `save_lockfile=false`).
     pub wanted_lockfile: Option<Lockfile>,
-    /// `true` when the wanted lockfile written to disk is the same
-    /// typed lockfile returned in [`Self::wanted_lockfile`]. A
-    /// non-null `afterAllResolved` hook result can mutate fields the
-    /// typed model tracks, so the caller must not record a verification
-    /// cache entry for that case.
-    pub can_record_lockfile_verification: bool,
+    /// How a verification of [`Self::wanted_lockfile`] can be recorded for
+    /// the next install to find.
+    pub saved_lockfile: SavedLockfileRecord,
     /// Sorted `name@version` keys whose build scripts were blocked by
     /// the `allowBuilds` policy. The caller raises
     /// `ERR_PNPM_IGNORED_BUILDS` from this list when `strictDepBuilds`
     /// is on (the default). Empty on the `lockfile_only` path, which
     /// never materializes or builds.
     pub ignored_builds: Vec<String>,
-    /// Dep paths whose build `--ignore-scripts` deferred — see
+    /// Dep paths whose build `--ignore-scripts` deferred; see
     /// [`crate::BuildModulesOutput::deferred_builds`]. The caller folds
     /// them into `.modules.yaml.pendingBuilds`. Empty on the
     /// `lockfile_only` path for the same reason as
@@ -427,7 +540,7 @@ pub struct InstallWithFreshLockfileResult {
     /// Installability-skipped optional snapshots. The outer install
     /// writer persists these into `.modules.yaml.skipped`.
     pub skipped: SkippedSnapshots,
-    /// The store-index writer task, already winding down — see
+    /// The store-index writer task, already winding down; see
     /// [`pnpm_deps_restorer::InstallFrozenLockfileOutput::store_index_teardown`]:
     /// every handle was dropped, the task is flushing its final batch
     /// and closing its `SQLite` connection (a WAL checkpoint). Await it
@@ -510,82 +623,82 @@ fn skipped_optional_log_fn<Reporter: self::Reporter>()
     })
 }
 
-/// Build the resolver's deprecation sink: each notification emits a
-/// `pnpm:deprecation` debug event through the install's reporter,
-/// matching pnpm's `deprecationLogger.debug` payload.
-fn deprecation_log_fn<Reporter: self::Reporter>() -> pnpm_resolving_deps_resolver::DeprecationLogFn
-{
-    Arc::new(|deprecation: pnpm_resolving_deps_resolver::Deprecation| {
-        Reporter::emit(&LogEvent::Deprecation(DeprecationLog {
-            level: LogLevel::Debug,
-            pkg_name: deprecation.pkg_name,
-            pkg_version: deprecation.pkg_version,
-            pkg_id: deprecation.pkg_id,
-            prefix: deprecation.prefix,
-            depth: deprecation.depth,
-            non_deprecated_alternative: deprecation.non_deprecated_alternative.map(|alt| {
-                pnpm_reporter::NonDeprecatedAlternative {
-                    version: alt.version,
-                    outside_declared_range: alt.outside_declared_range,
-                }
-            }),
-        }));
+/// A `pnpm:progress` `resolved` event for each package resolution adds to
+/// the graph, once per package across the walks of an automatic dedupe.
+fn resolved_progress_fn<Reporter: self::Reporter>(
+    requester: String,
+) -> pnpm_resolving_deps_resolver::ResolvedPackageFn {
+    let reported = dashmap::DashSet::<String>::new();
+    Arc::new(move |package_id| {
+        if reported.insert(package_id.to_owned()) {
+            Reporter::emit(&LogEvent::Progress(pnpm_reporter::ProgressLog {
+                level: LogLevel::Debug,
+                message: pnpm_reporter::ProgressMessage::Resolved {
+                    package_id: package_id.to_owned(),
+                    requester: requester.clone(),
+                },
+            }));
+        }
     })
 }
 
-/// The importer selection the patch-usage check is scoped by.
-#[derive(Clone, Copy)]
-struct PatchUsageScope<'a> {
-    real_importer_ids: Option<&'a HashSet<String>>,
-    selected_importer_ids: Option<&'a HashSet<String>>,
-    merge_wanted_lockfile: Option<&'a Lockfile>,
+/// The deprecations resolution reports. They are emitted once resolution
+/// ends, when each can be checked against the current lockfile, which the
+/// resolver's `'static` sink cannot borrow.
+#[derive(Default)]
+struct DeprecationCollector(Arc<std::sync::Mutex<Vec<pnpm_resolving_deps_resolver::Deprecation>>>);
+
+impl DeprecationCollector {
+    fn sink(&self) -> pnpm_resolving_deps_resolver::DeprecationLogFn {
+        let collected = Arc::clone(&self.0);
+        Arc::new(move |deprecation| {
+            collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(deprecation);
+        })
+    }
+
+    /// Emit a `pnpm:deprecation` event per collected deprecation, matching
+    /// pnpm's `deprecationLogger.debug` payload, flagged when `installed`
+    /// (the current lockfile) already has the package.
+    fn emit<Reporter: self::Reporter>(&self, installed: Option<&Lockfile>) {
+        let deprecations =
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let installed_packages = installed.and_then(|lockfile| lockfile.packages.as_ref());
+        for deprecation in deprecations {
+            let already_installed =
+                installed_packages.is_some_and(|packages| is_installed(packages, &deprecation));
+            Reporter::emit(&LogEvent::Deprecation(DeprecationLog {
+                level: LogLevel::Debug,
+                pkg_name: deprecation.pkg_name,
+                pkg_version: deprecation.pkg_version,
+                pkg_id: deprecation.pkg_id,
+                prefix: deprecation.prefix,
+                depth: deprecation.depth,
+                non_deprecated_alternative: deprecation
+                    .non_deprecated_alternative
+                    .map(|alt| pnpm_reporter::NonDeprecatedAlternative {
+                        version: alt.version,
+                        outside_declared_range: alt.outside_declared_range,
+                    }),
+                already_installed,
+            }));
+        }
+    }
 }
 
-/// Only in the fresh-lockfile path — a frozen lockfile trusts recorded
-/// patches. pnpm's importer-count gate admits an unfiltered run, or a filtered
-/// run whose root-augmented selection and previous wanted lockfile both cover
-/// the complete workspace. A first filtered install has no complete previous
-/// lockfile and skips this check.
-fn check_patch_usage<Reporter: self::Reporter>(
-    config: &Config,
-    patched_dependencies: Option<&pnpm_patching::PatchGroupRecord>,
-    applied_patches: &rustc_hash::FxHashSet<String>,
-    scope: PatchUsageScope<'_>,
-) -> Result<(), InstallWithFreshLockfileError> {
-    if !config.shares_one_lockfile() && config.workspace_dir.is_some() {
-        return Ok(());
-    }
-    let Some(deps) = patched_dependencies else { return Ok(()) };
-    let verify = match scope.selected_importer_ids {
-        None => true,
-        Some(selected_importer_ids) => {
-            !is_partial_workspace_selection(scope.real_importer_ids, Some(selected_importer_ids))
-                && scope.merge_wanted_lockfile.is_some_and(|wanted_lockfile| {
-                    wanted_lockfile.importers.len() == selected_importer_ids.len()
-                })
-        }
-    };
-    if !verify {
-        return Ok(());
-    }
-    match pnpm_patching::verify_patches(
-        deps,
-        &applied_patches
-            .iter()
-            .cloned()
-            .collect(),
-        config.allow_unused_patches,
-    ) {
-        Ok(None) => Ok(()),
-        Ok(Some(warning)) => {
-            Reporter::emit(&LogEvent::Global(GlobalLog {
-                level: LogLevel::Warn,
-                message: warning.to_string(),
-            }));
-            Ok(())
-        }
-        Err(err) => Err(InstallWithFreshLockfileError::UnusedPatch(err)),
-    }
+/// Whether `packages` has the deprecated package. Its id is the package's
+/// lockfile key, so a tarball or git resolution of the same version stays
+/// distinct from the registry one. An id that is no package key counts as
+/// not installed, which names the package rather than hiding it.
+fn is_installed(
+    packages: &std::collections::HashMap<pnpm_lockfile::PackageKey, pnpm_lockfile::PackageMetadata>,
+    deprecation: &pnpm_resolving_deps_resolver::Deprecation,
+) -> bool {
+    deprecation.pkg_id
+        .parse::<pnpm_lockfile::PackageKey>()
+        .is_ok_and(|key| packages.contains_key(&key.without_peer()))
 }
 
 /// Hand the per-importer peer issues to the programmatic caller before the
@@ -606,32 +719,6 @@ fn report_peer_issues(
             "Peer dependency issues detected (issue renderer not ported yet)",
         );
     }
-}
-
-/// No-op unless the run both parsed overrides and built an overrider for
-/// them; only then are the collected declared ranges complete enough for a
-/// staleness verdict.
-async fn warn_stale_convergence_overrides_if_any<Reporter: pnpm_reporter::Reporter>(
-    npm_resolver: &dyn pnpm_resolving_resolver_base::Resolver,
-    parsed_overrides: Option<&[pnpm_config_parse_overrides::VersionOverride]>,
-    versions_overrider: Option<&crate::VersionsOverrider>,
-    lockfile_dir: &Path,
-    published_by: (
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<&pnpm_config::version_policy::PackageVersionPolicy>,
-    ),
-) {
-    let (Some(parsed), Some(overrider)) = (parsed_overrides, versions_overrider) else { return };
-    let (published_by, published_by_exclude) = published_by;
-    resolve::warn_stale_convergence_overrides::<Reporter>(
-        npm_resolver,
-        parsed,
-        overrider,
-        lockfile_dir,
-        published_by,
-        published_by_exclude,
-    )
-    .await;
 }
 
 #[cfg(test)]

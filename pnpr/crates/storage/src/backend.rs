@@ -3,10 +3,16 @@ use async_trait::async_trait;
 use axum::body::Body;
 use object_store::UpdateVersion;
 use pnpr_error::Result;
-use pnpr_package_name::{CanonicalPackageName, Ecosystem};
+use pnpr_package_name::{
+    CanonicalPackageName,
+    Ecosystem,
+};
 use std::{
     fmt::Debug,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -42,7 +48,7 @@ pub(crate) trait HostedBackend: Debug + Send + Sync {
 
     /// Write only if the stored document is still at `version`. A backend
     /// without compare-and-set reports [`DocumentWrite::Written`]
-    /// unconditionally — it serializes writers by another means.
+    /// unconditionally; it serializes writers by another means.
     async fn write_document_if_current(
         &self,
         name: &CanonicalPackageName,
@@ -50,65 +56,58 @@ pub(crate) trait HostedBackend: Debug + Send + Sync {
         version: Option<&HostedDocumentVersion>,
     ) -> Result<DocumentWrite>;
 
-    async fn open_blob(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<Option<(Body, Option<u64>)>>;
+    // --- Archives ----------------------------------------------------------
+    //
+    // A namespace's archives are stored by key (see [`crate::BlobId::key`]),
+    // never by a public file name. A key is written only with the bytes its
+    // identity names, so a second write of one is a write of the same bytes.
 
-    async fn open_blob_range(
+    async fn open_archive(&self, key: &str) -> Result<Option<(Body, Option<u64>)>>;
+
+    async fn open_archive_range(
         &self,
-        name: &CanonicalPackageName,
-        filename: &str,
+        key: &str,
         range: &object_store::GetRange,
     ) -> Result<Option<crate::RangedBlob>>;
 
-    /// Reserve the local staging path the publish flow decodes into. Always
-    /// local: the bytes are verified on the way in, before the backend sees
-    /// them.
-    async fn reserve_blob_tmp(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<PathBuf>;
+    /// Reserve the local staging path an archive is written to before its
+    /// identity is known. Always local: the bytes are verified and hashed on
+    /// the way in, before the backend sees them.
+    async fn reserve_archive_tmp(&self) -> Result<PathBuf>;
 
-    /// Promote a staged blob to its final home, consuming the tmp file
-    /// unless the outcome is [`BlobFinalize::Conflict`] — those bytes stay
-    /// put for the caller to remove.
-    async fn finalize_blob(
-        &self,
-        tmp_path: &Path,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<BlobFinalize>;
+    /// Store the staged file at `tmp_path` under `key`, consuming it
+    /// whether or not it is stored.
+    async fn put_archive(&self, tmp_path: &Path, key: &str) -> Result<()>;
 
-    async fn remove_blob(&self, name: &CanonicalPackageName, filename: &str) -> Result<bool>;
+    /// The path [`Self::reserve_archive_tmp`] names its staging files
+    /// after, so files a process left behind when it stopped can be found.
+    fn archive_tmp_base(&self) -> PathBuf;
 
-    async fn remove_package(&self, name: &CanonicalPackageName) -> Result<bool>;
+    /// Remove the archive stored under `key`, reporting whether it was there.
+    async fn remove_archive(&self, key: &str) -> Result<bool>;
 
-    fn list_blob_files(&self)
-    -> futures_util::stream::BoxStream<'_, Result<crate::HostedBlobFile>>;
-
-    async fn list_package_blobs(&self, name: &CanonicalPackageName) -> Result<Vec<String>>;
+    /// Every name stored where the namespace keeps its archives, keys and
+    /// whatever else is there.
+    fn list_archives(&self) -> futures_util::stream::BoxStream<'_, Result<crate::StoredArchive>>;
 
     /// The names of the top-level directories (key prefixes) of this view.
     async fn list_top_level_dirs(&self) -> Result<Vec<String>>;
 
     /// A view rooted under `segment`, giving a hosted registry its own
-    /// namespace so two orgs hosting the same `name@version` never collide.
+    /// slice so two namespaces hosting the same `name@version` never collide.
     fn namespaced(&self, segment: &str) -> Arc<dyn HostedBackend>;
 
     /// A view that decodes package directories and object keys with
     /// `ecosystem`'s [`crate::layout::package_segments`] rules.
     fn with_ecosystem(&self, ecosystem: Ecosystem) -> Arc<dyn HostedBackend>;
 
-    /// What separates this backend's objects from another organization's.
+    /// What separates this backend's objects from another hosted slice's.
     ///
-    /// Two views with the same namespace address the same objects, and two
-    /// with different ones never do. It names an organization where the local
-    /// scratch root cannot: on the object-store backend every organization
-    /// stages through one directory, so a scratch path alone says nothing
-    /// about who owns what is in it.
+    /// Two views with the same prefix address the same objects, and two with
+    /// different ones never do. It names a namespace where the local scratch
+    /// root cannot: on the object-store backend every namespace stages
+    /// through one directory, so a scratch path alone says nothing about who
+    /// owns what is in it.
     fn namespace(&self) -> String;
 
     /// The local directory this backend stages blobs in. Local even when the
@@ -119,27 +118,22 @@ pub(crate) trait HostedBackend: Debug + Send + Sync {
     // --- Records ---------------------------------------------------------
     //
     // The store also holds what the registry itself keeps beside the packages:
-    // staged publishes waiting for approval, pipeline run records. Each such
-    // kind owns a reserved namespace of the hosted store — a dot-prefixed
-    // segment beside `packages/` — and addresses its records by a key within
+    // staged publish bodies and pipeline run records. Each such
+    // kind owns a reserved namespace of the hosted store (a dot-prefixed
+    // segment beside `packages/`) and addresses its records by a key within
     // it. `Storage` names the namespaces; a backend only maps a namespace and
     // key onto a path or an object key.
 
     async fn read_record(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Whether `namespace` holds at least one record.
+    async fn has_any_record(&self, namespace: &str) -> Result<bool>;
+
     /// Write a record where nothing is stored yet, reporting `false` when the
-    /// key is taken. Records that must not be rewritten — an approved-once
-    /// staged publish, an append-only run record — are created this way, so a
-    /// second writer is told rather than overwriting the first.
+    /// key is taken.
     async fn create_record(&self, namespace: &str, key: &str, bytes: &[u8]) -> Result<bool>;
 
     /// Replace a record only while it still holds `expected`.
-    ///
-    /// This is what makes a staged approval exclusive: the approving replica
-    /// rewrites the record it read, and a replica whose copy is no longer what
-    /// the store holds — because another approval claimed it, or a rejection
-    /// removed it — gets [`DocumentWrite::Conflict`] instead of acting on a
-    /// record that has moved on.
     async fn replace_record_if_current(
         &self,
         namespace: &str,
@@ -163,29 +157,16 @@ pub struct HostedDocumentForUpdate {
 
 /// What a backend needs to recognize the document it handed out, so a
 /// read-modify-write can refuse to clobber a concurrent publisher.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostedDocumentVersion {
     /// The backend offers no compare-and-set. It is single-writer by
     /// construction, so there is nothing to compare against.
     Unversioned,
     ObjectVersion(UpdateVersion),
-    /// The catalog generation that last changed the package, from a
+    /// The namespace generation that last changed the package, from a
     /// metadata backend that tracks generations.
     Generation(u64),
-}
-
-/// Outcome of promoting a staged blob into the hosted store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlobFinalize {
-    /// The blob was promoted: created on S3, or renamed into place on the
-    /// single-node FS backend, which owns its store exclusively.
-    Written,
-    /// An object with byte-identical content already occupied the key, so
-    /// promotion was a no-op. Safe — the published artifact is exactly ours.
-    AlreadyIdentical,
-    /// A *different* object already occupies the key: a concurrent publisher
-    /// won this version's blob. A published version's blob is immutable,
-    /// so the caller must not overwrite it and should surface a write conflict
-    /// rather than advertise an integrity that no longer matches the bytes.
-    Conflict,
+    /// The package had no stored document, and its removal tombstone listed
+    /// these owners.
+    Tombstone(Vec<String>),
 }

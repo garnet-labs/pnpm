@@ -1,14 +1,39 @@
 use super::{
-    AgentSkillsError, SyncAgentSkills, agent_skills_dir_from_env, decide_sources,
-    detected_agent_dirs, discover_skill_sources, discovery::SkillSource, sync_agent_skills,
+    AgentSkillsError,
+    SyncAgentSkills,
+    agent_skills_dir_from_env,
+    decide_sources,
+    detected_agent_dirs,
+    discover_skill_sources,
+    discovery::SkillSource,
+    sync_agent_skills,
 };
-use crate::{SkillsPolicy, VersionPolicyError};
-use derive_more::{Display, Error};
+use crate::{
+    SkillsPolicy,
+    VersionPolicyError,
+};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
-use pnpm_lockfile::{LoadLockfileError, Lockfile};
-use pnpm_modules_yaml::{Host, ReadModulesError, WriteModulesError};
-use std::{collections::BTreeMap, path::Path};
+use pnpm_lockfile::{
+    LoadLockfileError,
+    Lockfile,
+};
+use pnpm_modules_yaml::{
+    Host,
+    ReadModulesError,
+    WriteModulesError,
+};
+use std::{
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    path::Path,
+};
 
 /// Errors from [`resync_installed_agent_skills`].
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -53,6 +78,23 @@ pub(crate) fn resync_agent_skills_at(
     workspace_root: &Path,
     current_lockfile: Option<&Lockfile>,
 ) -> Result<Vec<String>, ResyncAgentSkillsError> {
+    resync_agent_skills_dep_paths_at(config, workspace_root, current_lockfile)
+        .map(|dep_paths| {
+            dep_paths
+                .iter()
+                .map(|dep_path| crate::skill_approval_key(dep_path))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+}
+
+/// Resync installed skills and return the dependency paths awaiting approval.
+pub(crate) fn resync_agent_skills_dep_paths_at(
+    config: &Config,
+    workspace_root: &Path,
+    current_lockfile: Option<&Lockfile>,
+) -> Result<Vec<String>, ResyncAgentSkillsError> {
     let Some(mut modules) = pnpm_modules_yaml::read_modules_manifest::<Host>(&config.modules_dir)
         .map_err(ResyncAgentSkillsError::ReadModules)?
     else {
@@ -77,12 +119,12 @@ pub(crate) fn resync_agent_skills_at(
         hoisted_locations: modules.hoisted_locations.as_ref(),
     })
     .map_err(ResyncAgentSkillsError::Sync)?;
-    let pending_keys = state.pending_keys();
+    let pending_dep_paths = state.pending.clone();
     if state.update_modules(&mut modules) {
         pnpm_modules_yaml::write_modules_manifest::<Host>(&config.modules_dir, modules)
             .map_err(ResyncAgentSkillsError::WriteModules)?;
     }
-    Ok(pending_keys)
+    Ok(pending_dep_paths)
 }
 
 /// Errors from [`skill_approval_options`].
@@ -155,17 +197,16 @@ pub fn skill_approval_options(
 }
 
 fn pending_skills_by_key(pending: Vec<SkillSource>) -> BTreeMap<String, Vec<String>> {
-    pending
+    let mut by_key: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for source in pending {
+        let names = by_key.entry(source.approval_key).or_default();
+        for skill in source.skills {
+            names.insert(skill.name);
+        }
+    }
+    by_key
         .into_iter()
-        .map(|source| {
-            (
-                source.approval_key,
-                source.skills
-                    .into_iter()
-                    .map(|skill| skill.name)
-                    .collect(),
-            )
-        })
+        .map(|(key, names)| (key, names.into_iter().collect()))
         .collect()
 }
 

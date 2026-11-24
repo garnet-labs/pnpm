@@ -1,6 +1,11 @@
 use super::{
-    EngineMode, HashMap, NodeApiProject, TestRegistry, install_options,
-    reject_non_object_manifests, run_install_inner,
+    EngineMode,
+    HashMap,
+    NodeApiProject,
+    TestRegistry,
+    install_options,
+    reject_non_object_manifests,
+    run_install_inner,
 };
 
 #[test]
@@ -28,7 +33,7 @@ fn non_object_project_manifests_are_rejected() {
 }
 
 /// The `pnpm fetch` shape: every importer the lockfile records is imported
-/// into the virtual store, and nothing is linked out of it — no importer
+/// into the virtual store, and nothing is linked out of it, no importer
 /// symlink for a direct dependency, and no top-level `.bin` entry. The
 /// in-memory manifests are ignored entirely, so an empty one still fetches
 /// the whole recorded graph.
@@ -96,7 +101,7 @@ fn ignore_package_manifest_populates_the_virtual_store_without_linking() {
 }
 
 /// A fetch-shaped install reads the lockfile by definition, so an ambient
-/// `lockfile: false` must not disable it — that would leave the mode with
+/// `lockfile: false` must not disable it, that would leave the mode with
 /// nothing to materialize from and fail with `ERR_PNPM_NO_LOCKFILE`.
 #[test]
 fn ignore_package_manifest_survives_an_ambient_lockfile_false() {
@@ -152,7 +157,7 @@ fn ignore_package_manifest_survives_an_ambient_lockfile_false() {
 }
 
 /// The fetch shape covers every importer the lockfile records, not just the
-/// ones the caller named — pnpm's `initialImporterIds` under
+/// ones the caller named, pnpm's `initialImporterIds` under
 /// `ignorePackageManifest`. Here the caller passes only the workspace root
 /// while the dependency belongs to a member project.
 #[test]
@@ -318,7 +323,7 @@ fn repeat_install_with_unchanged_in_memory_manifest_needs_no_registry() {
 }
 
 /// A workspace whose `lib` project is injected into `app`, with an importer
-/// manifest that drops the dependencies its `dependencyManifest` declares —
+/// manifest that drops the dependencies its `dependencyManifest` declares,
 /// the shape Bit passes after transforming its importer manifests. One of
 /// them injects the `util` project through `workspace:*`; another is also a
 /// peer, which `app` provides at a version the dependency spec rejects.
@@ -403,10 +408,12 @@ fn repeat_install_compares_injected_project_with_its_dependency_manifest() {
     // `lib@file+lib(@pnpm.e2e+foo@100.1.0)`.
     let injected_lib_deps = std::fs::read_dir(root_dir.join("node_modules/.pnpm"))
         .expect("read the virtual store")
-        .map(|entry| entry.expect("virtual store entry").path())
+        .map(|entry| entry.expect("virtual store entry"))
+        .map(|value| value.path())
         .find(|path| {
             path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("lib@file+lib"))
+                .map(std::ffi::OsStr::to_string_lossy)
+                .is_some_and(|text| text.starts_with("lib@file+lib"))
         })
         .expect("the injected lib's slot")
         .join("node_modules");
@@ -433,4 +440,149 @@ fn repeat_install_compares_injected_project_with_its_dependency_manifest() {
     run_install_inner(&options, None, EngineMode::Install(None))
         .expect("the frozen install accepts the lockfile");
     assert!(injected_foo.exists());
+}
+
+/// A lone in-memory project in a workspace replaces the workspace walk, so a
+/// member `package.json` on disk never becomes an importer.
+#[test]
+fn a_single_project_does_not_walk_the_workspace_globs() {
+    let registry = TestRegistry::start();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root_dir = temp_dir.path().join("workspace");
+    let member_dir = root_dir.join("packages/member");
+    std::fs::create_dir_all(&member_dir).expect("create member dir");
+    std::fs::write(root_dir.join("package.json"), "{}\n").expect("write root package.json");
+    std::fs::write(
+        member_dir.join("package.json"),
+        r#"{"name":"member","dependencies":{"@pnpm.e2e/hello-world-js-bin":"1.0.0"}}"#,
+    )
+    .expect("write member package.json");
+    std::fs::write(root_dir.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write workspace yaml");
+
+    let root_dir_string = root_dir.to_string_lossy().into_owned();
+    let mut options = install_options();
+    options.dir = root_dir_string.clone();
+    options.projects = vec![NodeApiProject {
+        root_dir: root_dir_string,
+        manifest: serde_json::json!({ "name": "root" }),
+        dependency_manifest: None,
+    }];
+    options.store_dir = Some(
+        temp_dir
+            .path()
+            .join("store")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    options.registries = Some(HashMap::from([("default".to_string(), registry.url().to_string())]));
+    options.lockfile_only = Some(true);
+    run_install_inner(&options, None, EngineMode::Install(None)).expect("install");
+
+    let lockfile = std::fs::read_to_string(root_dir.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(!lockfile.contains("packages/member"), "{lockfile}");
+    assert!(!lockfile.contains("hello-world-js-bin"), "{lockfile}");
+}
+
+/// An `ignorePackageManifest` install reads only the lockfile, so it accepts
+/// an empty `projects` list.
+#[test]
+fn ignore_package_manifest_accepts_no_projects() {
+    let registry = TestRegistry::start();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    std::fs::write(project_dir.join("package.json"), "{}\n").expect("write package.json");
+
+    let project_dir_string = project_dir.to_string_lossy().into_owned();
+    let mut options = install_options();
+    options.dir = project_dir_string.clone();
+    options.projects = vec![NodeApiProject {
+        root_dir: project_dir_string,
+        manifest: serde_json::json!({
+            "dependencies": { "@pnpm.e2e/hello-world-js-bin": "1.0.0" }
+        }),
+        dependency_manifest: None,
+    }];
+    options.store_dir = Some(
+        temp_dir
+            .path()
+            .join("store")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    options.registries = Some(HashMap::from([("default".to_string(), registry.url().to_string())]));
+    options.lockfile_only = Some(true);
+    run_install_inner(&options, None, EngineMode::Install(None)).expect("seed the lockfile");
+    options.lockfile_only = None;
+
+    options.projects.clear();
+    let Err(error) = run_install_inner(&options, None, EngineMode::Install(None)) else {
+        panic!("an install without the project at `dir` must be rejected");
+    };
+    assert!(error.reason.contains(r#""code":"ERR_PNPM_INVALID_OPTION""#), "{}", error.reason);
+
+    options.ignore_package_manifest = Some(true);
+    run_install_inner(&options, None, EngineMode::Install(None)).expect("fetch-shaped install");
+    let fetched = std::fs::read_dir(project_dir.join("node_modules/.pnpm"))
+        .expect("read the virtual store")
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("@pnpm.e2e+hello-world-js-bin")
+        });
+    assert!(fetched, "the locked dependency must be fetched");
+}
+
+/// With no projects, an `ignorePackageManifest` install still reads no member
+/// manifest, so a malformed one does not stop the fetch.
+#[test]
+fn ignore_package_manifest_without_projects_skips_member_manifests() {
+    let registry = TestRegistry::start();
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root_dir = temp_dir.path().join("workspace");
+    let member_dir = root_dir.join("packages/member");
+    std::fs::create_dir_all(&member_dir).expect("create member dir");
+    std::fs::write(root_dir.join("package.json"), "{}\n").expect("write root package.json");
+    std::fs::write(member_dir.join("package.json"), "{ not json").expect("write member manifest");
+    std::fs::write(root_dir.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write workspace yaml");
+
+    let root_dir_string = root_dir.to_string_lossy().into_owned();
+    let mut options = install_options();
+    options.dir = root_dir_string.clone();
+    options.projects = vec![NodeApiProject {
+        root_dir: root_dir_string,
+        manifest: serde_json::json!({
+            "dependencies": { "@pnpm.e2e/hello-world-js-bin": "1.0.0" }
+        }),
+        dependency_manifest: None,
+    }];
+    options.store_dir = Some(
+        temp_dir
+            .path()
+            .join("store")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    options.registries = Some(HashMap::from([("default".to_string(), registry.url().to_string())]));
+    options.lockfile_only = Some(true);
+    run_install_inner(&options, None, EngineMode::Install(None)).expect("seed the lockfile");
+    options.lockfile_only = None;
+
+    options.projects.clear();
+    options.ignore_package_manifest = Some(true);
+    run_install_inner(&options, None, EngineMode::Install(None)).expect("fetch-shaped install");
+    let fetched = std::fs::read_dir(root_dir.join("node_modules/.pnpm"))
+        .expect("read the virtual store")
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("@pnpm.e2e+hello-world-js-bin")
+        });
+    assert!(fetched, "the locked dependency must be fetched");
 }

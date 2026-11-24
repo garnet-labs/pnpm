@@ -7,21 +7,36 @@
 //! [`super::resolve`].
 
 use super::{
-    InstallWithFreshLockfileError, compose_manifest_hooks, parse_config_overrides,
+    InstallWithFreshLockfileError,
+    compose_manifest_hooks,
+    parse_config_overrides,
     resolved_overrides_map,
 };
 use crate::{
-    VersionsOverrider, apply_deploy_manifest_hook, install::apply_deploy_manifest_hook_to_arc,
-    package_extender::InvalidPackageExtensionSelector,
+    InvalidPackageExtensionSelector,
+    VersionsOverrider,
+    apply_deploy_manifest_hook,
+    install::apply_deploy_manifest_hook_to_arc,
 };
 use indexmap::IndexMap;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
-use pnpm_matcher::{Matcher, create_matcher};
+use pnpm_matcher::{
+    Matcher,
+    create_matcher,
+};
+use pnpm_package_extensions::DependencyManifestExtensions;
 use pnpm_package_manifest::PackageManifest;
-use pnpm_resolving_deps_resolver::{DependencyOverrider, ManifestHook};
+use pnpm_resolving_deps_resolver::{
+    DependencyOverrider,
+    ManifestHook,
+};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::Arc,
+};
 
 /// pnpm's built-in read-package hook chain for the manifests fresh
 /// resolution consumes, plus the pieces later phases read off it.
@@ -36,6 +51,9 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 /// injection, the overrides, or the removal.
 pub(super) struct ManifestTransforms {
     pub parsed_overrides: Option<Vec<pnpm_config_parse_overrides::VersionOverride>>,
+    /// `parsed_overrides` in the form the resolver attributes missing
+    /// versions with.
+    pub override_entries: Option<Arc<[pnpm_resolving_deps_resolver::OverrideEntry]>>,
     pub resolved_overrides: Option<IndexMap<String, String>>,
     pub package_extensions_checksum: Option<String>,
     pub versions_overrider: Option<Arc<VersionsOverrider>>,
@@ -52,17 +70,29 @@ pub(super) fn build_manifest_transforms(
     lockfile_dir: &Path,
     importer_manifests: &BTreeMap<String, &PackageManifest>,
     deploy_manifest_hook: bool,
+    overrides_root_dir: Option<&Path>,
 ) -> Result<ManifestTransforms, InstallWithFreshLockfileError> {
     let parsed_overrides = parse_config_overrides(config, catalogs)?;
     let versions_overrider = parsed_overrides
         .as_ref()
-        .map(|parsed| Arc::new(VersionsOverrider::new(parsed, lockfile_dir)));
+        .map(|parsed| {
+            Arc::new(
+                VersionsOverrider::new(
+                    parsed,
+                    overrides_root_dir.unwrap_or_else(|| {
+                        config.root_project_manifest_dir(lockfile_dir)
+                    }),
+                )
+                .with_catalogs(catalogs),
+            )
+        });
     let transforms =
         ImporterTransforms::new(config, versions_overrider.clone(), deploy_manifest_hook)
             .map_err(InstallWithFreshLockfileError::InvalidPackageExtensionSelector)?;
     let effective_importer_manifests = transforms.apply_to_all(importer_manifests);
     Ok(ManifestTransforms {
         resolved_overrides: parsed_overrides.as_deref().map(resolved_overrides_map),
+        override_entries: parsed_overrides.as_deref().map(override_entries),
         package_extensions_checksum: super::compute_package_extensions_checksum(config),
         parsed_overrides,
         versions_overrider,
@@ -102,22 +132,11 @@ pub(crate) fn resolver_manifest_hooks(
     Ok(ImporterTransforms::new(config, versions_overrider, false)?.into_hooks())
 }
 
-/// The user's `packageExtensions`, when they extend anything at all.
-fn configured_package_extender(
-    config: &Config,
-) -> Result<Option<Arc<crate::PackageExtender>>, InvalidPackageExtensionSelector> {
-    let Some(extensions) = config.package_extensions.as_ref() else { return Ok(None) };
-    let extender = crate::PackageExtender::new(extensions)?;
-    Ok((!extender.is_empty()).then(|| Arc::new(extender)))
-}
-
 /// Everything that rewrites an importer's manifest before the resolve reads
 /// it. An empty overrider is dropped at construction: it would rewrite
 /// nothing and install hooks that rewrite nothing.
 struct ImporterTransforms {
-    compat_package_extender: Option<&'static crate::PackageExtender>,
-    package_extender: Option<Arc<crate::PackageExtender>>,
-    add_missing_peer_types: bool,
+    dependency_extensions: Arc<DependencyManifestExtensions>,
     versions_overrider: Option<Arc<VersionsOverrider>>,
     deploy_manifest_hook: bool,
     ignored_optional_matcher: Matcher,
@@ -152,11 +171,7 @@ impl ImporterTransforms {
         deploy_manifest_hook: bool,
     ) -> Result<Self, InvalidPackageExtensionSelector> {
         Ok(Self {
-            compat_package_extender: (!config.ignore_compatibility_db).then(
-                crate::compat_package_extensions::compat_package_extender,
-            ),
-            package_extender: configured_package_extender(config)?,
-            add_missing_peer_types: config.add_missing_peer_types,
+            dependency_extensions: Arc::new(DependencyManifestExtensions::from_config(config)?),
             versions_overrider: versions_overrider.filter(|overrider| !overrider.is_empty()),
             deploy_manifest_hook,
             ignored_optional_matcher: create_matcher(
@@ -166,7 +181,7 @@ impl ImporterTransforms {
     }
 
     fn is_active(&self) -> bool {
-        self.package_extender.is_some()
+        self.dependency_extensions.configured().is_some()
             || self.versions_overrider.is_some()
             || self.deploy_manifest_hook
             || !self.ignored_optional_matcher.is_empty()
@@ -180,8 +195,8 @@ impl ImporterTransforms {
         if !self.is_active() {
             return BTreeMap::new();
         }
-        // Every importer's transform is independent — a clone of its own
-        // manifest plus in-place rewrites — so a workspace-scale set fans
+        // Every importer's transform is independent (a clone of its own
+        // manifest plus in-place rewrites) so a workspace-scale set fans
         // out across rayon. The rebuilt `BTreeMap` restores the ordering
         // regardless of completion order.
         use rayon::prelude::*;
@@ -192,24 +207,10 @@ impl ImporterTransforms {
     }
 
     fn manifest_hook(&self) -> Option<ManifestHook> {
-        let compat_package_extensions_hook: Option<ManifestHook> = self
-            .compat_package_extender
-            .map(|extender| {
-                Arc::new(move |manifest| extender.apply_to_arc(manifest)) as ManifestHook
-            });
-        let package_extensions_hook: Option<ManifestHook> = self
-            .package_extender
-            .as_ref()
-            .map(|extender| {
-                let extender = Arc::clone(extender);
-                Arc::new(move |manifest| extender.apply_to_arc(manifest)) as ManifestHook
-            });
-        let add_missing_peer_types_hook: Option<ManifestHook> = self
-            .add_missing_peer_types
-            .then(|| Arc::new(crate::missing_peer_types::add_missing_peer_types) as ManifestHook);
-        [compat_package_extensions_hook, package_extensions_hook, add_missing_peer_types_hook]
-            .into_iter()
-            .fold(None, compose_manifest_hooks)
+        (!self.dependency_extensions.is_empty()).then(|| {
+            let extensions = Arc::clone(&self.dependency_extensions);
+            Arc::new(move |manifest| extensions.apply(manifest)) as ManifestHook
+        })
     }
 
     fn override_bare_specifier(&self) -> Option<Arc<DependencyOverrider>> {
@@ -261,7 +262,7 @@ fn transform_importer_manifest(
     transforms: &ImporterTransforms,
 ) -> PackageManifest {
     let mut cloned = manifest.clone();
-    if let Some(extender) = transforms.package_extender.as_deref() {
+    if let Some(extender) = transforms.dependency_extensions.configured() {
         extender.apply(cloned.value_mut());
     }
     if transforms.deploy_manifest_hook {
@@ -284,7 +285,7 @@ fn transform_importer_manifest(
 /// The `optionalDependencies` entries `ignoredOptionalDependencies` matches.
 ///
 /// Callers query this before mutating, so a shared manifest with no match
-/// skips the copy-on-write clone — the common case across the thousands of
+/// skips the copy-on-write clone, the common case across the thousands of
 /// dependency manifests one resolve reads.
 fn ignored_optional_names(manifest: &Value, matcher: &Matcher) -> Vec<String> {
     if matcher.is_empty() {
@@ -311,4 +312,22 @@ fn remove_ignored_dependencies(manifest: &mut Value, ignored: &[String]) {
             }
         }
     }
+}
+
+fn override_entries(
+    overrides: &[pnpm_config_parse_overrides::VersionOverride],
+) -> Arc<[pnpm_resolving_deps_resolver::OverrideEntry]> {
+    overrides
+        .iter()
+        .map(|entry| pnpm_resolving_deps_resolver::OverrideEntry {
+            selector: entry.selector.clone(),
+            parent_name: entry.parent_pkg.as_ref().map(|parent| parent.name.clone()),
+            parent_range: entry.parent_pkg
+                .as_ref()
+                .and_then(|parent| parent.bare_specifier.clone()),
+            name: entry.target_pkg.name.clone(),
+            selector_range: entry.target_pkg.bare_specifier.clone(),
+            new_bare_specifier: entry.new_bare_specifier.clone(),
+        })
+        .collect()
 }

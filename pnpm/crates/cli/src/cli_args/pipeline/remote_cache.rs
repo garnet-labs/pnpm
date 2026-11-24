@@ -7,24 +7,67 @@
 //! under `outputs/`. A verified artifact is written into the local tier and
 //! restored from there through the same checks as a local entry.
 
-use super::cache::{StoredTask, TaskCache};
-use futures_util::{StreamExt as _, TryStreamExt as _, stream};
+use super::cache::{
+    StoredTask,
+    TaskCache,
+};
+use futures_util::{
+    StreamExt as _,
+    TryStreamExt as _,
+    stream,
+};
+#[cfg(unix)]
+use pipe_trait::Pipe as _;
 use pnpm_config::Config;
+use pnpm_deps_restorer::{
+    artifact_signer_settings,
+    artifact_store_options,
+};
 use pnpm_pnpr_client::{
-    ArtifactBlobRequest, ArtifactBlobSource, ArtifactBuildPolicy, ArtifactCandidate, ArtifactFile,
-    ArtifactManifest, ArtifactPayload, ArtifactPublication, ArtifactSigner, ArtifactStore,
-    ArtifactSubject, CompatibilityConstraints, OwnerScope, ResolveArtifactsOptions,
-    VerifiedArtifact, WORKSPACE_TASK_ARTIFACT_KIND, WORKSPACE_TASK_INPUT_KEY_PREFIX,
+    ArtifactBlobRequest,
+    ArtifactBlobSource,
+    ArtifactBuildPolicy,
+    ArtifactCandidate,
+    ArtifactFile,
+    ArtifactManifest,
+    ArtifactPayload,
+    ArtifactPublication,
+    ArtifactSigner,
+    ArtifactStore,
+    ArtifactSubject,
+    CompatibilityConstraints,
+    OwnerScope,
+    ResolveArtifactsOptions,
+    VerifiedArtifact,
+    WORKSPACE_TASK_ARTIFACT_KIND,
+    WORKSPACE_TASK_INPUT_KEY_PREFIX,
     decode_trusted_keys,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
     fs,
-    io::{self, Read as _},
-    path::{Component, Path},
-    sync::{Arc, Mutex},
+    io::{
+        self,
+        Read as _,
+    },
+    path::{
+        Component,
+        Path,
+    },
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
-use tokio::{runtime::Handle, sync::Semaphore, task::JoinHandle};
+use tokio::{
+    runtime::Handle,
+    sync::Semaphore,
+    task::JoinHandle,
+};
 
 /// A task as the artifact's subject names it.
 pub(super) struct TaskIdentity<'a> {
@@ -59,8 +102,8 @@ impl RemoteTaskCache {
     /// artifacts. `Err` with the reason when the configuration cannot work.
     pub(super) fn open(config: &Config) -> Result<Option<RemoteTaskCache>, String> {
         let settings = config.remote_cache_settings();
-        let Some(store) =
-            ArtifactStore::from_config(config, &settings).map_err(|error| error.to_string())?
+        let Some(store) = ArtifactStore::from_options(artifact_store_options(config, &settings))
+            .map_err(|error| error.to_string())?
         else {
             return Ok(None);
         };
@@ -82,11 +125,12 @@ impl RemoteTaskCache {
         // not agreed to share task outputs and their logs.
         let publishes_tasks = config.remote_cache
             .as_ref()
-            .is_some_and(|remote_cache| remote_cache.publish == Some(true));
+            .is_some_and(|remote_cache| remote_cache.publish.unwrap_or(false));
         let publisher = publishes_tasks
             .then(|| {
-                ArtifactSigner::from_settings(&settings)
-                    .map(|signer| Arc::new(TaskPublisher(signer)))
+                ArtifactSigner::from_settings(artifact_signer_settings(&settings))
+                    .map(TaskPublisher)
+                    .map(Arc::new)
             })
             .transpose()?;
         Ok(Some(RemoteTaskCache {
@@ -302,8 +346,11 @@ fn artifact_file(entry_dir: &Path, path: String) -> io::Result<(ArtifactFile, Ar
 fn is_executable(path: &Path) -> io::Result<bool> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        Ok(pnpm_fs::file_mode::is_executable(fs::metadata(path)?.permissions().mode()))
+        path.pipe(fs::metadata)?
+            .permissions()
+            .pipe_ref(pnpm_fs::FileMode::from_permissions)
+            .pipe(pnpm_fs::file_mode::is_executable)
+            .pipe(Ok)
     }
     #[cfg(not(unix))]
     {

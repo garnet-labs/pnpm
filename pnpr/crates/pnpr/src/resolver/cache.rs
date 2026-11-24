@@ -1,25 +1,47 @@
 use std::{
     collections::HashMap,
     sync::Mutex,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
-use pnpm_config::Config as PacquetConfig;
 use pnpm_lockfile::Lockfile;
 use pnpm_lockfile_verification::hash_lockfile;
-use sha2::{Digest, Sha256};
+use sha2::{
+    Digest,
+    Sha256,
+};
 
 use pnpr_policy::Identity;
-use pnpr_route::{Footprint, RouteContext};
+use pnpr_route::{
+    Footprint,
+    RouteContext,
+};
 
-use super::protocol::ResolveRequest;
+use super::{
+    config_cache::{
+        CONFIG_KEY,
+        ConfigKeyInputs,
+        KeyPart,
+        key_value,
+    },
+    protocol::ResolveRequest,
+};
 
 pub(super) struct CachedResolution {
     lockfile: Lockfile,
+    allowed_picks: Vec<String>,
     inserted: Instant,
     last_used: Instant,
     pub(super) footprint: Footprint,
     descriptor_digest: Option<String>,
+}
+
+pub(super) struct CachedResolutionResult {
+    pub(super) lockfile: Lockfile,
+    pub(super) allowed_picks: Vec<String>,
 }
 
 pub(super) const MAX_RESOLUTION_CACHE_ENTRIES: usize = 1024;
@@ -31,7 +53,7 @@ pub(super) fn cached_resolution(
     key: &str,
     route_context: &RouteContext,
     identity: &Identity,
-) -> Option<Lockfile> {
+) -> Option<CachedResolutionResult> {
     if ttl.is_zero() {
         return None;
     }
@@ -52,16 +74,20 @@ pub(super) fn cached_resolution(
     };
     let candidate = &mut candidates[candidate_index];
     candidate.last_used = Instant::now();
-    Some(candidate.lockfile.clone())
+    Some(CachedResolutionResult {
+        lockfile: candidate.lockfile.clone(),
+        allowed_picks: candidate.allowed_picks.clone(),
+    })
 }
 
-pub(super) fn store_resolution(
+pub(super) fn store_resolution_with_allowed_picks(
     cache: &Mutex<HashMap<String, Vec<CachedResolution>>>,
     ttl: Duration,
     key: String,
     footprint: Footprint,
     secret: &[u8],
     lockfile: &Lockfile,
+    allowed_picks: Vec<String>,
 ) -> bool {
     if ttl.is_zero() {
         return false;
@@ -70,6 +96,7 @@ pub(super) fn store_resolution(
     let descriptor_digest = footprint.digest(secret);
     let candidate = CachedResolution {
         lockfile: lockfile.clone(),
+        allowed_picks,
         inserted: now,
         last_used: now,
         footprint,
@@ -93,6 +120,44 @@ pub(super) fn store_resolution(
         }
     }
     true
+}
+
+/// What a finished resolution offers the resolution cache.
+pub(super) struct StoreCandidate<'a> {
+    pub(super) cache: &'a Mutex<HashMap<String, Vec<CachedResolution>>>,
+    pub(super) cache_ttl: Duration,
+    pub(super) key: String,
+    pub(super) footprint: &'a Mutex<Footprint>,
+    pub(super) cache_secret: &'a [u8],
+    pub(super) lockfile: &'a Lockfile,
+    pub(super) allowed_picks: &'a [String],
+}
+
+/// Offer a finished resolution to the cache, logging what a private one was
+/// judged on.
+pub(super) fn store_resolution_candidate(candidate: StoreCandidate<'_>) {
+    let footprint = candidate.footprint
+        .lock()
+        .expect("footprint poisoned")
+        .clone();
+    let descriptor = footprint.digest(candidate.cache_secret);
+    let cached = store_resolution_with_allowed_picks(
+        candidate.cache,
+        candidate.cache_ttl,
+        candidate.key,
+        footprint.clone(),
+        candidate.cache_secret,
+        candidate.lockfile,
+        candidate.allowed_picks.to_vec(),
+    );
+    if footprint.is_public() {
+        return;
+    }
+    tracing::debug!(
+        cached,
+        descriptor = descriptor.as_deref().unwrap_or("none"),
+        "private resolution cache candidate evaluated",
+    );
 }
 
 fn prune_expired_resolution_cache(
@@ -181,42 +246,55 @@ fn lru_resolution_candidate(
         .min_by_key(|(_, _, last_used)| *last_used)
 }
 
-pub(super) fn resolution_cache_key(
-    config: &PacquetConfig,
-    request: &ResolveRequest,
-) -> Option<String> {
+/// The parts the resolution cache key carries beyond [`CONFIG_KEY`].
+pub(super) const RESOLUTION_KEY: &[KeyPart] = &[
+    // Raw, unlike the config key's parsed view: the frozen fast path reads
+    // the request's own value.
+    KeyPart { fields: &["overrides"], value: |request, _| serde_json::json!(request.overrides) },
+    KeyPart { fields: &["catalogs"], value: |request, _| serde_json::json!(request.catalogs) },
+    KeyPart {
+        fields: &[
+            "projects",
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ],
+        value: |request, _| serde_json::Value::Array(cache_key_projects(request)),
+    },
+    KeyPart {
+        fields: &["lockfile"],
+        value: |request, _| serde_json::json!(request.lockfile.as_ref().map(hash_lockfile)),
+    },
+    KeyPart {
+        fields: &["frozenLockfile"],
+        value: |request, _| serde_json::json!(request.frozen_lockfile),
+    },
+    KeyPart {
+        fields: &["preferFrozenLockfile"],
+        value: |request, _| serde_json::json!(request.prefer_frozen_lockfile),
+    },
+    KeyPart {
+        fields: &["ignoreManifestCheck"],
+        value: |request, _| serde_json::json!(request.ignore_manifest_check),
+    },
+    KeyPart {
+        fields: &["trustLockfile"],
+        value: |request, _| serde_json::json!(request.trust_lockfile),
+    },
+];
+
+pub(super) fn resolution_cache_key(request: &ResolveRequest) -> Option<String> {
     // Explicit metadata refreshes must not repeat an old registry selection
     // from the whole-resolution cache.
-    if request.update_patches || request.fix_lockfile {
+    if request.update_patches || request.update_checksums || request.fix_lockfile {
         return None;
     }
-    let projects = cache_key_projects(request);
-    let input = serde_json::json!({
-        "registry": &config.registry,
-        "registries": &request.registries,
-        "overrides": &request.overrides,
-        "catalogs": &request.catalogs,
-        "patchedDependencies": &request.patched_dependencies,
-        "packageExtensions": &request.package_extensions,
-        "allowUnusedPatches": request.allow_unused_patches,
-        "autoInstallPeers": config.auto_install_peers,
-        "dedupePeers": config.dedupe_peers,
-        "excludeLinksFromLockfile": config.exclude_links_from_lockfile,
-        "addMissingPeerTypes": config.add_missing_peer_types,
-        "projects": projects,
-        "inputLockfileHash": request.lockfile.as_ref().map(hash_lockfile),
-        "frozenLockfile": request.frozen_lockfile,
-        "preferFrozenLockfile": request.prefer_frozen_lockfile,
-        "ignoreManifestCheck": request.ignore_manifest_check,
-        "trustLockfile": request.trust_lockfile,
-        "resolutionMode": request.resolution_mode,
-        "minimumReleaseAge": request.minimum_release_age,
-        "minimumReleaseAgeExclude": &request.minimum_release_age_exclude,
-        "minimumReleaseAgeIgnoreMissingTime": request.minimum_release_age_ignore_missing_time,
-        "trustPolicy": request.trust_policy,
-        "trustPolicyExclude": &request.trust_policy_exclude,
-        "trustPolicyIgnoreAfter": request.trust_policy_ignore_after,
-    });
+    let inputs = ConfigKeyInputs::for_request(request);
+    let input = serde_json::json!([
+        key_value(CONFIG_KEY, request, &inputs),
+        key_value(RESOLUTION_KEY, request, &inputs),
+    ]);
     let bytes = serde_json::to_vec(&input).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -237,6 +315,7 @@ fn cache_key_projects(request: &ResolveRequest) -> Vec<serde_json::Value> {
                 "devDependencies": project.dev_dependencies,
                 "optionalDependencies": project.optional_dependencies,
                 "peerDependencies": project.peer_dependencies,
+                "dependenciesMeta": project.dependencies_meta,
             })
         })
         .collect()

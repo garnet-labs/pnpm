@@ -3,16 +3,27 @@
 
 use super::{
     super::{
-        ManifestStat, OptimisticRepeatInstallCheck, Path, PathBuf, WorkspaceState,
+        ManifestStat,
+        OptimisticRepeatInstallCheck,
+        Path,
+        PathBuf,
+        WorkspaceState,
         current_lockfile::CurrentLockfile,
         validation::{
-            FileDigest, FileDigests, project_bins_digest, project_bins_match, workspace_bins_digest,
+            FileDigest,
+            FileDigests,
+            project_bins_digest,
+            project_bins_match,
+            workspace_bins_digest,
         },
     },
     Scope,
 };
 use pnpm_workspace::importer_id_from_root_dir;
-use pnpm_workspace_state::{FileSignature, Validation};
+use pnpm_workspace_state::{
+    FileSignature,
+    Validation,
+};
 use std::collections::HashSet;
 
 /// Whether a project is still proven installed.
@@ -34,6 +45,17 @@ impl ProjectStatus {
     pub(crate) fn needs_install_proof(self) -> bool {
         matches!(self, Self::LockfileChanged | Self::Unrecorded)
     }
+}
+
+/// What [`InputDrift::held`] does with a project the last validation proves
+/// installed.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ProvenProjects {
+    /// Leave it out.
+    Trusted,
+    /// Hold it like the others, for an input no validation records the
+    /// contents of.
+    Rechecked,
 }
 
 /// Every input the content phase compares against the last validation.
@@ -63,7 +85,9 @@ impl<'a> InputDrift<'a> {
     ) -> Self {
         let recorded = state.validation.as_ref();
         let digests = FileDigests::new(recorded);
-        let (lockfile_path, lockfile) = digests.lockfile(check.workspace_root, check.config);
+        let current = CurrentLockfile::new(&check.config.install_state_dir);
+        let (lockfile_path, mut lockfile) = digests.lockfile(check.workspace_root, check.config);
+        stand_in_regenerated_digest(check, &current, &lockfile_path, &mut lockfile);
         let recorded_lockfile = recorded_signature(recorded, &lockfile_path);
         let lockfile_rehashed = matches!(
             (&lockfile, recorded_lockfile),
@@ -73,7 +97,6 @@ impl<'a> InputDrift<'a> {
             && lockfile.digest()
                 != recorded_lockfile.map(|signature| signature.digest.as_str());
         let patches = patch_drift(check, state, &digests);
-        let current = CurrentLockfile::new(&check.config.install_state_dir);
         Self {
             stats: project_stats(check, &current, recorded, lockfile.digest()),
             current,
@@ -91,15 +114,20 @@ impl<'a> InputDrift<'a> {
             .all(|stat| stat.status == ProjectStatus::Proven)
     }
 
-    /// The projects `scope` holds that are not proven installed.
+    /// The projects `scope` holds that are not proven installed, and the
+    /// proven ones too when `proven` says so.
     pub(super) fn held(
         &self,
         check: &OptimisticRepeatInstallCheck<'_>,
         scope: Scope<'_>,
+        proven: ProvenProjects,
     ) -> Vec<&ManifestStat<'a>> {
         let unproven = self.stats
             .iter()
-            .filter(|stat| stat.status != ProjectStatus::Proven);
+            .filter(|stat| match proven {
+                ProvenProjects::Trusted => stat.status != ProjectStatus::Proven,
+                ProvenProjects::Rechecked => true,
+            });
         let (selected, held_anywhere): (&[&Path], fn(ProjectStatus) -> bool) = match scope {
             Scope::Workspace => return unproven.collect(),
             Scope::Selected(selected) => (selected, |_| false),
@@ -189,6 +217,28 @@ fn patch_drift(
 
 /// Every project's [`ManifestStat`] against `recorded`, which proved the
 /// projects against the lockfile whose digest was `lockfile_digest`.
+/// When the current lockfile stands in for a missing `pnpm-lock.yaml`, its
+/// digest is what the regenerated `pnpm-lock.yaml` will have only while the
+/// two files are written alike. In the next format they are not, so the
+/// digest is taken from the text the regeneration writes.
+fn stand_in_regenerated_digest(
+    check: &OptimisticRepeatInstallCheck<'_>,
+    current: &CurrentLockfile<'_>,
+    lockfile_path: &Path,
+    lockfile: &mut FileDigest,
+) {
+    let current_path =
+        check.config.install_state_dir.join(pnpm_lockfile::Lockfile::CURRENT_FILE_NAME);
+    if lockfile_path != current_path {
+        return;
+    }
+    let FileDigest::Present(signature) = lockfile else { return };
+    let Some(text) = current.regenerated_text(check.config.lockfile_format) else { return };
+    let mut digest = pnpm_crypto_hash::create_hex_hash(text);
+    digest.truncate(signature.digest.len());
+    signature.digest = digest;
+}
+
 fn project_stats<'a>(
     check: &OptimisticRepeatInstallCheck<'a>,
     current: &CurrentLockfile<'_>,

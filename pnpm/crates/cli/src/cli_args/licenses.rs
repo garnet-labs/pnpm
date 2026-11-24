@@ -1,37 +1,74 @@
+use super::stored_package::{
+    StoredPackage,
+    StoredPackageReader,
+};
 use crate::cli_args::{
     deps_tree::{
-        dep_types::{DepType, detect_dep_types},
+        dep_types::{
+            DepType,
+            detect_dep_types,
+        },
         pkg_info::is_unsafe_path_component,
     },
     install::resolve_bool_override,
-    sanitize::{sanitize, sanitize_inline},
+    sanitize::{
+        sanitize,
+        sanitize_inline,
+    },
 };
 use clap::Args;
 use dependencies::{
-    collect_dependencies, compare_package_names, compare_versions, select_newer_version,
+    collect_dependencies,
+    compare_package_names,
+    compare_versions,
+    select_newer_version,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use indexmap::IndexMap;
 use miette::Diagnostic;
-use owo_colors::{OwoColorize, Stream};
+use owo_colors::{
+    OwoColorize,
+    Stream,
+};
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    Lockfile, PackageKey, PeerEdgeOptions, PeerSatisfactionEdges, ResolvedDependencyMap,
+    Lockfile,
+    PackageKey,
+    PeerEdgeOptions,
+    PeerSatisfactionEdges,
+    ResolvedDependencyMap,
 };
 use pnpm_package_is_installable::{
-    InstallabilityOptions, WantedPlatformRef, platform_is_supported_with_inference,
+    InstallabilityOptions,
+    WantedPlatformRef,
+    platform_is_supported_with_inference,
 };
-use pnpm_package_manifest::{extract_license, safe_read_package_json_from_dir};
+use pnpm_package_manifest::{
+    extract_license,
+    safe_read_package_json_from_dir,
+};
 use pnpm_resolving_git_resolver::HostedGit;
 use serde::Serialize;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
 };
-use tabled::{builder::Builder, settings::Style};
+use tabled::{
+    builder::Builder,
+    settings::Style,
+};
 
 mod license_resolver;
-use license_resolver::{extract_license_author, extract_license_homepage};
+use license_resolver::{
+    extract_license_author,
+    extract_license_homepage,
+};
 
 #[derive(Debug, Args)]
 pub struct LicensesArgs {
@@ -107,6 +144,10 @@ pub enum BelongsTo {
     Dev,
 }
 
+/// Package identity within a license bucket: `(name, registry_name)`.
+type LicensePackageKey = (String, Option<String>);
+type LicensesByGroup = IndexMap<String, BTreeMap<LicensePackageKey, LicenseInfo>>;
+
 #[derive(Debug, Serialize)]
 #[cfg_attr(
     dylint_lib = "perfectionist",
@@ -120,6 +161,8 @@ pub struct LicenseInfo {
     pub versions: Vec<String>,
     pub paths: Vec<String>,
     pub license: String,
+    #[serde(rename = "registryName", skip_serializing_if = "Option::is_none")]
+    pub registry_name: Option<String>,
     #[serde(skip)]
     belongs_to: BelongsTo,
     #[serde(skip)]
@@ -145,7 +188,7 @@ impl LicensesArgs {
         let LicensedPackages { package_dirs, dependencies } =
             LicensedPackages::collect(config, dir, recursive, include)?;
 
-        let results_by_license = group_by_license(&package_dirs, dependencies).await;
+        let results_by_license = group_by_license(&package_dirs, dependencies, config).await;
 
         if self.json {
             pnpm_diagnostics::println!("{}", render_licenses_json(&results_by_license)?);
@@ -162,10 +205,7 @@ impl LicensesArgs {
     }
 }
 
-fn print_license_table(
-    results_by_license: &IndexMap<String, BTreeMap<String, LicenseInfo>>,
-    long: bool,
-) {
+fn print_license_table(results_by_license: &LicensesByGroup, long: bool) {
     let mut header: Vec<String> = vec!["Package".to_string(), "License".to_string()];
     if long {
         header.push("Details".to_string());
@@ -196,73 +236,88 @@ fn check_licenses_subcommand(subcommand: Option<&str>) -> Result<(), LicensesErr
 }
 
 /// Collect each package's license, grouped by license and then by
-/// package name.
+/// `(name, registry_name)`.
 async fn group_by_license(
     package_dirs: &[PackageDirs],
     dependencies: Vec<(usize, LicensedDependency)>,
-) -> IndexMap<String, BTreeMap<String, LicenseInfo>> {
-    let mut results_by_license: IndexMap<String, BTreeMap<String, LicenseInfo>> = IndexMap::new();
-    for (lockfile_index, (key, kind, name, version)) in dependencies {
-        for pkg_dir in package_dirs[lockfile_index].package_dirs(&key, &name, &version).iter() {
-            record_license(&mut results_by_license, kind, &name, &version, pkg_dir).await;
+    config: &Config,
+) -> LicensesByGroup {
+    let store =
+        StoredPackageReader::open(config.store_dir.root().to_path_buf(), config.frozen_store);
+    let mut results_by_license = LicensesByGroup::new();
+    for (lockfile_index, dependency) in dependencies {
+        let dirs = package_dirs[lockfile_index].package_dirs(
+            &dependency.key,
+            &dependency.name,
+            &dependency.version,
+        );
+        let cached = store
+            .as_ref()
+            .and_then(|store| Some(store.package(dependency.store_key.clone()?)));
+        for pkg_dir in dirs.iter() {
+            record_license(&mut results_by_license, &dependency, pkg_dir, cached.as_ref()).await;
         }
     }
     results_by_license
 }
 
 async fn record_license(
-    results_by_license: &mut IndexMap<String, BTreeMap<String, LicenseInfo>>,
-    kind: BelongsTo,
-    name: &str,
-    version: &str,
+    results_by_license: &mut LicensesByGroup,
+    dependency: &LicensedDependency,
     pkg_dir: &std::path::Path,
+    cached: Option<&StoredPackage<'_>>,
 ) {
-    let details = read_license_details(pkg_dir, name).await;
+    let details = read_license_details(pkg_dir, &dependency.name, cached).await;
     let path_str = pkg_dir.to_string_lossy().to_string();
 
     let license_group = results_by_license.entry(details.license.clone()).or_default();
+    let group_key = (dependency.name.clone(), dependency.registry_name.clone());
     let info = license_group
-        .entry(name.to_owned())
+        .entry(group_key)
         .or_insert_with(|| LicenseInfo {
-            name: name.to_owned(),
+            name: dependency.name.clone(),
             versions: Vec::new(),
             paths: Vec::new(),
             license: details.license,
-            belongs_to: kind,
-            selected_version: version.to_owned(),
+            registry_name: dependency.registry_name.clone(),
+            belongs_to: dependency.belongs_to,
+            selected_version: dependency.version.clone(),
             author: details.author.clone(),
             homepage: details.homepage.clone(),
             description: details.description.clone(),
         });
 
     // The newest version of a package supplies the rendered details.
-    if select_newer_version(info, version, kind) {
+    if select_newer_version(info, &dependency.version, dependency.belongs_to) {
         info.author = details.author;
         info.homepage = details.homepage;
         info.description = details.description;
     }
     if !info.versions
         .iter()
-        .any(|existing| existing == version)
+        .any(|existing| existing == &dependency.version)
     {
-        info.versions.push(version.to_owned());
+        info.versions.push(dependency.version.clone());
     }
     if !info.paths.contains(&path_str) {
         info.paths.push(path_str);
     }
 }
 
-/// Every collected package, in name order — the table lists packages
-/// rather than grouping them by license.
-fn sorted_license_infos(
-    results_by_license: &IndexMap<String, BTreeMap<String, LicenseInfo>>,
-) -> Vec<&LicenseInfo> {
+/// Every collected package, in name and registry order, the table lists
+/// packages rather than grouping them by license.
+fn sorted_license_infos(results_by_license: &LicensesByGroup) -> Vec<&LicenseInfo> {
     let mut all_packages: Vec<&LicenseInfo> = results_by_license
         .values()
         .flat_map(BTreeMap::values)
         .collect();
-    all_packages.sort_by(|left, right| compare_package_names(&left.name, &right.name));
+    all_packages.sort_by(|left, right| compare_license_infos(left, right));
     all_packages
+}
+
+fn compare_license_infos(left: &LicenseInfo, right: &LicenseInfo) -> Ordering {
+    compare_package_names(&left.name, &right.name)
+        .then_with(|| left.registry_name.cmp(&right.registry_name))
 }
 
 /// One package's license and the manifest fields `--long` renders.
@@ -275,11 +330,17 @@ struct LicenseDetails {
 
 /// The package's declared license, falling back to a license file in its
 /// directory when the manifest declares none or defers to one.
-async fn read_license_details(pkg_dir: &std::path::Path, name: &str) -> LicenseDetails {
+async fn read_license_details(
+    pkg_dir: &std::path::Path,
+    name: &str,
+    cached: Option<&StoredPackage<'_>>,
+) -> LicenseDetails {
     let manifest = if is_unsafe_path_component(name) {
         None
     } else {
-        safe_read_package_json_from_dir(pkg_dir).unwrap_or(None)
+        safe_read_package_json_from_dir(pkg_dir)
+            .unwrap_or(None)
+            .or_else(|| cached.and_then(StoredPackage::manifest))
     };
     let Some(manifest) = manifest else {
         return LicenseDetails {
@@ -291,9 +352,11 @@ async fn read_license_details(pkg_dir: &std::path::Path, name: &str) -> LicenseD
     };
     let license = match extract_license(&manifest) {
         Some(license) if !license.to_ascii_lowercase().contains("see license") => license,
-        manifest_license => license_resolver::resolve_license_from_dir(manifest_license, pkg_dir)
-            .await
-            .unwrap_or_else(|| "Unknown".to_string()),
+        manifest_license => {
+            license_resolver::resolve_license_from_dir(manifest_license, pkg_dir, cached)
+                .await
+                .unwrap_or_else(|| "Unknown".to_string())
+        }
     };
     LicenseDetails {
         license,
@@ -306,13 +369,11 @@ async fn read_license_details(pkg_dir: &std::path::Path, name: &str) -> LicenseD
     }
 }
 
-fn render_licenses_json(
-    results_by_license: &IndexMap<String, BTreeMap<String, LicenseInfo>>,
-) -> miette::Result<String> {
+fn render_licenses_json(results_by_license: &LicensesByGroup) -> miette::Result<String> {
     let mut json_output: IndexMap<String, Vec<&LicenseInfo>> = IndexMap::new();
     for (license, group) in results_by_license {
         let mut infos: Vec<&LicenseInfo> = group.values().collect();
-        infos.sort_by(|left, right| compare_package_names(&left.name, &right.name));
+        infos.sort_by(|left, right| compare_license_infos(left, right));
         json_output.insert(license.clone(), infos);
     }
     serde_json::to_string_pretty(&json_output)
@@ -332,11 +393,20 @@ fn render_license_details(info: &LicenseInfo) -> String {
 
 fn render_package_name(info: &LicenseInfo) -> String {
     let name = sanitize_inline(&info.name);
-    let suffix = match info.belongs_to {
-        BelongsTo::Prod | BelongsTo::Optional => return name.into_owned(),
-        BelongsTo::Dev => "(dev)",
+    let package_name = match info.registry_name.as_deref() {
+        Some(registry_name) => {
+            let alias = format!("({})", sanitize_inline(registry_name));
+            format!("{name} {}", alias.if_supports_color(Stream::Stdout, |text| text.dimmed()))
+        }
+        None => name.into_owned(),
     };
-    format!("{} {}", name, suffix.if_supports_color(Stream::Stdout, |text| text.dimmed()))
+    match info.belongs_to {
+        BelongsTo::Prod | BelongsTo::Optional => package_name,
+        BelongsTo::Dev => format!(
+            "{package_name} {}",
+            "(dev)".if_supports_color(Stream::Stdout, |text| text.dimmed()),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -348,4 +418,7 @@ mod package_dirs;
 use package_dirs::PackageDirs;
 
 mod lockfiles;
-use lockfiles::{LicensedDependency, LicensedPackages};
+use lockfiles::{
+    LicensedDependency,
+    LicensedPackages,
+};

@@ -1,19 +1,38 @@
 use super::{
-    DepsRequiringBuildSink, EngineMode, InstallOptions, NetworkConfigInput, NodeApiProject,
-    PeerIssuesOptions, ProxyConfigInput, build_overlay, is_lockfile_only,
-    peer_issues::peer_issues_install_options, rebuild::rebuild_options,
-    reject_non_object_manifests, reject_unsupported_install_options, run_install_inner,
+    DepsRequiringBuildSink,
+    EngineMode,
+    InstallOptions,
+    NetworkConfigInput,
+    NodeApiProject,
+    PeerIssuesOptions,
+    ProxyConfigInput,
+    build_overlay,
+    is_lockfile_only,
+    peer_issues::peer_issues_install_options,
+    rebuild::rebuild_options,
+    reject_non_object_manifests,
+    reject_unsupported_install_options,
+    run_install_inner,
     take_deps_requiring_build,
 };
 use crate::{
-    config::{ConfigOverlay, resolve_config},
-    reporter_bridge::{begin_stats, take_stats},
+    config::{
+        ConfigOverlay,
+        resolve_config,
+    },
+    reporter_bridge::{
+        begin_stats,
+        take_stats,
+    },
 };
 use pnpm_network::NoProxySetting;
 use pnpm_store_dir::STORE_VERSION;
 use pnpm_testing_utils::registry::TestRegistry;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{
+        BTreeSet,
+        HashMap,
+    },
     path::Path,
     sync::Arc,
 };
@@ -99,6 +118,7 @@ fn install_options() -> InstallOptions {
         lockfile_only: None,
         frozen_lockfile: None,
         prefer_frozen_lockfile: None,
+        lockfile_format: None,
         prefer_offline: None,
         offline: None,
         virtual_store_dir_max_length: None,
@@ -111,6 +131,7 @@ fn install_options() -> InstallOptions {
         dedupe_peer_dependents: None,
         dedupe_peers: None,
         add_missing_peer_types: None,
+        project_scoped_optional_peers: None,
         dedupe_direct_deps: None,
         dedupe_injected_deps: None,
         resolve_peers_from_workspace_root: None,
@@ -118,6 +139,7 @@ fn install_options() -> InstallOptions {
         hoist_workspace_packages: None,
         enable_modules_dir: None,
         ignore_package_manifest: None,
+        ignore_lockfile_settings_checks: None,
         node_version: None,
         engine_strict: None,
         minimum_release_age: None,

@@ -1,11 +1,21 @@
 use crate::fast_update_compose::Drift;
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    ImporterDepVersion, Lockfile, LockfileSettings, ProjectSnapshot, ResolutionSettings,
+    ImporterDepVersion,
+    Lockfile,
+    LockfileSettings,
+    ProjectSnapshot,
+    ResolutionSettings,
 };
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::PathBuf,
 };
 
@@ -18,6 +28,9 @@ pub(crate) fn lockfile_settings_from_config(config: &Config) -> LockfileSettings
         dedupe_peers: config.dedupe_peers.then_some(true),
         exclude_links_from_lockfile: config.exclude_links_from_lockfile,
         add_missing_peer_types: config.add_missing_peer_types.then_some(true),
+        project_scoped_optional_peers: config
+            .project_scoped_optional_peers_take_effect()
+            .then_some(true),
         inject_workspace_packages: config.inject_workspace_packages,
         peers_suffix_max_length: (config.peers_suffix_max_length
             != pnpm_config::default_peers_suffix_max_length())
@@ -29,10 +42,10 @@ pub(crate) fn lockfile_settings_from_config(config: &Config) -> LockfileSettings
     }
 }
 
-/// The values `lockfile.includeResolutionSettings` records, all unset when
-/// that setting is off.
+/// The resolution settings the lockfile records, all unset unless
+/// [`Config::lockfile_records_resolution_settings`].
 pub(crate) fn resolution_settings_from_config(config: &Config) -> ResolutionSettings {
-    if !config.lockfile_include_resolution_settings {
+    if !config.lockfile_records_resolution_settings() {
         return ResolutionSettings::default();
     }
     ResolutionSettings {
@@ -55,6 +68,7 @@ pub(crate) enum ChangedSetting {
     DedupePeers,
     ExcludeLinksFromLockfile,
     AddMissingPeerTypes,
+    ProjectScopedOptionalPeers,
     PeersSuffixMaxLength,
     InjectWorkspacePackages,
     IntegrityTarget,
@@ -78,7 +92,7 @@ pub(crate) fn detect_settings_drift(lockfile: &Lockfile, settings: &LockfileSett
 /// its graph: the peer settings when nothing declares a peer
 /// dependency, and the link and injection settings when no project
 /// depends on a directory or on another workspace project. Checked
-/// against the candidate the earlier handlers already rewrote — a peer
+/// against the candidate the earlier handlers already rewrote, a peer
 /// dependent they removed no longer blocks the setting. `false` leaves
 /// the caller on the full-resolution path.
 pub(crate) fn apply_settings_update(
@@ -108,31 +122,17 @@ fn changed_settings(
     if pnpm_lockfile::auto_install_peers_changed(recorded, settings.auto_install_peers) {
         changed.push(ChangedSetting::AutoInstallPeers);
     }
-    if pnpm_lockfile::recorded_dedupe_peers(recorded)
-        != pnpm_lockfile::recorded_dedupe_peers(Some(settings))
-    {
-        changed.push(ChangedSetting::DedupePeers);
-    }
     if pnpm_lockfile::exclude_links_from_lockfile_changed(
         recorded,
         settings.exclude_links_from_lockfile,
     ) {
         changed.push(ChangedSetting::ExcludeLinksFromLockfile);
     }
-    if pnpm_lockfile::recorded_add_missing_peer_types(recorded)
-        != pnpm_lockfile::recorded_add_missing_peer_types(Some(settings))
-    {
-        changed.push(ChangedSetting::AddMissingPeerTypes);
-    }
+    changed.extend(changed_flags(recorded, settings));
     if pnpm_lockfile::recorded_peers_suffix_max_length(recorded)
         != pnpm_lockfile::recorded_peers_suffix_max_length(Some(settings))
     {
         changed.push(ChangedSetting::PeersSuffixMaxLength);
-    }
-    if pnpm_lockfile::recorded_inject_workspace_packages(recorded)
-        != pnpm_lockfile::recorded_inject_workspace_packages(Some(settings))
-    {
-        changed.push(ChangedSetting::InjectWorkspacePackages);
     }
     if integrity_target_changed(recorded, settings) {
         changed.push(ChangedSetting::IntegrityTarget);
@@ -144,6 +144,31 @@ fn changed_settings(
         changed.push(ChangedSetting::ResolutionSettings);
     }
     changed
+}
+
+/// The boolean settings whose recorded value, absent counting as `false`,
+/// differs from `settings`.
+fn changed_flags<'a>(
+    recorded: Option<&'a LockfileSettings>,
+    settings: &'a LockfileSettings,
+) -> impl Iterator<Item = ChangedSetting> + 'a {
+    type RecordedFlag = fn(Option<&LockfileSettings>) -> bool;
+    let flags: [(ChangedSetting, RecordedFlag); 4] = [
+        (ChangedSetting::DedupePeers, pnpm_lockfile::recorded_dedupe_peers),
+        (ChangedSetting::AddMissingPeerTypes, pnpm_lockfile::recorded_add_missing_peer_types),
+        (
+            ChangedSetting::ProjectScopedOptionalPeers,
+            pnpm_lockfile::recorded_project_scoped_optional_peers,
+        ),
+        (
+            ChangedSetting::InjectWorkspacePackages,
+            pnpm_lockfile::recorded_inject_workspace_packages,
+        ),
+    ];
+    flags
+        .into_iter()
+        .filter(move |(_, recorded_flag)| recorded_flag(recorded) != recorded_flag(Some(settings)))
+        .map(|(setting, _)| setting)
 }
 
 fn integrity_target_changed(
@@ -164,6 +189,7 @@ fn setting_cannot_affect_lockfile(
         ChangedSetting::AutoInstallPeers
         | ChangedSetting::DedupePeers
         | ChangedSetting::AddMissingPeerTypes
+        | ChangedSetting::ProjectScopedOptionalPeers
         | ChangedSetting::PeersSuffixMaxLength => has_no_peer_dependencies(lockfile, manifests),
         ChangedSetting::ExcludeLinksFromLockfile => {
             has_no_linked_dependencies(lockfile, manifests, workspace_package_names)
@@ -215,7 +241,7 @@ fn has_no_peer_dependencies(
 /// `excludeLinksFromLockfile` decides whether a dependency that
 /// resolves to a directory is recorded in the lockfile. Dependencies
 /// declared with the `workspace:` protocol are recorded either way, so
-/// only the other directory dependencies matter — including plain
+/// only the other directory dependencies matter, including plain
 /// ranges that `linkWorkspacePackages` turns into links to a workspace
 /// project.
 fn has_no_linked_dependencies(

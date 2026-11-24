@@ -1,7 +1,24 @@
 use super::{
-    ApproveBuildsArgs, BTreeSet, Config, Context, GlobalError, IgnoredBuildsScan, IntoDiagnostic,
-    Path, PathBuf, Reporter, State, clear_decided_ignored_builds, get_automatically_ignored_builds,
-    global_group_config, is_subdir, run_rebuild, scan_global_packages, write_approval_settings,
+    ApproveBuildsArgs,
+    BTreeSet,
+    Config,
+    Context,
+    GlobalError,
+    IgnoredBuildsScan,
+    IntoDiagnostic,
+    Path,
+    PathBuf,
+    Reporter,
+    State,
+    clear_decided_ignored_builds,
+    exclude_disallowed_builds,
+    get_automatically_ignored_builds,
+    global_approval_store,
+    global_group_config,
+    is_subdir,
+    run_rebuild,
+    scan_global_packages,
+    warn_about_legacy_global_settings,
 };
 
 pub async fn approve_global_builds<Reporter: self::Reporter + 'static>(
@@ -10,17 +27,19 @@ pub async fn approve_global_builds<Reporter: self::Reporter + 'static>(
 ) -> miette::Result<()> {
     args.validate()?;
     let global_pkg_dir = base_config.global_pkg_dir.as_ref().ok_or(GlobalError::NoGlobalBinDir)?;
-    let (groups, pending) = scan_global_ignored_builds(base_config, global_pkg_dir)?;
+    warn_about_legacy_global_settings::<Reporter>(base_config, global_pkg_dir)?;
+    let (groups, pending) =
+        scan_global_ignored_builds(base_config, global_pkg_dir, ScanMode::of(&args))?;
     if pending.is_empty() && args.packages.is_empty() {
         pnpm_diagnostics::println!("There are no packages awaiting approval");
         return Ok(());
     }
     let pending = pending.into_iter().collect::<Vec<_>>();
-    let Some(decision) = args.decide::<Reporter>(&pending)? else {
+    let Some(decision) = args.decide::<Reporter>(&pending, base_config.ci)? else {
         return Ok(());
     };
 
-    write_approval_settings(global_pkg_dir, &decision)?;
+    global_approval_store(base_config, global_pkg_dir)?.write_decision(&decision)?;
     let mut rebuild_groups = Vec::new();
     for (install_dir, scan) in groups {
         let build_packages: Vec<String> = decision.build_packages
@@ -43,12 +62,28 @@ pub async fn approve_global_builds<Reporter: self::Reporter + 'static>(
 /// Each global group's install dir with its ignored builds.
 type IgnoredBuildGroups = Vec<(PathBuf, IgnoredBuildsScan)>;
 
+/// Which ignored builds a global scan reports.
+#[derive(Clone, Copy)]
+enum ScanMode {
+    /// Every ignored build: a run that names its packages may decide any.
+    All,
+    /// Only the builds no policy denies, see [`exclude_disallowed_builds`].
+    Undecided,
+}
+
+impl ScanMode {
+    fn of(args: &ApproveBuildsArgs) -> Self {
+        if args.packages.is_empty() { Self::Undecided } else { Self::All }
+    }
+}
+
 /// Each global group's ignored builds, with the union of their names. A
 /// group whose install dir resolves outside the global packages directory is
 /// not this pnpm home's to approve builds for.
 fn scan_global_ignored_builds(
     base_config: &Config,
     global_pkg_dir: &Path,
+    mode: ScanMode,
 ) -> miette::Result<(IgnoredBuildGroups, BTreeSet<String>)> {
     let packages =
         scan_global_packages(global_pkg_dir).into_diagnostic().wrap_err("scan global packages")?;
@@ -73,7 +108,10 @@ fn scan_global_ignored_builds(
             global_pkg_dir,
             base_config.supported_architectures.clone(),
         )?;
-        let scan = get_automatically_ignored_builds(&config)?;
+        let mut scan = get_automatically_ignored_builds(&config)?;
+        if matches!(mode, ScanMode::Undecided) {
+            exclude_disallowed_builds(&mut scan, &config)?;
+        }
         pending.extend(scan.names.iter().flatten().cloned());
         groups.push((package.install_dir, scan));
     }
@@ -85,16 +123,19 @@ async fn rebuild_approved_groups<Reporter: self::Reporter + 'static>(
     global_pkg_dir: &Path,
     rebuild_groups: Vec<(PathBuf, Vec<String>)>,
 ) -> miette::Result<()> {
+    let store = global_approval_store(base_config, global_pkg_dir)?;
     for (install_dir, build_packages) in rebuild_groups {
-        let config = Config::leak(global_group_config(
+        let group_config = global_group_config(
             base_config,
             &install_dir,
             global_pkg_dir,
             base_config.supported_architectures.clone(),
-        )?);
+        )?;
+        let config = store.config_with_approvals(&group_config)?;
         let state = State::init(install_dir.join("package.json"), config, true)
             .wrap_err("initialize the global approve-builds state")?;
         let selection = crate::cli_args::rebuild::RebuildSelection {
+            snapshots: None,
             names: Some(build_packages),
             projects: Vec::new(),
         };

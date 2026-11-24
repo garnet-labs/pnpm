@@ -1,14 +1,35 @@
 use super::{
-    LockfileResolution, base64_to_hex, build_purl, classify_license, confined_importer_dir,
-    extract_author, extract_repository, integrity_string, normalize_link_path,
-    peer_names_from_manifest, platform_incompatible_optional,
+    LockfileResolution,
+    RegistryContext,
+    SanitizedRegistries,
+    base64_to_hex,
+    build_purl,
+    build_purl_with_encoded_registry,
+    classify_license,
+    confined_importer_dir,
+    extract_author,
+    extract_repository,
+    integrity_string,
+    normalize_link_path,
+    peer_names_from_manifest,
+    platform_incompatible_optional,
 };
 use crate::cli_args::sbom::{
     cyclonedx::split_scoped_name,
-    metadata::{encode_purl_name, extract_bugs_url, url_without_credentials},
+    metadata::{
+        encode_purl_name,
+        encode_repository_url,
+        extract_bugs_url,
+        sanitize_registry_url,
+        url_without_credentials,
+    },
     spdx::sanitize_spdx_id,
 };
-use pnpm_lockfile::{PackageMetadata, RegistryResolution, StringOrList};
+use pnpm_lockfile::{
+    PackageMetadata,
+    RegistryResolution,
+    StringOrList,
+};
 use pnpm_package_is_installable::InstallabilityOptions;
 
 fn registry_package(
@@ -17,6 +38,7 @@ fn registry_package(
     libc: Option<StringOrList>,
 ) -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Registry(RegistryResolution {
             integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                 .parse()
@@ -104,7 +126,7 @@ fn confined_importer_dir_rejects_lexical_escapes() {
 }
 
 /// A lexically clean importer key whose directory is a symlink pointing
-/// outside the workspace must not be read — the canonicalize + containment
+/// outside the workspace must not be read, the canonicalize + containment
 /// check catches what the lexical `validate_importer_id` filter cannot.
 #[cfg(unix)]
 #[test]
@@ -136,6 +158,123 @@ fn build_purl_unscoped() {
 #[test]
 fn build_purl_scoped() {
     assert_eq!(build_purl("@babel/core", "7.22.0"), "pkg:npm/%40babel/core@7.22.0");
+}
+
+#[test]
+fn build_purl_with_named_registry_adds_repository_url_qualifier() {
+    let work_encoded = encode_repository_url("https://npm.enterprise.example.com/");
+    assert_eq!(
+        build_purl_with_encoded_registry("foo", "1.0.0", Some(&work_encoded)),
+        "pkg:npm/foo@1.0.0?repository_url=https%3A%2F%2Fnpm.enterprise.example.com%2F",
+    );
+    let team_encoded = encode_repository_url("https://npm.enterprise.example.com/team-a/");
+    assert_eq!(
+        build_purl_with_encoded_registry("@scope/pkg", "1.0.0", Some(&team_encoded)),
+        "pkg:npm/%40scope/pkg@1.0.0?repository_url=https%3A%2F%2Fnpm.enterprise.example.com%2Fteam-a%2F",
+    );
+}
+
+#[test]
+fn sanitize_registry_url_strips_credentials_and_rejects_malformed_urls() {
+    let sanitized = sanitize_registry_url(
+        "https://some-user:some-token@npm.enterprise.example.com/team-a/?api_key=secret#frag",
+    )
+    .expect("valid https url");
+    assert_eq!(sanitized, "https://npm.enterprise.example.com/team-a/");
+    let purl =
+        build_purl_with_encoded_registry("foo", "1.0.0", Some(&encode_repository_url(&sanitized)));
+    assert_eq!(
+        purl,
+        "pkg:npm/foo@1.0.0?repository_url=https%3A%2F%2Fnpm.enterprise.example.com%2Fteam-a%2F",
+    );
+    for secret in ["some-user", "some-token", "secret", "frag"] {
+        assert!(!purl.contains(secret), "secret {secret} leaked in {purl}");
+    }
+    assert_eq!(
+        sanitize_registry_url("https://token@npm.enterprise.example.com/team-a/").as_deref(),
+        Some("https://npm.enterprise.example.com/team-a/"),
+    );
+
+    for invalid in [
+        "https://token@npm.example.com:bad/",
+        "https://user:token@example.com:bad/team/",
+        "ftp://token@npm.example.com/",
+        "https://user:pass@",
+        "https://npm.example.com/%zz/",
+        "not-a-url",
+    ] {
+        assert_eq!(sanitize_registry_url(invalid), None, "expected {invalid:?} to fail closed");
+    }
+}
+
+#[test]
+fn sanitized_registries_resolves_configured_prefix_and_rejects_missing_or_invalid_urls() {
+    let mut context = RegistryContext::default();
+    context.registries_by_prefix.insert(
+        "work".to_string(),
+        "https://some-user:some-token@npm.work.example.com/team-a/?api_key=secret#frag".to_string(),
+    );
+    context.registries_by_prefix.insert(
+        "broken".to_string(),
+        "https://secret-user:secret-token@npm.broken.example.com:bad/team/".to_string(),
+    );
+    let registries = SanitizedRegistries::new(context);
+
+    let plain: pnpm_lockfile::PkgNameVerPeer = "foo@1.0.0".parse().unwrap();
+    assert_eq!(registries.resolve_named(&plain).unwrap(), None);
+
+    let qualified: pnpm_lockfile::PkgNameVerPeer =
+        "@scope/foo@work:1.0.0(peer@2.0.0)".parse().unwrap();
+    let resolved = registries
+        .resolve_named(&qualified)
+        .unwrap()
+        .expect("work registry");
+    assert_eq!(resolved.sanitized_url, "https://npm.work.example.com/team-a/");
+    assert_eq!(resolved.encoded_repository_url, "https%3A%2F%2Fnpm.work.example.com%2Fteam-a%2F");
+
+    let missing: pnpm_lockfile::PkgNameVerPeer = "foo@unknown:1.0.0".parse().unwrap();
+    let missing_err = registries.resolve_named(&missing).unwrap_err();
+    assert_eq!(missing_err.code().unwrap().to_string(), "ERR_PNPM_MISSING_NAMED_REGISTRY");
+
+    let broken: pnpm_lockfile::PkgNameVerPeer = "foo@broken:1.0.0".parse().unwrap();
+    let broken_err = registries.resolve_named(&broken).unwrap_err();
+    assert_eq!(broken_err.code().unwrap().to_string(), "ERR_PNPM_INVALID_NAMED_REGISTRY_URL");
+    let rendered = format!("{broken_err:?}");
+    for secret in ["secret-user", "secret-token", "npm.broken.example.com"] {
+        assert!(!rendered.contains(secret), "secret {secret} leaked in error: {rendered}");
+    }
+}
+
+#[test]
+fn tarball_url_for_component_sanitizes_registries_and_omits_malformed_default_registry() {
+    let resolution = LockfileResolution::Registry(RegistryResolution {
+        integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .expect("parse integrity"),
+        revision: None,
+    });
+    let mut context = RegistryContext::default();
+    context.registries_by_prefix.insert(
+        "work".to_string(),
+        "https://some-user:some-token@npm.work.example.com/team-a/?api_key=secret".to_string(),
+    );
+    context.registries.insert(
+        "default".to_string(),
+        "https://default-token@npm.default.example.com:bad/".to_string(),
+    );
+    let registries = SanitizedRegistries::new(context);
+
+    let qualified: pnpm_lockfile::PkgNameVerPeer = "@scope/pkg@work:1.0.0".parse().unwrap();
+    let named = registries.resolve_named(&qualified).unwrap();
+    let named_url = registries.tarball_url_for_component(&resolution, "@scope/pkg", "1.0.0", named);
+    assert_eq!(
+        named_url.as_deref(),
+        Some("https://npm.work.example.com/team-a/@scope/pkg/-/pkg-1.0.0.tgz"),
+    );
+
+    let malformed_default_url =
+        registries.tarball_url_for_component(&resolution, "plain-pkg", "1.0.0", None);
+    assert_eq!(malformed_default_url, None);
 }
 
 #[test]
@@ -611,4 +750,86 @@ fn integrity_string_publishes_only_verified_hashes() {
         path: None,
     });
     assert_eq!(integrity_string(&git), None);
+}
+
+#[test]
+fn workspace_relationships_do_not_depend_on_importer_order() {
+    use super::walk::{
+        ImporterComponents,
+        TransitiveEdges,
+        WalkContext,
+        WalkStores,
+        walk_importer_components,
+    };
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["app", "shared"] {
+        let project = dir.path().join(name);
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::json!({"name": name, "version": "1.0.0"}).to_string(),
+        )
+        .unwrap();
+    }
+    let lockfile: pnpm_lockfile::Lockfile = serde_saphyr::from_str(
+        r"
+lockfileVersion: '9.0'
+importers:
+  app:
+    dependencies:
+      shared: {specifier: 'workspace:*', version: 'link:../shared'}
+  shared:
+    dependencies:
+      leaf: {specifier: '1.0.0', version: '1.0.0'}
+snapshots:
+  leaf@1.0.0: {}
+",
+    )
+    .unwrap();
+    let config = pnpm_config::Config::default();
+    let dep_types = HashMap::new();
+    let ctx = WalkContext {
+        snapshots: lockfile.snapshots.as_ref(),
+        packages: None,
+        dep_types: &dep_types,
+        registries: SanitizedRegistries::new(config.registry_context()),
+        virtual_store_dirs: &[],
+        virtual_store_dir_max_length: 120,
+        transitive: TransitiveEdges { include_optional: true, skipped_peer_edges: None },
+        installability: InstallabilityOptions::default(),
+    };
+    let inputs = ImporterComponents {
+        lockfile: &lockfile,
+        lockfile_dir: dir.path(),
+        include: super::IncludeFilter {
+            dependencies: true,
+            dev_dependencies: true,
+            optional_dependencies: true,
+        },
+        exclude_peers: false,
+        root_purl: "pkg:npm/root@1.0.0",
+        ctx: &ctx,
+    };
+    for (queue, parent) in [
+        (vec!["app", "shared"], "pkg:npm/root@1.0.0"),
+        (vec!["shared", "app"], "pkg:npm/root@1.0.0"),
+        (vec!["app"], "pkg:npm/shared@1.0.0"),
+    ] {
+        let mut stores = WalkStores {
+            queue: queue
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ..Default::default()
+        };
+        walk_importer_components(&inputs, &mut stores).unwrap();
+        let parents = stores.relationships
+            .iter()
+            .filter(|edge| edge.to == "pkg:npm/leaf@1.0.0")
+            .map(|edge| edge.from.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(parents, [parent]);
+    }
 }

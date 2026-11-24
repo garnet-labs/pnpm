@@ -1,3 +1,6 @@
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
+
 //! Builds the directed graph of *inter-project* dependency edges for a
 //! workspace: each node is a project (keyed by its root directory) and
 //! its edges point at the root directories of the workspace siblings it
@@ -10,14 +13,26 @@
 //! the sibling's manifest `version`. Specifiers that resolve to neither
 //! (registry tags, git URLs, `npm:` aliases, ...) contribute no edge.
 
-pub use base_project::{BaseProject, GraphProject};
+pub use base_project::{
+    BaseProject,
+    DependencyGroups,
+    GraphProject,
+};
 pub use create_projects_graph::{
-    CreateProjectsGraphOptions, CreateProjectsGraphResult, Unmatched, WorkspaceCatalogs,
+    CreateProjectsGraphOptions,
+    CreateProjectsGraphResult,
+    Unmatched,
+    WorkspaceCatalogs,
     create_projects_graph,
 };
-pub use graph::{ProjectGraph, ProjectGraphNode};
+pub use dependency_rewriter::DependencyRewriter;
+pub use graph::{
+    ProjectGraph,
+    ProjectGraphNode,
+};
 pub use pnpm_fs::lexical_normalize;
 
 mod base_project;
 mod create_projects_graph;
+mod dependency_rewriter;
 mod graph;

@@ -1,9 +1,19 @@
 use super::{
-    assert_failure_contains, project, python, python_project, serve, serve_backends, wheel,
+    assert_failure_contains,
+    project,
+    python,
+    python_project,
+    serve,
+    serve_backends,
+    wheel,
 };
 use crate::_utils::pacquet_in;
 use assert_cmd::prelude::*;
-use std::{fs, path::Path};
+use command_extra::CommandExtra;
+use std::{
+    fs,
+    path::Path,
+};
 
 fn shared_workspace(root: &Path, index: &str) {
     project(root, index, &[]);
@@ -23,7 +33,8 @@ fn list(items: &[&str]) -> toml::Value {
     toml::Value::Array(
         items
             .iter()
-            .map(|item| toml::Value::String(item.to_string()))
+            .map(std::string::ToString::to_string)
+            .map(toml::Value::String)
             .collect(),
     )
 }
@@ -54,7 +65,7 @@ async fn members_of_a_shared_workspace_install_into_one_environment() {
     .unwrap();
 
     pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
 
@@ -67,23 +78,23 @@ async fn members_of_a_shared_workspace_install_into_one_environment() {
     assert!(!has_own_environment(&app), "app shares the workspace environment");
     assert!(!has_own_environment(&root.path().join("packages/lib")), "lib shares it too");
     python(root.path())
-        .args(["-c", "import alpha, beta, lib, app; print(lib.MARKER, app.MARKER)"])
+        .with_args(["-c", "import alpha, beta, lib, app; print(lib.MARKER, app.MARKER)"])
         .assert()
         .success()
         .stdout(line("workspace lib workspace app"));
     pacquet_in(&app)
-        .args(["exec", "python", "-c", "import alpha, app; print(app.MARKER)"])
+        .with_args(["exec", "python", "-c", "import alpha, app; print(app.MARKER)"])
         .assert()
         .success()
         .stdout(line("workspace app"));
 
     pnpm_fs::remove_symlink_dir(&root.path().join(".venv")).unwrap();
     pacquet_in(root.path())
-        .args(["install", "--offline", "--frozen-lockfile"])
+        .with_args(["install", "--offline", "--frozen-lockfile"])
         .assert()
         .success();
     python(root.path())
-        .args(["-c", "import alpha, beta, lib, app"])
+        .with_args(["-c", "import alpha, beta, lib, app"])
         .assert()
         .success();
     assert_eq!(fs::read_to_string(root.path().join("pylock.toml")).unwrap(), lock);
@@ -108,7 +119,7 @@ async fn members_that_cannot_be_installed_together_are_refused() {
     // canonical one where the temporary directory is reached through a link.
     let packages = dunce::canonicalize(root.path()).unwrap().join("packages");
     assert_failure_contains(
-        pacquet_in(root.path()).arg("install"),
+        &mut pacquet_in(root.path()).with_arg("install"),
         &format!(
             "cannot be installed together: {} requires `alpha==1.0` and {} requires `alpha==2.0`, \
              and no version of alpha the index offers satisfies both",
@@ -127,7 +138,7 @@ async fn members_that_cannot_be_installed_together_are_refused() {
     );
     python_project(&root.path().join("packages/b"), "b", "dependencies = ['alpha==1.0']");
     assert_failure_contains(
-        pacquet_in(root.path()).arg("install"),
+        &mut pacquet_in(root.path()).with_arg("install"),
         &format!(
             "{} requires `alpha==1.0` and {} requires `alpha==2.0`",
             packages.join("b").display(),
@@ -148,12 +159,12 @@ async fn selecting_one_member_installs_the_environment_they_share() {
     python_project(&root.path().join("packages/b"), "b", "dependencies = ['beta']");
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "a", "--fail-if-no-match"])
+        .with_args(["install", "--filter", "a", "--fail-if-no-match"])
         .assert()
         .success();
 
     python(root.path())
-        .args(["-c", "import alpha, beta, a, b"])
+        .with_args(["-c", "import alpha, beta, a, b"])
         .assert()
         .success();
     assert!(!has_own_environment(&root.path().join("packages/a")));
@@ -165,13 +176,18 @@ async fn adding_to_a_member_updates_its_manifest_and_the_shared_lockfile() {
     let mut server = mockito::Server::new_async().await;
     let _backends = serve_backends(&mut server).await;
     let _alpha = serve(&mut server, "alpha", &[("1.0", wheel("alpha", "1.0", "", &[]))]).await;
+    let beta = serve(&mut server, "beta", &[("1.0", wheel("beta", "1.0", "", &[]))]).await;
     let _gamma = serve(&mut server, "gamma", &[("1.0", wheel("gamma", "1.0", "", &[]))]).await;
     shared_workspace(root.path(), &server.url());
     python_project(&root.path().join("packages/a"), "a", "dependencies = ['alpha']");
     python_project(&root.path().join("packages/b"), "b", "dependencies = []");
 
+    let worker = root.path().join("packages/worker");
+    fs::create_dir(&worker).unwrap();
+    fs::write(worker.join("requirements.txt"), "beta>=1").unwrap();
+
     pacquet_in(&root.path().join("packages/b"))
-        .args(["add", "pypi:gamma"])
+        .with_args(["add", "pypi:gamma"])
         .assert()
         .success();
 
@@ -185,15 +201,34 @@ async fn adding_to_a_member_updates_its_manifest_and_the_shared_lockfile() {
     );
     let lock: toml::Value =
         toml::from_str(&fs::read_to_string(root.path().join("pylock.toml")).unwrap()).unwrap();
-    assert_eq!(lock["tool"]["pnpm"]["requirements"], list(&["alpha", "gamma>=1.0"]));
-    assert_eq!(lock["tool"]["pnpm"]["members"], list(&["packages/a", "packages/b"]));
+    assert_eq!(lock["tool"]["pnpm"]["requirements"], list(&["alpha", "beta>=1", "gamma>=1.0"]));
+    assert_eq!(
+        lock["tool"]["pnpm"]["members"],
+        list(&["packages/a", "packages/b", "packages/worker"]),
+    );
     assert!(!has_own_environment(&root.path().join("packages/b")));
     python(root.path())
-        .args(["-c", "import alpha, gamma, a, b"])
+        .with_args(["-c", "import alpha, gamma, a, b"])
         .assert()
         .success();
+    drop(beta);
+    let _beta = serve(
+        &mut server,
+        "beta",
+        &[("1.0", wheel("beta", "1.0", "", &[])), ("2.0", wheel("beta", "2.0", "", &[]))],
+    )
+    .await;
+    pacquet_in(&root.path().join("packages/b"))
+        .with_args(["update", "pypi:gamma"])
+        .assert()
+        .success();
+    python(root.path())
+        .with_args(["-c", "import beta; assert beta.VERSION == '1.0'"])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(worker.join("requirements.txt")).unwrap(), "beta>=1");
     pacquet_in(root.path())
-        .args(["install", "--offline", "--frozen-lockfile"])
+        .with_args(["install", "--offline", "--frozen-lockfile"])
         .assert()
         .success();
 }
@@ -218,12 +253,15 @@ async fn a_shared_member_with_dynamic_metadata_is_prepared_with_the_shared_inter
     .unwrap();
 
     pacquet_in(root.path())
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
 
     python(root.path())
-        .args(["-c", "import alpha, lib; import importlib.metadata as m; print(m.version('app'))"])
+        .with_args([
+            "-c",
+            "import alpha, lib; import importlib.metadata as m; print(m.version('app'))",
+        ])
         .assert()
         .success()
         .stdout(line("0.0.1"));
@@ -285,8 +323,8 @@ async fn a_shared_members_metadata_is_prepared_with_the_interpreter_the_root_ask
     logging_shim(&shims, "python3.12", "3.12.7", &log);
 
     pacquet_in(root.path())
-        .arg("install")
-        .env("PATH", format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()))
+        .with_arg("install")
+        .with_env("PATH", format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()))
         .assert()
         .success();
 
@@ -296,7 +334,10 @@ async fn a_shared_members_metadata_is_prepared_with_the_interpreter_the_root_ask
     assert!(started.contains("python3.11"), "the shared interpreter prepared the metadata");
     assert!(!started.contains("python3.12"), "the member's own choice was never started");
     python(root.path())
-        .args(["-c", "import alpha, lib; import importlib.metadata as m; print(m.version('app'))"])
+        .with_args([
+            "-c",
+            "import alpha, lib; import importlib.metadata as m; print(m.version('app'))",
+        ])
         .assert()
         .success()
         .stdout(line("0.0.1"));
@@ -338,7 +379,7 @@ async fn an_add_outside_the_declared_workspace_reads_the_project_alone() {
     let outside = root.path().join("tools/x");
 
     pacquet_in(&outside)
-        .args(["add", "pypi:alpha"])
+        .with_args(["add", "pypi:alpha"])
         .assert()
         .success();
 
@@ -352,7 +393,102 @@ async fn an_add_outside_the_declared_workspace_reads_the_project_alone() {
         "the workspace was not installed",
     );
     pacquet_in(&root.path().join("api/providers/good"))
-        .args(["add", "pypi:alpha"])
+        .with_args(["add", "pypi:alpha"])
         .assert()
         .failure();
+}
+
+#[tokio::test]
+async fn update_at_a_virtual_shared_workspace_root_updates_member_manifests_and_shared_env() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let _backends = serve_backends(&mut server).await;
+    let _alpha = serve(&mut server, "alpha", &[("1.0", wheel("alpha", "1.0", "", &[]))]).await;
+    let _beta = serve(&mut server, "beta", &[("1.0", wheel("beta", "1.0", "", &[]))]).await;
+    shared_workspace(root.path(), &server.url());
+    fs::write(
+        root.path().join("pyproject.toml"),
+        "[tool.uv.workspace]\nmembers = ['packages/*']\n\n[tool.uv.sources]\n\
+         lib = { workspace = true }\n\n[tool.pnpm.python]\nshared-environment = true\n",
+    )
+    .unwrap();
+    python_project(
+        &root.path().join("packages/lib"),
+        "lib",
+        "dependencies = ['alpha>=1.0,<2.0']\n\n[dependency-groups]\ndev = ['beta>=1.0']",
+    );
+    python_project(&root.path().join("packages/app"), "app", "dependencies = ['lib>=0.1.0']");
+
+    pacquet_in(root.path())
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let _alpha = serve(
+        &mut server,
+        "alpha",
+        &[
+            ("1.0", wheel("alpha", "1.0", "", &[])),
+            ("1.5", wheel("alpha", "1.5", "", &[])),
+            ("2.0", wheel("alpha", "2.0", "", &[])),
+        ],
+    )
+    .await;
+    let _beta = serve(
+        &mut server,
+        "beta",
+        &[("1.0", wheel("beta", "1.0", "", &[])), ("1.5", wheel("beta", "1.5", "", &[]))],
+    )
+    .await;
+
+    pacquet_in(root.path())
+        .with_args(["update", "pypi:alpha"])
+        .assert()
+        .success();
+    let lib_manifest = fs::read_to_string(root.path().join("packages/lib/pyproject.toml")).unwrap();
+    assert!(lib_manifest.contains("alpha>=1.5,<2.0"), "{lib_manifest}");
+    assert!(lib_manifest.contains("beta>=1.0"), "{lib_manifest}");
+    python(root.path())
+        .with_args([
+            "-c",
+            "import alpha, beta, lib, app; assert alpha.VERSION == '1.5' and beta.VERSION == '1.0'",
+        ])
+        .assert()
+        .success();
+
+    pacquet_in(root.path())
+        .with_arg("update")
+        .assert()
+        .success();
+    let lib_manifest = fs::read_to_string(root.path().join("packages/lib/pyproject.toml")).unwrap();
+    let app_manifest = fs::read_to_string(root.path().join("packages/app/pyproject.toml")).unwrap();
+    assert!(lib_manifest.contains("beta>=1.5"), "{lib_manifest}");
+    assert!(app_manifest.contains("lib>=0.1.0"), "{app_manifest}");
+    python(root.path())
+        .with_args([
+            "-c",
+            "import alpha, beta; assert alpha.VERSION == '1.5' and beta.VERSION == '1.5'",
+        ])
+        .assert()
+        .success();
+
+    pacquet_in(root.path())
+        .with_args(["update", "--latest", "pypi:alpha"])
+        .assert()
+        .success();
+    let lib_manifest = fs::read_to_string(root.path().join("packages/lib/pyproject.toml")).unwrap();
+    assert!(lib_manifest.contains("alpha>=2.0"), "{lib_manifest}");
+    python(root.path())
+        .with_args(["-c", "import alpha; assert alpha.VERSION == '2.0'"])
+        .assert()
+        .success();
+    pacquet_in(root.path())
+        .with_args(["install", "--offline", "--frozen-lockfile"])
+        .assert()
+        .success();
+
+    assert_failure_contains(
+        &mut pacquet_in(root.path()).with_args(["update", "pypi:missing"]),
+        "package missing is not a declared dependency in pyproject.toml",
+    );
 }

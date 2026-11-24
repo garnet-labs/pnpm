@@ -1,6 +1,4 @@
 ---
-"pacquet": patch
-"@pnpm/cli.commands": patch
 "pnpm": patch
 ---
 

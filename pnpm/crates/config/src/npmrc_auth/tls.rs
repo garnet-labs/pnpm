@@ -1,4 +1,9 @@
-use super::{NoProxySetting, Path, PathBuf, RegistryTls};
+use super::{
+    NoProxySetting,
+    Path,
+    PathBuf,
+    RegistryTls,
+};
 
 /// Turn the `\n` escapes of an inline PEM into real newlines, so a
 /// single INI line can carry a multi-line certificate. The unscoped
@@ -43,12 +48,12 @@ pub(super) fn load_cafile(path: &Path) -> Vec<String> {
     };
     let delimiter = "-----END CERTIFICATE-----";
     // Key contract points:
-    // - Filter on `chunk.trim().is_empty()` — drops the trailing
+    // - Filter on `chunk.trim().is_empty()`, drops the trailing
     //   empty chunk produced when the file ends with a delimiter,
     //   but *keeps* a trailing non-empty (malformed) chunk, which is
     //   what pnpm's `readCAFileSync` produces too. The network layer
     //   drops whatever carries no certificate.
-    // - `trim_start()` (not full `trim`) — any trailing whitespace
+    // - `trim_start()` (not full `trim`), any trailing whitespace
     //   inside the chunk before the appended delimiter is preserved.
     //   It doesn't matter to a PEM parser but does matter for
     //   byte-equivalence tests.
@@ -109,16 +114,11 @@ pub(super) fn split_ssl_key(key: &str) -> Option<(&str, &'static str, bool)> {
     None
 }
 
-pub(super) fn split_inline_identity_key(key: &str) -> Option<(&str, &'static str)> {
-    let (uri, field, is_file) = split_ssl_key(key)?;
-    (!is_file && matches!(field, "cert" | "key")).then_some((uri, field))
-}
-
 /// Write a per-registry TLS value onto a [`RegistryTls`] entry.
 ///
 /// For inline values (`is_file = false`) the parser pre-expands `\n`
-/// escapes to real newlines — this expansion applies only to
-/// per-registry values, not to the top-level `ca=` form — and `value`
+/// escapes to real newlines (this expansion applies only to
+/// per-registry values, not to the top-level `ca=` form) and `value`
 /// arrives already expanded.
 pub(super) fn apply_tls_field(tls: &mut RegistryTls, field: &str, value: String) {
     match field {

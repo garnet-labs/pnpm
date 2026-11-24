@@ -1,4 +1,9 @@
-use super::{Regex, RunError, Value};
+use super::{
+    Path,
+    Regex,
+    RunError,
+    Value,
+};
 use std::fmt::Write as _;
 
 /// The `run` positional, resolved once into whichever of pnpm's two
@@ -6,18 +11,22 @@ use std::fmt::Write as _;
 ///
 /// Built once per command rather than per project. The recursive runner
 /// applies the same selector across every selected project, so compiling
-/// the pattern there would repeat the work — and would report a rejected
+/// the pattern there would repeat the work, and would report a rejected
 /// pattern once per project instead of once.
 #[derive(Debug)]
 pub(in super::super) struct ScriptSelector<'a> {
     pub(super) name: &'a str,
-    /// `None` when the positional is a plain script name — including a
+    /// `None` when the positional is a plain script name, including a
     /// regexp literal whose pattern the engine rejects, which pnpm also
     /// falls back to reading as a name.
     pub(super) pattern: Option<Regex>,
 }
 
 impl<'a> ScriptSelector<'a> {
+    pub(in super::super) fn is_selector(name: &str) -> bool {
+        split_regex_literal(name).is_some()
+    }
+
     pub(in super::super) fn new(name: &'a str) -> Result<ScriptSelector<'a>, RunError> {
         Ok(ScriptSelector { name, pattern: try_build_regex_from_command(name)? })
     }
@@ -49,15 +58,15 @@ impl<'a> ScriptSelector<'a> {
     }
 
     /// [`Self::select`] plus single-project `run`'s `start` fallback:
-    /// `pnpm start` resolves to `node server.js` even when the manifest
-    /// declares no `start` script. The recursive runner has no such
-    /// fallback.
-    pub(super) fn select_with_start(&self, manifest: &Value) -> Vec<String> {
+    /// `pnpm start` resolves to `node server.js` when `server.js` exists in
+    /// `dir` and the manifest declares no `start` script. The recursive
+    /// runner has no such fallback.
+    pub(super) fn select_with_start(&self, manifest: &Value, dir: &Path) -> Vec<String> {
         let specified = self.select(manifest);
         if !specified.is_empty() {
             return specified;
         }
-        if self.name == "start" {
+        if self.name == "start" && dir.join("server.js").exists() {
             return vec![self.name.to_string()];
         }
         Vec::new()

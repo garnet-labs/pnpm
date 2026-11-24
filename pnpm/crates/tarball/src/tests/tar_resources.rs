@@ -1,10 +1,23 @@
 use super::{
-    AuthHeaders, Integrity, SilentReporter, StoreDir, TarballError, ThrottledClient, assert_eq,
-    fast_retry_opts, fetch_and_extract_with_retry, gzip_bytes, incompressible_tarball,
-    tar_with_entries, tempdir_with_leaked_path,
+    AuthHeaders,
+    Integrity,
+    SilentReporter,
+    StoreDir,
+    TarballError,
+    ThrottledClient,
+    assert_eq,
+    fast_retry_opts,
+    fetch_and_extract_with_retry,
+    gzip_bytes,
+    incompressible_tarball,
+    tar_with_entries,
+    tempdir_with_leaked_path,
 };
 use crate::ArchiveLimit;
-use std::io::{Read, Write};
+use std::io::{
+    Read,
+    Write,
+};
 
 const MANIFEST: &[u8] = br#"{"name":"tar-pkg","version":"1.0.0"}"#;
 
@@ -13,6 +26,21 @@ pub(super) fn small_tar() -> Vec<u8> {
         ("package/package.json", MANIFEST),
         ("package/index.js", b"module.exports = 1\n"),
     ])
+}
+
+/// A package with enough files that the eager path writes them on the
+/// CAS-write pool while it hashes the tar.
+pub(super) fn many_file_tar() -> Vec<u8> {
+    let paths: Vec<String> = (0..40)
+        .map(|index| format!("package/lib/{index}.js"))
+        .collect();
+    let mut entries: Vec<(&str, &[u8])> = vec![("package/package.json", MANIFEST)];
+    entries.extend(
+        paths
+            .iter()
+            .map(|path| (path.as_str(), path.as_bytes())),
+    );
+    tar_with_entries(&entries)
 }
 
 pub(super) fn sha512(bytes: &[u8]) -> Integrity {

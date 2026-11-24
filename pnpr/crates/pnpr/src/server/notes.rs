@@ -1,8 +1,8 @@
 //! Release notes of hosted npm package versions:
 //!
-//! - `GET|PUT|DELETE {base}/{name}/{version}/notes` — one version's note.
+//! - `GET|PUT|DELETE {base}/{name}/{version}/notes`; one version's note.
 //!   `GET` also takes a dist-tag.
-//! - `GET {base}/{name}/-/notes` — the notes of every version, newest first.
+//! - `GET {base}/{name}/-/notes`, the notes of every version, newest first.
 //!
 //! A version note has the access rules of its package: reading it needs read
 //! access, writing it the package's `publish` rule. A version's publication
@@ -10,27 +10,50 @@
 //! publication.
 
 pub(super) use listing::serve_package_notes;
-pub(super) use responses::{NoteRequest, PublicationLink, note_text_response, read_note_body};
+pub(super) use responses::{
+    NoteRequest,
+    PublicationLink,
+    note_text_response,
+    read_note_body,
+};
 
 mod listing;
 mod responses;
 
 use super::{
-    Action, AppState, Identity, RegistrySource, WriteTarget, authorize_package, not_found,
-    publications::{PublicationNoteLink, readable_publication_note},
+    Action,
+    AppState,
+    Identity,
+    RegistrySource,
+    WriteTarget,
+    authorize_package,
+    not_found,
+    publications::{
+        PublicationNoteLink,
+        readable_publication_note,
+    },
     resolve_write_target,
 };
-use axum::response::{IntoResponse, Response};
+use axum::response::{
+    IntoResponse,
+    Response,
+};
 use pnpr_error::RegistryError;
-use pnpr_package_name::{CanonicalPackageName, Ecosystem};
-use pnpr_storage::metadata::{NoteChange, SqlMetadata};
+use pnpr_package_name::{
+    CanonicalPackageName,
+    Ecosystem,
+};
+use pnpr_storage::database::{
+    NoteChange,
+    SqlDatabase,
+};
 use responses::version_note_response;
 use std::sync::Arc;
 
 /// The hosted package a notes request addresses, once the caller may reach
 /// it.
 struct NotesTarget {
-    database: Arc<SqlMetadata>,
+    database: Arc<SqlDatabase>,
     name: CanonicalPackageName,
     target: WriteTarget,
 }
@@ -44,7 +67,7 @@ async fn notes_target(
     raw_name: &str,
     writes: bool,
 ) -> Result<NotesTarget, Response> {
-    let database = Arc::clone(state.inner.storage.sql_metadata());
+    let database = Arc::clone(state.inner.storage.sql_database());
     let name = CanonicalPackageName::parse(raw_name, Ecosystem::Npm).map_err(|_| not_found())?;
     let target = match resolve_write_target(state, identity, registry, &name) {
         Ok(target) => target,
@@ -58,8 +81,8 @@ async fn notes_target(
             identity,
             &source,
             name.as_str(),
-            Action::Publish,
-            Some(&target.org),
+            Action::Annotate,
+            Some(&target.namespace),
         )
         .await
         .map_err(IntoResponse::into_response)?;
@@ -98,11 +121,11 @@ async fn read_version_note(
     let NotesTarget { database, name, target } = notes;
     // A removed version keeps its note and publication on record, but no
     // longer serves them.
-    if !database.has_version(name, &target.org, &version).await? {
+    if !database.has_version(name, &target.namespace, &version).await? {
         return Err(RegistryError::NotFound);
     }
-    let note = database.version_note(name, &target.org, &version).await?;
-    let publication = database.initial_publication(name, &target.org, &version).await?;
+    let note = database.version_note(name, &target.namespace, &version).await?;
+    let publication = database.initial_publication(name, &target.namespace, &version).await?;
     let access = match publication {
         Some(publication) => {
             readable_publication_note(state, identity, database, publication).await?
@@ -130,10 +153,10 @@ async fn resolve_tag(
     notes: &NotesTarget,
     version_or_tag: &str,
 ) -> Result<String, RegistryError> {
-    if notes.database.has_version(&notes.name, &notes.target.org, version_or_tag).await? {
+    if notes.database.has_version(&notes.name, &notes.target.namespace, version_or_tag).await? {
         return Ok(version_or_tag.to_string());
     }
-    let storage = state.inner.storage.for_hosted(&notes.target.org, Ecosystem::Npm);
+    let storage = state.inner.storage.for_hosted(&notes.target.namespace, Ecosystem::Npm);
     let Some(view) = storage.read_hosted_package_view(&notes.name).await? else {
         return Err(RegistryError::NotFound);
     };
@@ -154,19 +177,20 @@ async fn write_version_note(
     text: Option<String>,
 ) -> Result<Response, RegistryError> {
     let principal = identity
-        .username()
+        .user_id()
         .unwrap_or("-")
         .to_string();
     let deleted = text.is_none();
-    let change = NoteChange { text, principal: principal.clone() };
+    let change = NoteChange { text, principal };
     let NotesTarget { database, name, target } = notes;
-    if !database.set_version_note(name, &target.org, version, change).await? {
+    if !database.set_version_note(name, &target.namespace, version, change).await? {
         return Err(RegistryError::NotFound);
     }
-    tracing::info!(
-        target: "pnpr::audit",
-        action = if deleted { "package.note_delete" } else { "package.note_set" },
-        actor = %principal,
+    let actor = crate::audit::Actor::of(identity);
+    let action = if deleted { "package.note_delete" } else { "package.note_set" };
+    crate::audit!(
+        actor,
+        action,
         package = %name.as_str(),
         version = %version,
         registry = %target.source,

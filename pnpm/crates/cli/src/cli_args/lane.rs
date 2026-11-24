@@ -1,15 +1,25 @@
 use crate::cli_args::{
-    change::{releasable_projects, to_engine_projects},
+    change::{
+        releasable_projects,
+        to_engine_projects,
+    },
     recursive::discover_workspace_projects,
     version::selected_projects,
 };
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
 use pnpm_versioning::VersioningSettings;
 use pnpm_workspace_manifest_writer::update_workspace_setting;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{
+    BTreeMap,
+    HashMap,
+    HashSet,
+};
 
 /// The reserved name of the default lane: every package is on it unless
 /// assigned elsewhere, packages on it release stable versions, and no
@@ -86,26 +96,34 @@ impl LaneArgs {
         }
 
         let lane_by_dir = lanes_by_dir(&config.versioning, &refs);
-
         let mut settings: VersioningSettings = config.versioning.clone();
-        let selected_lines = selected_reference_lines(&selected);
-        let output = if lane_name == MAIN_LANE {
-            clear_lanes(&mut settings, &selected, &lane_by_dir);
-            format!(
-                r#"Moved to the main lane:
-{selected_lines}The accumulated stable versions release on the next "pnpm version -r" run."#,
-            )
-        } else {
-            check_lane_name(&lane_name)?;
-            assign_lane(&mut settings, &selected, &lane_by_dir, &lane_name)?;
-            format!("Moved to the \"{lane_name}\" lane:\n{selected_lines}")
-        };
+        let output = apply_lane_move(&mut settings, &selected, &lane_by_dir, &lane_name)?;
+        pnpm_versioning::validate_versioning_lanes(&engine_projects, &workspace_dir, &settings)?;
 
         update_workspace_setting(&workspace_dir, "versioning", &versioning_value(&settings))
             .map_err(miette::Report::new)?;
         pnpm_diagnostics::println!("{output}");
         Ok(())
     }
+}
+
+fn apply_lane_move(
+    settings: &mut VersioningSettings,
+    selected: &[(String, String, String)],
+    lane_by_dir: &HashMap<String, (String, String)>,
+    lane_name: &str,
+) -> Result<String, LaneError> {
+    let selected_lines = selected_reference_lines(selected);
+    if lane_name == MAIN_LANE {
+        clear_lanes(settings, selected, lane_by_dir);
+        return Ok(format!(
+            r#"Moved to the main lane:
+{selected_lines}The accumulated stable versions release on the next "pnpm version -r" run."#,
+        ));
+    }
+    check_lane_name(lane_name)?;
+    assign_lane(settings, selected, lane_by_dir, lane_name)?;
+    Ok(format!("Moved to the \"{lane_name}\" lane:\n{selected_lines}"))
 }
 
 /// (name, dir) of every selected releasable project, with the reference an

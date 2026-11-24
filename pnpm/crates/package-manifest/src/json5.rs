@@ -1,15 +1,27 @@
 pub(super) use comments::restore_comments;
 pub(super) use stringify::stringify;
+pub(super) use sync::sync;
 
 use serde::{
-    Deserialize, Deserializer,
-    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
+    Deserialize,
+    Deserializer,
+    de::{
+        self,
+        DeserializeSeed,
+        MapAccess,
+        SeqAccess,
+        Visitor,
+    },
 };
-use serde_json::{Map, Value};
+use serde_json::{
+    Map,
+    Value,
+};
 use std::fmt;
 
 mod comments;
 mod stringify;
+mod sync;
 
 // json5 does not bound recursion. Build the value through a seed so the limit
 // applies before descending, including to fields pnpm does not interpret.

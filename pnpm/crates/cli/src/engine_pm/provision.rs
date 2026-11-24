@@ -3,12 +3,23 @@
 
 use crate::{
     engine_pm::{
-        channel::{BinaryChannel, Channel, EnginePackages, PackageManager},
+        channel::{
+            BinaryChannel,
+            Channel,
+            EnginePackages,
+            PackageManager,
+        },
         error::EngineError,
-        install::{engine_env_root, install_engine_to_store},
+        install::{
+            engine_env_root,
+            install_engine_to_store,
+        },
         resolve::resolve_release,
     },
-    shim_dispatch::{MaterializedRuntime, materialize_runtime},
+    shim_dispatch::{
+        MaterializedRuntime,
+        materialize_runtime,
+    },
 };
 use miette::Context;
 use pnpm_config::Config;
@@ -16,12 +27,15 @@ use pnpm_reporter::Reporter;
 use pnpm_store_dir::PrivateInstall;
 use std::{
     ffi::OsStr,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// The Node.js line a JavaScript package manager runs on when the host has
-/// no `node` of its own. LTS is the conservative pick, and — being a stable
-/// release — it is the one channel whose archives carry Node's own
+/// no `node` of its own. LTS is the conservative pick, and (being a stable
+/// release) it is the one channel whose archives carry Node's own
 /// publisher signatures.
 const MANAGED_NODE_SPEC: &str = "lts";
 
@@ -43,7 +57,7 @@ impl ProvisionedEngine {
     /// The executable for the command `name`, falling back to the
     /// engine's main program when it publishes no such command.
     ///
-    /// A package manager publishes more than one — `npx` alongside `npm` —
+    /// A package manager publishes more than one (`npx` alongside `npm`)
     /// so the one the user typed is what runs. Only the engine's own
     /// directory answers: a managed Node.js behind it ships an `npm` and
     /// an `npx` of its own, which are not the versions that were asked
@@ -83,7 +97,7 @@ pub(crate) async fn provision<Reporter: self::Reporter + 'static>(
         Channel::Registry { package } => {
             Box::pin(provision_from_registry::<Reporter>(config, pm, package, version_spec)).await
         }
-        Channel::Binary(binary) => provision_binary(config, binary, version_spec).await,
+        Channel::Binary(binary) => Box::pin(provision_binary(config, binary, version_spec)).await,
     }
 }
 
@@ -99,8 +113,12 @@ async fn provision_binary(
         BinaryChannel::Bun => "bun",
         BinaryChannel::Yarn => "yarn",
     };
-    let runtime =
-        materialize_runtime(&config.state_dir, name.to_string(), version_spec.to_string()).await?;
+    let runtime = Box::pin(materialize_runtime(
+        &config.state_dir,
+        name.to_string(),
+        version_spec.to_string(),
+    ))
+    .await?;
     let bin_dir = runtime.bin
         .parent()
         .ok_or_else(|| EngineError::MissingEngineBin {
@@ -145,7 +163,7 @@ async fn provision_from_registry<Reporter: self::Reporter + 'static>(
     let packages = pm
         .engine_packages(&resolved.version)
         .ok_or_else(|| miette::miette!("{name}@{} is not a registry engine", resolved.version))?;
-    if let Some(node) = managed_node(config, packages).await? {
+    if let Some(node) = Box::pin(managed_node(config, packages)).await? {
         bin_dirs.extend(node.bin.parent().map(Path::to_path_buf));
         private_installs.extend(node.private_install);
     }
@@ -153,7 +171,7 @@ async fn provision_from_registry<Reporter: self::Reporter + 'static>(
 }
 
 /// A `node` for a JavaScript engine to run on, or `None` when the engine
-/// needs none — either because it is a native binary, or because the host
+/// needs none; either because it is a native binary, or because the host
 /// already has a `node` on `PATH`.
 ///
 /// A machine that only ever installed pnpm has no Node.js at all, and npm
@@ -166,10 +184,14 @@ async fn managed_node(
     if packages.links_native_binary || which::which("node").is_ok() {
         return Ok(None);
     }
-    materialize_runtime(&config.state_dir, "node".to_string(), MANAGED_NODE_SPEC.to_string())
-        .await
-        .wrap_err("install a Node.js runtime to run the package manager with")
-        .map(Some)
+    Box::pin(materialize_runtime(
+        &config.state_dir,
+        "node".to_string(),
+        MANAGED_NODE_SPEC.to_string(),
+    ))
+    .await
+    .wrap_err("install a Node.js runtime to run the package manager with")
+    .map(Some)
 }
 
 #[cfg(test)]

@@ -4,6 +4,9 @@
 #[path = "auth_publish/scoped_publishing.rs"]
 mod scoped_publishing;
 
+#[path = "auth_publish/package_names.rs"]
+mod package_names;
+
 #[path = "auth_publish/publish_validation.rs"]
 mod publish_validation;
 
@@ -16,19 +19,44 @@ mod authentication;
 #[path = "auth_publish/manifest_verification.rs"]
 mod manifest_verification;
 
-use crate::{npm, storage as common};
+use crate::{
+    npm,
+    storage as common,
+};
 
 use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+    },
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
-use npm::{npm_tgz, npm_tgz_with, publish_doc, sha1_hex, sri_sha512};
-use pnpr::{Config, MaxUsers, router};
+use npm::{
+    npm_tgz,
+    npm_tgz_with,
+    publish_doc,
+    sha1_hex,
+    sri_sha512,
+};
+use pnpr::{
+    Config,
+    MaxUsers,
+};
 use pnpr_fixtures::MockConfigPresets;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
     path::PathBuf,
 };
 use tempfile::TempDir;
@@ -38,7 +66,7 @@ fn static_config(storage: PathBuf) -> Config {
     let listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873));
     let mut config = Config::static_serve(listen, storage);
     config.http.public_url = "http://example.test".to_string();
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     config
 }
 
@@ -47,11 +75,11 @@ fn static_config_with_packages(dir: &TempDir, packages_block: &str) -> (Config, 
     let storage = dir.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
     // Route everything to one local hosted over the flat storage root (an
-    // empty `org` namespace), so publishes/reads resolve through the
+    // empty `namespace`), so publishes/reads resolve through the
     // path-less base and the per-package rules in `packages_block` gate
     // them. The callers indent keys by two spaces; re-indent under
     // `registries.local.packages`, and add a `'**'` catch-all with the
-    // default rules so the namespace stays name-unbounded like the old
+    // default rules so the registry stays name-unbounded like the old
     // static shape.
     let nested: String = packages_block
         .lines()
@@ -60,7 +88,7 @@ fn static_config_with_packages(dir: &TempDir, packages_block: &str) -> (Config, 
         .join("\n");
     let yaml = format!(
         "storage: {}\nregistries:\n  \
-         local:\n    type: hosted\n    org: \"\"\n    access: $all\n    packages:\n\
+         local:\n    type: hosted\n    namespace: \"\"\n    access: $all\n    packages:\n\
          {nested}\n      '**': {{}}\n  \
          main:\n    type: router\n    sources: [local]\n\
          defaultRegistry: main\n",
@@ -68,9 +96,12 @@ fn static_config_with_packages(dir: &TempDir, packages_block: &str) -> (Config, 
     );
     let config_path = dir.path().join("config.yaml");
     std::fs::write(&config_path, yaml).unwrap();
-    let mut config =
-        Config::from_yaml(&config_path, listen, Some("http://example.test".to_string())).unwrap();
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    let mut config = pnpr_fixtures::load_seeded_config(
+        &config_path,
+        listen,
+        Some("http://example.test".to_string()),
+    );
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     (config, storage)
 }
 
@@ -121,4 +152,10 @@ async fn add_user_and_get_token(
         .expect("token in response")
         .to_string();
     (app, token)
+}
+
+fn router(config: Config) -> axum::Router {
+    let auth =
+        crate::tokens::seeded_auth(&config, &[("alice", "secret123"), ("admin", "secret123")]);
+    pnpr::router_with_auth(config, auth)
 }

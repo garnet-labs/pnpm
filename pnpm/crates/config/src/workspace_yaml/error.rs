@@ -1,4 +1,10 @@
-use super::{Diagnostic, Display, Error, PathBuf, io};
+use super::{
+    Diagnostic,
+    Display,
+    Error,
+    PathBuf,
+    io,
+};
 
 /// Error when reading `pnpm-workspace.yaml`.
 ///
@@ -8,6 +14,9 @@ use super::{Diagnostic, Display, Error, PathBuf, io};
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum LoadWorkspaceYamlError {
+    #[display("The \"noProxy\" setting should be a boolean or string, but got {received_type}")]
+    #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
+    InvalidNoProxy { received_type: &'static str },
     #[display("Failed to read pnpm-workspace.yaml at {}: {source}", path.display())]
     ReadFile {
         path: PathBuf,
@@ -21,6 +30,9 @@ pub enum LoadWorkspaceYamlError {
         #[error(source)]
         source: Box<serde_saphyr::Error>,
     },
+    #[display("Failed to replace env in config: {var}")]
+    #[diagnostic(code(ERR_PNPM_CONFIG_UNRESOLVED_ENV_VAR))]
+    ConfigUnresolvedEnvVar { var: String },
     /// The registry URL is redacted before it reaches this variant.
     #[display("The \"registries\" key {registry} embeds credentials")]
     #[diagnostic(
@@ -104,6 +116,9 @@ pub enum LoadWorkspaceYamlError {
     #[display("The Python package pattern {pattern:?} is routed to two registries: {registries}")]
     #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
     PythonPackageRoutedTwice { pattern: String, registries: String },
+    #[display("Invalid value of referenceTime: {value:?} {reason}")]
+    #[diagnostic(code(ERR_PNPM_INVALID_REFERENCE_TIME))]
+    InvalidReferenceTime { value: String, reason: &'static str },
     #[display("The \"pipelines['{pipeline}']\" setting contains an entry with no task name")]
     #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
     EmptyPipelineTaskName { pipeline: String },
@@ -142,15 +157,25 @@ pub enum LoadWorkspaceYamlError {
     #[display("tokenHelper must not be configured in project-level .npmrc")]
     #[diagnostic(
         code(ERR_PNPM_TOKEN_HELPER_IN_PROJECT_CONFIG),
-        help(
-            "The key {key:?} was found in project config. Move it to ~/.npmrc or the global pnpm auth.ini."
-        )
+        help("Set {key:?} in ~/.npmrc or the global pnpm auth.ini.")
     )]
     TokenHelperInProjectConfig { key: String },
+    /// A repository-controlled file names a registry whose URL holds a
+    /// `${VAR}` placeholder. pnpm does not expand it there, and dropping the
+    /// URL would resolve the packages it serves from another registry.
+    /// `setting` is redacted before it reaches this variant.
+    #[display(r#"The "{setting}" registry URL in "{file}" contains an environment variable"#)]
+    #[diagnostic(
+        code(ERR_PNPM_REGISTRY_ENV_NOT_EXPANDED),
+        help(
+            "pnpm does not expand environment variables in registry URLs that come from a file committed to the repository. Ignoring the URL would resolve the packages it serves from another registry. Write the URL literally, or move the setting to the global config.yaml."
+        )
+    )]
+    RegistryEnvNotExpanded { setting: String, file: String },
     /// An `_auth` or `_password` credential did not decode as base64. Both
     /// exist to carry a base64-encoded value, so a value that cannot be
     /// decoded would otherwise reach the registry as a credential nobody
-    /// chose — a silent 401 instead of a fixable error.
+    /// chose, a silent 401 instead of a fixable error.
     #[display("Failed to decode {key} as base64")]
     #[diagnostic(
         code(ERR_PNPM_AUTH_INVALID_BASE64),
@@ -194,7 +219,7 @@ pub enum LoadWorkspaceYamlError {
 
     /// The signing trust root for remote side-effects artifacts appeared in a
     /// committed file. Only the global config yaml and the environment may
-    /// carry it — see [`RemoteSideEffectsCacheSettings`](crate::workspace_yaml::sections::RemoteSideEffectsCacheSettings).
+    /// carry it; see [`RemoteSideEffectsCacheSettings`](crate::workspace_yaml::sections::RemoteSideEffectsCacheSettings).
     #[display("{prefix}.{field} cannot be set by a workspace ({})", path.display())]
     #[diagnostic(
         code(ERR_PNPM_WORKSPACE_REMOTE_SIDE_EFFECTS_TRUST),
@@ -205,7 +230,7 @@ pub enum LoadWorkspaceYamlError {
     )]
     WorkspaceRemoteSideEffectsTrust { path: PathBuf, prefix: &'static str, field: &'static str },
 
-    /// A machine-only field of `remoteCache` appeared in a committed file —
+    /// A machine-only field of `remoteCache` appeared in a committed file;
     /// see [`RemoteCacheSettings`](crate::workspace_yaml::sections::RemoteCacheSettings).
     #[display("remoteCache.{field} cannot be set by a workspace ({})", path.display())]
     #[diagnostic(
@@ -216,6 +241,18 @@ pub enum LoadWorkspaceYamlError {
         )
     )]
     WorkspaceRemoteCacheTrust { path: PathBuf, field: &'static str },
+
+    /// An `editor` appeared in a committed file, which may not choose the
+    /// executable `pnpm edit` runs.
+    #[display("editor cannot be set by a workspace ({})", path.display())]
+    #[diagnostic(
+        code(ERR_PNPM_WORKSPACE_EDITOR),
+        help(
+            "Set it in the global config file or in the environment instead of {}.",
+            path.display(),
+        )
+    )]
+    WorkspaceEditor { path: PathBuf },
 
     #[diagnostic(transparent)]
     UnexpandedEnvInPath(#[error(source)] crate::UnexpandedWindowsEnvVar),

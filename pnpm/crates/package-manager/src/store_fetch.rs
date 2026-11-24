@@ -8,10 +8,17 @@
 //! prefetch every tarball as it resolves, keeps those download tasks, and
 //! waits for them here.
 
-use crate::{InstallError, PrefetchDownloads, tarball_prefetch::TarballPrefetcher};
+use crate::{
+    InstallError,
+    PrefetchDownloads,
+    tarball_prefetch::TarballPrefetcher,
+};
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
-use pnpm_network::{AuthHeaders, ThrottledClient};
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+};
 use pnpm_package_is_installable::SupportedArchitectures;
 use pnpm_reporter::Reporter;
 use pnpm_tarball::MemCache;
@@ -30,7 +37,7 @@ pub(crate) enum StoreFetchScope {
 
 pub(crate) struct StoreFetchInputs<'a> {
     pub lockfile: &'a Lockfile,
-    pub config: &'static Config,
+    pub config: &'a Config,
     pub http_client: &'a Arc<ThrottledClient>,
     pub mem_cache: &'a Arc<MemCache>,
     pub auth_override: Option<&'a Arc<AuthHeaders>>,

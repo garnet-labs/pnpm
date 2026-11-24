@@ -1,4 +1,11 @@
-use super::{DateTime, Map, OwoColorize, Stream, Style, Utc, Value};
+use super::{
+    Map,
+    OwoColorize,
+    Stream,
+    Style,
+    Timestamp,
+    Value,
+};
 
 /// Render the selected `fields` of `info`. A single field unwraps to its
 /// value (raw for `--json`, plain for text); multiple fields render as a
@@ -69,9 +76,9 @@ pub(super) fn format_field_value(value: Option<&Value>) -> String {
 
 /// Render the human-readable summary block: a `name@version | license |
 /// deps | versions` header followed by description, homepage, deprecation,
-/// keywords, bin, dist, dependencies, maintainers, dist-tags, and the
-/// published-by line.
-pub(super) fn render_summary(info: &Value) -> String {
+/// keywords, bin, dist, dependencies, maintainers, dist-tags, the
+/// published-by line, and the registry the metadata was read from.
+pub(super) fn render_summary(info: &Value, registry: &str) -> String {
     let mut lines: Vec<String> = vec![summary_header(info)];
 
     if let Some(description) = str_field(info, "description") {
@@ -104,6 +111,14 @@ pub(super) fn render_summary(info: &Value) -> String {
         lines.push(String::new());
         lines.push(published);
     }
+
+    // A mirror that lags behind its upstream shows stale versions and
+    // dist-tags, so name the registry the metadata came from.
+    lines.push(String::new());
+    lines.push(format!(
+        "registry: {}",
+        underline_blue(&pnpm_network::redact_url_for_display(registry)),
+    ));
 
     lines.join("\n")
 }
@@ -282,8 +297,8 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 /// The age of `date` relative to `now`, bucketed into a coarse "N units
 /// ago" label. `None` for a future date (clock skew). Split from
 /// [`format_time_ago`] so the `now` reference is injectable in tests.
-pub(super) fn format_time_ago_since(date: DateTime<Utc>, now: DateTime<Utc>) -> Option<String> {
-    let diff_ms = now.signed_duration_since(date).num_milliseconds();
+pub(super) fn format_time_ago_since(date: Timestamp, now: Timestamp) -> Option<String> {
+    let diff_ms = now.duration_since(date).as_millis();
     if diff_ms < 0 {
         return None;
     }
@@ -293,7 +308,7 @@ pub(super) fn format_time_ago_since(date: DateTime<Utc>, now: DateTime<Utc>) -> 
     let diff_day = diff_hour / 24;
     let diff_month = diff_day / 30;
     let diff_year = diff_day / 365;
-    let unit = |count: i64, singular: &str| {
+    let unit = |count: i128, singular: &str| {
         format!("{count} {singular}{} ago", if count == 1 { "" } else { "s" })
     };
     Some(if diff_year > 0 {
@@ -311,14 +326,12 @@ pub(super) fn format_time_ago_since(date: DateTime<Utc>, now: DateTime<Utc>) -> 
     })
 }
 
-fn format_time_ago(date: DateTime<Utc>) -> Option<String> {
-    format_time_ago_since(date, Utc::now())
+fn format_time_ago(date: Timestamp) -> Option<String> {
+    format_time_ago_since(date, Timestamp::now())
 }
 
-pub(super) fn parse_date(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|date| date.with_timezone(&Utc))
+pub(super) fn parse_date(value: &str) -> Option<Timestamp> {
+    pnpm_time::parse_rfc3339(value).ok()
 }
 
 pub(super) fn to_pretty(value: &Value) -> String {

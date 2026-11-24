@@ -1,7 +1,25 @@
 use super::{
-    Config, EnvVar, EnvVarOs, GLOBAL_LAYOUT_VERSION, GetCurrentDir, GetHomeDir, HostNoHome,
-    LinkProbe, LoadWorkspaceYamlError, OsString, Path, PathBuf, assert_eq, capture_warnings,
-    default_store_dir, display_store_dir, fs, io, safe_host_var, tempdir, write_file,
+    Config,
+    EnvVar,
+    EnvVarOs,
+    GLOBAL_LAYOUT_VERSION,
+    GetCurrentDir,
+    GetHomeDir,
+    HostNoHome,
+    LinkProbe,
+    LoadWorkspaceYamlError,
+    OsString,
+    Path,
+    PathBuf,
+    assert_eq,
+    capture_warnings,
+    default_store_dir,
+    display_store_dir,
+    fs,
+    io,
+    safe_host_var,
+    tempdir,
+    write_file,
 };
 
 #[test]
@@ -178,6 +196,112 @@ pub fn pnpm_config_request_destinations_expand_env() {
     assert_eq!(config.registry, "https://env.example.com/npm/");
 }
 
+/// A dropped registry URL would resolve its packages from another registry.
+/// <https://github.com/pnpm/pnpm/issues/17762>
+#[test]
+pub fn repository_registry_with_env_placeholder_aborts_the_load() {
+    for (file_name, contents, expected_setting) in [
+        ("pnpm-workspace.yaml", "registry: http://localhost:${MOCK_PORT}/\n", "registry"),
+        (".npmrc", "registry=http://localhost:${MOCK_PORT}/\n", "registry"),
+        (
+            "pnpm-workspace.yaml",
+            "registries:\n  '@acme': http://localhost:${MOCK_PORT}/\n",
+            "registries['@acme']",
+        ),
+        (".npmrc", "@acme:registry=http://localhost:${MOCK_PORT}/\n", "@acme:registry"),
+    ] {
+        let project = tempdir().expect("project tempdir");
+        write_file(&project.path().join(file_name), contents);
+
+        let result = Config::default().current::<HostNoHome>(project.path());
+        eprintln!("{file_name}: {result:?}");
+        assert!(matches!(
+            result,
+            Err(LoadWorkspaceYamlError::RegistryEnvNotExpanded { setting, .. })
+                if setting == expected_setting
+        ));
+    }
+}
+
+/// The load that switches to the pinned pnpm leaves out what this pnpm
+/// refuses, so a newer or older pinned pnpm still gets to decide.
+#[test]
+pub fn readable_load_leaves_out_a_registry_with_env_placeholder() {
+    let project = tempdir().expect("project tempdir");
+    write_file(
+        &project.path().join("pnpm-workspace.yaml"),
+        "registry: http://localhost:${MOCK_PORT}/\nregistries:\n  '@acme': http://localhost:${MOCK_PORT}/\n  '@good': https://good.example/\nlockfile: false\n",
+    );
+    write_file(
+        &project.path().join(".npmrc"),
+        "registry=http://localhost:${MOCK_PORT}/\n@other:registry=http://localhost:${MOCK_PORT}/\n",
+    );
+
+    let config = Config { settings_read: crate::SettingsRead::Readable, ..Config::default() }
+        .current::<HostNoHome>(project.path())
+        .expect("load config");
+
+    assert!(!config.lockfile);
+    assert_eq!(config.registry, "https://registry.npmjs.org/");
+    assert_eq!(config.registries_by_scope.get("@acme"), None);
+    assert_eq!(
+        config.registries_by_scope.get("@good").map(String::as_str),
+        Some("https://good.example/"),
+    );
+    assert_eq!(config.registries_by_scope.get("@other"), None);
+}
+
+/// A readable load leaves out a `storeDir` whose variable is unset, so the
+/// store is placed as if the setting were absent.
+#[test]
+pub fn readable_load_places_the_store_when_store_dir_is_left_out() {
+    let load = |workspace_yaml: &str| {
+        let project = tempdir().expect("project tempdir");
+        write_file(&project.path().join("pnpm-workspace.yaml"), workspace_yaml);
+        let config = Config { settings_read: crate::SettingsRead::Readable, ..Config::default() }
+            .current::<HostNoHome>(project.path())
+            .expect("load config");
+        (config.store_dir, config.store_dir_placement_skipped)
+    };
+
+    assert_eq!(load("storeDir: ${PNPM_TEST_UNSET_STORE_DIR}\n"), load("packages: []\n"));
+}
+
+#[test]
+pub fn unresolved_store_dir_placeholder_fails_the_load() {
+    let project = tempdir().expect("project tempdir");
+    write_file(
+        &project.path().join("pnpm-workspace.yaml"),
+        "storeDir: ${PNPM_TEST_UNSET_STORE_DIR}\n",
+    );
+
+    let error = Config::default().current::<HostNoHome>(project.path()).unwrap_err();
+
+    assert!(
+        error.to_string().contains("${PNPM_TEST_UNSET_STORE_DIR}"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+pub fn repository_proxy_with_env_placeholder_warns() {
+    let project = tempdir().expect("project tempdir");
+    write_file(
+        &project.path().join("pnpm-workspace.yaml"),
+        "httpsProxy: http://localhost:${MOCK_PORT}/\n",
+    );
+
+    let config = Config::default().current::<HostNoHome>(project.path()).expect("load config");
+
+    assert_eq!(config.proxy, pnpm_network::ProxyConfig::default());
+    dbg!(&config.npmrc_warnings);
+    assert!(
+        config.npmrc_warnings
+            .iter()
+            .any(|warning| warning.starts_with(r#"Ignored "httpsProxy" in pnpm-workspace.yaml"#)),
+    );
+}
+
 /// End-to-end: malformed `pnpm_config__auth` JSON aborts the load with an
 /// error rather than silently dropping the auth.
 #[test]
@@ -202,7 +326,7 @@ pub fn json_env_non_object_top_level_aborts_the_load() {
 }
 
 /// End-to-end: the "@" (default) scope in `pnpm_config__auth` routes the
-/// default registry to its host — `pnpm add <pkg>` resolves against the
+/// default registry to its host, `pnpm add <pkg>` resolves against the
 /// env-declared host, not the npmjs default. Confirmed semantics in
 /// pnpm/pnpm#12559.
 #[test]
@@ -247,7 +371,7 @@ pub fn json_env_scoped_entry_routes_that_scope() {
 }
 
 /// End-to-end: a `PNPM_CONFIG_REGISTRY` env var (CLI-equivalent) still
-/// wins over the env JSON default — matching pnpm's "CLI > env JSON >
+/// wins over the env JSON default, matching pnpm's "CLI > env JSON >
 /// yaml" precedence.
 #[test]
 pub fn json_env_env_registry_flag_wins_over_json_env_default() {
@@ -313,7 +437,7 @@ pub fn json_env_inferred_registries_flow_to_bootstrap() {
 
 /// Env JSON routes override user-level (`~/.npmrc` / `auth.ini`) scoped
 /// registries in the package-manager bootstrap: env JSON outranks the
-/// trusted `.npmrc`. CLI scoped overrides still win — applied later by
+/// trusted `.npmrc`. CLI scoped overrides still win, applied later by
 /// `ConfigOverrides`.
 #[test]
 pub fn json_env_overrides_user_bootstrap_scoped_registry() {
@@ -525,7 +649,7 @@ pub fn cli_https_proxy_precedes_standard_http_proxy_environment_fallback() {
 }
 
 /// A flag names its key even when the value reads as unset, so the
-/// `.npmrc` below it cannot win the key back — the cascade falls through
+/// `.npmrc` below it cannot win the key back, the cascade falls through
 /// to the other keys and the environment, and here to neither.
 #[test]
 pub fn empty_cli_proxy_flags_mask_the_project_npmrc() {
@@ -682,7 +806,7 @@ pub fn npmrc_in_current_folder_applies_registry() {
 
 /// pnpm 11 does not treat the `fetch-retries*` family as an
 /// `.npmrc`-readable auth setting, so a value like `fetch-retries=99`
-/// in `.npmrc` is silently ignored. pacquet must do the same —
+/// in `.npmrc` is silently ignored. pacquet must do the same,
 /// applying it would silently change install behaviour for projects
 /// that have a stale `.npmrc` lying around.
 #[test]
@@ -705,7 +829,7 @@ pub fn test_current_folder_for_invalid_npmrc() {
     fs::write(tmp.path().join(".npmrc"), b"Hello \xff World").expect("write to .npmrc");
     let config =
         Config::new().current::<HostNoHome>(tmp.path()).expect("workspace yaml absent => no error");
-    assert!(config.symlink); // default — invalid .npmrc is silently ignored
+    assert!(config.symlink); // default, invalid .npmrc is silently ignored
 }
 
 #[test]
@@ -715,7 +839,7 @@ pub fn npmrc_in_home_folder_applies_registry() {
     fs::write(home_dir.path().join(".npmrc"), "registry=https://home.example")
         .expect("write to .npmrc");
     // Per-test fake: home_dir is a tempdir, so it can't be a
-    // module-level constant — stash it in a per-test `OnceLock`
+    // module-level constant, stash it in a per-test `OnceLock`
     // so `GetHomeDir::home_dir`'s associated-function shape (no
     // `&self`) can still resolve it at call time.
     static HOME_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();

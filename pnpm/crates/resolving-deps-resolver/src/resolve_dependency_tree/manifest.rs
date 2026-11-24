@@ -3,17 +3,31 @@
 //! leaf classification, and whether it is deprecated.
 
 use pnpm_catalogs_types::Catalogs;
-use pnpm_package_manifest::{DependencyGroup, engines_runtime_dependencies, is_truthy};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    engines_runtime_dependencies,
+    is_truthy,
+};
 use pnpm_patching::get_patch_info;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::resolved_tree::PeerSet;
 
 use super::{
-    CatalogAnchor, DependencySpec, Deprecation, ResolveDependencyTreeError,
-    catalogs::resolve_catalog_specifier, dependency_is_injected, lock_recoverable,
+    DependencySpec,
+    Deprecation,
+    ResolveDependencyTreeError,
+    catalogs::{
+        catalog_anchor,
+        resolve_catalog_specifier,
+    },
+    dependency_is_injected,
+    lock_recoverable,
     tree_ctx::TreeCtx,
 };
 
@@ -31,11 +45,11 @@ use super::{
 ///    `ERR_PNPM_UNUSED_PATCH` check sees the hit.
 ///
 /// Packages whose resolver didn't supply [`pnpm_resolving_resolver_base::ResolvedPackageInfo::name_ver`]
-/// use the manifest's `name` and, for non-directory resolutions, its
-/// `version`. Local directories remain linked rather than patched, matching
-/// the TypeScript CLI and the lockfile format, which omits their manifest
-/// version. The lookup is skipped when either field is unavailable or no
-/// patches are configured.
+/// use the manifest's `name` and `version`. A local directory is matched by
+/// the `file:` locator its key records instead, as a frozen install reads it
+/// back, so only a wildcard patch reaches it. A `link:` dependency is never
+/// patched. The lookup is skipped when no version is known or no patches are
+/// configured.
 pub(super) async fn build_pkg_id_with_patch_hash(
     ctx: &TreeCtx,
     result: &pnpm_resolving_resolver_base::ResolveResult,
@@ -51,7 +65,7 @@ pub(super) async fn build_pkg_id_with_patch_hash(
     }
     // Resolvers that learn the name from the fetched manifest (git,
     // tarball, directory) leave `name_ver` unset. The `name` is read
-    // from the manifest itself and the id is prefixed regardless — so a
+    // from the manifest itself and the id is prefixed regardless, so a
     // `file:project-1` id becomes `project-1@file:project-1`. Skipping
     // the prefix would leave `(` as the first paren-bearing character in
     // the downstream depPath, which `PkgNameVerPeer`'s `@`-split parser
@@ -60,24 +74,23 @@ pub(super) async fn build_pkg_id_with_patch_hash(
     let manifest_name = manifest
         .and_then(|manifest| manifest.get("name"))
         .and_then(serde_json::Value::as_str);
-    let manifest_version =
-        (!matches!(result.resolution, pnpm_lockfile::LockfileResolution::Directory(_)))
-            .then(|| {
-                manifest
-                    .and_then(|manifest| manifest.get("version"))
-                    .and_then(serde_json::Value::as_str)
-            })
-            .flatten();
-    let (name, version) = match (result.package.name_ver.as_ref(), manifest_name) {
+    let manifest_version = manifest
+        .and_then(|manifest| manifest.get("version"))
+        .and_then(serde_json::Value::as_str);
+    let (name, mut version) = match (result.package.name_ver.as_ref(), manifest_name) {
         (Some(name_ver), _) => (name_ver.name.to_string(), name_ver.suffix.to_string()),
         (None, Some(name)) => (name.to_string(), manifest_version.unwrap_or_default().to_string()),
         (None, None) => return Ok(raw_id.to_string()),
     };
-    let prefixed = if raw_id.starts_with(&format!("{name}@")) {
+    let name_prefix = format!("{name}@");
+    let prefixed = if raw_id.starts_with(&name_prefix) {
         raw_id.to_string()
     } else {
-        format!("{name}@{raw_id}")
+        format!("{name_prefix}{raw_id}")
     };
+    if matches!(result.resolution, pnpm_lockfile::LockfileResolution::Directory(_)) {
+        version = prefixed[name_prefix.len()..].to_string();
+    }
     // `patched_dependencies` keys carry a `name@version` shape. Bail
     // out when the resolver and manifest both omitted the version so
     // the patch lookup doesn't run a `name@""` query.
@@ -131,7 +144,7 @@ pub(super) fn extract_children(
 /// The child dependency specs the resolver walks for a package whose
 /// manifest is `manifest`: its `dependencies` + `optionalDependencies`.
 ///
-/// Peer dependencies are **not** walked as regular edges here — they're
+/// Peer dependencies are **not** walked as regular edges here, they're
 /// hoisted to the importer level by the
 /// [`fn@crate::resolve_importer`] orchestrator (which calls [`extend_tree`]
 /// with the hoist-picker's output) so a peer ends up shared across
@@ -189,36 +202,33 @@ pub fn manifest_child_specs(
             injected: false,
         });
     }
-    add_variant_child_specs(manifest, parent, &mut out)?;
     out.sort_unstable();
     Ok(out)
 }
 
-/// Add the dependencies only a platform variant declares. Every archive's
-/// dependencies are resolved on every machine, so the lockfile is the same
-/// everywhere; the lockfile writer splits them into the version's snapshot
-/// and each variant's. A name the version already declares keeps the
-/// version's specifier, since a package resolves one version per name.
-fn add_variant_child_specs(
+pub fn declared_specifiers(
     manifest: &Value,
     parent: &str,
-    out: &mut Vec<DependencySpec>,
-) -> Result<(), ResolveDependencyTreeError> {
-    for (_, variant) in pnpm_platform_variants::variant_manifests(manifest) {
-        let bundled = bundled_dependency_names(&variant);
-        let mut specs = Vec::new();
-        collect_deps(&variant, DependencyGroup::Prod, parent, &bundled, &mut specs)?;
-        collect_deps(&variant, DependencyGroup::Optional, parent, &bundled, &mut specs)?;
-        for spec in specs {
-            if !out
-                .iter()
-                .any(|existing| existing.alias == spec.alias)
-            {
-                out.push(spec);
-            }
-        }
-    }
-    Ok(())
+) -> Result<pnpm_lockfile::DeclaredSpecifiers, ResolveDependencyTreeError> {
+    let children = manifest_child_specs(manifest, parent)?;
+    let group = |group: DependencyGroup| {
+        let specifiers: std::collections::HashMap<String, String> = children
+            .iter()
+            .filter(|child| child.optional == matches!(group, DependencyGroup::Optional))
+            .map(|child| (child.alias.clone(), child.bare_specifier.clone()))
+            .collect();
+        (!specifiers.is_empty()).then_some(specifiers)
+    };
+    let injected: std::collections::BTreeSet<String> = children
+        .iter()
+        .filter(|child| child.injected)
+        .map(|child| child.alias.clone())
+        .collect();
+    Ok(pnpm_lockfile::DeclaredSpecifiers {
+        dependencies: group(DependencyGroup::Prod),
+        optional_dependencies: group(DependencyGroup::Optional),
+        injected: (!injected.is_empty()).then_some(injected),
+    })
 }
 
 /// The dependency names a manifest declares as bundled, read from
@@ -300,22 +310,23 @@ pub(super) fn extract_peer_dependencies(
     result: &pnpm_resolving_resolver_base::ResolveResult,
     peer_shadowed: &HashSet<String>,
     catalogs: Option<&Catalogs>,
+    catalogs_dir: Option<&std::path::Path>,
+    lockfile_dir: &std::path::Path,
 ) -> Result<PeerSet, ResolveDependencyTreeError> {
     let Some(manifest) = result.package.manifest.as_ref() else { return Ok(PeerSet::default()) };
     let peer_set = PeerSet::from_manifest(manifest, |name| peer_shadowed.contains(name));
     let Some(catalogs) = catalogs else { return Ok(peer_set) };
-    // A peer range names a version range, never a path, so a `file:` /
-    // `link:` entry has nothing to re-anchor.
+    let declaring_dir = super::declaring_manifest_dir(lockfile_dir, result);
+    let anchor = catalog_anchor(catalogs_dir, declaring_dir.as_deref());
     peer_set.try_map_taken_ranges(|name, range| {
-        resolve_catalog_specifier(name.to_string(), range, catalogs, CatalogAnchor::AsWritten)
-            .map(|(_, range)| range)
+        resolve_catalog_specifier(name.to_string(), range, catalogs, anchor).map(|(_, range)| range)
     })
 }
 
 /// `true` when the package has no `dependencies`, `optionalDependencies`,
 /// `peerDependencies`, or `peerDependenciesMeta`.
 ///
-/// Conservatively returns `false` when the manifest is missing —
+/// Conservatively returns `false` when the manifest is missing,
 /// collapsing onto a leaf `NodeId` would claim knowledge of children
 /// there is none of. Resolutions reaching here always carry one, real
 /// or synthesized by `walk::fallback_manifest`.
@@ -325,21 +336,37 @@ pub(super) fn pkg_is_leaf(result: &pnpm_resolving_resolver_base::ResolveResult) 
         && is_empty_or_absent(manifest.get("optionalDependencies"))
         && is_empty_or_absent(manifest.get("peerDependencies"))
         && is_empty_or_absent(manifest.get("peerDependenciesMeta"))
-        && pnpm_platform_variants::variant_manifests(manifest)
-            .iter()
-            .all(|(_, variant)| {
-                is_empty_or_absent(variant.get("dependencies"))
-                    && is_empty_or_absent(variant.get("optionalDependencies"))
-            })
 }
 
 fn is_empty_or_absent(value: Option<&Value>) -> bool {
     value.and_then(Value::as_object).is_none_or(serde_json::Map::is_empty)
 }
 
+/// Report a package the walk just added to the graph: tell
+/// [`crate::WorkspaceResolveHooks::resolved_package`] and emit its
+/// deprecation, if any.
+pub(super) fn report_created_package(
+    ctx: &TreeCtx,
+    result: &pnpm_resolving_resolver_base::ResolveResult,
+    id: &str,
+    depth: i32,
+) {
+    if let Some(resolved_package) = ctx.workspace.hooks.resolved_package.as_ref() {
+        resolved_package(id);
+    }
+    emit_deprecation_if_needed(ctx, result, id, depth);
+}
+
 /// Emits a [`Deprecation`] when a newly-resolved package's manifest is marked
 /// deprecated and the version is not covered by `allowedDeprecatedVersions`.
-pub(super) fn emit_deprecation_if_needed(
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`id` is copied only for a deprecated package that no policy allows, after the early returns, and callers reuse it, so an owned parameter would allocate on every call."
+    )
+)]
+fn emit_deprecation_if_needed(
     ctx: &TreeCtx,
     result: &pnpm_resolving_resolver_base::ResolveResult,
     id: &str,
@@ -383,7 +410,7 @@ fn is_deprecated_in_manifest(manifest: Option<&Value>) -> bool {
 
 /// The name/version a `pnpm:deprecation` payload reports:
 /// [`pnpm_resolving_resolver_base::ResolvedPackageInfo::name_ver`] when the resolver filled it, otherwise
-/// the manifest's `name`/`version` — the canonical source for non-npm
+/// the manifest's `name`/`version`, the canonical source for non-npm
 /// resolutions (see the `name_ver` field doc). `None`, suppressing the
 /// warning, when neither carries both fields.
 ///
@@ -402,7 +429,7 @@ fn deprecated_pkg_name_ver(
 
 /// Whether `pkg_name@pkg_version` satisfies its entry in the
 /// `pnpm.allowedDeprecatedVersions` map, matching the TS check at
-/// `pnpm11/installing/deps-resolver/src/resolveDependencies.ts:2122`.
+/// [`pnpm11/installing/deps-resolver/src/addResolvedPackageToGraph.ts:125`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/installing/deps-resolver/src/addResolvedPackageToGraph.ts#L125).
 fn is_deprecation_allowed(
     pkg_name: &str,
     pkg_version: &str,

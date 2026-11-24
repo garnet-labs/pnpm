@@ -5,20 +5,44 @@
 //! peer cycles.
 
 mod counterexamples;
+mod fast_update;
+mod fixture;
+mod graph;
+mod hashed_cycles;
 mod model;
+mod moving_providers;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use model::{
-    IMPORTER_IDS, Outcome, Settings, StubResolver, Workspace, importer_dependencies, lockfile_of,
-    lockfile_with_settings, move_dependency, outcome_of,
+    IMPORTER_IDS,
+    Outcome,
+    Settings,
+    StubResolver,
+    Workspace,
+    lockfile_of,
+    lockfile_with_settings,
+    move_dependency,
+    outcome_of,
 };
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_resolving_resolver_base::{PreferredVersions, ResolveOptions};
-use proptest::{prelude::*, test_runner::RngSeed};
+use pnpm_package_manifest::DependencyGroup;
+use pnpm_resolving_resolver_base::{
+    PreferredVersions,
+    ResolveOptions,
+};
+use proptest::{
+    prelude::*,
+    test_runner::RngSeed,
+};
 
 use pnpm_resolving_deps_resolver::{
-    ResolveImporterOptions, ResolveWorkspaceResult, WorkspaceImporter, WorkspaceResolveOptions,
+    ResolveImporterOptions,
+    ResolveWorkspaceResult,
+    WorkspaceImporter,
+    WorkspaceResolveOptions,
     resolve_workspace,
 };
 
@@ -32,24 +56,6 @@ enum Reuse<'a> {
     Dedupe(&'a pnpm_lockfile::Lockfile),
 }
 
-fn manifests(workspace: &Workspace) -> Vec<(tempfile::TempDir, PackageManifest)> {
-    workspace.importers
-        .iter()
-        .map(|edges| {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let path = tmp.path().join("package.json");
-            let json = serde_json::json!({
-                "name": "importer",
-                "version": "0.0.0",
-                "dependencies": importer_dependencies(edges),
-            });
-            std::fs::write(&path, json.to_string()).expect("write package.json");
-            let manifest = PackageManifest::from_path(path).expect("parse package.json");
-            (tmp, manifest)
-        })
-        .collect()
-}
-
 fn importer_opts(id: &str, settings: Settings) -> ResolveImporterOptions {
     ResolveImporterOptions {
         base_opts: ResolveOptions {
@@ -61,11 +67,12 @@ fn importer_opts(id: &str, settings: Settings) -> ResolveImporterOptions {
         },
         peers_suffix_max_length: settings.peers_suffix_max_length,
         peers: pnpm_resolving_deps_resolver::ImporterPeerOptions {
+            explicitly_requested_direct_dependencies: std::collections::HashSet::default(),
             auto_install_peers: settings.auto_install_peers,
             auto_install_peers_from_highest_match: false,
             resolve_peers_from_workspace_root: false,
             dedupe_peers: false,
-            dedupe_peer_dependents: true,
+            dedupe_peer_dependents: pnpm_resolving_deps_resolver::PeerDependentsDedupe::On,
         },
         links: pnpm_resolving_deps_resolver::PeerLinkOptions {
             exclude_links_from_lockfile: false,
@@ -103,7 +110,7 @@ fn workspace_opts(settings: Settings, reuse: Reuse<'_>) -> WorkspaceResolveOptio
         peers: pnpm_resolving_deps_resolver::WorkspacePeerResolutionOptions {
             dedupe_peers: false,
             dedupe_injected_deps: false,
-            dedupe_peer_dependents: true,
+            dedupe_peer_dependents: pnpm_resolving_deps_resolver::PeerDependentsDedupe::On,
             resolve_peers_from_workspace_root: false,
             exclude_links_from_lockfile: false,
             lockfile_dir: std::path::PathBuf::from("/repo"),
@@ -117,6 +124,7 @@ fn workspace_opts(settings: Settings, reuse: Reuse<'_>) -> WorkspaceResolveOptio
             ..pnpm_resolving_deps_resolver::WorkspaceLockfileReuse::default()
         },
         version: pnpm_resolving_deps_resolver::WorkspaceVersionResolution::default(),
+        parsed_overrides: None,
     }
 }
 
@@ -135,14 +143,20 @@ fn resolve_with(
     settings: Settings,
     reuse: Reuse<'_>,
 ) -> Result<ResolveWorkspaceResult, String> {
-    let resolver: StubResolver = model::stub_resolver(workspace);
-    let manifests = manifests(workspace);
+    let fixture = fixture::Fixture::new(workspace, settings);
+    let resolver: StubResolver = model::stub_resolver(workspace, &fixture);
     let importers: Vec<WorkspaceImporter<'_>> = order
         .iter()
         .map(|&index| WorkspaceImporter {
             id: IMPORTER_IDS[index].to_string(),
-            manifest: &manifests[index].1,
+            manifest: &fixture.manifests[index].1,
         })
+        .chain(
+            fixture.manifests
+                .iter()
+                .skip(workspace.importers.len())
+                .map(|(id, manifest)| WorkspaceImporter { id: id.clone(), manifest }),
+        )
         .collect();
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("build runtime");
     runtime
@@ -150,8 +164,8 @@ fn resolve_with(
             &resolver,
             &importers,
             &[DependencyGroup::Prod],
-            workspace_opts(settings, reuse),
-            |importer| importer_opts(&importer.id, settings),
+            fixture.workspace_opts(settings, reuse),
+            |importer| fixture.importer_opts(&importer.id, settings, reuse),
         ))
         .map_err(|error| format!("{error:?}"))
 }
@@ -185,6 +199,27 @@ fn config() -> ProptestConfig {
 
 proptest! {
     #![proptest_config(config())]
+
+    #[test]
+    fn frozen_check_accepts_writer_output_with_recorded_directory_specs(
+        workspace in model::workspace(),
+        settings in model::settings(),
+    ) {
+        let settings = if settings.injected {
+            Settings { format: pnpm_lockfile::LockfileFormat::V13, ..settings }
+        } else {
+            settings
+        };
+        let result = resolve_with(&workspace, &in_order(&workspace), settings, Reuse::Fresh)
+            .expect("generated workspace resolves");
+        let lockfile = lockfile_with_settings(&result, &workspace, settings);
+        let fixture = fixture::Fixture::new(&workspace, settings);
+        prop_assert_eq!(fixture.frozen_check(&lockfile, settings), Ok(()));
+        let mut stale = lockfile;
+        stale.importers.get_mut(".").unwrap().dependencies.as_mut().unwrap()
+            .values_mut().next().unwrap().specifier = "not-the-manifest-specifier".to_string();
+        prop_assert!(fixture.frozen_check(&stale, settings).is_err());
+    }
 
     /// Installing over the lockfile a fresh resolution wrote changes nothing.
     #[test]
@@ -295,4 +330,102 @@ proptest! {
         let deduped = outcome_with(&moved, &order, settings, Reuse::Dedupe(&lockfile));
         prop_assert_eq!(fresh, deduped);
     }
+}
+
+#[test]
+fn optional_provider_outside_a_same_named_cycle_keeps_its_context() {
+    use model::{
+        Edge,
+        PackageVersion,
+        Peer,
+        PeerRange,
+        Settings,
+        Workspace,
+    };
+    let leaf = || PackageVersion { dependencies: vec![], peers: vec![] };
+    let peer_package = |target, range, optional| PackageVersion {
+        dependencies: vec![],
+        peers: vec![Peer { target, range, optional, also_dependency: false }],
+    };
+    let mut workspace = Workspace {
+        packages: vec![
+            vec![peer_package(2, PeerRange::Major(1), false), leaf()],
+            vec![peer_package(0, PeerRange::Any, true), leaf()],
+            vec![peer_package(1, PeerRange::Major(1), false), leaf()],
+        ],
+        importers: vec![
+            vec![Edge { target: 1, major: 2 }, Edge { target: 0, major: 2 }],
+            vec![Edge { target: 0, major: 1 }],
+        ],
+    };
+    for alternative in [leaf(), peer_package(1, PeerRange::Major(1), false)] {
+        workspace.packages[0][1] = alternative;
+        for format in [pnpm_lockfile::LockfileFormat::V9, pnpm_lockfile::LockfileFormat::V13] {
+            for peers_suffix_max_length in [20, 1000] {
+                let settings = Settings {
+                    auto_install_peers: true,
+                    injected: true,
+                    format,
+                    peers_suffix_max_length,
+                    ..Default::default()
+                };
+                let order = in_order(&workspace);
+                let fresh = resolve_with(&workspace, &order, settings, Reuse::Fresh).unwrap();
+                let lockfile = lockfile_with_settings(&fresh, &workspace, settings);
+                let reused =
+                    resolve_with(&workspace, &order, settings, Reuse::Install(&lockfile)).unwrap();
+                assert_eq!(outcome_of(&fresh, &workspace), outcome_of(&reused, &workspace));
+                assert_eq!(lockfile, lockfile_with_settings(&reused, &workspace, settings));
+            }
+        }
+    }
+}
+
+#[test]
+fn cyclic_transitive_peers_round_trip_with_ordinary_children() {
+    use model::{
+        Edge,
+        PackageVersion,
+        Peer,
+        PeerRange,
+        Settings,
+        Workspace,
+    };
+    let leaf = || PackageVersion { dependencies: vec![], peers: vec![] };
+    let peer = |target, major| Peer {
+        target,
+        range: PeerRange::Major(major),
+        optional: false,
+        also_dependency: false,
+    };
+    let workspace = Workspace {
+        packages: vec![
+            vec![
+                PackageVersion { dependencies: vec![Edge { target: 1, major: 1 }], peers: vec![] },
+                leaf(),
+            ],
+            vec![PackageVersion { dependencies: vec![], peers: vec![peer(2, 2)] }, leaf()],
+            vec![
+                leaf(),
+                PackageVersion {
+                    dependencies: vec![Edge { target: 3, major: 1 }],
+                    peers: vec![peer(1, 2)],
+                },
+            ],
+            vec![PackageVersion { dependencies: vec![], peers: vec![peer(0, 1)] }, leaf()],
+        ],
+        importers: vec![
+            vec![Edge { target: 0, major: 1 }, Edge { target: 1, major: 1 }],
+            vec![Edge { target: 3, major: 1 }],
+        ],
+    };
+    let settings = Settings {
+        peers_suffix_max_length: 20,
+        auto_install_peers: true,
+        format: pnpm_lockfile::LockfileFormat::V13,
+        ..Default::default()
+    };
+    let fresh = resolve_with(&workspace, &in_order(&workspace), settings, Reuse::Fresh).unwrap();
+    let lockfile = lockfile_with_settings(&fresh, &workspace, settings);
+    fixture::Fixture::new(&workspace, settings).frozen_check(&lockfile, settings).unwrap();
 }

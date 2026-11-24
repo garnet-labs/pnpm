@@ -1,14 +1,30 @@
-use super::{LOADER_FILENAME, StoreManifest, write_file};
+use super::{
+    LOADER_FILENAME,
+    StoreManifest,
+    write_file,
+};
 use pnpm_cmd_shim::{
-    FsWalkFiles, Host, PackageBinSource, get_bins_from_package_manifest_with_walk,
+    FsWalkFiles,
+    Host,
+    PackageBinSource,
+    get_bins_from_package_manifest_with_walk,
     link_bins_of_packages,
 };
-use sha2::{Digest, Sha256};
-use std::{collections::HashMap, io, path::Path, sync::Arc};
+use sha2::{
+    Digest,
+    Sha256,
+};
+use std::{
+    collections::HashMap,
+    io,
+    path::Path,
+    sync::Arc,
+};
 use url::Url;
 
 pub(crate) struct BinInstall<'a> {
     pub config: &'a pnpm_config::Config,
+    pub layout: &'a crate::VirtualStoreLayout,
     pub root: &'a Path,
     pub trusted_importer_ids: &'a std::collections::HashSet<String>,
     pub importers: &'a std::collections::HashMap<String, pnpm_lockfile::ProjectSnapshot>,
@@ -17,6 +33,7 @@ pub(crate) struct BinInstall<'a> {
 pub(super) fn write_bins(inputs: &BinInstall<'_>, manifest: &StoreManifest) -> io::Result<()> {
     validate_importers(inputs)?;
     let mut cached = HashMap::new();
+    let modules_dirs = crate::ImporterModulesDirs::from_config(inputs.config, inputs.root);
     for importer in inputs.importers.keys() {
         let Some(project) = manifest.packages.get(importer) else { continue };
         let mut sources = Vec::new();
@@ -28,10 +45,7 @@ pub(super) fn write_bins(inputs: &BinInstall<'_>, manifest: &StoreManifest) -> i
                 sources.push(source.clone());
             }
         }
-        let directory = inputs.root
-            .join(importer)
-            .join(inputs.config.modules_dir_name())
-            .join(".bin");
+        let directory = modules_dirs.of_importer_id(importer).join(".bin");
         link_bins_of_packages::<Host>(
             &sources,
             &directory,
@@ -67,7 +81,7 @@ fn bin_source(
                 .join(".pnpm-loader")
                 .join(&hash)
         });
-    let metadata = read_manifest(package, &manifest.store_dir, &root)?;
+    let metadata = read_manifest(package, &manifest.store_dir, &manifest_root(inputs, id, &root))?;
     if package.resolution.as_deref() == Some("node") {
         return Ok(Some(PackageBinSource::new(root, Arc::new(metadata))));
     }
@@ -101,12 +115,24 @@ fn package_bins(
         let Some(files) = &package.files else {
             return Host::walk_files(directory).map(Iterator::collect::<Vec<_>>);
         };
+        let directory = pnpm_fs::lexical_normalize(directory);
         Ok(files
             .keys()
             .map(|name| root.join(name))
-            .filter(|path| pnpm_fs::is_subdir(directory, path))
+            .filter(|path| is_visible_bin_entry(&directory, path))
             .collect::<Vec<_>>())
     })
+}
+
+fn is_visible_bin_entry(directory: &Path, path: &Path) -> bool {
+    pnpm_fs::lexical_normalize(path)
+        .strip_prefix(directory)
+        .is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .iter()
+                    .all(|part| !part.as_encoded_bytes().starts_with(b"."))
+        })
 }
 
 fn write_entry(loader_dir: &Path, path: &Path, target: &Path) -> io::Result<()> {
@@ -123,6 +149,20 @@ fn file_url(path: &Path) -> io::Result<String> {
     Url::from_file_path(path)
         .map(String::from)
         .map_err(|()| io::Error::other(format!("Invalid file path: {}", path.display())))
+}
+
+/// Where the package's `package.json` is now: `root`, or the staging
+/// directory of a package this install builds, which the build phase
+/// renames to `root` once built.
+fn manifest_root(inputs: &BinInstall<'_>, id: &str, root: &Path) -> std::path::PathBuf {
+    if root.join("package.json").exists() {
+        return root.to_path_buf();
+    }
+    id.parse::<pnpm_lockfile::PackageKey>()
+        .ok()
+        .map(|key| inputs.layout.staging_package_dir(&key))
+        .filter(|staging| staging.join("package.json").exists())
+        .unwrap_or_else(|| root.to_path_buf())
 }
 
 fn read_manifest(

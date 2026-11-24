@@ -1,12 +1,43 @@
 use super::{
-    BinLinkSettings, CacheDisposition, Config, CopyFiles, ExecutionStatus, GraphPkg, HashMap,
-    Instant, IntoDiagnostic, LogEvent, LogLevel, Path, PathBuf, PipelineInvocation, PnpmLog,
-    ProjectGraph, RunContext, RunReport, ScriptOutput, Status, SyncInjectedDeps, TaskNode, Value,
-    cache_tiers::CacheTiers, capture, cargo_cache, env, make_node_package_map_option,
-    make_node_require_option, package_map_path_for_execution, pnp_path_for_execution, run_stages,
+    BinLinkSettings,
+    CacheDisposition,
+    Config,
+    CopyFiles,
+    ExecutionStatus,
+    GraphPkg,
+    HashMap,
+    Instant,
+    IntoDiagnostic,
+    LogEvent,
+    LogLevel,
+    Path,
+    PathBuf,
+    PipelineInvocation,
+    PnpmLog,
+    ProjectGraph,
+    RunContext,
+    RunReport,
+    ScriptOutput,
+    Status,
+    SyncInjectedDeps,
+    TaskCachePlan,
+    TaskNode,
+    Value,
+    cache_tiers::CacheTiers,
+    capture,
+    cargo_cache,
+    env,
+    make_node_package_map_option,
+    make_node_require_option,
+    package_map_path_for_execution,
+    pnp_path_for_execution,
+    run_stages,
     sync_injected_deps,
 };
-use crate::cli_args::{reporter::script_output_colors, run::project_modules_dirs};
+use crate::cli_args::{
+    reporter::script_output_colors,
+    run::project_modules_dirs,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct RunTaskOptions<'a, 'graph> {
@@ -15,7 +46,7 @@ pub(super) struct RunTaskOptions<'a, 'graph> {
     pub(super) config: &'a Config,
     pub(super) invocation: &'a PipelineInvocation,
     pub(super) cache: CacheTiers<'a>,
-    pub(super) task_key: Option<&'a str>,
+    pub(super) cache_plan: Option<&'a TaskCachePlan>,
     pub(super) environment: TaskEnvironment<'a>,
     pub(super) reporting: TaskReporting<'a>,
 }
@@ -34,6 +65,16 @@ pub(crate) struct TaskReporting<'a> {
     pub(super) summary_key: &'a str,
 }
 
+impl<'a> RunTaskOptions<'a, '_> {
+    fn task_key(&self) -> Option<&'a str> {
+        self.cache_plan.and_then(|plan| plan.task_key.as_deref())
+    }
+
+    fn output_cache_key(&self) -> Option<&'a str> {
+        self.cache_plan.and_then(|plan| plan.output_cache_key.as_deref())
+    }
+}
+
 /// Script failures are returned as statuses. Infrastructure errors abort the run.
 pub(super) fn run_pipeline_task(
     options: &RunTaskOptions<'_, '_>,
@@ -41,9 +82,9 @@ pub(super) fn run_pipeline_task(
     let root = options.node.project.as_path();
     let summary_key = options.reporting.summary_key;
     let settings = options.config.tasks.get(&options.node.task_name);
-    let cache_key = options.task_key.filter(|_| task_cacheable(options.invocation, settings));
+    let cache_key = options.output_cache_key();
     let start = Instant::now();
-    options.reporting.report.task_started(summary_key, options.task_key);
+    options.reporting.report.task_started(summary_key, options.task_key());
 
     if let Some(cache_key) = cache_key
         && let Some(restored) = try_restore(options, cache_key, start)?
@@ -168,10 +209,11 @@ fn execute_task_with_cargo_cache(
         cargo_cache::prepend_path(&mut environment, rust);
     }
     let cargo_cacheable = !options.invocation.no_cache
-        && settings.is_some_and(|settings| settings.cache != Some(false));
+        && settings.is_some_and(|settings| settings.cache.unwrap_or(true));
     let snapshot = cargo_cacheable
-        .then_some(options.task_key)
+        .then(|| options.task_key())
         .flatten()
+        .map(str::to_owned)
         .and_then(|task_key| {
             cargo_cache::snapshot_entry(&options.config.cache_dir, root, task_key, &environment)
                 .inspect_err(|error| cargo_cache_warning(options, &error.to_string()))
@@ -186,7 +228,7 @@ fn execute_task_with_cargo_cache(
         ..*options
     })?;
     if execution.status == Status::Passed
-        && let Some(task_key) = options.task_key
+        && let Some(task_key) = options.task_key()
         && let Some(snapshot) = &snapshot
     {
         publish_cargo_snapshot(options, &cargo, snapshot, task_key, &environment);
@@ -227,7 +269,7 @@ fn cargo_build_env(
     extra_env
 }
 
-/// Save the build directory as this task key's snapshot — but only when
+/// Save the build directory as this task key's snapshot, but only when
 /// the inputs still hash to the key the run started with, since a
 /// concurrent edit would otherwise be published under the wrong key.
 fn publish_cargo_snapshot(
@@ -238,7 +280,12 @@ fn publish_cargo_snapshot(
     environment: &std::collections::BTreeMap<String, String>,
 ) {
     let root = options.node.project.as_path();
-    match cargo_cache::snapshot_entry(&options.config.cache_dir, root, task_key, environment) {
+    match cargo_cache::snapshot_entry(
+        &options.config.cache_dir,
+        root,
+        task_key.to_owned(),
+        environment,
+    ) {
         Ok((_, after, _)) if after == *key => {
             if let Err(error) = cargo.publish(entry, key, local_packages) {
                 cargo_cache_warning(options, &error.to_string());
@@ -268,8 +315,7 @@ fn execute_task_scripts(options: &RunTaskOptions<'_, '_>) -> miette::Result<Task
     let manifest = &options.graph[root].package.project.manifest;
 
     let extra_env = task_environment(options.config, root, options.environment.extra_env);
-    let capture_output = options.task_key.is_some()
-        && task_cacheable(options.invocation, options.config.tasks.get(&options.node.task_name));
+    let capture_output = options.output_cache_key().is_some();
     let root_str = root.to_string_lossy().into_owned();
     let mut execution = TaskExecution {
         status: Status::Passed,
@@ -353,7 +399,7 @@ fn runnable_script(
 }
 
 /// A cache hit skips the script but must not skip the injected-deps sync
-/// that would have followed it — consumers of an injected dependency
+/// that would have followed it, consumers of an injected dependency
 /// would otherwise keep seeing the previous build.
 fn sync_injected_deps_if_configured(
     config: &Config,
@@ -378,23 +424,22 @@ fn sync_injected_deps_if_configured(
         project_modules_dirs: &project_modules_dirs,
         bin_links: BinLinkSettings {
             modules_dir_name: config.modules_dir_name(),
-            extend_node_path: config.extend_node_path,
-            ignored_directories: config.managed_directories(),
+            link_options: pnpm_deps_restorer::shim_link_options(config, config.node_linker),
+            projects: pnpm_workspace::FindWorkspaceProjectsOpts {
+                patterns: config.workspace_package_patterns.clone(),
+                ignored_directories: config.managed_directories(),
+            },
         },
     })?;
     Ok(())
 }
 
-fn task_cacheable(
-    invocation: &PipelineInvocation,
-    settings: Option<&pnpm_config::TaskSettings>,
-) -> bool {
-    !invocation.no_cache
-        && settings.is_some_and(|settings| {
-            settings.outputs.is_some()
-                && settings.cache != Some(false)
-                && settings.cargo_target_dir.is_none()
-        })
+pub(super) fn is_output_cacheable(settings: Option<&pnpm_config::TaskSettings>) -> bool {
+    settings.is_some_and(|settings| {
+        settings.outputs.is_some()
+            && settings.cache.unwrap_or(true)
+            && settings.cargo_target_dir.is_none()
+    })
 }
 
 pub(super) fn task_environment(

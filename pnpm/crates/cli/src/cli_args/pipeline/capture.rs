@@ -1,5 +1,5 @@
 //! Capture of a task's `pnpm:lifecycle` output stream for the cache, and
-//! its replay on a hit — so a hit renders exactly like a run, through the
+//! its replay on a hit, so a hit renders exactly like a run, through the
 //! same reporter.
 //!
 //! The executor's streamed output takes a plain `fn(&LogEvent)`, so the
@@ -7,12 +7,25 @@
 //! events into per-`(project, stage)` buffers and forwards everything to
 //! the real reporter emit installed by [`install_forward`].
 
-use pnpm_reporter::{LifecycleLog, LifecycleMessage, LifecycleStdio, LogEvent, LogLevel};
-use serde::{Deserialize, Serialize};
+use pnpm_reporter::{
+    LifecycleLog,
+    LifecycleMessage,
+    LifecycleStdio,
+    LogEvent,
+    LogLevel,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{LazyLock, Mutex, OnceLock},
+    sync::{
+        LazyLock,
+        Mutex,
+        OnceLock,
+    },
 };
 
 /// One captured lifecycle stage: what replaying needs to reconstruct the
@@ -70,13 +83,17 @@ pub fn capturing_emit(event: &LogEvent) {
     if let LogEvent::Lifecycle(log) = event {
         match &log.message {
             LifecycleMessage::Script { dep_path, stage, script, .. } => {
-                with_buffer(dep_path, stage, |buffer| buffer.command.clone_from(script));
+                with_buffer(dep_path.clone(), stage.clone(), |buffer| {
+                    buffer.command.clone_from(script);
+                });
             }
             LifecycleMessage::Stdio { dep_path, stage, line, stdio, .. } => {
-                with_buffer(dep_path, stage, |buffer| buffer.push(*stdio, line));
+                with_buffer(dep_path.clone(), stage.clone(), |buffer| buffer.push(*stdio, line));
             }
             LifecycleMessage::Exit { dep_path, stage, exit_code, .. } => {
-                with_buffer(dep_path, stage, |buffer| buffer.exit_code = *exit_code);
+                with_buffer(dep_path.clone(), stage.clone(), |buffer| {
+                    buffer.exit_code = *exit_code;
+                });
             }
         }
     }
@@ -155,11 +172,11 @@ pub fn replay(scripts: &[CapturedScript], project_dir: &Path, emit: fn(&LogEvent
     }
 }
 
-fn with_buffer(dep_path: &str, stage: &str, mutate: impl FnOnce(&mut Buffer)) {
+fn with_buffer(dep_path: String, stage: String, mutate: impl FnOnce(&mut Buffer)) {
     let mut buffers = BUFFERS.lock().expect("capture buffer lock is not poisoned");
     mutate(
         buffers
-            .entry((dep_path.to_string(), stage.to_string()))
+            .entry((dep_path, stage))
             .or_default(),
     );
 }

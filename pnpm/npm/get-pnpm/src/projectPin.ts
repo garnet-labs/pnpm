@@ -2,9 +2,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { parseJSON5 } from 'confbox/json5'
-import { parseYAML } from 'confbox/yaml'
 import picomatch from 'picomatch'
 import semver from 'semver'
+
+import { parseYamlDocument } from './yaml.js'
 
 /** The pnpm version a project pins, and where the pin was read from. */
 export interface ProjectPin {
@@ -93,9 +94,9 @@ function isWorkspaceProject (workspaceDir: string, workspace: Record<string, unk
   if (relative === '') return true
   if (relative.startsWith('../') || relative.split('/').some((part) => part === 'node_modules' || part === 'bower_components')) return false
   const patterns = Array.isArray(workspace.packages) ? workspace.packages.filter((pattern) => typeof pattern === 'string') : []
-  const matches = (pattern: string): boolean => picomatch.isMatch(relative, pattern.replace(/^\.\//, '').replace(/\/$/, ''))
+  const matches = (pattern: string, options?: picomatch.PicomatchOptions): boolean => picomatch.isMatch(relative, pattern.replace(/^\.\//, '').replace(/\/$/, ''), options)
   const excludes = patterns.filter((pattern) => pattern.startsWith('!')).map((pattern) => pattern.slice(1))
-  return !excludes.some(matches) && patterns.filter((pattern) => !pattern.startsWith('!')).some(matches)
+  return !excludes.some((pattern) => matches(pattern, { dot: true })) && patterns.filter((pattern) => !pattern.startsWith('!')).some((pattern) => matches(pattern))
 }
 
 interface Manifest {
@@ -117,7 +118,8 @@ function readManifest (dir: string | undefined): Manifest | undefined {
 }
 
 function parseManifest (file: string, content: string): unknown {
-  if (file.endsWith('.yaml')) return parseYaml(file, content)
+  // pnpm reads a `package.yaml` that holds no document as an empty manifest.
+  if (file.endsWith('.yaml')) return parseYaml(file, content) ?? {}
   try {
     // Windows tools write a byte order mark, which pnpm reads past.
     const text = content.replace(/^\uFEFF/, '')
@@ -129,7 +131,7 @@ function parseManifest (file: string, content: string): unknown {
 
 function parseYaml (file: string, content: string): unknown {
   try {
-    return parseYAML(content)
+    return parseYamlDocument(content)
   } catch (err) {
     throw new Error(`${file} is not valid YAML: ${(err as Error).message}`, { cause: err })
   }
@@ -179,10 +181,21 @@ function lockedPnpmVersion (lockfileDir: string, range: string): string | undefi
   const content = readOptionalFile(lockfilePath)
   const envDocument = content == null ? undefined : extractEnvDocument(content)
   if (envDocument == null) return undefined
-  const locked = valueAt(parseYaml(lockfilePath, envDocument), ['importers', '.', 'packageManagerDependencies', 'pnpm', 'version'])
+  const locked = lockedVersionOf(parseYaml(lockfilePath, envDocument))
   // In range the way pnpm checks a locked version, prereleases included.
   if (typeof locked !== 'string' || semver.valid(locked) == null) return undefined
   return semver.satisfies(locked, range, { includePrerelease: true }) ? locked : undefined
+}
+
+/**
+ * The locked pnpm version of an env document. Lockfile format 13 names the
+ * root `projects` and writes the entry as its specifier alone when that is
+ * an exact version.
+ */
+function lockedVersionOf (envDocument: unknown): unknown {
+  const root = valueAt(envDocument, ['projects', '.']) ?? valueAt(envDocument, ['importers', '.'])
+  const entry = valueAt(root, ['packageManagerDependencies', 'pnpm'])
+  return typeof entry === 'string' ? entry : valueAt(entry, ['version'])
 }
 
 /**

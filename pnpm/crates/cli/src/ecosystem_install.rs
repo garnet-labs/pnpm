@@ -1,12 +1,18 @@
 pub(crate) mod python;
 
-pub(crate) use workspace_inventory::{EcosystemManifest, EcosystemWorkspaceInventory};
+pub(crate) use workspace_inventory::{
+    EcosystemManifest,
+    EcosystemWorkspaceInventory,
+};
 
 mod workspace_inventory;
 
 use crate::{
     cargo_deps,
-    cli_args::{install::InstallDependencyOptions, pipelines::WorkspaceScope},
+    cli_args::{
+        install::InstallDependencyOptions,
+        pipelines::WorkspaceScope,
+    },
 };
 use pnpm_config::Config;
 use pnpm_install_coordinator::InstallPlan;
@@ -14,7 +20,10 @@ use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::DependencyGroup;
 use std::{
     borrow::Cow,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -23,12 +32,15 @@ pub(crate) fn is_enabled(config: &Config) -> bool {
     config.cargo.enabled || config.python.enabled
 }
 
-/// The directories a script or command run for the project in `dir` finds
-/// executables in before `PATH`: the toolchains pnpm installed for it, then
-/// `extraBinPaths`.
-pub(crate) fn execution_paths<'a>(config: &'a Config, dir: &Path) -> Cow<'a, [PathBuf]> {
-    let paths = pnpm_python_installer::execution_paths(config, dir);
-    match rust_bin_dir(config, dir) {
+/// The installed toolchains and configured bin paths for a command.
+pub(crate) fn execution_paths<'a>(
+    config: &'a Config,
+    project: &Path,
+    run_dir: &Path,
+) -> Cow<'a, [PathBuf]> {
+    let python_dir = if config.workspace_dir.is_some() { run_dir } else { project };
+    let paths = pnpm_python_installer::execution_paths(config, python_dir);
+    match rust_bin_dir(config, project) {
         Some(rust) => Cow::Owned(
             std::iter::once(rust)
                 .chain(paths.iter().cloned())

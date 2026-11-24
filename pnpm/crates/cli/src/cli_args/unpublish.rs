@@ -1,25 +1,66 @@
 use super::deprecate::{
-    DEPRECATION_ERROR_BODY_LIMIT, DeprecateContext, DeprecateError, fetch_package_meta,
-    package_url, parse_package_spec, registry_for_package, registry_operation_error,
-    registry_operation_failed, registry_write_error, write_error_for_status,
+    DEPRECATION_ERROR_BODY_LIMIT,
+    DeprecateContext,
+    DeprecateError,
+    fetch_package_meta,
+    package_url,
+    parse_package_spec,
+    registry_for_package,
+    registry_operation_error,
+    registry_operation_failed,
+    registry_write_error,
+    write_error_for_status,
 };
-use crate::cli_args::{package_spec::PackageSpec, registry_client::auth_header_for_package};
+use crate::cli_args::{
+    package_spec::PackageSpec,
+    registry_client::{
+        OtpHost,
+        auth_header_for_package,
+        web_auth_fetch_options,
+    },
+};
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
-use mutation::{MutationContext, MutationRequest, send_mutation, web_auth_fetch_options};
-use node_semver::{Range, Version};
+use mutation::{
+    MutationContext,
+    MutationRequest,
+    send_mutation,
+};
+use node_semver::{
+    Range,
+    Version,
+};
 use pnpm_config::Config;
-use pnpm_network::{normalize_registry_url, read_limited_body, send_with_retry};
+use pnpm_network::{
+    normalize_registry_url,
+    read_limited_body,
+    send_with_retry,
+};
 use pnpm_network_web_auth::{
-    Clock, EnterKeyListener, Host as WebAuthHost, OpenUrl, OtpChallenge, OtpError, OtpSession,
-    PromptOtp, Sleep, StdinIsTty, StdoutIsTty, WebAuthFetch, WebAuthFetchOptions,
-    WebAuthRetryOptions, WithOtpError, otp_challenge_from_unauthorized_body,
+    Host as WebAuthHost,
+    OtpChallenge,
+    OtpError,
+    OtpSession,
+    WithOtpError,
+    otp_challenge_from_unauthorized_body,
 };
 use pnpm_reporter::Reporter;
-use reqwest::{Method, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use reqwest::{
+    Method,
+    StatusCode,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Map,
+    Value,
+};
 use std::collections::HashSet;
 
 /// Remove a package, or a range of its versions, from the registry.
@@ -106,25 +147,6 @@ struct Packument {
     other: Map<String, Value>,
 }
 
-/// The web-auth capabilities an unpublish run drives its OTP challenges
-/// through: the real [`WebAuthHost`] in production, a scripted fake in tests.
-pub(crate) trait UnpublishHost:
-    Clock + Sleep + WebAuthFetch + StdinIsTty + StdoutIsTty + EnterKeyListener + OpenUrl + PromptOtp
-{
-}
-
-impl<Sys> UnpublishHost for Sys where
-    Sys: Clock
-        + Sleep
-        + WebAuthFetch
-        + StdinIsTty
-        + StdoutIsTty
-        + EnterKeyListener
-        + OpenUrl
-        + PromptOtp
-{
-}
-
 /// Mirrors npm's `auth-type`: `Web` opts into the web-based OTP challenge,
 /// `Legacy` is set when the user passes `--otp` so a classic code is
 /// accepted.
@@ -153,7 +175,7 @@ impl UnpublishArgs {
 
     /// Generic over the web-auth host `Sys` so tests can script the OTP
     /// flow while the registry requests still go through a mocked server.
-    async fn execute<Sys: UnpublishHost, Reporter: self::Reporter>(
+    async fn execute<Sys: OtpHost, Reporter: self::Reporter>(
         &self,
         config: &Config,
     ) -> miette::Result<String> {
@@ -192,7 +214,7 @@ impl UnpublishArgs {
 
     /// Unpublish the versions `spec` names, or the whole package when it
     /// names no version or its range matches every version.
-    async fn unpublish_range<Sys: UnpublishHost, Reporter: self::Reporter>(
+    async fn unpublish_range<Sys: OtpHost, Reporter: self::Reporter>(
         &self,
         mutation: &mut MutationContext<'_>,
         package_url: &str,
@@ -232,7 +254,7 @@ impl UnpublishArgs {
     /// without `--force`; a 405 from the registry means the package may only
     /// be deprecated, not removed. `full_range_spec` is the user's spec when
     /// its range matches every version.
-    async fn unpublish_all<Sys: UnpublishHost, Reporter: self::Reporter>(
+    async fn unpublish_all<Sys: OtpHost, Reporter: self::Reporter>(
         &self,
         mutation: &mut MutationContext<'_>,
         package_url: &str,
@@ -283,9 +305,9 @@ impl UnpublishArgs {
 
 /// Remove `versions` from the packument, re-point the dist-tags that
 /// referenced them, `PUT` the updated document back, then delete the
-/// orphaned tarballs (a 404 there is fine — some registries clean tarballs
+/// orphaned tarballs (a 404 there is fine, some registries clean tarballs
 /// up on the packument update themselves).
-async fn unpublish_versions<Sys: UnpublishHost, Reporter: self::Reporter>(
+async fn unpublish_versions<Sys: OtpHost, Reporter: self::Reporter>(
     mutation: &mut MutationContext<'_>,
     package_url: &str,
     registry_url: &str,
@@ -391,15 +413,14 @@ fn versions_matching_range(versions: &Map<String, Value>, range: &str) -> Vec<St
     }
 }
 
-/// The highest remaining semver version — the new `latest` after the old
-/// one is unpublished.
+/// Prefer the highest stable version for `latest`, falling back to prereleases.
 fn highest_version(versions: &Map<String, Value>) -> Option<String> {
     versions
         .keys()
         .filter_map(|ver_str| {
             Version::parse(ver_str)
                 .ok()
-                .map(|ver| (ver, ver_str))
+                .map(|ver| ((ver.pre_release.is_empty(), ver), ver_str))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, ver_str)| ver_str.clone())

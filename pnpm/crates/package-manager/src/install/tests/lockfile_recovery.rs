@@ -1,15 +1,46 @@
 use super::{
-    super::{Install, InstallError, ProjectMutation},
-    InstallDirs, PARTIAL_INSTALL_LOCKFILE, assert_package_absent, assert_package_present,
-    fresh_lockfile_only_with_overrides, install_then_go_offline, install_with_pnpmfile,
+    super::{
+        Install,
+        InstallError,
+        ProjectMutation,
+    },
+    InstallDirs,
+    PARTIAL_INSTALL_LOCKFILE,
+    assert_package_absent,
+    assert_package_present,
+    fresh_lockfile_only_with_overrides,
+    fresh_lockfile_only_with_overrides_reporting,
+    install_then_go_offline,
+    install_with_pnpmfile,
     touch_manifest,
 };
-use crate::{PolicyExcludes, UpToDateFastPathCheck, install_already_up_to_date};
+use crate::{
+    PolicyExcludes,
+    UpToDateFastPathCheck,
+    install_already_up_to_date,
+};
 use pnpm_config::Config;
-use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
-use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, write_modules_manifest};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::{LockfileVerificationMessage, LogEvent, Reporter, SilentReporter};
+use pnpm_lockfile::{
+    Lockfile,
+    MaybeLazyLockfile,
+};
+use pnpm_modules_yaml::{
+    Host,
+    LayoutVersion,
+    Modules,
+    NodeLinker,
+    write_modules_manifest,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_reporter::{
+    LockfileVerificationMessage,
+    LogEvent,
+    Reporter,
+    SilentReporter,
+};
 use pnpm_testing_utils::registry::TestRegistry;
 use pnpm_workspace_state as workspace_state;
 use std::sync::Mutex;
@@ -26,7 +57,7 @@ async fn stale_lockfile_under_no_flag_falls_through_to_fresh_resolve() {
     let dirs = InstallDirs::new();
 
     let manifest_path = dirs.path().join("package.json");
-    // Deliberately omit the `placeholder` dep — this drifts from
+    // Deliberately omit the `placeholder` dep; this drifts from
     // `PARTIAL_INSTALL_LOCKFILE`'s importer entry.
     let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
     manifest
@@ -63,6 +94,7 @@ async fn stale_lockfile_under_no_flag_falls_through_to_fresh_resolve() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -78,6 +110,7 @@ async fn stale_lockfile_under_no_flag_falls_through_to_fresh_resolve() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -245,15 +278,15 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
         Ok(&*workspace_root),
     );
 }
-/// Regression: a single-project install with NO lockfile anywhere —
-/// `pnpm-lock.yaml` is gone and the virtual store has no current
-/// `lock.yaml` to stand in for it — must NOT short-circuit, even when
+/// Regression: a single-project install with NO lockfile anywhere
+/// (`pnpm-lock.yaml` is gone and the virtual store has no current
+/// `lock.yaml` to stand in for it) must NOT short-circuit, even when
 /// `node_modules` and the workspace-state file survive. There is
 /// nothing to content-check the manifests against and nothing to
-/// regenerate `pnpm-lock.yaml` from, so the full install must run —
+/// regenerate `pnpm-lock.yaml` from, so the full install must run,
 /// the missing-lockfile case converts into `upToDate: false`. When
 /// the current lockfile IS present, the fast path instead treats it
-/// as the wanted lockfile —
+/// as the wanted lockfile;
 /// see `regenerates_missing_wanted_lockfile_from_current_when_manifests_unchanged`
 /// in the `optimistic_repeat_install` tests. Companion to the
 /// workspace-mode tolerance proved by
@@ -284,7 +317,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
     manifest.save().unwrap();
 
     // Deliberately do NOT write `pnpm-lock.yaml` and do NOT seed a
-    // current `lock.yaml` in the virtual store — that's the scenario
+    // current `lock.yaml` in the virtual store; that's the scenario
     // under test.
 
     let mut config = Config::new();
@@ -300,7 +333,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
         optional_dependencies: false,
     };
 
-    // Seed `.modules.yaml` and a fresh workspace state — same shape
+    // Seed `.modules.yaml` and a fresh workspace state, same shape
     // as the happy-path optimistic test above. The only difference
     // is the missing `pnpm-lock.yaml`.
     let seed_modules = Modules {
@@ -350,7 +383,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
     )
     .expect("seed workspace state");
 
-    // We're not testing the full install pipeline here — without a
+    // We're not testing the full install pipeline here, without a
     // lockfile on disk the fresh-resolve path would try to resolve
     // `link:../sibling` against a directory that doesn't exist. We
     // only need to prove the optimistic short-circuit did NOT fire,
@@ -360,6 +393,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -375,6 +409,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -421,14 +456,14 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
 }
 /// A fresh install records its lockfile-verification verdict, so a
 /// repeat install that reaches the full path (the optimistic fast
-/// path is disabled here — it would otherwise absorb the touched
+/// path is disabled here; it would otherwise absorb the touched
 /// manifest via the content re-check) hits the cache and never fans
 /// out to the registry.
 #[tokio::test]
 async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
-    let mock_instance = TestRegistry::start();
-
     let dir = tempdir().unwrap();
+    let mock_instance = TestRegistry::start_recording_with_own_storage(dir.path(), &[]);
+
     let cache_dir = dir.path().join("cache");
     let store_dir = dir.path().join("pacquet-store");
     let project_root = dir.path().join("project");
@@ -456,6 +491,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -471,6 +507,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -508,7 +545,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
     let wanted_lockfile =
         Lockfile::load_wanted_from_dir(&project_root).expect("load wanted lockfile").unwrap();
 
-    drop(mock_instance);
+    let _ = mock_instance.take_requests();
 
     let manifest_text = std::fs::read_to_string(&manifest_path).expect("read package.json");
     std::fs::write(&manifest_path, manifest_text).expect("refresh package.json mtime");
@@ -533,7 +570,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
     second_config.store_dir = store_dir.into();
     second_config.modules_dir = modules_dir;
     second_config.install_state_dir = virtual_store_dir;
-    second_config.registry = "http://127.0.0.1:9/".to_string();
+    second_config.registry = mock_instance.url().to_string();
     second_config.optimistic_repeat_install = false;
     let second_config = second_config.leak();
 
@@ -542,6 +579,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -557,6 +595,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -588,7 +627,13 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
     }
     .run::<RecordingReporter>()
     .await
-    .expect("second install must no-op without contacting the stopped registry");
+    .expect("second install must no-op without contacting the registry");
+
+    assert_eq!(
+        mock_instance.take_requests(),
+        Vec::new(),
+        "verification cache hit must not contact the registry",
+    );
 
     let captured = EVENTS.lock().unwrap();
     assert!(
@@ -654,6 +699,7 @@ async fn optimistic_repeat_install_restores_missing_lockfile_offline() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -669,6 +715,7 @@ async fn optimistic_repeat_install_restores_missing_lockfile_offline() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -759,6 +806,96 @@ async fn fresh_lockfile_applies_overrides_to_transitive_dependencies() {
     assert_package_present(&lockfile, "@pnpm.e2e/has-foo-100.0.0-range-dep@1.0.0");
     assert_package_present(&lockfile, "@pnpm.e2e/foo@100.0.0");
     assert_package_absent(&lockfile, "@pnpm.e2e/foo@100.1.0");
+}
+/// Only the override that rewrote no edge is reported. Convergence and
+/// removal overrides are never reported.
+#[tokio::test]
+async fn fresh_lockfile_reports_overrides_that_matched_no_dependency() {
+    use pnpm_reporter::{
+        LogEvent,
+        Reporter,
+    };
+    use std::sync::Mutex;
+
+    static EVENTS: Mutex<Vec<LogEvent>> = Mutex::new(Vec::new());
+    EVENTS.lock().unwrap().clear();
+
+    struct RecordingReporter;
+    impl Reporter for RecordingReporter {
+        fn emit(event: &LogEvent) {
+            EVENTS
+                .lock()
+                .unwrap()
+                .push(event.clone());
+        }
+    }
+
+    fresh_lockfile_only_with_overrides_reporting::<RecordingReporter>(
+        &[("@pnpm.e2e/foo", "^100.0.0")],
+        &[
+            ("@pnpm.e2e/foo@^100.0.0", "100.0.0"),
+            ("@pnpm.e2e/missing-pkg@^1.0.0", "1.0.0"),
+            ("@pnpm.e2e/missing-converge@", "1.0.0"),
+            ("@pnpm.e2e/missing-removal", "-"),
+        ],
+        None,
+        |_| {},
+    )
+    .await;
+
+    let events = EVENTS.lock().unwrap();
+    let unused: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            LogEvent::UnusedOverride(log) => Some(log.selector.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unused, vec!["@pnpm.e2e/missing-pkg@^1.0.0"]);
+    let unused_at = events
+        .iter()
+        .position(|event| matches!(event, LogEvent::UnusedOverride(_)));
+    let resolution_done_at = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                LogEvent::Stage(log) if matches!(log.stage, pnpm_reporter::Stage::ResolutionDone),
+            )
+        });
+    assert!(unused_at < resolution_done_at, "unused overrides must precede resolution_done");
+}
+#[tokio::test]
+async fn fresh_lockfile_does_not_report_unused_overrides_when_the_warning_is_off() {
+    use pnpm_reporter::{
+        LogEvent,
+        Reporter,
+    };
+    use std::sync::atomic::{
+        AtomicUsize,
+        Ordering,
+    };
+
+    static UNUSED_OVERRIDE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+    struct RecordingReporter;
+    impl Reporter for RecordingReporter {
+        fn emit(event: &LogEvent) {
+            if matches!(event, LogEvent::UnusedOverride(_)) {
+                UNUSED_OVERRIDE_EVENTS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fresh_lockfile_only_with_overrides_reporting::<RecordingReporter>(
+        &[("@pnpm.e2e/foo", "^100.0.0")],
+        &[("@pnpm.e2e/missing-pkg@^1.0.0", "1.0.0")],
+        None,
+        |config| config.warn_unused_overrides = false,
+    )
+    .await;
+
+    assert_eq!(UNUSED_OVERRIDE_EVENTS.load(Ordering::SeqCst), 0);
 }
 // The `afterAllResolved` hook receives the resolved
 // lockfile object and its return value is what gets written, so an arbitrary

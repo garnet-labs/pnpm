@@ -1,6 +1,15 @@
 use super::{
-    Config, HashSet, LogEvent, PreCommandError, Value, apply_runtime_on_fail_override, global_warn,
-    is_runtime_alias, sanitize_inline, system_runtime_version, version_satisfies,
+    Config,
+    HashSet,
+    LogEvent,
+    PreCommandError,
+    Value,
+    apply_runtime_on_fail_override,
+    global_warn,
+    is_runtime_alias,
+    sanitize_inline,
+    system_runtime_version,
+    version_satisfies,
 };
 
 /// pnpm's `getWantedRuntimes` + `checkRuntime`: validate every runtime the
@@ -35,7 +44,8 @@ pub(super) fn declares_runtime(manifest: &Value) -> bool {
     ["devEngines", "engines"]
         .into_iter()
         .flat_map(|engines_field| declared_runtimes(manifest, engines_field))
-        .filter_map(|runtime| runtime.get("name").and_then(Value::as_str))
+        .map(|runtime| runtime.get("name"))
+        .filter_map(|value| value.and_then(Value::as_str))
         .any(is_runtime_alias)
 }
 
@@ -72,6 +82,7 @@ fn check_runtime(runtime: &Value, name: &str, emit: fn(&LogEvent)) -> miette::Re
                 "This project requires a {display_name} runtime but does not specify a version range",
             ),
             emit,
+            RuntimeCheckFailure::MissingVersionRange,
         );
     };
     if node_semver::Range::parse(wanted_range).is_err() {
@@ -81,21 +92,48 @@ fn check_runtime(runtime: &Value, name: &str, emit: fn(&LogEvent)) -> miette::Re
                 "This project requires an invalid {display_name} version range: {wanted_range}",
             ),
             emit,
+            RuntimeCheckFailure::InvalidVersionRange,
         );
     }
     check_installed_runtime(name, display_name, wanted_range, on_fail, emit)
 }
 
-/// Every `onFail` other than `error` — including a value pnpm does not
-/// define — degrades to a warning.
+#[derive(Clone, Copy)]
+enum RuntimeCheckFailure {
+    MissingVersionRange,
+    InvalidVersionRange,
+    NotFound,
+    UnsatisfiedVersion,
+}
+
+impl RuntimeCheckFailure {
+    fn into_error(self, message: String) -> PreCommandError {
+        match self {
+            RuntimeCheckFailure::MissingVersionRange => {
+                PreCommandError::MissingRuntimeVersionRange { message }
+            }
+            RuntimeCheckFailure::InvalidVersionRange => {
+                PreCommandError::InvalidRuntimeVersionRange { message }
+            }
+            RuntimeCheckFailure::NotFound => PreCommandError::RuntimeNotFound { message },
+            RuntimeCheckFailure::UnsatisfiedVersion => {
+                PreCommandError::BadRuntimeVersion { message }
+            }
+        }
+    }
+}
+
+/// Every `onFail` other than `error` (including a value pnpm does not
+/// define) degrades to a warning.
 fn fail_runtime_check(
     on_fail: Option<&str>,
     message: &str,
     emit: fn(&LogEvent),
+    failure: RuntimeCheckFailure,
 ) -> miette::Result<()> {
     if on_fail == Some("error") {
         let message = sanitize_inline(message).into_owned();
-        return Err(PreCommandError::BadRuntimeVersion { message }.into());
+        return Err(failure.into_error(message).into());
     }
     global_warn(emit, message);
     Ok(())
@@ -125,6 +163,7 @@ fn check_installed_runtime(
                 "This project requires {display_name} {wanted_range}, but {display_name} was not found on the system",
             ),
             emit,
+            RuntimeCheckFailure::NotFound,
         );
     };
     if version_satisfies(&current_version, wanted_range) {
@@ -136,5 +175,6 @@ fn check_installed_runtime(
             "This project requires {display_name} {wanted_range}. Your current {display_name} is v{current_version}",
         ),
         emit,
+        RuntimeCheckFailure::UnsatisfiedVersion,
     )
 }

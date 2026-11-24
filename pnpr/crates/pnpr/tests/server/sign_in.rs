@@ -1,6 +1,18 @@
 use super::{
-    Body, Config, Ipv4Addr, Request, ServiceExt, SocketAddr, SocketAddrV4, StatusCode, TempDir,
-    body_bytes, body_json, header, json, router,
+    Body,
+    Config,
+    Ipv4Addr,
+    Request,
+    ServiceExt,
+    SocketAddr,
+    SocketAddrV4,
+    StatusCode,
+    TempDir,
+    body_bytes,
+    body_json,
+    header,
+    json,
+    router,
 };
 use pnpr_fixtures::MockConfigPresets;
 
@@ -14,13 +26,13 @@ fn config_with_providers(storage: &TempDir) -> Config {
     config.identity.auth.oidc = serde_json::from_value(json!([
         {
             "name": "company", "issuer": "https://login.example", "audience": "pnpr",
-            "login": { "users": [{ "subject": "alice", "username": "alice" }] }
+            "login": { "users": [{ "subject": "alice", "userId": "alice" }] }
         },
         {
             "name": "github", "issuer": "https://token.actions.githubusercontent.com",
             "audience": "pnpr",
             "workloads": [{
-                "identity": { "subject": "repo:org/repo:ref:refs/heads/main", "username": "ci" },
+                "identity": { "subject": "repo:org/repo:ref:refs/heads/main", "userId": "ci" },
                 "registry": "local", "packages": ["foo"]
             }]
         }

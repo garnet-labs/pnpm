@@ -1,11 +1,32 @@
-use super::{CliReporter, EventFilter, ReporterType, select_reporter};
+use super::{
+    CliReporter,
+    EventFilter,
+    ReporterType,
+    select_reporter,
+};
 use pnpm_reporter::{
-    GlobalLog, LogEvent, LogLevel, PackageManifestLog, PackageManifestMessage, PnpmLog,
-    RemovedRoot, Reporter, RootLog, RootMessage, StatsLog, StatsMessage, SummaryLog,
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    PackageManifestLog,
+    PackageManifestMessage,
+    PnpmLog,
+    RemovedRoot,
+    Reporter,
+    RootLog,
+    RootMessage,
+    StatsLog,
+    StatsMessage,
+    SummaryLog,
 };
 
 fn summary() -> LogEvent {
-    LogEvent::Summary(SummaryLog { level: LogLevel::Debug, prefix: "/project".to_string() })
+    LogEvent::Summary(SummaryLog {
+        level: LogLevel::Debug,
+        prefix: "/project".to_string(),
+        new_projects: None,
+        project_names: None,
+    })
 }
 
 fn stats() -> LogEvent {
@@ -30,7 +51,12 @@ fn root() -> LogEvent {
         level: LogLevel::Debug,
         message: RootMessage::Removed {
             prefix: "/project".to_string(),
-            removed: RemovedRoot { name: "dep".to_string(), version: None, dependency_type: None },
+            removed: RemovedRoot {
+                name: "dep".to_string(),
+                version: None,
+                dependency_type: None,
+                registry_package: None,
+            },
         },
     })
 }

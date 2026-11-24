@@ -1,7 +1,21 @@
 #[cfg(unix)]
 use super::{
-    super::{Host, LINK_STATE_COPY, LINK_STATE_HARDLINK, auto_link, clone_or_copy_link},
+    super::{
+        Host,
+        LINK_STATE_CLONE,
+        LINK_STATE_COPY,
+        LINK_STATE_HARDLINK,
+        auto_link,
+        clone_or_copy_link,
+    },
+    ModeDroppingClone,
+    STORE_ENTRY,
     write_source,
+};
+#[cfg(unix)]
+use pnpm_fs::{
+    FileMode,
+    StoreFile,
 };
 #[cfg(unix)]
 use pnpm_reporter::SilentReporter;
@@ -10,7 +24,10 @@ use pretty_assertions::assert_eq;
 #[cfg(unix)]
 use std::{
     fs,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{
+        AtomicU8,
+        Ordering,
+    },
 };
 #[cfg(unix)]
 use tempfile::tempdir;
@@ -63,7 +80,7 @@ fn auto_respects_cached_hardlink_state() {
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_HARDLINK, "state must not drift");
 }
 /// Pre-seed `CloneOrCopy` state to `COPY` and verify it uses
-/// `fs::copy` — mirrors [`auto_respects_cached_copy_state`]. Also
+/// `fs::copy`, mirrors [`auto_respects_cached_copy_state`]. Also
 /// confirms we skip the hardlink tier entirely (pnpm
 /// `createCloneOrCopyImporter` has no hardlink fallback).
 #[test]
@@ -85,4 +102,33 @@ fn clone_or_copy_respects_cached_copy_state() {
         "state=COPY must not hardlink",
     );
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY, "state must not drift");
+}
+
+/// The clone tier aligns a reflinked target only when this install has not
+/// already read the source's mode as the desired one: a reflink copies the
+/// source's mode, so the alignment's `open` would change nothing.
+#[test]
+#[cfg(unix)]
+fn clone_tier_aligns_only_when_the_source_mode_is_unknown_or_undesired() {
+    let tmp = tempdir().unwrap();
+    let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let stale = FileMode::from_mode(desired.mode() ^ 0o004);
+    let reflinked = FileMode::from_mode(0o400);
+    let src = write_source(tmp.path(), STORE_ENTRY, b"data\n").path;
+    fs::set_permissions(&src, desired.into()).unwrap();
+    let target_mode = |source: StoreFile, name: &str| {
+        let dst = tmp.path().join(name);
+        auto_link::<SilentReporter, ModeDroppingClone>(
+            &AtomicU8::new(0),
+            &AtomicU8::new(LINK_STATE_CLONE),
+            &source,
+            &dst,
+        )
+        .expect("reflink should succeed");
+        FileMode::from_permissions(&fs::metadata(&dst).unwrap().permissions())
+    };
+
+    assert_eq!(target_mode(StoreFile::with_mode(src.clone(), Some(desired)), "known"), reflinked);
+    assert_eq!(target_mode(StoreFile::new(src.clone()), "unknown"), desired);
+    assert_eq!(target_mode(StoreFile::with_mode(src, Some(stale)), "stale"), desired);
 }

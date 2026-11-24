@@ -7,7 +7,10 @@
 
 use std::path::Path;
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_catalogs_protocol_parser::parse_catalog_protocol;
 use pnpm_catalogs_types::Catalogs;
@@ -34,7 +37,9 @@ pub struct WantedDependency {
 pub enum CatalogAnchor<'a> {
     /// Re-anchor the entry from `workspace_dir` to `consumer_dir`. A
     /// `None` consumer yields the absolute path, for a consumer that
-    /// installs somewhere unrelated to the workspace.
+    /// installs somewhere unrelated to the workspace. A `workspace:` path
+    /// stays relative to `workspace_dir` instead, because the resolver
+    /// reads it as a path only while it is relative.
     Reanchor { workspace_dir: &'a Path, consumer_dir: Option<&'a Path> },
     /// Return the entry exactly as it is written. For call sites that
     /// compare or display an entry rather than install from it, and for
@@ -116,7 +121,7 @@ pub fn resolve_from_catalog(
     };
 
     if parse_catalog_protocol(catalog_lookup).is_some() {
-        return recursive_catalog_error(catalog_name, &wanted_dependency.alias);
+        return recursive_catalog_error(catalog_name, wanted_dependency.alias.clone());
     }
 
     CatalogResolutionResult::Found(CatalogResolutionFound {
@@ -140,15 +145,19 @@ fn anchored_specifier(catalog_lookup: &str, anchor: CatalogAnchor<'_>) -> String
     let CatalogAnchor::Reanchor { workspace_dir, consumer_dir } = anchor else {
         return catalog_lookup.to_string();
     };
-    LocalSpec::parse_filesystem(catalog_lookup, workspace_dir)
-        .map_or_else(|| catalog_lookup.to_string(), |spec| spec.render(consumer_dir))
+    if let Some(spec) = LocalSpec::parse_filesystem(catalog_lookup, workspace_dir) {
+        return spec.render(consumer_dir);
+    }
+    LocalSpec::parse_workspace_path(catalog_lookup, workspace_dir)
+        .map(|spec| spec.render(Some(consumer_dir.unwrap_or(workspace_dir))))
+        .unwrap_or_else(|| catalog_lookup.to_string())
 }
 
-fn recursive_catalog_error(catalog_name: &str, alias: &str) -> CatalogResolutionResult {
+fn recursive_catalog_error(catalog_name: &str, alias: String) -> CatalogResolutionResult {
     CatalogResolutionResult::Misconfiguration(CatalogResolutionMisconfiguration {
         catalog_name: catalog_name.to_string(),
         error: CatalogResolutionError::EntryInvalidRecursiveDefinition {
-            alias: alias.to_string(),
+            alias,
             catalog_name: catalog_name.to_string(),
         },
     })

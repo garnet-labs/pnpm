@@ -1,11 +1,24 @@
-use crate::{SkippedSnapshots, VirtualStoreLayout};
+use crate::{
+    SkippedSnapshots,
+    VirtualStoreLayout,
+};
 use pnpm_lockfile::{
-    ImporterDepVersion, PkgName, PkgNameVerPeer, ProjectSnapshot, ResolvedDependencySpec,
+    ImporterDepVersion,
+    PkgName,
+    PkgNameVerPeer,
+    ProjectSnapshot,
+    ResolvedDependencySpec,
 };
 use pnpm_package_manifest::DependencyGroup;
 use std::{
-    collections::{BTreeMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// The wire `version` of a dep whose metadata row carries none.
@@ -67,8 +80,8 @@ pub(super) fn collect_resolved_entries<'a>(
         .filter(|(name, _, _)| seen.insert(*name))
         // Drop direct deps whose resolved snapshot landed in the
         // skipped set. Without this filter, the symlink would
-        // either dangle (no virtual-store slot was created) or —
-        // worse — point at a half-installed slot from a prior
+        // either dangle (no virtual-store slot was created) or
+        // (worse) point at a half-installed slot from a prior
         // install. `link:` deps
         // never participate in the virtual store, so they are
         // exempt from the skipped check (the resolved snapshot key
@@ -76,7 +89,7 @@ pub(super) fn collect_resolved_entries<'a>(
         .filter(|(name, spec, _)| match spec.version.resolved_key(name) {
             Some(resolved) => !skipped.contains(&resolved),
             // `link:` deps have no virtual-store slot and so
-            // cannot be in `skipped` — keep them.
+            // cannot be in `skipped`, keep them.
             None => true,
         })
         // Hoisted-mode filter: `link_only` keeps only `link:`
@@ -137,34 +150,10 @@ pub(super) fn resolve_target_path(
                 .join("node_modules")
                 .join(alias.name.to_string())
         }
-        ImporterDepVersion::Link(target) => {
-            // `link:<path>` values are relative to the importer's
-            // `rootDir` (or absolute). Resolve them here so the
-            // on-disk symlink points at the right sibling project.
-            // pacquet's lockfile snapshot already carries the
-            // raw `link:` payload, so the resolution lives at the
-            // install layer.
-            //
-            // Run the joined result through `lexical_normalize` so
-            // the dedupe pass treats `<workspace>/packages/a` and
-            // `<workspace>/packages/foo/../a` as the same target.
-            // The dedupe compares stored symlink targets via
-            // `path.relative(a, b) === ''`, which on absolute paths
-            // reduces to lexical equality *after* both arguments pass
-            // through `path.resolve` (Node normalises by default).
-            // `Path::join` does not, so we have to do it explicitly
-            // here.
-            let candidate = Path::new(target);
-            let joined = if candidate.is_absolute() {
-                candidate.to_path_buf()
-            } else {
-                project_dir.join(candidate)
-            };
-            pnpm_fs::lexical_normalize(&joined)
-        }
+        ImporterDepVersion::Link(target) => link_target_dir(project_dir, target),
         ImporterDepVersion::File(_) => {
             // Injected workspace dep that didn't dedupe back to
-            // `link:` — the importer entry references a virtual-store
+            // `link:`, the importer entry references a virtual-store
             // slot keyed by `(importer_key, file:<payload>)`. Route
             // through `resolved_key` so the layout's GVS-suffix map
             // sees the same key the snapshot writer used.
@@ -177,10 +166,19 @@ pub(super) fn resolve_target_path(
         }
     }
 }
+/// The directory a `link:<target>` dependency of the project at
+/// `project_dir` points at: `target` is relative to the project, or
+/// absolute. Normalized lexically, so the dedupe pass treats
+/// `<workspace>/packages/a` and `<workspace>/packages/b/../a` as one
+/// target, as pnpm's `path.relative` comparison does.
+#[must_use]
+pub fn link_target_dir(project_dir: &Path, target: &str) -> PathBuf {
+    pnpm_fs::lexical_normalize(&project_dir.join(target))
+}
 /// Build the `<alias → resolved-target>` map a dedupe pass needs
 /// for a single importer (always the root). Applies the same
 /// per-importer filters as [`collect_resolved_entries`] so the map
-/// only contains aliases that would have been symlinked — equivalent
+/// only contains aliases that would have been symlinked, equivalent
 /// to reading the root's `node_modules/` after its direct deps are
 /// linked, which by then contains exactly the entries that survived
 /// the skipped / link-only filters.

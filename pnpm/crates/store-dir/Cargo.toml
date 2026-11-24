@@ -22,6 +22,7 @@ pnpm-shared-artifact-protocol = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 dunce = { workspace = true }
+libsqlite3-sys = { workspace = true }
 miette = { workspace = true }
 node-semver = { workspace = true }
 pipe-trait = { workspace = true }
@@ -47,6 +48,7 @@ url = { workspace = true }
 sha2 = { workspace = true, features = ["asm"] }
 
 [target.'cfg(windows)'.dependencies]
+pnpm-ffi-fs = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
@@ -60,3 +62,9 @@ tokio = { workspace = true, features = ["net", "signal"] }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+pnpm-ffi-sqlite = { workspace = true }
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["libsqlite3-sys"]

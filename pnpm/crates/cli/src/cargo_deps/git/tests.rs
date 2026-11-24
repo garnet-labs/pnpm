@@ -1,12 +1,26 @@
-use super::{GitPackage, GitSource, VendorSourceOptions, vendor_source};
-use crate::cargo_deps::git::manifest::{Manifest, vendored_package};
+use super::{
+    GitPackage,
+    GitSource,
+    VendorSourceOptions,
+    vendor_source,
+};
+use crate::cargo_deps::git::manifest::{
+    Manifest,
+    vendored_package,
+};
 use pnpm_reporter::SilentReporter;
 use pnpm_store_dir::StoreDir;
 use pnpm_testing_utils::git_repo::GitRepoFixture;
 use std::{
     fs,
-    path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicU8},
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        atomic::AtomicU8,
+    },
 };
 
 fn manifest(text: &str) -> Manifest {
@@ -111,6 +125,45 @@ workspace = true
     );
     assert_eq!(document["build-dependencies"]["serde"]["version"].as_str(), Some("1"));
     assert_eq!(document["lints"]["rust"]["unsafe_code"].as_str(), Some("forbid"));
+}
+
+#[test]
+fn workspace_inheritance_honors_renamed_package_declarations() {
+    let workspace = manifest(
+        r#"
+[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+itoa = "1.0"
+ws_ryu = { package = "ryu", version = "1.0.19" }
+"#,
+    );
+    let member = manifest(
+        r#"
+[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+my_itoa = { package = "itoa", workspace = true, features = ["extra"] }
+ws_ryu = { workspace = true }
+local_ryu = { package = "ws_ryu", workspace = true }
+"#,
+    );
+
+    let vendored = vendored_package(&member, Some(&workspace.document)).unwrap();
+    let document: toml::Table = toml::from_str(&vendored.manifest).expect("valid TOML");
+    assert_eq!(document["dependencies"]["my_itoa"]["package"].as_str(), Some("itoa"));
+    assert_eq!(document["dependencies"]["my_itoa"]["version"].as_str(), Some("1.0"));
+    assert_eq!(
+        document["dependencies"]["my_itoa"]["features"].as_array().map(Vec::as_slice),
+        Some(["extra".into()].as_slice()),
+    );
+    assert_eq!(document["dependencies"]["ws_ryu"]["package"].as_str(), Some("ryu"));
+    assert_eq!(document["dependencies"]["ws_ryu"]["version"].as_str(), Some("1.0.19"));
+    assert_eq!(document["dependencies"]["local_ryu"]["package"].as_str(), Some("ryu"));
+    assert_eq!(document["dependencies"]["local_ryu"]["version"].as_str(), Some("1.0.19"));
 }
 
 #[test]
@@ -427,8 +480,15 @@ fn a_crate_is_found_past_a_manifest_that_shares_its_name_and_reads_no_version() 
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_file_whose_name_is_not_utf8_is_refused() {
-    use super::{CheckoutPackage, import_package};
-    use std::{collections::BTreeSet, ffi::OsStr, os::unix::ffi::OsStrExt as _};
+    use super::{
+        CheckoutPackage,
+        import_package,
+    };
+    use std::{
+        collections::BTreeSet,
+        ffi::OsStr,
+        os::unix::ffi::OsStrExt as _,
+    };
 
     let temp_dir = tempfile::tempdir().unwrap();
     let package_dir = temp_dir.path().join("crate");

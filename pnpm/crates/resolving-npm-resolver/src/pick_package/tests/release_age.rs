@@ -1,9 +1,29 @@
 use super::{
-    ABBREVIATED_BODY, ABBREVIATED_META_DIR, Arc, AuthHeaders, InMemoryPackageMetaCache,
-    PACKAGE_BODY, PARTIAL_TIME_PACKAGE_BODY, PickPackageContext, PickPackageError,
-    PickPackageOptions, RetryOpts, TempDir, ThrottledClient, assert_eq,
-    create_package_version_policy, default_opts, get_pkg_mirror_path, load_meta, parse_cutoff,
-    persist_meta_to_mirror, pick_package, range_spec, shared_packument_fetch_locker,
+    ABBREVIATED_BODY,
+    ABBREVIATED_META_DIR,
+    Arc,
+    AuthHeaders,
+    InMemoryPackageMetaCache,
+    PACKAGE_BODY,
+    PARTIAL_TIME_PACKAGE_BODY,
+    PickPackageContext,
+    PickPackageError,
+    PickPackageOptions,
+    RetryOpts,
+    STALE_PACKAGE_BODY,
+    TempDir,
+    ThrottledClient,
+    assert_eq,
+    create_package_version_policy,
+    default_opts,
+    get_pkg_mirror_path,
+    load_meta,
+    parse_cutoff,
+    persist_meta_to_mirror,
+    pick_package,
+    range_spec,
+    shared_packument_fetch_locker,
+    version_spec,
 };
 use crate::pick_package::metadata_cache::PackageMetaCache;
 
@@ -196,7 +216,7 @@ async fn published_by_skips_upgrade_when_modified_equals_cutoff() {
         .expect(1)
         .create_async()
         .await;
-    // No second mock — the registry must NOT see a full-metadata
+    // No second mock, the registry must NOT see a full-metadata
     // request. If the upgrade trigger fires by mistake, the test
     // panics on an unmatched request from `mockito`.
 
@@ -651,7 +671,8 @@ async fn published_by_excluded_package_bypasses_mtime_shortcut_and_revalidates()
     let mirror_path =
         get_pkg_mirror_path(cache_dir.path(), ABBREVIATED_META_DIR, &registry, "acme")
             .expect("path");
-    let forced_mtime: std::time::SystemTime = parse_cutoff("2024-01-01T00:00:00Z").into();
+    let forced_mtime: std::time::SystemTime =
+        std::time::SystemTime::try_from(parse_cutoff("2024-01-01T00:00:00Z")).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
         .open(&mirror_path)
@@ -727,7 +748,8 @@ async fn published_by_upgrade_of_a_lowest_version_mirror_pick_is_remembered_acro
     let mirror_path =
         get_pkg_mirror_path(cache_dir.path(), ABBREVIATED_META_DIR, &registry, "acme")
             .expect("path");
-    let forced_mtime: std::time::SystemTime = parse_cutoff("2022-01-01T00:00:00Z").into();
+    let forced_mtime: std::time::SystemTime =
+        std::time::SystemTime::try_from(parse_cutoff("2022-01-01T00:00:00Z")).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
         .open(&mirror_path)
@@ -769,4 +791,65 @@ async fn published_by_upgrade_of_a_lowest_version_mirror_pick_is_remembered_acro
     let _ = pick_package(&ctx, &range_spec("acme", "^1.0.0"), &opts).await.expect("second pick");
 
     full_mock.assert_async().await;
+}
+
+/// A mirror written after the cutoff holds every mature version, but not an
+/// immature one that `minimumReleaseAgeExclude` lets through. The in-memory
+/// entry the first pick promotes from that mirror must not answer the second
+/// pick with "no matching version".
+#[tokio::test]
+async fn published_by_mirror_pick_revalidates_a_later_excluded_immature_version() {
+    let mut server = mockito::Server::new_async().await;
+    let network_mock = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_body(PACKAGE_BODY)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let cache_dir = TempDir::new().expect("tempdir");
+    let registry = format!("{}/", server.url());
+    let stale: pnpm_registry::Package =
+        serde_json::from_str(STALE_PACKAGE_BODY).expect("parse stale packument");
+    persist_meta_to_mirror(cache_dir.path(), ABBREVIATED_META_DIR, &registry, &stale)
+        .expect("warm stale mirror");
+
+    let http_client = ThrottledClient::default();
+    let auth_headers = AuthHeaders::default();
+    let meta_cache = InMemoryPackageMetaCache::default();
+    let fetch_locker = shared_packument_fetch_locker();
+    let ctx = PickPackageContext {
+        pnpr_format: None,
+        full_metadata: false,
+        needs_full_metadata_for: None,
+        filter_metadata: false,
+        cache_policy: crate::MetadataCachePolicy {
+            network: pnpm_resolving_resolver_base::NetworkPolicy::Online,
+            ignore_missing_time_field: false,
+        },
+        store_view: None,
+        metadata: crate::MetadataRequestContext {
+            meta_cache: &meta_cache,
+            fetch_locker: &fetch_locker,
+            cache_dir: Some(cache_dir.path()),
+            http: crate::MetadataHttpClient {
+                http_client: &http_client,
+                auth_headers: &auth_headers,
+                retry_opts: RetryOpts::default(),
+            },
+        },
+    };
+
+    let policy = create_package_version_policy(["acme@1.1.0"]).expect("policy");
+    let mut opts = default_opts(&registry);
+    opts.policy.published_by = Some(parse_cutoff("2024-06-01T00:00:00Z"));
+    opts.policy.published_by_exclude = Some(&policy);
+
+    let first = pick_package(&ctx, &range_spec("acme", "^1.0.0"), &opts).await.expect("range pick");
+    assert_eq!(first.picked_package.expect("picked").version.to_string(), "1.0.0");
+    let second =
+        pick_package(&ctx, &version_spec("acme", "1.1.0"), &opts).await.expect("excluded pick");
+    assert_eq!(second.picked_package.expect("picked").version.to_string(), "1.1.0");
+    network_mock.assert_async().await;
 }

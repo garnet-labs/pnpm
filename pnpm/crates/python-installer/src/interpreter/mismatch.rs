@@ -4,9 +4,20 @@
 //! Node.js runtime, so `runtimeOnFail` decides this the same way.
 
 use super::Interpreter;
-use miette::{Result, bail};
-use pnpm_config::{Config, RuntimeOnFail};
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
+use miette::{
+    Result,
+    bail,
+};
+use pnpm_config::{
+    Config,
+    RuntimeOnFail,
+};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
 use std::path::Path;
 
 /// What an install does with an interpreter outside the project's
@@ -74,5 +85,5 @@ pub(super) fn check_requires_python<Reporter: self::Reporter + 'static>(
     if accepted::<Reporter>(root, version, specifiers, mismatch) {
         return Ok(());
     }
-    bail!("{} requires Python {specifiers}, but {version} was selected", root.display())
+    bail!("{} requires Python {specifiers}, but {version} was selected", root.display());
 }

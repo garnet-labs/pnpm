@@ -34,8 +34,8 @@ pub(super) fn allow_builds_match(
 
 /// `packageExtensions` are compared as opaque `serde_json::Value`
 /// trees so the workspace-state file written by either implementation
-/// round-trips through the other. Empty maps are equivalent to absent
-/// — pacquet's [`pnpm_config::WorkspaceSettings::apply_to`] already collapses
+/// round-trips through the other. Empty maps are equivalent to absent,
+/// pacquet's [`pnpm_config::WorkspaceSettings::apply_to`] already collapses
 /// `packageExtensions: {}` to `None`, but pnpm may write `Some({})`
 /// directly, and the workspace-state file is shared across the two.
 pub(super) fn package_extensions_match(
@@ -96,4 +96,24 @@ fn same_file(left: &Path, right: &Path) -> bool {
 
 fn non_empty(map: Option<&IndexMap<String, String>>) -> Option<&IndexMap<String, String>> {
     map.filter(|map| !map.is_empty())
+}
+
+/// Whether `referenceTime` moved to a time the recorded install did
+/// not cover. A later time accepts every version the recorded install
+/// accepted, so it needs no new install. An earlier time, a fixed time where
+/// the recorded install used its own unknown clock, or the current time in
+/// place of a recorded time that is still ahead of `now`, can reject some.
+pub(super) fn reference_time_moved_back(
+    recorded: Option<&str>,
+    live: Option<&str>,
+    now: jiff::Timestamp,
+) -> bool {
+    let parse = |value: &str| pnpm_time::parse_rfc3339(value).ok();
+    match (recorded.map(parse), live.map(parse)) {
+        (None, None) => false,
+        (None, Some(_)) => true,
+        (Some(Some(recorded)), None) => recorded > now,
+        (Some(Some(recorded)), Some(Some(live))) => live < recorded,
+        (Some(None), _) | (_, Some(None)) => true,
+    }
 }

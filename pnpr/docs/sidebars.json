@@ -14,8 +14,10 @@
         "tls-and-reverse-proxy",
         "cloudflare",
         "webhooks",
-        "auth-backends",
+        { "type": "doc", "id": "auth-backends", "label": "Shared database" },
+        "identity",
         "oidc",
+        "access",
         "scim"
       ]
     },
@@ -28,6 +30,7 @@
     "compiler-cache",
     "pipeline-runs",
     "endpoints",
+    { "type": "link", "label": "Error responses", "href": "/pnpr/endpoints#error-responses" },
     "license"
   ]
 }

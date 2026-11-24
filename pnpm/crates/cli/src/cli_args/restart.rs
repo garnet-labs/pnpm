@@ -1,4 +1,7 @@
-use super::{reporter::ReporterType, run::RunArgs};
+use super::{
+    reporter::ReporterType,
+    run::RunArgs,
+};
 use clap::Args;
 
 /// Restarts a package. Runs a package's "stop", "restart" (if present), and
@@ -25,7 +28,7 @@ impl RestartArgs {
 
         for script_name in ["stop", "restart", "start"] {
             RunArgs {
-                script: RunArgs::script(script_name, args.clone()),
+                script: RunArgs::script(script_name.to_owned(), args.clone()),
                 if_present: if_present || script_name == "restart",
                 sequential: false,
                 dry_run: false,

@@ -2,7 +2,12 @@
 //! process, named by its id, whose `stat` file holds the process's state
 //! and process group among its fields.
 
-use std::{fs, io, path::Path, process};
+use std::{
+    fs,
+    io,
+    path::Path,
+    process,
+};
 
 /// Whether the group led by `leader` may still hold a process that has not
 /// exited. Only two readings in a row of `table` that show the same members
@@ -82,10 +87,7 @@ fn has_other_threads(entry: &Path) -> bool {
 }
 
 fn is_in_group(pid: u32, leader: i32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else { return false };
-    // SAFETY: `getpgid` only reads the process group of `pid`, and returns
-    // -1, never a group, once no such process exists.
-    unsafe { libc::getpgid(pid) == leader }
+    pnpm_ffi_signal::process_group_of(pid) == Some(leader)
 }
 
 /// The state and the process group in a `stat` line. Both follow the

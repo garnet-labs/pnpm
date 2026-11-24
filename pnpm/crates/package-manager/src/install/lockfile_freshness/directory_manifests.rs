@@ -2,23 +2,39 @@
 //! resolver read them.
 
 use super::{
-    FreshnessCheckError, LockfileFreshnessInputs,
+    FreshnessCheckError,
+    LockfileFreshnessInputs,
     directory_deps::{
-        InjectedDirectory, NestedByImporter, is_declared_local_directory, is_deploy_file_url_key,
-        overridden_unhooked_manifest, unhooked_manifest,
+        GraphEdges,
+        NestedByImporter,
+        NestedDirectoryPackage,
+        is_deploy_file_url_key,
+        nested_directory_packages as nested_directory_packages_along,
     },
     project_manifests_by_dir,
 };
-use crate::install::{Arc, Lockfile, PackageManifest, PathBuf};
+use crate::install::{
+    Arc,
+    Lockfile,
+    PackageManifest,
+    PathBuf,
+};
 use pnpm_package_manifest::DependencyGroup;
-use pnpm_resolving_deps_resolver::{ChildCatalogs, ManifestTransformHooks};
-use std::collections::{HashMap, HashSet};
+use pnpm_resolving_deps_resolver::{
+    ChildCatalogs,
+    ManifestTransformHooks,
+    directory_package_dir,
+};
+use std::collections::{
+    HashMap,
+    HashSet,
+};
+
+mod read;
 
 /// A directory dependency as the check reaches it: the directory the
-/// lockfile records, as written, and whether a `file:` spec declared it.
-/// The two declarations can read different manifests; see
-/// [`unhooked_manifest`].
-type DirectoryDep = (String, bool);
+/// lockfile records, as written.
+type DirectoryDep = String;
 
 /// The manifests [`hooked_directory_manifests`] returns, by [`DirectoryDep`].
 #[derive(Default)]
@@ -26,14 +42,47 @@ pub(crate) struct DirectoryManifests(HashMap<DirectoryDep, PackageManifest>);
 
 impl DirectoryManifests {
     /// No manifests: every directory package is read from its directory.
+    #[cfg(test)]
     pub(crate) fn none() -> &'static Self {
         static NONE: std::sync::OnceLock<DirectoryManifests> = std::sync::OnceLock::new();
         NONE.get_or_init(Self::default)
     }
 
-    pub(crate) fn get(&self, directory: &str, declared_as_file: bool) -> Option<&PackageManifest> {
-        self.0.get(&(directory.to_string(), declared_as_file))
+    pub(crate) fn get(&self, directory: &str) -> Option<&PackageManifest> {
+        self.0.get(directory)
     }
+}
+
+/// The manifest of every directory package the importers of `inputs` reach in
+/// `lockfile`, with the resolver's manifest hooks applied, for a check that
+/// compares those importers outside [`super::check_lockfile_freshness`].
+pub(crate) async fn hooked_importer_directory_manifests(
+    lockfile: &Lockfile,
+    inputs: &LockfileFreshnessInputs<'_, '_>,
+    overrider: Option<&Arc<crate::VersionsOverrider>>,
+) -> Result<DirectoryManifests, FreshnessCheckError> {
+    let nested_packages = nested_directory_packages(lockfile, inputs);
+    let nested = checked_nested(&nested_packages, inputs);
+    hooked_directory_manifests(lockfile, inputs, (overrider, &nested)).await
+}
+
+pub(super) fn nested_directory_packages(
+    lockfile: &Lockfile,
+    inputs: &LockfileFreshnessInputs<'_, '_>,
+) -> Vec<NestedDirectoryPackage> {
+    nested_directory_packages_along(lockfile, GraphEdges::installed(inputs.config.optional))
+}
+
+/// The nested directory packages of the importers `inputs` checks.
+pub(super) fn checked_nested<'n>(
+    nested: &'n [NestedDirectoryPackage],
+    inputs: &LockfileFreshnessInputs<'_, '_>,
+) -> NestedByImporter<'n> {
+    let checked: std::collections::HashSet<&str> = inputs.manifests
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
+    NestedByImporter::assign(nested, |importer_id| checked.contains(importer_id))
 }
 
 /// The manifest of every directory package the importers of `inputs` reach
@@ -48,10 +97,7 @@ impl DirectoryManifests {
 pub(super) async fn hooked_directory_manifests(
     lockfile: &Lockfile,
     inputs: &LockfileFreshnessInputs<'_, '_>,
-    (parsed_overrides, nested): (
-        Option<&[pnpm_config_parse_overrides::VersionOverride]>,
-        &NestedByImporter<'_>,
-    ),
+    (overrider, nested): (Option<&Arc<crate::VersionsOverrider>>, &NestedByImporter<'_>),
 ) -> Result<DirectoryManifests, FreshnessCheckError> {
     let mut level = direct_directory_deps(lockfile, inputs);
     level.extend(nested_directory_deps(nested));
@@ -61,43 +107,28 @@ pub(super) async fn hooked_directory_manifests(
     let walk = DirectoryWalk {
         lockfile,
         inputs,
-        parsed_overrides,
+        overrider: overrider.map(Arc::as_ref),
         manifests_by_dir: dependency_manifest_sources(inputs),
-        hooks: resolver_hooks(inputs, parsed_overrides)?,
-    };
-    // A directory is read once, but each snapshot of it is walked: peer
-    // variants of one package can record different children.
-    let mut walked: HashSet<(pnpm_lockfile::PackageKey, DirectoryDep)> = HashSet::new();
-    let mut read: HashMap<DirectoryDep, Option<(PackageManifest, bool)>> = HashMap::new();
-    while !level.is_empty() {
-        level.retain(|visit| walked.insert((visit.key.clone(), visit.dep.clone())));
-        walk.read_level(&level, &mut read).await?;
-        level = level
-            .iter()
-            .filter_map(|visit| {
-                let (manifest, _) = read.get(&visit.dep)?.as_ref()?;
-                Some(walk.children(visit, manifest))
+        declared_manifests_by_dir: lockfile.packages
+            .as_ref()
+            .filter(|packages| {
+                packages.values().any(|metadata| metadata.specifiers.is_some())
             })
-            .flatten()
-            .collect();
-    }
-    let manifests = read
-        .into_iter()
-        .filter_map(|(dep, manifest)| match manifest {
-            Some((manifest, true)) => Some((dep, manifest)),
-            _ => None,
-        })
-        .collect();
-    Ok(DirectoryManifests(manifests))
+            .map(|_| {
+                project_manifests_by_dir(
+                    inputs.dependency_manifests.declared.iter().map(|(_, manifest)| *manifest),
+                    inputs.dependency_manifests.injected,
+                )
+            }),
+        hooks: resolver_hooks(inputs, overrider.cloned())?,
+    };
+    walk.read_all(level).await
 }
 
 fn resolver_hooks(
     inputs: &LockfileFreshnessInputs<'_, '_>,
-    parsed_overrides: Option<&[pnpm_config_parse_overrides::VersionOverride]>,
+    versions_overrider: Option<Arc<crate::VersionsOverrider>>,
 ) -> Result<ManifestTransformHooks, FreshnessCheckError> {
-    let versions_overrider = parsed_overrides.map(|parsed| {
-        Arc::new(crate::VersionsOverrider::new(parsed, inputs.lockfile_dir))
-    });
     Ok(crate::install_with_fresh_lockfile::resolver_manifest_hooks(
         inputs.config,
         versions_overrider,
@@ -119,24 +150,14 @@ pub(super) fn injected_project_manifests<'a>(
         return Vec::new();
     }
     let groups = [DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional];
-    let mut injected: Vec<(bool, PathBuf, &PackageManifest)> = inputs.manifests
+    inputs.manifests
         .iter()
         .flat_map(|(importer_id, _)| lockfile.injected_dependencies(importer_id, groups))
         .filter_map(|dependency| {
             let directory = &dependency.directory.directory;
-            let declared_as_file = is_declared_local_directory(&dependency.spec.specifier);
-            let manifest = directory_manifests.get(directory, declared_as_file)?;
-            let dir = pnpm_fs::lexical_normalize(&inputs.lockfile_dir.join(directory));
-            Some((declared_as_file, dir, manifest))
+            let manifest = directory_manifests.get(directory)?;
+            Some((directory_package_dir(inputs.lockfile_dir, directory), manifest))
         })
-        .collect();
-    // The map these extend is keyed by directory and serves workspace specs,
-    // so a directory reached both ways keeps the workspace declaration's
-    // manifest: it comes last.
-    injected.sort_by_key(|(declared_as_file, ..)| !declared_as_file);
-    injected
-        .into_iter()
-        .map(|(_, dir, manifest)| (dir, manifest))
         .collect()
 }
 
@@ -162,7 +183,7 @@ fn direct_directory_deps(
             let key = dependency.spec.version.resolved_key(dependency.alias)?;
             let directory = &dependency.directory.directory;
             (!is_deploy_file_url_key(dependency.spec, &key, directory)).then(|| Visit {
-                dep: (directory.clone(), is_declared_local_directory(&dependency.spec.specifier)),
+                dep: directory.clone(),
                 alias: dependency.alias.to_string(),
                 key,
             })
@@ -170,25 +191,24 @@ fn direct_directory_deps(
         .collect()
 }
 
-/// Each nested package under both declarations, which the check tries (see
+/// Each nested package the check reaches (see
 /// [`super::directory_deps::check_nested_directory_package`]).
 fn nested_directory_deps<'n>(nested: &'n NestedByImporter<'_>) -> impl Iterator<Item = Visit> + 'n {
     nested
         .packages()
-        .flat_map(|package| {
-            [false, true].map(|declared_as_file| Visit {
-                dep: (package.directory.clone(), declared_as_file),
-                alias: package.alias.clone(),
-                key: package.key.clone(),
-            })
+        .map(|package| Visit {
+            dep: package.directory.clone(),
+            alias: package.alias.clone(),
+            key: package.key.clone(),
         })
 }
 
 struct DirectoryWalk<'a, 'i> {
     lockfile: &'a Lockfile,
     inputs: &'a LockfileFreshnessInputs<'i, 'i>,
-    parsed_overrides: Option<&'a [pnpm_config_parse_overrides::VersionOverride]>,
+    overrider: Option<&'a crate::VersionsOverrider>,
     manifests_by_dir: super::ProjectManifestsByDir<'a>,
+    declared_manifests_by_dir: Option<super::ProjectManifestsByDir<'a>>,
     hooks: ManifestTransformHooks,
 }
 
@@ -202,7 +222,8 @@ impl DirectoryWalk<'_, '_> {
         let mut queued: HashSet<&DirectoryDep> = HashSet::new();
         let unread: Vec<&Visit> = level
             .iter()
-            .filter(|visit| !read.contains_key(&visit.dep) && queued.insert(&visit.dep))
+            .filter(|visit| !read.contains_key(&visit.dep))
+            .filter(|visit| queued.insert(&visit.dep))
             .collect();
         let manifests = futures_util::future::try_join_all(
             unread
@@ -219,41 +240,6 @@ impl DirectoryWalk<'_, '_> {
         Ok(())
     }
 
-    /// The manifest the check reads for `visit`, and whether it was hooked
-    /// here. Projects need the dependency hook chain when it adds optional type peers.
-    async fn read(
-        &self,
-        visit: &Visit,
-    ) -> Result<Option<(PackageManifest, bool)>, FreshnessCheckError> {
-        let (directory, declared_as_file) = &visit.dep;
-        let dir = pnpm_fs::lexical_normalize(&self.inputs.lockfile_dir.join(directory));
-        let injected = InjectedDirectory {
-            dir: &dir,
-            declared_as_file: *declared_as_file,
-            workspace_root: self.inputs.config.workspace_dir
-                .as_deref()
-                .unwrap_or(self.inputs.lockfile_dir),
-            manifests_by_dir: &self.manifests_by_dir,
-        };
-        if self.manifests_by_dir.contains_key(&dir) && !self.inputs.config.add_missing_peer_types {
-            let manifest = overridden_unhooked_manifest(
-                &injected,
-                self.parsed_overrides,
-                self.inputs.lockfile_dir,
-            );
-            return Ok(manifest.map(|manifest| (manifest, false)));
-        }
-        let Some(mut manifest) = unhooked_manifest(&injected) else { return Ok(None) };
-        let hook_ctx =
-            || pnpm_hooks::HookContext { log: Arc::new(|_| {}), dir: Some(directory.clone()) };
-        let value = self.hooks
-            .apply(Arc::new(manifest.value().clone()), hook_ctx)
-            .await
-            .map_err(FreshnessCheckError::ReadPackageHook)?;
-        *manifest.value_mut() = (*value).clone();
-        Ok(Some((manifest, true)))
-    }
-
     /// The children of `visit` the check walks into: the ones `manifest`
     /// declares that the snapshot records as directory packages.
     fn children(&self, visit: &Visit, manifest: &PackageManifest) -> Vec<Visit> {
@@ -263,9 +249,15 @@ impl DirectoryWalk<'_, '_> {
         else {
             return Vec::new();
         };
-        let (directory, declared_as_file) = &visit.dep;
-        let dir = self.inputs.lockfile_dir.join(directory);
-        let catalogs = (!declared_as_file).then_some(ChildCatalogs {
+        if self.lockfile.packages
+            .as_ref()
+            .and_then(|packages| packages.get(&visit.key.without_peer()))
+            .is_some_and(|metadata| metadata.specifiers.is_some())
+        {
+            return self.recorded_directory_children(snapshot);
+        }
+        let dir = directory_package_dir(self.inputs.lockfile_dir, &visit.dep);
+        let catalogs = Some(ChildCatalogs {
             catalogs: self.inputs.catalogs,
             workspace_dir: self.inputs.config.workspace_dir.as_deref(),
             package_dir: &dir,
@@ -283,6 +275,30 @@ impl DirectoryWalk<'_, '_> {
             .filter(|child| !child.optional || self.inputs.config.optional)
             .filter_map(|child| self.child_visit(snapshot, child))
             .collect()
+    }
+
+    fn recorded_directory_children(&self, snapshot: &pnpm_lockfile::SnapshotEntry) -> Vec<Visit> {
+        [
+            snapshot.dependencies.as_ref(),
+            self.inputs.config.optional
+                .then_some(snapshot.optional_dependencies.as_ref())
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|(name, reference)| {
+            let key = reference.resolve(name)?;
+            let metadata = self.lockfile.packages
+                .as_ref()?
+                .get(&key.without_peer())?;
+            let pnpm_lockfile::LockfileResolution::Directory(resolution) = &metadata.resolution
+            else {
+                return None;
+            };
+            Some(Visit { dep: resolution.directory.clone(), alias: name.to_string(), key })
+        })
+        .collect()
     }
 
     fn child_visit(
@@ -303,11 +319,7 @@ impl DirectoryWalk<'_, '_> {
         let pnpm_lockfile::LockfileResolution::Directory(resolution) = &metadata.resolution else {
             return None;
         };
-        Some(Visit {
-            dep: (resolution.directory.clone(), is_declared_local_directory(&child.bare_specifier)),
-            alias: child.alias,
-            key,
-        })
+        Some(Visit { dep: resolution.directory.clone(), alias: child.alias, key })
     }
 }
 

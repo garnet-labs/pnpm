@@ -1,6 +1,18 @@
 use super::{
-    Config, ConfigError, ConfigFlags, DEFAULT_JSR_REGISTRY, GLOBAL_CONFIG_YAML_FILENAME, IndexMap,
-    Map, Path, Segment, Value, config_types, naming_cases, property_path, protected_settings,
+    Config,
+    ConfigError,
+    ConfigFlags,
+    DEFAULT_JSR_REGISTRY,
+    GLOBAL_CONFIG_YAML_FILENAME,
+    IndexMap,
+    Map,
+    Path,
+    Segment,
+    Value,
+    config_types,
+    naming_cases,
+    property_path,
+    protected_settings,
     refused_keys,
 };
 
@@ -102,18 +114,22 @@ pub(super) fn validate_yaml_config_key(key: &str) -> Result<String, ConfigError>
     if config_types::is_config_file_key(&kebab) {
         return Ok(kebab);
     }
-    Err(ConfigError::SetUnsupportedYamlConfigKey { key: key.to_string() })
+    let hint = if refused_keys::is_refused_by_a_project_manifest(key) {
+        refused_keys::where_refused_key_belongs(&naming_cases::to_camel_case(key))
+    } else {
+        "Try setting them instead to the local pnpm-workspace.yaml file".to_string()
+    };
+    Err(ConfigError::SetUnsupportedYamlConfigKey { key: key.to_string(), hint })
 }
 
-const STRING_ONLY_INI_KEYS: &[&str] = &["_auth", "_authToken", "_password", "username", "registry"];
+const STRING_ONLY_INI_KEYS: &[&str] =
+    &["_auth", "_authToken", "_password", "username", "tokenHelper", "registry"];
 
 pub(super) fn is_string_only_ini_key(key: &str) -> bool {
     STRING_ONLY_INI_KEYS.contains(&key) || key.starts_with('@') || key.starts_with("//")
 }
 
-// ---------------------------------------------------------------------------
 // config get / list
-// ---------------------------------------------------------------------------
 
 /// `configGet`: resolve and render the value at `key`.
 pub(super) fn config_get(
@@ -121,6 +137,9 @@ pub(super) fn config_get(
     flags: ConfigFlags,
     key: &str,
 ) -> Result<String, ConfigError> {
+    if protected_settings::is_setting_protected(key) {
+        return Err(ConfigError::GetProtected);
+    }
     let is_scoped = key.starts_with('@');
     let value = match lookup_config(config, key, is_scoped) {
         Some(value) => value,
@@ -132,7 +151,7 @@ pub(super) fn config_get(
 
 /// pnpm resolves relative patch paths against the workspace root when it
 /// reads the setting, so its record shows the resolved paths; pacquet keeps
-/// them as written and resolves lazily — mirror the resolved display.
+/// them as written and resolves lazily, mirror the resolved display.
 fn absolutize_patch_paths(result: &mut Map<String, Value>, config: &Config) {
     let Some(workspace_dir) = &config.workspace_dir else { return };
     let Some(Value::Object(patched)) = result.get_mut("patchedDependencies") else { return };
@@ -150,8 +169,8 @@ fn absolutize_patch_paths(result: &mut Map<String, Value>, config: &Config) {
     }
 }
 
-/// `catalogs` shows the complete resolved catalog set — the singular
-/// `catalog` block is its `default` entry, listed first — whichever spelling
+/// `catalogs` shows the complete resolved catalog set (the singular
+/// `catalog` block is its `default` entry, listed first) whichever spelling
 /// declared it.
 fn merge_default_catalog(result: &mut Map<String, Value>) {
     let named = match result.remove("catalogs") {
@@ -207,7 +226,7 @@ fn lookup_config(config: &Config, key: &str, is_scoped: bool) -> Option<Value> {
     };
     // The merged default is what resolvers use, so `registry` answers the
     // same URL the resolved `registries` view declares as the bare `@`
-    // scope — a raw `.npmrc` value would contradict it.
+    // scope, a raw `.npmrc` value would contradict it.
     if kebab == "registry" {
         return Some(Value::String(config.registry.clone()));
     }
@@ -244,14 +263,21 @@ fn lookup_scoped_config(config: &Config, key: &str) -> Value {
 /// auth-file value, or null.
 fn lookup_typed_config(config: &Config, kebab: &str) -> Value {
     let camel = naming_cases::to_camel_case(kebab);
-    if let Some(value) = config.explicit_settings.get(&camel) {
-        return value.clone();
+    let mut value = config.explicit_settings
+        .get(&camel)
+        .cloned()
+        .unwrap_or_else(|| auth_value(config, kebab));
+    if !value.is_null() {
+        protected_settings::censor_protected_setting_value(&camel, &mut value);
     }
-    config.raw_auth_config.get(kebab).map_or(Value::Null, |value| Value::String(value.clone()))
+    value
 }
 
 fn auth_value(config: &Config, key: &str) -> Value {
-    config.raw_auth_config.get(key).map_or(Value::Null, |value| Value::String(value.clone()))
+    config.raw_auth_config
+        .get(key)
+        .cloned()
+        .map_or(Value::Null, Value::String)
 }
 
 /// `lookupByPropertyPath`: resolve a (possibly nested) property path against the
@@ -306,9 +332,9 @@ fn plain_string(value: &Value) -> String {
     }
 }
 
-/// `configToRecord`: build the camelCase record shown by `list` / `get` — the
+/// `configToRecord`: build the camelCase record shown by `list` / `get` (the
 /// explicitly-set settings, then the raw auth keys (original casing), then
-/// `userAgent` — sorted by key and with protected settings censored.
+/// `userAgent`) sorted by key and with protected settings censored.
 /// `registries` is always present and holds the resolved view: the registries
 /// the CLI resolves from, merged across every source, in place of the raw
 /// `registries` / `namedRegistries` values a single source set.
@@ -329,8 +355,8 @@ fn config_to_record(config: &Config) -> Map<String, Value> {
     for (key, value) in &config.raw_auth_config {
         result.entry(key.clone()).or_insert_with(|| Value::String(value.clone()));
     }
-    // The `registry` / `@scope:registry` rows show the merged routes — the
-    // values `config get` answers — so a raw `.npmrc` row cannot contradict
+    // The `registry` / `@scope:registry` rows show the merged routes (the
+    // values `config get` answers) so a raw `.npmrc` row cannot contradict
     // the resolved `registries` view.
     result.insert("registry".to_string(), Value::String(config.registry.clone()));
     for (scope, url) in &config.registries_by_scope {

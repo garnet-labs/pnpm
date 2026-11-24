@@ -1,8 +1,35 @@
 use super::{
-    Arc, BTreeMap, DEFAULT_CONCURRENCY, FuturesUnordered, Lockfile, LockfileResolution, PkgName,
-    RESOLUTION_SHAPE_MISMATCH_VIOLATION_CODE, RenderedViolation, ResolutionPolicyViolation,
-    ResolutionVerification, ResolutionVerifier, Semaphore, StreamExt, VerifyCtx, VerifyError,
-    is_registry_shaped_resolution,
+    Arc,
+    BTreeMap,
+    DEFAULT_CONCURRENCY,
+    FuturesUnordered,
+    Lockfile,
+    LockfileResolution,
+    PkgName,
+    RenderedViolation,
+    ResolutionPolicyViolation,
+    ResolutionVerification,
+    ResolutionVerifier,
+    Semaphore,
+    StreamExt,
+    VerifyCtx,
+    VerifyError,
+    file_url_shape::{
+        FileShapeContext,
+        file_url_matches_target,
+    },
+    local_containment::roots::normalize_rel_dir,
+    local_git_shape::{
+        has_local_git_resolution,
+        is_local_git_key,
+        local_git_key_mismatches_target,
+        local_git_key_raw_path,
+    },
+    offline_checks::{
+        has_local_filesystem_resolution,
+        is_registry_shaped_resolution,
+        strip_file_url_prefix,
+    },
 };
 
 /// One `(name, version, resolution)` tuple deduplicated from
@@ -23,14 +50,11 @@ pub(super) struct Candidate {
 /// `BTreeMap` over a serialized key gives deterministic iteration
 /// order for tests; the fan-out runs across the value iter so order
 /// doesn't affect correctness, only the reproducibility of failures.
-pub(super) fn collect_candidates(
-    lockfile: &Lockfile,
-) -> (Vec<Candidate>, Vec<ResolutionPolicyViolation>) {
+pub(super) fn collect_candidates(lockfile: &Lockfile) -> Vec<Candidate> {
     let Some(packages) = lockfile.packages.as_ref() else {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     };
     let mut deduped: BTreeMap<String, Candidate> = BTreeMap::new();
-    let mut shape_violations = Vec::new();
     for (key, metadata) in packages {
         let name = key.name.clone();
         // A registry-qualified key (`<name>@<registryName>:<version>`)
@@ -43,25 +67,9 @@ pub(super) fn collect_candidates(
             Some((_, version)) => version.to_string(),
             None => key.suffix.version().to_string(),
         };
-        // A registry-style dep path (`name@semver`, no `runtime:`-style
-        // prefix) must be backed by a registry-shaped resolution: the
-        // allowBuilds policy derives a trusted package identity from
-        // that key shape, which is only sound while this invariant
-        // holds. The check is offline, so it applies even when no
-        // policy verifiers are active.
-        if has_registry_shape_mismatch(key, &metadata.resolution) {
-            shape_violations.push(ResolutionPolicyViolation {
-                name: name.clone(),
-                version: version.clone(),
-                resolution: metadata.resolution.clone(),
-                code: RESOLUTION_SHAPE_MISMATCH_VIOLATION_CODE,
-                reason: "a registry-style dependency path is backed by a non-registry resolution"
-                    .to_string(),
-            });
-        }
         // Every `LockfileResolution` variant derives `Serialize`, and
         // the wire shape never contains non-string keys or non-finite
-        // numbers — the only way this `expect` could fire is a future
+        // numbers, the only way this `expect` could fire is a future
         // variant that breaks the contract. Fail loudly rather than
         // skipping the candidate, which would silently bypass
         // verification for that lockfile entry.
@@ -80,11 +88,51 @@ pub(super) fn collect_candidates(
                 resolution: metadata.resolution.clone(),
             });
     }
-    (deduped.into_values().collect(), shape_violations)
+    deduped.into_values().collect()
 }
 
-/// A registry-style key must have a registry-shaped resolution because
-/// build approval derives the trusted package identity from that key.
+/// Check offline invariants between a `packages:` key and its resolution:
+/// - a registry-style key must have a registry-shaped resolution;
+/// - a local-filesystem resolution (`directory` or `file:` tarball) must have
+///   a `file:` key whose workspace containment agrees with its target path;
+/// - a local-git resolution must have a matching `git+file:` key.
+pub(super) fn shape_mismatch_reason(
+    key: &pnpm_lockfile::PkgNameVerPeer,
+    resolution: &pnpm_lockfile::LockfileResolution,
+    shape_ctx: FileShapeContext<'_>,
+) -> Option<&'static str> {
+    if has_registry_shape_mismatch(key, resolution) {
+        return Some("a registry-style dependency path is backed by a non-registry resolution");
+    }
+    if !matches!(key.suffix.version(), pnpm_lockfile::VersionPart::File(_))
+        && has_local_filesystem_resolution(resolution)
+    {
+        return Some("a non-file dependency path is backed by a local filesystem resolution");
+    }
+    if let pnpm_lockfile::VersionPart::File(key_path) = key.suffix.version()
+        && file_key_mismatches_local_target(key_path, resolution, shape_ctx)
+    {
+        return Some("a file dependency path does not match its local resolution target");
+    }
+    local_git_shape_mismatch_reason(key, resolution, shape_ctx)
+}
+
+fn local_git_shape_mismatch_reason(
+    key: &pnpm_lockfile::PkgNameVerPeer,
+    resolution: &pnpm_lockfile::LockfileResolution,
+    shape_ctx: FileShapeContext<'_>,
+) -> Option<&'static str> {
+    if !is_local_git_key(key) && has_local_git_resolution(resolution) {
+        return Some("a non-local-git dependency path is backed by a local git resolution");
+    }
+    if let Some(key_path) = local_git_key_raw_path(key)
+        && local_git_key_mismatches_target(key_path, resolution, shape_ctx)
+    {
+        return Some("a local git dependency path does not match its git repository target");
+    }
+    None
+}
+
 fn has_registry_shape_mismatch(
     key: &pnpm_lockfile::PkgNameVerPeer,
     resolution: &pnpm_lockfile::LockfileResolution,
@@ -98,35 +146,78 @@ fn has_registry_shape_mismatch(
         && !is_registry_shaped_resolution(resolution)
 }
 
+pub(super) fn file_key_mismatches_local_target(
+    key_path: &str,
+    resolution: &LockfileResolution,
+    shape_ctx: FileShapeContext<'_>,
+) -> bool {
+    match resolution {
+        LockfileResolution::Directory(dir) => {
+            if !key_path.starts_with("//") {
+                return normalize_rel_dir(key_path) != normalize_rel_dir(&dir.directory);
+            }
+            !file_url_matches_target(key_path, &dir.directory, shape_ctx)
+        }
+        LockfileResolution::Tarball(tarball) => {
+            // A remote tarball has its own URL key, so one behind a `file:`
+            // key disguises its source.
+            let Some(tar_path) = strip_file_url_prefix(&tarball.tarball) else {
+                return true;
+            };
+            if !key_path.starts_with("//") {
+                return normalize_rel_dir(key_path) != normalize_rel_dir(tar_path);
+            }
+            !file_url_matches_target(key_path, tar_path, shape_ctx)
+        }
+        LockfileResolution::Variations(variations) => variations.variants
+            .iter()
+            .any(|variant| {
+                file_key_mismatches_local_target(key_path, &variant.resolution, shape_ctx)
+            }),
+        LockfileResolution::Git(_) => true,
+        _ => false,
+    }
+}
+
 /// Run every active verifier against every candidate with a
 /// concurrency cap. Each candidate stops at the first verifier that
 /// rejects it.
+///
+/// `on_entry_checked` is called once per candidate as its check
+/// completes, and no more once a transport failure aborts the pass.
 pub(super) async fn run_fan_out(
     candidates: Vec<Candidate>,
     verifiers: &[Arc<dyn ResolutionVerifier>],
     concurrency: Option<usize>,
+    on_entry_checked: &mut (dyn FnMut() + Send),
 ) -> Result<Vec<ResolutionPolicyViolation>, String> {
     let limit = concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1);
     let semaphore = Arc::new(Semaphore::new(limit));
-    let mut futures = FuturesUnordered::new();
+    let futures = FuturesUnordered::new();
     for candidate in candidates {
         let verifiers = candidate_verifiers(&candidate, verifiers);
         if verifiers.is_empty() {
+            on_entry_checked();
             continue;
         }
 
         let semaphore = Arc::clone(&semaphore);
         futures.push(async move {
-            // Holding the permit across every verifier .await keeps
-            // the effective in-flight count bounded by the semaphore.
-            // Releasing per-verifier would let N candidates × M
-            // verifiers race past the cap.
             let _permit = semaphore.acquire().await.expect("semaphore not closed during fan-out");
             evaluate_candidate(candidate, &verifiers).await
         });
     }
-    // Drain the rest of the fan-out so no in-flight task is dropped mid-await,
-    // but keep only the first abort.
+    drain_fan_out(futures, on_entry_checked).await
+}
+
+/// Drain the whole fan-out so no in-flight task is dropped mid-await,
+/// keeping only the first abort.
+async fn drain_fan_out(
+    mut futures: FuturesUnordered<
+        impl Future<Output = Result<Option<ResolutionPolicyViolation>, String>>,
+    >,
+    on_entry_checked: &mut (dyn FnMut() + Send),
+) -> Result<Vec<ResolutionPolicyViolation>, String> {
     let mut violations = Vec::new();
     let mut fetch_error: Option<String> = None;
     while let Some(result) = futures.next().await {
@@ -139,10 +230,10 @@ pub(super) async fn run_fan_out(
                 }
             }
         }
+        if fetch_error.is_none() {
+            on_entry_checked();
+        }
     }
-    // A registry that couldn't be reached takes precedence over collected
-    // violations: the pass never finished, so the batch is incomplete and the
-    // actionable failure is the transport error.
     match fetch_error {
         Some(message) => Err(message),
         None => Ok(violations),
@@ -168,7 +259,7 @@ fn candidate_verifiers(
 
 /// Outcome of evaluating one candidate against the active verifiers.
 /// `Err(message)` is a transport failure (the registry couldn't be
-/// reached to verify the entry) — the runner aborts the whole pass with
+/// reached to verify the entry), the runner aborts the whole pass with
 /// it rather than collecting it as a policy violation.
 async fn evaluate_candidate(
     candidate: Candidate,

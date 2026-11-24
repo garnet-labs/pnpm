@@ -4,21 +4,39 @@
 //! The client sends its requirements and the interpreter they are for; the
 //! server reads the index and answers with the `pylock.toml` document.
 //! These tests stand a mock index up and assert what the server read from
-//! it as much as what it returned — above all that it reads a wheel's
+//! it as much as what it returned, above all that it reads a wheel's
 //! metadata from the file an index publishes beside it, and downloads the
 //! wheel only when there is no such file.
 
 use crate::tokens::issue_token;
 use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+    },
 };
-use pnpr::{AuthState, Config, PublicRoute, router_with_auth};
+use pnpr::{
+    AuthState,
+    Config,
+    PublicRoute,
+    router_with_auth,
+};
 use pnpr_fixtures::MockConfigPresets;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
     io::Write as _,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
     path::PathBuf,
     time::Duration,
 };
@@ -83,7 +101,7 @@ fn project_page(files: &Value) -> String {
     json!({ "files": files }).to_string()
 }
 
-fn resolve_request(index: &str, token: &str, requirements: &Value) -> Request<Body> {
+pub(super) fn resolve_request(index: &str, token: &str, requirements: &Value) -> Request<Body> {
     let body = json!({
         "ecosystem": "pypi",
         "requirements": requirements,
@@ -120,15 +138,17 @@ async fn frames(body: Body) -> Vec<Value> {
     String::from_utf8_lossy(&bytes)
         .lines()
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).expect("frame is JSON"))
+        .map(serde_json::from_str)
+        .map(|parsed| parsed.expect("frame is JSON"))
         .collect()
 }
 
-async fn resolved_lockfile(response: axum::response::Response) -> Value {
+pub(super) async fn resolved_lockfile(response: axum::response::Response) -> Value {
     assert_eq!(response.status(), StatusCode::OK);
     let frames = frames(response.into_body()).await;
     assert_eq!(frames.len(), 1, "{frames:?}");
     assert_eq!(frames[0]["type"], "done", "{frames:?}");
+    assert_eq!(frames[0]["lockfileFormat"], "pylock", "{frames:?}");
     frames[0]["lockfile"].clone()
 }
 

@@ -1,16 +1,32 @@
 use super::{
-    CliArgs, Invocation,
-    configuration::{RunAnchors, RunSetup, apply_update_config},
+    CliArgs,
+    Invocation,
+    configuration::{
+        RunAnchors,
+        RunSetup,
+        apply_update_config,
+    },
     seed_config,
 };
-use crate::{State, cli_args::reporter::ReporterFlags, config_overrides::ConfigOverrides};
+use crate::{
+    State,
+    cli_args::reporter::ReporterFlags,
+    config_overrides::ConfigOverrides,
+};
 use miette::Context;
-use pnpm_config::{Config, ConfigLoadFailure, Host};
+use pnpm_config::{
+    Config,
+    ConfigLoadFailure,
+    Host,
+};
 use std::{
     future::Future,
     path::Path,
     pin::Pin,
-    sync::{Mutex, atomic::AtomicBool},
+    sync::{
+        Mutex,
+        atomic::AtomicBool,
+    },
 };
 
 pub(crate) type CommandFuture<'a, Output = ()> =
@@ -41,7 +57,7 @@ pub(crate) struct RunCtx<'a> {
 pub(crate) struct CommandLocations<'a> {
     pub(crate) dir: &'a Path,
     /// The `--dir` as the command line gave it, or the process cwd when it
-    /// gave none — pnpm's `cliOptions.dir ?? process.cwd()`. `init`
+    /// gave none, pnpm's `cliOptions.dir ?? process.cwd()`. `init`
     /// scaffolds here and a non-recursive `exec` runs here, rather than at
     /// the local prefix [`Self::dir`] resolves to.
     pub(crate) cli_dir: &'a Path,
@@ -50,6 +66,7 @@ pub(crate) struct CommandLocations<'a> {
 
 pub(crate) struct WorkspaceInvocation<'a> {
     pub(crate) recursive: bool,
+    pub(crate) recursive_from_command_line: bool,
     pub(crate) resume_from: Option<&'a str>,
     pub(crate) report_summary: bool,
     pub(crate) parallel: bool,
@@ -62,10 +79,18 @@ pub(crate) struct WorkspaceInvocation<'a> {
 
 pub(crate) struct CommandLoaders<'a> {
     pub(crate) config: &'a (dyn Fn() -> miette::Result<&'static mut Config> + Sync),
+    /// Like [`Self::config`] but restricted to the local settings `dlx` and
+    /// `create` inherit from the caller's `.npmrc` and `pnpm-workspace.yaml`
+    /// ([`pnpm_config::CommandTarget::Dlx`]), preserving user global config.
+    pub(crate) dlx_config: &'a (dyn Fn() -> miette::Result<&'static mut Config> + Sync),
     /// Like [`Self::config`] but anchored at the pnpm home dir instead of
     /// `--dir`, so a `-g` install can't inherit the caller project's
     /// `.npmrc` network / TLS / registry settings.
     pub(crate) global_config: &'a (dyn Fn() -> miette::Result<&'static mut Config> + Sync),
+    /// Like [`Self::global_config`], with the `globalPackagesConfig` settings of
+    /// the global `config.yaml` applied. For the commands that act on the
+    /// global packages.
+    pub(crate) global_packages_config: &'a (dyn Fn() -> miette::Result<&'static mut Config> + Sync),
     /// Like [`Self::config`] but loaded through
     /// [`Config::current_for_self_update`], so a repo-controlled
     /// `pnpm-workspace.yaml` can only tighten the release-age policy that
@@ -137,6 +162,7 @@ impl<'a> From<&'a crate::cli_args::cli_command::CliWorkspaceArgs> for WorkspaceI
     fn from(args: &'a crate::cli_args::cli_command::CliWorkspaceArgs) -> Self {
         Self {
             recursive: args.recursive,
+            recursive_from_command_line: args.recursive_from_command_line,
             resume_from: args.ordering.resume_from.as_deref(),
             report_summary: args.execution.report_summary,
             parallel: args.ordering.parallel,
@@ -148,11 +174,12 @@ impl<'a> From<&'a crate::cli_args::cli_command::CliWorkspaceArgs> for WorkspaceI
 
 pub(super) fn take_preloaded_config(
     preloaded_config: &Mutex<Option<Result<Config, ConfigLoadFailure>>>,
-    anchor: &Path,
-    is_global: bool,
+    target: &super::ConfigTarget<'_>,
     local_dir: &Path,
 ) -> Option<Result<Config, ConfigLoadFailure>> {
-    (!is_global && anchor == local_dir)
+    (!target.is_global
+        && target.command_target == pnpm_config::CommandTarget::Project
+        && target.anchor == local_dir)
         .then(|| {
             preloaded_config
                 .lock()

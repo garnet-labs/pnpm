@@ -10,9 +10,15 @@ keywords.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["shell-emulator"]
+shell-emulator = ["dep:deno_task_shell"]
+
 [dependencies]
+pnpm-signal-registry = { workspace = true }
 pnpm-fs = { workspace = true }
 pnpm-package-manifest = { workspace = true }
+pnpm-process = { path = "../process" }
 pnpm-reporter = { workspace = true }
 
 derive_more = { workspace = true }
@@ -25,7 +31,12 @@ tracing = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(any(unix, windows))'.dependencies]
+pnpm-ffi-process = { workspace = true }
+pnpm-ffi-signal = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
+pnpm-ffi-fs = { workspace = true }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
@@ -36,17 +47,19 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+command-extra = { workspace = true }
+pnpm-process = { path = "../process", features = ["test"] }
+pnpm-testing-utils = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 which = { workspace = true }
-deno_task_shell = { workspace = true }
+deno_task_shell = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["net", "process", "signal"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 pnpm-which = { workspace = true }
-pnpm-process = { path = "../process" }
 
 [lints]
 workspace = true

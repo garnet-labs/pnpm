@@ -1,19 +1,45 @@
-use super::{Host, PackError, PackOptions, PackResult, format_pack_output, to_pack_result_json};
+use super::{
+    Host,
+    PackError,
+    PackOptions,
+    PackResult,
+    format_pack_output,
+    to_pack_result_json,
+};
 use crate::{
-    capabilities::{FsAtomicWrite, FsCreateDirAll, FsFileLen, FsIsExecutable, FsReadFile},
+    capabilities::{
+        FsAtomicWrite,
+        FsCreateDirAll,
+        FsFileLen,
+        FsIsExecutable,
+        FsReadFile,
+    },
     manifest_entry::is_manifest_entry,
 };
 use flate2::read::GzDecoder;
 use pnpm_config::NodeLinker;
-use pnpm_reporter::{LogEvent, Reporter, SilentReporter};
-use serde_json::{Value, json};
+use pnpm_reporter::{
+    LogEvent,
+    Reporter,
+    SilentReporter,
+};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     io,
     path::Path,
     sync::Mutex,
 };
-use tempfile::{TempDir, tempdir};
+use tempfile::{
+    TempDir,
+    tempdir,
+};
 
 /// Minimal single-project fixture: a `package.json` plus whatever extra
 /// files the caller writes. `ignore_scripts` defaults to `true` so the
@@ -43,10 +69,12 @@ fn fixture(manifest: &Value) -> (TempDir, PackOptions) {
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
             workspace_packages: None,
+            bumped_workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
             dry_run: false,
+            base_dir: None,
             destination: None,
             out: None,
             injected_files: Vec::new(),
@@ -253,13 +281,16 @@ fn en_collator_matches_javascript_locale_compare() {
 #[test]
 fn en_collator_matches_full_compiled_en_collation() {
     use super::collation::en_collator;
-    use icu_collator::{CollatorBorrowed, options::CollatorOptions};
+    use icu_collator::{
+        CollatorBorrowed,
+        options::CollatorOptions,
+    };
     use icu_locale_core::locale;
 
     let full = CollatorBorrowed::try_new(locale!("en").into(), CollatorOptions::default()).unwrap();
     let en = en_collator();
     let root = en.as_borrowed();
-    let mut by_full: Vec<String> = ('\u{20}'..='\u{24FF}')
+    let mut by_full: Vec<String> = ('\u{20}'..='⓿')
         .flat_map(|char| [char.to_string(), format!("{char}\u{301}")])
         .collect();
     let mut by_root = by_full.clone();
@@ -328,7 +359,7 @@ fn on_disk_executable_file_is_packed_executable() {
 }
 
 /// A `publishConfig.name` rename has to reach the tarball filename and the
-/// packed manifest together — the registry derives the published package from
+/// packed manifest together, the registry derives the published package from
 /// the manifest, so a filename naming the workspace package would name a
 /// different artifact than the one inside it.
 #[test]
@@ -809,10 +840,12 @@ fn workspace_license_is_injected_into_a_sub_package() {
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
             workspace_packages: None,
+            bumped_workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
             dry_run: false,
+            base_dir: None,
             destination: None,
             out: None,
             injected_files: Vec::new(),
@@ -832,8 +865,8 @@ fn workspace_license_is_injected_into_a_sub_package() {
 }
 
 /// A symlinked workspace-root `LICENSE` must not be injected: following
-/// it would leak the target's bytes — potentially a file outside the
-/// workspace — into the published tarball.
+/// it would leak the target's bytes (potentially a file outside the
+/// workspace) into the published tarball.
 #[cfg(unix)]
 #[test]
 fn symlinked_workspace_license_is_not_injected() {
@@ -871,10 +904,12 @@ fn symlinked_workspace_license_is_not_injected() {
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
             workspace_packages: None,
+            bumped_workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
             dry_run: false,
+            base_dir: None,
             destination: None,
             out: None,
             injected_files: Vec::new(),
@@ -923,10 +958,12 @@ fn workspace_root_gitignore_excludes_workspace_package_files() {
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
             workspace_packages: None,
+            bumped_workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
             dry_run: false,
+            base_dir: None,
             destination: None,
             out: None,
             injected_files: Vec::new(),
@@ -1088,8 +1125,11 @@ fn host_is_executable_propagates_non_not_found_error() {
 
 #[test]
 fn format_pack_output_json_single_vs_multiple() {
+    // The two manifests differ by the readme, the way `with_registry_readme`
+    // leaves them, so serializing the registry one would be visible here.
     let result = PackResult {
-        published_manifest: json!({ "name": "foo", "version": "1.0.0" }),
+        published_manifest: json!({ "name": "foo", "version": "1.0.0", "readme": "# foo" }),
+        packed_manifest: json!({ "name": "foo", "version": "1.0.0" }),
         contents: vec!["package.json".to_string()],
         tarball_path: "foo-1.0.0.tgz".to_string(),
         unpacked_size: 42,
@@ -1100,6 +1140,7 @@ fn format_pack_output_json_single_vs_multiple() {
     assert_eq!(parsed["name"], json!("foo"));
     assert_eq!(parsed["filename"], json!("foo-1.0.0.tgz"));
     assert_eq!(parsed["files"], json!([{ "path": "package.json" }]));
+    assert_eq!(parsed["manifest"], result.packed_manifest);
 
     let two = vec![to_pack_result_json(&result), to_pack_result_json(&result)];
     let json_multi = format_pack_output(&two, true, false);
@@ -1125,6 +1166,7 @@ fn text_output_strips_control_characters_from_paths() {
     // verbatim, or it could spoof/obscure the printed output.
     let result = PackResult {
         published_manifest: json!({ "name": "foo", "version": "1.0.0" }),
+        packed_manifest: json!({ "name": "foo", "version": "1.0.0" }),
         contents: vec!["evil\u{1b}[2K.js".to_string(), "package.json".into()],
         tarball_path: "foo-1.0.0.tgz".to_string(),
         unpacked_size: 0,
@@ -1139,6 +1181,7 @@ fn text_output_strips_control_characters_from_paths() {
 fn format_pack_output_text_block() {
     let result = PackResult {
         published_manifest: json!({ "name": "foo", "version": "1.0.0" }),
+        packed_manifest: json!({ "name": "foo", "version": "1.0.0" }),
         contents: vec!["index.js".to_string(), "package.json".into()],
         tarball_path: "foo-1.0.0.tgz".to_string(),
         unpacked_size: 0,
@@ -1347,10 +1390,10 @@ fn pack_preserves_internal_symlinks() {
 }
 
 mod bundled_dependencies;
+mod copying;
 mod dotenv;
-mod variants;
-
-mod variant_warnings;
+mod output;
+mod publish_directory;
 
 #[test]
 fn bin_with_crlf_shebang_is_rejected() {

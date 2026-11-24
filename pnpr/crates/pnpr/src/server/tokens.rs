@@ -1,33 +1,40 @@
+mod payload;
+
+use payload::CredentialLimits;
+
 use std::net::IpAddr;
 
 use axum::{
-    extract::{Path, State},
-    response::{IntoResponse, Response},
+    extract::{
+        Path,
+        State,
+    },
+    http::HeaderMap,
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use pnpr_auth::TokenRecord;
 use pnpr_error::RegistryError;
 use pnpr_policy::Identity;
 use serde::Deserialize;
-use serde_json::{Value, json};
-
-use super::{
-    AppState, AuthedCaller, StatusCode, TargetRegistry, iso_from_unix_millis, json_response,
-    not_found, private_no_cache, require_caller,
+use serde_json::{
+    Value,
+    json,
 };
 
-#[derive(Default, Deserialize)]
-struct CreateTokenPayload {
-    password: Option<String>,
-    #[serde(default)]
-    readonly: bool,
-    #[serde(default)]
-    cidr_whitelist: Vec<String>,
-    name: Option<String>,
-    expires: Option<Value>,
-    expires_in: Option<u64>,
-    scopes: Option<Vec<String>>,
-    kind: Option<String>,
-}
+use super::{
+    AppState,
+    AuthedCaller,
+    StatusCode,
+    TargetRegistry,
+    iso_from_unix_millis,
+    json_response,
+    not_found,
+    private_no_cache,
+    require_caller,
+};
 
 #[derive(Deserialize)]
 pub(super) struct TokenPath {
@@ -44,10 +51,22 @@ pub(crate) async fn post_create_token(
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(_): TargetRegistry,
     client_ip: Option<axum::extract::Extension<super::ClientIp>>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let ip = client_ip.map(|axum::extract::Extension(super::ClientIp(ip))| ip);
-    private_no_cache(create_token(&state, ip, &identity, &body).await)
+    let credential = super::single_authorization_header(&headers)
+        .ok()
+        .flatten()
+        .and_then(super::authentication::token_credentials);
+    let caller = Caller { identity: &identity, credential: credential.as_deref() };
+    private_no_cache(create_token(&state, ip, &caller, &body).await)
+}
+
+/// Who calls the token API, and the raw credential they authenticated with.
+pub(super) struct Caller<'a> {
+    pub(super) identity: &'a Identity,
+    pub(super) credential: Option<&'a str>,
 }
 
 pub(crate) async fn get_token_list(
@@ -79,174 +98,163 @@ pub(crate) async fn delete_session_token(
 pub(super) async fn create_token(
     state: &AppState,
     client_ip: Option<IpAddr>,
-    identity: &Identity,
+    caller: &Caller<'_>,
     body: &[u8],
 ) -> Response {
-    let username = match require_caller(identity, "token creation") {
+    let username = match require_caller(caller.identity, "token creation") {
         Ok(u) => u,
         Err(err) => return err.into_response(),
     };
     if let Err(retry_after) = state.inner.identity.login_rate_limiter.check(client_ip, &username) {
         return super::user_accounts::login_throttled_response(state, retry_after);
     }
-    let payload = match parse_create_token_payload(body) {
-        Ok(p) => p,
-        Err(err) => return err.into_response(),
-    };
-    if let Err(err) = validate_token_payload(&payload) {
-        return err.into_response();
+    let _permit = state.inner.identity.login_concurrency.acquire().await;
+    if let Err(retry_after) = state.inner.identity.login_rate_limiter.check(client_ip, &username) {
+        return super::user_accounts::login_throttled_response(state, retry_after);
     }
-    let now = token_store_unix_seconds();
-    let expires_at = match parse_token_expiry(&payload, now) {
-        Ok(exp) => exp,
-        Err(err) => return err.into_response(),
-    };
-    if let Err(err) =
-        verify_caller_password(state, client_ip, &username, payload.password.as_deref()).await
-    {
-        return err.into_response();
-    }
-    let new_token = pnpr_auth::NewToken::new()
-        .with_readonly(payload.readonly)
-        .with_cidr_whitelist(payload.cidr_whitelist)
-        .with_name(payload.name)
-        .with_expires_at(expires_at)
-        .with_scopes(payload.scopes)
-        .with_kind(payload.kind);
-    match state.inner.identity.auth.tokens.issue_token(&username, new_token).await {
-        Ok((raw, record)) => json_response(StatusCode::OK, &create_token_response(&raw, &record)),
-        Err(err) => err.into_response(),
-    }
+    create_verified_token(state, client_ip, caller, body).await
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
-fn validate_token_payload(payload: &CreateTokenPayload) -> Result<(), RegistryError> {
-    validate_cidr_whitelist(&payload.cidr_whitelist)?;
-    if let Some(kind) = payload.kind.as_deref()
-        && kind.chars().count() > 64
-    {
-        return Err(RegistryError::BadRequest {
-            reason: "kind must be at most 64 characters".to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn parse_create_token_payload(body: &[u8]) -> Result<CreateTokenPayload, RegistryError> {
-    if body.is_empty() {
-        return Ok(CreateTokenPayload::default());
-    }
-    serde_json::from_slice(body).map_err(RegistryError::Json)
-}
-
-fn validate_cidr_whitelist(whitelist: &[String]) -> Result<(), RegistryError> {
-    for entry in whitelist {
-        if pnpr_config::IpNetwork::parse(entry.trim()).is_err() {
-            return Err(RegistryError::BadRequest {
-                reason: format!("invalid CIDR whitelist entry: {entry}"),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn parse_token_expiry(
-    payload: &CreateTokenPayload,
-    now: u64,
-) -> Result<Option<u64>, RegistryError> {
-    if let Some(sec) = payload.expires_in {
-        if sec == 0 {
-            return Err(RegistryError::BadRequest {
-                reason: "expires_in must be greater than 0".to_string(),
-            });
-        }
-        return Ok(Some(now.saturating_add(sec)));
-    }
-    let Some(val) = &payload.expires else {
-        return Ok(None);
-    };
-    parse_expiry_value(val, now)
-}
-
-fn parse_expiry_value(val: &Value, now: u64) -> Result<Option<u64>, RegistryError> {
-    match val {
-        Value::Number(n) => {
-            let n = n
-                .as_u64()
-                .ok_or_else(|| RegistryError::BadRequest {
-                    reason: "invalid expiry timestamp".to_string(),
-                })?;
-            resolve_future_expiry(n, now)
-        }
-        Value::String(s) => parse_expiry_string(s, now),
-        Value::Null => Ok(None),
-        _ => Err(RegistryError::BadRequest { reason: "invalid expiry value".to_string() }),
-    }
-}
-
-fn parse_expiry_string(raw: &str, now: u64) -> Result<Option<u64>, RegistryError> {
-    if let Ok(n) = raw.parse::<u64>() {
-        resolve_future_expiry(n, now)
-    } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
-        let exp = dt.timestamp().max(0) as u64;
-        if exp <= now {
-            return Err(RegistryError::BadRequest {
-                reason: "expiry must be in the future".to_string(),
-            });
-        }
-        Ok(Some(exp))
-    } else {
-        Err(RegistryError::BadRequest { reason: format!("unsupported expiry format: {raw}") })
-    }
-}
-
-fn resolve_future_expiry(raw: u64, now: u64) -> Result<Option<u64>, RegistryError> {
-    let exp = if raw < 100_000_000 {
-        now.saturating_add(raw)
-    } else if raw > 1_000_000_000_000 {
-        raw / 1000
-    } else {
-        raw
-    };
-    if exp <= now {
-        return Err(RegistryError::BadRequest {
-            reason: "expiry must be in the future".to_string(),
-        });
-    }
-    Ok(Some(exp))
-}
-
-async fn verify_caller_password(
+async fn create_verified_token(
     state: &AppState,
     client_ip: Option<IpAddr>,
-    username: &str,
-    password: Option<&str>,
-) -> Result<(), RegistryError> {
-    if let Some(hash) = state.inner.identity.auth.users.password_hash(username).await? {
-        let Some(password) = password else {
-            state.inner.identity.login_rate_limiter.record_failure(client_ip, username);
-            return Err(RegistryError::Unauthenticated {
-                resource: "password required for token creation".to_string(),
-            });
-        };
-        let _permit = state.inner.identity.login_concurrency.acquire().await;
-        let valid = pnpr_auth::verify_bcrypt(password.to_string(), hash).await?;
-        if !valid {
-            state.inner.identity.login_rate_limiter.record_failure(client_ip, username);
-            return Err(RegistryError::Unauthenticated {
-                resource: "invalid password".to_string(),
-            });
-        }
+    caller: &Caller<'_>,
+    body: &[u8],
+) -> Result<Response, RegistryError> {
+    let username = caller.identity.username().expect("authenticated caller");
+    let user_id = caller.identity.user_id().expect("authenticated caller");
+    let mut request = payload::parse_and_validate_token_request(body, pnpr_auth::unix_millis())?;
+    let expected_revision = state.inner.identity.auth
+        .active_account_revision(user_id)
+        .await?
+        .ok_or_else(|| RegistryError::Unauthenticated { resource: format!("user {username:?}") })?;
+    let verified_credential =
+        verify_caller_password(state, client_ip, caller.identity, request.password()).await?;
+    let now = pnpr_auth::unix_millis();
+    request = request
+        .expiring_by_default(default_token_expiry(state, now))
+        .expiring_by(latest_token_expiry(state, now));
+    if matches!(verified_credential, pnpr_auth::AccountCredential::None) {
+        request = request.within(credential_limits(state, caller.credential).await?)?;
     }
-    state.inner.identity.login_rate_limiter.record_success(client_ip, username);
-    Ok(())
+    let new_token = request.into_new_token(pnpr_auth::unix_millis())?;
+    let (raw, record) = state.inner.identity.auth.issue_token_if_credential_current(
+        username,
+        user_id,
+        &verified_credential,
+        expected_revision,
+        new_token,
+    )
+    .await?;
+    let key = super::ecosystem::sha256_hex(raw.as_bytes());
+    let actor = crate::audit::Actor::of(caller.identity);
+    crate::audit!(
+        actor,
+        "token.create",
+        token_key = %key,
+        readonly = record.readonly,
+        "token created",
+    );
+    Ok(json_response(StatusCode::OK, &create_token_response(&raw, &key, &record)))
 }
 
-fn create_token_response(raw_token: &str, record: &TokenRecord) -> Value {
-    let key = super::ecosystem::sha256_hex(raw_token.as_bytes());
+/// When a token issued at `now` without a requested expiry expires: after
+/// `auth.tokens.defaultLifetime`, but no later than `auth.tokens.maxLifetime`.
+pub(super) fn unrequested_token_expiry(state: &AppState, now: u64) -> u64 {
+    let default = default_token_expiry(state, now);
+    latest_token_expiry(state, now).map_or(default, |latest| latest.min(default))
+}
+
+fn default_token_expiry(state: &AppState, now: u64) -> u64 {
+    payload::expiry_after(state.inner.config.identity.auth.tokens.default_lifetime, now)
+}
+
+/// When a token issued at `now` expires at the latest under
+/// `auth.tokens.maxLifetime`. `None` when no maximum is configured.
+fn latest_token_expiry(state: &AppState, now: u64) -> Option<u64> {
+    let max_lifetime = state.inner.config.identity.auth.tokens.max_lifetime?;
+    Some(payload::expiry_after(max_lifetime, now))
+}
+
+/// The limits of the browser session or token that `credential` carries.
+/// Without a password, a new token is held to them.
+async fn credential_limits(
+    state: &AppState,
+    credential: Option<&str>,
+) -> Result<CredentialLimits, RegistryError> {
+    let unsupported = || RegistryError::Unauthenticated {
+        resource: "token creation without a password from this credential".to_string(),
+    };
+    let raw = credential.ok_or_else(unsupported)?;
+    if let Some(expires) = state.inner.identity.oidc.session_expires(raw) {
+        const MILLIS_PER_SECOND: u64 = 1_000;
+        let expires_at = u64::try_from(expires)
+            .ok()
+            .and_then(|seconds| seconds.checked_mul(MILLIS_PER_SECOND));
+        return Ok(CredentialLimits { cidr_whitelist: Vec::new(), expires_at });
+    }
+    let record =
+        state.inner.identity.auth.tokens.lookup_record(raw).await?.ok_or_else(unsupported)?;
+    Ok(CredentialLimits { cidr_whitelist: record.cidr_whitelist, expires_at: record.expires_at })
+}
+
+pub(super) async fn verify_caller_password(
+    state: &AppState,
+    client_ip: Option<IpAddr>,
+    identity: &Identity,
+    password: Option<&str>,
+) -> Result<pnpr_auth::AccountCredential, RegistryError> {
+    let username = identity.username().expect("authenticated caller");
+    let credential = state.inner.identity.auth.users
+        .credential(username)
+        .await?
+        .ok_or_else(|| RegistryError::Unauthenticated {
+            resource: "password verification".to_string(),
+        })?;
+    if let Err(error) = verify_account_credential(username, password, &credential).await {
+        if matches!(error, RegistryError::Unauthenticated { .. }) {
+            let actor = crate::audit::Actor::of(identity);
+            super::user_accounts::record_login_failure(state, client_ip, actor, username);
+        }
+        return Err(error);
+    }
+    state.inner.identity.login_rate_limiter.record_success(client_ip, username);
+    Ok(credential)
+}
+
+async fn verify_account_credential(
+    username: &str,
+    password: Option<&str>,
+    credential: &pnpr_auth::AccountCredential,
+) -> Result<(), RegistryError> {
+    if matches!(credential, pnpr_auth::AccountCredential::None) {
+        return Ok(());
+    }
+    let password = password.ok_or_else(|| RegistryError::Unauthenticated {
+        resource: "password required for token creation".to_string(),
+    })?;
+    match pnpr_auth::verify_returning_user(
+        username,
+        password,
+        credential,
+        pnpr_auth::DEFAULT_BCRYPT_COST,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(RegistryError::Unauthenticated { .. }) => {
+            Err(RegistryError::Unauthenticated { resource: "password verification".to_string() })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_token_response(raw_token: &str, key: &str, record: &TokenRecord) -> Value {
     let mut obj = json!({
         "token": raw_token,
         "key": key,
-        "user": record.username,
+        "user": record.user_id,
         "readonly": record.readonly,
         "cidr_whitelist": record.cidr_whitelist,
         "created": token_timestamp_iso(record.created_at),
@@ -258,21 +266,21 @@ fn create_token_response(raw_token: &str, record: &TokenRecord) -> Value {
     if let Some(ref name) = record.name {
         obj["name"] = json!(name);
     }
-    if let Some(ref scopes) = record.scopes {
-        obj["scopes"] = json!(scopes);
-    }
-    if let Some(ref kind) = record.kind {
-        obj["kind"] = json!(kind);
+    if let Some(kind) = record.kind {
+        obj["kind"] = json!(kind.as_str());
     }
     obj
 }
 
 pub(super) async fn list_tokens(state: &AppState, identity: &Identity) -> Response {
-    let username = match require_caller(identity, "token list") {
-        Ok(username) => username,
-        Err(err) => return err.into_response(),
-    };
-    let tokens = match state.inner.identity.auth.tokens.list_for_user(&username).await {
+    if let Err(err) = require_caller(identity, "token list") {
+        return err.into_response();
+    }
+    let tokens = match state.inner.identity.auth.tokens.list_for_user(
+        identity.user_id().expect("authenticated caller"),
+    )
+    .await
+    {
         Ok(tokens) => tokens,
         Err(err) => return err.into_response(),
     };
@@ -293,14 +301,19 @@ pub(super) async fn revoke_token_by_key(
         Err(err) => return err.into_response(),
     };
     match state.inner.identity.auth.tokens.find_by_key(key).await {
-        Ok(Some(record)) if record.username != username => RegistryError::Forbidden {
-            user: username,
-            action: "revoke",
-            resource: "this token".to_string(),
+        Ok(Some(record)) if Some(record.user_id.as_str()) != identity.user_id() => {
+            RegistryError::Forbidden {
+                user: username,
+                action: "revoke",
+                resource: "this token".to_string(),
+            }
+            .into_response()
         }
-        .into_response(),
         Ok(Some(_)) => match state.inner.identity.auth.tokens.revoke_by_key(key).await {
-            Ok(Some(_)) => json_response(StatusCode::OK, &json!({ "ok": "token revoked" })),
+            Ok(Some(_)) => {
+                audit_token_revoke(identity, key);
+                json_response(StatusCode::OK, &json!({ "ok": "token revoked" }))
+            }
             Ok(None) => not_found(),
             Err(err) => err.into_response(),
         },
@@ -310,25 +323,27 @@ pub(super) async fn revoke_token_by_key(
 }
 
 pub(super) async fn logout(state: &AppState, identity: &Identity, raw_token: &str) -> Response {
-    let username = match require_caller(identity, "logout") {
-        Ok(username) => username,
-        Err(err) => return err.into_response(),
-    };
-    if let Some(resp) = try_logout_session(state, &username, raw_token) {
+    if let Err(err) = require_caller(identity, "logout") {
+        return err.into_response();
+    }
+    if let Some(resp) = try_logout_session(state, identity, raw_token) {
         return resp;
     }
-    logout_bearer_token(state, &username, raw_token).await
+    logout_bearer_token(state, identity, raw_token).await
 }
 
-fn try_logout_session(state: &AppState, username: &str, raw_token: &str) -> Option<Response> {
+fn try_logout_session(state: &AppState, identity: &Identity, raw_token: &str) -> Option<Response> {
     match state.inner.identity.oidc.session(raw_token) {
-        Ok(Some(owner)) if owner.username == username => {
+        Ok(Some(owner)) if Some(owner.user_id.as_str()) == identity.user_id() => {
             state.inner.identity.oidc.revoke_session(raw_token);
             Some(json_response(StatusCode::OK, &json!({ "ok": true })))
         }
         Ok(Some(_)) => Some(
             RegistryError::Forbidden {
-                user: username.to_string(),
+                user: identity
+                    .username()
+                    .expect("authenticated caller")
+                    .to_string(),
                 action: "revoke",
                 resource: "this session".to_string(),
             }
@@ -339,25 +354,41 @@ fn try_logout_session(state: &AppState, username: &str, raw_token: &str) -> Opti
     }
 }
 
-async fn logout_bearer_token(state: &AppState, username: &str, raw_token: &str) -> Response {
+async fn logout_bearer_token(state: &AppState, identity: &Identity, raw_token: &str) -> Response {
     let target_owner = match state.inner.identity.auth.tokens.lookup(raw_token).await {
         Ok(Some(owner)) => owner,
         Ok(None) => return not_found(),
         Err(err) => return err.into_response(),
     };
-    if target_owner != username {
+    if Some(target_owner.as_str()) != identity.user_id() {
         return RegistryError::Forbidden {
-            user: username.to_string(),
+            user: identity
+                .username()
+                .expect("authenticated caller")
+                .to_string(),
             action: "revoke",
             resource: "this token".to_string(),
         }
         .into_response();
     }
     match state.inner.identity.auth.tokens.revoke_by_raw(raw_token).await {
-        Ok(Some(_)) => json_response(StatusCode::OK, &json!({ "ok": true })),
+        Ok(Some(_)) => {
+            audit_token_revoke(identity, &super::ecosystem::sha256_hex(raw_token.as_bytes()));
+            json_response(StatusCode::OK, &json!({ "ok": true }))
+        }
         Ok(None) => not_found(),
         Err(err) => err.into_response(),
     }
+}
+
+fn audit_token_revoke(identity: &Identity, key: &str) {
+    let actor = crate::audit::Actor::of(identity);
+    crate::audit!(
+        actor,
+        "token.revoke",
+        token_key = %key,
+        "token revoked",
+    );
 }
 
 pub(super) fn token_response_object(key: &str, record: &pnpr_auth::TokenRecord) -> Value {
@@ -367,7 +398,7 @@ pub(super) fn token_response_object(key: &str, record: &pnpr_auth::TokenRecord) 
     let mut obj = json!({
         "key": key,
         "token": preview,
-        "user": record.username,
+        "user": record.user_id,
         "cidr_whitelist": record.cidr_whitelist,
         "readonly": record.readonly,
         "created": created,
@@ -379,25 +410,15 @@ pub(super) fn token_response_object(key: &str, record: &pnpr_auth::TokenRecord) 
     if let Some(ref name) = record.name {
         obj["name"] = json!(name);
     }
-    if let Some(ref scopes) = record.scopes {
-        obj["scopes"] = json!(scopes);
-    }
-    if let Some(ref kind) = record.kind {
-        obj["kind"] = json!(kind);
+    if let Some(kind) = record.kind {
+        obj["kind"] = json!(kind.as_str());
     }
     obj
 }
 
-pub(super) fn token_timestamp_iso(seconds: u64) -> String {
-    iso_from_unix_millis(token_timestamp_millis(seconds))
+pub(super) fn token_timestamp_iso(millis: u64) -> String {
+    iso_from_unix_millis(i64::try_from(millis).unwrap_or(i64::MAX))
 }
 
-pub(super) fn token_timestamp_millis(seconds: u64) -> i64 {
-    const MILLIS_PER_SECOND: u64 = 1000;
-    let max_seconds = i64::MAX as u64 / MILLIS_PER_SECOND;
-    (seconds.min(max_seconds) * MILLIS_PER_SECOND) as i64
-}
-
-fn token_store_unix_seconds() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
+#[cfg(test)]
+mod tests;

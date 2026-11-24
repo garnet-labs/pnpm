@@ -1,31 +1,52 @@
-pub(in crate::install) use graph::{ProjectLifecycleGraph, project_lifecycle_graph};
-pub(super) use uninstall::{project_script_stages, run_pre_uninstall_scripts};
+pub(in crate::install) use graph::{
+    ProjectLifecycleGraph,
+    project_lifecycle_graph,
+};
+pub(super) use uninstall::{
+    project_script_stages,
+    run_pre_uninstall_scripts,
+};
 
 mod graph;
 mod project_script_runner;
 mod uninstall;
 
-use project_script_runner::{ProjectScriptRunner, run_project_stages};
+use project_script_runner::{
+    ProjectScriptRunner,
+    run_project_stages,
+};
 
 use super::{
-    Config, DEV_PREINSTALL_ALREADY_RAN_ENV, HashMap, InstallError, NodeLinker, Path, PathBuf,
-    ROOT_PREINSTALL_ALREADY_RAN_ENV, Reporter, RunPostinstallHooks,
+    Config,
+    DEV_PREINSTALL_ALREADY_RAN_ENV,
+    HashMap,
+    InstallError,
+    NodeLinker,
+    Path,
+    PathBuf,
+    ROOT_PREINSTALL_ALREADY_RAN_ENV,
+    Reporter,
+    RunPostinstallHooks,
     project_requires_lifecycle_scripts,
 };
 
 use pnpm_executor::LifecycleScriptError;
-use pnpm_workspace_task_scheduler::{ScheduleGraphOptions, TaskCompletion, schedule_graph};
+use pnpm_workspace_task_scheduler::{
+    ScheduleGraphOptions,
+    TaskCompletion,
+    schedule_graph,
+};
 use std::sync::Mutex;
 
 /// Walk every workspace project's `package.json`. Returns `Ok(None)`
-/// when no `pnpm-workspace.yaml` exists in (or above) `workspace_root`
-/// — the install isn't a workspace install, so the caller should use
+/// when no `pnpm-workspace.yaml` exists in (or above) `workspace_root`,
+/// the install isn't a workspace install, so the caller should use
 /// the top-level `Install.manifest` as its only importer and pass
 /// `None` for the `workspace:`-spec lookup.
 pub(crate) fn load_workspace_projects(
     workspace_root: &std::path::Path,
     workspace_manifest: Option<&pnpm_workspace::WorkspaceManifest>,
-    ignored_directories: &[std::path::PathBuf],
+    ignored_directories: Vec<std::path::PathBuf>,
 ) -> Result<Option<Vec<pnpm_workspace::Project>>, pnpm_workspace::FindWorkspaceProjectsError> {
     let Some(manifest) = workspace_manifest else { return Ok(None) };
     pnpm_workspace::find_workspace_projects(
@@ -39,18 +60,18 @@ pub(crate) fn load_workspace_projects(
 /// `workspace_manifest` declares.
 pub(super) fn workspace_projects_opts(
     workspace_manifest: &pnpm_workspace::WorkspaceManifest,
-    ignored_directories: &[std::path::PathBuf],
+    ignored_directories: Vec<std::path::PathBuf>,
 ) -> pnpm_workspace::FindWorkspaceProjectsOpts {
     pnpm_workspace::FindWorkspaceProjectsOpts {
         patterns: Some(pnpm_workspace::workspace_package_patterns(workspace_manifest)),
-        ignored_directories: ignored_directories.to_vec(),
+        ignored_directories,
     }
 }
 
 /// [`load_workspace_projects`] for the repeat-install checks, which read the
 /// projects the install itself would read: the `--workspace-packages`
 /// patterns when given, else the ones `workspace_manifest` declares.
-pub(crate) fn load_checked_workspace_projects(
+fn load_checked_workspace_projects(
     config: &Config,
     workspace_root: &std::path::Path,
     workspace_manifest: Option<&pnpm_workspace::WorkspaceManifest>,
@@ -61,6 +82,24 @@ pub(crate) fn load_checked_workspace_projects(
         &checked_projects_opts(config, manifest),
     )
     .map(Some)
+}
+
+/// The workspace projects a repeat-install check compares: the ones `listed`
+/// names, or else [`load_checked_workspace_projects`], with
+/// [`crate::apply_runtime_on_fail`] applied as the install applies it.
+pub(crate) fn read_checked_workspace_projects(
+    config: &Config,
+    (workspace_root, workspace_manifest): (&Path, Option<&pnpm_workspace::WorkspaceManifest>),
+    listed: Option<Vec<pnpm_workspace::ProjectManifestPaths>>,
+) -> Result<Option<Vec<pnpm_workspace::Project>>, pnpm_workspace::FindWorkspaceProjectsError> {
+    let mut projects = match listed {
+        Some(listed) => pnpm_workspace::read_workspace_projects(listed).map(Some),
+        None => load_checked_workspace_projects(config, workspace_root, workspace_manifest),
+    }?;
+    if let Some(projects) = &mut projects {
+        crate::apply_runtime_on_fail_to_projects(config, projects);
+    }
+    Ok(projects)
 }
 
 /// The discovery options of [`load_checked_workspace_projects`].
@@ -79,8 +118,8 @@ pub(crate) fn checked_projects_opts(
 
 /// [`Config::extra_env_with_node_options`] plus the `NODE_OPTIONS` entry for
 /// the selected project-level dependency loader. pnpm adds it only once it
-/// links and builds, which is why `pnpm:devPreinstall` — running before the
-/// file exists — takes the plain [`Config::extra_env_with_node_options`].
+/// links and builds, which is why `pnpm:devPreinstall` (running before the
+/// file exists) takes the plain [`Config::extra_env_with_node_options`].
 pub(super) fn project_lifecycle_extra_env(
     config: &Config,
     node_linker: NodeLinker,
@@ -112,11 +151,11 @@ pub(super) fn project_lifecycle_extra_env(
 /// Whether the delegating CLI claims to have run the hook already.
 ///
 /// Only the exact `true` the TypeScript CLI writes counts. Every other
-/// value — unset, empty, `false` — runs the hook, so a stray assignment
+/// value (unset, empty, `false`) runs the hook, so a stray assignment
 /// in someone's environment cannot silently suppress it.
 ///
-/// The marker reaches no process this install spawns — [`build_env`]
-/// drops it — so a nested `pnpm install` started from a lifecycle script
+/// The marker reaches no process this install spawns ([`build_env`]
+/// drops it) so a nested `pnpm install` started from a lifecycle script
 /// still runs its own hook.
 ///
 /// [`build_env`]: pnpm_executor::build_env
@@ -130,13 +169,41 @@ pub(super) fn root_preinstall_already_ran() -> bool {
     std::env::var(ROOT_PREINSTALL_ALREADY_RAN_ENV).is_ok_and(|value| value == "true")
 }
 
-/// Run one of the root project's pre-resolution hooks — `run` is
+/// The workspace root's `pnpm:devPreinstall` for the per-project installs of
+/// a workspace whose projects keep their own lockfiles. The first install to
+/// reach its pre-resolution hooks runs it, and the others wait for it, so it
+/// runs once and before any project resolves.
+#[derive(Debug, Default, Clone)]
+pub struct SharedDevPreinstall(std::sync::Arc<Mutex<Option<bool>>>);
+
+impl SharedDevPreinstall {
+    /// Run `hook` unless an earlier call ran it. A failure is returned to the
+    /// install that ran the hook, and the others stop with
+    /// [`InstallError::WorkspaceDependencyFailed`].
+    pub(super) fn run_once(
+        &self,
+        hook: impl FnOnce() -> Result<bool, InstallError>,
+    ) -> Result<(), InstallError> {
+        let mut succeeded = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *succeeded {
+            Some(true) => Ok(()),
+            Some(false) => Err(InstallError::WorkspaceDependencyFailed),
+            None => {
+                let outcome = hook();
+                *succeeded = Some(outcome.is_ok());
+                outcome.map(drop)
+            }
+        }
+    }
+}
+
+/// Run one of the root project's pre-resolution hooks, `run` is
 /// [`pnpm_executor::run_dev_preinstall_hook`] or
 /// [`pnpm_executor::run_root_preinstall_hook`].
 ///
 /// `pnpm:devPreinstall` exists so a workspace can prepare state that
-/// resolution or linking depends on — next.js creates the placeholder
-/// `next` bin its other packages link against — and `preinstall` so a
+/// resolution or linking depends on (next.js creates the placeholder
+/// `next` bin its other packages link against) and `preinstall` so a
 /// guard can refuse the install before it changes anything, so both run
 /// from the lockfile directory before either, and only for the root
 /// project.
@@ -205,5 +272,6 @@ pub(super) fn run_projects_lifecycle_scripts<Reporter: self::Reporter>(
     first_error
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .map_or(Ok(()), Err)
+        .map(Err)
+        .unwrap_or(Ok(()))
 }

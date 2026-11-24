@@ -1,11 +1,18 @@
 use crate::_utils::{
-    append_line_script, has_link, importer_has_group_dependency, pacquet_in, read_lockfile,
+    append_line_script,
+    has_link,
+    importer_has_group_dependency,
+    pacquet_in,
+    read_lockfile,
     set_minimum_release_age,
 };
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
 use std::fs;
 
 const PROD: &str = "@pnpm.e2e/pkg-with-1-dep";
@@ -308,6 +315,39 @@ fn prune_offline_honors_trust_lockfile() {
     assert!(!has_link(&workspace, FILTERED));
 
     drop((root, mock_instance));
+}
+
+#[test]
+fn warm_hoisted_install_and_prune_remove_extraneous_links() {
+    let fixture = CommandTempCwd::init().add_mocked_registry();
+    let workspace = &fixture.workspace;
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"is-positive":"1.0.0"}}"#)
+        .unwrap();
+    let settings = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&settings).unwrap();
+    fs::write(&settings, format!("{yaml}\nnodeLinker: hoisted\n")).unwrap();
+    pacquet_in(workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let modules = workspace.join("node_modules");
+    let unmanaged = modules.join("_tmp");
+    fs::create_dir(&unmanaged).unwrap();
+    let link = modules.join("extra");
+    let target = workspace.join("extra");
+    fs::create_dir(&target).unwrap();
+    for command in ["prune", "install"] {
+        pnpm_fs::symlink_dir(&target, &link).unwrap();
+        let mut cmd = pacquet_in(workspace).with_arg(command);
+        if command == "install" {
+            cmd = cmd.with_arg("--config.prune-direct-dependencies=true");
+        }
+        cmd.assert().success();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(target.is_dir());
+        assert!(unmanaged.is_dir());
+        assert!(modules.join("is-positive/package.json").is_file());
+    }
 }
 
 #[test]

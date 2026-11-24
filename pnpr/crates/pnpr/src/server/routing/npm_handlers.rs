@@ -1,80 +1,62 @@
 use pnpr_policy::Identity;
 
 use super::{
-    Action, AppState, AuthedCaller, CanonicalPackageName, Deserialize, Ecosystem, HeaderMap,
-    IntoResponse, MAX_PUBLISH_BODY_BYTES, Path, RawQuery, RegistrySource, Response, State,
-    StatusCode, TargetRegistry, authorize_package, caller_scoped, check_publish_tombstone,
-    delete_package, delete_tarball, get_dist_tags, hosted_storage, not_found, private_no_cache,
-    publish_package, remove_dist_tag, resolve_write_target, serve_package_tarball, serve_packument,
-    serve_search, serve_tarball, serve_version_manifest, set_dist_tag, split_package_identifier,
+    Action,
+    AppState,
+    AuthedCaller,
+    CanonicalPackageName,
+    Ecosystem,
+    HeaderMap,
+    IntoResponse,
+    MAX_PUBLISH_BODY_BYTES,
+    Path,
+    RawQuery,
+    RegistrySource,
+    Response,
+    State,
+    StatusCode,
+    TargetRegistry,
+    authorize_package,
+    authorize_package_write,
+    caller_scoped,
+    check_publish_tombstone,
+    delete_package,
+    delete_tarball,
+    get_dist_tags,
+    hosted_storage,
+    not_found,
+    npm_paths::{
+        DeletePath,
+        DistTagPath,
+        NamePath,
+        RevisionPath,
+        ScopedRevPath,
+        ScopedTarballPath,
+        TarballPath,
+        TwoSegments,
+    },
+    private_no_cache,
+    publish_package,
+    remove_dist_tag,
+    resolve_write_target,
+    serve_package_tarball,
+    serve_packument,
+    serve_search,
+    serve_tarball,
+    serve_version_manifest,
+    set_dist_tag,
+    split_package_identifier,
     update_packument,
 };
 
-// --------------------------------------------------------------------
-// Path shapes. Each names only the segments its handlers read: the
-// `/~<name>/` registration captures a `registry` segment too, and the
-// `-rev` routes capture a revision token pnpr does not track.
-// --------------------------------------------------------------------
-
-/// A package addressed by a single segment: an unscoped name, or a scoped name
-/// percent-encoded as `@scope%2Fname`.
-#[derive(Deserialize)]
-pub(super) struct NamePath {
-    pub(super) name: String,
-}
-
-/// npm's overloaded two-segment address. Which package it names, and which
-/// resource of it, depends on the first segment's shape and on the method, so
-/// neither segment can be given a resource name here.
-#[derive(Deserialize)]
-pub(super) struct TwoSegments {
-    pub(super) first: String,
-    pub(super) second: String,
-}
-
-#[derive(Deserialize)]
-pub(super) struct ScopedVersionPath {
-    pub(super) scope: String,
-    pub(super) name: String,
-    pub(super) version: String,
-}
-
-#[derive(Deserialize)]
-pub(super) struct TarballPath {
-    pub(super) name: String,
-    pub(super) filename: String,
-}
-
-#[derive(Deserialize)]
-pub(super) struct ScopedTarballPath {
-    pub(super) scope: String,
-    pub(super) name: String,
-    pub(super) filename: String,
-}
-
-#[derive(Deserialize)]
-pub(super) struct ScopedRevPath {
-    pub(super) scope: String,
-    pub(super) name: String,
-    #[serde(default)]
-    pub(super) _rev: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct DistTagPath {
-    pub(super) name: String,
-    pub(super) tag: String,
-}
-
-// --------------------------------------------------------------------
-// Package reads — packument, version manifest, tarball.
-// --------------------------------------------------------------------
+// Package reads, packument, version manifest, tarball.
 
 /// `GET {base}/{pkg}`.
 pub(super) async fn get_packument(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     Path(path): Path<NamePath>,
 ) -> Response {
@@ -88,16 +70,18 @@ pub(super) async fn get_packument(
         )
         .await;
     }
-    serve_packument(&state, &identity, &headers, registry.as_deref(), &path.name).await
+    serve_packument(&state, &identity, headers, registry.as_deref(), &path.name, query.as_deref())
+        .await
 }
 
-/// `GET {base}/@{scope}/{pkg}` — a scoped package's packument — or
-/// `GET {base}/{pkg}/{version-or-tag}` — a version manifest for a package
+/// `GET {base}/@{scope}/{pkg}` (a scoped package's packument) or
+/// `GET {base}/{pkg}/{version-or-tag}`, a version manifest for a package
 /// whose name fits one segment.
 pub(super) async fn get_packument_or_version_manifest(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     Path(path): Path<TwoSegments>,
 ) -> Response {
@@ -115,7 +99,15 @@ pub(super) async fn get_packument_or_version_manifest(
             .await;
         }
         let name = format!("{first}/{second}");
-        return serve_packument(&state, &identity, &headers, registry.as_deref(), &name).await;
+        return serve_packument(
+            &state,
+            &identity,
+            headers,
+            registry.as_deref(),
+            &name,
+            query.as_deref(),
+        )
+        .await;
     }
     serve_version_manifest(&state, &identity, registry.as_deref(), &first, &second).await
 }
@@ -158,9 +150,7 @@ pub(super) async fn get_search(
     private_no_cache(serve_search(&state, &identity, registry.as_deref(), &query).await)
 }
 
-// --------------------------------------------------------------------
-// Package writes — publish, unpublish, dist-tags.
-// --------------------------------------------------------------------
+// Package writes, publish, unpublish, dist-tags.
 
 async fn preauthorize_publish(
     state: &AppState,
@@ -176,19 +166,14 @@ async fn preauthorize_publish(
         Ok(target) => target,
         Err(err) => return Err(err.into_response()),
     };
-    if let Err(err) = authorize_package(
-        state,
-        identity,
-        &RegistrySource::Hosted(target.source.clone()),
-        name.as_str(),
-        Action::Publish,
-        Some(&target.org),
-    )
-    .await
+    let source = RegistrySource::Hosted(target.source.clone());
+    if let Err(err) =
+        authorize_package_write(state, identity, &source, name.as_str(), Some(&target.namespace))
+            .await
     {
         return Err(err.into_response());
     }
-    let storage = hosted_storage(state, Some(&target.org));
+    let storage = hosted_storage(state, Some(&target.namespace));
     check_publish_tombstone(state, identity, &storage, &name).await
         .map_err(IntoResponse::into_response)?;
     Ok(name)
@@ -214,8 +199,8 @@ async fn preauthorize_rewrite(
         identity,
         &source,
         name.as_str(),
-        Action::Publish,
-        Some(&target.org),
+        Action::Annotate,
+        Some(&target.namespace),
     )
     .await
     {
@@ -230,7 +215,12 @@ async fn collect_publish_body(
 ) -> Result<axum::body::Bytes, Response> {
     let _permit = state.inner.locks.publish_concurrency.acquire().await;
     axum::body::to_bytes(body, MAX_PUBLISH_BODY_BYTES).await
-        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())
+        .map_err(|_| {
+            super::npm_errors::json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Publish request body exceeds the 100 MiB JSON limit; use staged archives for large tarballs",
+            )
+        })
 }
 
 /// `PUT {base}/{pkg}`.
@@ -253,7 +243,7 @@ pub(super) async fn put_package(
     publish_package(&state, &identity, registry.as_deref(), &path.name, body_bytes).await
 }
 
-/// `PUT {base}/@{scope}/{pkg}` — publish a scoped package. A first segment
+/// `PUT {base}/@{scope}/{pkg}`: publish a scoped package. A first segment
 /// that is not a scope names no publishable package.
 pub(super) async fn put_scoped_package(
     State(state): State<AppState>,
@@ -279,13 +269,13 @@ pub(super) async fn put_scoped_package(
     publish_package(&state, &identity, registry.as_deref(), &full, body_bytes).await
 }
 
-/// `PUT {base}/{pkg}/-rev/{rev}` — the full mutated packument, which is how
+/// `PUT {base}/{pkg}/-rev/{rev}`: the full mutated packument, which is how
 /// npm spells a partial unpublish.
 pub(super) async fn put_packument_revision(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
-    Path(path): Path<NamePath>,
+    Path(path): Path<RevisionPath>,
     body: axum::body::Body,
 ) -> Response {
     if let Err(rejection) =
@@ -297,10 +287,11 @@ pub(super) async fn put_packument_revision(
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
-    update_packument(&state, &identity, registry.as_deref(), &path.name, &body_bytes).await
+    update_packument(&state, &identity, registry.as_deref(), (&path.name, &path.rev), &body_bytes)
+        .await
 }
 
-/// `PUT {base}/@{scope}/{pkg}/-rev/{rev}` — full mutated packument or
+/// `PUT {base}/@{scope}/{pkg}/-rev/{rev}`: full mutated packument or
 /// maintainer update for a scoped package.
 pub(super) async fn put_scoped_packument_revision(
     State(state): State<AppState>,
@@ -309,7 +300,7 @@ pub(super) async fn put_scoped_packument_revision(
     Path(path): Path<ScopedRevPath>,
     body: axum::body::Body,
 ) -> Response {
-    let ScopedRevPath { scope, name, .. } = path;
+    let ScopedRevPath { scope, name, rev } = path;
     if !scope.starts_with('@') {
         return not_found();
     }
@@ -323,17 +314,17 @@ pub(super) async fn put_scoped_packument_revision(
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
-    update_packument(&state, &identity, registry.as_deref(), &full, &body_bytes).await
+    update_packument(&state, &identity, registry.as_deref(), (&full, &rev), &body_bytes).await
 }
 
-/// `DELETE {base}/{pkg}` and `DELETE {base}/{pkg}/-rev/{rev}` — remove a whole
+/// `DELETE {base}/{pkg}` and `DELETE {base}/{pkg}/-rev/{rev}`, remove a whole
 /// package (`pnpm unpublish --force`), or remove one version's tarball when the
 /// segment is `{pkg}@{version}`.
 pub(super) async fn unpublish_package(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
-    Path(path): Path<NamePath>,
+    Path(path): Path<DeletePath>,
 ) -> Response {
     if let Some((pkg_name, version)) = split_package_identifier(&path.name) {
         return unpublish_version_tarball(
@@ -345,10 +336,10 @@ pub(super) async fn unpublish_package(
         )
         .await;
     }
-    delete_package(&state, &identity, registry.as_deref(), &path.name).await
+    delete_package(&state, &identity, registry.as_deref(), (&path.name, path.rev.as_deref())).await
 }
 
-/// `DELETE {base}/@{scope}/{pkg}` — remove a whole scoped package, or remove
+/// `DELETE {base}/@{scope}/{pkg}`: remove a whole scoped package, or remove
 /// one scoped version's tarball when the second segment is `{pkg}@{version}`.
 pub(super) async fn delete_scoped_package(
     State(state): State<AppState>,
@@ -356,10 +347,11 @@ pub(super) async fn delete_scoped_package(
     TargetRegistry(registry): TargetRegistry,
     Path(path): Path<TwoSegments>,
 ) -> Response {
-    unpublish_scoped(&state, &identity, registry.as_deref(), &path.first, &path.second).await
+    unpublish_scoped(&state, &identity, registry.as_deref(), &path.first, (&path.second, None))
+        .await
 }
 
-/// `DELETE {base}/@{scope}/{pkg}/-rev/{rev}` — remove a whole scoped package,
+/// `DELETE {base}/@{scope}/{pkg}/-rev/{rev}`: remove a whole scoped package,
 /// or remove one scoped version's tarball when the second segment is
 /// `{pkg}@{version}` (`DELETE {dist.tarball}/-rev/{rev}`).
 pub(super) async fn unpublish_scoped_package(
@@ -368,7 +360,14 @@ pub(super) async fn unpublish_scoped_package(
     TargetRegistry(registry): TargetRegistry,
     Path(path): Path<ScopedRevPath>,
 ) -> Response {
-    unpublish_scoped(&state, &identity, registry.as_deref(), &path.scope, &path.name).await
+    unpublish_scoped(
+        &state,
+        &identity,
+        registry.as_deref(),
+        &path.scope,
+        (&path.name, Some(&path.rev)),
+    )
+    .await
 }
 
 async fn unpublish_scoped(
@@ -376,7 +375,7 @@ async fn unpublish_scoped(
     identity: &Identity,
     registry: Option<&str>,
     scope: &str,
-    name: &str,
+    (name, revision): (&str, Option<&str>),
 ) -> Response {
     if !scope.starts_with('@') || scope.contains('/') {
         return not_found();
@@ -386,7 +385,7 @@ async fn unpublish_scoped(
         return unpublish_version_tarball(state, identity, registry, &full, version).await;
     }
     let full = format!("{scope}/{name}");
-    delete_package(state, identity, registry, &full).await
+    delete_package(state, identity, registry, (&full, revision)).await
 }
 
 async fn unpublish_version_tarball(
@@ -396,7 +395,9 @@ async fn unpublish_version_tarball(
     raw_name: &str,
     version: &str,
 ) -> Response {
-    if super::super::revision_tarballs::parse_revision_version(version).is_some() {
+    if super::super::publishing::is_valid_semver(version)
+        && super::super::revision_tarballs::parse_revision_version(version).is_some()
+    {
         return not_found();
     }
     let canonical = match CanonicalPackageName::parse(raw_name, Ecosystem::Npm) {
@@ -407,7 +408,7 @@ async fn unpublish_version_tarball(
     delete_tarball(state, identity, registry, raw_name, &filename).await
 }
 
-/// `DELETE {base}/{pkg}/-/{filename}/-rev/{rev}` — remove one version's
+/// `DELETE {base}/{pkg}/-/{filename}/-rev/{rev}`: remove one version's
 /// tarball, a step of `pnpm unpublish <pkg>@<version>`.
 pub(super) async fn unpublish_tarball(
     State(state): State<AppState>,
@@ -418,7 +419,7 @@ pub(super) async fn unpublish_tarball(
     delete_tarball(&state, &identity, registry.as_deref(), &path.name, &path.filename).await
 }
 
-/// `DELETE {base}/@{scope}/{pkg}/-/{filename}/-rev/{rev}` — remove one scoped
+/// `DELETE {base}/@{scope}/{pkg}/-/{filename}/-rev/{rev}`: remove one scoped
 /// version's tarball. The unpublish flow reconstructs this URL from the
 /// packument's `dist.tarball`, which spells a scoped name with a literal
 /// slash.

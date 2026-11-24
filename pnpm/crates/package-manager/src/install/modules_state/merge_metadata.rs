@@ -1,4 +1,9 @@
-use super::super::{HashSet, Lockfile, Modules, VersionPart};
+use super::super::{
+    HashSet,
+    Lockfile,
+    Modules,
+    VersionPart,
+};
 
 /// The `pendingBuilds` list for this install: the builds still owed,
 /// carried-over entries first, then the ones this install deferred.
@@ -17,21 +22,23 @@ where
     Deferred: IntoIterator<Item = String>,
 {
     // An importer id and a dep path are both plain strings on disk, so
-    // the current lockfile's `importers` — not the shape of the string —
+    // the current lockfile's `importers` (not the shape of the string)
     // decides which one an entry is.
     //
     // Only dependencies are settled here: the build phase has already
     // run by the time this file is written, while a project's scripts
     // run after it. `drain_settled_projects` discharges those once they
     // have actually succeeded. A dependency is settled only when the
-    // rebuild both selected it and was allowed to build it — a selected
+    // rebuild both selected it and was allowed to build it, a selected
     // package the policy still blocks stays owed, matching pnpm's "drop
     // only what was actually rebuilt".
     let settled = |entry: &str| {
         let (Some(rebuild), Some(policy)) = (rebuild, rebuild_build_policy) else { return false };
         !current.is_some_and(|current| current.importers.contains_key(entry))
             && rebuild.settles_dependency(entry)
-            && policy.check(pnpm_deps_path::remove_suffix(entry)) == Some(true)
+            && policy
+                .check(pnpm_deps_path::remove_suffix(entry))
+                .unwrap_or(false)
     };
     let retained = previous
         .iter()
@@ -87,12 +94,7 @@ pub(super) fn merge_hoisted_locations(
             continue;
         }
         let retained_locations = next.hoisted_locations.get_or_insert_default();
-        let retained = retained_locations.entry(dep_path.clone()).or_default();
-        for location in locations {
-            if !retained.contains(location) {
-                retained.push(location.clone());
-            }
-        }
+        retained_locations.entry(dep_path.clone()).or_insert_with(|| locations.clone());
     }
 }
 pub(super) fn merge_retained_pending_builds(
@@ -124,7 +126,7 @@ pub(super) fn merge_ignored_builds(
     let new_ignored_builds = next.ignored_builds.take();
     if let Some(previous_ignored) = previous.ignored_builds.as_ref() {
         for dep_path in previous_ignored {
-            if retained_only_dep_path(current, selected, dep_path.as_str()) {
+            if retained_only_ignored_build(current, selected, dep_path.as_str()) {
                 let retained_ignored = next.ignored_builds.get_or_insert_default();
                 retained_ignored.insert(dep_path.clone());
             }
@@ -155,7 +157,7 @@ pub(super) fn merge_skipped(
     }
 }
 /// A source the selected install re-materialized has its targets recomputed
-/// in `next`, so the previous file's targets for it are stale — a bumped
+/// in `next`, so the previous file's targets for it are stale, a bumped
 /// injected dep moves to a new virtual-store slot and the old one is gone.
 /// Only sources no selected importer touched carry their previous targets
 /// forward.
@@ -183,6 +185,14 @@ pub(in super::super) fn retained_only_dep_path(
 ) -> bool {
     current_contains_dep_path(current, dep_path) && !current_contains_dep_path(selected, dep_path)
 }
+pub(super) fn retained_only_ignored_build(
+    current: &Lockfile,
+    selected: &Lockfile,
+    dep_path: &str,
+) -> bool {
+    current_contains_ignored_build(current, dep_path)
+        && !current_contains_ignored_build(selected, dep_path)
+}
 pub(in super::super) fn injected_source_paths(lockfile: &Lockfile) -> HashSet<String> {
     lockfile.snapshots
         .iter()
@@ -205,10 +215,26 @@ pub(in super::super) fn current_contains_dep_path(current: &Lockfile, dep_path: 
         return true;
     }
     let Ok(key) = dep_path.parse::<pnpm_lockfile::PackageKey>() else { return false };
-    current.snapshots
-        .as_ref()
-        .is_some_and(|snapshots| snapshots.contains_key(&key))
-        || current.packages
+    if let Some(snapshots) = current.snapshots.as_ref() {
+        snapshots.contains_key(&key)
+    } else {
+        current.packages
             .as_ref()
-            .is_some_and(|packages| packages.contains_key(&key.without_peer()))
+            .is_some_and(|packages| packages.contains_key(&key))
+    }
+}
+pub(in super::super) fn current_contains_ignored_build(current: &Lockfile, dep_path: &str) -> bool {
+    let Ok(key) = dep_path.parse::<pnpm_lockfile::PackageKey>() else { return false };
+    let peerless = key.without_peer();
+    current.packages
+        .as_ref()
+        .is_some_and(|packages| packages.contains_key(&peerless))
+        || current.snapshots
+            .as_ref()
+            .is_some_and(|snapshots| {
+                snapshots.contains_key(&key)
+                    || snapshots
+                        .keys()
+                        .any(|snapshot_key| snapshot_key.without_peer() == peerless)
+            })
 }

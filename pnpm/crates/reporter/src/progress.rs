@@ -1,4 +1,8 @@
-use super::{LogLevel, Serialize};
+use super::{
+    LogLevel,
+    Serialize,
+};
+use std::collections::BTreeMap;
 
 /// `pnpm:context` payload.
 ///
@@ -57,13 +61,25 @@ pub enum Stage {
 ///
 /// [bunyan]: https://github.com/trentm/node-bunyan
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SummaryLog {
     pub level: LogLevel,
     pub prefix: String,
+    /// The root directories of the projects this install found no
+    /// previous install of. Set only when the install covers a workspace
+    /// of several projects, with `prefix` as its root, and skipped from the
+    /// wire otherwise, so `None` means a single-project install.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_projects: Option<Vec<String>>,
+    /// The package name of each project of the workspace, keyed by root
+    /// directory. Set under the same condition as `new_projects`. A
+    /// project without a name has no entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_names: Option<BTreeMap<String, String>>,
 }
 
 /// `pnpm:package-import-method` payload. The method names match pnpm's
-/// wire shape exactly — anything else would silently fail to render
+/// wire shape exactly; anything else would silently fail to render
 /// even though the JSON parses.
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageImportMethodLog {
@@ -75,8 +91,8 @@ pub struct PackageImportMethodLog {
 /// config enum (`pnpm_config::PackageImportMethod`) carries `Auto`
 /// and `CloneOrCopy` on top of those, but those are dispatched-on by
 /// the auto-importer's fallback chain, not emitted. The wire value is
-/// the resolved method `link_file` actually used — `Clone` /
-/// `Hardlink` / `Copy` — so an `auto` install that falls back to
+/// the resolved method `link_file` actually used (`Clone` /
+/// `Hardlink` / `Copy`) so an `auto` install that falls back to
 /// hardlink emits `hardlink`, not the optimistic `clone`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -97,10 +113,15 @@ pub struct ProgressLog {
     pub message: ProgressMessage,
 }
 
+/// The `requester` of every `pnpm:progress` event of a Python install. It
+/// is not an install root: no [`StageLog`] or `pnpm:stats` event carries it.
+pub const PYTHON_ENVIRONMENT_REQUESTER: &str = "Python environment";
+
 /// `pnpm:progress` discriminated payload.
 ///
-/// `requester` is the install root — same value as the
-/// [`StageLog::prefix`] threaded through `Install::run`.
+/// `requester` is the install root, same value as the
+/// [`StageLog::prefix`] threaded through `Install::run`, or
+/// [`PYTHON_ENVIRONMENT_REQUESTER`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProgressMessage {

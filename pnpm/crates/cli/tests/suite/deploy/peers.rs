@@ -1,6 +1,14 @@
 use super::{
-    AddMockedRegistry, CommandExtra, CommandTempCwd, Lockfile, PkgName, fs, pacquet_cmd,
-    write_ambiguous_peer_workspace, write_peer_workspace, write_project,
+    AddMockedRegistry,
+    CommandExtra,
+    CommandTempCwd,
+    Lockfile,
+    PkgName,
+    fs,
+    pacquet_cmd,
+    write_ambiguous_peer_workspace,
+    write_peer_workspace,
+    write_project,
 };
 use assert_cmd::assert::OutputAssertExt;
 
@@ -9,6 +17,21 @@ use assert_cmd::assert::OutputAssertExt;
 /// resolution of that peer, so the synthesized snapshot can bind it.
 #[test]
 fn shared_lockfile_deploy_binds_a_singleton_peer_of_a_linked_workspace_package() {
+    check_linked_workspace_peer(PeerDeclaration::Explicit);
+}
+
+#[test]
+fn shared_lockfile_deploy_binds_a_metadata_only_optional_peer() {
+    check_linked_workspace_peer(PeerDeclaration::MetadataOnly);
+}
+
+#[derive(Clone, Copy)]
+enum PeerDeclaration {
+    Explicit,
+    MetadataOnly,
+}
+
+fn check_linked_workspace_peer(declaration: PeerDeclaration) {
     let CommandTempCwd {
         pacquet,
         root,
@@ -18,6 +41,19 @@ fn shared_lockfile_deploy_binds_a_singleton_peer_of_a_linked_workspace_package()
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
     write_peer_workspace(&workspace);
+    if matches!(declaration, PeerDeclaration::MetadataOnly) {
+        let manifest_path = workspace.join("packages/lib/package.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("peerDependencies");
+        manifest["peerDependenciesMeta"] = serde_json::json!({
+            "@pnpm.e2e/peer-a": { "optional": true },
+        });
+        write_project(&workspace, "lib", &manifest);
+    }
 
     pacquet
         .with_arg("install")
@@ -45,9 +81,58 @@ fn shared_lockfile_deploy_binds_a_singleton_peer_of_a_linked_workspace_package()
     drop((root, mock_instance));
 }
 
+#[test]
+fn shared_lockfile_deploy_binds_the_peer_of_a_workspace_package_linked_from_its_publish_directory()
+{
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_peer_workspace(&workspace);
+    let lib_manifest = serde_json::json!({
+        "name": "lib",
+        "version": "1.0.0",
+        "peerDependencies": { "@pnpm.e2e/peer-a": "*" },
+    });
+    let mut lib_root_manifest = lib_manifest.clone();
+    lib_root_manifest["devDependencies"] = serde_json::json!({ "@pnpm.e2e/peer-a": "1.0.1" });
+    lib_root_manifest["publishConfig"] = serde_json::json!({ "directory": "dist" });
+    write_project(&workspace, "lib", &lib_root_manifest);
+    fs::create_dir_all(workspace.join("packages/lib/dist")).unwrap();
+    fs::write(workspace.join("packages/lib/dist/package.json"), lib_manifest.to_string()).unwrap();
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--prod"])
+        .with_arg(&deploy_dir)
+        .assert()
+        .success();
+
+    let lib_real = fs::canonicalize(deploy_dir.join("node_modules/lib")).unwrap();
+    let peer = lib_real
+        .parent()
+        .unwrap()
+        .join("@pnpm.e2e/peer-a");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(fs::canonicalize(&peer).unwrap().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], "1.0.0");
+
+    drop((root, mock_instance));
+}
+
 /// Deploy does not adjudicate peer ranges. Injecting the package binds the
-/// consumer's version even when it falls outside the declared range — pnpm
-/// treats that as a resolution-time warning — so the non-injected path binds
+/// consumer's version even when it falls outside the declared range (pnpm
+/// treats that as a resolution-time warning) so the non-injected path binds
 /// it too rather than inventing a stricter rule for linked packages.
 #[test]
 fn shared_lockfile_deploy_binds_a_singleton_peer_outside_the_declared_range() {

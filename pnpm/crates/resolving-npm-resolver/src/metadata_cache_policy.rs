@@ -5,18 +5,24 @@
 //!   sends.
 //! - [`MirrorWrite`]: how a `2xx` response is recorded in the mirror. It is
 //!   the only writer of a fetched document's [`MetaHeaders`].
-//! - [`mirror_may_answer`]: whether a pick may be answered from the mirror
-//!   without the registry.
+//! - [`mirror_may_answer`]: whether a pick that depends on the mirror being
+//!   current may be answered from it without the registry.
 
 use std::path::Path;
 
 use pnpm_registry::Package;
 use pnpm_resolving_resolver_base::NetworkPolicy;
-use reqwest::header::{self, HeaderMap};
+use reqwest::header::{
+    self,
+    HeaderMap,
+};
 
 use crate::{
     fetch_full_metadata::{
-        ACCEPT_ABBREVIATED_DOC, ACCEPT_FULL_DOC, ACCEPT_PNPR_DOC, is_abbreviated_content_type,
+        ACCEPT_ABBREVIATED_DOC,
+        ACCEPT_FULL_DOC,
+        ACCEPT_PNPR_DOC,
+        is_abbreviated_content_type,
         metadata_response_is_uncacheable,
     },
     mirror::MetaHeaders,
@@ -131,7 +137,8 @@ impl MirrorWrite {
             kind,
             etag: headers
                 .get(header::ETAG)
-                .and_then(|value| value.to_str().ok())
+                .map(reqwest::header::HeaderValue::to_str)
+                .and_then(Result::ok)
                 .map(str::to_string),
             uncacheable: metadata_response_is_uncacheable(headers),
             normalize_to_abbreviated: normalizes_to_abbreviated(kind, headers),
@@ -174,9 +181,10 @@ pub(crate) fn normalizes_to_abbreviated(kind: DocumentKind, headers: &HeaderMap)
     kind == DocumentKind::Abbreviated && !is_abbreviated_content_type(headers)
 }
 
-/// Whether a pick may be answered from the mirror without asking the
-/// registry. An online pick asks the registry when it forbade caching the
-/// mirror's document. Offline and prefer-offline still read the mirror.
+/// Whether a pick that depends on the mirror being current may be answered
+/// from it without asking the registry. An online pick asks the registry when
+/// it forbade caching the mirror's document. Offline and prefer-offline still
+/// read the mirror.
 pub(crate) fn mirror_may_answer(network: NetworkPolicy, stored: Option<&MetaHeaders>) -> bool {
     network.reads_cache_first() || !stored.is_some_and(|headers| headers.uncacheable)
 }

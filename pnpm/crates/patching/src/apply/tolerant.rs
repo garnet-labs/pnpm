@@ -1,8 +1,9 @@
 //! Hunk application with pnpm's tolerances.
 //!
-//! pnpm applies patches through `@pnpm/patch-package`, whose matcher is
-//! deliberately loose in two ways [`diffy::apply`] is not, and real
-//! patch files in the wild depend on both:
+//! pnpm 11's applier (`@pnpm/patching.apply-patch`, derived from
+//! patch-package) has a matcher that is deliberately loose in two ways
+//! [`diffy::apply`] is not, and real patch files in the wild depend on
+//! both:
 //!
 //! 1. Lines are compared with trailing whitespace stripped, so an LF
 //!    patch applies to a CRLF file (and a hunk whose last line is
@@ -14,13 +15,16 @@
 //! [`strip_cr_from_extended_headers`] and
 //! [`drop_context_no_newline_markers`].
 //!
-//! The file is modeled as `split('\n')` throughout — the same
-//! representation `patch-package` uses — so a line's own ending is
+//! The file is modeled as `split('\n')` throughout (the same
+//! representation pnpm 11's applier uses) so a line's own ending is
 //! whatever the surrounding text carried: untouched CRLF lines keep
 //! their `\r`, replacement lines take the patch's LF, and a file
 //! without a final newline keeps that shape through the round trip.
 
-use diffy::{Line, Patch};
+use diffy::{
+    Line,
+    Patch,
+};
 
 /// How far either side of its recorded position a hunk is retried
 /// before the patch is rejected.
@@ -35,7 +39,7 @@ const NO_NEWLINE_MARKER: &str = r"\ No newline at end of file";
 // that only lost its final newline as unchanged, so git prints it as context
 // carrying the marker, followed by the deletions after it. `diffy` rejects
 // anything but the end of the hunk after a marked context line. Both
-// `patch-package` and `apply` ignore that marker, so dropping it loses
+// pnpm 11's applier and `apply` ignore that marker, so dropping it loses
 // nothing.
 pub(super) fn drop_context_no_newline_markers(text: String) -> String {
     if !text.contains(NO_NEWLINE_MARKER) {
@@ -53,6 +57,127 @@ pub(super) fn drop_context_no_newline_markers(text: String) -> String {
         kept.push_str(line);
     }
     kept
+}
+
+/// Give a space prefix to each hunk line that is only a CRLF line break.
+///
+/// Editors strip the space from a blank context line. [`diffy`] reads the
+/// resulting `\n` line as context, but rejects the `\r\n` one a CRLF patch
+/// file has. pnpm 11's parser reads both as context.
+pub(super) fn mark_blank_crlf_context_lines(text: String) -> String {
+    if !text.contains("\n\r\n") {
+        return text;
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut in_hunk = false;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("@@") {
+            in_hunk = true;
+        } else if line.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if in_hunk && line == "\r\n" {
+            kept.push(' ');
+        }
+        kept.push_str(line);
+    }
+    kept
+}
+
+/// Split a unified diff without `diff --git` lines into its file records,
+/// each starting at a `---` line that a `+++` line follows outside a hunk.
+/// The first record keeps any preamble.
+///
+/// [`diffy`] parses such records one after another, but rejects a `---`
+/// header that follows a deletion marked `\ No newline at end of file`,
+/// taking it for one more deleted line. pnpm 11's parser starts a new record
+/// at each `--- a/` line.
+pub(super) fn unidiff_records(text: &str) -> Vec<&str> {
+    let mut header_starts = Vec::new();
+    let mut pending_header: Option<usize> = None;
+    let mut hunk = HunkLinesLeft::default();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let header = pending_header.take();
+        if hunk.consume(line) {
+            continue;
+        }
+        match header {
+            Some(start) if line.starts_with("+++ ") => header_starts.push(start),
+            _ => pending_header = line.starts_with("--- ").then_some(line_start),
+        }
+        if line.starts_with("@@ ") {
+            hunk = HunkLinesLeft::of_header(line);
+        }
+    }
+    split_before(
+        text,
+        header_starts
+            .get(1..)
+            .unwrap_or_default(),
+    )
+}
+
+fn split_before<'a>(text: &'a str, starts: &[usize]) -> Vec<&'a str> {
+    let mut records = Vec::with_capacity(starts.len() + 1);
+    let mut from = 0;
+    for &start in starts {
+        records.push(&text[from..start]);
+        from = start;
+    }
+    records.push(&text[from..]);
+    records
+}
+
+/// The pre-image and post-image lines a hunk header announces that its body
+/// has not yet supplied.
+#[derive(Default)]
+struct HunkLinesLeft {
+    old: usize,
+    new: usize,
+}
+
+/// The length of a `start,len` range, which is one when it is left out.
+fn range_len(range: &str) -> &str {
+    range.split_once(',').map_or("1", |(_, len)| len)
+}
+
+impl HunkLinesLeft {
+    /// Read the counts of an `@@ -l,s +l,s @@` header. A count left out is
+    /// one; a header that does not parse announces no lines.
+    fn of_header(line: &str) -> Self {
+        let mut ranges = line.split_whitespace().skip(1);
+        let mut count = |sign: char| {
+            ranges
+                .next()
+                .and_then(|range| range.strip_prefix(sign))
+                .map(range_len)
+                .map(str::parse)
+                .and_then(Result::ok)
+                .unwrap_or(0)
+        };
+        let old = count('-');
+        let new = count('+');
+        HunkLinesLeft { old, new }
+    }
+
+    /// Count `line` against the hunk, returning whether it belongs to it.
+    fn consume(&mut self, line: &str) -> bool {
+        if self.old == 0 && self.new == 0 {
+            return false;
+        }
+        match line.as_bytes().first() {
+            Some(b'-') => self.old = self.old.saturating_sub(1),
+            Some(b'+') => self.new = self.new.saturating_sub(1),
+            Some(b'\\') => {}
+            _ => {
+                self.old = self.old.saturating_sub(1);
+                self.new = self.new.saturating_sub(1);
+            }
+        }
+        true
+    }
 }
 
 /// The git extended headers whose value [`diffy`] matches exactly: the
@@ -78,7 +203,7 @@ const VALUE_EXTENDED_HEADERS: [&str; 9] = [
 /// patch saved with CRLF line endings each of those values keeps its `\r`
 /// and then fails the match it feeds: `invalid file mode: 100644`, an
 /// unparsable rename path, or an invalid `diff --git` fallback. Hunk
-/// lines are left alone — a `\r` there is content both `patch-package` and
+/// lines are left alone, a `\r` there is content both pnpm 11's applier and
 /// [`diffy`] preserve, and an LF patch for a CRLF file relies on it.
 pub(super) fn strip_cr_from_extended_headers(text: String) -> String {
     if !text.contains('\r') {
@@ -112,7 +237,7 @@ pub(super) fn strip_cr_from_extended_headers(text: String) -> String {
 ///
 /// Hunks are located against the unpatched file and only then spliced
 /// in, so one hunk's edits can't shift another out from under its own
-/// match — the recorded line numbers all address the same baseline.
+/// match, the recorded line numbers all address the same baseline.
 ///
 /// The error carries `diffy`'s wording so the diagnostic a failed patch
 /// produces stays the same whichever matcher rejected it.
@@ -129,7 +254,7 @@ pub(super) fn apply(original: &str, patch: &Patch<'_, str>) -> Result<String, St
                 // against the unpatched file, so a patch whose hunks
                 // overlap can shift one past the end. JavaScript's
                 // `splice` clamps too, and a patch file is untrusted
-                // input — an out-of-range index must not panic.
+                // input, an out-of-range index must not panic.
                 let at = to_usize(to_isize(index) + offset).min(lines.len());
                 offset += to_isize(insert.len()) - to_isize(delete);
                 lines.splice(at..(at + delete).min(lines.len()), insert);
@@ -171,7 +296,7 @@ fn fuzzing_offsets() -> impl Iterator<Item = isize> {
 
 /// A run of consecutive same-kind lines within a hunk, holding each
 /// line without its ending. `ends_file` marks the run whose last line
-/// carried the `\ No newline at end of file` annotation — the pre-image
+/// carried the `\ No newline at end of file` annotation, the pre-image
 /// (for a deletion) or post-image (for an insertion) ends there without
 /// a final newline.
 struct Part<'a> {
@@ -235,18 +360,40 @@ fn evaluate_hunk<'a>(
     }
 
     let mut modifications = Vec::new();
+    let mut pre_image_end = PreImageEnd::Elsewhere;
     for part in parts {
         match part.kind {
             Kind::Context | Kind::Delete => {
                 index = match_pre_image(part, lines, index)?;
+                pre_image_end = PreImageEnd::of(part, lines, index);
                 if part.kind == Kind::Delete {
                     push_deletion(&mut modifications, part, index);
                 }
             }
-            Kind::Insert => push_insertion(&mut modifications, part, index),
+            Kind::Insert => push_insertion(&mut modifications, part, index, pre_image_end),
         }
     }
     Some(modifications)
+}
+
+/// Where the pre-image lines walked so far stop in the file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreImageEnd {
+    /// On the file's last line, which has no final newline, although the
+    /// hunk carries no `\ No newline at end of file` marker for it.
+    UnterminatedLastLine,
+    Elsewhere,
+}
+
+impl PreImageEnd {
+    fn of(part: &Part<'_>, lines: &[&str], index: usize) -> Self {
+        let unterminated = !part.ends_file
+            && index == lines.len()
+            && lines
+                .last()
+                .is_some_and(|line| !line.is_empty());
+        if unterminated { PreImageEnd::UnterminatedLastLine } else { PreImageEnd::Elsewhere }
+    }
 }
 
 /// Walk the pre-image lines of one part past `index`, returning where it
@@ -276,7 +423,19 @@ fn push_deletion<'a>(modifications: &mut Vec<Modification<'a>>, part: &Part<'a>,
     }
 }
 
-fn push_insertion<'a>(modifications: &mut Vec<Modification<'a>>, part: &Part<'a>, index: usize) {
+fn push_insertion<'a>(
+    modifications: &mut Vec<Modification<'a>>,
+    part: &Part<'a>,
+    index: usize,
+    pre_image_end: PreImageEnd,
+) {
+    // `git diff --ignore-cr-at-eol`, which `pnpm patch-commit` runs, writes
+    // lines appended to a file without a final newline as context followed
+    // by the insertion. The newline is restored so that the insertion's
+    // `Pop` removes it rather than the last inserted line.
+    if part.ends_file && pre_image_end == PreImageEnd::UnterminatedLastLine {
+        modifications.push(Modification::Push);
+    }
     modifications.push(Modification::Splice { index, delete: 0, insert: part.lines.clone() });
     if part.ends_file {
         modifications.push(Modification::Pop);

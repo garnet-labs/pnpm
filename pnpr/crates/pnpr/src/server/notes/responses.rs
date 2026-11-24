@@ -1,12 +1,25 @@
 //! The responses of the note routes.
 
 use axum::{
-    body::{Body, Bytes},
-    http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    body::{
+        Body,
+        Bytes,
+    },
+    http::{
+        HeaderValue,
+        StatusCode,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use pnpr_error::RegistryError;
-use pnpr_storage::metadata::{Note, note_digest};
+use pnpr_storage::database::{
+    Note,
+    note_digest,
+};
 
 /// How long a shared cache may keep a public note response.
 pub(in super::super) const PUBLIC_NOTE_MAX_AGE: u64 = 300;
@@ -40,7 +53,7 @@ pub(in crate::server) fn read_note_body(
 /// The publication note a version note response links to.
 #[derive(Clone)]
 pub(in crate::server) struct PublicationLink {
-    pub(in crate::server) org: String,
+    pub(in crate::server) namespace: String,
     pub(in crate::server) id: u64,
     pub(in crate::server) name: Option<String>,
     pub(in crate::server) initial_digest: Option<String>,
@@ -52,8 +65,8 @@ impl PublicationLink {
     /// The absolute path of the publication's note on this server, under the
     /// path prefix of `public_url`.
     pub(in crate::server) fn notes_path(&self, public_url: &str) -> String {
-        let org = if self.org.is_empty() { "-" } else { &self.org };
-        format!("{}/-/publications/{org}/{}/notes", path_prefix(public_url), self.id)
+        let namespace = if self.namespace.is_empty() { "-" } else { &self.namespace };
+        format!("{}/-/publications/{namespace}/{}/notes", path_prefix(public_url), self.id)
     }
 }
 
@@ -137,13 +150,8 @@ pub(in crate::server) fn with_cache_rules(mut response: Response, public: bool) 
 }
 
 fn http_date(iso: &str) -> Option<String> {
-    let parsed = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
-    Some(
-        parsed
-            .with_timezone(&chrono::Utc)
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string(),
-    )
+    let parsed = pnpm_time::parse_rfc3339(iso).ok()?;
+    Some(parsed.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string())
 }
 
 fn insert(headers: &mut axum::http::HeaderMap, name: &str, value: &str) {

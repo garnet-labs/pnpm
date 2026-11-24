@@ -18,11 +18,24 @@ mod loaded_prefetch;
 
 use super::CreateVirtualStore;
 use pnpm_lockfile::{
-    GitResolution, LockfileEntries, LockfileResolution, PackageKey, PackageMetadata, PkgName,
-    PkgVerPeer, RegistryResolution, SnapshotDepRef, SnapshotEntry, TarballResolution,
+    GitResolution,
+    LockfileEntries,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    PkgVerPeer,
+    RegistryResolution,
+    SnapshotDepRef,
+    SnapshotEntry,
+    TarballResolution,
 };
 use pnpm_reporter::SilentReporter;
-use std::{collections::HashMap, fs, sync::atomic::AtomicU8};
+use std::{
+    collections::HashMap,
+    fs,
+    sync::atomic::AtomicU8,
+};
 
 thread_local! {
     static PREFETCH_STARTS: std::cell::RefCell<Vec<Vec<String>>> =
@@ -46,6 +59,7 @@ fn name(text: &str) -> PkgName {
 
 fn metadata_with_integrity(integrity: &str) -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Registry(RegistryResolution {
             integrity: integrity.parse().expect("parse integrity"),
             revision: None,
@@ -115,9 +129,16 @@ impl SeededStoreInstall {
     /// dep-state cache key. `None` seeds a row without a side-effects
     /// cache.
     fn new(build_output: Option<&[u8]>) -> Self {
-        use pnpm_config::{Config, PackageImportMethod};
+        use pnpm_config::{
+            Config,
+            PackageImportMethod,
+        };
         use pnpm_store_dir::{
-            CafsFileInfo, PackageFilesIndex, SideEffectsDiff, StoreIndex, store_index_key,
+            CafsFileInfo,
+            PackageFilesIndex,
+            SideEffectsDiff,
+            StoreIndex,
+            store_index_key,
         };
 
         let root = tempfile::tempdir().expect("create temp dir");
@@ -208,7 +229,11 @@ impl SeededStoreInstall {
     }
 
     async fn run(&self) -> Result<super::CreateVirtualStoreOutput, super::CreateVirtualStoreError> {
-        use crate::{AllowBuildPolicy, SkippedSnapshots, VirtualStoreLayout};
+        use crate::{
+            AllowBuildPolicy,
+            SkippedSnapshots,
+            VirtualStoreLayout,
+        };
         use pnpm_config::NodeLinker;
         use pnpm_store_dir::StoreIndexWriter;
         use pnpm_tarball::SharedReportedProgressKeys;
@@ -297,6 +322,7 @@ fn key(name_text: &str, version: &str) -> PackageKey {
 
 fn git_metadata() -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Git(GitResolution {
             repo: "https://github.com/ksxnodemodules/ts-pipe-compose.git".to_string(),
             commit: "e63c09e460269b0c535e4c34debf69bb91d57b22".to_string(),
@@ -319,6 +345,7 @@ fn git_metadata() -> PackageMetadata {
 
 fn git_hosted_tarball_metadata() -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Tarball(TarballResolution {
             tarball: "https://codeload.github.com/foo/bar/tar.gz/f43f6a1cefff47fb361c88cf4b943fdbcaafe540"
                 .to_string(),
@@ -343,6 +370,7 @@ fn git_hosted_tarball_metadata() -> PackageMetadata {
 
 fn tarball_metadata_without_integrity() -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Tarball(TarballResolution {
             tarball: "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz".to_string(),
             integrity: None,
@@ -389,6 +417,7 @@ fn gvs_layout(
 
 fn directory_metadata(directory: &str) -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Directory(pnpm_lockfile::DirectoryResolution {
             directory: directory.to_string(),
         }),
@@ -417,7 +446,7 @@ fn slot_link<'a>(
             is_mutable: true,
             source_exists: true,
             force: false,
-            build_marker: None,
+            awaits_build: false,
             needs_build: false,
         },
         snapshot_key,

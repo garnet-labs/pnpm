@@ -1,16 +1,27 @@
 //! `pnpm import` of dependencies Yarn declares with its `patch:` protocol.
 
-use crate::{_utils::append_workspace_yaml_key, patch::MARKER_PATCH};
+use crate::{
+    _utils::append_workspace_yaml_key,
+    patch::MARKER_PATCH,
+};
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use serde_json::{Value, json};
-use std::{fs, path::Path, process::Command};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
-const IS_POSITIVE_PATCH: &str = include_str!(
-    "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0.patch"
-);
+const IS_POSITIVE_PATCH: &str = include_str!("../fixtures/patches/is-positive@1.0.0.patch");
 
 const ROOT_PATCH_PATH: &str = ".yarn/patches/is-positive-npm-1.0.0-0a1b2c3d4e.patch";
 
@@ -61,11 +72,11 @@ fn import_converts_yarn_patches_into_patched_dependencies() {
     let foo_manifest = json!({
         "name": "foo",
         "devDependencies": {
-            "@pnpm.e2e/foo": "patch:@pnpm.e2e/foo@npm%3A1.0.0#./foo.patch::locator=foo%40workspace%3Apackages%2Ffoo",
+            "@pnpm.e2e/foo": "patch:@pnpm.e2e/foo@npm%3A1.0.0#../../patches/foo.patch::locator=foo%40workspace%3Apackages%2Ffoo",
         },
     });
     write_file(&workspace, "packages/foo/package.json", &foo_manifest.to_string());
-    write_file(&workspace, "packages/foo/foo.patch", MARKER_PATCH);
+    write_file(&workspace, "patches/foo.patch", MARKER_PATCH);
     write_file(&workspace, "yarn.lock", YARN_LOCKFILE);
 
     pacquet
@@ -84,7 +95,7 @@ fn import_converts_yarn_patches_into_patched_dependencies() {
         "pnpm-workspace.yaml:\n{workspace_yaml}",
     );
     assert!(
-        workspace_yaml.contains("'@pnpm.e2e/foo@1.0.0': packages/foo/foo.patch"),
+        workspace_yaml.contains(r#""@pnpm.e2e/foo@1.0.0": patches/foo.patch"#),
         "pnpm-workspace.yaml:\n{workspace_yaml}",
     );
     let lockfile = read_text(&workspace.join("pnpm-lock.yaml"));

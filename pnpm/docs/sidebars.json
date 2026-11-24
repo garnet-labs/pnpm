@@ -43,6 +43,7 @@
           "type": "category",
           "label": "Patch dependencies",
           "items": [
+            "cli/edit",
             "cli/patch",
             "cli/patch-commit",
             "cli/patch-remove"
@@ -58,6 +59,7 @@
             "cli/outdated",
             "cli/why",
             "cli/licenses",
+            "cli/fund",
             "cli/peers",
             "cli/view",
             "cli/search",
@@ -165,6 +167,7 @@
             "cli/doctor",
             "cli/pm",
             "cli/pkg",
+            "cli/catalog",
             "cli/repo",
             "cli/set-script",
             "cli/config",
@@ -254,6 +257,7 @@
         "store-loader",
         "how-peers-are-resolved",
         "lockfile",
+        "lockfile-format",
         "uninstall",
         "pnpm-vs-npm"
       ]

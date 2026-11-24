@@ -2,12 +2,19 @@
 
 pub(crate) use install_policy::recorded_extend_node_path_matches;
 pub(crate) use recorded_values::{
-    catalogs_to_json, empty_json_object, filter_null_object_values,
-    link_workspace_packages_to_json, map_node_linker,
+    catalogs_to_json,
+    empty_json_object,
+    filter_null_object_values,
+    link_workspace_packages_to_json,
+    map_node_linker,
 };
 pub(crate) use registry_prefixes::{
-    ResolvedImporters, recorded_default_registry, recorded_registry_prefixes,
-    recorded_registry_routes, recorded_registry_routes_after_install, records_registry_keys_of,
+    ResolvedImporters,
+    recorded_default_registry,
+    recorded_registry_prefixes,
+    recorded_registry_routes,
+    recorded_registry_routes_after_install,
+    records_registry_keys_of,
     registry_key_settings_differ,
 };
 
@@ -19,17 +26,26 @@ mod registry_prefixes;
 mod store_location;
 use agent_skills::agent_skills_settings;
 use equivalence::{
-    allow_builds_match, enable_global_virtual_store_match, package_extensions_match,
+    allow_builds_match,
+    enable_global_virtual_store_match,
+    package_extensions_match,
     patched_dependencies_match,
+    reference_time_moved_back,
 };
 use install_policy::install_policy_settings;
 use recorded_values::map_trust_policy;
 
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{Config, NodeLinker};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+};
 use pnpm_modules_yaml::IncludedDependencies;
 use pnpm_package_is_installable::SupportedArchitectures;
-use pnpm_workspace_state::{WorkspaceState, WorkspaceStateSettings};
+use pnpm_workspace_state::{
+    WorkspaceState,
+    WorkspaceStateSettings,
+};
 use std::path::Path;
 
 /// Whether the `supportedArchitectures` recorded by the last install
@@ -38,7 +54,7 @@ use std::path::Path;
 /// other guards (`wanted == current`, `.modules.yaml` consistency) cannot
 /// see an architecture change: the skip set it would produce differs, so
 /// the shortcut must not fire. A missing or unreadable state (`None`)
-/// reports a match only when `live` is also unset — the conservative
+/// reports a match only when `live` is also unset, the conservative
 /// direction is a full install.
 pub(crate) fn recorded_supported_architectures_match(
     recorded: Option<&WorkspaceState>,
@@ -48,7 +64,8 @@ pub(crate) fn recorded_supported_architectures_match(
         recorded.and_then(|state| state.settings.supported_architectures.as_ref());
     recorded
         == live
-            .and_then(|value| serde_json::to_value(value).ok())
+            .map(serde_json::to_value)
+            .and_then(Result::ok)
             .as_ref()
 }
 
@@ -63,9 +80,9 @@ pub(crate) fn recorded_supported_architectures_match(
 /// key absent from the recorded state as `undefined`. So the reverse
 /// scenario (pacquet wrote the state, pnpm reads it next) stays on the
 /// fast path only for keys whose pnpm-resolved value is also
-/// `undefined`. Every key pnpm resolves to a concrete default —
-/// `excludeLinksFromLockfile` (`false`), `minimumReleaseAge` (`1440`),
-/// `minimumReleaseAgeIgnoreMissingTime` (`true`) — must therefore be
+/// `undefined`. Every key pnpm resolves to a concrete default
+/// (`excludeLinksFromLockfile` (`false`), `minimumReleaseAge` (`1440`),
+/// `minimumReleaseAgeIgnoreMissingTime` (`true`)) must therefore be
 /// written by [`current_settings`] and compared here, or pnpm would
 /// report drift and re-run a (no-op) install on every command after a
 /// pacquet install. `enableGlobalVirtualStore` is `undefined` by
@@ -158,6 +175,11 @@ impl SettingsComparison<'_> {
             "addMissingPeerTypes",
             recorded.add_missing_peer_types != live.add_missing_peer_types,
         );
+        return_drift_if!(
+            self,
+            "projectScopedOptionalPeers",
+            recorded.project_scoped_optional_peers != live.project_scoped_optional_peers,
+        );
         return_drift_if!(self, "autoDedupe", recorded.auto_dedupe != live.auto_dedupe);
         return_drift_if!(self, "dev", recorded.dev != live.dev);
         None
@@ -165,6 +187,7 @@ impl SettingsComparison<'_> {
     fn lockfile_drift(&self) -> Option<&'static str> {
         let recorded = self.recorded;
         let live = self.live;
+        return_drift_if!(self, "lockfile.format", recorded.lockfile_format != live.lockfile_format);
         return_drift_if!(
             self,
             "lockfile.includeResolutionSettings",
@@ -179,6 +202,12 @@ impl SettingsComparison<'_> {
         let registry_keys_drift = registry_key_settings_differ(recorded, live);
         return_drift_if!(self, "registryPrefixes", registry_keys_drift);
         return_drift_if!(self, "registryRoutes", recorded.registry_routes != live.registry_routes);
+        let reference_time_drift = reference_time_moved_back(
+            recorded.reference_time.as_deref(),
+            live.reference_time.as_deref(),
+            jiff::Timestamp::now(),
+        );
+        return_drift_if!(self, "referenceTime", reference_time_drift);
         None
     }
     fn linking_drift(&self) -> Option<&'static str> {
@@ -227,6 +256,32 @@ impl SettingsComparison<'_> {
         let live = self.live;
         return_drift_if!(
             self,
+            "blockExoticSubdeps",
+            recorded.block_exotic_subdeps != live.block_exotic_subdeps,
+        );
+        if let Some(drift) = self.minimum_release_age_drift() {
+            return Some(drift);
+        }
+        return_drift_if!(
+            self,
+            "nodeLinker",
+            recorded.node_linker != live.node_linker
+                || recorded.node_linker_excluded != live.node_linker_excluded
+        );
+        return_drift_if!(self, "optional", recorded.optional != live.optional);
+        return_drift_if!(self, "overrides", recorded.overrides != live.overrides);
+        let package_extensions_drift = !package_extensions_match(
+            recorded.package_extensions.as_ref(),
+            live.package_extensions.as_ref(),
+        );
+        return_drift_if!(self, "packageExtensions", package_extensions_drift);
+        None
+    }
+    fn minimum_release_age_drift(&self) -> Option<&'static str> {
+        let recorded = self.recorded;
+        let live = self.live;
+        return_drift_if!(
+            self,
             "minimumReleaseAge",
             recorded.minimum_release_age != live.minimum_release_age,
         );
@@ -246,19 +301,6 @@ impl SettingsComparison<'_> {
             "minimumReleaseAgeStrict",
             recorded.minimum_release_age_strict != live.minimum_release_age_strict,
         );
-        return_drift_if!(
-            self,
-            "nodeLinker",
-            recorded.node_linker != live.node_linker
-                || recorded.node_linker_excluded != live.node_linker_excluded
-        );
-        return_drift_if!(self, "optional", recorded.optional != live.optional);
-        return_drift_if!(self, "overrides", recorded.overrides != live.overrides);
-        let package_extensions_drift = !package_extensions_match(
-            recorded.package_extensions.as_ref(),
-            live.package_extensions.as_ref(),
-        );
-        return_drift_if!(self, "packageExtensions", package_extensions_drift);
         None
     }
     fn workspace_policy_drift(&self) -> Option<&'static str> {
@@ -303,9 +345,16 @@ impl SettingsComparison<'_> {
     }
 }
 
+fn recorded_package_extensions(config: &Config) -> Option<serde_json::Value> {
+    config.package_extensions
+        .as_ref()
+        .map(serde_json::to_value)
+        .and_then(Result::ok)
+}
+
 /// Build the [`WorkspaceStateSettings`] that today's install would
 /// write. Shared with `install::build_workspace_state` so the
-/// freshness check sees the same byte shape the writer produced —
+/// freshness check sees the same byte shape the writer produced,
 /// when one side grows a field, the other automatically does too.
 pub(crate) fn current_settings(
     config: &Config,
@@ -342,9 +391,7 @@ pub(crate) fn current_settings(
         }),
         optional: Some(included.optional_dependencies),
         overrides: recorded_overrides(config),
-        package_extensions: config.package_extensions
-            .as_ref()
-            .and_then(|map| serde_json::to_value(map).ok()),
+        package_extensions: recorded_package_extensions(config),
         patched_dependencies: config.patched_dependencies.clone(),
         peers_suffix_max_length: Some(
             u32::try_from(config.peers_suffix_max_length).unwrap_or(u32::MAX),
@@ -375,8 +422,12 @@ fn recorded_allow_builds(
 
 fn current_policy_settings(config: &Config) -> WorkspaceStateSettings {
     WorkspaceStateSettings {
+        block_exotic_subdeps: Some(config.block_exotic_subdeps),
+        lockfile_format: (config.lockfile_format == pnpm_lockfile::LockfileFormat::V13).then(
+            || "v13".to_string(),
+        ),
         lockfile_include_resolution_settings: config
-            .lockfile_include_resolution_settings
+            .lockfile_records_resolution_settings()
             .then_some(true),
         lockfile_integrity_target: (config.lockfile_integrity_target
             != pnpm_lockfile::IntegrityTarget::Resource)
@@ -386,17 +437,21 @@ fn current_policy_settings(config: &Config) -> WorkspaceStateSettings {
         minimum_release_age_ignore_missing_time: Some(
             config.minimum_release_age_ignore_missing_time,
         ),
-        // The resolved form pnpm records — see
+        // The resolved form pnpm records; see
         // `WorkspaceStateSettings::minimum_release_age_strict`.
         minimum_release_age_strict: config.minimum_release_age_strict.or_else(|| {
             config.resolved_minimum_release_age_strict().then_some(true)
         }),
+        reference_time: config.reference_time
+            .filter(|_| config.reference_time_applies())
+            .map(|time| time.to_string()),
+        project_scoped_optional_peers: config.project_scoped_optional_peers.then_some(true),
         registry_prefixes: recorded_registry_prefixes(config),
         default_registry: recorded_default_registry(config),
         registry_routes: Some(recorded_registry_routes(config)),
         side_effects_cache_exclude: config.side_effects_cache_exclude.clone(),
         // pnpm records the raw config value, which stays `undefined`
-        // until the user configures the setting — `explicit_settings` is
+        // until the user configures the setting, `explicit_settings` is
         // how pacquet tells its resolved default apart from a real
         // `trustPolicy: off`.
         trust_policy: config.explicit_settings
@@ -442,3 +497,6 @@ fn recorded_overrides(config: &Config) -> Option<std::collections::BTreeMap<Stri
                 .collect()
         })
 }
+
+#[cfg(test)]
+mod tests;

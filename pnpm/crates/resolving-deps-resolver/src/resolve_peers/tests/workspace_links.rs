@@ -1,7 +1,19 @@
 use super::{
-    BTreeMap, DepPath, DirectDep, HashMap, HashSet, ImporterPeerInput, NodeId, ResolvePeersOptions,
-    ResolvedTree, WorkspacePeerSettings, linked_package, package, resolve_peers,
-    resolve_peers_workspace, tree_node,
+    BTreeMap,
+    DepPath,
+    DirectDep,
+    HashMap,
+    HashSet,
+    ImporterPeerInput,
+    NodeId,
+    ResolvePeersOptions,
+    ResolvedTree,
+    WorkspacePeerSettings,
+    linked_package,
+    package,
+    resolve_peers,
+    resolve_peers_workspace,
+    tree_node,
 };
 
 /// Same as [`pruned_hoisted_provider_falls_back_to_root_resolution`] but
@@ -12,6 +24,8 @@ fn pruned_hoisted_provider_falls_back_in_workspace_pass() {
     let consumer = NodeId::next();
 
     let importer = ImporterPeerInput {
+        declared_direct_dependencies: HashSet::default(),
+        explicitly_requested_direct_dependencies: HashSet::default(),
         id: ".".to_string(),
         direct: vec![
             DirectDep {
@@ -23,6 +37,8 @@ fn pruned_hoisted_provider_falls_back_in_workspace_pass() {
         ],
         root_dir: std::path::PathBuf::from("/repo"),
         modules_dir: None,
+        rejected_optional_peers: HashSet::default(),
+        hoisted_peer_provider_node_ids: HashSet::default(),
     };
     let mut tree = ResolvedTree {
         direct: Vec::new(),

@@ -53,7 +53,7 @@ jobs:
         uses: $/.github/actions/rustup
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -61,7 +61,7 @@ jobs:
         run: pnpm runtime set node 22 --global
 
       - name: Install just and cargo-nextest
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: just,cargo-nextest
 
@@ -71,12 +71,6 @@ jobs:
           unset PNPM_HOME
           unset XDG_DATA_HOME
           just install
-
-      - name: Bundle pnpm v11
-        shell: bash
-        run: |
-          pnpm --filter pnpm exec tsgo --build
-          pnpm --filter pnpm run bundle
 
       - name: Switch matrix across released outer pnpm versions (11.latest, 12.0.0, 12.latest) and pins (10, 11, 12, HEAD)
         # zizmor: ignore[adhoc-packages] -- This matrix intentionally installs
@@ -90,7 +84,7 @@ jobs:
             outer_dir="$RUNNER_TEMP/outer-${outer_spec//[^a-zA-Z0-9]/_}"
             mkdir -p "$outer_dir"
             printf '{"name":"outer-runner","private":true}\n' > "$outer_dir/package.json"
-            pnpm --dir "$outer_dir" add "$outer_spec"
+            pnpm --dir "$outer_dir" add --allow-build=pnpm "$outer_spec"
             outer_bin="$outer_dir/node_modules/.bin/pnpm"
             if [ "${RUNNER_OS:-}" = "Windows" ] && [ -f "${outer_bin}.cmd" ]; then
               outer_bins+=("${outer_bin}.cmd")
@@ -119,6 +113,6 @@ jobs:
           unset IFS
           unset PNPM_HOME
           unset XDG_DATA_HOME
-          PNPM_V11_BUNDLE="$PWD/pnpm11/pnpm/dist/pnpm.mjs" \
+          PNPM_V11_BUNDLE="$PWD/pnpm/test-oracles/node_modules/pnpm-v11/dist/pnpm.mjs" \
           PNPM_TEST_OUTER_CLIS="$outer_clis" \
             cargo nextest run --locked --run-ignored all -p pnpm-cli --test suite -E 'test(/^version::/)'

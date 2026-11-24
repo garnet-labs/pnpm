@@ -1,6 +1,14 @@
 use super::{
-    Config, EnvVar, GetCurrentDir, GetHomeDir, LinkProbe, Path, WorkspaceSettings,
-    explicit_or_default, explicit_pattern, to_camel_case,
+    Config,
+    EnvVar,
+    GetCurrentDir,
+    GetHomeDir,
+    LinkProbe,
+    Path,
+    WorkspaceSettings,
+    explicit_or_default,
+    explicit_pattern,
+    to_camel_case,
 };
 
 type Reset = fn(&mut Config, &Config);
@@ -37,12 +45,44 @@ fn reset_node_package_map(config: &mut Config, defaults: &Config, key: &str) -> 
     true
 }
 
+fn reset_node_linker(config: &mut Config, defaults: &Config, key: &str) -> bool {
+    if key != "nodeLinker" {
+        return false;
+    }
+    config.node_linker = defaults.node_linker;
+    config.node_linker_excluded.clone_from(&defaults.node_linker_excluded);
+    config.hoisting_limits = config.explicit_settings
+        .get("hoistingLimits")
+        .cloned()
+        .map(serde_json::from_value)
+        .and_then(Result::ok)
+        .unwrap_or(defaults.hoisting_limits);
+    config.hoist = config.explicit_settings
+        .get("hoist")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(defaults.hoist);
+    // The `virtualStoreOnly` snapshot may hold the linker's patterns.
+    config.hoist_patterns_before_virtual_store_only = None;
+    config.hoist_pattern = config.hoist
+        .then(|| explicit_or_default(config, "hoistPattern", defaults.hoist_pattern.as_deref()))
+        .flatten();
+    reset_public_hoist_pattern(config, defaults);
+    config.apply_prefer_symlinked_executables_derivation();
+    true
+}
+
 /// The paths anchored on the lockfile directory, re-anchored the way
 /// pinning it does, so a `modulesDir` still set keeps its shape and a
 /// pinned lockfile directory keeps its paths.
 fn reanchor_lockfile_paths(config: &mut Config, base_dir: &Path) {
     let dir = config.lockfile_dir.clone().unwrap_or_else(|| base_dir.to_path_buf());
     config.anchor_lockfile_paths(&dir);
+}
+
+fn reset_lockfile_dir(config: &mut Config, base_dir: &Path) {
+    config.configured_lockfile_dir = None;
+    config.lockfile_dir = None;
+    reanchor_lockfile_paths(config, base_dir);
 }
 
 /// `lockfile` follows `packageLock` while nothing sets it, as it does when
@@ -56,6 +96,7 @@ fn derive_lockfile(config: &mut Config) {
 fn reset_lockfile(config: &mut Config, defaults: &Config) {
     config.lockfile_include_resolution_settings = defaults.lockfile_include_resolution_settings;
     config.lockfile_integrity_target = defaults.lockfile_integrity_target;
+    config.lockfile_format = defaults.lockfile_format;
     derive_lockfile(config);
 }
 
@@ -158,23 +199,25 @@ impl WorkspaceSettings {
             global_pnpmfile, pnpmfile, global_dir, global_bin_dir, cache_dir, symlinked_lockfile_target_dirs,
             prefer_frozen_lockfile, lockfile, merge_git_branch_lockfiles,
             optimistic_repeat_install, minimum_release_age, global_shims, frozen_lockfile,
-            provenance,
+            provenance, access,
             registry, scope, pnpr_server, cargo, python, tools, remote_side_effects_cache, remote_cache,
             reporter_hide_prefix, loglevel, reporter, max_sockets, patched_dependencies, patches_dir,
             config_dependencies, dangerously_allow_all_builds, strict_dep_builds,
             ignore_scripts, ignore_pnpmfile, git_checks, git_tag_version, publish_branch, engine_strict, force_ignores_platform,
             node_version,
-            runtime_on_fail, node_download_mirrors, script_shell,
+            runtime_on_fail, node_download_mirrors, script_shell, editor,
             node_options, unsafe_perm, supported_architectures, ignored_optional_dependencies,
             overrides, package_extensions, package_configs, minimum_release_age_exclude,
             minimum_release_age_ignore_missing_time, minimum_release_age_strict,
+            reference_time,
             trust_lockfile, trust_policy, trust_policy_exclude, trust_policy_exclude_prune,
             trust_policy_ignore_after, init_author_name, init_author_email, init_author_url,
             init_license, init_version, pm_on_fail, versioning, save_catalog_name, tag,
             save_prefix, tag_version_prefix, pipeline_base, child_concurrency, workspace_concurrency, catalogs,
-            allow_builds, concurrency_groups, boot_config,
+            allow_builds, concurrency_groups, boot_config, global_packages_config,
         });
         if reset_node_package_map(config, defaults, key)
+            || reset_node_linker(config, defaults, key)
             || Self::reset_derived_setting_to_default::<Sys>(config, defaults, key, base_dir)
         {
             return true;
@@ -200,10 +243,7 @@ impl WorkspaceSettings {
         match key {
             "macosBackup" => config.macos_backup.clone_from(&defaults.macos_backup),
             "storeDir" => config.reset_store_dir_to_default::<Sys>(base_dir),
-            "lockfileDir" => {
-                config.lockfile_dir = None;
-                reanchor_lockfile_paths(config, base_dir);
-            }
+            "lockfileDir" => reset_lockfile_dir(config, base_dir),
             "modulesDir" | "virtualStoreDir" => reanchor_lockfile_paths(config, base_dir),
             // Derived from the virtual store directory once that is settled.
             "globalVirtualStoreDir" => {}
@@ -222,11 +262,6 @@ impl WorkspaceSettings {
                 reset_public_hoist_pattern(config, defaults);
             }
             "publicHoistPattern" => reset_public_hoist_pattern(config, defaults),
-            "nodeLinker" => {
-                config.node_linker = defaults.node_linker;
-                config.node_linker_excluded.clone_from(&defaults.node_linker_excluded);
-                config.apply_prefer_symlinked_executables_derivation();
-            }
             "preferSymlinkedExecutables" => {
                 config.prefer_symlinked_executables = None;
                 config.apply_prefer_symlinked_executables_derivation();

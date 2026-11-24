@@ -10,7 +10,7 @@ affects them. It is not a log of the pull requests that landed. Every entry has 
 earn its line.
 
 The wording rules for a single entry live in the "Changeset style" section of
-`CLAUDE.md`. This skill is about the set: which entries exist at all, how they are
+`AGENTS.md`. This skill is about the set: which entries exist at all, how they are
 grouped, what order they appear in, and how the page reads end to end.
 
 ## Edit the composed section, not the intents
@@ -21,9 +21,9 @@ grouped, what order they appear in, and how the page reads end to end.
    them**, and composes them into `.changeset/changelogs/<package>@<version>.md`,
    one section per released package, grouped into Major, Minor, and Patch changes.
 3. That file is the release page. The Rust CLI's GitHub release body is literally
-   `tail -n +2 .changeset/changelogs/pacquet@<version>.md` plus the sponsors
+   `tail -n +2 .changeset/changelogs/pnpm@<version>.md` plus the sponsors
    fragment (`.github/workflows/release.yml`), and the same section is composed into
-   the published `CHANGELOG.md`. For a stable v11 or v12 release, it also becomes the pnpm.io release page
+   the published `CHANGELOG.md`. For a stable pnpm release, it also becomes the pnpm.io release page
    ([DOCUMENTATION.md](../../../DOCUMENTATION.md#release-pages)).
 
 So curate `.changeset/changelogs/<package>@<version>.md` directly, on the release PR
@@ -135,12 +135,8 @@ they hit the bug (Installing packages, Running scripts and tasks, Windows), not 
 the subsystem that changed. Leave a section of a dozen or fewer flat - the headings
 cost more than they save.
 
-Both consumers tolerate the extra level: `release.yml` writes the Rust release body
-with `tail -n +2`, and `getChangelogEntry` (`pnpm11/__utils__/get-release-text`)
-slices between headings of the *same* depth as `## <version>`, so a `####` heading
-neither ends the slice nor is dropped. It does scan every heading for
-`major|minor|patch`, so avoid a group literally named "Patching" - call it "Patched
-dependencies".
+`release.yml` tolerates the extra level: it writes the Rust release body with
+`tail -n +2`.
 
 In the Minor section of a feature release, lead with the three to five entries that
 change how people work, the way Playwright leads with a handful of highlights before
@@ -151,11 +147,11 @@ recognises, then the new capability, then the code.
 ## How one entry should read
 
 **Do not ship the raw composed list.** Yarn's release pages are the conventional-commit
-log with the PR appended - "fix(nm): prefer direct dependency binaries by @user in
-#1234". Every entry is accurate and the page tells a user nothing: it is indexed by
-the change's author, not by the reader's problem. pnpm's uncurated output has the same
-shape, one entry per pull request in filename order. That is the thing being fixed
-here.
+log with the author and PR appended: `fix(nm): prefer direct dependency binaries by
+@user in #1234`. Every entry is accurate and the page tells a user nothing: it is
+indexed by the change's author, not by the reader's problem. pnpm's uncurated output
+has the same shape, one entry per pull request in filename order. That is the thing
+being fixed here.
 
 **The first sentence is the title.** esbuild gives every entry a bold heading; uv
 makes each bullet short enough to be one. pnpm's format has no title slot, so the
@@ -166,9 +162,9 @@ issue where, under certain conditions, ..." does not.
 **Default to one sentence.** uv's bullets run 80 to 120 characters and hold exactly
 one idea; Gitea's run 60 to 90. SQLite states a whole behavior change in one clause
 and no adjectives: "Fix the count-of-view optimization so that it does not give an
-incorrect answer for a DISTINCT query." Add a second sentence when the reader needs the old behavior to recognise
-the bug, and a second paragraph only when they must act: a migration, an opt-out, an
-exception to what the first paragraph promised.
+incorrect answer for a DISTINCT query." Add a second sentence when the reader needs
+the old behavior to recognise the bug, and a second paragraph only when they must
+act: a migration, an opt-out, an exception to what the first paragraph promised.
 
 **Show the literal change when output changes.** esbuild pairs almost every entry
 with before and after. Where a change rewrites a manifest range, a lockfile field, or
@@ -189,7 +185,7 @@ style identical across every entry in a release.
 `pnpm change status` prints the planned version for every package before anything is
 written. Read the line for each released package and ask whether it matches the
 entries you are about to curate. Read the packages that carry no intent of their own
-too: `@pnpm/napi` rides pacquet's `versioning.fixed` group, and `release.yml` fails
+too: `@pnpm/napi` rides pnpm's `versioning.fixed` group, and `release.yml` fails
 the build if the two versions have drifted apart.
 
 The release engine applies plain semver: a `major` intent on a `0.x` package moves it

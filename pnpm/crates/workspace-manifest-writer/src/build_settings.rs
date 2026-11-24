@@ -1,8 +1,16 @@
 use pnpm_config::SkillsPermission;
 
 use super::{
-    Manifest, Path, UpdateWorkspaceManifestError, edit, has_control_char, read_owning_manifest,
-    unsupported_inline_key, write_or_remove_manifest,
+    Manifest,
+    ManifestTarget,
+    Path,
+    UpdateWorkspaceManifestError,
+    edit,
+    has_control_char,
+    read_manifest_at,
+    read_owning_manifest,
+    unsupported_inline_key,
+    write_or_remove_manifest,
 };
 
 /// The value of one `permissions` entry: the capability the decision is
@@ -23,8 +31,13 @@ pub enum PermissionValue {
 /// Upsert `name → bool` entries into `dir`'s `pnpm-workspace.yaml`
 /// `allowBuilds:` block (creating the file/block if absent), preserving the
 /// rest of the document's formatting, and write the file back only when
-/// something actually changed. Used by `pnpm approve-builds` to record
-/// which dependencies may (`true`) or may not (`false`) run build scripts.
+/// something actually changed. Records which dependencies may (`true`) or
+/// may not (`false`) run build scripts.
+///
+/// When the file has a `permissions` block, each decision lands there as
+/// [`set_permissions`] places a [`PermissionValue::Build`]: a
+/// `permissions.<name>.build` entry outranks `allowBuilds.<name>`, so an
+/// `allowBuilds` write would not take effect.
 ///
 /// `entries` is iterated in its own order; pass an ordered map for a
 /// deterministic result.
@@ -36,6 +49,50 @@ where
     Entries: IntoIterator<Item = (&'a str, bool)>,
 {
     update_allow_builds(dir, entries, false)
+}
+
+/// Record `name → bool` build decisions as
+/// `globalPackagesConfig.permissions.<name>.build` in the global
+/// `config.yaml` at `path`, creating the file, its directory, and the
+/// section if absent. Preserves the rest of the document's formatting, and
+/// writes the file back only when something changed.
+pub fn set_global_packages_build_permissions<'a, Entries>(
+    path: &Path,
+    entries: Entries,
+) -> Result<(), UpdateWorkspaceManifestError>
+where
+    Entries: IntoIterator<Item = (&'a str, bool)>,
+{
+    let target = ManifestTarget::root_manifest(path);
+    let mut manifest = read_manifest_at(path)?;
+    let entries: Vec<(&str, bool)> = entries.into_iter().collect();
+    let mut blocks =
+        vec![vec!["globalPackagesConfig"], vec!["globalPackagesConfig", "permissions"]];
+    blocks.extend(
+        entries
+            .iter()
+            .map(|(name, _)| vec!["globalPackagesConfig", "permissions", *name]),
+    );
+    let blocks: Vec<&[&str]> = blocks
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
+    validate_allow_build_entries(&manifest, path, &entries, &blocks)?;
+    let mut changed = false;
+    for (name, value) in entries {
+        changed |= edit::set_global_packages_build_permission(&mut manifest, name, value);
+    }
+    if !changed {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|source| UpdateWorkspaceManifestError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    write_or_remove_manifest(&target, manifest)
 }
 
 /// Top-level `pnpm-workspace.yaml` settings that `allowBuilds:` replaced in
@@ -73,26 +130,20 @@ where
     let path = target.path.clone();
 
     let entries: Vec<(&str, bool)> = entries.into_iter().collect();
-    if !entries.is_empty()
-        && let Some(key) = unsupported_inline_key(manifest.document.text(), &[&["allowBuilds"]])
-    {
-        return Err(UpdateWorkspaceManifestError::UnsupportedInlineBlock { path, key });
-    }
+    let blocks = permission_blocks(entries.iter().map(|(name, _)| *name));
+    let blocks: Vec<&[&str]> = blocks
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
+    validate_allow_build_entries(&manifest, &path, &entries, &blocks)?;
 
-    // The block-style splice writes `- name: true` on one line, so a control
-    // character in `name` (e.g. a newline from a crafted `--allow-build`)
-    // would corrupt the document — refuse instead.
-    if let Some((name, _)) = entries.iter().find(|(name, _)| has_control_char(name)) {
-        return Err(UpdateWorkspaceManifestError::InvalidControlCharacter {
-            path,
-            value: (*name).to_string(),
-        });
-    }
-
-    let mut changed = false;
-    for (name, value) in entries {
-        changed |= edit::add_allow_build(&mut manifest, name, value);
-    }
+    let mut changed = record_permissions(
+        &mut manifest,
+        entries
+            .into_iter()
+            .map(|(name, allowed)| (name, PermissionValue::Build(allowed)))
+            .collect(),
+    );
     if clear_legacy_settings {
         for key in LEGACY_BUILD_SETTINGS {
             changed |= edit::remove_top_level_field(&mut manifest, key);
@@ -105,6 +156,34 @@ where
     write_or_remove_manifest(&target, manifest)
 }
 
+/// Refuse an `allowBuilds` write the line-based splices cannot make safely:
+/// one into an inline block at `blocks`, or one whose name holds a control
+/// character. The block-style splice writes `name: true` on one line, so a
+/// control character in `name` (e.g. a newline from a crafted
+/// `--allow-build`) would corrupt the document.
+fn validate_allow_build_entries(
+    manifest: &Manifest,
+    path: &Path,
+    entries: &[(&str, bool)],
+    blocks: &[&[&str]],
+) -> Result<(), UpdateWorkspaceManifestError> {
+    if !entries.is_empty()
+        && let Some(key) = unsupported_inline_key(manifest.document.text(), blocks)
+    {
+        return Err(UpdateWorkspaceManifestError::UnsupportedInlineBlock {
+            path: path.to_path_buf(),
+            key,
+        });
+    }
+    if let Some((name, _)) = entries.iter().find(|(name, _)| has_control_char(name)) {
+        return Err(UpdateWorkspaceManifestError::InvalidControlCharacter {
+            path: path.to_path_buf(),
+            value: (*name).to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Record `permissions` decisions in `dir`'s `pnpm-workspace.yaml`,
 /// deleting the [`LEGACY_BUILD_SETTINGS`] in the same write.
 ///
@@ -112,7 +191,7 @@ where
 /// the file already has a `permissions` block, and the package's
 /// `allowBuilds` entry is then removed. Otherwise it lands in
 /// `allowBuilds`, which pnpm versions without `permissions` read too. A
-/// `PermissionValue::Skills` decision always lands in `permissions` — this
+/// `PermissionValue::Skills` decision always lands in `permissions`; this
 /// pnpm is the only reader of that capability.
 pub fn set_permissions<'a, Entries>(
     dir: &Path,
@@ -136,15 +215,28 @@ where
     write_or_remove_manifest(&target, manifest)
 }
 
+/// The blocks a build or permission decision for `names` may be spliced
+/// into: `allowBuilds`, `permissions`, and each named package's
+/// `permissions` entry.
+fn permission_blocks<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Vec<&'a str>> {
+    let mut blocks = vec![vec!["allowBuilds"], vec!["permissions"]];
+    blocks.extend(names.map(|name| vec!["permissions", name]));
+    blocks
+}
+
 /// Refuse a write the line-based splices cannot make safely.
 fn validate_permission_entries(
     manifest: &Manifest,
     path: &Path,
     entries: &[(&str, PermissionValue)],
 ) -> Result<(), UpdateWorkspaceManifestError> {
+    let blocks = permission_blocks(entries.iter().map(|(name, _)| *name));
+    let blocks: Vec<&[&str]> = blocks
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
     if !entries.is_empty()
-        && let Some(key) =
-            unsupported_inline_key(manifest.document.text(), &[&["allowBuilds"], &["permissions"]])
+        && let Some(key) = unsupported_inline_key(manifest.document.text(), &blocks)
     {
         return Err(UpdateWorkspaceManifestError::UnsupportedInlineBlock {
             path: path.to_path_buf(),
@@ -153,7 +245,7 @@ fn validate_permission_entries(
     }
     // The block- and flow-style splices write every value on one line, so a
     // control character in a package key or a chosen skill name would
-    // corrupt the document — refuse instead.
+    // corrupt the document, refuse instead.
     for (name, value) in entries {
         if has_control_char(name) {
             return Err(UpdateWorkspaceManifestError::InvalidControlCharacter {
@@ -203,7 +295,7 @@ fn record_permissions(manifest: &mut Manifest, entries: Vec<(&str, PermissionVal
 /// write the file back only when something actually changed.
 ///
 /// The directories are workspace-root-relative. An empty `dirs` removes the
-/// `skills.dirs` entry — and the `skills` block when it held nothing else —
+/// `skills.dirs` entry (and the `skills` block when it held nothing else)
 /// recording the detected directories instead: pnpm only writes a decision
 /// it has read, so a caller that learned nothing records nothing. A caller
 /// can still write an empty `skills.dirs` list by hand to turn the feature
@@ -218,7 +310,7 @@ pub fn set_skills_dirs(dir: &Path, dirs: &[String]) -> Result<(), UpdateWorkspac
     }
     // The upsert splices write every item on its own line but the entry
     // starts after `dirs: `, so a control character in a relative directory
-    // would corrupt the document — refuse instead.
+    // would corrupt the document, refuse instead.
     if let Some(dir_value) = dirs.iter().find(|dir_value| has_control_char(dir_value)) {
         return Err(UpdateWorkspaceManifestError::InvalidControlCharacter {
             path,
@@ -232,14 +324,14 @@ pub fn set_skills_dirs(dir: &Path, dirs: &[String]) -> Result<(), UpdateWorkspac
 }
 
 /// The value an install writes for a package whose build it ignored. Not a
-/// decision — pnpm's build policy only acts on `true` / `false` — so it is
+/// decision (pnpm's build policy only acts on `true` / `false`) so it is
 /// purely a prompt to edit, next to the packages the user already decided.
 pub const UNDECIDED_ALLOW_BUILD: &str = "set this to true or false";
 
 /// Add an [`UNDECIDED_ALLOW_BUILD`] entry to `dir`'s `pnpm-workspace.yaml`
 /// `allowBuilds:` block (creating the file/block if absent) for every name
 /// in `names` that has no entry there yet, preserving the rest of the
-/// document's formatting. Names that already have one — decided or not —
+/// document's formatting. Names that already have one (decided or not)
 /// are left alone, so this never overwrites a user's answer.
 ///
 /// `names` is iterated in its own order; pass an ordered collection for a

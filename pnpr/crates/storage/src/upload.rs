@@ -9,28 +9,71 @@ pub(crate) use remote::RemoteUploadStore;
 
 mod remote;
 
-use crate::{BlobFinalize, BlobSlot, Storage};
-use pnpr_error::{RegistryError, Result};
+use crate::{
+    BlobId,
+    BlobSlot,
+    Storage,
+    database::{
+        BlobRef,
+        Uncommitted,
+    },
+};
+use pnpr_error::{
+    RegistryError,
+    Result,
+};
 use pnpr_package_name::CanonicalPackageName;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::{
     fmt::Write as _,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     fs,
-    io::{AsyncWriteExt, ErrorKind},
+    io::{
+        AsyncWriteExt,
+        ErrorKind,
+    },
 };
 
 /// Where in-progress uploads live under the backend's local scratch root.
 /// The dot prefix keeps it out of the hosted store's package walk.
 pub(crate) const UPLOADS_DIR: &str = ".uploads";
 
-/// Where an upload records the repository it was started for. The id alone
-/// would let a caller who learns one finish it into a different repository,
-/// with bytes they never sent.
-const REPOSITORY_SUFFIX: &str = ".repository";
+/// Where an upload records the namespace, repository, and principal it was
+/// started for.
+const SESSION_SUFFIX: &str = ".session";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum UploadPrincipal {
+    Anonymous,
+    User(String),
+}
+
+impl UploadPrincipal {
+    pub(super) fn from_user_id(user_id: Option<&str>) -> Self {
+        match user_id {
+            Some(id) => Self::User(id.to_string()),
+            None => Self::Anonymous,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UploadSession {
+    namespace: String,
+    repository: String,
+    principal: UploadPrincipal,
+}
 
 /// How long an untouched upload is kept before it is reclaimed.
 ///
@@ -84,9 +127,9 @@ impl BlobUpload {
         Ok(())
     }
 
-    /// The filename of this upload's repository record.
-    fn repository_record(&self) -> String {
-        repository_record(&self.id)
+    /// The filename of this upload's session record.
+    fn session_record(&self) -> String {
+        session_record(&self.id)
     }
 
     /// Open the upload for appending. Held for one request, so a chunk is
@@ -133,10 +176,15 @@ impl BlobUploadWriter {
 }
 
 impl Storage {
-    /// Start an upload for `repository` and give it an unguessable id.
-    pub async fn begin_blob_upload(&self, repository: &CanonicalPackageName) -> Result<BlobUpload> {
+    /// Start an upload for `repository` initiated by `principal` and give it an
+    /// unguessable id.
+    pub async fn begin_blob_upload(
+        &self,
+        repository: &CanonicalPackageName,
+        principal: Option<&str>,
+    ) -> Result<BlobUpload> {
         if let Some(remote) = self.hosted.upload_store() {
-            return remote.begin(repository).await;
+            return remote.begin(repository, principal).await;
         }
         let root = self.uploads_root();
         fs::create_dir_all(&root).await.map_err(RegistryError::Io)?;
@@ -150,36 +198,40 @@ impl Storage {
             .open(&path)
             .await
             .map_err(RegistryError::Io)?;
-        fs::write(root.join(repository_record(&id)), self.upload_owner(repository))
-            .await
-            .map_err(RegistryError::Io)?;
+        let session = serde_json::to_vec(&self.upload_session(repository, principal))?;
+        if let Err(error) = fs::write(root.join(session_record(&id)), session).await {
+            let _ = fs::remove_file(&path).await;
+            return Err(RegistryError::Io(error));
+        }
         Ok(BlobUpload { id, path, remote: None, _temp: None })
     }
 
-    /// Reopen an upload of `repository` by id.
+    /// Reopen an upload of `repository` started by `principal` by id.
     ///
     /// `None` when no such upload is held, and equally when one is held for
-    /// another repository or another organization: an id is a capability over
-    /// the bytes its own client sent, not over the scratch space they passed
-    /// through.
+    /// another repository, another namespace, or another principal: an id is a
+    /// capability over the bytes its own client sent, not over the scratch
+    /// space they passed through.
     pub async fn open_blob_upload(
         &self,
         repository: &CanonicalPackageName,
+        principal: Option<&str>,
         id: &str,
     ) -> Result<Option<BlobUpload>> {
         if !is_upload_id(id) {
             return Ok(None);
         }
         if let Some(remote) = self.hosted.upload_store() {
-            return remote.open(repository, id).await;
+            return remote.open(repository, principal, id).await;
         }
         let root = self.uploads_root();
-        let held = match fs::read_to_string(root.join(repository_record(id))).await {
-            Ok(held) => held,
+        let bytes = match fs::read(root.join(session_record(id))).await {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(RegistryError::Io(error)),
         };
-        if held != self.upload_owner(repository) {
+        let held: UploadSession = serde_json::from_slice(&bytes)?;
+        if held != self.upload_session(repository, principal) {
             return Ok(None);
         }
         let path = root.join(id);
@@ -191,48 +243,90 @@ impl Storage {
     }
 
     /// Discard an upload, reporting whether one was held.
-    pub async fn abort_blob_upload(&self, id: &str) -> Result<bool> {
-        if !is_upload_id(id) {
+    pub async fn abort_blob_upload(&self, upload: &BlobUpload) -> Result<bool> {
+        if !is_upload_id(&upload.id) {
             return Ok(false);
         }
         if let Some(remote) = self.hosted.upload_store() {
-            return remote.abort(id).await;
+            return remote.abort(&upload.id).await;
         }
         let root = self.uploads_root();
-        let _ = fs::remove_file(root.join(repository_record(id))).await;
-        match fs::remove_file(root.join(id)).await {
+        let _ = fs::remove_file(root.join(upload.session_record())).await;
+        match fs::remove_file(root.join(&upload.id)).await {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(RegistryError::Io(error)),
         }
     }
 
-    /// Promote verified bytes before closing their shared upload session.
-    /// A failed promotion leaves accepted remote chunks available for retry.
+    /// Promote verified bytes, the bytes of `id`, as the file `filename` of
+    /// `name`, before closing their shared upload session. The live
+    /// incarnation of `id` is reused, so bytes already stored are not stored
+    /// again; otherwise the next incarnation is stored and mapped. A failed
+    /// promotion leaves accepted remote chunks available for retry.
     pub async fn finalize_uploaded_blob(
         &self,
         upload: BlobUpload,
         name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<BlobFinalize> {
+        (filename, id): (&str, BlobId),
+    ) -> Result<()> {
+        self.finalize_uploaded_blob_for_owner(upload, name, (filename, id), None).await
+    }
+
+    /// Like [`Self::finalize_uploaded_blob`], requiring `required_owner` to own
+    /// `name` in the mapping transaction whenever `name` already records owners.
+    pub async fn finalize_uploaded_blob_for_owner(
+        &self,
+        upload: BlobUpload,
+        name: &CanonicalPackageName,
+        (filename, id): (&str, BlobId),
+        required_owner: Option<&str>,
+    ) -> Result<()> {
         let remote = upload.remote.clone();
         let slot = self.stage_uploaded_blob(upload, name, filename).await?;
-        let _temp = tempfile::TempPath::try_from_path(slot.tmp_path.clone())?;
         if let Some(remote) = &remote {
             remote.prepare_completion(filename).await?;
         }
-        let outcome = self.finalize_blob_slot(slot).await?;
-        if outcome != BlobFinalize::Conflict
-            && let Some(remote) = remote
+        let size = fs::metadata(&slot.tmp_path).await?.len();
+        let rows = self.blob_rows(vec![id.clone()]).await?;
+        let row = rows.get(&id);
+        let promoted = self.promote_blob_slot(slot, (id, size), row).await?;
+        let stored_blob = promoted.stored.then(|| promoted.artifact.blob.clone());
+        if let Err(error) =
+            self.map_hosted_artifact_for_owner(promoted.artifact, required_owner).await
+        {
+            self.cleanup_failed_promotion(stored_blob, remote.as_deref(), &error).await;
+            return Err(error);
+        }
+        if let Some(remote) = remote
             && let Err(error) = remote.close().await
         {
             tracing::warn!(error = %error.log_message(), "promoted upload awaits session cleanup");
         }
-        Ok(outcome)
+        Ok(())
+    }
+
+    async fn cleanup_failed_promotion(
+        &self,
+        stored_blob: Option<BlobRef>,
+        remote: Option<&remote::RemoteUpload>,
+        error: &RegistryError,
+    ) {
+        if let Some(blob) = stored_blob
+            && let Err(err) =
+                self.remove_uncommitted(vec![Uncommitted { blob, may_fence: true }]).await
+        {
+            tracing::warn!(error = %err, "an unmapped upload awaits `pnpr gc`");
+        }
+        if matches!(error, RegistryError::Forbidden { .. })
+            && let Some(remote) = remote
+        {
+            let _ = remote.close().await;
+        }
     }
 
     /// Move a finished upload into a hosted blob slot, ready for
-    /// [`Storage::finalize_blob_slot`].
+    /// [`Storage::promote_blob_slot`].
     ///
     /// Shared chunks remain available until their bytes have been promoted.
     async fn stage_uploaded_blob(
@@ -246,14 +340,12 @@ impl Storage {
         if let Some(parent) = slot.tmp_path.parent() {
             fs::create_dir_all(parent).await.map_err(RegistryError::Io)?;
         }
-        // Both paths are under the backend's local scratch root, so this is a
-        // rename rather than a copy through memory. A cross-device staging
-        // root is the one case that needs the copy.
-        if fs::rename(&upload.path, &slot.tmp_path).await.is_err() {
-            fs::copy(&upload.path, &slot.tmp_path).await.map_err(RegistryError::Io)?;
-            let _ = fs::remove_file(&upload.path).await;
-        }
-        let _ = fs::remove_file(self.uploads_root().join(upload.repository_record())).await;
+        let upload_path = upload.path.clone();
+        let slot = slot.run_blocking_write(move |slot_path| {
+            move_upload_into_slot(&upload_path, slot_path)
+        })
+        .await?;
+        let _ = fs::remove_file(self.uploads_root().join(upload.session_record())).await;
         Ok(slot)
     }
 
@@ -280,15 +372,16 @@ impl Storage {
         Ok(swept)
     }
 
-    /// Who an upload started here belongs to.
-    ///
-    /// The repository alone is not enough. Every organization of an
-    /// object-store backend shares one uploads directory, so two of them
-    /// hosting the same repository name would otherwise reach each other's
-    /// uploads. The newline cannot appear in either half, so one owner has
-    /// exactly one spelling.
-    fn upload_owner(&self, repository: &CanonicalPackageName) -> String {
-        format!("{}\n{}", self.hosted.namespace(), repository.as_str())
+    fn upload_session(
+        &self,
+        repository: &CanonicalPackageName,
+        principal: Option<&str>,
+    ) -> UploadSession {
+        UploadSession {
+            namespace: self.hosted.namespace(),
+            repository: repository.as_str().to_string(),
+            principal: UploadPrincipal::from_user_id(principal),
+        }
     }
 
     fn uploads_root(&self) -> PathBuf {
@@ -305,9 +398,9 @@ fn is_upload_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// The filename holding the repository an upload was started for.
-fn repository_record(id: &str) -> String {
-    format!("{id}{REPOSITORY_SUFFIX}")
+/// The filename holding the session metadata an upload was started with.
+fn session_record(id: &str) -> String {
+    format!("{id}{SESSION_SUFFIX}")
 }
 
 fn generate_upload_id() -> String {
@@ -319,6 +412,21 @@ fn generate_upload_id() -> String {
             write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
             hex
         })
+}
+
+/// Reset `upload_path`'s modification time and move it into `slot_path` (with a
+/// cross-device copy fallback), so a chunked upload whose last `PATCH` predates
+/// the request timeout is not swept while promotion runs.
+fn move_upload_into_slot(upload_path: &Path, slot_path: &Path) -> std::io::Result<()> {
+    std::fs::File::options()
+        .write(true)
+        .open(upload_path)?
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
+    if std::fs::rename(upload_path, slot_path).is_err() {
+        std::fs::copy(upload_path, slot_path)?;
+        let _ = std::fs::remove_file(upload_path);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -333,7 +441,7 @@ mod tests;
 async fn sweep_upload_entry(root: &Path, entry: &fs::DirEntry, max_age: Duration) -> bool {
     let name = entry.file_name();
     let name = name.to_string_lossy();
-    if let Some(id) = name.strip_suffix(REPOSITORY_SUFFIX) {
+    if let Some(id) = name.strip_suffix(SESSION_SUFFIX) {
         if !fs::try_exists(root.join(id)).await.unwrap_or(true) {
             let _ = fs::remove_file(entry.path()).await;
         }
@@ -345,12 +453,13 @@ async fn sweep_upload_entry(root: &Path, entry: &fs::DirEntry, max_age: Duration
     let idle = metadata
         .modified()
         .ok()
-        .and_then(|at| at.elapsed().ok());
+        .map(|at| at.elapsed())
+        .and_then(Result::ok);
     if idle.is_none_or(|idle| idle <= max_age)
         || fs::remove_file(entry.path()).await.is_err()
     {
         return false;
     }
-    let _ = fs::remove_file(root.join(repository_record(&name))).await;
+    let _ = fs::remove_file(root.join(session_record(&name))).await;
     true
 }

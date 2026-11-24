@@ -1,20 +1,46 @@
 use std::{
     path::Path,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc,
+        Mutex,
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
     },
 };
 
-use pnpm_lockfile::{Lockfile, LockfileResolution, PkgName};
-use pnpm_reporter::{LockfileVerificationMessage, LogEvent, Reporter, SilentReporter};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileResolution,
+    PkgName,
+};
+use pnpm_reporter::{
+    LockfileVerificationMessage,
+    LogEvent,
+    Reporter,
+    SilentReporter,
+};
 use pnpm_resolving_resolver_base::{
-    ResolutionVerification, ResolutionVerifier, VerifyCtx, VerifyFuture,
+    ResolutionVerification,
+    ResolutionVerifier,
+    VerifyCtx,
+    VerifyFuture,
 };
 use tempfile::TempDir;
 
 use super::{
-    ReplacedEntries, VerifyLockfileResolutionsOptions, collect_resolution_policy_violations,
+    RESOLUTION_SHAPE_MISMATCH_VIOLATION_CODE,
+    ReplacedCandidate,
+    ReplacedEntries,
+    VerifyLockfileResolutionsOptions,
+    candidates::{
+        collect_candidates,
+        run_fan_out,
+    },
+    collect_resolution_policy_violations,
+    lockfile_verification_is_cached,
+    lockfile_verification_is_cached_by_content,
     verify_lockfile_resolutions,
 };
 use crate::VerifyError;
@@ -213,3 +239,7 @@ mod lockfile;
 mod streaming;
 
 mod security;
+
+mod exotic_subdeps;
+
+mod security_policy;

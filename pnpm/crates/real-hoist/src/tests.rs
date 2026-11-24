@@ -1,16 +1,38 @@
+pub(super) mod resolution;
+
 use super::{
-    HoistError, HoistOpts, HoisterResult, RcByPtr, build_hoist_ident_map, hoist,
-    is_preferred_ident, percent_encode_path,
+    HoistError,
+    HoistOpts,
+    HoisterDependencyKind,
+    HoisterResult,
+    HoisterTree,
+    RcByPtr,
+    engine,
+    hoist,
+    percent_encode_path,
 };
 use indexmap::IndexSet;
 use pnpm_lockfile::{
-    ComVer, Lockfile, LockfileSettings, LockfileVersion, PkgName, PkgNameVerPeer, PkgVerPeer,
-    ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec, SnapshotDepRef, SnapshotEntry,
+    ComVer,
+    Lockfile,
+    LockfileSettings,
+    LockfileVersion,
+    PkgName,
+    PkgNameVerPeer,
+    PkgVerPeer,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
+    SnapshotEntry,
 };
 use pretty_assertions::assert_eq;
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{
+        BTreeSet,
+        HashMap,
+    },
     rc::Rc,
 };
 
@@ -55,10 +77,15 @@ fn empty_lockfile() -> Lockfile {
 /// Helper for the peer-aware tests: build a `PackageMetadata`
 /// whose `packages:`-level `peer_dependencies` claims one peer.
 fn pkg_metadata_with_peer(peer_name: &str) -> pnpm_lockfile::PackageMetadata {
-    use pnpm_lockfile::{LockfileResolution, PackageMetadata, TarballResolution};
+    use pnpm_lockfile::{
+        LockfileResolution,
+        PackageMetadata,
+        TarballResolution,
+    };
     let mut peer_deps = HashMap::new();
     peer_deps.insert(peer_name.to_string(), "*".to_string());
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Tarball(TarballResolution {
             tarball: format!("https://example.invalid/{peer_name}-host.tgz"),
             integrity: None,
@@ -80,31 +107,76 @@ fn pkg_metadata_with_peer(peer_name: &str) -> pnpm_lockfile::PackageMetadata {
     }
 }
 
-/// Construct a [`HoisterResult`] node directly, for unit-testing the
-/// preference machinery without going through [`hoist`] (which only ever
-/// builds the `.` root with empty `peer_names`).
-fn result_node(
+/// Run the hoist on a prepared input tree under the resolution oracle,
+/// for tests that build the tree by hand.
+fn nm_hoist(tree: &HoisterTree, opts: &HoistOpts) -> HoisterResult {
+    let result = engine::hoist(tree, opts);
+    resolution::assert_resolves_as_declared(tree, &result);
+    result
+}
+
+/// Construct a [`HoisterTree`] node directly, for feeding [`nm_hoist`] an
+/// input the lockfile converter does not produce: nodes that share a
+/// `reference` while carrying `peer_names`, the shape the TypeScript
+/// wrapper's `depPathByPkgId` gives every peer variant.
+fn tree_node(
     name: &str,
     reference: &str,
     peer_names: &[&str],
-    dependencies: Vec<Rc<HoisterResult>>,
-) -> Rc<HoisterResult> {
-    Rc::new(HoisterResult {
+    dependencies: Vec<Rc<HoisterTree>>,
+) -> Rc<HoisterTree> {
+    Rc::new(HoisterTree {
+        identity: None,
         name: name.to_string(),
         ident_name: name.to_string(),
-        references: RefCell::new(BTreeSet::from([reference.to_string()])),
+        reference: reference.to_string(),
         peer_names: peer_names
             .iter()
             .map(|&peer| peer.to_string())
             .collect(),
+        dependency_kind: HoisterDependencyKind::Regular,
+        hoist_priority: 0,
         dependencies: RefCell::new(
             dependencies
                 .into_iter()
                 .map(RcByPtr)
                 .collect::<IndexSet<_>>(),
         ),
-        hoisted_dependencies: RefCell::new(std::collections::HashMap::new()),
-        decoupled: std::cell::Cell::new(false),
+    })
+}
+
+/// The child of `parent` named `name`; panics listing the children it has.
+fn child_of(parent: &HoisterResult, name: &str) -> Rc<HoisterResult> {
+    let children = parent.dependencies.borrow();
+    let child = children
+        .iter()
+        .find(|dep| dep.0.name == name)
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = children
+                .iter()
+                .map(|dep| dep.0.name.as_str())
+                .collect();
+            panic!("{} has no child {name}, only {names:?}", parent.name)
+        });
+    Rc::clone(&child.0)
+}
+
+/// The `.` root [`hoist`] builds, over hand-made [`tree_node`] children.
+fn tree_root(dependencies: Vec<Rc<HoisterTree>>) -> Rc<HoisterTree> {
+    Rc::new(HoisterTree {
+        identity: None,
+        name: ".".to_string(),
+        ident_name: ".".to_string(),
+        reference: String::new(),
+        peer_names: IndexSet::new(),
+        dependency_kind: HoisterDependencyKind::Workspace,
+        hoist_priority: 0,
+        dependencies: RefCell::new(
+            dependencies
+                .into_iter()
+                .map(RcByPtr)
+                .collect::<IndexSet<_>>(),
+        ),
     })
 }
 
@@ -117,3 +189,15 @@ mod lockfile;
 mod dependencies;
 
 mod behavior;
+
+mod peer_bindings;
+
+mod peer_layout;
+
+mod nested_projects;
+
+mod generated;
+
+mod determinism;
+
+mod generated_workspaces;

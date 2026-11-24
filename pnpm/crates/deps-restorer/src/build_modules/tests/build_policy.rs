@@ -1,22 +1,48 @@
 use super::{
     super::{
-        BuildModules, ScheduledBuilds, ScheduledBuildsInputs, allow_build_policy::AllowBuildPolicy,
+        BuildModules,
+        ScheduledBuilds,
+        ScheduledBuildsInputs,
+        allow_build_policy::{
+            AllowBuildPolicy,
+            allow_build_key_from_ignored_build,
+        },
         deferred_builds,
     },
-    TEST_LOGGED_METHODS, create_buildable_pkg, key, policy_from_specs, root_importers,
+    TEST_LOGGED_METHODS,
+    create_buildable_pkg,
+    key,
+    policy_from_specs,
+    root_importers,
 };
 #[cfg(unix)]
-use super::{create_failing_postinstall_fixture, create_postinstall_modifies_source_fixture};
-use crate::{RequiresBuildBySnapshot, SkippedSnapshots, VirtualStoreLayout};
-use pnpm_config::{Config, PackageImportMethod};
+use super::{
+    create_failing_postinstall_fixture,
+    create_postinstall_modifies_source_fixture,
+};
+use crate::{
+    RequiresBuildBySnapshot,
+    SkippedSnapshots,
+    VirtualStoreLayout,
+};
+use pnpm_config::{
+    Config,
+    PackageImportMethod,
+};
 use pnpm_lockfile::SnapshotEntry;
 use pnpm_reporter::SilentReporter;
 #[cfg(unix)]
-use pnpm_reporter::{LogEvent, Reporter};
+use pnpm_reporter::{
+    LogEvent,
+    Reporter,
+};
 use pretty_assertions::assert_eq;
 #[cfg(unix)]
 use std::sync::Mutex;
-use std::{collections::HashMap, fs};
+use std::{
+    collections::HashMap,
+    fs,
+};
 use tempfile::tempdir;
 
 /// Only a materialized snapshot whose build `allowBuilds` allows is scheduled,
@@ -79,6 +105,24 @@ fn explicit_deny_outranks_dangerously_allow_all_builds() {
     assert_eq!(policy.check("pinned@2.0.0"), Some(true));
     assert_eq!(policy.check("other-package@1.0.0"), Some(true));
 }
+/// A named registry may serve a different artifact under the same name, so
+/// approvals stay registry-exact while denials widen.
+#[test]
+fn named_registry_packages_take_denials_but_not_approvals_by_name() {
+    let policy = policy_from_specs([("pinned@1.0.0", false)], true);
+    assert_eq!(policy.check("pinned@work:1.0.0"), Some(false));
+    assert_eq!(policy.check("pinned@work:1.0.0(peer@2.0.0)"), Some(false));
+    assert_eq!(policy.check("pinned@work:2.0.0"), Some(true));
+
+    let policy = policy_from_specs(
+        [("allowed", true), ("pinned@1.0.0", true), ("exact@work:1.0.0", true)],
+        false,
+    );
+    assert_eq!(policy.check("allowed@work:1.0.0"), None);
+    assert_eq!(policy.check("pinned@work:1.0.0"), None);
+    assert_eq!(policy.check("exact@work:1.0.0"), Some(true));
+    assert_eq!(allow_build_key_from_ignored_build("allowed@work:1.0.0"), "allowed@work:1.0.0");
+}
 /// Wildcards in `allowBuilds` keys are accepted by the parser
 /// (they land as literal strings in the expanded set) but the
 /// `HashSet::contains` lookup means they never match a real
@@ -123,13 +167,13 @@ fn build_modules_collects_ignored_builds() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -153,6 +197,7 @@ fn build_modules_collects_ignored_builds() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -189,7 +234,7 @@ fn build_modules_collects_ignored_builds() {
 }
 /// The post-build importer bin relink keys off
 /// [`BuildModulesOutput::mutated_slots`], so the signal must stay
-/// `false` when every candidate is blocked by the allow policy —
+/// `false` when every candidate is blocked by the allow policy;
 /// nothing wrote into a linked slot, and the relink may skip.
 #[test]
 fn mutated_slots_is_false_when_every_build_is_ignored() {
@@ -204,13 +249,13 @@ fn mutated_slots_is_false_when_every_build_is_ignored() {
 
     let output = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -234,6 +279,7 @@ fn mutated_slots_is_false_when_every_build_is_ignored() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -285,13 +331,13 @@ fn mutated_slots_is_true_when_a_script_runs() {
 
     let output = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -315,6 +361,7 @@ fn mutated_slots_is_true_when_a_script_runs() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -365,13 +412,13 @@ fn ignore_scripts_skips_build_without_collecting_ignored() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -395,6 +442,7 @@ fn ignore_scripts_skips_build_without_collecting_ignored() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -441,13 +489,13 @@ fn cached_requires_build_false_skips_package_dir_probe() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -471,6 +519,7 @@ fn cached_requires_build_false_skips_package_dir_probe() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -532,13 +581,13 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -562,6 +611,7 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -599,7 +649,7 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
         "ignored set must be the same under concurrency 2 as under 1: {ignored:?}",
     );
 }
-/// Explicit `false` in `allowBuilds` is silently skipped — it does NOT
+/// Explicit `false` in `allowBuilds` is silently skipped; it does NOT
 /// land in the ignored-scripts list.
 #[test]
 fn build_modules_excludes_explicit_deny_from_ignored() {
@@ -620,13 +670,13 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -650,6 +700,7 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -686,13 +737,13 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
 }
 /// A side-effects cache hit skips the rebuild.
 ///
-/// The cache is normally populated by running the install twice —
+/// The cache is normally populated by running the install twice,
 /// once via the WRITE path, then consumed. Pacquet doesn't have a
 /// WRITE path yet ([#421]'s slice (B)), so we hand-craft the same
 /// state directly: a `side_effects_maps_by_snapshot` entry whose
 /// cache key matches what `BuildModules` will compute via
 /// `calc_dep_state`. With that in place, the gate skips the build
-/// even though the package's `postinstall` would have failed —
+/// even though the package's `postinstall` would have failed,
 /// observable via the absence of a `pnpm:lifecycle` event for the
 /// stage.
 ///
@@ -724,6 +775,7 @@ fn using_side_effects_cache_skips_rebuild() {
         HashMap::from([(
             pkg_key.without_peer(),
             pnpm_lockfile::PackageMetadata {
+                specifiers: None,
                 resolution: pnpm_lockfile::LockfileResolution::Registry(
                     pnpm_lockfile::RegistryResolution {
                         integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -760,7 +812,7 @@ fn using_side_effects_cache_skips_rebuild() {
     // (resolved to CAS paths); the gate re-materializes it into the
     // already-linked slot, so it carries both the pristine
     // `package.json` and a side-effect file the build would have
-    // produced — proving the cached build output lands on disk
+    // produced, proving the cached build output lands on disk
     // without the script re-running.
     let engine = "darwin;arm64;node20";
     let dep_graph = crate::build_deps_graph(&snapshots, &packages);
@@ -797,6 +849,7 @@ fn using_side_effects_cache_skips_rebuild() {
 
     BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects {
                 overlays: Some(&side_effects_maps),
                 rows: None,
@@ -805,8 +858,7 @@ fn using_side_effects_cache_skips_rebuild() {
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -830,6 +882,7 @@ fn using_side_effects_cache_skips_rebuild() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -869,7 +922,7 @@ fn using_side_effects_cache_skips_rebuild() {
     assert!(!any_lifecycle, "side-effects cache hit must skip lifecycle scripts: {captured:#?}");
 
     // The script was skipped, but the cached build output still has to
-    // be materialized — the overlay's side-effect file must land in the
+    // be materialized, the overlay's side-effect file must land in the
     // slot so the warm reinstall isn't left in its pre-build state.
     assert!(
         pkg_dir.join("generated-by-postinstall.js").exists(),
@@ -877,7 +930,7 @@ fn using_side_effects_cache_skips_rebuild() {
     );
 }
 /// A cache hit whose overlay can't be materialized (e.g. a side-effects
-/// `added` blob deleted out from under the store — those aren't
+/// `added` blob deleted out from under the store; those aren't
 /// re-verified) must not abort the install. It degrades to a cache miss:
 /// the build re-runs over the pristine files and re-seeds the cache,
 /// instead of propagating the import error past the optional-dependency
@@ -891,6 +944,7 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
         HashMap::from([(
             pkg_key.without_peer(),
             pnpm_lockfile::PackageMetadata {
+                specifiers: None,
                 resolution: pnpm_lockfile::LockfileResolution::Registry(
                     pnpm_lockfile::RegistryResolution {
                         integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -936,7 +990,7 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
         },
     );
     // The overlay points `generated.txt` at a CAS path that doesn't
-    // exist, so `materialize_side_effects` fails — standing in for a
+    // exist, so `materialize_side_effects` fails, standing in for a
     // store whose side-effects blob went missing.
     let overlay = pnpm_fs::CasPaths::from([
         ("package.json".to_string(), pkg_dir.join("package.json").into()),
@@ -956,6 +1010,7 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
 
     BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects {
                 overlays: Some(&side_effects_maps),
                 rows: None,
@@ -964,8 +1019,7 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -989,6 +1043,7 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),

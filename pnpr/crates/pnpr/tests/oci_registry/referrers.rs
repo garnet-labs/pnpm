@@ -1,6 +1,22 @@
 use super::{
-    AuthState, Body, Ecosystem, Request, ServiceExt, StatusCode, TempDir, Value, basic, body_bytes,
-    digest_of, get, header, json, oci_config, router_with_auth, strip_referrer_metadata, token,
+    AuthState,
+    Body,
+    Ecosystem,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    Value,
+    basic,
+    body_bytes,
+    digest_of,
+    get,
+    header,
+    json,
+    oci_config,
+    router_with_auth,
+    strip_referrer_metadata,
+    token,
 };
 
 #[tokio::test]
@@ -101,7 +117,7 @@ async fn referrer_pages_bound_migration_and_keep_filter_and_registry() {
                 .all(|entry| entry.referrer.is_some()),
         );
         let path = format!(
-            "/oci/~images/v2/acme/paged/referrers/{subject}?artifactType=application%2Fexample%2Bjson",
+            "/oci/~images/v2/acme/paged/referrers/{subject}?artifactType=application/example+json",
         );
         let (received, pages) = collect_filtered_referrer_pages(&app, path).await;
         expected.sort();

@@ -1,6 +1,12 @@
-use super::{Deserialize, RegistryError};
+use super::{
+    Deserialize,
+    RegistryError,
+};
 use pnpm_transparency_log::NoteSigner;
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::Arc,
+};
 
 /// How pnpr logs the release records of the versions it hosts
 /// ([release records](https://github.com/pnpm/rfcs/blob/92d2b281af321ecf8f1e5fea63f698716ba4e9e7/pnpr/text/0000-release-records.md)).
@@ -24,10 +30,12 @@ impl fmt::Debug for ReleaseRecordsConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = self.log_signing_key
             .as_ref()
-            .map(|signer| signer.verifier_key().to_string());
+            .map(|signer| signer.verifier_key())
+            .map(std::string::ToString::to_string);
         let statement_key = self.statement_signing_key
             .as_ref()
-            .map(|signer| signer.verifier_key().to_string());
+            .map(|signer| signer.verifier_key())
+            .map(std::string::ToString::to_string);
         formatter
             .debug_struct("ReleaseRecordsConfig")
             .field("log_signing_key", &key)
@@ -43,10 +51,10 @@ pub(super) struct ReleaseRecordsFile {
     /// A signed-note private key, `PRIVATE+KEY+<name>+<key hash>+<key>`, as
     /// Go's `note.GenerateKey` writes one.
     #[serde(default)]
-    log_signing_key: Option<String>,
+    log_signing_key: Option<crate::Secret>,
     /// A signed-note private key, as for `log_signing_key`.
     #[serde(default)]
-    statement_signing_key: Option<String>,
+    statement_signing_key: Option<crate::Secret>,
 }
 
 pub(super) fn build_release_records_config(
@@ -59,7 +67,10 @@ pub(super) fn build_release_records_config(
     })
 }
 
-fn signer(field: &str, key: Option<String>) -> Result<Option<Arc<NoteSigner>>, RegistryError> {
+fn signer(
+    field: &str,
+    key: Option<crate::Secret>,
+) -> Result<Option<Arc<NoteSigner>>, RegistryError> {
     let Some(key) = key else { return Ok(None) };
     let signer = NoteSigner::from_private_key(key.trim()).map_err(|err| {
         RegistryError::InvalidConfig {

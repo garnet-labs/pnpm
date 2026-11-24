@@ -1,16 +1,37 @@
 use super::{
     super::{
-        DepHierarchy, DependenciesGraph, HoistedDepGraphError, InstallabilityError,
-        LockfileToDepGraphResult, LockfileToHoistedDepGraphOptions, lockfile_to_hoisted_dep_graph,
+        DepHierarchy,
+        DependenciesGraph,
+        HoistedDepGraphError,
+        InstallabilityError,
+        LockfileToDepGraphResult,
+        LockfileToHoistedDepGraphOptions,
+        lockfile_to_hoisted_dep_graph,
     },
-    dep_key, directory_resolution, host_aware_opts, lockfile_with, metadata_stub, metadata_with_os,
-    pkg_name, resolved_dep, ver_peer,
+    dep_key,
+    directory_resolution,
+    host_aware_opts,
+    lockfile_with,
+    metadata_stub,
+    metadata_with_os,
+    pkg_name,
+    resolved_dep,
+    ver_peer,
 };
-use pnpm_lockfile::{PackageMetadata, ResolvedDependencyMap, SnapshotDepRef, SnapshotEntry};
+use pnpm_lockfile::{
+    PackageMetadata,
+    ResolvedDependencyMap,
+    SnapshotDepRef,
+    SnapshotEntry,
+};
 use pnpm_modules_yaml::DepPath;
 use pretty_assertions::assert_eq;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+    },
     path::PathBuf,
 };
 
@@ -50,7 +71,7 @@ fn hierarchy_nests_recursively() {
 #[test]
 fn options_default_is_empty() {
     let opts = LockfileToHoistedDepGraphOptions::default();
-    assert_eq!(opts.lockfile_dir, PathBuf::new());
+    assert_eq!(opts.modules_dirs.lockfile_dir(), std::path::Path::new(""));
     assert!(!opts.placement.auto_install_peers);
     assert!(opts.skipped.is_empty());
     assert!(!opts.force);
@@ -79,7 +100,7 @@ fn walker_transitive_dep_flattens_under_root() {
     let lockfile = lockfile_with(root_deps, packages, snapshots);
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -129,7 +150,7 @@ fn walker_version_conflict_keeps_loser_nested() {
     let lockfile = lockfile_with(root_deps, packages, snapshots);
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -169,7 +190,7 @@ fn walker_honors_pre_skipped_dep_path() {
     let mut skipped = BTreeSet::new();
     skipped.insert("a@1.0.0".to_string());
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: PathBuf::from("/repo"),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(std::path::Path::new("/repo")),
         skipped,
         ..LockfileToHoistedDepGraphOptions::default()
     };
@@ -202,7 +223,7 @@ fn walker_records_directory_resolution_as_injection_target() {
     let lockfile = lockfile_with(root_deps, packages, snapshots);
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -313,7 +334,7 @@ fn walker_defers_published_engines_of_a_patched_snapshot() {
         .expect("a patched snapshot's published engines are checked after patching");
 }
 /// `opts.include_incompatible_packages = true` bypasses the
-/// installability check entirely — even a required dep on an
+/// installability check entirely, even a required dep on an
 /// unsupported platform passes through. Used by the `prev_graph` walk
 /// so the diff against the previous lockfile catches packages that
 /// previously installed but would now be filtered.
@@ -370,7 +391,7 @@ fn prev_graph_includes_orphan_even_when_now_incompatible() {
             current_libc: "glibc".to_string(),
             ..LockfileToHoistedDepGraphOptions::default().installability
         },
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
 
         ..LockfileToHoistedDepGraphOptions::default()
     };

@@ -1,14 +1,38 @@
 use super::super::{
-    Arc, Config, InstallError, Lockfile, LogEvent, LogLevel, Path, PnpmLog, Reporter,
-    ResolutionVerifier, Stage, StageLog, SystemTime, frozen_tree_intact, gvs_build_marker_present,
-    has_newly_allowed_ignored_builds, hoisted_linker_workspace_links_intact,
-    hoisted_workspace_packages_present, map_frozen_lockfile_error, modules_consistent_with,
-    moved_tree_is_reusable, recorded_allow_builds_differ, unapproved_recorded_ignored_builds,
-    update_workspace_state_or_warn, verify_lockfile_eagerly,
+    Arc,
+    Config,
+    ExoticSubdepsPolicy,
+    InstallError,
+    Lockfile,
+    LogEvent,
+    LogLevel,
+    Path,
+    PnpmLog,
+    Reporter,
+    ResolutionVerifier,
+    Stage,
+    StageLog,
+    SystemTime,
+    frozen_tree_intact,
+    has_newly_allowed_ignored_builds,
+    hoisted_linker_workspace_links_intact,
+    hoisted_workspace_packages_present,
+    map_frozen_lockfile_error,
+    modules_consistent_with,
+    moved_tree_is_reusable,
+    recorded_allow_builds_differ,
+    unapproved_recorded_ignored_builds,
+    update_workspace_state_or_warn,
+    verify_lockfile_eagerly,
 };
 use crate::install_state::{
-    filesystem_now_ms_in_modules, materialized_shape_matches,
-    validation::{project_bins_digest, project_bins_match, workspace_bins_digest},
+    filesystem_now_ms_in_modules,
+    materialized_shape_matches,
+    validation::{
+        project_bins_digest,
+        project_bins_match,
+        workspace_bins_digest,
+    },
 };
 use pnpm_workspace::importer_id_from_root_dir;
 
@@ -46,6 +70,7 @@ pub(super) fn frozen_tree_up_to_date<'a>(
         || context.repeat.filtered
         || context.repeat.disable_optimistic_check
         || config.force
+        || config.prune_direct_dependencies
     {
         return None;
     }
@@ -84,7 +109,7 @@ pub(super) fn frozen_tree_up_to_date<'a>(
             context.recorded.state,
             config.extend_node_path,
         )
-        || !build_state_unchanged(context, current, modules)
+        || !build_state_unchanged(context, modules)
     {
         return None;
     }
@@ -157,7 +182,6 @@ fn bins_resolve_where_the_tree_is(context: &FrozenTreeUpToDate<'_>, current: &Lo
 /// records on its own.
 fn build_state_unchanged(
     context: &FrozenTreeUpToDate<'_>,
-    current: &Lockfile,
     modules: &pnpm_modules_yaml::ModulesLayout,
 ) -> bool {
     let config = context.tree.config;
@@ -168,16 +192,12 @@ fn build_state_unchanged(
         // hashes its slots on the set, so a flipped decision leaves the
         // tree in a slot this install would no longer produce.
         && !recorded_allow_builds_differ(modules, config)
-        // A build marker lives in the shared slot, outside every
-        // project-state input checked above. Let materialization inspect
-        // buildable and patched GVS slots instead of declaring the local
-        // tree complete from importer links alone.
-        && !gvs_build_marker_present(
-            current,
-            config,
-            context.tree.workspace_root,
-            context.repeat.effective_node_version,
-        )
+        // A global virtual store keeps a build an `--ignore-scripts`
+        // install withheld in the slot of the unbuilt package, so the tree
+        // moves to the built slot only through materialization.
+        && (!config.enable_global_virtual_store
+            || config.ignore_scripts
+            || modules.pending_builds.is_empty())
 }
 pub(super) fn modules_cache_prune_due(
     config: &Config,
@@ -226,6 +246,11 @@ pub(super) async fn report_up_to_date<Reporter: self::Reporter + 'static>(
 ) -> Result<(), InstallError> {
     pnpm_lockfile_verification::verify_lockfile_dependency_names(context.wanted_lockfile)
         .map_err(InstallError::LockfileVerification)?;
+    pnpm_lockfile_verification::verify_lockfile_local_resolutions(
+        context.wanted_lockfile,
+        Some(context.verification.local_policy.clone()),
+    )
+    .map_err(InstallError::LockfileVerification)?;
     pnpm_lockfile_verification::verify_lockfile_importer_snapshot_links(context.wanted_lockfile)
         .map_err(InstallError::LockfileVerification)?;
     // Nothing to materialize means no fetch to overlap; verify
@@ -234,7 +259,8 @@ pub(super) async fn report_up_to_date<Reporter: self::Reporter + 'static>(
         context.wanted_lockfile,
         context.verification.override_check.take(),
         context.verification.verifiers,
-        (context.verification.path, &context.tree.config.cache_dir),
+        (context.verification.exotic_subdeps.clone(), context.verification.local_policy.clone()),
+        (context.verification.source, &context.tree.config.cache_dir),
     )
     .await?;
     enforce_recorded_build_policy(&context)?;
@@ -292,6 +318,7 @@ pub(super) fn refresh_up_to_date_workspace<Reporter: self::Reporter>(
             &context.tree.config.workspace_state_modules_dir(context.tree.workspace_root),
         ),
         carried: crate::install::CarriedSettings {
+            trust_lockfile: context.verification.trust_lockfile,
             established_auto_dedupe: context.carried_state.recorded_auto_dedupe,
             registry_keys_verified: crate::install::registry_keys_current(
                 context.tree.config,
@@ -317,15 +344,15 @@ pub(super) async fn verify_up_to_date_lockfile<Reporter: self::Reporter + 'stati
     wanted_lockfile: &Lockfile,
     lockfile_verification_override: Option<super::super::LockfileVerificationOverride<'_>>,
     resolution_verifiers: &[Arc<dyn ResolutionVerifier>],
-    paths: (Option<&Path>, &Path),
+    policies: (ExoticSubdepsPolicy, pnpm_lockfile_verification::LocalResolutionPolicy),
+    paths: (Option<pnpm_lockfile_verification::LockfileCacheSource<'_>>, &Path),
 ) -> Result<(), InstallError> {
-    let (derived_lockfile_path, cache_dir) = paths;
     let Some(lockfile_verification_override) = lockfile_verification_override else {
         return verify_lockfile_eagerly::<Reporter>(
             wanted_lockfile,
             resolution_verifiers,
-            derived_lockfile_path,
-            cache_dir,
+            policies,
+            paths,
         )
         .await;
     };
@@ -347,7 +374,8 @@ pub(super) fn save_merged_wanted_lockfile(
         && save_lockfile
     {
         wanted_lockfile
-            .save_to_path(
+            .save_to_path_as(
+                config.lockfile_format,
                 &workspace_root.join(config.wanted_lockfile_name()),
                 config.symlinked_lockfile(),
             )

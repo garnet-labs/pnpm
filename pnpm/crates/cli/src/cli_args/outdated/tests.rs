@@ -1,22 +1,38 @@
 use super::{
-    OutdatedDependencyOptions, OutdatedInWorkspace, OutdatedPackage, render_json,
-    render_recursive_json, render_recursive_table, sort_outdated, workspace::DependentProject,
+    OutdatedDependencyOptions,
+    OutdatedInWorkspace,
+    OutdatedPackage,
+    render_json,
+    render_recursive_json,
+    render_recursive_table,
+    sort_outdated,
+    workspace::DependentProject,
 };
 use crate::cli_args::{
     outdated::{
         OutdatedFormat,
         notes::with_notes,
         query::current_versions_from_importer,
-        render::{Change, DEPENDENTS_COLUMN_WIDTH, classify, render_dependents, render_latest},
+        render::{
+            DEPENDENTS_COLUMN_WIDTH,
+            render_dependents,
+            render_latest,
+        },
     },
-    release_notes::{UpgradeNotes, reader::VersionNote},
+    release_notes::{
+        UpgradeNotes,
+        reader::VersionNote,
+    },
 };
 use node_semver::Version;
 use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::DependencyGroup;
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 #[cfg(unix)]
-use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+use std::{
+    ffi::OsString,
+    os::unix::ffi::OsStringExt,
+};
 use text_block_macros::text_block;
 
 fn v(text: &str) -> Version {
@@ -37,12 +53,12 @@ fn pkg(name: &str, current: &str, target: &str, group: DependencyGroup) -> Outda
 }
 
 // Mirrors `outdated() skips dependencies resolved from local refs` in
-// `pnpm11/deps/inspection/outdated/test/outdated.spec.ts`: a dependency
+// <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/inspection/outdated/test/outdated.spec.ts>: a dependency
 // resolved to a local `link:`/`file:`/`workspace:` ref has no
 // lockfile-pinned semver, so `collect_outdated` drops it before any
 // registry fetch even when its manifest specifier is a plain semver range.
 #[test]
-fn current_versions_omit_local_refs() {
+fn current_versions_record_local_refs_without_a_version() {
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
         "lockfileVersion: '9.0'"
         "importers:"
@@ -67,17 +83,10 @@ fn current_versions_omit_local_refs() {
         Lockfile::ROOT_IMPORTER_KEY,
         &[DependencyGroup::Dev],
     );
-    dbg!(&versions);
-    assert_eq!(versions, HashMap::from([("is-positive".to_string(), v("1.0.0"))]));
-}
-
-#[test]
-fn classify_detects_each_bump_kind() {
-    assert_eq!(classify(&v("1.0.0"), &v("2.0.0")), Change::Breaking);
-    assert_eq!(classify(&v("1.0.0"), &v("1.1.0")), Change::Feature);
-    assert_eq!(classify(&v("1.0.0"), &v("1.0.1")), Change::Fix);
-    assert_eq!(classify(&v("1.0.0"), &v("1.0.0")), Change::None);
-    assert_eq!(classify(&v("1.0.0-alpha.1"), &v("1.0.0")), Change::Unknown);
+    assert_eq!(versions.get("is-positive"), Some(&Some(v("1.0.0"))));
+    assert_eq!(versions.get("private-workspace-pkg"), Some(&None));
+    assert_eq!(versions.get("injected-pkg"), Some(&None));
+    assert_eq!(versions.get("workspace-pkg"), Some(&None));
 }
 
 #[test]
@@ -212,8 +221,8 @@ fn assert_borders_aligned(table: &str) {
 // Enabling `tabled`'s `ansi` feature makes it size a colored cell by its
 // visible glyphs, not its escape bytes; without it the columns and borders
 // drift apart. Feed a modern-style table the kind of ANSI-colored cells the
-// `outdated` renderers emit — a highlighted version segment, a dim group
-// label, bright-blue headers — and confirm every vertical border lands on the
+// `outdated` renderers emit (a highlighted version segment, a dim group
+// label, bright-blue headers) and confirm every vertical border lands on the
 // same column. Coloring the cells directly (`owo_colors` unconditional
 // styling) rather than forcing the global color override keeps the test free
 // of process-global state, so it can't leak into or be perturbed by other
@@ -221,7 +230,10 @@ fn assert_borders_aligned(table: &str) {
 #[test]
 fn colored_table_borders_stay_aligned() {
     use owo_colors::OwoColorize;
-    use tabled::{builder::Builder, settings::Style};
+    use tabled::{
+        builder::Builder,
+        settings::Style,
+    };
 
     let header = ["Package", "Current", "Latest"].map(|name| name.bright_blue().to_string());
     let rows = [
@@ -276,7 +288,7 @@ fn dependent_names_are_sanitized_for_terminal_output() {
 }
 
 // Mirrors the `getCellWidth(data, 3, 30)` clamp of pnpm 11's recursive
-// renderer in `pnpm11/deps/inspection/commands/src/outdated/recursive.ts`.
+// renderer in <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/inspection/commands/src/outdated/recursive.ts>.
 // A dependency shared by a dozen workspace projects lists all of them in one
 // cell, which sizes the `Dependents` column past any terminal unless the cell
 // wraps.
@@ -529,4 +541,27 @@ fn a_shared_json_entry_gets_only_the_notes_of_the_package_it_shows() {
         .expect("one entry");
     assert_eq!(entry["latest"], "2.0.0", "the entry shows the later package: {report}");
     assert_eq!(entry.get("releaseNotes"), None, "{report}");
+}
+
+#[test]
+fn outdated_validates_normalized_python_patterns_in_standalone_projects() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("pyproject.toml"),
+        "[project]\nname = 'app'\nversion = '1.0'\ndependencies = ['Example_Name']\n",
+    )
+    .unwrap();
+    let mut config = pnpm_config::Config::default();
+    config.python.enabled = true;
+    for selector in ["pkg:pypi/example.name", "pypi:EXAMPLE_NAME", "Example..*"] {
+        super::filters::validate_package_patterns(
+            [],
+            &[project.path().to_owned()],
+            &config,
+            &[selector.to_owned()],
+            &[DependencyGroup::Prod],
+            true,
+        )
+        .unwrap();
+    }
 }

@@ -18,14 +18,27 @@
 //! Every violation of a fixture is collected before the test fails, so one
 //! run reports the whole matrix.
 //!
-//! With `PNPM_V11_BUNDLE` naming the pnpm v11 bundle (`pnpm11/pnpm/dist/pnpm.mjs`),
+//! With `PNPM_V11_BUNDLE` naming the pnpm v11 bundle (`pnpm/test-oracles/node_modules/pnpm-v11/dist/pnpm.mjs`),
 //! every fixture also runs through v11, apart from the rows that set the
 //! v12-only `autoDedupe`, and each row's fresh v11 lockfile has to equal the
 //! v12 one.
 
+mod cyclic_locked_contexts;
+mod fast_update;
 mod harness;
+mod moving_providers;
+mod nested_retained_pins;
+mod new_project_pins;
+mod patched_retained_pins;
+mod ranged_provider_pins;
+mod same_name_peer_contexts;
 
-use harness::{Harness, Move, Project, project};
+use harness::{
+    Harness,
+    Move,
+    Project,
+    project,
+};
 
 #[test]
 fn satisfied_peer() {
@@ -310,3 +323,7 @@ fn peer_provided_by_another_projects_direct_dependency_moves() {
         vec![],
     );
 }
+
+mod retargeted_provider_removal;
+
+mod locked_provider_contexts;

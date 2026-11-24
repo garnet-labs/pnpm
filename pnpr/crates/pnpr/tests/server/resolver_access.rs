@@ -1,8 +1,31 @@
 use super::{
-    AuthState, Body, Bytes, Duration, HeaderValue, Infallible, IpNetwork, MaxUsers, Ordering,
-    PublicRoute, Request, ServiceExt, StatusCode, TempDir, body_bytes, body_json, config_for,
-    drain_resolve_response, git_resolve_request, header, json, router, router_with_auth,
-    spawn_counting_server, spawn_git_probe, stream, verify_lockfile_request,
+    AuthState,
+    Body,
+    Bytes,
+    Duration,
+    HeaderValue,
+    Infallible,
+    IpNetwork,
+    MaxUsers,
+    Ordering,
+    PublicRoute,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    body_bytes,
+    body_json,
+    config_for,
+    drain_resolve_response,
+    git_resolve_request,
+    header,
+    json,
+    router,
+    router_with_auth,
+    spawn_counting_server,
+    spawn_git_probe,
+    stream,
+    verify_lockfile_request,
 };
 use crate::tokens::issue_token;
 
@@ -31,7 +54,7 @@ async fn default_registration_cannot_mint_a_resolver_credential() {
     let registration = json!({
         "_id": "org.couchdb.user:outsider",
         "name": "outsider",
-        "password": "secret",
+        "password": "secret123",
         "email": "outsider@example.test",
         "type": "user",
         "roles": [],
@@ -172,12 +195,11 @@ async fn authenticated_resolve_preserves_git_dependencies() {
         .oneshot(git_resolve_request(&repo_url, Some(&format!("Bearer {token}"))))
         .await
         .unwrap();
-    assert_eq!(
+    assert!(
         response
             .headers()
             .get("pnpr-project-transforms")
-            .and_then(|value| value.to_str().ok()),
-        Some("1"),
+            .is_none(),
     );
     let (status, body) = drain_resolve_response(response).await;
 
@@ -187,7 +209,7 @@ async fn authenticated_resolve_preserves_git_dependencies() {
 }
 
 /// Mirrors the YAML rule at the programmatic layer: an upstream reachable
-/// without an `access:` gate may not send custom headers — any header can
+/// without an `access:` gate may not send custom headers, any header can
 /// carry a credential, and an ungated `/~<name>/` would let every caller
 /// spend it.
 #[tokio::test]
@@ -206,12 +228,12 @@ async fn resolver_only_serves_resolver_endpoints_and_refuses_registry_routes() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://upstream.invalid", tmp.path().to_path_buf());
     config.features.registry.enabled = false;
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     let app = router(config);
 
     // The resolver surface stays reachable. `/-/ping` and the capability
     // handshake answer 200; `/-/pnpr/v0/verify-lockfile` is mounted and gated,
-    // so an anonymous request is a 401 rather than a 404 (route absent) — that
+    // so an anonymous request is a 401 rather than a 404 (route absent), that
     // distinction is the point of the assertion.
     let ping = app
         .clone()
@@ -238,15 +260,8 @@ async fn resolver_only_serves_resolver_endpoints_and_refuses_registry_routes() {
         body_json(handshake.into_body()).await,
         json!({
             "pnpr": {
-                "versions": [0],
-                "artifacts": [],
-                "pipeline": [],
-                "fixLockfile": [0],
-                "ecosystems": ["npm", "cargo", "pypi"],
-                "publish": [],
                 "protocols": {
                     "resolver": {
-                        "version": 0,
                         "versions": [0],
                         "features": [
                             "fixLockfile",
@@ -256,34 +271,41 @@ async fn resolver_only_serves_resolver_endpoints_and_refuses_registry_routes() {
                             "errorCodes",
                             "acceptedLockfileFormats"
                         ],
-                        "ecosystems": ["npm", "cargo", "pypi"]
+                        "ecosystems": ["npm", "cargo", "pypi"],
+                        "experimental": false
                     },
                     "artifacts": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "compilerCache": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "pipeline": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "publish": {
-                        "version": 0,
                         "versions": [],
-                        "pnpmPublish": []
+                        "features": [],
+                        "experimental": false
+                    },
+                    "pnpmPublish": {
+                        "versions": [],
+                        "features": [],
+                        "experimental": false
+                    },
+                    "records": {
+                        "versions": [],
+                        "features": [],
+                        "experimental": false,
+                        "manifestProfiles": []
                     }
-                },
-                "features": {
-                    "registries": true,
-                    "admin": false,
-                    "scim": false,
-                    "signIn": false
-                },
-                "records": [],
-                "manifestProfiles": []
+                }
             }
         }),
     );
@@ -342,7 +364,7 @@ async fn resolver_only_serves_resolver_endpoints_and_refuses_registry_routes() {
     let registration = json!({
         "_id": "org.couchdb.user:alice",
         "name": "alice",
-        "password": "secret",
+        "password": "secret123",
         "email": "alice@example.test",
         "type": "user",
         "roles": [],
@@ -362,7 +384,7 @@ async fn resolver_only_serves_resolver_endpoints_and_refuses_registry_routes() {
         .as_str()
         .unwrap()
         .to_string();
-    // The `/~<prefix>/`-addressed twins answer too — they must not depend on
+    // The `/~<prefix>/`-addressed twins answer too; they must not depend on
     // the (absent) registry segment routes.
     for path in [
         "/-/whoami",
@@ -449,8 +471,8 @@ async fn registry_only_serves_registry_and_refuses_resolver_endpoints() {
         .unwrap();
     assert_eq!(packument.status(), StatusCode::OK);
 
-    // The registry tier has a pnpr protocol of its own — the cross-ecosystem
-    // publish transaction — so the handshake answers, and reports no resolver.
+    // The registry tier has a pnpr protocol of its own (the cross-ecosystem
+    // publish transaction) so the handshake answers, and reports no resolver.
     let handshake = app
         .clone()
         .oneshot(
@@ -465,52 +487,45 @@ async fn registry_only_serves_registry_and_refuses_resolver_endpoints() {
         body_json(handshake.into_body()).await,
         json!({
             "pnpr": {
-                "versions": [],
-                "artifacts": [],
-                "pipeline": [],
-                "fixLockfile": [],
-                "ecosystems": [],
-                "publish": [0],
                 "protocols": {
                     "resolver": {
-                        "version": 0,
                         "versions": [],
-                        "features": [
-                            "fixLockfile",
-                            "verifyLockfile",
-                            "projectTransforms",
-                            "policyEcho",
-                            "errorCodes",
-                            "acceptedLockfileFormats"
-                        ],
-                        "ecosystems": []
+                        "features": [],
+                        "ecosystems": [],
+                        "experimental": false
                     },
                     "artifacts": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "compilerCache": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "pipeline": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "publish": {
-                        "version": 0,
                         "versions": [0],
-                        "pnpmPublish": [1]
+                        "features": [],
+                        "experimental": false
+                    },
+                    "pnpmPublish": {
+                        "versions": [1],
+                        "features": [],
+                        "experimental": false
+                    },
+                    "records": {
+                        "versions": [],
+                        "features": [],
+                        "experimental": false,
+                        "manifestProfiles": []
                     }
-                },
-                "features": {
-                    "registries": true,
-                    "admin": false,
-                    "scim": false,
-                    "signIn": false
-                },
-                "records": [],
-                "manifestProfiles": []
+                }
             }
         }),
     );
@@ -636,7 +651,9 @@ async fn allowlisted_registry_egress(
     });
     config.routing.route_policy.allowed_private_networks = allowed_private_networks
         .iter()
-        .map(|network| IpNetwork::parse(network).unwrap())
+        .copied()
+        .map(IpNetwork::parse)
+        .map(Result::unwrap)
         .collect();
     let body = json!({
         "dependencies": { "carrier": "1.0.0" },
@@ -717,4 +734,48 @@ async fn git_does_not_connect_to_an_allowlisted_name_that_resolves_to_loopback()
     assert_eq!(status, StatusCode::OK);
     assert_eq!(request_count.load(Ordering::SeqCst), 0, "{body}");
     assert!(body.contains("which this client is not allowed to connect to"), "{body}");
+}
+
+#[tokio::test]
+async fn resolver_keeps_serving_after_configuration_cache_eviction() {
+    let tmp = TempDir::new().unwrap();
+    let auth = AuthState::in_memory();
+    let token = issue_token(&auth, "client").await;
+    let app = router_with_auth(config_for("http://127.0.0.1:1", tmp.path().to_path_buf()), auth);
+    for age in 0..1026 {
+        let path = if age % 2 == 0 { "resolve" } else { "verify-lockfile" };
+        let body = json!({
+            "minimumReleaseAge": age,
+            "frozenLockfile": true,
+            "ignoreManifestCheck": true,
+            "lockfile": {
+                "lockfileVersion": "9.0",
+                "settings": { "autoInstallPeers": true, "excludeLinksFromLockfile": false },
+                "importers": { ".": {} },
+            },
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/-/pnpr/v0/{path}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = drain_resolve_response(response).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "configuration {age}: {}",
+            String::from_utf8_lossy(&body),
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains(r#""type":"done""#),
+            "configuration {age}: {}",
+            String::from_utf8_lossy(&body),
+        );
+    }
 }

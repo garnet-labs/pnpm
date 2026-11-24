@@ -1,5 +1,5 @@
 //! `pacquet update --latest` over `jsr:` dependencies, ported from
-//! `pnpm11/installing/commands/test/update/jsr.ts`.
+//! [`pnpm11/installing/commands/test/update/jsr.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/installing/commands/test/update/jsr.ts).
 //!
 //! Upstream pins `latest` with `addDistTag` first; the fixture registry
 //! already serves 2.0.0 as the highest published version of
@@ -8,11 +8,25 @@
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_lockfile::{Lockfile, PkgName};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_lockfile::{
+    Lockfile,
+    PkgName,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
 use pretty_assertions::assert_eq;
-use std::{ffi::OsStr, fs, path::Path, process::Command};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
 /// `jsr:` specifiers resolve through the `@jsr` scope, which defaults to
@@ -219,7 +233,7 @@ fn update_jsr_alias_selector_targets_the_aliased_package() {
 
     // Pin the aliased package at 1.0.0 through an exact entry naming the
     // npm package the alias installs, then drop that entry so the alias is
-    // the only thing holding it — its ^1.0.0 range a fresh resolve answers
+    // the only thing holding it; its ^1.0.0 range a fresh resolve answers
     // with 1.1.0.
     write_manifest(
         &workspace,

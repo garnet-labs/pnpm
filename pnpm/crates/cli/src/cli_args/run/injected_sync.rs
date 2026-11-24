@@ -1,13 +1,25 @@
 //! `syncInjectedDepsAfterScripts` around one script: publish injected
 //! copies while it runs, then hardlink-sync them after it succeeds.
 
-use super::{RunContext, Value};
+use super::{
+    RunContext,
+    Value,
+};
 use pnpm_config::Config;
 use pnpm_injected_deps_syncer::{
-    BinLinkSettings, CopyFiles, InjectedEditWatch, ProjectModulesDir, SyncInjectedDeps,
-    injected_edit_sources, sync_injected_deps, watch_injected_edits,
+    BinLinkSettings,
+    CopyFiles,
+    InjectedEditWatch,
+    ProjectModulesDir,
+    SyncInjectedDeps,
+    injected_edit_sources,
+    sync_injected_deps,
+    watch_injected_edits,
 };
-use pnpm_workspace::{FindWorkspaceProjectsOpts, find_workspace_projects};
+use pnpm_workspace::{
+    FindWorkspaceProjectsOpts,
+    find_workspace_projects,
+};
 
 pub(super) fn start_injected_edit_watch(
     ctx: &RunContext<'_>,
@@ -85,8 +97,11 @@ fn injected_sync_opts<'a>(
         project_modules_dirs,
         bin_links: BinLinkSettings {
             modules_dir_name: ctx.config.modules_dir_name(),
-            extend_node_path: ctx.config.extend_node_path,
-            ignored_directories: ctx.config.managed_directories(),
+            link_options: pnpm_deps_restorer::shim_link_options(ctx.config, ctx.config.node_linker),
+            projects: pnpm_workspace::FindWorkspaceProjectsOpts {
+                patterns: ctx.config.workspace_package_patterns.clone(),
+                ignored_directories: ctx.config.managed_directories(),
+            },
         },
     }
 }

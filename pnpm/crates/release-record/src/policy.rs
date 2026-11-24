@@ -18,12 +18,23 @@
 
 use crate::{
     identity::Authority,
-    tuf::{TrustedRepository, TufError},
+    tuf::{
+        TrustedRepository,
+        TufError,
+    },
 };
-use chrono::{DateTime, Utc};
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
+use jiff::Timestamp;
 use pnpm_transparency_log::{
-    CheckpointPolicy, KeyAlgorithm, KeyError, KeySet, PolicyError, VerifierKey,
+    CheckpointPolicy,
+    KeyAlgorithm,
+    KeyError,
+    KeySet,
+    PolicyError,
+    VerifierKey,
 };
 use serde::Deserialize;
 
@@ -93,7 +104,7 @@ impl LogPolicy {
     pub fn from_repository(
         repository: &TrustedRepository,
         bytes: &[u8],
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<Self, LogPolicyError> {
         repository.verify_target(LOG_POLICY_TARGET, bytes, now).map_err(LogPolicyError::Tuf)?;
         LogPolicy::parse(bytes, *repository.first_root_digest())
@@ -122,7 +133,7 @@ impl LogPolicy {
         {
             return Err(LogPolicyError::InvalidStatementKey { key: key.key_name() });
         }
-        let authority = Authority::new(&document.log, first_root_digest);
+        let authority = Authority::new(document.log, first_root_digest);
         Ok(LogPolicy { authority, checkpoints, statement_keys })
     }
 

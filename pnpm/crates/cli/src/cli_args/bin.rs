@@ -1,6 +1,9 @@
 use super::global::GlobalError;
 use clap::Args;
-use pnpm_config::{Config, check_global_bin_dir};
+use pnpm_config::{
+    Config,
+    check_global_bin_dir,
+};
 use std::path::Path;
 
 /// Print the directory where pnpm installs executables.
@@ -33,8 +36,7 @@ impl BinArgs {
                 .applies_package_configs()
                 .then(|| pnpm_workspace::read_project_name(dir))
                 .flatten();
-            dir.join(config.modules_dir_name_for(dir, project_name.as_deref()))
-                .join(".bin")
+            config.project_modules_dir(dir, project_name.as_deref()).join(".bin")
         };
         pnpm_diagnostics::println!("{}", bin.display());
         Ok(())

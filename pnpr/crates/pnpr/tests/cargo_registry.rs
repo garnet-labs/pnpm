@@ -1,8 +1,14 @@
 //! The Cargo registry surface: sparse index, downloads, `cargo publish`,
 //! yank, and proxying an upstream sparse index and its downloads.
 
+#[path = "cargo_registry/caching.rs"]
+mod caching;
+
 #[path = "cargo_registry/behavior.rs"]
 mod behavior;
+
+#[path = "cargo_registry/owners.rs"]
+mod owners;
 
 #[path = "cargo_registry/publishing.rs"]
 mod publishing;
@@ -10,16 +16,40 @@ mod publishing;
 #[path = "cargo_registry/routing.rs"]
 mod routing;
 
-use crate::{ecosystem as common, registry_groups};
+use crate::{
+    ecosystem as common,
+    multi_ecosystem,
+};
 
 use axum::{
     body::Body,
-    http::{Request, StatusCode, header},
+    http::{
+        Request,
+        StatusCode,
+        header,
+    },
 };
-use common::{HostedSource, body_bytes, find_file, mixed_router_config, sha256_hex};
-use pnpr::{AuthState, Config, Ecosystem, router_with_auth};
-use serde_json::{Value, json};
-use std::{io::Write as _, path::PathBuf};
+use common::{
+    HostedSource,
+    body_bytes,
+    find_file,
+    mixed_router_config,
+    sha256_hex,
+};
+use pnpr::{
+    AuthState,
+    Config,
+    Ecosystem,
+    router_with_auth,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    io::Write as _,
+    path::PathBuf,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -32,7 +62,7 @@ fn cargo_config(storage: PathBuf, upstream_url: &str, hosted_access: &str) -> Co
         Ecosystem::Cargo,
         HostedSource {
             name: "crates",
-            org: "crates",
+            namespace: "crates",
             access: hosted_access,
             packages: &["demo", "inflector"],
         },

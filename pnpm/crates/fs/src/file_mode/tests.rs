@@ -1,21 +1,31 @@
-use super::{EXEC_MASK, EXEC_MODE, cas_path_is_executable, is_cas_file_path, is_executable};
+use super::{
+    EXEC_MASK,
+    EXEC_MODE,
+    cas_path_is_executable,
+    is_cas_file_path,
+    is_executable,
+};
+use pnpm_ffi_fs::FileMode;
 use std::path::Path;
-#[cfg(target_os = "linux")]
-use text_block_macros::text_block_fnl;
+
+/// A mode from its octal literal, so each case below still reads as one.
+fn mode(bits: u32) -> FileMode {
+    FileMode::from_mode(bits)
+}
 
 #[test]
 fn exec_constants_pin_pnpm_layout() {
     assert_eq!(EXEC_MASK, 0o111);
-    assert_eq!(EXEC_MODE, 0o755);
+    assert_eq!(EXEC_MODE.mode(), 0o755);
 }
 
 #[test]
 fn is_executable_matches_any_exec_bit() {
-    assert!(!is_executable(0o644));
-    assert!(is_executable(0o744));
-    assert!(is_executable(0o755));
-    assert!(is_executable(0o050));
-    assert!(is_executable(0o001));
+    assert!(!is_executable(mode(0o644)));
+    assert!(is_executable(mode(0o744)));
+    assert!(is_executable(mode(0o755)));
+    assert!(is_executable(mode(0o050)));
+    assert!(is_executable(mode(0o001)));
 }
 
 #[test]
@@ -49,7 +59,10 @@ fn is_cas_file_path_matches_the_store_layout_only() {
 fn set_path_permissions_refuses_symlinks() {
     use std::{
         fs,
-        os::unix::fs::{PermissionsExt, symlink},
+        os::unix::fs::{
+            PermissionsExt,
+            symlink,
+        },
     };
     let temporary = tempfile::tempdir().unwrap();
     let target = temporary.path().join("target");
@@ -57,7 +70,7 @@ fn set_path_permissions_refuses_symlinks() {
     fs::write(&target, "data").unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
     symlink(&target, &link).unwrap();
-    assert!(super::set_path_permissions(&link, 0o755).is_err());
+    assert!(super::set_path_permissions(&link, mode(0o755)).is_err());
     assert_eq!(
         fs::metadata(&target)
             .unwrap()
@@ -66,7 +79,7 @@ fn set_path_permissions_refuses_symlinks() {
             & 0o777,
         0o600,
     );
-    super::set_path_permissions(&target, 0o755).unwrap();
+    super::set_path_permissions(&target, mode(0o755)).unwrap();
     assert_eq!(
         fs::metadata(&target)
             .unwrap()
@@ -132,7 +145,10 @@ fn make_file_executable_fills_partial_bits_and_preserves_full() {
 #[test]
 fn restore_exec_bit_adds_bits_for_exec_suffix() {
     use super::restore_exec_bit_from_cas_suffix;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let tmp = tempfile::tempdir().expect("create tempdir");
     let cas_path = Path::new("files/1b/59d9-exec");
@@ -156,7 +172,10 @@ fn restore_exec_bit_adds_bits_for_exec_suffix() {
 #[test]
 fn restore_exec_bit_does_not_widen_non_exec_suffix() {
     use super::restore_exec_bit_from_cas_suffix;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let tmp = tempfile::tempdir().expect("create tempdir");
     let cas_path = Path::new("files/1b/59d9");
@@ -176,13 +195,13 @@ fn restore_exec_bit_does_not_widen_non_exec_suffix() {
 
 #[test]
 fn inherited_file_mode_copies_directory_rw_and_keeps_owner_access() {
-    assert_eq!(super::inherited_file_mode(0o2775, false) & 0o777, 0o664);
-    assert_eq!(super::inherited_file_mode(0o2775, true) & 0o777, 0o775);
-    assert_eq!(super::inherited_file_mode(0o755, false) & 0o777, 0o644);
-    assert_eq!(super::inherited_file_mode(0o700, false) & 0o777, 0o600);
-    assert_eq!(super::inherited_file_mode(0o2775, true) & 0o7000, 0);
-    assert_eq!(super::inherited_file_mode(0o1777, false) & 0o777, 0o664);
-    assert_eq!(super::inherited_file_mode(0o1777, true) & 0o777, 0o775);
+    assert_eq!(super::inherited_file_mode(mode(0o2775), false).mode() & 0o777, 0o664);
+    assert_eq!(super::inherited_file_mode(mode(0o2775), true).mode() & 0o777, 0o775);
+    assert_eq!(super::inherited_file_mode(mode(0o755), false).mode() & 0o777, 0o644);
+    assert_eq!(super::inherited_file_mode(mode(0o700), false).mode() & 0o777, 0o600);
+    assert_eq!(super::inherited_file_mode(mode(0o2775), true).mode() & 0o7000, 0);
+    assert_eq!(super::inherited_file_mode(mode(0o1777), false).mode() & 0o777, 0o664);
+    assert_eq!(super::inherited_file_mode(mode(0o1777), true).mode() & 0o777, 0o775);
 }
 
 /// pnpm/pnpm#16677: what a store write gives a file in a group- or
@@ -190,14 +209,19 @@ fn inherited_file_mode_copies_directory_rw_and_keeps_owner_access() {
 /// readable-and-writable store implies.
 #[test]
 fn store_inode_mode_is_linkable_ignores_group_and_other_write() {
-    use super::{store_entry_mode, store_inode_mode_is_linkable};
+    use super::{
+        Umask,
+        store_entry_mode,
+        store_inode_mode_is_linkable,
+    };
     for (dir_mode, umask) in [(0o777, 0o000), (0o1777, 0o000), (0o2775, 0o002), (0o2775, 0o022)] {
         for executable in [false, true] {
-            let mode = super::inherited_file_mode(dir_mode, executable);
-            let desired = store_entry_mode(executable, umask);
+            let entry = super::inherited_file_mode(mode(dir_mode), executable);
+            let desired = store_entry_mode(executable, Umask::from_mask(umask));
             assert!(
-                store_inode_mode_is_linkable(mode, desired),
-                "a {mode:o} entry from a {dir_mode:o} directory is linkable under umask {umask:o}",
+                store_inode_mode_is_linkable(entry, desired),
+                "a {:o} entry from a {dir_mode:o} directory is linkable under umask {umask:o}",
+                entry.mode(),
             );
         }
     }
@@ -205,40 +229,56 @@ fn store_inode_mode_is_linkable_ignores_group_and_other_write() {
 
 #[test]
 fn store_inode_mode_is_linkable_rejects_other_differences() {
-    use super::{store_entry_mode, store_inode_mode_is_linkable};
-    let plain_077 = store_entry_mode(false, 0o077);
-    let exec_077 = store_entry_mode(true, 0o077);
-    assert!(!store_inode_mode_is_linkable(0o644, plain_077), "extra read bits");
-    assert!(!store_inode_mode_is_linkable(0o755, exec_077), "extra read and execute bits");
-    assert!(!store_inode_mode_is_linkable(0o646, plain_077), "extra other-write");
+    use super::{
+        Umask,
+        store_entry_mode,
+        store_inode_mode_is_linkable,
+    };
+    let plain_077 = store_entry_mode(false, Umask::from_mask(0o077));
+    let exec_077 = store_entry_mode(true, Umask::from_mask(0o077));
+    assert!(!store_inode_mode_is_linkable(mode(0o644), plain_077), "extra read bits");
+    assert!(!store_inode_mode_is_linkable(mode(0o755), exec_077), "extra read and execute bits");
+    assert!(!store_inode_mode_is_linkable(mode(0o646), plain_077), "extra other-write");
     assert!(
-        !store_inode_mode_is_linkable(0o666, store_entry_mode(false, 0o022)),
+        !store_inode_mode_is_linkable(
+            mode(0o666),
+            store_entry_mode(false, Umask::from_mask(0o022))
+        ),
         "extra other-write",
     );
     assert!(
-        !store_inode_mode_is_linkable(0o600, store_entry_mode(false, 0o022)),
+        !store_inode_mode_is_linkable(
+            mode(0o600),
+            store_entry_mode(false, Umask::from_mask(0o022))
+        ),
         "missing read bits",
     );
     assert!(
-        !store_inode_mode_is_linkable(0o644, store_entry_mode(true, 0o022)),
+        !store_inode_mode_is_linkable(mode(0o644), store_entry_mode(true, Umask::from_mask(0o022))),
         "missing execute bits",
     );
     assert!(
-        !store_inode_mode_is_linkable(0o755, store_entry_mode(false, 0o022)),
+        !store_inode_mode_is_linkable(
+            mode(0o755),
+            store_entry_mode(false, Umask::from_mask(0o022))
+        ),
         "extra execute bits",
     );
     assert!(
-        !store_inode_mode_is_linkable(0o444, store_entry_mode(false, 0o022)),
+        !store_inode_mode_is_linkable(
+            mode(0o444),
+            store_entry_mode(false, Umask::from_mask(0o022))
+        ),
         "missing owner write",
     );
 }
 
 #[test]
 fn inherited_dir_bits_carry_group_access_with_group_write() {
-    assert_eq!(super::inherited_dir_bits(0o2775), 0o2070);
-    assert_eq!(super::inherited_dir_bits(0o770), 0o070);
-    assert_eq!(super::inherited_dir_bits(0o2750), 0o2050);
-    assert_eq!(super::inherited_dir_bits(0o755), 0);
+    assert_eq!(super::inherited_dir_bits(mode(0o2775)).mode(), 0o2070);
+    assert_eq!(super::inherited_dir_bits(mode(0o770)).mode(), 0o070);
+    assert_eq!(super::inherited_dir_bits(mode(0o2750)).mode(), 0o2050);
+    assert_eq!(super::inherited_dir_bits(mode(0o755)).mode(), 0);
 }
 
 /// A restrictive umask leaves a new directory at `0o700`. Granting only
@@ -247,7 +287,10 @@ fn inherited_dir_bits_carry_group_access_with_group_write() {
 #[cfg(unix)]
 #[test]
 fn grant_inherited_dir_mode_restores_group_search_under_restrictive_umask() {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
@@ -275,7 +318,10 @@ fn grant_inherited_dir_mode_restores_group_search_under_restrictive_umask() {
 #[cfg(unix)]
 #[test]
 fn grant_inherited_dir_mode_does_not_follow_a_swapped_symlink() {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("store");
@@ -302,16 +348,18 @@ fn grant_inherited_dir_mode_does_not_follow_a_swapped_symlink() {
 #[cfg(unix)]
 #[test]
 fn grant_inherited_dir_mode_refuses_a_swapped_fifo_without_blocking() {
-    use std::{ffi::CString, fs, os::unix::ffi::OsStrExt, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("store");
     fs::create_dir(&store).unwrap();
     fs::set_permissions(&store, fs::Permissions::from_mode(0o2775)).unwrap();
     let shard = store.join("ab");
-    let c_path = CString::new(shard.as_os_str().as_bytes()).unwrap();
-    // SAFETY: `c_path` is a valid NUL-terminated path.
-    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    pnpm_ffi_fs::create_fifo(&shard, pnpm_ffi_fs::FileMode::from_mode(0o600))
+        .expect("create the FIFO");
 
     let error = super::grant_inherited_dir_mode(&shard, &store).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
@@ -322,7 +370,10 @@ fn grant_inherited_dir_mode_refuses_a_swapped_fifo_without_blocking() {
 #[cfg(unix)]
 #[test]
 fn grant_inherited_dir_mode_reaches_a_directory_its_owner_cannot_read() {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
@@ -343,7 +394,10 @@ fn grant_inherited_dir_mode_reaches_a_directory_its_owner_cannot_read() {
 #[cfg(unix)]
 #[test]
 fn grant_inherited_dir_mode_rejects_unrelated_template_without_changes() {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let temporary = tempfile::tempdir().unwrap();
     let template = temporary.path().join("template");
@@ -374,7 +428,10 @@ fn grant_inherited_dir_mode_rejects_unrelated_template_without_changes() {
 fn grant_inherited_dir_mode_rejects_symlink_parent_escape() {
     use std::{
         fs,
-        os::unix::fs::{PermissionsExt, symlink},
+        os::unix::fs::{
+            PermissionsExt,
+            symlink,
+        },
     };
 
     let temporary = tempfile::tempdir().unwrap();
@@ -406,7 +463,10 @@ fn grant_inherited_dir_mode_rejects_symlink_parent_escape() {
 fn grant_inherited_dir_mode_refuses_intermediate_symlink() {
     use std::{
         fs,
-        os::unix::fs::{PermissionsExt, symlink},
+        os::unix::fs::{
+            PermissionsExt,
+            symlink,
+        },
     };
 
     let temporary = tempfile::tempdir().unwrap();
@@ -460,7 +520,10 @@ fn create_dir_all_inheriting_mode_rejects_parent_traversal_before_creation() {
 #[cfg(unix)]
 #[test]
 fn create_dir_all_inheriting_mode_accepts_existing_parent_traversal() {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let temporary = tempfile::tempdir().unwrap();
     fs::create_dir(temporary.path().join("workspace")).unwrap();
@@ -481,7 +544,10 @@ fn create_dir_all_inheriting_mode_accepts_existing_parent_traversal() {
 #[cfg(unix)]
 #[test]
 fn grant_inherited_dir_mode_accepts_relative_dot_template() {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
 
     let temporary = tempfile::tempdir_in(".").unwrap();
     let directory = temporary.path().join("child");
@@ -502,7 +568,7 @@ fn grant_inherited_dir_mode_accepts_relative_dot_template() {
             .permissions()
             .mode()
             & 0o7777,
-        0o700 | super::inherited_dir_bits(template_mode),
+        0o700 | super::inherited_dir_bits(mode(template_mode)).mode(),
     );
     assert_eq!(
         fs::metadata(".")
@@ -511,61 +577,4 @@ fn grant_inherited_dir_mode_accepts_relative_dot_template() {
             .mode(),
         template_mode,
     );
-}
-
-/// Pins that reading the mask leaves it as it was, which is what keeps a
-/// concurrent file creation from seeing an unmasked mode after the read.
-#[cfg(unix)]
-#[test]
-fn reading_the_mask_restores_it() {
-    let before = super::read_umask_by_writing_it();
-    let _ = super::current_umask();
-    assert_eq!(super::read_umask_by_writing_it(), before);
-}
-
-/// Pins that the published mask and the one read by writing it agree, so
-/// the Linux path cannot answer differently from the fallback every other
-/// target uses.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_published_mask_matches_the_one_read_by_writing_it() {
-    let by_writing = super::read_umask_by_writing_it();
-    match super::published_umask() {
-        Some(published) => assert_eq!(published, by_writing),
-        // No `procfs` to publish it, so what the read must hold to is the
-        // fallback's answer. Asserted rather than skipped, so the case is
-        // covered on a host that has it and on one that does not.
-        None => assert_eq!(super::read_umask(), by_writing),
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn an_octal_umask_line_parses() {
-    let status = text_block_fnl! {
-        "Name:\tpnpm"
-        "Umask:\t0022"
-        "State:\tR (running)"
-    };
-    assert_eq!(super::parse_published_umask(status), Some(0o022));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn a_status_without_the_line_parses_as_absent() {
-    let status = text_block_fnl! {
-        "Name:\tpnpm"
-        "State:\tR (running)"
-    };
-    assert_eq!(super::parse_published_umask(status), None);
-}
-
-/// A pre-4.7 kernel prints no `Umask:` line, and a value that is not octal
-/// would mean the field changed shape, so both read as absent and send the
-/// caller to the fallback rather than to a wrong mask.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_non_octal_umask_line_parses_as_absent() {
-    let status = text_block_fnl! { "Umask:\trw-r--r--" };
-    assert_eq!(super::parse_published_umask(status), None);
 }

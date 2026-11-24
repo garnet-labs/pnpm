@@ -1,8 +1,10 @@
-#[cfg(all(unix, not(target_os = "linux")))]
-use super::narrow_mode;
+use pnpm_ffi_fs::FileMode;
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// `create_dir_all` that, on Unix, gives each directory it creates the
@@ -10,7 +12,7 @@ use std::{
 /// existed. Directories that were already present are not modified.
 pub fn create_dir_all_inheriting_mode(dir: &Path) -> io::Result<()> {
     #[cfg(any(unix, target_os = "wasi"))]
-    let template = if dir.is_dir() { None } else { nearest_existing_ancestor(dir) };
+    let template = if dir.is_dir() { None } else { nearest_existing_ancestor(dir.to_path_buf()) };
     #[cfg(any(unix, target_os = "wasi"))]
     if let Some(template) = template.as_deref() {
         validate_permission_boundary(dir, template)?;
@@ -29,8 +31,8 @@ pub fn create_dir_all_inheriting_mode(dir: &Path) -> io::Result<()> {
 /// working directory exists. Returns `None` when nothing on the path is a
 /// directory.
 #[must_use]
-pub fn nearest_existing_ancestor(dir: &Path) -> Option<PathBuf> {
-    let mut current = dir.to_path_buf();
+pub fn nearest_existing_ancestor(dir: PathBuf) -> Option<PathBuf> {
+    let mut current = dir;
     loop {
         if current.as_os_str().is_empty() {
             let dot = PathBuf::from(".");
@@ -65,7 +67,7 @@ pub fn grant_inherited_dir_mode(dir: &Path, template: &Path) -> io::Result<()> {
         return Ok(());
     };
     let extra = inherited_dir_bits(template_mode);
-    if extra == 0 {
+    if extra.mode() == 0 {
         return Ok(());
     }
     #[cfg(unix)]
@@ -108,10 +110,9 @@ fn validate_permission_boundary(
 
 /// Mode of `path`, or `None` when it is missing or cannot be stated.
 #[cfg(unix)]
-fn reachable_mode(path: &Path) -> io::Result<Option<u32>> {
-    use std::os::unix::fs::PermissionsExt;
+fn reachable_mode(path: &Path) -> io::Result<Option<FileMode>> {
     match std::fs::metadata(path) {
-        Ok(meta) => Ok(Some(meta.permissions().mode())),
+        Ok(meta) => Ok(Some(FileMode::from_permissions(&meta.permissions()))),
         Err(error) if is_unchangeable(&error) || error.kind() == io::ErrorKind::NotFound => {
             Ok(None)
         }
@@ -120,19 +121,21 @@ fn reachable_mode(path: &Path) -> io::Result<Option<u32>> {
 }
 
 #[cfg(unix)]
-fn grant_unix_dir_mode(template: &Path, descendant: &Path, extra: u32) -> io::Result<()> {
+fn grant_unix_dir_mode(template: &Path, descendant: &Path, extra: FileMode) -> io::Result<()> {
     let mut parent = open_directory_anchor(template)?;
     for component in descendant.components() {
         let std::path::Component::Normal(name) = component else { continue };
-        let opened = crate::ensure_file::retry_on_fd_pressure(|| open_directory_at(&parent, name));
-        let (child, restricted) = match opened {
+        let opened = crate::ensure_file::retry_on_fd_pressure(|| {
+            pnpm_ffi_fs::open_directory_for_traversal(&parent, name)
+        });
+        let (child, access) = match opened {
             Ok(opened) => opened,
             Err(error) if is_unchangeable(&error) || error.kind() == io::ErrorKind::NotFound => {
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
-        add_opened_dir_mode_bits(&parent, name, &child, restricted, extra)?;
+        add_opened_dir_mode_bits(&parent, name, &child, access, extra)?;
         parent = child;
     }
     Ok(())
@@ -143,24 +146,24 @@ fn add_opened_dir_mode_bits(
     parent: &std::fs::File,
     name: &std::ffi::OsStr,
     child: &std::fs::File,
-    restricted: bool,
-    extra: u32,
+    access: pnpm_ffi_fs::DirectoryAccess,
+    extra: FileMode,
 ) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt as _;
+    let search_only = access == pnpm_ffi_fs::DirectoryAccess::SearchOnly;
     let meta = child.metadata()?;
-    // SAFETY: `geteuid` has no preconditions and does not mutate memory.
-    if restricted && meta.uid() != unsafe { libc::geteuid() } {
+    if search_only && meta.uid() != pnpm_ffi_process::effective_user_id() {
         return Ok(());
     }
-    let mode = meta.mode() & 0o7777;
-    let merged = mode | extra;
+    let mode = FileMode::from_permissions(&meta.permissions());
+    let merged = FileMode::from_mode(mode.mode() | extra.mode());
     if merged == mode {
         return Ok(());
     }
-    let result = if restricted {
-        chmod_restricted_directory(parent, name, child, merged)
+    let result = if search_only {
+        chmod_search_only_directory(parent, name, child, merged)
     } else {
-        child.set_permissions(std::fs::Permissions::from_mode(merged))
+        child.set_permissions(merged.into())
     };
     match result {
         Err(error) if is_unchangeable(&error) => Ok(()),
@@ -187,104 +190,40 @@ fn open_directory_anchor(path: &Path) -> io::Result<std::fs::File> {
 
 #[cfg(unix)]
 fn open_restricted_directory_anchor(path: &Path) -> io::Result<std::fs::File> {
-    use std::os::fd::FromRawFd;
-    let path = path_to_cstring(path)?;
-    crate::ensure_file::retry_on_fd_pressure(|| {
-        // SAFETY: the path is NUL-terminated and no creation mode is needed.
-        let fd =
-            unsafe { libc::open(path.as_ptr(), restricted_directory_flags() & !libc::O_NOFOLLOW) };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: successful open transfers ownership of this descriptor.
-            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-        }
-    })
-}
-
-#[cfg(unix)]
-fn open_directory_at(
-    parent: &std::fs::File,
-    name: &std::ffi::OsStr,
-) -> io::Result<(std::fs::File, bool)> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let name = path_to_cstring(Path::new(name))?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: the name is NUL-terminated and the parent descriptor stays open.
-    let mut fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    let restricted = fd < 0 && io::Error::last_os_error().kind() == io::ErrorKind::PermissionDenied;
-    if restricted {
-        // SAFETY: the name and parent descriptor remain valid; no creation mode is needed.
-        fd = unsafe {
-            libc::openat(parent.as_raw_fd(), name.as_ptr(), restricted_directory_flags())
-        };
-    }
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful open transfers ownership of this descriptor.
-    Ok((unsafe { std::fs::File::from_raw_fd(fd) }, restricted))
-}
-
-#[cfg(unix)]
-fn path_to_cstring(path: &Path) -> io::Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    crate::ensure_file::retry_on_fd_pressure(|| pnpm_ffi_fs::open_search_directory(path))
 }
 
 #[cfg(target_os = "linux")]
-fn restricted_directory_flags() -> libc::c_int {
-    libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
-}
-
-#[cfg(target_os = "macos")]
-fn restricted_directory_flags() -> libc::c_int {
-    libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn restricted_directory_flags() -> libc::c_int {
-    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
-}
-
-#[cfg(target_os = "linux")]
-fn chmod_restricted_directory(
+fn chmod_search_only_directory(
     _parent: &std::fs::File,
     _name: &std::ffi::OsStr,
     child: &std::fs::File,
-    mode: u32,
+    mode: FileMode,
 ) -> io::Result<()> {
-    use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
+    use std::os::unix::io::AsRawFd as _;
     let path = format!("/proc/self/fd/{}", child.as_raw_fd());
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    std::fs::set_permissions(path, mode.into())
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn chmod_restricted_directory(
+fn chmod_search_only_directory(
     parent: &std::fs::File,
     name: &std::ffi::OsStr,
     _child: &std::fs::File,
-    mode: u32,
+    mode: FileMode,
 ) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let name = path_to_cstring(Path::new(name))?;
-    let mode = narrow_mode::<libc::mode_t>(mode)?;
-    // SAFETY: name is NUL-terminated and parent stays open for the call.
-    let status = unsafe {
-        libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW)
-    };
-    if status == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    pnpm_ffi_fs::set_mode_at(parent, name, mode)
 }
 
 /// The group permission and setgid bits a new directory inherits from an
 /// ancestor with `template_mode`.
 #[must_use]
-pub fn inherited_dir_bits(template_mode: u32) -> u32 {
+pub fn inherited_dir_bits(template_mode: FileMode) -> FileMode {
+    let template_mode = template_mode.mode();
     if template_mode & (0o020 | 0o2000) == 0 {
-        return 0;
+        return FileMode::from_mode(0);
     }
-    template_mode & (0o070 | 0o2000)
+    FileMode::from_mode(template_mode & (0o070 | 0o2000))
 }
 
 #[cfg(any(unix, target_os = "wasi"))]
@@ -293,9 +232,9 @@ pub(super) fn is_unchangeable(error: &io::Error) -> bool {
 }
 
 #[cfg(target_os = "wasi")]
-fn reachable_mode(path: &Path) -> io::Result<Option<u32>> {
+fn reachable_mode(path: &Path) -> io::Result<Option<FileMode>> {
     match crate::copy_permissions(path) {
-        Ok(permissions) => Ok(Some(permissions.mode())),
+        Ok(permissions) => Ok(Some(FileMode::from_mode(permissions.mode()))),
         Err(error) if is_unchangeable(&error) || error.kind() == io::ErrorKind::NotFound => {
             Ok(None)
         }
@@ -304,8 +243,8 @@ fn reachable_mode(path: &Path) -> io::Result<Option<u32>> {
 }
 
 #[cfg(target_os = "wasi")]
-fn add_dir_mode_bits(path: &Path, template: &Path, extra: u32) -> io::Result<()> {
-    match crate::wasi_fs::grant_directory_mode_beneath(path, template, extra) {
+fn add_dir_mode_bits(path: &Path, template: &Path, extra: FileMode) -> io::Result<()> {
+    match crate::wasi_fs::grant_directory_mode_beneath(path, template, extra.mode()) {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::Unsupported => {}
         Err(error) if is_unchangeable(&error) || error.kind() == io::ErrorKind::NotFound => {
@@ -323,11 +262,12 @@ fn add_dir_mode_bits(path: &Path, template: &Path, extra: u32) -> io::Result<()>
     if !file.metadata()?.is_dir() {
         return Err(io::Error::from(io::ErrorKind::NotADirectory));
     }
-    let mode = crate::wasi_fs::file_mode(&file)? & 0o7777;
-    if mode | extra == mode {
+    let mode = FileMode::from_mode(crate::wasi_fs::file_mode(&file)?);
+    let merged = FileMode::from_mode(mode.mode() | extra.mode());
+    if merged == mode {
         return Ok(());
     }
-    match crate::wasi_fs::set_file_mode(&file, mode | extra) {
+    match crate::wasi_fs::set_file_mode(&file, merged.mode()) {
         Err(error) if is_unchangeable(&error) => Ok(()),
         result => result,
     }

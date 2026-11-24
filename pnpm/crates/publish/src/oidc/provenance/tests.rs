@@ -1,9 +1,23 @@
-use super::{DetermineProvenanceError, ProvenanceError, determine_provenance};
+use super::{
+    DetermineProvenanceError,
+    ProvenanceError,
+    determine_provenance,
+};
 use crate::{
-    capabilities::{EnvVar, OidcFetch, OidcFetchError, OidcMethod, OidcRequest, OidcResponse},
+    capabilities::{
+        EnvVar,
+        OidcFetch,
+        OidcFetchError,
+        OidcMethod,
+        OidcRequest,
+        OidcResponse,
+    },
     oidc::OidcHttpOptions,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::URL_SAFE_NO_PAD,
+};
 use pretty_assertions::assert_eq;
 
 const REGISTRY: &str = "https://registry.npmjs.org/";
@@ -294,7 +308,7 @@ fn visibility_failure_message_names_the_package_registry_and_reason() {
         ProvenanceError::failed_to_fetch_visibility(
             body,
             status,
-            "@pnpm/test-package",
+            "@pnpm/test-package".to_owned(),
             "https://registry.npmjs.org",
         )
         .to_string()

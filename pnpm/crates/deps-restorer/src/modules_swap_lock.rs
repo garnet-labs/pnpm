@@ -1,13 +1,16 @@
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Mutex,
     time::Duration,
 };
 
 /// How long an install waits for another install's linking phase under
-/// the same modules directory before it replaces unserialized, as the
-/// global virtual store slot lock does. A linking phase that runs
+/// the same modules directory before it replaces unserialized. A linking
+/// phase that runs
 /// longer than this, as a large cold install on a slow disk can, leaves
 /// the waiter to the tolerant swap, which accepts or replaces an
 /// equivalent concurrent import on its own.
@@ -21,10 +24,10 @@ const ABANDONED_AFTER: Duration = Duration::from_hours(2);
 /// one modules directory, so that two installs replacing the same
 /// directories at once take turns instead of undoing each other's work.
 ///
-/// Taken when a private import replaces or repairs a directory — on any
+/// Taken when a private import replaces or repairs a directory (on any
 /// forced import, when an incomplete directory is rebuilt, or when a
 /// lock-free rename into an absent target meets a directory another
-/// install placed first — and held until [`Self::release`]: at most one
+/// install placed first) and held until [`Self::release`]: at most one
 /// acquisition per linking phase, however many packages it imports, and
 /// none for an uncontended cold isolated install. The workers of one
 /// install share the held lock. The linking phase releases it before any
@@ -53,8 +56,8 @@ enum State {
 
 impl ModulesSwapLock {
     #[must_use]
-    pub fn new(modules_dir: &Path) -> Self {
-        ModulesSwapLock { modules_dir: modules_dir.to_path_buf(), state: Mutex::new(State::Free) }
+    pub fn new(modules_dir: PathBuf) -> Self {
+        ModulesSwapLock { modules_dir, state: Mutex::new(State::Free) }
     }
 
     /// Take the lock unless this install already holds it or already

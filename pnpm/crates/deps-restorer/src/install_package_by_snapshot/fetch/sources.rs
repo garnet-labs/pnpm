@@ -1,28 +1,43 @@
 use super::{
     super::{
-        InstallPackageBySnapshot, InstallPackageBySnapshotError, PNPM_EXECPATH,
-        runtime::{archive_filter_for, fetch_binary_resolution_to_cas},
-        tarball_resolution::{local_file_tarball_install_url, tarball_url_and_integrity},
-        variant_fetch::ArchiveSource,
+        InstallPackageBySnapshot,
+        InstallPackageBySnapshotError,
+        PNPM_EXECPATH,
+        runtime::{
+            archive_filter_for,
+            fetch_binary_resolution_to_cas,
+        },
+        tarball_resolution::{
+            local_file_tarball_install_url,
+            tarball_url_and_integrity,
+        },
     },
-    CustomFetched, ExtractedPackageMetadata, SnapshotFetch, TarballFetch, download_tarball,
+    CustomFetched,
+    ExtractedPackageMetadata,
+    SnapshotFetch,
+    TarballFetch,
+    download_tarball,
 };
 use crate::custom_fetcher::CustomFetchOutcome;
 use pnpm_config::PmOnFail;
-use pnpm_git_fetcher::{GitFetchOutput, GitFetcher, GitHostedTarballFetcher};
-use pnpm_lockfile::{BinaryResolution, LockfileResolution, PackageKey, PackageMetadata};
+use pnpm_git_fetcher::{
+    GitFetchOutput,
+    GitFetcher,
+    GitHostedTarballFetcher,
+};
+use pnpm_lockfile::{
+    BinaryResolution,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+};
 use pnpm_reporter::Reporter;
 use pnpm_store_dir::git_hosted_store_index_key;
 use pnpm_tarball::IngestTarballToStore;
-use std::{path::Path, sync::Arc};
-
-fn is_revision_addressed(resolution: &LockfileResolution) -> bool {
-    match resolution {
-        LockfileResolution::Tarball(tarball) => tarball.revision.is_some(),
-        LockfileResolution::Registry(registry) => registry.revision.is_some(),
-        _ => false,
-    }
-}
+use std::{
+    path::Path,
+    sync::Arc,
+};
 
 fn custom_fetch_options(
     package_key: &PackageKey,
@@ -158,7 +173,6 @@ impl InstallPackageBySnapshot<'_> {
                 package_key: fetch.package_key,
                 package_id: fetch.package_id,
                 allow_build: &allow_build,
-                source: ArchiveSource::Any,
             },
             tarball,
             cas_paths,
@@ -189,7 +203,7 @@ impl InstallPackageBySnapshot<'_> {
     ) -> Result<pnpm_fs::CasPaths, InstallPackageBySnapshotError> {
         let config = self.ctx.config;
         let built = !config.ignore_scripts
-            && allow_build(&fetch.package_key.without_peer().to_string()) != Some(false);
+            && allow_build(&fetch.package_key.without_peer().to_string()).unwrap_or(true);
         let files_index_file = git_hosted_store_index_key(fetch.package_id, built);
         let package_name = fetch.package_key.name.to_string();
         let GitFetchOutput { cas_paths, built: _built } = GitFetcher {
@@ -230,8 +244,7 @@ impl InstallPackageBySnapshot<'_> {
     ) -> Result<(Arc<pnpm_fs::CasPaths>, ExtractedPackageMetadata), InstallPackageBySnapshotError>
     {
         let config = self.ctx.config;
-        let revision_addressed =
-            is_revision_addressed(fetch.resolution) || fetch.source == ArchiveSource::Variant;
+        let revision_addressed = fetch.resolution.revision().is_some();
         let (tarball_url, integrity) =
             tarball_url_and_integrity(fetch.resolution, fetch.package_key, config)?;
         let tarball_url = local_file_tarball_install_url(tarball_url, self.ctx.workspace_root);
@@ -287,7 +300,7 @@ impl InstallPackageBySnapshot<'_> {
             fetch.package_id,
             !config.ignore_scripts
                 && (fetch.allow_build)(&fetch.package_key.without_peer().to_string())
-                    != Some(false),
+                    .unwrap_or(true),
         );
         let GitFetchOutput { cas_paths, built: _built } = GitHostedTarballFetcher {
             scripts: prepare_script_options(config),

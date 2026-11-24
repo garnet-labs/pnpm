@@ -24,7 +24,7 @@
 //!
 //! That prefetch is speculative, and a run may switch it off
 //! ([`PrefetchPolicy::downloads`]). Reading an archive whose resolution
-//! describes it only partly is not speculative — the lockfile records
+//! describes it only partly is not speculative, the lockfile records
 //! the hash the bytes yield, and the dependency walk reads the
 //! package's children out of the manifest inside. Such a read publishes
 //! its extraction too, so the install pass never downloads the archive a
@@ -34,27 +34,56 @@
 //! an unpinned tarball before that read can download it.
 
 use crate::install_package_from_registry::{
-    extract_tarball, manifest_file_count, manifest_unpacked_size,
+    extract_tarball,
+    manifest_file_count,
+    manifest_unpacked_size,
 };
-use dashmap::{DashMap, DashSet};
+use dashmap::{
+    DashMap,
+    DashSet,
+};
 use pnpm_config::Config;
-use pnpm_deps_restorer::{CustomFetcherSession, ResolvedTarballMetadata};
-use pnpm_lockfile::{LockfileResolution, is_git_hosted_tarball_url};
+use pnpm_deps_restorer::{
+    CustomFetcherSession,
+    ResolvedTarballMetadata,
+};
+use pnpm_lockfile::{
+    LockfileResolution,
+    is_git_hosted_tarball_url,
+};
 use pnpm_network::ThrottledClient;
 use pnpm_package_is_installable::{
-    SupportedArchitectures, WantedPlatformRef, platform_is_supported,
+    SupportedArchitectures,
+    WantedPlatformRef,
+    platform_is_supported,
 };
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::{
-    LatestQuery, ResolveFuture, ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver,
+    LatestQuery,
+    ResolveFuture,
+    ResolveLatestFuture,
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
     WantedDependency,
 };
-use pnpm_store_dir::{SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreIndexWriter};
+use pnpm_store_dir::{
+    SharedReadonlyStoreIndex,
+    SharedVerifiedFilesCache,
+    StoreIndexWriter,
+};
 use pnpm_tarball::{
-    ArchiveStoreProjection, IngestTarballToStore, MemCache, SharedReportedProgressKeys,
+    ArchiveStoreProjection,
+    IngestTarballToStore,
+    MemCache,
+    SharedReportedProgressKeys,
     package_mem_cache_key,
 };
-use std::{future::Future, marker::PhantomData, sync::Arc};
+use std::{
+    future::Future,
+    marker::PhantomData,
+    sync::Arc,
+};
 use tokio::sync::OnceCell;
 
 /// Borrowed-data bag handed to [`PrefetchingResolver::new`]. Everything
@@ -63,7 +92,7 @@ use tokio::sync::OnceCell;
 pub struct PrefetchContext<'a> {
     pub http_client: &'a Arc<ThrottledClient>,
     pub mem_cache: &'a Arc<MemCache>,
-    pub config: &'static Config,
+    pub config: &'a Config,
     pub requester: &'a str,
     pub supported_architectures: Option<&'a SupportedArchitectures>,
     /// Install-scoped set the background download records when it emits
@@ -93,13 +122,9 @@ pub struct PrefetchPolicy<'a> {
     pub tracked: Option<&'a Arc<crate::PrefetchDownloads>>,
 }
 
-/// Owned, `'static`-friendly clones of [`PrefetchContext`] stored on
-/// the wrapper. Every field is either an `Arc` clone or a `Copy`
-/// scalar so each [`tokio::spawn`]ed download task can capture an
-/// independent set without leaking lifetimes back into the resolver's
-/// type.
+/// Owned inputs shared by background downloads.
 struct OwnedFetchCtx {
-    config: &'static Config,
+    config: Arc<Config>,
     mem_cache: Arc<MemCache>,
     requester: Arc<str>,
     progress_reported: SharedReportedProgressKeys,
@@ -161,6 +186,26 @@ pub struct PrefetchingResolver<Reporter: self::Reporter> {
     _phantom: PhantomData<fn() -> Reporter>,
 }
 
+pub(super) struct DownloadClaimGuard<'a> {
+    spawned_downloads: &'a DashSet<String>,
+    key: Option<String>,
+}
+
+impl DownloadClaimGuard<'_> {
+    pub(super) fn settle<Value, Err>(mut self, result: Result<Value, Err>) -> Result<Value, Err> {
+        self.key = None;
+        result
+    }
+}
+
+impl Drop for DownloadClaimGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.spawned_downloads.remove(&key);
+        }
+    }
+}
+
 impl<Reporter: self::Reporter + 'static> PrefetchingResolver<Reporter> {
     /// Build a wrapper from the install orchestrator's borrowed
     /// references. Clones the necessary `Arc`s up front so the
@@ -185,7 +230,7 @@ impl<Reporter: self::Reporter + 'static> PrefetchingResolver<Reporter> {
     ///
     /// Non-tarball resolutions (git, directory, registry-shape,
     /// binary, variations) and resolutions missing a structured
-    /// `name@version` fall through to a no-op — the install path's
+    /// `name@version` fall through to a no-op, the install path's
     /// per-protocol code path handles them.
     ///
     /// The spawned task's result is dropped: the `MemCache` slot
@@ -290,12 +335,27 @@ impl<Reporter: self::Reporter + 'static> PrefetchingResolver<Reporter> {
         ))
     }
 
+    /// Claim `package_url` for a resolve-time read and release the claim on
+    /// drop unless the read finishes and calls [`DownloadClaimGuard::settle`].
+    fn claim_download_until_settled(
+        &self,
+        package_url: &str,
+        integrity: Option<&ssri::Integrity>,
+        revision_addressed: bool,
+    ) -> DownloadClaimGuard<'_> {
+        let key = integrity.and_then(|integrity| {
+            let key = package_mem_cache_key(package_url, Some(integrity), revision_addressed);
+            self.spawned_downloads.insert(key.clone()).then_some(key)
+        });
+        DownloadClaimGuard { spawned_downloads: &self.spawned_downloads, key }
+    }
+
     fn should_skip_prefetch(
         &self,
         wanted_dependency: &WantedDependency,
         result: &ResolveResult,
     ) -> bool {
-        if wanted_dependency.optional != Some(true) || !is_remote_tarball(&result.resolution) {
+        if !wanted_dependency.optional.unwrap_or(false) || !is_remote_tarball(&result.resolution) {
             return false;
         }
         let manifest = crate::platform_manifest_from_resolve_result(
@@ -339,7 +399,7 @@ impl OwnedFetchCtx {
                 url: package_url,
                 id: package_id,
             },
-            store: self.store.clone(),
+            store: self.store.borrowed(),
 
             requester: &self.requester,
 
@@ -368,7 +428,7 @@ fn owned_fetch_context(prefetch_ctx: &PrefetchContext<'_>) -> OwnedFetchCtx {
             },
     } = prefetch_ctx;
     OwnedFetchCtx {
-        config,
+        config: Arc::new((*config).clone()),
         mem_cache: Arc::clone(mem_cache),
         requester: Arc::<str>::from(*requester),
         progress_reported: SharedReportedProgressKeys::clone(progress_reported),
@@ -421,6 +481,10 @@ impl<Reporter: self::Reporter + 'static> Resolver for PrefetchingResolver<Report
     ) -> ResolveLatestFuture<'a> {
         self.inner.resolve_latest(query, opts)
     }
+
+    fn on_reused(&self, result: &ResolveResult) {
+        self.inner.on_reused(result);
+    }
 }
 
 fn is_remote_tarball(resolution: &LockfileResolution) -> bool {
@@ -436,12 +500,9 @@ mod tar_integrity;
 mod tests;
 
 impl PrefetchStoreRefs<'_> {
-    fn archive_context(
-        &self,
-        config: &'static Config,
-    ) -> pnpm_tarball::ArchiveStoreContext<'static> {
+    fn archive_context(&self, config: &Config) -> pnpm_tarball::ArchiveStoreContext<'static> {
         pnpm_tarball::ArchiveStoreContext {
-            dir: &config.store_dir,
+            dir: std::borrow::Cow::Owned(config.store_dir.clone()),
             index: self.index.cloned(),
             index_writer: self.index_writer.cloned(),
             verified_files_cache: SharedVerifiedFilesCache::clone(self.verified_files_cache),

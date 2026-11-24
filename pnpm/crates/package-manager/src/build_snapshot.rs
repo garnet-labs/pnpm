@@ -1,8 +1,20 @@
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_lockfile::{
-    LockfileResolution, PackageKey, PackageMetadata, ParsePkgVerPeerError, PkgName, PkgNameVerPeer,
-    PkgVerPeer, RegistryResolution, SnapshotDepRef, SnapshotEntry, TarballRevision,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    ParsePkgVerPeerError,
+    PkgName,
+    PkgNameVerPeer,
+    PkgVerPeer,
+    RegistryResolution,
+    SnapshotDepRef,
+    SnapshotEntry,
+    TarballRevision,
 };
 use pnpm_registry::PackageVersion;
 use pnpm_resolving_npm_resolver::InvalidTarballRevisionMetadataError;
@@ -87,6 +99,7 @@ pub fn build_package_snapshot(
     }
 
     let metadata = PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Registry(resolution),
         version: None,
         engines: None,
@@ -102,6 +115,7 @@ pub fn build_package_snapshot(
     };
 
     let snapshot = SnapshotEntry {
+        recorded_peer_bindings: None,
         id: None,
         dependencies: (!dependencies.is_empty()).then_some(dependencies),
         optional_dependencies: None,

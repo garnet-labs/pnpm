@@ -2,11 +2,35 @@ use futures_util::future;
 use pipe_trait::Pipe;
 
 use super::{
-    AncestorPkgIds, Arc, BTreeMap, ChildEdge, ChildrenOwnerClaim, ChildrenRecording, Cow,
-    DirectDep, NodeId, NodeSeed, ParentPkgAliases, PkgName, PkgNameVerPeer,
-    RecordedChildrenContext, ResolveDependencyTreeError, Resolver, ReuseSource, SnapshotDepRef,
-    SnapshotEntry, TreeChildren, TreeCtx, UpdateReuseScope, WantedDependency,
-    is_current_children_owner, level_aliases, node_id_for, record_children, resolve_node_seed,
+    AncestorPkgIds,
+    Arc,
+    BTreeMap,
+    ChildEdge,
+    ChildrenOwnerClaim,
+    ChildrenRecording,
+    Cow,
+    DirectDep,
+    NodeId,
+    NodeSeed,
+    ParentOrigin,
+    ParentPkgAliases,
+    PkgName,
+    PkgNameVerPeer,
+    RecordedChildrenContext,
+    ResolveDependencyTreeError,
+    Resolver,
+    ReuseSource,
+    SnapshotDepRef,
+    SnapshotEntry,
+    TreeChildren,
+    TreeCtx,
+    UpdateReuseScope,
+    WantedDependency,
+    is_current_children_owner,
+    level_aliases,
+    node_id_for,
+    record_children,
+    resolve_node_seed,
     walk_from_seeds,
 };
 
@@ -25,10 +49,16 @@ pub(super) struct ReusedNodeAncestry {
     pub(super) next_ancestors: AncestorPkgIds,
     pub(super) depth: i32,
     pub(super) current_is_optional: bool,
+    pub(super) non_local_parent: bool,
 }
 
 impl ReusedNodeAncestry {
-    pub(super) fn new(edge: &ChildEdge<'_>, id: &Arc<str>, current_is_optional: bool) -> Self {
+    pub(super) fn new(
+        edge: &ChildEdge<'_>,
+        id: &Arc<str>,
+        current_is_optional: bool,
+        non_local_parent: bool,
+    ) -> Self {
         Self {
             parent_ancestors: Arc::clone(edge.ancestor_ids),
             next_ancestors: Arc::new(
@@ -40,12 +70,13 @@ impl ReusedNodeAncestry {
             ),
             depth: edge.depth,
             current_is_optional,
+            non_local_parent,
         }
     }
 }
 
 /// Walk a reused node's children and record them, unless another occurrence
-/// owns them — then this node's children stay lazy.
+/// owns them; then this node's children stay lazy.
 pub(super) async fn reused_children<Chain>(
     ctx: &TreeCtx,
     resolver: &Chain,
@@ -129,6 +160,8 @@ where
                 ..WantedDependency::default()
             };
             let next_ancestors = Arc::clone(&context.ancestry.next_ancestors);
+            let reused_parent_id = Arc::clone(&context.dep.id);
+            let non_local_parent = context.ancestry.non_local_parent;
             let child_key = child_key.clone();
             let pick_overlay = base_overlay.clone();
             async move {
@@ -144,7 +177,11 @@ where
                         pick_overlay,
                         parent_dir: None,
                         parent_pkg_aliases: children_pkg_aliases,
-                        parent_is_workspace: false,
+                        parent_origin: if non_local_parent {
+                            ParentOrigin::NonLocal(&reused_parent_id)
+                        } else {
+                            ParentOrigin::RootOrLocal
+                        },
                     },
                 )
                 .await

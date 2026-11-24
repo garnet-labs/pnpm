@@ -1,15 +1,34 @@
-use std::{io::Write, marker::PhantomData, path::Path};
+use std::{
+    io::Write,
+    marker::PhantomData,
+    path::Path,
+};
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::{
     Config,
-    version_policy::{VersionPolicyError, merge_package_version_specs},
+    version_policy::{
+        VersionPolicyError,
+        merge_package_version_specs,
+    },
 };
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, PromptAction, PromptLog, Reporter};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    PromptAction,
+    PromptLog,
+    Reporter,
+};
 use pnpm_resolving_resolver_base::ResolutionPolicyViolation;
 use pnpm_workspace_manifest_writer::{
-    UpdateWorkspaceManifestError, UpdateWorkspaceManifestOptions, update_workspace_manifest,
+    UpdateWorkspaceManifestError,
+    UpdateWorkspaceManifestOptions,
+    update_workspace_manifest,
 };
 
 use pnpm_resolving_npm_resolver::MINIMUM_RELEASE_AGE_VIOLATION_CODE;
@@ -30,7 +49,7 @@ pub enum MinimumReleaseAgeError {
     #[diagnostic(
         code(ERR_PNPM_NO_MATURE_MATCHING_VERSION),
         help(
-            "Run the install interactively to approve these picks, add them to minimumReleaseAgeExclude in pnpm-workspace.yaml, or wait for the packages to mature."
+            "Run the install interactively to approve these picks, add them to minimumReleaseAgeExclude in pnpm-workspace.yaml, or wait for the packages to mature (move referenceTime forward if it is set)."
         )
     )]
     NoMatureMatchingVersion { message: String },
@@ -39,7 +58,7 @@ pub enum MinimumReleaseAgeError {
     #[diagnostic(
         code(ERR_PNPM_MINIMUM_RELEASE_AGE_DENIED),
         help(
-            "Re-run without minimumReleaseAgeStrict: true, or wait for the packages to mature past the configured cutoff."
+            "Re-run without minimumReleaseAgeStrict: true, or wait for the packages to mature past the configured cutoff (move referenceTime forward if it is set)."
         )
     )]
     Denied,
@@ -127,7 +146,8 @@ impl ApprovalPrompt for DialoguerPrompt {
             result
         })
         .await
-        .map_err(|error| dialoguer::Error::IO(std::io::Error::other(error)))?
+        .map_err(std::io::Error::other)
+        .map_err(dialoguer::Error::IO)?
     }
 }
 
@@ -157,7 +177,7 @@ where
         return persist_and_report_excludes::<ReporterImpl>(
             workspace_dir,
             &immature,
-            "(set minimumReleaseAgeStrict to true to gate these updates with a prompt)",
+            ExcludeReportMode::Loose,
         );
     }
 
@@ -186,37 +206,68 @@ where
     persist_and_report_excludes::<ReporterImpl>(
         workspace_dir,
         &immature,
-        "(approved at the prompt)",
+        ExcludeReportMode::ApprovedAtPrompt,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExcludeReportMode {
+    Loose,
+    ApprovedAtPrompt,
 }
 
 fn persist_and_report_excludes<ReporterImpl: Reporter>(
     workspace_dir: &Path,
     immature: &[&ResolutionPolicyViolation],
-    reason: &str,
+    mode: ExcludeReportMode,
 ) -> Result<(), MinimumReleaseAgeError> {
     let added: Vec<String> = immature
         .iter()
         .map(|violation| format!("{}@{}", violation.name, violation.version))
         .collect();
     let added = merge_package_version_specs(&added).map_err(MinimumReleaseAgeError::VersionPolicy)?;
+    write_and_report_excludes::<ReporterImpl>(workspace_dir, &added, mode)
+}
+
+/// Add release-age fallback picks that a loose resolution made to
+/// `minimumReleaseAgeExclude` and report them. `picks` are already merged
+/// `name@version || version` specs.
+pub fn persist_loose_release_age_picks<ReporterImpl: Reporter>(
+    workspace_dir: &Path,
+    picks: &[String],
+) -> Result<(), MinimumReleaseAgeError> {
+    write_and_report_excludes::<ReporterImpl>(workspace_dir, picks, ExcludeReportMode::Loose)
+}
+
+fn write_and_report_excludes<ReporterImpl: Reporter>(
+    workspace_dir: &Path,
+    added: &[String],
+    mode: ExcludeReportMode,
+) -> Result<(), MinimumReleaseAgeError> {
     update_workspace_manifest(
         workspace_dir,
         &UpdateWorkspaceManifestOptions {
-            added_minimum_release_age_excludes: &added,
+            added_minimum_release_age_excludes: added,
             ..Default::default()
         },
     )
     .map_err(MinimumReleaseAgeError::WriteWorkspaceManifest)?;
 
-    ReporterImpl::emit(&LogEvent::Pnpm(PnpmLog {
-        level: LogLevel::Info,
-        message: format!(
-            "Added {} {} to minimumReleaseAgeExclude in pnpm-workspace.yaml {reason}:\n  {}",
-            added.len(),
-            if added.len() == 1 { "entry" } else { "entries" },
+    let count = added.len();
+    let entry_word = if count == 1 { "entry" } else { "entries" };
+    let message = match mode {
+        ExcludeReportMode::Loose => format!(
+            "Added {count} {entry_word} to minimumReleaseAgeExclude in pnpm-workspace.yaml (set minimumReleaseAgeStrict to true to gate these updates with a prompt):\n  {}",
             added.join("\n  "),
         ),
+        ExcludeReportMode::ApprovedAtPrompt => format!(
+            "Added {count} {entry_word} to minimumReleaseAgeExclude in pnpm-workspace.yaml (approved at the prompt)",
+        ),
+    };
+
+    ReporterImpl::emit(&LogEvent::Pnpm(PnpmLog {
+        level: LogLevel::Info,
+        message,
         prefix: workspace_dir.to_string_lossy().into_owned(),
     }));
     Ok(())

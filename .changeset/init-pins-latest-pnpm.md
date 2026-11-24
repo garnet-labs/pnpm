@@ -1,8 +1,4 @@
 ---
-"@pnpm/engine.pm.commands": minor
-"@pnpm/store.connection-manager": minor
-"@pnpm/workspace.commands": minor
-"pacquet": minor
 "pnpm": minor
 ---
 

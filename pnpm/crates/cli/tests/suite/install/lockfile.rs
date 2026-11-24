@@ -1,14 +1,30 @@
 #[cfg(unix)]
 use super::set_dir_modes;
 use super::{
-    AddMockedRegistry, BIG_LOCKFILE, BIG_MANIFEST, CommandExtra, CommandTempCwd, OpenOptions,
-    STORE_VERSION, Write, assert_merged_conflicted_lockfile, flatten_report, fs,
-    new_pacquet_command, write_conflicted_lockfile_fixture,
+    AddMockedRegistry,
+    BIG_LOCKFILE,
+    BIG_MANIFEST,
+    CommandExtra,
+    CommandTempCwd,
+    OpenOptions,
+    STORE_VERSION,
+    Write,
+    assert_merged_conflicted_lockfile,
+    flatten_report,
+    fs,
+    new_pacquet_command,
+    write_conflicted_lockfile_fixture,
     write_required_incompatible_engine_fixture,
 };
 #[cfg(unix)]
-use super::{enable_gvs_in_workspace_yaml, is_symlink_or_junction};
-use assert_cmd::{assert::OutputAssertExt, cargo::CommandCargoExt};
+use super::{
+    enable_gvs_in_workspace_yaml,
+    is_symlink_or_junction,
+};
+use assert_cmd::{
+    assert::OutputAssertExt,
+    cargo::CommandCargoExt,
+};
 
 #[test]
 fn install_merges_git_conflicts_and_keeps_the_locked_version() {
@@ -161,8 +177,7 @@ fn fix_lockfile_regenerates_broken_metadata_without_changing_locked_versions() {
     fs::write(&lockfile_path, serde_saphyr::to_string(&broken).expect("serialize broken lockfile"))
         .expect("write broken lockfile");
 
-    let mut command = new_pacquet_command(&workspace);
-    command.env("CI", "true");
+    let command = new_pacquet_command(&workspace).with_env("CI", "true");
     command
         .with_args(["install", "--fix-lockfile", "--lockfile-only"])
         .assert()
@@ -296,6 +311,64 @@ fn filtered_fix_lockfile_preserves_unselected_snapshot_metadata() {
             .iter()
             .all(|key| { repaired_snapshots.get(key).is_some_and(|snapshot| snapshot.optional) }),
     );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn filtered_fix_lockfile_accepts_a_local_override_from_a_workspace_catalog() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\ncatalog:\n  '@pnpm.e2e/dep-of-pkg-with-1-dep': file:./vendor/helper\noverrides:\n  '@pnpm.e2e/pkg-with-1-dep>@pnpm.e2e/dep-of-pkg-with-1-dep': 'catalog:'\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "name": "root", "private": true }).to_string(),
+    )
+    .expect("write root manifest");
+    let helper = workspace.join("vendor/helper");
+    fs::create_dir_all(&helper).expect("create helper");
+    fs::write(
+        helper.join("package.json"),
+        serde_json::json!({ "name": "@pnpm.e2e/dep-of-pkg-with-1-dep", "version": "100.0.0" })
+            .to_string(),
+    )
+    .expect("write helper manifest");
+    let selected = workspace.join("packages/selected");
+    fs::create_dir_all(&selected).expect("create selected project");
+    fs::write(
+        selected.join("package.json"),
+        serde_json::json!({
+            "name": "selected",
+            "version": "1.0.0",
+            "dependencies": { "@pnpm.e2e/pkg-with-1-dep": "100.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write selected manifest");
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    assert!(
+        fs::read_to_string(&lockfile_path).expect("read lockfile").contains("vendor/helper"),
+        "the override must resolve to the local helper",
+    );
+
+    new_pacquet_command(&workspace)
+        .with_args(["--filter", "selected", "install", "--fix-lockfile", "--lockfile-only"])
+        .assert()
+        .success();
 
     drop((root, mock_instance));
 }
@@ -559,7 +632,8 @@ fn install_regenerates_lockfile_from_node_modules_when_wanted_is_missing() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
     let up_to_date = stderr
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .filter_map(Result::ok)
         .find(|record| {
             record.get("name").and_then(|v| v.as_str()) == Some("pnpm")
                 && record.get("level").and_then(|v| v.as_str()) == Some("info")
@@ -629,7 +703,8 @@ fn frozen_install_short_circuits_when_node_modules_is_up_to_date() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
     let up_to_date = stderr
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .filter_map(Result::ok)
         .find(|record| {
             record.get("name").and_then(|v| v.as_str()) == Some("pnpm")
                 && record.get("level").and_then(|v| v.as_str()) == Some("info")
@@ -660,9 +735,9 @@ fn frozen_install_short_circuits_when_node_modules_is_up_to_date() {
 /// This is the Rust parallel to the TypeScript end-to-end coverage that
 /// caught the equivalent worker-thread regression in pnpm
 /// (`@pnpm/worker` opened its own *writable* `StoreIndex` on every cache hit).
-/// pacquet has no analogous bug — frozen-store reads go through the immutable
+/// pacquet has no analogous bug, frozen-store reads go through the immutable
 /// [`StoreIndex::shared_immutable_in`] and every warm-path store write is
-/// either gated under `frozenStore` or best-effort — so there is no clean
+/// either gated under `frozenStore` or best-effort, so there is no clean
 /// hard-fail negative control here; the load-bearing assertion is that the
 /// install *succeeds* against a genuinely read-only store and mutates nothing.
 #[cfg(unix)]
@@ -695,7 +770,7 @@ fn frozen_store_installs_against_a_read_only_global_virtual_store() {
         .success();
 
     // Drop node_modules so the frozen run cannot take the up-to-date
-    // short-circuit — it must re-materialize from the store, which
+    // short-circuit; it must re-materialize from the store, which
     // exercises the read path against the now read-only index.
     eprintln!("Removing node_modules so the frozen install re-materializes...");
     fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
@@ -748,7 +823,7 @@ fn frozen_store_installs_against_a_read_only_global_virtual_store() {
         );
     }
 
-    // Restore writability so the TempDir can clean itself up — unlinking a
+    // Restore writability so the TempDir can clean itself up, unlinking a
     // file needs write permission on its *parent* directory.
     set_dir_modes(&store_dir, 0o755);
 

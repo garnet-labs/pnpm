@@ -1,6 +1,14 @@
 use super::{
-    dispatch::{CommandFuture, RunCtx, apply_update_config},
-    exec::{ExecArgs, ExecDirs},
+    catalog::CatalogArgs,
+    dispatch::{
+        CommandFuture,
+        RunCtx,
+        apply_update_config,
+    },
+    exec::{
+        ExecArgs,
+        ExecDirs,
+    },
     init::InitArgs,
     pkg::PkgArgs,
     restart::RestartArgs,
@@ -10,8 +18,15 @@ use super::{
 };
 use crate::cli_args::reporter::selected_reporter;
 use miette::Context;
-use pnpm_config::{Config, InitType};
-use pnpm_package_manifest::{InitAuthor, InitOptions, PackageManifest};
+use pnpm_config::{
+    Config,
+    InitType,
+};
+use pnpm_package_manifest::{
+    InitAuthor,
+    InitOptions,
+    PackageManifest,
+};
 
 // `init` looks the version it pins up on the registry, so unlike the other
 // manifest-only commands here it dispatches a real future rather than a
@@ -78,11 +93,26 @@ pub(super) fn pkg<'a>(ctx: &RunCtx<'a>, args: PkgArgs) -> miette::Result<Command
     Ok(Box::pin(std::future::ready(result)))
 }
 
+// `catalog` compares against the catalogs an install resolves through, so
+// the `updateConfig` hooks apply first.
+pub(super) fn catalog<'a>(
+    ctx: &RunCtx<'a>,
+    args: CatalogArgs,
+) -> miette::Result<CommandFuture<'a>> {
+    let config = (ctx.loaders.config)()?;
+    let pre_hook_config = config.clone();
+    let dir = ctx.locations.dir;
+    Ok(Box::pin(async move {
+        apply_update_config(config, dir).await?;
+        Box::pin(args.run(config, pre_hook_config, dir)).await
+    }))
+}
+
 pub(super) fn test<'a>(
     ctx: &RunCtx<'a>,
     args: ScriptShortcutArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    run(ctx, args.into_run_args("test", true))
+    run(ctx, args.into_run_args("test".to_owned()))
 }
 
 pub(super) fn run<'a>(ctx: &RunCtx<'a>, args: RunArgs) -> miette::Result<CommandFuture<'a>> {
@@ -221,25 +251,14 @@ pub(super) fn start<'a>(
     ctx: &RunCtx<'a>,
     args: ScriptShortcutArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    run(ctx, args.into_run_args("start", ctx.workspace.if_present))
+    run(ctx, args.into_run_args("start".to_owned()))
 }
 
 pub(super) fn stop<'a>(
     ctx: &RunCtx<'a>,
     args: ScriptShortcutArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    if ctx.workspace.recursive {
-        run(ctx, args.into_run_args("stop", ctx.workspace.if_present))
-    } else {
-        let config = (ctx.loaders.config)()?;
-        let dir = ctx.locations.dir;
-        let reporter = selected_reporter();
-        let if_present = ctx.workspace.if_present;
-        Ok(Box::pin(async move {
-            apply_update_config(config, dir).await?;
-            args.run("stop", if_present, dir, config, reporter)
-        }))
-    }
+    run(ctx, args.into_run_args("stop".to_owned()))
 }
 
 pub(super) fn restart<'a>(

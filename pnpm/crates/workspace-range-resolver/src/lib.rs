@@ -1,8 +1,9 @@
 //! Picks the best workspace-sibling version for one of the `workspace:`
-//! range tokens — `*`, `^`, `~`, the empty string, or an arbitrary
+//! range tokens, `*`, `^`, `~`, the empty string, or an arbitrary
 //! semver range.
 
-use node_semver::{Range, Version};
+use node_semver::Version;
+use pnpm_semver_include_prerelease::parse_strict_semver_range;
 
 /// Pick the highest workspace-sibling version matching `range`.
 ///
@@ -48,6 +49,18 @@ fn is_wildcard(range: &str) -> bool {
     matches!(range, "*" | "^" | "~" | "")
 }
 
+/// Whether the version part of a `workspace:` specifier admits every
+/// workspace version: a sentinel token, or a `||` union with one as a
+/// branch, such as `^ || ^2.0.0`. A plain semver range is not a
+/// `workspace:` specifier, so it keeps `*`'s prerelease exclusion.
+#[must_use]
+pub fn matches_any_workspace_version(range: &str) -> bool {
+    range
+        .split("||")
+        .map(str::trim)
+        .any(is_wildcard)
+}
+
 /// Highest version overall, including prereleases. Since `*` matches
 /// everything when prereleases are allowed, this collapses to a direct
 /// max over all parseable versions.
@@ -66,7 +79,7 @@ fn max_version_including_prerelease(versions: &[String]) -> Option<String> {
 /// Highest version satisfying `range`. Prereleases are excluded unless
 /// the range itself contains a prerelease tag.
 fn max_satisfying(versions: &[String], range: &str) -> Option<String> {
-    let parsed_range = Range::parse(range).ok()?;
+    let parsed_range = parse_strict_semver_range(range)?;
     let range_allows_prereleases = range_allows_prereleases(range);
     let mut best: Option<(Version, &str)> = None;
     for raw in versions {

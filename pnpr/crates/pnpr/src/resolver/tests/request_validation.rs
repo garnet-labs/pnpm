@@ -1,7 +1,29 @@
 use super::{
-    ResolveRequest, RouteContext, StatusCode, registry_config, reject_off_allowlist_fetches,
-    reject_unsafe_publish_directories, reject_unusable_resolve,
+    ResolveRequest,
+    RouteContext,
+    StatusCode,
+    registry_config,
+    reject_off_allowlist_fetches,
+    reject_unsafe_publish_directories,
+    reject_unusable_resolve,
 };
+use crate::resolver::{
+    parse_request,
+    protocol::{
+        CargoResolveRequest,
+        PypiResolveRequest,
+    },
+    request_validation::reject_local_dependency_specs,
+};
+
+async fn error_code(response: axum::response::Response) -> String {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    body["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
 
 #[test]
 fn reject_unsafe_publish_directories_only_refuses_escapes() {
@@ -60,7 +82,7 @@ fn reject_unusable_resolve_refuses_an_escaping_publish_directory() {
     // `resolve_npm_request` runs this chain before every resolve path, including
     // the frozen fast path that returns the caller's input lockfile without
     // walking the tree, so an escaping value cannot skip the check.
-    let response = reject_unusable_resolve(&request, &context)
+    let response = reject_unusable_resolve(&request, &context, 100)
         .expect("the request chain refuses an escaping publish directory");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
@@ -92,20 +114,136 @@ fn reject_off_allowlist_fetches_scans_catalogs() {
     assert!(reject_off_allowlist_fetches(&clean_catalog, &context).is_none());
 }
 
-#[test]
-fn reject_incompatible_lockfile_format_refuses_unsupported_versions() {
+#[tokio::test]
+async fn reject_incompatible_lockfile_format_refuses_unsupported_versions() {
     let context = RouteContext::from_config(&registry_config());
     let incompatible = serde_json::from_value::<ResolveRequest>(serde_json::json!({
-        "acceptedLockfileFormats": ["6.0", "7.0"]
+        "acceptedLockfileFormats": ["9.0", "pnpm-lock/13.0"]
     }))
     .expect("request parses");
-    let response = reject_unusable_resolve(&incompatible, &context)
+    let response = reject_unusable_resolve(&incompatible, &context, 100)
         .expect("incompatible lockfile format is rejected");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(response).await, "ERR_PNPR_INCOMPATIBLE_LOCKFILE_FORMAT");
 
     let compatible = serde_json::from_value::<ResolveRequest>(serde_json::json!({
-        "acceptedLockfileFormats": ["6.0", "9.0"]
+        "acceptedLockfileFormats": ["pnpm-lock/13.0", "pnpm-lock/9.0"]
     }))
     .expect("request parses");
-    assert!(reject_unusable_resolve(&compatible, &context).is_none());
+    assert!(reject_unusable_resolve(&compatible, &context, 100).is_none());
+}
+
+#[tokio::test]
+async fn parse_request_refuses_a_field_the_server_does_not_know() {
+    for body in [
+        serde_json::json!({ "futureResolutionSetting": true }),
+        serde_json::json!({ "projects": [{ "dir": ".", "futureProjectField": {} }] }),
+        serde_json::json!({ "projects": [{ "dir": ".", "publishConfig": { "access": "public" } }] }),
+    ] {
+        let response = parse_request::<ResolveRequest>(body.to_string().as_bytes())
+            .expect_err("unknown field is refused");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(response).await, "ERR_PNPR_UNSUPPORTED_REQUEST_FIELD");
+    }
+
+    let cargo = serde_json::json!({ "ecosystem": "cargo", "metadata": "{}", "features": [] });
+    let response = parse_request::<CargoResolveRequest>(cargo.to_string().as_bytes())
+        .expect_err("unknown cargo field is refused");
+    assert_eq!(error_code(response).await, "ERR_PNPR_UNSUPPORTED_REQUEST_FIELD");
+
+    let pypi = serde_json::json!({ "ecosystem": "pypi", "requirements": [], "extras": [] });
+    let response = parse_request::<PypiResolveRequest>(pypi.to_string().as_bytes())
+        .expect_err("unknown pypi field is refused");
+    assert_eq!(error_code(response).await, "ERR_PNPR_UNSUPPORTED_REQUEST_FIELD");
+}
+
+#[tokio::test]
+async fn parse_request_keeps_malformed_bodies_apart_from_unknown_fields() {
+    let response = parse_request::<ResolveRequest>(br#"{ "frozenLockfile": "yes" }"#)
+        .expect_err("a mistyped field is refused");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(response).await, "ERR_PNPR_BAD_REQUEST");
+}
+
+#[test]
+fn parse_request_accepts_the_fields_existing_clients_send() {
+    let body = serde_json::json!({
+        "ecosystem": "npm",
+        "nodeVersion": "22.0.0",
+        "os": "linux",
+        "arch": "x64",
+        "acceptedLockfileFormats": ["pnpm-lock/9.0"],
+    });
+    assert!(parse_request::<ResolveRequest>(body.to_string().as_bytes()).is_ok());
+}
+
+#[tokio::test]
+async fn reject_local_dependency_specs_refuses_host_filesystem_specs_across_request_fields() {
+    let context = RouteContext::from_config(&registry_config());
+    let parse = |body: serde_json::Value| {
+        serde_json::from_value::<ResolveRequest>(body).expect("resolve request parses")
+    };
+
+    for spec in [
+        "file:/path/on/server",
+        "file:../dir",
+        "file:./local.tgz",
+        "file:///path/on/server",
+        "link:/path/on/server",
+        "link:../dir",
+        "git+file:/path/on/server",
+        "git+file:///path/on/server",
+        "git+file://localhost/path/on/server",
+        "./local-dir",
+        "../local-dir",
+        "/path/on/server",
+        "~/local-dir",
+        "workspace:/path/on/server",
+        "workspace:../../../outside",
+        "npm:alias@file:../dir",
+    ] {
+        for body in [
+            serde_json::json!({ "dependencies": { "sneaky": spec } }),
+            serde_json::json!({ "devDependencies": { "sneaky": spec } }),
+            serde_json::json!({ "optionalDependencies": { "sneaky": spec } }),
+            serde_json::json!({ "peerDependencies": { "sneaky": spec } }),
+            serde_json::json!({ "projects": [{ "dir": "packages/app", "dependencies": { "sneaky": spec } }] }),
+            serde_json::json!({ "overrides": { "sneaky": spec } }),
+            serde_json::json!({ "overrides": { "parent>sneaky": { "nested": spec } } }),
+            serde_json::json!({ "catalogs": { "default": { "sneaky": spec } } }),
+            serde_json::json!({ "packageExtensions": { "foo@1": { "dependencies": { "sneaky": spec } } } }),
+        ] {
+            let request = parse(body);
+            let response =
+                reject_local_dependency_specs(&request).expect("local spec must be rejected");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "spec: {spec}");
+            assert_eq!(error_code(response).await, "ERR_PNPR_BAD_REQUEST");
+            let chain_response =
+                reject_unusable_resolve(&request, &context, 100).expect("chain must reject spec");
+            assert_eq!(chain_response.status(), StatusCode::BAD_REQUEST, "spec: {spec}");
+            assert_eq!(error_code(chain_response).await, "ERR_PNPR_BAD_REQUEST");
+        }
+    }
+
+    let allowed = parse(serde_json::json!({
+        "projects": [
+            { "dir": "packages/lib", "name": "@ws/lib", "version": "1.0.0" },
+            {
+                "dir": "packages/app",
+                "name": "@ws/app",
+                "version": "1.0.0",
+                "dependencies": {
+                    "@ws/lib": "workspace:*",
+                    "sibling": "workspace:../lib",
+                    "corp-pkg": "c:^1.0.0"
+                }
+            }
+        ],
+        "registries": {
+            "https://registry.npmjs.org/": { "prefix": "c" }
+        },
+        "overrides": { "target": "workspace:./packages/lib" },
+        "catalogs": { "default": { "is-positive": "^1.0.0" } }
+    }));
+    assert!(reject_local_dependency_specs(&allowed).is_none());
 }

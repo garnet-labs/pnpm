@@ -1,17 +1,34 @@
 use super::{
-    ManifestSpecBumps, OverriddenDeclarations, apply_manifest_spec_bumps, bumped_range,
+    ManifestSpecBumps,
+    OverriddenDeclarations,
+    apply_manifest_spec_bumps,
+    bumped_range,
     split_registry_alias,
 };
 use crate::VersionsOverrider;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config_parse_overrides::parse_overrides;
-use pnpm_lockfile::{ImporterDepVersion, Lockfile, PkgName, ResolvedDependencyMap};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_lockfile::{
+    ImporterDepVersion,
+    Lockfile,
+    PkgName,
+    ResolvedDependencyMap,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_registry::RangeSpecStyle;
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 fn lockfile(source: &str) -> Lockfile {
@@ -50,6 +67,11 @@ fn keeps_the_declared_range_operator() {
     assert_eq!(bump("~1.0.0", "1.0.3").as_deref(), Some("~1.0.3"));
     assert_eq!(bump("=1.0.0", "1.2.0").as_deref(), Some("=1.2.0"));
     assert_eq!(bump("1.0.0", "1.2.0").as_deref(), Some("1.2.0"));
+}
+
+#[test]
+fn registry_ranges_still_bump_without_runtime_provisioning() {
+    assert_eq!(bump("^1.0.0", "1.2.0").as_deref(), Some("^1.2.0"));
 }
 
 #[test]
@@ -115,11 +137,20 @@ fn a_declaration_without_a_range_is_left_alone() {
     assert_eq!(bump("npm:is-positive", "is-positive@3.1.0"), None);
 }
 
+#[cfg_attr(not(feature = "runtime-provisioning"), ignore = "requires runtime provisioning")]
 #[test]
 fn a_node_runtime_range_moves_under_its_prefix() {
     let bump_node = |declared, version| bump_under("node", declared, version);
     assert_eq!(bump_node("runtime:^26.8.2", "runtime:26.9.0").as_deref(), Some("runtime:^26.9.0"));
     assert_eq!(bump_node("runtime:~26.8.2", "runtime:26.8.5").as_deref(), Some("runtime:~26.8.5"));
+}
+
+#[cfg_attr(not(feature = "runtime-provisioning"), ignore = "requires runtime provisioning")]
+#[test]
+fn a_node_runtime_update_keeps_compatible_compound_ranges() {
+    for declaration in ["runtime:>= 20 <23", "runtime:^18 || ^22", "runtime:20 - 22"] {
+        assert_eq!(bump_under("node", declaration, "runtime:22.11.0"), None);
+    }
 }
 
 #[test]
@@ -128,6 +159,7 @@ fn a_node_runtime_declaration_that_already_names_the_version_is_left_alone() {
     assert_eq!(bump_under("node", "runtime:26.8.2", "runtime:26.8.2"), None);
 }
 
+#[cfg_attr(not(feature = "runtime-provisioning"), ignore = "requires runtime provisioning")]
 #[test]
 fn a_node_runtime_channel_is_dropped_unless_the_pick_is_a_prerelease() {
     let bump_node = |declared, version| bump_under("node", declared, version);
@@ -141,6 +173,7 @@ fn a_node_runtime_channel_is_dropped_unless_the_pick_is_a_prerelease() {
     );
 }
 
+#[cfg_attr(not(feature = "runtime-provisioning"), ignore = "requires runtime provisioning")]
 #[test]
 fn a_node_runtime_tag_is_pinned_to_the_pick() {
     assert_eq!(
@@ -154,6 +187,7 @@ fn a_node_runtime_declaration_with_an_unknown_channel_is_left_alone() {
     assert_eq!(bump_under("node", "runtime:unknown/^26.8.2", "runtime:26.9.0"), None);
 }
 
+#[cfg_attr(not(feature = "runtime-provisioning"), ignore = "requires runtime provisioning")]
 #[test]
 fn a_deno_or_bun_runtime_declaration_moves_its_range_and_leaves_tags_alone() {
     for alias in ["deno", "bun"] {
@@ -210,11 +244,13 @@ fn registry_aliases_split_into_the_prefix_they_keep() {
     let some = |prefix: &str, range: &str| Some((prefix.to_string(), range.to_string()));
     assert_eq!(split("^1.0.0"), some("", "^1.0.0"));
     assert_eq!(split("npm:foo@^1.0.0"), some("npm:foo@", "^1.0.0"));
+    assert_eq!(split("npm:foo@>=1.0.0 <2.0.0"), some("npm:foo@", ">=1.0.0 <2.0.0"));
     assert_eq!(split("npm:@scope/foo@^1.0.0"), some("npm:@scope/foo@", "^1.0.0"));
     assert_eq!(split("npm:^1.0.0"), some("npm:", "^1.0.0"));
     assert_eq!(split("npm:foo"), some("npm:foo@", ""));
     assert_eq!(split("jsr:^1.0.0"), some("jsr:", "^1.0.0"));
     assert_eq!(split("jsr:@scope/foo@^1.0.0"), some("jsr:@scope/foo@", "^1.0.0"));
+    assert_eq!(split("jsr:@scope/foo@>=1.0.0 <2.0.0"), some("jsr:@scope/foo@", ">=1.0.0 <2.0.0"));
     assert_eq!(split("jsr:@scope/foo"), some("jsr:@scope/foo@", ""));
     assert_eq!(split("workspace:^1.0.0"), None);
     assert_eq!(split("gh:^1.0.0"), None);
@@ -222,6 +258,7 @@ fn registry_aliases_split_into_the_prefix_they_keep() {
 
 /// `devEngines.runtime` reaches the update as a `runtime:` dependency under
 /// `devDependencies`.
+#[cfg_attr(not(feature = "runtime-provisioning"), ignore = "requires runtime provisioning")]
 #[test]
 fn a_runtime_bump_moves_the_lockfile_entry_and_reports_the_new_range() {
     let mut lockfile = lockfile(
@@ -337,8 +374,8 @@ importers:
 }
 
 /// The declared text is what the resolver read. When the lockfile entry
-/// carries something else — an override replaced the declaration before
-/// resolution — the entry is not the update's to move (pnpm/pnpm#12115).
+/// carries something else (an override replaced the declaration before
+/// resolution) the entry is not the update's to move (pnpm/pnpm#12115).
 #[test]
 fn a_declaration_an_override_replaced_is_left_alone() {
     let mut lockfile = lockfile(

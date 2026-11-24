@@ -1,6 +1,21 @@
 use super::{
-    Arc, AuthHeaders, BTreeMap, Config, IntoDiagnostic, Path, PathBuf, RegistryConfig, Result,
-    RetryOpts, StreamExt, ThrottledClient, TryStreamExt, fs, is_crates_io, registry_auth, stream,
+    Arc,
+    AuthHeaders,
+    BTreeMap,
+    Config,
+    IntoDiagnostic,
+    Path,
+    PathBuf,
+    RegistryConfig,
+    Result,
+    RetryOpts,
+    StreamExt,
+    ThrottledClient,
+    TryStreamExt,
+    fs,
+    is_crates_io,
+    registry_auth,
+    stream,
     validate_package_field,
 };
 use miette::WrapErr;
@@ -113,6 +128,7 @@ pub(crate) fn cargo_auth_headers(config: &Config) -> Result<Arc<AuthHeaders>> {
 pub(super) async fn fetch_sparse_index(
     config: &Config,
     metadata: &str,
+    preferred_versions: &BTreeMap<String, Vec<String>>,
     http_client: &Arc<ThrottledClient>,
 ) -> Result<BTreeMap<String, String>> {
     let auth_headers = cargo_auth_headers(config)?;
@@ -121,8 +137,13 @@ pub(super) async fn fetch_sparse_index(
     let mut index_files = BTreeMap::new();
 
     loop {
-        let missing = pnpm_cargo_resolver::missing_index_names(metadata, &index_files, &source)
-            .wrap_err("discover Cargo sparse-index files")?;
+        let missing = pnpm_cargo_resolver::missing_index_names_with_preferences(
+            metadata,
+            &index_files,
+            source.clone(),
+            preferred_versions,
+        )
+        .wrap_err("discover Cargo sparse-index files")?;
         if missing.is_empty() {
             return Ok(index_files);
         }

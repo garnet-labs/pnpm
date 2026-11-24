@@ -1,10 +1,22 @@
-use super::{get_bins_from_package_manifest, pkg_owns_bin};
-use crate::{capabilities::Host, path_util::lexical_normalize};
+use super::{
+    get_bins_from_package_manifest,
+    pkg_owns_bin,
+};
+use crate::{
+    capabilities::Host,
+    path_util::lexical_normalize,
+};
 use pipe_trait::Pipe;
 use serde_json::json;
 use std::{
-    fs::{create_dir_all, write as write_file},
-    path::{Path, PathBuf},
+    fs::{
+        create_dir_all,
+        write as write_file,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 use tempfile::tempdir;
 
@@ -208,6 +220,9 @@ fn directories_bin_walks_files_recursively() {
     let bin_dir = pkg.join("bin-dir");
     create_dir_all(bin_dir.join("subdir")).unwrap();
     write_file(bin_dir.join("rootBin.js"), "").unwrap();
+    create_dir_all(bin_dir.join(".hidden")).unwrap();
+    write_file(bin_dir.join(".hidden/nested"), "").unwrap();
+    write_file(bin_dir.join(".gitkeep"), "").unwrap();
     write_file(bin_dir.join("subdir/subBin.js"), "").unwrap();
 
     let manifest = json!({

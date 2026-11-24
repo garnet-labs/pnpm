@@ -1,16 +1,42 @@
-pub use self::package_settings::apply_config_dependency_settings;
+pub use self::{
+    catalogs::update_config_hook_catalogs,
+    package_settings::apply_config_dependency_settings,
+};
 
 use self::apply::apply_hook_delta;
 use super::{
-    Arc, BTreeMap, Config, HashMap, HookContext, HookLog, Host, IntoDiagnostic, LogEvent, LogFn,
-    LogLevel, Path, PathBuf, PnpmLog, PnpmfileHooks, Reporter, Result, TrustedSettings, Value,
-    WorkspaceSettings, apply_store_dir_override, default_state_dir, finder,
-    get_catalogs_from_workspace_manifest, install_config_deps, is_known_setting_key,
+    Arc,
+    BTreeMap,
+    Config,
+    HashMap,
+    HookContext,
+    HookLog,
+    Host,
+    IntoDiagnostic,
+    LogEvent,
+    LogFn,
+    LogLevel,
+    Path,
+    PathBuf,
+    PnpmLog,
+    PnpmfileHooks,
+    Reporter,
+    Result,
+    TrustedSettings,
+    Value,
+    WorkspaceSettings,
+    apply_store_dir_override,
+    default_state_dir,
+    finder,
+    get_catalogs_from_workspace_manifest,
+    install_config_deps,
+    is_known_setting_key,
     resolve_configured_state_dir,
 };
 use miette::WrapErr;
 use pnpm_hooks::IgnoredHook;
 use pnpm_network::redact_and_sanitize;
+use pnpm_reporter::GlobalLog;
 
 /// The pnpmfile paths that contribute hooks for `root_dir`, in
 /// application order (see [`finder::find_pnpmfiles`]). Every hook applies
@@ -37,7 +63,8 @@ pub fn may_update_config(config: &Config, root_dir: &Path) -> bool {
     }
     let has_config_plugin = config.config_dependencies
         .as_ref()
-        .is_some_and(|dependencies| dependencies.keys().any(|name| finder::is_plugin_name(name)));
+        .map(BTreeMap::keys)
+        .is_some_and(|mut keys| keys.any(|name| finder::is_plugin_name(name)));
     has_config_plugin
         || !finder::find_pnpmfiles(root_dir, pnpm_package_manager::pnpmfile_selection(config))
             .is_empty()
@@ -65,8 +92,8 @@ pub fn load_before_packing_hooks(
 ///
 /// The entry point for commands outside the install family, each of which
 /// resolves its own [`Config`]: pnpm applies `updateConfig` once per
-/// invocation, before the command runs, so a hook's settings — including
-/// `extraEnv` and `extraBinPaths` — reach every command's child processes.
+/// invocation, before the command runs, so a hook's settings (including
+/// `extraEnv` and `extraBinPaths`) reach every command's child processes.
 pub async fn prepare_config<Reporter: self::Reporter>(
     config: &mut Config,
     dir: &Path,
@@ -98,8 +125,8 @@ pub async fn prepare_config<Reporter: self::Reporter>(
 /// hook changes is applied back the same way `pnpm-workspace.yaml` is. Only
 /// the keys a hook actually changed are applied, so values resolved from
 /// `.npmrc` or CLI flags that the hooks leave untouched are not clobbered.
-/// The `catalog:`/`catalogs:` blocks — which pacquet models outside
-/// `WorkspaceSettings` — are seeded into the hook input and, when changed,
+/// The `catalog:`/`catalogs:` blocks (which pacquet models outside
+/// `WorkspaceSettings`) are seeded into the hook input and, when changed,
 /// captured into [`Config::catalogs`] for install and packing commands.
 pub async fn run_update_config_hooks<Reporter: self::Reporter>(
     config: &mut Config,
@@ -116,31 +143,181 @@ pub async fn run_update_config_hooks<Reporter: self::Reporter>(
         return Ok(hooks);
     }
 
-    let base_dir = hook_base_dir(root_dir)?;
+    let base_dir = hook_base_dir(config, root_dir)?;
     let mut input = TrustedSettings::from_resolved(config)
         .to_json()
         .into_diagnostic()
         .wrap_err("serialize the resolved settings for updateConfig hooks")?;
     seed_hook_input(&mut input, config, root_dir, &pnpmfiles, manifest_catalogs_value(root_dir)?)?;
 
-    let prefix = root_dir.to_string_lossy().into_owned();
-    let mut current = input.clone();
-    let mut ignored_hooks = Vec::new();
-    for (pnpmfile, hook) in pnpmfiles.iter().zip(&hooks) {
-        let ctx = HookContext { log: hook_logger::<Reporter>(pnpmfile, &prefix), dir: None };
-        current = hook
-            .update_config(current, ctx)
-            .await
-            .map_err(|err| miette::miette!("{err}"))
-            .wrap_err_with(|| format!("running updateConfig hook from {}", pnpmfile.display()))?;
-        ignored_hooks.push((pnpmfile.as_path(), hook.ignored_hooks().await));
-    }
-    warn_ignored_hooks::<Reporter>(&ignored_hooks, &prefix);
-
+    let current = execute_update_config_hooks::<Reporter>(
+        &pnpmfiles,
+        &hooks,
+        input.clone(),
+        root_dir,
+        IgnoredHookWarnings::Emit,
+    )
+    .await?;
     adopt_hook_catalogs(config, &current)?;
 
     apply_hook_delta(config, &input, &current, &base_dir)?;
+    warn_legacy_registries_for_config::<Reporter>(&input, &current, config);
     Ok(hooks)
+}
+
+/// Whether a hook run reports the hooks a pnpmfile defines but pnpm ignores.
+/// A repeated run skips them, so each warning appears once per command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoredHookWarnings {
+    Emit,
+    Skip,
+}
+
+async fn execute_update_config_hooks<Reporter: self::Reporter>(
+    pnpmfiles: &[PathBuf],
+    hooks: &[Arc<dyn PnpmfileHooks>],
+    mut current: Value,
+    root_dir: &Path,
+    warnings: IgnoredHookWarnings,
+) -> Result<Value> {
+    let prefix = root_dir.to_string_lossy().into_owned();
+    let mut ignored_hooks = Vec::new();
+    for (pnpmfile, hook) in pnpmfiles.iter().zip(hooks) {
+        let ctx = HookContext { log: hook_logger::<Reporter>(pnpmfile, prefix.clone()), dir: None };
+        current = hook
+            .update_config(current, ctx)
+            .await
+            .map_err(|err| update_config_hook_error(pnpmfile, err))?;
+        ignored_hooks.push((pnpmfile.as_path(), hook.ignored_hooks().await));
+    }
+    if warnings == IgnoredHookWarnings::Emit {
+        warn_ignored_hooks::<Reporter>(&ignored_hooks, &prefix);
+    }
+    Ok(current)
+}
+
+fn update_config_hook_error(pnpmfile: &Path, err: pnpm_hooks::HookError) -> miette::Report {
+    match err {
+        pnpm_hooks::HookError::ConfigIsUndefined { message } => {
+            miette::miette!(code = "ERR_PNPM_CONFIG_IS_UNDEFINED", "{message}")
+        }
+        other => {
+            let pnpmfile_display = pnpmfile.display();
+            miette::miette!(
+                code = "ERR_PNPM_PNPMFILE_FAIL",
+                "running updateConfig hook from {pnpmfile_display}: {other}",
+            )
+        }
+    }
+}
+
+pub(super) fn legacy_registries_warning(
+    input: &Value,
+    current: &Value,
+    final_routes: &BTreeMap<String, String>,
+) -> Option<String> {
+    if !has_legacy_registries_update(input, current) {
+        return None;
+    }
+    let routes = input.get("registriesByScope")?.as_object()?;
+    let legacy_routes = current.get("registries")?.as_object()?;
+    if !is_legacy_registry_map(legacy_routes) {
+        return None;
+    }
+    let default_route = legacy_routes.get("default").and_then(Value::as_str);
+    let unchanged_scopes =
+        unchanged_legacy_scopes(routes, legacy_routes, default_route, final_routes);
+    if unchanged_scopes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The updateConfig hook changed the `registries` setting, but these routes still use their configured registry: {}. Return `registriesByScope` to replace scope routing.",
+        unchanged_scopes.join(", "),
+    ))
+}
+
+fn has_legacy_registries_update(input: &Value, current: &Value) -> bool {
+    let scope_routes_changed = current
+        .get("registriesByScope")
+        .is_some_and(|routes| input.get("registriesByScope") != Some(routes));
+    input.get("registries") != current.get("registries") && !scope_routes_changed
+}
+
+fn is_legacy_registry_map(legacy_routes: &serde_json::Map<String, Value>) -> bool {
+    legacy_routes
+        .iter()
+        .all(|(key, value)| (key == "default" || key.starts_with('@')) && value.is_string())
+}
+
+fn unchanged_legacy_scopes<'a>(
+    routes: &'a serde_json::Map<String, Value>,
+    legacy_routes: &serde_json::Map<String, Value>,
+    default_route: Option<&str>,
+    final_routes: &BTreeMap<String, String>,
+) -> Vec<&'a str> {
+    routes
+        .iter()
+        .filter(|(scope, _)| {
+            expected_legacy_route(scope, legacy_routes, default_route)
+                .is_some_and(|expected| {
+                    final_routes
+                        .get(*scope)
+                        .is_some_and(|route| !same_registry_route(route, expected))
+                })
+        })
+        .map(|(scope, _)| scope.as_str())
+        .collect()
+}
+
+fn same_registry_route(left: &str, right: &str) -> bool {
+    normalized_registry_route(left) == normalized_registry_route(right)
+}
+
+fn normalized_registry_route(route: &str) -> String {
+    let mut normalized =
+        url::Url::parse(route).map(String::from).unwrap_or_else(|_| route.to_string());
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+fn expected_legacy_route<'a>(
+    scope: &str,
+    legacy_routes: &'a serde_json::Map<String, Value>,
+    default_route: Option<&'a str>,
+) -> Option<&'a str> {
+    if scope == "default" {
+        return None;
+    }
+    legacy_routes
+        .get(scope)
+        .and_then(Value::as_str)
+        .or_else(|| if scope == "@jsr" { None } else { default_route })
+}
+
+pub(super) fn warn_legacy_registries<Reporter: self::Reporter>(
+    input: &Value,
+    current: &Value,
+    final_routes: &BTreeMap<String, String>,
+) {
+    let Some(message) = legacy_registries_warning(input, current, final_routes) else {
+        return;
+    };
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }));
+}
+
+fn warn_legacy_registries_for_config<Reporter: self::Reporter>(
+    input: &Value,
+    current: &Value,
+    config: &Config,
+) {
+    if !has_legacy_registries_update(input, current) {
+        return;
+    }
+    let mut final_routes = config.resolved_registry_lookups().registries_by_scope;
+    final_routes.insert("default".to_string(), config.registry.clone());
+    warn_legacy_registries::<Reporter>(input, current, &final_routes);
 }
 
 fn warn_ignored_hooks<Reporter: self::Reporter>(
@@ -177,10 +354,18 @@ fn ignored_hook_warning(hook: IgnoredHook, pnpmfiles: &str) -> String {
 }
 
 /// The directory relative hook-output paths resolve against: the workspace
-/// manifest's, else the root.
-fn hook_base_dir(root_dir: &Path) -> Result<PathBuf> {
+/// manifest's for project commands that search for a workspace, else `root_dir`.
+fn hook_base_dir(config: &Config, root_dir: &Path) -> Result<PathBuf> {
+    if config.ignore_workspace
+        || config.cli.command_target == pnpm_config::CommandTarget::GlobalPackages
+    {
+        return Ok(root_dir.to_path_buf());
+    }
     Ok(match WorkspaceSettings::find_and_load(root_dir).into_diagnostic()? {
-        Some((path, _)) => path.parent().map_or_else(|| root_dir.to_path_buf(), Path::to_path_buf),
+        Some((path, _)) => path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root_dir.to_path_buf()),
         None => root_dir.to_path_buf(),
     })
 }
@@ -197,10 +382,12 @@ fn manifest_catalogs_value(root_dir: &Path) -> Result<Value> {
 }
 
 /// Settings that come only from trusted global config or its environment
-/// overlay: the machine-local backup policy, and the directories a symlinked
-/// lockfile may be written into. Repository-controlled hooks may neither read
-/// nor rewrite them.
-const HIDDEN_FROM_HOOKS: [&str; 2] = ["macosBackup", "symlinkedLockfileTargetDirs"];
+/// overlay: the machine-local backup policy, the directories a symlinked
+/// lockfile may be written into, and the settings of the global packages,
+/// which decide the builds a global install runs. Repository-controlled hooks
+/// may neither read nor rewrite them.
+const HIDDEN_FROM_HOOKS: [&str; 3] =
+    ["globalPackagesConfig", "macosBackup", "symlinkedLockfileTargetDirs"];
 
 /// Seed the hook input with the values pnpm resolves outside
 /// [`WorkspaceSettings`], so a hook can read and extend them. They are
@@ -279,24 +466,11 @@ fn resolved_config_views(
         set("registriesByPrefix", serde_json::to_value(&config.registries_by_prefix)?);
     }
 
-    // The raw auth keys, plus the registry rows resolved across every
-    // source, so `authConfig.registry` and `authConfig['@scope:registry']`
-    // answer the URL the install fetches from rather than whichever
-    // `.npmrc` line happened to name one. `pnpm config list` merges them
-    // the same way.
-    let mut auth_config: serde_json::Map<String, Value> = config.raw_auth_config
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect();
-    for (scope, url) in &registries_by_scope {
-        let key =
-            if scope == "default" { "registry".to_string() } else { format!("{scope}:registry") };
-        auth_config.insert(key, Value::String(url.clone()));
-    }
-    set("authConfig", Value::Object(auth_config));
+    set("authConfig", resolved_auth_config(config, &registries_by_scope));
     set("configByUri", serde_json::to_value(&config.registry_creds_by_uri)?);
 
-    set("dir", Value::String(root_dir.to_string_lossy().into_owned()));
+    let dir = if config.dir.as_os_str().is_empty() { root_dir } else { &config.dir };
+    set("dir", Value::String(dir.to_string_lossy().into_owned()));
     set("workspaceDir", serde_json::to_value(&config.workspace_dir)?);
     set("configDir", serde_json::to_value(&config.config_dir)?);
     set("globalPkgDir", serde_json::to_value(&config.global_pkg_dir)?);
@@ -320,6 +494,23 @@ fn resolved_config_views(
     Ok(views)
 }
 
+/// The raw auth keys, plus the registry rows resolved across every source,
+/// so `authConfig.registry` and `authConfig['@scope:registry']` answer the
+/// URL the install fetches from rather than whichever `.npmrc` line happened
+/// to name one. `pnpm config list` merges them the same way.
+fn resolved_auth_config(config: &Config, registries_by_scope: &BTreeMap<String, String>) -> Value {
+    let mut auth_config: serde_json::Map<String, Value> = config.raw_auth_config
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    for (scope, url) in registries_by_scope {
+        let key =
+            if scope == "default" { "registry".to_string() } else { format!("{scope}:registry") };
+        auth_config.insert(key, Value::String(url.clone()));
+    }
+    Value::Object(auth_config)
+}
+
 /// The keys whose value the hooks changed between the serialized input
 /// config and the hooks' output.
 pub(super) fn config_delta(input: &Value, output: &Value) -> Value {
@@ -337,9 +528,8 @@ pub(super) fn config_delta(input: &Value, output: &Value) -> Value {
 
 /// A `context.log(...)` sink that forwards each hook log line to the
 /// `pnpm:hook` channel, tagged with the pnpmfile it came from.
-fn hook_logger<Reporter: self::Reporter>(pnpmfile: &Path, prefix: &str) -> LogFn {
+fn hook_logger<Reporter: self::Reporter>(pnpmfile: &Path, prefix: String) -> LogFn {
     let from = pnpmfile.to_string_lossy().into_owned();
-    let prefix = prefix.to_owned();
     Arc::new(move |message| {
         Reporter::emit(&LogEvent::Hook(HookLog {
             level: LogLevel::Debug,
@@ -353,19 +543,12 @@ fn hook_logger<Reporter: self::Reporter>(pnpmfile: &Path, prefix: &str) -> LogFn
 
 /// Hook output replaces the seeded catalogs, including removed entries.
 fn adopt_hook_catalogs(config: &mut Config, current: &Value) -> Result<()> {
-    config.catalogs = Some(
-        current
-            .get("catalogs")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .into_diagnostic()
-            .wrap_err("the updateConfig hook produced an invalid catalogs value")?
-            .unwrap_or_default(),
-    );
-
+    config.catalogs = Some(catalogs::hook_output_catalogs(current)?);
     Ok(())
 }
 
 mod apply;
+mod catalogs;
+mod hook_added_overrides;
+mod node_linker_aliases;
 mod package_settings;

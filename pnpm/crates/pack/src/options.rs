@@ -1,6 +1,14 @@
 use super::{
-    Arc, Catalogs, HashMap, NodeLinker, Path, PathBuf, PnpmfileHooks, WorkspacePackageManifest,
-    lexical_normalize,
+    Arc,
+    Catalogs,
+    HashMap,
+    HashSet,
+    NodeLinker,
+    Path,
+    PathBuf,
+    PnpmfileHooks,
+    WorkspacePackageManifest,
+    canonicalize_output_key,
 };
 
 /// Inputs for [`crate::api`]. The CLI maps the resolved [`pnpm_config::Config`]
@@ -56,6 +64,8 @@ pub struct PackManifestOptions {
     pub before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     /// Workspace packages lookup used when a dependency is not installed in `node_modules`.
     pub workspace_packages: Option<Arc<HashMap<String, WorkspacePackageManifest>>>,
+    /// See [`pnpm_exportable_manifest::WorkspacePackageLookup::prefer_workspace_for`].
+    pub bumped_workspace_packages: Option<Arc<HashSet<String>>>,
 }
 
 pub struct PackOutputOptions {
@@ -63,6 +73,9 @@ pub struct PackOutputOptions {
     pub gzip_level: Option<u32>,
     /// Do everything except writing the tarball to disk.
     pub dry_run: bool,
+    /// Base directory relative `destination` / `out` paths (and the default
+    /// output directory) resolve against; `None` uses the packed directory.
+    pub base_dir: Option<PathBuf>,
     /// Directory to write the tarball into.
     pub destination: Option<String>,
     /// Custom output path template (`%s` = name, `%v` = version).
@@ -81,18 +94,36 @@ pub struct PackOutputOptions {
 #[derive(Default)]
 pub struct PackOutputLocks {
     by_path: tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    canonical_dirs: std::sync::Mutex<HashMap<PathBuf, PathBuf>>,
 }
 
 impl PackOutputLocks {
     pub(super) async fn lock(&self, path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = self.resolve_lock_key(path);
         let lock = {
             let mut by_path = self.by_path.lock().await;
-            Arc::clone(
-                by_path
-                    .entry(lexical_normalize(path))
-                    .or_default(),
-            )
+            Arc::clone(by_path.entry(key).or_default())
         };
         lock.lock_owned().await
+    }
+
+    fn resolve_lock_key(&self, path: &Path) -> PathBuf {
+        let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+            return canonicalize_output_key(path);
+        };
+        let cached = self.canonical_dirs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(parent)
+            .cloned();
+        if let Some(dir) = cached {
+            return dir.join(file_name);
+        }
+        let resolved = canonicalize_output_key(parent);
+        self.canonical_dirs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.to_path_buf(), resolved.clone());
+        resolved.join(file_name)
     }
 }

@@ -1,21 +1,51 @@
 use super::{
-    AddError, AddOptions, AddOwned, AddResolution, AddResolveInputs, resolve_added_dependency,
+    AddError,
+    AddOptions,
+    AddOwned,
+    AddResolution,
+    AddResolveInputs,
+    prepared_manifest::{
+        PickedVersion,
+        PreparedManifest,
+    },
+    resolve_added_dependency,
     workspace_projects_for_add,
 };
 use crate::{
-    CatalogDecision, DIRECT_GROUPS, DiscoveredWorkspace,
-    catalog_cleanup::{write_workspace_catalogs, write_workspace_catalogs_selected},
+    CatalogDecision,
+    DIRECT_GROUPS,
+    DiscoveredWorkspace,
+    catalog_cleanup::{
+        write_workspace_catalogs,
+        write_workspace_catalogs_selected,
+    },
     emit_initial_package_manifest,
 };
-use futures_util::{StreamExt, stream::FuturesOrdered};
+use futures_util::{
+    StreamExt,
+    stream::FuturesOrdered,
+};
 use pnpm_catalogs_config::get_catalogs_from_workspace_manifest;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{Config, SaveWorkspaceProtocol};
+use pnpm_config::{
+    Config,
+    SaveWorkspaceProtocol,
+};
 use pnpm_lockfile::Lockfile;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::PreferredVersions;
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{
+        BTreeSet,
+        HashSet,
+    },
+    path::PathBuf,
+    sync::Arc,
+};
 
 pub(super) async fn prepare_selected_add<Reporter: self::Reporter>(
     projects: &mut [pnpm_workspace::Project],
@@ -39,7 +69,7 @@ pub(super) async fn prepare_single_add<Reporter: self::Reporter>(
     owned: &AddOwned,
     manifest: &mut PackageManifest,
 ) -> Result<SingleAddPreparation, AddError> {
-    let resolution = AddResolution::new();
+    let resolution = AddResolution::new(add.config);
     let catalog_ctx = read_catalog_ctx(manifest, add.config)?;
     let mut workspace_projects =
         walk_workspace_for_add(add, owned, &catalog_ctx.catalogs, manifest);
@@ -177,6 +207,7 @@ pub(super) struct SelectedAddPreparation {
     pub(super) updated_catalogs: Catalogs,
     /// One list per selected project, in selection order.
     pub(super) picked_versions: Vec<Vec<PickedVersion>>,
+    pub(super) requested_aliases: Vec<BTreeSet<String>>,
     pub(super) catalogs_override: Option<Catalogs>,
     pub(super) workspace_dir: PathBuf,
 }
@@ -191,11 +222,12 @@ pub(super) async fn prepare_selected_manifests<Reporter: self::Reporter>(
     let mut catalogs = catalog_ctx.catalogs;
     let mut updated_catalogs = Catalogs::new();
     let mut picked_versions = Vec::with_capacity(selected_indices.len());
+    let mut requested_aliases = Vec::with_capacity(selected_indices.len());
     // One resolution across every selected
     // project: the picker is created on first use (a selection that resolves
     // no `latest` tag never builds one), and the shared caches keep the same
     // package from being fetched once per project.
-    let resolution = AddResolution::new();
+    let resolution = AddResolution::new(add.config);
     // Indexed once, before the loop mutates any manifest: a
     // `workspace:` request saved into project A resolves against the
     // versions the projects declared on entry, not against a sibling
@@ -222,6 +254,7 @@ pub(super) async fn prepare_selected_manifests<Reporter: self::Reporter>(
         merge_catalogs(&mut catalogs, &prepared.updated_catalogs);
         merge_catalogs(&mut updated_catalogs, &prepared.updated_catalogs);
         picked_versions.push(prepared.picked_versions);
+        requested_aliases.push(prepared.requested_aliases);
     }
 
     let catalogs_override = (!updated_catalogs.is_empty()).then_some(catalogs.clone());
@@ -229,6 +262,7 @@ pub(super) async fn prepare_selected_manifests<Reporter: self::Reporter>(
         catalogs,
         updated_catalogs,
         picked_versions,
+        requested_aliases,
         catalogs_override,
         workspace_dir: catalog_ctx.workspace_dir,
     })
@@ -246,20 +280,6 @@ pub(super) fn guess_dependency_group(
                 .dependencies([group])
                 .any(|(dep, _)| dep == name)
         })
-}
-/// What [`prepare_manifest`] decided beyond the manifest it rewrote.
-pub(super) struct PreparedManifest {
-    pub(super) updated_catalogs: Catalogs,
-    pub(super) picked_versions: Vec<PickedVersion>,
-}
-/// The version an explicit registry specifier for `alias` resolved to, and
-/// the specifier the manifest saves for it.
-pub(super) struct PickedVersion {
-    pub(super) alias: String,
-    /// The registry name the version belongs to.
-    pub(super) name: String,
-    pub(super) version: String,
-    pub(super) specifier: String,
 }
 /// Resolve every selector against `catalogs` concurrently, then apply them
 /// to `manifest`.
@@ -311,30 +331,6 @@ pub(super) async fn prepare_manifest<Reporter: self::Reporter>(
             .map_err(AddError::AddDependencyToManifest)?;
     }
     Ok(PreparedManifest::collect(resolved_dependencies.into_iter().chain(types_dependencies)))
-}
-impl PreparedManifest {
-    /// An exact saved specifier already names the picked version, so it needs
-    /// no seed.
-    fn collect(
-        dependencies: impl IntoIterator<Item = super::specifier::ResolvedAddedDependency>,
-    ) -> Self {
-        let mut updated_catalogs = Catalogs::new();
-        let mut picked_versions = Vec::new();
-        for dependency in dependencies {
-            merge_catalogs(&mut updated_catalogs, &dependency.updated_catalogs);
-            if let Some(picked) = dependency.picked
-                && dependency.manifest_specifier != picked.version
-            {
-                picked_versions.push(PickedVersion {
-                    alias: dependency.package_name,
-                    name: picked.name,
-                    version: picked.version,
-                    specifier: dependency.manifest_specifier,
-                });
-            }
-        }
-        Self { updated_catalogs, picked_versions }
-    }
 }
 async fn resolve_dependencies<'s, Reporter: self::Reporter>(
     manifest: &PackageManifest,

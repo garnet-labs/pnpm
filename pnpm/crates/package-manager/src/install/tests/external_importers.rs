@@ -2,17 +2,29 @@
 //! installs take: the lockfile dir is one capsule, and the capsules dir
 //! above it is a second project whose importer id is `..`.
 
-use super::super::{Install, InstallError};
+use super::super::{
+    Install,
+    InstallError,
+};
 use pipe_trait::Pipe;
 use pnpm_config::Config;
-use pnpm_lockfile::{LazyLockfile, MaybeLazyLockfile};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_lockfile::{
+    LazyLockfile,
+    MaybeLazyLockfile,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::SilentReporter;
 use pnpm_testing_utils::registry::TestRegistry;
 use std::{
     fmt::Write,
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 use tempfile::tempdir;
@@ -131,6 +143,7 @@ async fn run_capsule(
         match mode {
             Mode::Rebuild => {
                 install.run_rebuild::<SilentReporter>(pnpm_deps_restorer::RebuildOptions {
+                    selected_snapshots: None,
                     selected_names: None,
                     pending_projects: Vec::new(),
                     check_lockfile_patches_only: false,
@@ -147,7 +160,9 @@ async fn run_capsule(
 fn assert_capsules_dir_linked(setup: &CapsuleLayout) {
     let link = setup.capsules.join("node_modules/core-aspect");
     assert!(
-        fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
+        fs::symlink_metadata(&link)
+            .map(|meta| meta.file_type())
+            .is_ok_and(|file_type| file_type.is_symlink()),
         "{link:?} should be a symlink",
     );
     assert!(link.join("package.json").exists());

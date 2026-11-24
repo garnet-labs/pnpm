@@ -1,12 +1,27 @@
 use super::{
-    Arc, CurrentPkg, GitResolveError, NoMatchingVersionError, Path, PickPackageError,
-    PreferredVersionsOverlay, RegistryResponseError, ResolveDependencyTreeError, ResolveError,
-    ResolveOptions, Resolver, SharedWorkspaceWantedKey, TreeCtx, UnsupportedProtocolError,
-    WantedDependency, WantedKey, WorkspaceFinalWantedKey, cached_workspace_final,
-    completed_resolved_wanted, lock_recoverable,
-    manifest_hooks::{apply_manifest_hooks, original_manifest_opts},
-    render_specifier, wanted_key_admission,
+    Arc,
+    CurrentPkg,
+    Path,
+    PreferredVersionsOverlay,
+    ResolveDependencyTreeError,
+    ResolveOptions,
+    Resolver,
+    SharedWorkspaceWantedKey,
+    TreeCtx,
+    WantedDependency,
+    WantedKey,
+    WorkspaceFinalWantedKey,
+    cached_workspace_final,
+    completed_resolved_wanted,
+    lock_recoverable,
+    manifest_hooks::{
+        apply_manifest_hooks,
+        original_manifest_opts,
+    },
+    render_specifier,
+    wanted_key_admission,
 };
+use crate::resolve_dependency_tree::override_reframe::attribute_to_override;
 
 /// Convert a workspace directory resolution into the representation shared by
 /// every importer. A `link:` target is stored relative to the lockfile root;
@@ -105,7 +120,9 @@ pub(super) fn shared_workspace_key(
     #[cfg(not(debug_assertions))]
     let _ = opts;
     let bare_specifier = wanted.bare_specifier.as_deref()?;
-    if !bare_specifier.starts_with("workspace:") || bare_specifier.starts_with("workspace:.") {
+    if !bare_specifier.starts_with("workspace:")
+        || pnpm_workspace_spec::is_workspace_path_specifier(bare_specifier)
+    {
         return None;
     }
     #[cfg(debug_assertions)]
@@ -134,7 +151,7 @@ pub(super) fn shared_workspace_key(
 /// result keyed by the `link:` this importer renders, shared only with the
 /// importers that render the same one. A second importer therefore always
 /// skips the resolver chain, and skips the hooks as well when its rendered
-/// link matches. Concurrent first-callers can both miss and resolve in parallel —
+/// link matches. Concurrent first-callers can both miss and resolve in parallel,
 /// the resolver's own per-cache-key fetch locker coalesces the network work,
 /// and the second `or_insert` loses the race harmlessly.
 pub(super) async fn resolve_wanted_cached<Chain>(
@@ -227,12 +244,7 @@ where
         ));
     }
     let opts = original_manifest_opts(ctx, opts).await?;
-    let result = resolver.resolve(wanted, &opts).await.map_err(map_resolve_error)?;
-    let Some(result) = result else {
-        return Err(ResolveDependencyTreeError::SpecNotSupported {
-            specifier: render_specifier(wanted),
-        });
-    };
+    let result = run_resolver_chain(ctx, resolver, wanted, &opts).await?;
     if let Some(shared_workspace_key) = shared_workspace_key
         && let Some(canonical) = canonical_workspace_resolution(
             &result,
@@ -250,11 +262,38 @@ where
     Ok(result)
 }
 
+/// Resolve `wanted` through the resolver chain. A missing version is
+/// attributed to the override that forced it.
+async fn run_resolver_chain<Chain>(
+    ctx: &TreeCtx,
+    resolver: &Chain,
+    wanted: &WantedDependency,
+    opts: &ResolveOptions,
+) -> Result<pnpm_resolving_resolver_base::ResolveResult, ResolveDependencyTreeError>
+where
+    Chain: Resolver + ?Sized,
+{
+    let overrides = ctx.workspace.policy.parsed_overrides.as_deref();
+    let result = resolver
+        .resolve(wanted, opts)
+        .await
+        .map_err(|err| {
+            attribute_to_override(
+                ResolveDependencyTreeError::from_resolve_error(err),
+                wanted,
+                overrides,
+            )
+        })?;
+    result.ok_or_else(|| ResolveDependencyTreeError::SpecNotSupported {
+        specifier: render_specifier(wanted),
+    })
+}
+
 /// Combine two per-package opts adjustments into one clone, or `None` when
 /// neither applies. The `update_requested` flag is scoped per
-/// wanted-dependency — true only when the package's real name (parsed from
+/// wanted-dependency (true only when the package's real name (parsed from
 /// `bare_specifier` for npm-aliases, folded from the jsr specifier for jsr
-/// deps) is in the update target list — so the picker's held-back-update
+/// deps) is in the update target list) so the picker's held-back-update
 /// warning fires only for the packages the user actually asked to update.
 pub(super) fn per_wanted_opts(
     opts: &ResolveOptions,
@@ -281,7 +320,7 @@ pub(super) fn per_wanted_opts(
 /// `getManifestFromResponse`).
 ///
 /// Every consumer downstream of the resolver chain reads the package's
-/// identity off its manifest — most of all
+/// identity off its manifest, most of all
 /// [`build_pkg_id_with_patch_hash`](crate::resolve_dependency_tree::manifest::build_pkg_id_with_patch_hash), which has no name to prefix the dep
 /// path with when there is none, leaving a bare `file:<path>` / URL that
 /// keys no `packages:` row. A package with no `package.json` of its own
@@ -309,7 +348,8 @@ fn manifest_from_current_pkg(
         .filter(|name| !name.is_empty())?;
     let version = current.version
         .as_deref()
-        .filter(|version| !version.is_empty() && *version != "0.0.0")?;
+        .filter(|version| !version.is_empty())
+        .filter(|version| *version != "0.0.0")?;
     Some(serde_json::json!({ "name": name, "version": version }))
 }
 
@@ -350,38 +390,6 @@ fn stamp_fallback_identity(result: &mut pnpm_resolving_resolver_base::ResolveRes
             obj.insert("version".to_string(), serde_json::Value::String("0.0.0".to_string()));
         }
         *manifest = Arc::new(updated);
-    }
-}
-
-/// Wrap a resolver-chain failure, keeping the pnpm error code of the ones
-/// that carry one. The chain hands back a type-erased
-/// [`ResolveError`], which drops the `miette::Diagnostic` facet, so the codes
-/// that are part of pnpm's public contract are recovered by downcast —
-/// [`PickPackageError`] included, so `ERR_PNPM_NO_OFFLINE_META` and its
-/// legacy-mirror hint reach the CLI instead of collapsing to a plain
-/// string; every other failure keeps the generic envelope.
-pub(super) fn map_resolve_error(err: ResolveError) -> ResolveDependencyTreeError {
-    let err = match err.downcast::<NoMatchingVersionError>() {
-        Ok(no_matching_version) => {
-            return ResolveDependencyTreeError::NoMatchingVersion(*no_matching_version);
-        }
-        Err(err) => err,
-    };
-    let err = match err.downcast::<RegistryResponseError>() {
-        Ok(response) => return ResolveDependencyTreeError::RegistryResponse(*response),
-        Err(err) => err,
-    };
-    let err = match err.downcast::<GitResolveError>() {
-        Ok(git) => return ResolveDependencyTreeError::GitResolve(*git),
-        Err(err) => err,
-    };
-    let err = match err.downcast::<UnsupportedProtocolError>() {
-        Ok(unsupported) => return ResolveDependencyTreeError::UnsupportedProtocol(*unsupported),
-        Err(err) => err,
-    };
-    match err.downcast::<PickPackageError>() {
-        Ok(pick) => ResolveDependencyTreeError::Pick(*pick),
-        Err(err) => ResolveDependencyTreeError::Resolve(err),
     }
 }
 

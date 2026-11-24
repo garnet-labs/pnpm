@@ -1,11 +1,17 @@
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use std::{
     borrow::Cow,
     env,
     ffi::OsString,
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Failure to pick a shell for a lifecycle hook.
@@ -51,7 +57,7 @@ pub struct SelectedShell {
     /// (Windows-only API; not linked as an intra-doc reference
     /// because rustdoc on non-Windows targets cannot resolve it).
     ///
-    /// On non-Windows platforms the field is set but ignored —
+    /// On non-Windows platforms the field is set but ignored,
     /// keeping the struct platform-independent simplifies tests.
     pub windows_verbatim_args: bool,
 }
@@ -59,6 +65,7 @@ pub struct SelectedShell {
 /// `shellEmulator` selects the built-in shell only when `scriptShell` is
 /// unset. A blank value is unset, the same as the TypeScript runner.
 /// A configured shell is the one that runs the script.
+#[must_use]
 pub fn use_shell_emulator(shell_emulator: bool, script_shell: Option<&Path>) -> bool {
     shell_emulator && configured_script_shell(script_shell).is_none()
 }
@@ -103,7 +110,8 @@ pub fn select_shell(
     if is_windows {
         let comspec = env::var_os("ComSpec")
             .or_else(|| env::var_os("COMSPEC"))
-            .map_or_else(|| PathBuf::from("cmd"), PathBuf::from);
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cmd"));
         return Ok(SelectedShell {
             program: comspec,
             args: cmd_exe_args(),

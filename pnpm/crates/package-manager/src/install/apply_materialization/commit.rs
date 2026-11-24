@@ -1,8 +1,22 @@
 use super::super::{
-    Config, Host, InstallError, InstallWithFreshLockfileError, Lockfile, Modules,
-    PROJECT_LIFECYCLE_STAGES, PackageManifest, Path, PathBuf, SystemTime, build_modules_manifest,
-    current_contains_dep_path, keep_recorded_layout, merge_filtered_modules_metadata,
-    merge_pending_builds, project_requires_lifecycle_scripts, write_modules_manifest,
+    Config,
+    Host,
+    InstallError,
+    InstallWithFreshLockfileError,
+    Lockfile,
+    Modules,
+    PROJECT_LIFECYCLE_STAGES,
+    PackageManifest,
+    Path,
+    PathBuf,
+    SystemTime,
+    build_modules_manifest,
+    current_contains_ignored_build,
+    keep_recorded_layout,
+    merge_filtered_modules_metadata,
+    merge_pending_builds,
+    project_requires_lifecycle_scripts,
+    write_modules_manifest,
 };
 
 pub(super) struct CommitModulesStateInputs<'a> {
@@ -75,6 +89,9 @@ fn record_agent_skills(
         next_modules.linked_skills.clone_from(&prior.linked_skills);
         next_modules.has_unlinked_skills = prior.has_unlinked_skills;
     }
+    if inputs.tree.config.virtual_store_only {
+        return Ok(Vec::new());
+    }
     let Some(lockfile) = inputs.lockfiles.materialized else { return Ok(Vec::new()) };
     let linked = inputs.prior.metadata
         .and_then(|modules| modules.linked_skills.as_deref())
@@ -89,9 +106,9 @@ fn record_agent_skills(
         hoisted_locations: next_modules.hoisted_locations.as_ref(),
     })
     .map_err(InstallError::AgentSkills)?;
-    let pending_keys = state.pending_keys();
+    let pending_dep_paths = state.pending.clone();
     state.update_modules(next_modules);
-    Ok(pending_keys)
+    Ok(pending_dep_paths)
 }
 pub(super) fn prepare_committed_build_state(
     inputs: &mut CommitModulesStateInputs<'_>,
@@ -123,7 +140,9 @@ pub(super) fn prepare_committed_build_state(
     .map_err(InstallWithFreshLockfileError::AllowBuildsPolicy)
     .map_err(InstallError::WithFreshLockfile)?;
     let pending_builds = merge_pending_builds(
-        inputs.prior.layout.map_or(&[][..], |modules| modules.pending_builds.as_slice()),
+        inputs.prior.layout
+            .map(|modules| modules.pending_builds.as_slice())
+            .unwrap_or(&[][..]),
         deferred_projects(
             inputs.tree.config,
             inputs.materialized.manifests,
@@ -149,10 +168,11 @@ pub(super) fn merge_committed_modules_metadata(
     {
         keep_recorded_layout(next_modules, recorded);
     }
+    let retention = preserve_skipped_hoisted_tree_metadata(inputs, next_modules);
     if let (Some(previous), Some(current), Some(policy)) =
         (inputs.prior.layout, inputs.lockfiles.materialized, allow_build_policy)
     {
-        retain_current_ignored_builds(next_modules, previous, current, policy);
+        retain_current_ignored_builds(next_modules, previous, current, policy, retention);
     }
     if inputs.prior.filtered_install
         && !inputs.prior.is_inconsistent
@@ -161,6 +181,27 @@ pub(super) fn merge_committed_modules_metadata(
     {
         merge_filtered_modules_metadata(next_modules, previous, current, selected);
     }
+}
+
+fn preserve_skipped_hoisted_tree_metadata(
+    inputs: &CommitModulesStateInputs<'_>,
+    next_modules: &mut Modules,
+) -> IgnoredBuildRetention {
+    if !inputs.tree.config.virtual_store_only
+        || inputs.tree.node_linker != pnpm_config::NodeLinker::Hoisted
+    {
+        return IgnoredBuildRetention::SettledByBuildPhase;
+    }
+    if !inputs.prior.is_inconsistent {
+        if let Some(recorded) = inputs.prior.layout {
+            next_modules.included = recorded.included;
+        }
+        if let Some(previous) = inputs.prior.metadata {
+            next_modules.hoisted_locations.clone_from(&previous.hoisted_locations);
+            next_modules.injected_deps.clone_from(&previous.injected_deps);
+        }
+    }
+    IgnoredBuildRetention::DeferredByHoistedFetch
 }
 /// Stamp `prunedAt` only when the sweep ran (or there was no prior
 /// `.modules.yaml`); otherwise preserve the recorded timestamp so
@@ -207,7 +248,7 @@ pub(super) fn deferred_projects(
 /// snapshot against it and skip the unchanged
 /// slots. Persist *after* `write_modules_manifest` succeeds so
 /// a manifest failure can't leave a fresh current-lockfile
-/// pointing at incomplete install state — the next frozen
+/// pointing at incomplete install state, the next frozen
 /// reinstall would otherwise diff against a graph that never
 /// finished committing.
 ///
@@ -328,7 +369,8 @@ pub(super) fn save_relinked_wanted_lockfile(
         && let Some(updated) = save.loaded_wanted_lockfile
     {
         updated
-            .save_to_path(
+            .save_to_path_as(
+                config.lockfile_format,
                 &save.workspace_root.join(config.wanted_lockfile_name()),
                 config.symlinked_lockfile(),
             )
@@ -336,17 +378,27 @@ pub(super) fn save_relinked_wanted_lockfile(
     }
     Ok(())
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IgnoredBuildRetention {
+    SettledByBuildPhase,
+    DeferredByHoistedFetch,
+}
+
 pub(super) fn retain_current_ignored_builds(
     next: &mut Modules,
     previous: &pnpm_modules_yaml::ModulesLayout,
     current: &Lockfile,
     allow_build_policy: &crate::AllowBuildPolicy,
+    retention: IgnoredBuildRetention,
 ) {
     let Some(previous_ignored) = previous.ignored_builds.as_ref() else { return };
     for dep_path in previous_ignored {
-        if current_contains_dep_path(current, dep_path.as_str())
-            && allow_build_policy.check(dep_path.as_str()).is_none()
-        {
+        let decision = allow_build_policy.check(dep_path.as_str());
+        let still_unbuilt = match retention {
+            IgnoredBuildRetention::SettledByBuildPhase => decision.is_none(),
+            IgnoredBuildRetention::DeferredByHoistedFetch => decision.unwrap_or(true),
+        };
+        if current_contains_ignored_build(current, dep_path.as_str()) && still_unbuilt {
             next.ignored_builds.get_or_insert_default().insert(dep_path.clone());
         }
     }

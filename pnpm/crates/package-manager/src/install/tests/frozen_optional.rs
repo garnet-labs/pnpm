@@ -1,18 +1,38 @@
 use super::{
-    super::{Install, InstallError, ProjectMutation},
+    super::{
+        Install,
+        InstallError,
+        ProjectMutation,
+    },
     InstallDirs,
 };
 use crate::PolicyExcludes;
 use pipe_trait::Pipe;
 use pnpm_config::Config;
-use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
-use pnpm_modules_yaml::{
-    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH, Host, LayoutVersion, Modules, NodeLinker,
-    read_modules_manifest, write_modules_manifest,
+use pnpm_lockfile::{
+    Lockfile,
+    MaybeLazyLockfile,
 };
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_modules_yaml::{
+    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH,
+    Host,
+    LayoutVersion,
+    Modules,
+    NodeLinker,
+    read_modules_manifest,
+    write_modules_manifest,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::{
-    LogEvent, Reporter, SilentReporter, SkippedOptionalPackage, SkippedOptionalReason, StatsLog,
+    LogEvent,
+    Reporter,
+    SilentReporter,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
+    StatsLog,
     StatsMessage,
 };
 use std::sync::Mutex;
@@ -52,6 +72,7 @@ async fn frozen_lockfile_with_gvs_off_registers_the_project() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -67,6 +88,7 @@ async fn frozen_lockfile_with_gvs_off_registers_the_project() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -103,7 +125,8 @@ async fn frozen_lockfile_with_gvs_off_registers_the_project() {
     let registered: Vec<_> = pnpm_store_dir::get_registered_projects(&config.store_dir)
         .expect("list registered projects")
         .iter()
-        .map(|project| dunce::canonicalize(project).expect("resolve registered project"))
+        .map(dunce::canonicalize)
+        .map(|canonical| canonical.expect("resolve registered project"))
         .collect();
     let project_root = dunce::canonicalize(&dirs.project_root).expect("resolve project root");
     assert_eq!(registered, [project_root]);
@@ -113,7 +136,7 @@ async fn frozen_lockfile_with_gvs_off_registers_the_project() {
 /// Workspace install under GVS registers the workspace root once,
 /// regardless of how many importers the workspace declares. The
 /// project registration fires exactly once per install against the
-/// workspace root — store prune walks
+/// workspace root, store prune walks
 /// `<workspace>/node_modules/.pnpm/` to find every installed package,
 /// so one registry entry per workspace is enough.
 #[tokio::test]
@@ -162,6 +185,7 @@ async fn frozen_lockfile_under_gvs_registers_workspace_root_only() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -177,6 +201,7 @@ async fn frozen_lockfile_under_gvs_registers_workspace_root_only() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -239,7 +264,7 @@ async fn frozen_lockfile_under_gvs_registers_workspace_root_only() {
 /// `.modules.yaml.skipped` before a frozen-lockfile install runs;
 /// confirm the install picks up the seed and re-writes the file
 /// with the same key. The lockfile here has empty `snapshots: {}` so
-/// the constraint-free fast path runs — that's the branch in
+/// the constraint-free fast path runs; that's the branch in
 /// [`InstallFrozenLockfile::run`] that preserves the seed verbatim
 /// without calling `compute_skipped_snapshots`. Together with the
 /// unit tests on the slow path, this pins the full plumbing between
@@ -263,7 +288,7 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
     config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
-    // Pre-write `.modules.yaml` with a non-empty `skipped` list —
+    // Pre-write `.modules.yaml` with a non-empty `skipped` list,
     // models the state left by a previous install that landed
     // platform-mismatched optional deps. Two entries: one bare
     // package and one scoped, so the parse-then-serialize round-trip
@@ -300,6 +325,7 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -315,6 +341,7 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -353,7 +380,7 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
         .expect("read .modules.yaml")
         .expect("modules manifest exists");
 
-    // Both seed entries survive — proves the read → seed → write
+    // Both seed entries survive, proves the read → seed → write
     // loop is fully wired. Order is the sort-on-write order:
     // `@scope/...` < `previously-...` lexically, so the scoped
     // entry leads.
@@ -374,14 +401,14 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
 }
 /// Scenario: skipping an optional dependency if it cannot be fetched.
 /// An `optional: true` snapshot whose tarball URL is unreachable must
-/// not abort the install — the failure is swallowed at the
+/// not abort the install, the failure is swallowed at the
 /// per-snapshot fetch dispatch in `CreateVirtualStore`.
 ///
 /// Asserts:
 /// 1. The install resolves `Ok` (no abort).
 /// 2. The broken snapshot's virtual-store slot was NOT created.
 /// 3. The on-disk `.modules.yaml.skipped` does NOT contain the
-///    broken snapshot — fetch failures are transient (the catch site
+///    broken snapshot, fetch failures are transient (the catch site
 ///    never updates `opts.skipped`), so a subsequent install retries
 ///    the fetch.
 /// 4. The skip is reported as `pnpm:skipped-optional-dependency` with
@@ -405,7 +432,7 @@ async fn frozen_install_swallows_and_reports_unreachable_optional_tarball() {
     // Lockfile with one `optional: true` snapshot whose `tarball` URL
     // dials `0.0.0.0:1`, whose connect fails at once on every OS, so
     // the fetch reliably fails without a network round-trip. The
-    // integrity is arbitrary — we never get far enough to verify it.
+    // integrity is arbitrary; we never get far enough to verify it.
     const BROKEN_OPTIONAL_LOCKFILE: &str = text_block! {
         "lockfileVersion: '9.0'"
         "importers:"
@@ -457,6 +484,7 @@ async fn frozen_install_swallows_and_reports_unreachable_optional_tarball() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             // The lockfile-resolution verifier is unrelated to what this test
             // exercises (the optional-tarball swallow path);
             // its fail-closed tarball-URL check would otherwise try to fetch
@@ -478,6 +506,7 @@ async fn frozen_install_swallows_and_reports_unreachable_optional_tarball() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -512,7 +541,7 @@ async fn frozen_install_swallows_and_reports_unreachable_optional_tarball() {
     .expect("install must NOT abort when an optional snapshot fails to fetch");
 
     // The broken snapshot's virtual-store slot must not have been
-    // created — the cold-batch dispatch failed before extraction.
+    // created, the cold-batch dispatch failed before extraction.
     let expected_slot = dirs.virtual_store_dir.join("broken-pkg@1.0.0").join("node_modules");
     assert!(
         !expected_slot.exists(),
@@ -580,7 +609,7 @@ async fn frozen_install_swallows_and_reports_unreachable_optional_tarball() {
 /// non-optional snapshot whose tarball is unreachable must still
 /// abort the install (the swallow is `if optional return; else throw`).
 /// Same fixture as the swallow test but with `optional: true`
-/// removed from the snapshot entry — confirms the polarity is
+/// removed from the snapshot entry, confirms the polarity is
 /// correct.
 #[tokio::test]
 async fn frozen_install_propagates_non_optional_fetch_failure() {
@@ -609,7 +638,7 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
     let mut config = Config::new();
     config.lockfile = false;
     // Match the sister test's GVS-off setup so both swallow tests
-    // route through the same layout — sidesteps any GVS-routing
+    // route through the same layout, sidesteps any GVS-routing
     // path divergence affecting where the cold-batch dispatch even
     // runs.
     config.enable_global_virtual_store = false;
@@ -627,6 +656,7 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             // As in the sister test: without it the lockfile verifier fetches
             // `broken-pkg` metadata from the live default registry and fails
             // the install before the tarball fetch this test is about.
@@ -645,6 +675,7 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -691,7 +722,7 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
 /// filter from the fetch-failure swallow: a snapshot with
 /// `optional: true` whose **metadata row is missing from
 /// `packages:`**. The swallow only covers `DownloadTarball`
-/// and `GitFetch` — `MissingPackageMetadata` propagates even for
+/// and `GitFetch`. `MissingPackageMetadata` propagates even for
 /// optional snapshots. So if the filter doesn't fire, the
 /// missing-metadata error aborts the install.
 /// A successful install therefore proves the snapshot was
@@ -702,7 +733,7 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
 /// before extraction / linking / building runs.
 ///
 /// Also asserts that `--no-optional` exclusions are **not**
-/// persisted to `.modules.yaml.skipped` — same convention as the
+/// persisted to `.modules.yaml.skipped`, same convention as the
 /// fetch-failure swallow: the exclusion is transient,
 /// so a later install without `--no-optional` brings the snapshot
 /// back into the install graph.
@@ -750,7 +781,7 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
     let lockfile: Lockfile = serde_saphyr::from_str(OPTIONAL_NO_METADATA_LOCKFILE)
         .expect("parse optional-no-metadata fixture lockfile");
 
-    // The dispatch list excludes `DependencyGroup::Optional` — same
+    // The dispatch list excludes `DependencyGroup::Optional`, same
     // shape `--no-optional` produces from
     // `InstallDependencyOptions::dependency_groups()` in
     // `crates/cli/src/cli_args/install.rs`.
@@ -759,6 +790,7 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -774,6 +806,7 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -813,7 +846,7 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
         "optional-only snapshot's slot must not exist, found {expected_slot:?}",
     );
 
-    // Transient — must not bleed into the persistent
+    // Transient, must not bleed into the persistent
     // `.modules.yaml.skipped` set.
     let written = dirs.modules_dir
         .pipe_as_ref(read_modules_manifest::<Host>)
@@ -830,7 +863,7 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
 /// Polarity test for [`frozen_install_no_optional_drops_optional_only_snapshots`].
 /// Same fixture, but the dispatch list **includes** `Optional`. With
 /// the snapshot's metadata missing from `packages:`, the install
-/// must now abort with `MissingPackageMetadata` — the
+/// must now abort with `MissingPackageMetadata`, the
 /// fetch-failure swallow doesn't cover that variant, so the
 /// optional-ness alone doesn't save the install. Proves the
 /// filter is gated on the dispatch list rather than firing
@@ -874,6 +907,7 @@ async fn frozen_install_optional_included_surfaces_missing_metadata() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -889,6 +923,7 @@ async fn frozen_install_optional_included_surfaces_missing_metadata() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -989,6 +1024,7 @@ async fn frozen_install_no_optional_keeps_shared_non_optional_snapshot() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -1004,6 +1040,7 @@ async fn frozen_install_no_optional_keeps_shared_non_optional_snapshot() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -1046,7 +1083,7 @@ async fn frozen_install_no_optional_keeps_shared_non_optional_snapshot() {
                 crate::CreateVirtualStoreError::MissingPackageMetadata { .. },
             ),),
         ),
-        "expected FrozenLockfile(CreateVirtualStore(MissingPackageMetadata)) — \
+        "expected FrozenLockfile(CreateVirtualStore(MissingPackageMetadata)), \
          proves the snapshot was kept; got {err:?}",
     );
 

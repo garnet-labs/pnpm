@@ -1,12 +1,33 @@
 use super::{
-    BuildInputs, ConcurrentVerification, FetchInputs, HostDetectionInputs, HostPlan,
-    InstallFrozenLockfile, InstallFrozenLockfileError, LinkInputs, MaterializationPlan,
-    SkipSetPlan, build_extra_env,
-    build_phase::{BuildPhaseInputs, run_build_phase},
-    detect_host, fetch_verified, load_custom_fetcher_session, needs_installability_check,
-    plan_engine_name, seed_skip_set, settle_engine_name,
+    BuildInputs,
+    ConcurrentVerification,
+    FetchInputs,
+    FrozenInputs,
+    HostDetectionInputs,
+    HostPlan,
+    InstallFrozenLockfile,
+    InstallFrozenLockfileError,
+    LinkInputs,
+    MaterializationPlan,
+    SkipSetPlan,
+    build_extra_env,
+    build_phase::{
+        BuildPhaseInputs,
+        run_build_phase,
+    },
+    detect_host,
+    fetch_verified,
+    load_custom_fetcher_session,
+    needs_installability_check,
+    plan_engine_name,
+    seed_skip_set,
+    settle_engine_name,
 };
-use crate::{AllowBuildPolicy, CreateVirtualStoreOutput, SkippedSnapshots};
+use crate::{
+    AllowBuildPolicy,
+    CreateVirtualStoreOutput,
+    SkippedSnapshots,
+};
 use pnpm_lockfile::LockfileEntries;
 use pnpm_reporter::Reporter;
 use pnpm_tarball::SharedReportedProgressKeys;
@@ -14,7 +35,7 @@ use std::future::Future;
 
 impl<'a> InstallFrozenLockfile<'a> {
     /// Run the dependency builds, report ignored ones, and relink the
-    /// top-level bins — the same build phase the fresh path runs.
+    /// top-level bins, the same build phase the fresh path runs.
     pub(super) fn build<'p, Reporter: self::Reporter>(
         &self,
         ctx: &'p crate::InstallContext<'p>,
@@ -49,13 +70,13 @@ impl<'a> InstallFrozenLockfile<'a> {
                 directories: build_directories(install.projects.workspace_root, ctx, phase.linked),
                 graph: crate::BuildPhaseGraph {
                     trusted_importer_ids: &install.importer_sets().0,
-                    loaded_snapshots: ctx.select_loaded_snapshots(snapshots),
+                    loaded_snapshots: phase.fetched.snapshot_placement.loaded.as_deref(),
                     snapshots,
                     packages,
                     importers: &install.lockfiles.wanted.importers,
                     dependency_groups: install.projects.dependency_groups,
                     materialized_snapshots: phase.linked.build_snapshots(
-                        &phase.fetched.materialized_snapshots,
+                        &phase.fetched.snapshot_placement.materialized,
                     ),
                     build_scope: phase.linked.build_scope.as_ref(),
                 },
@@ -63,6 +84,7 @@ impl<'a> InstallFrozenLockfile<'a> {
                 extra_env: &build_extra_env,
                 skipped: phase.skipped,
                 pending_bins: Some(&phase.linked.pending_bins),
+                supported_architectures: install.platform.supported_architectures,
             })
             .map_err(InstallFrozenLockfileError::BuildPhase)
         }
@@ -84,7 +106,8 @@ impl<'a> InstallFrozenLockfile<'a> {
                     current_lockfile: install.lockfiles.current,
                     materialized_snapshots: (install.prior.rebuild.is_none()
                         && !install.prior.relink_every_slot_bin)
-                        .then_some(phase.fetched.materialized_snapshots.as_slice()),
+                        .then_some(phase.fetched.snapshot_placement.materialized.as_slice()),
+                    selected_snapshots: phase.fetched.snapshot_placement.loaded.as_deref(),
                     sidecar_lockfile: phase.current_lockfile,
                 },
                 packages: crate::LinkPackageData {
@@ -92,13 +115,15 @@ impl<'a> InstallFrozenLockfile<'a> {
                     package_bins: Some(&phase.fetched.package_bins),
                     requires_build_by_snapshot: Some(&phase.fetched.requires_build_by_snapshot),
                     cas_paths_by_pkg_id: phase.cas_paths_by_pkg_id,
+                    cas_paths_by_snapshot: phase.fetched.cas_paths_by_snapshot.clone(),
+                    // A frozen install reads no registry metadata.
+                    latest_versions: None,
                 },
                 prior: install.prior.link_state(),
                 projects: crate::LinkProjects {
                     manifests: install.projects.manifests,
                     package_map_manifests: install.projects.package_map_manifests,
                     dependency_groups: install.projects.dependency_groups,
-                    symlink_root: install.projects.workspace_root,
                     trusted_importer_ids: &trusted_importer_ids,
                     root_component_importers: &root_component_importers,
                 },
@@ -136,6 +161,7 @@ impl<'a> InstallFrozenLockfile<'a> {
             // Timed from here: a pnpmfile's fetcher setup is hook work, not
             // materialization, and the integrated benchmark reads this phase.
             let phase_start = std::time::Instant::now();
+            let local_policy = install.effective_local_policy().await?;
             let output = fetch_verified::<Reporter>(
                 install.virtual_store(
                     ctx,
@@ -148,9 +174,11 @@ impl<'a> InstallFrozenLockfile<'a> {
                 ConcurrentVerification {
                     lockfile: install.lockfiles.verified,
                     verifiers: install.lockfiles.resolution_verifiers,
+                    exotic_subdeps: install.lockfiles.policies.exotic_subdeps.clone(),
                     precomputed: phase.verification_override,
-                    lockfile_path: install.lockfiles.path,
+                    lockfile_source: install.lockfiles.source,
                     cache_dir: &install.drivers.config.cache_dir,
+                    local_policy,
                 },
             )
             .await?;
@@ -195,6 +223,7 @@ impl<'a> InstallFrozenLockfile<'a> {
                 installability_host.as_ref(),
                 seed_skipped,
             )?;
+            ensure_runtime_provisioning(&inputs, &skipped)?;
             let host_node =
                 installability_host.as_ref().map(crate::materialization_plan::HostNode::from);
             Ok(SkipSetPlan { skipped, engine_name, host_node })
@@ -230,14 +259,19 @@ impl<'a> InstallFrozenLockfile<'a> {
                 known_requires_build,
             )
             .await;
-            let layout = install.verified_layout(allow_build_policy, host.engine_name.as_deref())?;
+            let local_policy = install.effective_local_policy().await?;
+            let layout = install.verified_layout(
+                allow_build_policy,
+                host.engine_name.as_deref(),
+                local_policy,
+            )?;
             // Built after the offline lockfile checks above: constructing
             // the cache probes the filesystem (a store-side write), which a
             // rejected lockfile must never reach.
             let dir_clone_cache = install.dir_clone_cache(allow_build_policy, engine_source);
             // Kick off the store-side half of `CreateVirtualStore::run`'s
-            // planning — like the directory-clone cache above, only after
-            // the offline lockfile checks — so its index reads run while a
+            // planning (like the directory-clone cache above, only after
+            // the offline lockfile checks) so its index reads run while a
             // pending host detection finishes its `node --version`.
             let cas_prefetch = install.drivers.start_cas_prefetch(
                 install.entries(),
@@ -312,7 +346,6 @@ fn build_directories<'a>(
 ) -> crate::BuildPhaseDirectories<'a> {
     crate::BuildPhaseDirectories {
         workspace_root,
-        top_level_bin_root: workspace_root,
         layout: ctx.linker.layout,
         hoisted_pkg_roots_by_key: linked.hoisted_pkg_roots_by_key.as_ref(),
         is_hoisted: ctx.is_hoisted(),
@@ -353,6 +386,21 @@ fn compute_frozen_skip_set<Reporter: self::Reporter>(
         },
     )
     .map_err(InstallFrozenLockfileError::Installability)
+}
+
+fn ensure_runtime_provisioning(
+    inputs: &FrozenInputs<'_>,
+    skipped: &SkippedSnapshots,
+) -> Result<(), InstallFrozenLockfileError> {
+    if inputs.platform.runtime_provisioning {
+        return Ok(());
+    }
+    if let Some(alias) =
+        crate::runtime_dependency_alias(inputs.lockfiles.wanted, inputs.included(), skipped)
+    {
+        return Err(InstallFrozenLockfileError::RuntimeProvisioningUnavailable { alias });
+    }
+    Ok(())
 }
 
 fn report_host_detection_wait(phase_start: std::time::Instant, needs_installability_check: bool) {

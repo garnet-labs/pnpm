@@ -1,25 +1,49 @@
 use super::{
-    APPROVAL_CLAIM_LEASE, AppState, ApprovalClaim, CanonicalPackageName, DocumentWrite, Identity,
-    RegistryError, Response, StatusCode, StoredStagedRecord, Value, cleanup_tmp_slots,
-    commit_publishes, json, json_response, load_authorized_record, stage_publish,
+    APPROVAL_CLAIM_LEASE,
+    AppState,
+    ApprovalClaim,
+    CanonicalPackageName,
+    Identity,
+    JsonObject,
+    RegistryError,
+    Response,
+    StatusCode,
+    StoredStagedRecord,
+    Value,
+    cleanup_tmp_slots,
+    json,
+    json_response,
+    load_authorized_record,
+    parse_json_body,
+    single_publish_notes,
+    stage_publish,
     validate_publish_doc,
 };
-use crate::server::publishing::add_npm_notices;
+use crate::server::publishing::{
+    add_npm_notices,
+    commit_publication,
+};
 use axum::response::IntoResponse;
 use pnpr_storage::publish::now_iso;
 
-/// `POST /-/stage/:id/approve` — claim the record, publish the held document
+/// `POST /-/stage/:id/approve`: claim the record, publish the held document
 /// through the regular validate → stage → commit flow, then drop the record.
 pub(super) async fn serve_staged_approve(
     state: &AppState,
     identity: &Identity,
     registry: Option<&str>,
     stage_id: &str,
+    body: &[u8],
 ) -> Response {
     let stored = match load_authorized_record(state, identity, registry, stage_id).await {
         Ok(stored) => stored,
         Err(err) => return err.into_response(),
     };
+    if !body.iter().all(u8::is_ascii_whitespace)
+        && let Err(err) = parse_json_body::<JsonObject>(body)
+    {
+        return err.into_response();
+    }
     let claim = match claim_for_approval(state, stage_id, stored).await {
         Ok(claim) => claim,
         Err(err) => return err.into_response(),
@@ -46,17 +70,20 @@ pub(super) async fn claim_for_approval(
     let mut record = stored.record;
     record.approving_since = Some(now_iso());
     let claimed_bytes = serde_json::to_vec(&record).expect("a staged record serializes");
-    let written =
-        state.inner.storage.replace_staged_meta_if_current(stage_id, &stored.bytes, &claimed_bytes)
-            .await?;
+    let written = state.inner.storage.replace_staged_meta_if_current(
+        stage_id,
+        &stored.stored,
+        &claimed_bytes,
+    )
+    .await?;
     match written {
-        DocumentWrite::Written => {
-            Ok(ApprovalClaim { record, unclaimed_bytes: stored.bytes, claimed_bytes })
+        Some(claimed) => {
+            Ok(ApprovalClaim { record, unclaimed_bytes: stored.stored.bytes, claimed })
         }
         // Something got between the read and the claim. Another approval
         // leaves its claim behind; one that finished, or a rejection, leaves
         // no record at all.
-        DocumentWrite::Conflict => match state.inner.storage.read_staged_meta(stage_id).await? {
+        None => match state.inner.storage.read_staged_meta(stage_id).await? {
             Some(_) => {
                 Err(RegistryError::StagedApprovalInFlight { stage_id: stage_id.to_string() })
             }
@@ -69,13 +96,14 @@ pub(super) async fn claim_for_approval(
 ///
 /// A claim from the future is live: replicas time their claims by their own
 /// clocks, and one running ahead must not have its claim read as expired by
-/// one running behind. An unparsable timestamp is expired instead — a value
+/// one running behind. An unparsable timestamp is expired instead, a value
 /// pnpr cannot read must not be able to hold a stage forever.
 pub(super) fn approval_claim_is_live(since: &str) -> bool {
-    let Ok(started) = chrono::DateTime::parse_from_rfc3339(since) else {
+    let Ok(started) = pnpm_time::parse_rfc3339(since) else {
         return false;
     };
-    let Ok(held) = chrono::Utc::now().signed_duration_since(started).to_std() else {
+    let Ok(held) = std::time::Duration::try_from(jiff::Timestamp::now().duration_since(started))
+    else {
         return true;
     };
     held < APPROVAL_CLAIM_LEASE
@@ -90,7 +118,7 @@ pub(super) async fn still_claimed(
     claim: &ApprovalClaim,
 ) -> Result<(), RegistryError> {
     match state.inner.storage.read_staged_meta(stage_id).await? {
-        Some(stored) if stored == claim.claimed_bytes => Ok(()),
+        Some(stored) if stored.generation == claim.claimed.generation => Ok(()),
         Some(_) => Err(RegistryError::StagedApprovalInFlight { stage_id: stage_id.to_string() }),
         None => Err(RegistryError::NotFound),
     }
@@ -107,7 +135,7 @@ pub(super) async fn release_approval_claim(
 ) {
     let restored = state.inner.storage.replace_staged_meta_if_current(
         stage_id,
-        &claim.claimed_bytes,
+        &claim.claimed,
         &claim.unclaimed_bytes,
     )
     .await;
@@ -124,30 +152,31 @@ pub(super) async fn approve_claimed(
     claim: &ApprovalClaim,
 ) -> Result<Response, RegistryError> {
     let record = &claim.record;
-    let Some(body) = state.inner.storage.read_staged_body(stage_id).await? else {
+    let Some(stored_body) = state.inner.storage.read_staged_body(stage_id).await? else {
         return Err(RegistryError::Io(std::io::Error::other(format!(
             "staged publish {stage_id} has no stored body",
         ))));
     };
-    let incoming: Value = serde_json::from_slice(&body).map_err(RegistryError::Json)?;
+    let mut incoming: Value = serde_json::from_slice(&stored_body).map_err(RegistryError::Json)?;
+    let notes = single_publish_notes(&mut incoming)?;
     let name =
         CanonicalPackageName::parse(&record.package_name, pnpr_package_name::Ecosystem::Npm)?;
     // Re-validate against the registry state of *now*: rules may have
     // changed since staging, and the version may have been published in
     // the meantime (which surfaces as the usual 409).
-    let (validated, target) =
+    let (mut validated, target) =
         validate_publish_doc(state, identity, record.registry.as_deref(), name, incoming).await?;
 
+    record.record_approval(&mut validated);
     let _packument_guard = state.inner.locks.packages.lock(validated.name.as_str()).await;
-    let mut staged = stage_publish(state, validated, &now_iso(), Some(&target.org)).await?;
-    let notices = std::mem::take(&mut staged.verification.notices);
+    let staged = stage_publish(state, validated, &now_iso(), Some(&target.namespace)).await?;
     // Nothing is visible yet, which is the last moment a rejection can still
     // take the stage back. Past the commit it cannot: the publish is served.
     if let Err(err) = still_claimed(state, stage_id, claim).await {
         cleanup_tmp_slots(staged.slots).await;
         return Err(err);
     }
-    commit_publishes(state, vec![staged]).await?;
+    let receipt = commit_publication(state, vec![staged], notes, None).await?;
     // Past the commit the stage is spent.
     if let Err(err) = state.inner.storage.remove_staged(stage_id).await {
         // The publish is already committed and visible; a failed record
@@ -155,6 +184,6 @@ pub(super) async fn approve_claimed(
         tracing::warn!(error = %err, stage_id, "approved staged publish but its record cleanup failed");
     }
     let mut response = json_response(StatusCode::CREATED, &json!({ "ok": true }));
-    add_npm_notices(&mut response, &notices);
+    add_npm_notices(&mut response, &receipt.notices);
     Ok(response)
 }

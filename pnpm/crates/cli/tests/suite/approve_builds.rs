@@ -5,13 +5,103 @@
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use std::{fmt::Write as _, fs, path::Path, process::Command};
+use pnpm_testing_utils::{
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
+    git_repo::GitRepoFixture,
+};
+use std::{
+    fmt::Write as _,
+    fs,
+    path::Path,
+    process::Command,
+};
 
 /// The install marker the `@pnpm.e2e/install-script-example` package's
 /// `install` lifecycle script writes when it runs.
 const INSTALL_MARKER: &str = "node_modules/.pnpm/@pnpm.e2e+install-script-example@1.0.0\
      /node_modules/@pnpm.e2e/install-script-example/generated-by-install.js";
+
+#[test]
+fn approve_builds_requires_an_exact_file_selector() {
+    let harness = CommandTempCwd::init();
+    let package = harness.root.path().join("fixture");
+    fs::create_dir(&package).expect("create file dependency");
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0","scripts":{"postinstall":"node build.cjs"}}"#,
+    )
+    .expect("write dependency manifest");
+    fs::write(package.join("build.cjs"), "require('node:fs').writeFileSync('built', '')")
+        .expect("write dependency build script");
+    fs::write(
+        harness.workspace.join("package.json"),
+        r#"{"dependencies":{"fixture":"file:../fixture"}}"#,
+    )
+    .expect("write project manifest");
+    let settings = harness.workspace.join("pnpm-workspace.yaml");
+    fs::write(&settings, "enableGlobalVirtualStore: false\n").expect("write settings");
+    pacquet(&harness.workspace)
+        .with_arg("install")
+        .assert()
+        .failure();
+    let original_settings = fs::read(&settings).expect("read settings after install");
+    let rejected = pacquet(&harness.workspace)
+        .with_args(["approve-builds", "fixture"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_APPROVE_BUILDS_EXACT_SELECTOR_REQUIRED"), "{stderr}");
+    assert!(stderr.contains("fixture@file:../fixture"), "{stderr}");
+    assert_eq!(fs::read(&settings).expect("read settings after rejection"), original_settings);
+    pacquet(&harness.workspace)
+        .with_args(["approve-builds", "fixture@file:../fixture"])
+        .assert()
+        .success();
+    assert!(harness.workspace.join("node_modules/fixture/built").is_file());
+}
+
+/// A bare name cannot identify a git-hosted artifact either, so
+/// `approve-builds` must name the exact pending selector here too.
+#[test]
+fn approve_builds_requires_an_exact_git_selector() {
+    let harness = CommandTempCwd::init();
+    let repo = GitRepoFixture::init(harness.root.path(), "gitbuild");
+    repo.write_file(
+        "package.json",
+        r#"{"name":"gitbuild","version":"1.0.0","scripts":{"postinstall":"node build.cjs"}}"#,
+    );
+    repo.write_file("build.cjs", "require('node:fs').writeFileSync('built', '')");
+    let spec = repo.git_url_at(&repo.commit("init"));
+    let selector = format!("gitbuild@{spec}");
+    fs::write(
+        harness.workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "gitbuild": spec } }).to_string(),
+    )
+    .expect("write project manifest");
+    let settings = harness.workspace.join("pnpm-workspace.yaml");
+    fs::write(&settings, "enableGlobalVirtualStore: false\n").expect("write settings");
+    pacquet(&harness.workspace)
+        .with_arg("install")
+        .assert()
+        .failure();
+    let original_settings = fs::read(&settings).expect("read settings after install");
+    let rejected = pacquet(&harness.workspace)
+        .with_args(["approve-builds", "gitbuild"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_APPROVE_BUILDS_EXACT_SELECTOR_REQUIRED"), "{stderr}");
+    assert!(stderr.contains(&selector), "{stderr}");
+    assert_eq!(fs::read(&settings).expect("read settings after rejection"), original_settings);
+    pacquet(&harness.workspace)
+        .with_args(["approve-builds", &selector])
+        .assert()
+        .success();
+    assert!(harness.workspace.join("node_modules/gitbuild/built").is_file());
+}
 
 #[cfg(unix)]
 #[test]
@@ -62,7 +152,7 @@ fn install_and_rebuild_refresh_privately_hoisted_bins_for_transitive_dependents(
     .expect("write build policy");
 
     pacquet(&harness.workspace)
-        .args(["install", "--ignore-scripts"])
+        .with_args(["install", "--ignore-scripts"])
         .assert()
         .success();
     Command::new(harness.workspace.join("node_modules/.pnpm/node_modules/.bin/tool"))
@@ -71,7 +161,7 @@ fn install_and_rebuild_refresh_privately_hoisted_bins_for_transitive_dependents(
         .stdout("placeholder\n");
 
     pacquet(&harness.workspace)
-        .arg("rebuild")
+        .with_arg("rebuild")
         .assert()
         .success();
     Command::new(harness.workspace.join("node_modules/.pnpm/node_modules/.bin/tool"))
@@ -85,7 +175,7 @@ fn install_and_rebuild_refresh_privately_hoisted_bins_for_transitive_dependents(
 
     fs::remove_dir_all(harness.workspace.join("node_modules")).expect("remove node_modules");
     pacquet(&harness.workspace)
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
 
@@ -144,7 +234,7 @@ fn assert_rebuild_refreshes_replaced_bin(linker: &str, nested: bool) {
     )
     .expect("write build policy");
     pacquet(&harness.workspace)
-        .args(["install", "--ignore-scripts"])
+        .with_args(["install", "--ignore-scripts"])
         .assert()
         .success();
     let initial_bin = harness.workspace.join(if nested {
@@ -162,12 +252,12 @@ fn assert_rebuild_refreshes_replaced_bin(linker: &str, nested: bool) {
             .stdout("placeholder\n");
     }
     pacquet(&harness.workspace)
-        .args(["rebuild"])
+        .with_args(["rebuild"])
         .assert()
         .success();
     if !nested {
         pacquet(&harness.workspace)
-            .args(["exec", "tool"])
+            .with_args(["exec", "tool"])
             .assert()
             .success()
             .stdout("built binary\n");
@@ -308,7 +398,7 @@ fn allow_builds_placeholder_does_not_block_commands() {
         "an undecided entry is not an explicit denial: {output}",
     );
 
-    // Deciding a package replaces its placeholder outright — the whole
+    // Deciding a package replaces its placeholder outright, the whole
     // value, not the first word of it, which would leave the rest behind
     // as a plain scalar that reads as undecided all over again.
     pacquet(&workspace)
@@ -484,7 +574,7 @@ fn approve_builds_with_args_runs_the_build() {
     // With its only ignored build approved, `.modules.yaml` no longer
     // records an `ignoredBuilds` field, so the package is no longer listed.
     // (pnpm prints "Cannot identify as no node_modules found" when the
-    // field is absent — "None" is reserved for a present-but-empty list.)
+    // field is absent. "None" is reserved for a present-but-empty list.)
     let output = stdout_of(pacquet(&workspace).with_arg("ignored-builds").assert());
     assert!(
         !output.contains("@pnpm.e2e/install-script-example"),
@@ -732,11 +822,21 @@ const PREPOST_MARKER: &str = "node_modules/.pnpm/@pnpm.e2e+pre-and-postinstall-s
 /// Install both build-script fixtures with their builds ignored (neither in
 /// `allowBuilds`).
 fn install_two_with_ignored_builds() -> (CommandTempCwd<AddMockedRegistry>, std::path::PathBuf) {
+    let (harness, workspace) = install_prepost_with_ignored_build_and(INSTALL);
+    assert!(!workspace.join(INSTALL_MARKER).exists(), "install build must be ignored initially");
+    (harness, workspace)
+}
+
+/// Install the pre/postinstall fixture, with its build ignored, alongside
+/// `other_dependency`.
+fn install_prepost_with_ignored_build_and(
+    other_dependency: &str,
+) -> (CommandTempCwd<AddMockedRegistry>, std::path::PathBuf) {
     let harness = CommandTempCwd::init().add_mocked_registry();
     let workspace = harness.workspace.clone();
 
     let package_json = serde_json::json!({
-        "dependencies": { PREPOST: "1.0.0", INSTALL: "1.0.0" },
+        "dependencies": { PREPOST: "1.0.0", other_dependency: "1.0.0" },
     });
     fs::write(workspace.join("package.json"), package_json.to_string())
         .expect("write package.json");
@@ -748,36 +848,89 @@ fn install_two_with_ignored_builds() -> (CommandTempCwd<AddMockedRegistry>, std:
         .success();
 
     assert!(!workspace.join(PREPOST_MARKER).exists(), "prepost build must be ignored initially");
-    assert!(!workspace.join(INSTALL_MARKER).exists(), "install build must be ignored initially");
     (harness, workspace)
+}
+
+fn assert_prepost_approvable_after_removing(workspace: &Path, removed: &str) {
+    pacquet(workspace)
+        .with_args(["remove", removed])
+        .assert()
+        .success();
+
+    let output = stdout_of(pacquet(workspace).with_arg("ignored-builds").assert());
+    assert!(output.contains(PREPOST), "the remaining package stays pending: {output}");
+    assert!(!output.contains(removed), "the removed package must not stay pending: {output}");
+
+    pacquet(workspace)
+        .with_args(["approve-builds", "--all"])
+        .assert()
+        .success();
+
+    assert!(workspace.join(PREPOST_MARKER).exists(), "remaining package built under --all");
+    assert_eq!(
+        allow_builds(workspace).get(PREPOST),
+        Some(&true),
+        "remaining package approval persisted",
+    );
 }
 
 #[test]
 fn approve_builds_works_after_removing_an_unrelated_dependency() {
     let (harness, workspace) = install_two_with_ignored_builds();
 
+    assert_prepost_approvable_after_removing(&workspace, INSTALL);
+    assert!(!workspace.join(INSTALL_MARKER).exists(), "removed package was not rebuilt");
+
+    drop(harness);
+}
+
+#[test]
+fn approve_builds_works_after_removing_dependency_without_scripts() {
+    let (harness, workspace) = install_prepost_with_ignored_build_and("is-positive");
+
+    assert_prepost_approvable_after_removing(&workspace, "is-positive");
+
+    drop(harness);
+}
+
+#[test]
+fn approve_builds_works_after_adding_another_dependency() {
+    let harness = CommandTempCwd::init().add_mocked_registry();
+    let workspace = harness.workspace.clone();
+    let package_json = serde_json::json!({ "dependencies": { PREPOST: "1.0.0" } });
+    fs::write(workspace.join("package.json"), package_json.to_string())
+        .expect("write package.json");
+    disable_strict_dep_builds(&workspace);
     pacquet(&workspace)
-        .with_args(["remove", INSTALL])
+        .with_arg("install")
         .assert()
         .success();
 
+    pacquet(&workspace)
+        .with_args(["add", "is-positive@1.0.0"])
+        .assert()
+        .success();
     let output = stdout_of(pacquet(&workspace).with_arg("ignored-builds").assert());
-    assert!(output.contains(PREPOST), "the remaining package stays pending: {output}");
-    assert!(!output.contains(INSTALL), "the removed package must not stay pending: {output}");
+    assert!(output.contains(PREPOST), "first package stays pending: {output}");
+    assert!(!output.contains("is-positive"), "package without scripts is not pending: {output}");
+
+    pacquet(&workspace)
+        .with_args(["add", &format!("{INSTALL}@1.0.0")])
+        .assert()
+        .success();
+    let output = stdout_of(pacquet(&workspace).with_arg("ignored-builds").assert());
+    assert!(output.contains(PREPOST), "first package stays pending: {output}");
+    assert!(output.contains(INSTALL), "second package is also pending: {output}");
 
     pacquet(&workspace)
         .with_args(["approve-builds", "--all"])
         .assert()
         .success();
-
-    assert!(workspace.join(PREPOST_MARKER).exists(), "remaining package built under --all");
-    assert!(!workspace.join(INSTALL_MARKER).exists(), "removed package was not rebuilt");
-    assert_eq!(
-        allow_builds(&workspace).get(PREPOST),
-        Some(&true),
-        "remaining package approval persisted",
-    );
-
+    assert!(workspace.join(PREPOST_MARKER).exists(), "first package built under --all");
+    assert!(workspace.join(INSTALL_MARKER).exists(), "second package built under --all");
+    let recorded = allow_builds(&workspace);
+    assert_eq!(recorded.get(PREPOST), Some(&true), "first package approval persisted");
+    assert_eq!(recorded.get(INSTALL), Some(&true), "second package approval persisted");
     drop(harness);
 }
 
@@ -976,9 +1129,9 @@ fn ignore_workspace_skips_the_allow_builds_scaffold() {
     pacquet_in_terminal(&workspace)
         .with_arg("--ignore-workspace")
         // The run reads no workspace manifest, so the settings the
-        // harness put there — the test store and cache, and the relaxed
+        // harness put there (the test store and cache, and the relaxed
         // build policy that keeps a blocked build from failing the
-        // install — have to come from the environment instead.
+        // install) have to come from the environment instead.
         .with_env("PNPM_CONFIG_STRICT_DEP_BUILDS", "false")
         .with_env("PNPM_CONFIG_STORE_DIR", &harness.npmrc_info.store_dir)
         .with_env("PNPM_CONFIG_CACHE_DIR", &harness.npmrc_info.cache_dir)
@@ -1002,3 +1155,24 @@ fn ignore_workspace_skips_the_allow_builds_scaffold() {
 
     drop(harness);
 }
+
+#[test]
+fn permissions_approval_rebuilds_the_selected_dependency() {
+    let (harness, workspace) = install_with_ignored_build();
+    let marker = workspace.join(INSTALL_MARKER);
+    assert!(!marker.exists());
+    pacquet(&workspace)
+        .with_args(["permissions", "approve", "@pnpm.e2e/install-script-example"])
+        .assert()
+        .success();
+    assert!(marker.exists(), "permissions approval must run the install script");
+    let modules = pnpm_modules_yaml::read_modules_manifest::<pnpm_modules_yaml::Host>(
+        &workspace.join("node_modules"),
+    )
+    .expect("read .modules.yaml")
+    .expect(".modules.yaml exists");
+    assert!(modules.pending_builds.is_empty(), "{:?}", modules.pending_builds);
+    drop(harness);
+}
+
+mod non_interactive;

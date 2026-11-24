@@ -1,4 +1,7 @@
-use super::{TILE_HEIGHT, TilePath};
+use super::{
+    TILE_HEIGHT,
+    TilePath,
+};
 use pretty_assertions::assert_eq;
 use tlog_tiles::Tile;
 
@@ -52,7 +55,8 @@ fn rejects_non_canonical_paths() {
 fn lists_the_tiles_of_a_tree_of_70000_entries_as_the_spec_does() {
     let tiles: Vec<TilePath> = Tile::new_tiles(TILE_HEIGHT, 0, 70_000)
         .iter()
-        .map(|tile| TilePath::of_tile(tile).unwrap())
+        .map(TilePath::of_tile)
+        .map(Option::unwrap)
         .collect();
     let count = |level: u8, is_full: bool| {
         tiles
@@ -88,4 +92,15 @@ fn does_not_convert_hash_tiles_outside_tlog_tiles_bounds() {
     for (level, width) in [(64, 1), (0, 0), (0, 257)] {
         assert_eq!(TilePath::Hashes { level, index: 0, width }.to_tile(), None);
     }
+}
+
+#[test]
+fn formats_partial_entries_prefix_for_bundle_discovery() {
+    assert_eq!(TilePath::partial_entries_prefix(0), "tile/entries/000.p");
+    assert_eq!(TilePath::partial_entries_prefix(1_234_067), "tile/entries/x001/x234/067.p");
+    let candidate = format!("{}/17", TilePath::partial_entries_prefix(1_234_067));
+    assert_eq!(
+        candidate.parse::<TilePath>(),
+        Ok(TilePath::Entries { index: 1_234_067, width: 17 }),
+    );
 }

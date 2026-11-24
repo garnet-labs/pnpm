@@ -2,21 +2,40 @@
 //! chain and command-level registry lookups, so they pick byte-identical
 //! versions (`minimumReleaseAge` and `resolutionMode` included).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+#[cfg(feature = "runtime-provisioning")]
+use pnpm_config::Tool;
 use pnpm_config::{
-    Config, NeedsFullMetadataFor, ResolutionMode, Tool,
-    version_policy::{PackageVersionPolicy, VersionPolicyError, create_package_version_policy},
+    Config,
+    NeedsFullMetadataFor,
+    ResolutionMode,
+    version_policy::{
+        PackageVersionPolicy,
+        VersionPolicyError,
+        create_package_version_policy,
+    },
 };
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_pm_yarn_resolver::YarnResolver;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_runtime_bun_resolver::BunResolver;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_runtime_deno_resolver::DenoResolver;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_runtime_node_resolver::NodeResolver;
 use pnpm_network::ThrottledClient;
 use pnpm_resolving_default_resolver::DefaultResolver;
 use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, MergeNamedRegistriesError, NamedRegistryResolver, NpmResolver,
-    OfflineStoreView, PackumentFetchLocker, PickPackageContext, merge_named_registries,
-    shared_packument_fetch_locker, shared_picked_manifest_cache,
+    InMemoryPackageMetaCache,
+    MergeNamedRegistriesError,
+    NamedRegistryResolver,
+    NpmResolver,
+    OfflineStoreView,
+    PackumentFetchLocker,
+    PickPackageContext,
+    merge_named_registries,
+    shared_packument_fetch_locker,
+    shared_picked_manifest_cache,
 };
 use pnpm_resolving_resolver_base::Resolver;
 use std::sync::Arc;
@@ -45,22 +64,22 @@ pub struct PickPolicy {
     pub filter_metadata: bool,
     /// `minimumReleaseAge` cutoff: only versions published at or before
     /// this instant are eligible. `None` disables the maturity filter.
-    pub published_by: Option<DateTime<Utc>>,
+    pub published_by: Option<Timestamp>,
     /// `minimumReleaseAgeExclude` policy, exempting matching packages from
     /// the cutoff.
     pub published_by_exclude: Option<PackageVersionPolicy>,
 }
 
 impl PickPolicy {
-    /// Derive the policy from config, sampling the wall clock for the
-    /// `minimumReleaseAge` cutoff. Errors only when
+    /// Derive the policy from config, with the `minimumReleaseAge` cutoff
+    /// counted back from [`Config::resolved_reference_time`]. Errors only when
     /// `minimumReleaseAgeExclude` contains an invalid rule.
     ///
-    /// The cutoff is anchored to "now" at the moment of the call. Share the
+    /// The cutoff is computed once per call. Share the
     /// returned policy across an operation so every lookup uses the same
     /// cutoff instant.
     pub fn from_config(config: &Config) -> Result<Self, VersionPolicyError> {
-        Self::from_config_at(config, chrono::Utc::now())
+        Self::from_config_at(config, config.resolved_reference_time())
     }
 
     /// [`Self::from_config`] with extra `minimumReleaseAgeExclude` specs
@@ -99,18 +118,18 @@ impl PickPolicy {
     /// `minimumReleaseAge` cutoff to the same instant.
     pub(crate) fn from_config_at(
         config: &Config,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<Self, VersionPolicyError> {
         let time_based = config.resolution_mode == ResolutionMode::TimeBased;
         let pick_lowest_direct = config.resolution_mode.picks_lowest_direct();
         let full_metadata = config.requires_full_metadata_for_resolution();
-        // On overflow we leave the policy inactive for this run — better
+        // On overflow we leave the policy inactive for this run, better
         // than silently producing a cutoff in the wrong direction.
         let published_by = config
             .resolved_minimum_release_age()
             .and_then(|minutes| {
-                let duration = chrono::Duration::try_minutes(i64::try_from(minutes).ok()?)?;
-                now.checked_sub_signed(duration)
+                let duration = pnpm_time::duration_minutes(i64::try_from(minutes).ok()?)?;
+                now.checked_sub(duration).ok()
             });
         let published_by_exclude = config.minimum_release_age_exclude
             .as_deref()
@@ -138,6 +157,10 @@ impl PickPolicy {
 ///
 /// Returns an error when the configured named-registry prefixes cannot be
 /// merged into an unambiguous resolver map.
+#[cfg_attr(
+    not(feature = "runtime-provisioning"),
+    expect(clippy::needless_pass_by_value, reason = "the runtime resolvers consume `http_client`")
+)]
 pub fn create_configured_registry_resolver(
     config: &Config,
     http_client: Arc<ThrottledClient>,
@@ -147,17 +170,23 @@ pub fn create_configured_registry_resolver(
     let named = create_configured_named_registry_resolver(config, &npm, policy)?;
     let registry_resolver: Arc<dyn Resolver> =
         Arc::new(DefaultResolver::new(vec![Box::new(npm), Box::new(named)]));
-    let node_resolver = create_configured_node_resolver(config, Arc::clone(&http_client));
-    Ok(DefaultResolver::new(vec![
-        Box::new(Arc::clone(&registry_resolver)) as Box<dyn Resolver>,
-        Box::new(node_resolver),
-        Box::new(DenoResolver::new(Arc::clone(&http_client), Arc::clone(&registry_resolver))),
-        Box::new(
+    let mut chain: Vec<Box<dyn Resolver>> = vec![Box::new(Arc::clone(&registry_resolver))];
+    #[cfg(feature = "runtime-provisioning")]
+    {
+        chain.push(Box::new(create_configured_node_resolver(config, Arc::clone(&http_client))));
+        chain.push(Box::new(DenoResolver::new(
+            Arc::clone(&http_client),
+            Arc::clone(&registry_resolver),
+        )));
+        chain.push(Box::new(
             BunResolver::new(Arc::clone(&http_client), Arc::clone(&registry_resolver))
                 .with_mirror(config.tool_mirror(Tool::Bun)),
-        ),
-        Box::new(YarnResolver::new(http_client, config.tls.strict_ssl.unwrap_or(true))),
-    ]))
+        ));
+        chain.push(Box::new(YarnResolver::new(http_client, config.tls.strict_ssl.unwrap_or(true))));
+    }
+    #[cfg(not(feature = "runtime-provisioning"))]
+    chain.push(Box::new(pnpm_resolving_default_resolver::UnavailableToolResolver));
+    Ok(DefaultResolver::new(chain))
 }
 
 fn create_configured_named_registry_resolver(
@@ -200,6 +229,7 @@ fn create_configured_named_registry_resolver(
     })
 }
 
+#[cfg(feature = "runtime-provisioning")]
 fn create_configured_node_resolver(
     config: &Config,
     http_client: Arc<ThrottledClient>,
@@ -239,7 +269,7 @@ fn create_configured_npm_resolver(
             needs_full_metadata_for: Some(Arc::clone(&policy.needs_full_metadata_for)),
             filter_metadata: policy.filter_metadata,
             registry_options_by_url: Arc::new(config.registry_options_by_url.clone()),
-            minimum_release_age: config.resolved_minimum_release_age(),
+            minimum_release_age: config.release_age_window_from_now(),
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
             network: config.network_policy(),
@@ -274,7 +304,7 @@ pub(crate) fn pick_package_context<'a>(
     PickPackageContext {
         pnpr_format: Some(pnpm_resolving_npm_resolver::PnprFormatPolicy {
             registry_options: &config.registry_options_by_url,
-            minimum_release_age: config.resolved_minimum_release_age(),
+            minimum_release_age: config.release_age_window_from_now(),
         }),
         full_metadata: policy.full_metadata,
         needs_full_metadata_for: Some(policy.needs_full_metadata_for.as_ref()),
@@ -296,3 +326,9 @@ pub(crate) fn pick_package_context<'a>(
         },
     }
 }
+
+#[cfg(all(test, not(feature = "runtime-provisioning")))]
+mod tests;
+
+#[cfg(test)]
+mod reference_time_tests;

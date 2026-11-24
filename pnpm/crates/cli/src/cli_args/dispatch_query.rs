@@ -1,16 +1,54 @@
 pub(super) use maintenance::{
-    bin, bugs, cache, cat_file, cat_index, clean, config, config_get, config_set, docs, doctor,
-    find_hash, ignored_builds, not_implemented, prefix, repo, root, self_update, setup, shim,
-    store, tasks, with,
+    bin,
+    bugs,
+    cache,
+    cat_file,
+    cat_index,
+    clean,
+    config,
+    config_get,
+    config_set,
+    docs,
+    doctor,
+    find_hash,
+    ignored_builds,
+    prefix,
+    repo,
+    root,
+    self_update,
+    setup,
+    shim,
+    store,
+    tasks,
+    with,
 };
 pub(super) use registry::{
-    access, deprecate, dist_tag, login, logout, owner, ping, profile, search, star, stars, team,
-    token, undeprecate, unpublish, unstar, view, whoami,
+    access,
+    deprecate,
+    dist_tag,
+    login,
+    logout,
+    owner,
+    ping,
+    profile,
+    search,
+    star,
+    stars,
+    team,
+    token,
+    undeprecate,
+    unpublish,
+    unstar,
+    view,
+    whoami,
 };
 
 use super::{
     access::AccessArgs,
-    audit::{AuditArgs, AuditOutcome},
+    audit::{
+        AuditArgs,
+        AuditOutcome,
+    },
     bin::BinArgs,
     bugs::BugsArgs,
     cache::CacheCommand,
@@ -18,29 +56,52 @@ use super::{
     cat_index::CatIndexArgs,
     change::ChangeArgs,
     clean::CleanArgs,
-    config::{ConfigArgs, ConfigGetAliasArgs, ConfigSetAliasArgs, ConfigSubcommand},
+    config::{
+        ConfigArgs,
+        ConfigGetAliasArgs,
+        ConfigSetAliasArgs,
+        ConfigSubcommand,
+    },
     deprecate::DeprecateArgs,
-    dispatch::{CommandFuture, RunCtx, apply_update_config},
+    dispatch::{
+        CommandFuture,
+        RunCtx,
+        apply_global_update_config,
+        apply_update_config,
+    },
     dist_tag::DistTagArgs,
     docs::DocsArgs,
-    doctor::{DoctorArgs, DoctorOutcome},
+    doctor::{
+        DoctorArgs,
+        DoctorOutcome,
+    },
     find_hash::FindHashArgs,
+    fund::FundArgs,
     ignored_builds::IgnoredBuildsArgs,
     lane::LaneArgs,
     licenses::LicensesArgs,
     list::ListArgs,
     login::LoginArgs,
     logout::LogoutArgs,
-    not_implemented::NotImplementedError,
-    outdated::{OutdatedArgs, OutdatedOutcome},
+    outdated::{
+        OutdatedArgs,
+        OutdatedOutcome,
+    },
     owner::OwnerArgs,
-    pack::{PackArgs, PackJsonReporter},
+    pack::{
+        PackArgs,
+        PackJsonReporter,
+    },
     pack_app::PackAppArgs,
-    peers::{PeersArgs, PeersOutcome},
+    peers::{
+        PeersArgs,
+        PeersOutcome,
+    },
     ping::PingArgs,
     prefix::PrefixArgs,
     profile::ProfileArgs,
     publish::PublishArgs,
+    recursive::selectors_narrow_the_run,
     repo::RepoArgs,
     reporter::ReporterType,
     root::RootArgs,
@@ -66,7 +127,10 @@ use super::{
     with::WithArgs,
 };
 use crate::{
-    cli_args::reporter::{CliReporter, EventFilter},
+    cli_args::reporter::{
+        CliReporter,
+        EventFilter,
+    },
     config_deps::prepare_config,
 };
 use clap::CommandFactory;
@@ -94,8 +158,9 @@ pub(super) fn outdated<'a>(
     args: OutdatedArgs,
 ) -> miette::Result<CommandFuture<'a>> {
     if args.global {
-        let config = (ctx.loaders.global_config)()?;
+        let config = (ctx.loaders.global_packages_config)()?;
         return Ok(Box::pin(async move {
+            apply_global_update_config(config).await?;
             if Box::pin(args.run_global(config)).await? == OutdatedOutcome::Outdated {
                 // `outdated` exits non-zero when a dependency is outdated, mirroring pnpm.
                 pnpm_executor::exit(1);
@@ -128,6 +193,14 @@ pub(super) fn audit<'a>(ctx: &RunCtx<'a>, args: AuditArgs) -> miette::Result<Com
 }
 
 pub(super) fn list<'a>(ctx: &RunCtx<'a>, args: ListArgs) -> miette::Result<CommandFuture<'a>> {
+    if args.global {
+        let config = (ctx.loaders.global_packages_config)()?;
+        let dir = ctx.locations.dir;
+        return Ok(Box::pin(async move {
+            apply_global_update_config(config).await?;
+            args.run(config, dir, false).await
+        }));
+    }
     let config = (ctx.loaders.config)()?;
     let dir = ctx.locations.dir;
     let recursive = ctx.workspace.recursive;
@@ -155,7 +228,24 @@ pub(super) fn licenses<'a>(
     }))
 }
 
+pub(super) fn fund<'a>(ctx: &RunCtx<'a>, args: FundArgs) -> miette::Result<CommandFuture<'a>> {
+    let config = (ctx.loaders.config)()?;
+    let dir = ctx.locations.dir;
+    let recursive = ctx.workspace.recursive;
+    Ok(Box::pin(async move {
+        apply_update_config(config, dir).await?;
+        args.run::<pnpm_network_web_auth::Host>(config, dir, recursive)
+    }))
+}
+
 pub(super) fn why<'a>(ctx: &RunCtx<'a>, args: WhyArgs) -> miette::Result<CommandFuture<'a>> {
+    if args.global {
+        let config = (ctx.loaders.global_packages_config)()?;
+        return Ok(Box::pin(async move {
+            apply_global_update_config(config).await?;
+            args.run_global(config).await
+        }));
+    }
     let command_state = ctx.prepared_state(true);
     Ok(Box::pin(async move { args.run(command_state.await?).await }))
 }
@@ -166,19 +256,42 @@ pub(super) fn sbom<'a>(ctx: &RunCtx<'a>, args: SbomArgs) -> miette::Result<Comma
 }
 
 pub(super) fn peers<'a>(ctx: &RunCtx<'a>, args: PeersArgs) -> miette::Result<CommandFuture<'a>> {
-    let cfg = if args.global { (ctx.loaders.global_config)()? } else { (ctx.loaders.config)()? };
+    let cfg =
+        if args.global { (ctx.loaders.global_packages_config)()? } else { (ctx.loaders.config)()? };
     let recursive = ctx.workspace.recursive;
+    let recursive_from_command_line = ctx.workspace.recursive_from_command_line;
     let dir = ctx.locations.dir;
     Ok(Box::pin(async move {
-        if !args.global {
+        if args.global {
+            apply_global_update_config(cfg).await?;
+        } else {
             apply_update_config(cfg, dir).await?;
         }
+        let recursive = recursive && !dedicated_subproject(cfg, dir, recursive_from_command_line);
         if args.run(cfg, dir, recursive)? != PeersOutcome::NoIssues {
             // `peers` exits non-zero when peer issues are found or the subcommand is unknown, mirroring pnpm.
             pnpm_executor::exit(1);
         }
         Ok(())
     }))
+}
+
+/// Without `-r` or a workspace selector, `pnpm peers` run inside a subproject
+/// of a `sharedWorkspaceLockfile: false` workspace checks only that project's
+/// dedicated lockfile.
+fn dedicated_subproject(
+    config: &Config,
+    dir: &std::path::Path,
+    recursive_from_command_line: bool,
+) -> bool {
+    !config.shares_one_lockfile()
+        && !recursive_from_command_line
+        && !selectors_narrow_the_run(config)
+        && config.workspace_dir
+            .as_deref()
+            .is_some_and(|workspace_dir| {
+                pnpm_fs::lexical_normalize(dir) != pnpm_fs::lexical_normalize(workspace_dir)
+            })
 }
 
 pub(super) fn change<'a>(ctx: &RunCtx<'a>, args: ChangeArgs) -> miette::Result<CommandFuture<'a>> {
@@ -235,7 +348,7 @@ pub(super) fn pack<'a>(ctx: &RunCtx<'a>, args: PackArgs) -> miette::Result<Comma
 ///
 /// `dir` / `config` / `recursive` are read off `ctx` here, before the boxed
 /// future, so the future captures only owned/concrete values and never holds
-/// `&RunCtx` — whose higher-ranked config closures would otherwise make the
+/// `&RunCtx`, whose higher-ranked config closures would otherwise make the
 /// boxed [`CommandFuture`] not `Send`.
 pub(super) fn publish<'a>(
     ctx: &RunCtx<'a>,
@@ -296,6 +409,12 @@ pub(super) fn stage<'a>(
             }
         }
         Ok(())
+    }
+    if args.flags.output.json {
+        return Ok(Box::pin(async move {
+            let _quiet = EventFilter::All.apply();
+            print_output::<CliReporter>(args, dir, config, recursive).await
+        }));
     }
     Ok(Box::pin(print_output::<CliReporter>(args, dir, config, recursive)))
 }

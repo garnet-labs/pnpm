@@ -1,13 +1,28 @@
 use super::{
-    AuditLevel, BTreeMap, Config, IndexMap, LogLevel, NodeLinker, Path, PathBuf, PmOnFail,
-    ProjectConfig, RemoteSideEffectsCacheSettings, ReporterType, RuntimeOnFail,
-    SupportedArchitectures, UNREPORTED_SETTINGS, UpdateConfig, WorkspaceSettings, assert_eq,
+    AuditLevel,
+    BTreeMap,
+    Config,
+    IndexMap,
+    LogLevel,
+    NodeLinker,
+    Path,
+    PathBuf,
+    PmOnFail,
+    ProjectConfig,
+    RemoteSideEffectsCacheSettings,
+    ReporterType,
+    RuntimeOnFail,
+    SupportedArchitectures,
+    UNREPORTED_SETTINGS,
+    UpdateConfig,
+    WorkspaceSettings,
+    assert_eq,
 };
 
 /// Every setting must report its resolved value, so that a hook reading the
 /// configuration sees what the install runs with. A key absent from the
 /// projection reads as `null`, which is indistinguishable from "explicitly
-/// unset" — so adding a setting to [`WorkspaceSettings`] or
+/// unset", so adding a setting to [`WorkspaceSettings`] or
 /// [`MachineSettings`](crate::MachineSettings) without teaching its
 /// `from_resolved` about it fails here.
 ///
@@ -22,6 +37,7 @@ fn from_resolved_reports_every_setting() {
         pnpr_server: Some("https://pnpr.example".to_string()),
         frozen_lockfile: Some(true),
         provenance: Some(false),
+        access: Some("restricted".to_string()),
         reporter_hide_prefix: Some(true),
         loglevel: Some(LogLevel::Error),
         reporter: Some(ReporterType::Silent),
@@ -30,6 +46,7 @@ fn from_resolved_reports_every_setting() {
         node_version: Some("24.0.0".to_string()),
         publish_branch: Some("production".to_string()),
         script_shell: Some("/bin/bash".to_string()),
+        editor: Some("example-editor --wait".to_string()),
         node_options: Some("--max-old-space-size=8192".to_string()),
         patches_dir: Some("patches".to_string()),
         save_prefix: Some("~".to_string()),
@@ -43,6 +60,7 @@ fn from_resolved_reports_every_setting() {
         init_author_url: Some("https://example.com".to_string()),
         init_license: Some("MIT".to_string()),
         init_version: Some("1.0.0".to_string()),
+        reference_time: Some(pnpm_time::parse_rfc3339("2026-11-14T00:00:00Z").expect("valid")),
         minimum_release_age_strict: Some(true),
         boot_config: Some(Box::new(crate::BootConfig {
             minimum_release_age: Some(0),
@@ -51,6 +69,7 @@ fn from_resolved_reports_every_setting() {
         minimum_release_age_exclude: Some(vec!["is-positive".to_string()]),
         trust_policy_exclude: Some(vec!["is-negative".to_string()]),
         trust_policy_ignore_after: Some(1),
+        global_packages_config: Some(std::sync::Arc::new(WorkspaceSettings::default())),
         lockfile_dir: Some(PathBuf::from("/tmp/project")),
         npmrc_auth_file: Some(PathBuf::from("/tmp/auth.ini")),
         global_pnpmfile: Some(PathBuf::from("/tmp/global/pnpmfile.cjs")),

@@ -1,6 +1,13 @@
 use super::{
-    DepType, HashMap, SbomComponent, SbomComponentType, SbomResult, base64_to_hex, build_purl,
-    classify_license, generate_uuid_v4,
+    DepType,
+    HashMap,
+    SbomComponent,
+    SbomComponentType,
+    SbomResult,
+    base64_to_hex,
+    build_purl,
+    classify_license,
+    generate_uuid_v4,
 };
 
 pub(super) struct CycloneDxOpts<'a> {
@@ -64,7 +71,7 @@ fn cyclonedx_metadata(
     opts: &CycloneDxOpts<'_>,
     root_component: &serde_json::Value,
 ) -> serde_json::Value {
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let timestamp = pnpm_time::format_millis(jiff::Timestamp::now());
     let phase = if opts.lockfile_only { "pre-build" } else { "build" };
 
     let mut metadata = serde_json::json!({
@@ -189,8 +196,8 @@ fn cyclonedx_external_references(component: &SbomComponent) -> Vec<serde_json::V
     ext_refs
 }
 
-/// The `dependencies` graph, with one entry per component — including
-/// the ones nothing depends on — in a deterministic order.
+/// The `dependencies` graph, with one entry per component (including
+/// the ones nothing depends on) in a deterministic order.
 fn cyclonedx_dependencies(result: &SbomResult, root_purl: &str) -> Vec<serde_json::Value> {
     let mut deps_map: HashMap<&str, Vec<&str>> = HashMap::new();
     deps_map.entry(root_purl).or_default();

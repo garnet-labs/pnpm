@@ -1,10 +1,24 @@
 use super::{
-    AuthState, Body, Request, ServiceExt, StatusCode, TempDir, Value, body_bytes, cargo_config,
-    crate_archive, header, json, metadata, publish_body, publish_request, registry_groups,
-    router_with_auth, sha256_hex,
+    AuthState,
+    Body,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    Value,
+    body_bytes,
+    cargo_config,
+    crate_archive,
+    header,
+    json,
+    metadata,
+    multi_ecosystem,
+    publish_body,
+    publish_request,
+    router_with_auth,
+    sha256_hex,
 };
 use crate::tokens::issue_token;
-use pnpr_storage::layout::local_blob_path;
 
 #[tokio::test]
 async fn publish_then_resolve_and_download_a_hosted_crate() {
@@ -47,7 +61,8 @@ async fn publish_then_resolve_and_download_a_hosted_crate() {
     let index = String::from_utf8(body_bytes(response.into_body()).await).unwrap();
     let lines: Vec<Value> = index
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+        .map(serde_json::from_str)
+        .map(Result::unwrap)
         .collect();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["name"], "demo");
@@ -70,16 +85,15 @@ async fn publish_then_resolve_and_download_a_hosted_crate() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response.into_body()).await, archive);
 
-    // Storage layout: the hosted org namespace, keyed by the lowercase name.
-    assert!(
-        local_blob_path(
+    // Storage layout: the hosted namespace, keyed by the lowercase name.
+    assert_eq!(
+        pnpr_fixtures::read_hosted_file(
             tmp.path(),
-            "crates",
-            pnpr_storage::Ecosystem::Cargo,
+            ("crates", pnpr_storage::Ecosystem::Cargo),
             "demo",
-            "demo-0.1.0.crate"
-        )
-        .is_file(),
+            "demo-0.1.0.crate",
+        ),
+        Some(archive.clone()),
     );
     assert!(
         pnpr_fixtures::read_hosted_document(
@@ -104,7 +118,7 @@ async fn publish_then_resolve_and_download_a_hosted_crate() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{wrong}");
     }
-    // The same crate through the named registry, caller-scoped.
+    // The same public crate through the named registry stays cacheable.
     let response = app
         .clone()
         .oneshot(
@@ -115,7 +129,7 @@ async fn publish_then_resolve_and_download_a_hosted_crate() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+    assert!(!response.headers().contains_key(header::CACHE_CONTROL));
     // npm-shaped paths mean nothing on the Cargo surface.
     let response = app
         .clone()
@@ -192,14 +206,13 @@ async fn publish_requires_a_token_and_refuses_duplicates_and_bad_archives() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(
-        !local_blob_path(
+        pnpr_fixtures::read_hosted_file(
             tmp.path(),
-            "crates",
-            pnpr_storage::Ecosystem::Cargo,
+            ("crates", pnpr_storage::Ecosystem::Cargo),
             "demo",
             "demo-0.2.0.crate"
         )
-        .exists(),
+        .is_none(),
     );
 
     // A name the hosted registry does not claim routes to the upstream, where
@@ -210,7 +223,7 @@ async fn publish_requires_a_token_and_refuses_duplicates_and_bad_archives() {
         .oneshot(publish_request(Some(&token), unclaimed))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let errors: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
     assert!(
         errors["errors"][0]["detail"]
@@ -410,13 +423,13 @@ async fn search_reports_the_newest_unyanked_release() {
 }
 
 #[tokio::test]
-async fn grouped_cargo_publish_stays_out_of_same_named_npm_registry() {
+async fn cargo_publish_stays_out_of_other_ecosystems() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
     let token = issue_token(&auth, "alice").await;
-    let app = router_with_auth(registry_groups::grouped_config(tmp.path(), "$all"), auth);
+    let app = router_with_auth(multi_ecosystem::multi_ecosystem_config(tmp.path(), "$all"), auth);
     let archive = crate_archive("demo", "0.1.0");
-    let request = Request::put("/cargo/~internal/api/v1/crates/new")
+    let request = Request::put("/cargo/~cargo-internal/api/v1/crates/new")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::from(publish_body(&metadata("demo", "0.1.0"), &archive)))
         .unwrap();
@@ -426,7 +439,7 @@ async fn grouped_cargo_publish_stays_out_of_same_named_npm_registry() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    for base in ["/cargo/~internal", "/cargo/~main", "/cargo"] {
+    for base in ["/cargo/~cargo-internal", "/cargo/~cargo-main", "/cargo"] {
         let response = app
             .clone()
             .oneshot(
@@ -451,9 +464,12 @@ async fn grouped_cargo_publish_stays_out_of_same_named_npm_registry() {
         assert_eq!(response.status(), StatusCode::OK, "{base}");
         assert_eq!(body_bytes(response.into_body()).await, archive);
     }
-    for path in
-        ["/npm/~internal/demo", "/npm/~main/demo", "/npm/demo", "/pypi/~internal/simple/demo/"]
-    {
+    for path in [
+        "/npm/~npm-internal/demo",
+        "/npm/~npm-main/demo",
+        "/npm/demo",
+        "/pypi/~pypi-internal/simple/demo/",
+    ] {
         let response = app
             .clone()
             .oneshot(
@@ -465,4 +481,64 @@ async fn grouped_cargo_publish_stays_out_of_same_named_npm_registry() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
+}
+
+#[tokio::test]
+async fn publishing_an_unclaimed_crate_names_the_packages_setting() {
+    let tmp = TempDir::new().unwrap();
+    let auth = AuthState::in_memory();
+    let token = issue_token(&auth, "publisher").await;
+    let app = router_with_auth(
+        cargo_config(tmp.path().to_path_buf(), "http://upstream.invalid/", "$all"),
+        auth,
+    );
+    let mut request = publish_request(
+        Some(&token),
+        publish_body(&metadata("example-crate", "1.0.0"), &crate_archive("example-crate", "1.0.0")),
+    );
+    *request.uri_mut() = "/cargo/~crates/api/v1/crates/new".parse().unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
+    assert!(
+        body["errors"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("`packages:`"),
+    );
+}
+
+#[tokio::test]
+async fn only_the_owner_publishes_or_yanks_a_claimed_crate() {
+    let tmp = TempDir::new().unwrap();
+    let auth = AuthState::in_memory();
+    let alice = issue_token(&auth, "alice").await;
+    let bob = issue_token(&auth, "bob").await;
+    let app = router_with_auth(
+        cargo_config(tmp.path().to_path_buf(), "http://upstream.invalid/", "$all"),
+        auth,
+    );
+    let publish = |token: String, version: &'static str| {
+        let app = app.clone();
+        async move {
+            let body = publish_body(&metadata("demo", version), &crate_archive("demo", version));
+            app.oneshot(publish_request(Some(&token), body)).await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(publish(alice.clone(), "0.1.0").await, StatusCode::OK);
+    assert_eq!(publish(bob.clone(), "0.2.0").await, StatusCode::FORBIDDEN);
+    let yank = app
+        .clone()
+        .oneshot(
+            Request::delete("/cargo/api/v1/crates/demo/0.1.0/yank")
+                .header(header::AUTHORIZATION, &bob)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(yank.status(), StatusCode::FORBIDDEN);
+    assert_eq!(publish(alice, "0.2.0").await, StatusCode::OK);
 }

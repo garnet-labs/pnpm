@@ -1,8 +1,27 @@
 use super::{
-    AuditLevel, BTreeMap, CASE, ColorMode, Config, ConfigDependency, ConfigDependencyDetail,
-    EnvVar, LoadWorkspaceYamlError, LogLevel, NAMED_UNRECOGNIZED_SETTINGS, NodeLinker,
-    NodePackageMapMode, NodePackageMapSettings, NodePackageMapType, Path, ReporterType, StoreDir,
-    TrustPolicy, WORKSPACE_MANIFEST_FILENAME, WorkspaceSettings, assert_eq, fs,
+    AuditLevel,
+    BTreeMap,
+    CASE,
+    ColorMode,
+    Config,
+    ConfigDependency,
+    ConfigDependencyDetail,
+    EnvVar,
+    LoadWorkspaceYamlError,
+    LogLevel,
+    NAMED_UNRECOGNIZED_SETTINGS,
+    NodeLinker,
+    NodePackageMapMode,
+    NodePackageMapSettings,
+    NodePackageMapType,
+    Path,
+    ReporterType,
+    StoreDir,
+    TrustPolicy,
+    WORKSPACE_MANIFEST_FILENAME,
+    WorkspaceSettings,
+    assert_eq,
+    fs,
 };
 use std::fmt::Write as _;
 
@@ -188,6 +207,20 @@ fn the_lockfile_section_sets_the_integrity_target() {
     assert_eq!(config.lockfile_integrity_target, pnpm_lockfile::IntegrityTarget::Resource);
 }
 
+#[test]
+fn the_lockfile_section_sets_the_format() {
+    let settings: WorkspaceSettings = serde_saphyr::from_str("lockfile:\n  format: v13\n").unwrap();
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.lockfile_format, pnpm_lockfile::LockfileFormat::V13);
+
+    assert!(serde_saphyr::from_str::<WorkspaceSettings>("lockfile:\n  format: v10\n").is_err());
+
+    let settings: WorkspaceSettings = serde_saphyr::from_str("lockfile: {}\n").unwrap();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.lockfile_format, pnpm_lockfile::LockfileFormat::V9);
+}
+
 /// pnpm reads `fetchRetries` / `fetchRetryFactor` /
 /// `fetchRetryMintimeout` / `fetchRetryMaxtimeout` from
 /// `pnpm-workspace.yaml` as camelCase keys (mirrors of the kebab-case
@@ -243,13 +276,13 @@ userAgent: my-agent/2.0
 }
 
 #[test]
-fn parses_max_tarball_unpacked_size_into_the_tar_limits() {
+fn parses_max_tarball_unpacked_size() {
     let mut config = Config::new();
-    assert_eq!(config.tar_limits(), pnpm_tarball::TarLimits::default());
+    assert_eq!(config.max_tarball_unpacked_size, pnpm_network::DEFAULT_MAX_TARBALL_UNPACKED_SIZE);
     let settings: WorkspaceSettings =
         serde_saphyr::from_str("maxTarballUnpackedSize: 1024\n").unwrap();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
-    assert_eq!(config.tar_limits(), pnpm_tarball::TarLimits::new(1024));
+    assert_eq!(config.max_tarball_unpacked_size, 1024);
 }
 
 #[test]
@@ -272,7 +305,7 @@ namedRegistries:
   work: https://${WORK_HOST}/work/
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_trusted::<EnvWithHost>();
+    settings.substitute_env_trusted::<EnvWithHost>().unwrap();
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
     assert_eq!(config.pnpr_server.as_deref(), Some("https://internal.example.com/pnpr/"));
@@ -357,7 +390,7 @@ cargo:
 }
 
 /// The variables are named for the setting they configure, and the names that
-/// matched the older spelling keep working — a machine set up before the rename
+/// matched the older spelling keep working, a machine set up before the rename
 /// is not something a `pnpm install` should start ignoring.
 ///
 /// Every suffix is covered because they do not share a parsing path: `PUBLISH`
@@ -437,7 +470,7 @@ fn the_remote_tier_reads_both_environment_spellings() {
 }
 
 /// A malformed JSON variable is reported by name, so it has to be the name the
-/// reader actually set — pointing at the spelling they did not use sends them
+/// reader actually set, pointing at the spelling they did not use sends them
 /// looking for a variable that is not in their environment.
 #[test]
 fn malformed_json_names_the_environment_variable_that_was_set() {
@@ -671,12 +704,11 @@ fn parses_save_settings_from_yaml_and_applies() {
 }
 
 /// The registry URL is the key here, so the untrusted-environment gate has to
-/// drop the entry rather than expanding a placeholder into a request URL. The
-/// variable resolves, so a dropped entry is distinguishable from one expanded
-/// to an empty string — expanding it is how a token would reach an
-/// attacker-chosen host from a committed pnpm-workspace.yaml.
+/// apply to the key. The variable resolves, so the refusal is distinguishable
+/// from an expansion to an empty string. Expanding it is how a token would
+/// reach an attacker-chosen host from a committed pnpm-workspace.yaml.
 #[test]
-fn drops_a_registry_declaration_whose_url_has_an_env_placeholder() {
+fn refuses_a_registry_declaration_whose_url_has_an_env_placeholder() {
     struct EnvWithToken;
     impl EnvVar for EnvWithToken {
         fn var(name: &str) -> Option<String> {
@@ -690,16 +722,11 @@ registries:
   https://npm.example.com/: {serverType: artifactory}
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithToken>();
-    let entries = settings.registries.as_ref().expect("registries present");
-    assert_eq!(entries.len(), 1);
-    assert!(entries.contains_key("https://npm.example.com/"));
-    assert!(
-        !entries
-            .keys()
-            .any(|registry| registry.contains("super-secret-token")),
-        "the token must never be expanded into a registry URL: {entries:?}",
-    );
+    let error = settings.substitute_env_untrusted::<EnvWithToken>().unwrap_err();
+    let message = error.to_string();
+    eprintln!("{message}");
+    assert!(matches!(error, crate::LoadWorkspaceYamlError::RegistryEnvNotExpanded { .. }));
+    assert!(!message.contains("super-secret-token"));
 }
 
 #[test]
@@ -834,6 +861,18 @@ fn a_report_names_only_the_first_unrecognized_task_settings() {
     let reported = &settings.key_issues.unrecognized_task_settings;
     assert_eq!(reported.named.len(), NAMED_UNRECOGNIZED_SETTINGS);
     assert_eq!(reported.total, NAMED_UNRECOGNIZED_SETTINGS + 3);
+}
+
+#[test]
+fn rejects_a_task_entry_without_a_value_with_a_hint() {
+    for entry in ["build:", "build: null"] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(WORKSPACE_MANIFEST_FILENAME), format!("tasks:\n  {entry}\n"))
+            .unwrap();
+
+        let error = WorkspaceSettings::load_at(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("Write `{}` for a task with no settings"), "{entry}: {error}");
+    }
 }
 
 #[test]

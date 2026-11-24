@@ -1,6 +1,12 @@
 use super::relocate_pre_subcommand_flags;
-use crate::{boolean_negations::with_boolean_negations, cli_args::CliArgs};
-use clap::{CommandFactory, FromArgMatches};
+use crate::{
+    boolean_negations::with_boolean_negations,
+    cli_args::CliArgs,
+};
+use clap::{
+    CommandFactory,
+    FromArgMatches,
+};
 use pretty_assertions::assert_eq;
 use std::ffi::OsString;
 
@@ -14,7 +20,8 @@ fn relocate(tokens: &[&str]) -> Vec<String> {
             .collect(),
     )
     .into_iter()
-    .map(|token| token.into_string().expect("test tokens are UTF-8"))
+    .map(OsString::into_string)
+    .map(|text| text.expect("test tokens are UTF-8"))
     .collect()
 }
 
@@ -150,9 +157,9 @@ fn short_with_conflicting_arity_moves_with_the_value_its_command_reads() {
 #[test]
 fn short_with_conflicting_arity_takes_a_command_name_as_its_value() {
     assert_eq!(
-        relocate(&["pnpm", "-d", "edit", "patch", "foo"]),
-        ["pnpm", "patch", "-d", "edit", "foo"],
-        "`edit` does not declare -d, so `patch -d` reads `edit` as its value",
+        relocate(&["pnpm", "-d", "store", "patch", "foo"]),
+        ["pnpm", "patch", "-d", "store", "foo"],
+        "`store` does not declare -d, so `patch -d` reads `store` as its value",
     );
     assert_eq!(
         relocate(&["pnpm", "-d", "add", "foo"]),

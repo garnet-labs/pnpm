@@ -8,7 +8,7 @@ const ERROR_BLOCK: &str = r#"[ERR_PNPM_PEER_DEP_ISSUES] Unmet peer dependencies
 ✕ missing peer missing-peer
   Wanted:
     "*":
-      peer-user@file:dep
+      peer-user@1.0.0
 hint: To auto-install peer dependencies, add the following to "pnpm-workspace.yaml" in your project root:
 
   autoInstallPeers: true
@@ -41,10 +41,10 @@ fn peer_project(strict: bool) -> CommandTempCwd<()> {
 #[test]
 fn fatal_peer_block_and_hints_go_only_to_stderr() {
     for args in [vec![], vec!["--reporter=append-only"], vec!["--use-stderr"]] {
-        let mut project = peer_project(true);
+        let project = peer_project(true);
         let output = project.pacquet
-            .args(["install", "--color=never"])
-            .args(args)
+            .with_args(["install", "--color=never"])
+            .with_args(args)
             .output()
             .expect("run install");
         assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -61,15 +61,15 @@ fn fatal_peer_block_and_hints_go_only_to_stderr() {
 
 #[test]
 fn nonfatal_peer_warning_stays_on_stdout() {
-    let mut project = peer_project(false);
+    let project = peer_project(false);
     let output = project.pacquet
-        .arg("install")
+        .with_arg("install")
         .output()
         .expect("run install");
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    assert!(stdout.contains("[WARN] Issues with peer dependencies found."), "{stdout}");
+    assert!(stdout.contains(" has issues: "), "{stdout}");
     assert!(!stdout.contains("ERR_PNPM_PEER_DEP_ISSUES"), "{stdout}");
 }
 
@@ -85,7 +85,8 @@ fn fatal_peer_ndjson_keeps_the_structured_error() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     let records: Vec<Value> = stderr
         .lines()
-        .map(|line| serde_json::from_str(line).expect("every stderr line is JSON"))
+        .map(serde_json::from_str)
+        .map(|parsed| parsed.expect("every stderr line is JSON"))
         .collect();
     let errors: Vec<_> = records
         .iter()
@@ -110,14 +111,14 @@ fn silent_peer_failure_stays_silent() {
 
 #[test]
 fn registry_not_found_stays_on_stderr() {
-    let mut project = CommandTempCwd::init().add_mocked_registry();
+    let project = CommandTempCwd::init().add_mocked_registry();
     fs::write(
         project.workspace.join("package.json"),
         r#"{"dependencies":{"pnpm-missing-peer-error-test":"1.0.0"}}"#,
     )
     .expect("write project manifest");
     let output = project.pacquet
-        .arg("install")
+        .with_arg("install")
         .output()
         .expect("run install");
     assert_eq!(output.status.code(), Some(1), "{output:?}");

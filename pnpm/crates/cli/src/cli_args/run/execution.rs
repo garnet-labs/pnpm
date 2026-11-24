@@ -1,15 +1,43 @@
 use super::{
-    Config, ExecDirs, HashMap, IndexMap, IntoDiagnostic, Mutex, PackageManifest, Path,
-    ProcessTracker, ReporterType, RunError, RunScript, ScheduleGraphOptions, ScriptExit,
-    ScriptOutput, ScriptSelector, TaskCompletion, Value, env, exec_fallback, exit_like,
-    injected_sync::{start_injected_edit_watch, sync_injected_deps_after},
+    Config,
+    ExecDirs,
+    HashMap,
+    IndexMap,
+    IntoDiagnostic,
+    Mutex,
+    PackageManifest,
+    Path,
+    ProcessTracker,
+    RunArgs,
+    RunError,
+    RunScript,
+    ScheduleGraphOptions,
+    ScriptExit,
+    ScriptOutput,
+    ScriptSelector,
+    TaskCompletion,
+    Value,
+    env,
+    exec_fallback,
+    exit_like,
+    injected_sync::{
+        start_injected_edit_watch,
+        sync_injected_deps_after,
+    },
     interrupt_count,
     lifecycle_failure::report_lifecycle_failure,
-    make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
-    pnp_path_for_execution, run_script, schedule_graph, throw_or_filter_hidden_scripts,
+    make_node_package_map_option,
+    make_node_require_option,
+    package_map_path_for_execution,
+    pnp_path_for_execution,
+    run_script,
+    schedule_graph,
+    throw_or_filter_hidden_scripts,
 };
 use crate::cli_args::concurrency_group::{
-    SlotOutcome, acquire_concurrency_group_slot, with_held_group,
+    SlotOutcome,
+    acquire_concurrency_group_slot,
+    with_held_group,
 };
 use pnpm_reporter::LogEvent;
 
@@ -87,7 +115,7 @@ fn resolve_main_script(ctx: &RunContext<'_>, name: &str) -> Result<Option<String
 /// fallback, so the `pre`/`post` substring guard runs against the
 /// resolved `main_body` here.
 /// Run the matched scripts, in parallel when the run allows it. One
-/// script — or a sequential run — needs no scheduler; running it inline
+/// script (or a sequential run) needs no scheduler; running it inline
 /// keeps its output attached to this process.
 pub(super) fn run_selected_scripts(
     ctx: &RunContext<'_>,
@@ -136,30 +164,41 @@ fn run_one_script(
     }
     match run_stages(ctx, name, &main, args) {
         Ok(exit) if exit.status.success() => TaskCompletion::Passed,
-        Ok(exit) => outcome.fail(name, exit.status),
+        Ok(exit) => outcome.fail(name.to_owned(), exit.status),
         Err(error) => outcome.abort(error),
     }
 }
 
-/// What a run does when the manifest declares no matching script:
-/// `--if-present` succeeds, a shorthand invocation falls back to `exec`,
-/// and anything else is an error.
-pub(super) fn no_matching_script(
-    script_name: &str,
-    args: &[String],
-    dirs: ExecDirs<'_>,
-    config: &Config,
-    reporter: ReporterType,
-    if_present: bool,
-    fallback_to_exec: bool,
-) -> miette::Result<()> {
-    if if_present {
-        return Ok(());
+#[derive(Clone, Copy)]
+pub(super) enum MissingScript {
+    ReportError,
+    FallbackToExec,
+}
+
+impl RunArgs {
+    /// What a run does when the manifest declares no matching script:
+    /// `--if-present` succeeds, `start` reports [`RunError::NoScriptOrServer`],
+    /// a shorthand invocation falls back to `exec`, and anything else reports
+    /// [`RunError::NoScript`].
+    pub(super) fn no_matching_script(
+        &self,
+        script_name: &str,
+        args: &[String],
+        dirs: ExecDirs<'_>,
+        config: &Config,
+        missing_script: MissingScript,
+    ) -> miette::Result<()> {
+        if self.if_present {
+            return Ok(());
+        }
+        if script_name == "start" {
+            return Err(RunError::NoScriptOrServer.into());
+        }
+        match missing_script {
+            MissingScript::FallbackToExec => exec_fallback(script_name, args, dirs, config),
+            MissingScript::ReportError => Err(RunError::no_script(script_name, args).into()),
+        }
     }
-    if fallback_to_exec {
-        return exec_fallback(script_name, args, dirs, config, reporter);
-    }
-    Err(RunError::no_script(script_name, args).into())
 }
 
 /// The scripts the selector matches. Hidden scripts (names starting
@@ -167,9 +206,10 @@ pub(super) fn no_matching_script(
 /// an inherited `npm_lifecycle_event`.
 pub(super) fn selected_scripts(
     manifest: &PackageManifest,
+    dir: &Path,
     script_name: &str,
 ) -> miette::Result<Vec<String>> {
-    let specified = ScriptSelector::new(script_name)?.select_with_start(manifest.value());
+    let specified = ScriptSelector::new(script_name)?.select_with_start(manifest.value(), dir);
     if env::var_os("npm_lifecycle_event").is_some() {
         return Ok(specified);
     }
@@ -207,11 +247,11 @@ pub(super) fn script_concurrency(
     parallel: bool,
     sequential: bool,
 ) -> usize {
-    if parallel {
-        return script_count;
-    }
     if sequential {
         return 1;
+    }
+    if parallel {
+        return script_count;
     }
     usize::try_from(config.workspace_concurrency).unwrap_or(usize::MAX).max(1)
 }
@@ -264,11 +304,11 @@ impl ScriptOutcome<'_> {
         .into())
     }
 
-    pub(super) fn fail(&self, name: &str, exit: ScriptExit) -> TaskCompletion {
+    pub(super) fn fail(&self, name: String, exit: ScriptExit) -> TaskCompletion {
         self.failures
             .lock()
             .expect("run failure lock is not poisoned")
-            .push((name.to_owned(), exit));
+            .push((name, exit));
         self.cancel_siblings();
         TaskCompletion::Failed
     }
@@ -326,17 +366,17 @@ fn project_extra_env(ctx: &RunContext<'_>) -> HashMap<String, String> {
     ctx.config.prepend_project_node_path::<pnpm_config::Host>(
         &mut env,
         ctx.dir,
-        &project_modules_dir_name(ctx),
+        &project_modules_dir(ctx),
     );
     env
 }
 
-fn project_modules_dir_name<'a>(ctx: &RunContext<'a>) -> std::borrow::Cow<'a, std::ffi::OsStr> {
+fn project_modules_dir(ctx: &RunContext<'_>) -> std::path::PathBuf {
     let project_name = ctx.manifest
         .value()
         .get("name")
         .and_then(Value::as_str);
-    ctx.config.modules_dir_name_for(ctx.dir, project_name)
+    ctx.config.project_modules_dir(ctx.dir, project_name)
 }
 
 fn run_script_stages(
@@ -424,7 +464,7 @@ fn get_run_script_stages(
 /// no-op guards apply (empty body, or `npx only-allow pnpm` with no
 /// args), so the caller can record "didn't actually run" without
 /// inventing a synthetic exit. A non-success status is
-/// returned to the caller — single-project `RunArgs::run` exits with
+/// returned to the caller, single-project `RunArgs::run` exits with
 /// the code; recursive `run_recursive` records `Failure` and decides
 /// whether to bail.
 pub(in super::super) fn run_stage(
@@ -445,14 +485,14 @@ pub(in super::super) fn run_stage(
         return Ok(None);
     }
 
-    let modules_bin_dir = ctx.dir
-        .join(project_modules_dir_name(ctx))
-        .join(".bin");
+    let modules_bin_dir = project_modules_dir(ctx).join(".bin");
     let interrupts_before = interrupt_count();
     let status = run_script(&RunScript {
         environment: super::script_environment(ctx.config, ctx.init_cwd, ctx.extra_env),
         execution: pnpm_executor::ScriptExecutionOptions {
-            extra_bin_paths: &crate::ecosystem_install::execution_paths(ctx.config, ctx.dir),
+            extra_bin_paths: &crate::ecosystem_install::execution_paths(
+                ctx.config, ctx.dir, ctx.dir,
+            ),
             node_gyp_bin: None,
             shell: ctx.config.script_shell.as_deref().map(Path::new),
             shell_emulator: ctx.config.shell_emulator,

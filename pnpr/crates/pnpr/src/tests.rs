@@ -1,7 +1,21 @@
-use super::{Args, RegistryError, StorageArgs, apply_storage_overrides, redacted_report};
-use clap::{CommandFactory as _, Parser as _};
+use super::{
+    Args,
+    RegistryError,
+    StorageArgs,
+    apply_storage_overrides,
+    redacted_report,
+    without_env_values,
+};
+use clap::{
+    CommandFactory as _,
+    Parser as _,
+};
 use pnpm_testing_utils::env_guard::EnvGuard;
-use std::{ffi::OsStr, net::SocketAddr, time::Duration};
+use std::{
+    ffi::OsStr,
+    net::SocketAddr,
+    time::Duration,
+};
 
 const ENV_VARS: [&str; 12] = [
     "PNPR_CONFIG",
@@ -21,19 +35,17 @@ const ENV_VARS: [&str; 12] = [
 /// Hold the env lock with every `PNPR_*` variable cleared, so a parse sees
 /// only what the test sets and never what the developer's shell exports.
 fn scrubbed_env() -> EnvGuard {
-    let env = EnvGuard::snapshot(ENV_VARS);
-    for var in ENV_VARS {
-        // SAFETY: `env` holds the process-wide env-mutation lock and restores
-        // every variable in `ENV_VARS` on drop.
-        unsafe { std::env::remove_var(var) };
-    }
-    env
+    EnvGuard::scrubbed(ENV_VARS)
 }
 
 #[test]
 fn every_flag_is_bound_to_the_env_var_named_after_it() {
     let mut bound = Vec::new();
-    for arg in Args::command().get_arguments() {
+    // A hidden flag is not configuration, so it has no variable.
+    for arg in Args::command()
+        .get_arguments()
+        .filter(|arg| !arg.is_hide_set())
+    {
         let long = arg.get_long().expect("every pnpr option has a long flag");
         let expected = format!("PNPR_{}", long.to_uppercase().replace('-', "_"));
         assert_eq!(arg.get_env(), Some(OsStr::new(&expected)), "--{long}");
@@ -74,7 +86,7 @@ fn env_vars_stand_in_for_omitted_flags() {
     let args = Args::try_parse_from(["pnpr"]).unwrap();
 
     assert_eq!(args.config.as_deref(), Some("/etc/pnpr/config.yaml".as_ref()));
-    assert_eq!(args.server.listen, "0.0.0.0:4873".parse::<SocketAddr>().unwrap());
+    assert_eq!(args.server.listen, Some("0.0.0.0:4873".parse::<SocketAddr>().unwrap()));
     assert_eq!(args.paths.storage.as_deref(), Some("/var/lib/pnpr".as_ref()));
     assert_eq!(args.paths.cache.as_deref(), Some("/var/cache/pnpr".as_ref()));
     assert_eq!(args.server.public_url.as_deref(), Some("https://registry.example.com"));
@@ -93,7 +105,7 @@ fn omitted_flags_without_env_vars_keep_their_defaults() {
 
     let args = Args::try_parse_from(["pnpr"]).unwrap();
 
-    assert_eq!(args.server.listen, super::Config::DEFAULT_LISTEN.parse::<SocketAddr>().unwrap());
+    assert_eq!(args.server.listen, None);
     assert_eq!(args.config, None);
     assert_eq!(args.server.packument_ttl, None);
     assert_eq!(args.server.osv_options.osv, None);
@@ -120,7 +132,7 @@ fn flags_on_the_command_line_win_over_env_vars() {
     ])
     .unwrap();
 
-    assert_eq!(args.server.listen, "127.0.0.1:7677".parse::<SocketAddr>().unwrap());
+    assert_eq!(args.server.listen, Some("127.0.0.1:7677".parse::<SocketAddr>().unwrap()));
     assert_eq!(args.server.packument_ttl, Some(Duration::from_secs(5)));
     assert!(args.server.features.disable_artifacts);
 }
@@ -175,24 +187,32 @@ fn startup_error_report_redacts_dsn_credentials() {
 }
 
 #[test]
-fn oci_gc_requires_a_registry_and_parses_maintenance_options() {
+fn gc_parses_registries_and_maintenance_options() {
     let _env = scrubbed_env();
     assert!(Args::try_parse_from(["pnpr", "oci-gc"]).is_err());
+    let args = Args::try_parse_from(["pnpr", "gc"]).unwrap();
+    assert!(
+        matches!(args.command, Some(super::Command::Gc { registry, dry_run: false, min_age }) if registry.is_empty() && min_age == Duration::from_hours(24)),
+    );
     let args = Args::try_parse_from([
         "pnpr",
         "-c",
         "registry.yaml",
-        "oci-gc",
+        "gc",
         "--registry",
         "images",
+        "--registry",
+        "local",
         "--dry-run",
         "--min-age",
         "0",
     ])
     .unwrap();
     assert!(
-        matches!(args.command, Some(super::Command::OciGc { registry, dry_run: true, min_age }) if registry == "images" && min_age.is_zero()),
+        matches!(args.command, Some(super::Command::Gc { registry, dry_run: true, min_age }) if registry == ["images", "local"] && min_age.is_zero()),
     );
+    assert!(Args::try_parse_from(["pnpr", "gc", "@scope/pkg@1.0.0"]).is_err());
+    assert!(Args::try_parse_from(["pnpr", "verify", "--prune-orphans"]).is_err());
 }
 
 #[test]
@@ -225,23 +245,17 @@ fn pnpr_serve_subcommand_works_as_alias() {
     let _env = scrubbed_env();
     let args = Args::try_parse_from(["pnpr", "serve", "--listen", "0.0.0.0:4873"]).unwrap();
     assert!(
-        matches!(args.command, Some(super::Command::Serve(server)) if server.listen.to_string() == "0.0.0.0:4873"),
+        matches!(args.command, Some(super::Command::Serve(server)) if server.listen == Some("0.0.0.0:4873".parse().unwrap())),
     );
 }
 
 #[test]
 fn maintenance_subcommands_do_not_accept_server_flags() {
     let _env = scrubbed_env();
-    let err = Args::try_parse_from([
-        "pnpr",
-        "oci-gc",
-        "--registry",
-        "images",
-        "--listen",
-        "0.0.0.0:4873",
-    ])
-    .unwrap_err()
-    .to_string();
+    let err =
+        Args::try_parse_from(["pnpr", "gc", "--registry", "images", "--listen", "0.0.0.0:4873"])
+            .unwrap_err()
+            .to_string();
     assert!(err.contains("unexpected argument '--listen'"), "{err}");
 }
 
@@ -255,9 +269,9 @@ fn interval_valued_flags_accept_units_and_bare_seconds() {
     assert_eq!(args2.server.packument_ttl, Some(Duration::from_mins(5)));
 
     let gc_args =
-        Args::try_parse_from(["pnpr", "oci-gc", "--registry", "img", "--min-age", "2h"]).unwrap();
+        Args::try_parse_from(["pnpr", "gc", "--registry", "img", "--min-age", "2h"]).unwrap();
     assert!(
-        matches!(gc_args.command, Some(super::Command::OciGc { min_age, .. }) if min_age == Duration::from_hours(2)),
+        matches!(gc_args.command, Some(super::Command::Gc { min_age, .. }) if min_age == Duration::from_hours(2)),
     );
 }
 
@@ -269,7 +283,7 @@ fn served_from(yaml: &str, storage: &std::path::Path) -> pnpr::Config {
     let mut config =
         pnpr::Config::from_yaml(&path, "127.0.0.1:4873".parse().unwrap(), None).unwrap();
     let mut paths = StorageArgs { storage: Some(storage.to_path_buf()), cache: None };
-    apply_storage_overrides(&mut config, &mut paths, &pnpr::ConfigSource::Cli(path));
+    apply_storage_overrides(&mut config, &mut paths);
     config
 }
 
@@ -277,10 +291,27 @@ fn served_from(yaml: &str, storage: &std::path::Path) -> pnpr::Config {
 fn a_storage_override_takes_the_default_metadata_database_along() {
     let storage = std::path::Path::new("/srv/pnpr");
     let config = served_from("storage: ./storage\n", storage);
-    assert_eq!(
-        config.storage.metadata,
-        pnpr_config::MetadataBackend::Sqlite(pnpr_config::default_metadata_path(storage)),
-    );
+    let metadata = pnpr_config::default_database_path(storage);
+    assert_eq!(config.storage.database, pnpr_config::DatabaseBackend::Sqlite(metadata.clone()));
+    assert!(matches!(
+        config.identity.backend,
+        pnpr_config::BackendConfig::Sqlite(ref path) if *path == metadata,
+    ));
+}
+
+#[test]
+fn a_storage_override_takes_the_default_cache_along() {
+    let storage = std::path::Path::new("/srv/pnpr");
+    let config = served_from("storage: ./storage\n", storage);
+    assert_eq!(config.storage.cache_dir, pnpr::default_cache_dir(storage));
+}
+
+#[test]
+fn a_storage_override_leaves_a_configured_cache_where_it_is() {
+    let cache = tempfile::TempDir::new().unwrap();
+    let yaml = format!("storage: ./storage\ncache: '{}'\n", cache.path().display());
+    let config = served_from(&yaml, std::path::Path::new("/srv/pnpr"));
+    assert_eq!(config.storage.cache_dir, cache.path());
 }
 
 #[test]
@@ -288,14 +319,14 @@ fn a_storage_override_leaves_a_named_metadata_database_where_it_is() {
     let named = tempfile::TempDir::new().unwrap();
     let database = named.path().join("metadata.sqlite");
     let yaml = format!(
-        "storage: ./storage\nmetadata:\n  url: 'sqlite:{}'\n",
+        "storage:\n  path: ./storage\n  database:\n    url: 'sqlite:{}'\n",
         database
             .display()
             .to_string()
             .replace('\'', "''"),
     );
     let config = served_from(&yaml, std::path::Path::new("/srv/pnpr"));
-    assert_eq!(config.storage.metadata, pnpr_config::MetadataBackend::Sqlite(database));
+    assert_eq!(config.storage.database, pnpr_config::DatabaseBackend::Sqlite(database));
 }
 
 /// A database the config names at the default path is the storage
@@ -304,11 +335,41 @@ fn a_storage_override_leaves_a_named_metadata_database_where_it_is() {
 fn a_storage_override_takes_a_database_named_at_the_default_path_along() {
     let storage = std::path::Path::new("/srv/pnpr");
     let config = served_from(
-        "storage: ./storage\nmetadata:\n  url: sqlite:./storage/.metadata/metadata.sqlite\n",
+        "storage:\n  path: ./storage\n  database:\n    url: sqlite:./storage/.metadata/metadata.sqlite\n",
         storage,
     );
     assert_eq!(
-        config.storage.metadata,
-        pnpr_config::MetadataBackend::Sqlite(pnpr_config::default_metadata_path(storage)),
+        config.storage.database,
+        pnpr_config::DatabaseBackend::Sqlite(pnpr_config::default_database_path(storage)),
     );
+}
+
+#[test]
+fn an_env_var_read_by_serve_keeps_the_explicit_top_level_flag() {
+    let env = scrubbed_env();
+    env.set("PNPR_LISTEN", "127.0.0.1:7677");
+    env.set("PNPR_PUBLIC_URL", "https://env.example.com");
+
+    let matches = Args::command()
+        .try_get_matches_from(["pnpr", "--listen", "0.0.0.0:4873", "serve"])
+        .unwrap();
+    let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+    let Some(super::Command::Serve(serve)) = args.command.take() else { panic!("expected serve") };
+    let merged = args.server.merge(without_env_values(serve, matches.subcommand_matches("serve")));
+
+    assert_eq!(merged.listen, Some("0.0.0.0:4873".parse::<SocketAddr>().unwrap()));
+    assert_eq!(merged.public_url.as_deref(), Some("https://env.example.com"));
+}
+
+#[test]
+fn package_export_is_not_a_command() {
+    let _env = scrubbed_env();
+    let error = Args::try_parse_from(["pnpr", "export", "--out", "backup"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    assert!(
+        !Args::command()
+            .get_subcommands()
+            .any(|command| command.get_name() == "export"),
+    );
+    assert!(Args::try_parse_from(["pnpr", "registries", "export"]).is_ok());
 }

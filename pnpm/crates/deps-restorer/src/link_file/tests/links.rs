@@ -1,24 +1,31 @@
 #[cfg(target_os = "linux")]
 use super::super::AUTO_FIRST_TIER;
-use super::{
-    super::{Host, LINK_STATE_HARDLINK, LinkFileError, auto_link, link_file, try_import},
-    OutOfLinks, write_source,
-};
 #[cfg(unix)]
+use super::super::{
+    import_into_fresh_target,
+    recover_from_concurrent_import,
+};
 use super::{
     super::{
-        LINK_STATE_CLONE, LINK_STATE_COPY, clone_or_copy_link, import_into_fresh_target,
-        is_link_permission_error, recover_from_concurrent_import,
+        Host,
+        LINK_STATE_HARDLINK,
+        LinkFileError,
+        auto_link,
+        link_file,
     },
-    EaccesHardLink, EaccesLinks, EpermHardLink, EpermReflink, inode,
+    write_source,
 };
 use pnpm_config::PackageImportMethod;
 use pnpm_fs::StoreFile;
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
 use std::{
-    fs, io,
-    sync::atomic::{AtomicU8, Ordering},
+    fs,
+    io,
+    sync::atomic::{
+        AtomicU8,
+        Ordering,
+    },
 };
 use tempfile::tempdir;
 
@@ -95,7 +102,7 @@ fn hardlink_shares_contents_with_source() {
     }
 }
 /// Explicit `Hardlink` must surface non-`EXDEV` link-creation errors
-/// instead of silently falling back — matches pnpm's `linkOrCopy`,
+/// instead of silently falling back, matches pnpm's `linkOrCopy`,
 /// which only swallows `EXDEV` (and a couple of other kernel-level
 /// "not permitted" codes, not modelled here). We drive the error
 /// path by pointing at a non-existent source (`NotFound`, which is
@@ -113,7 +120,7 @@ fn explicit_hardlink_surfaces_errors() {
 }
 /// A dangling symlink left behind by an interrupted install is left
 /// alone. Matches pnpm's `linkOrCopy` (`fs/indexed-pkg-importer/src/index.ts`),
-/// which returns on `EEXIST` without inspecting the dirent — the
+/// which returns on `EEXIST` without inspecting the dirent, the
 /// downside is that a dangling symlink survives until something
 /// rewrites the slot, the upside is a single import syscall per file
 /// instead of stat-then-link-then-maybe-unlink. The pre-flight
@@ -138,8 +145,8 @@ fn dangling_symlink_is_preserved() {
     assert!(meta.file_type().is_symlink(), "dangling symlink stays in place");
     assert_eq!(std::fs::read_link(&dst).unwrap(), dangling_target, "target unchanged");
 }
-/// Live symlinks (pointing at real files) should still short-circuit
-/// — they're legitimate user state, not corruption from an
+/// Live symlinks (pointing at real files) should still short-circuit,
+/// they're legitimate user state, not corruption from an
 /// interrupted install. Observable: we don't remove the link, and
 /// we don't overwrite its target either.
 #[test]
@@ -180,7 +187,7 @@ fn auto_hardlink_tier_call_errors_propagate() {
     );
 }
 /// A fresh `Auto` on Linux hardlinks: same-filesystem tempdir, no
-/// prior downgrades, and the observable is the shared inode — the
+/// prior downgrades, and the observable is the shared inode, the
 /// exact on-disk shape an install's first file gets.
 #[test]
 #[cfg(target_os = "linux")]
@@ -201,215 +208,6 @@ fn auto_fresh_state_hardlinks_on_linux() {
         "a fresh Auto on Linux must land on the hardlink tier",
     );
     assert_eq!(state.load(Ordering::Relaxed), AUTO_FIRST_TIER, "success must not downgrade");
-}
-/// `EPERM` from the hardlink tier retires the tier and the file still
-/// lands, materialized by a lower tier rather than shared with the
-/// source. This is the repeat install that re-imports a `file:` package
-/// inside an `EdenFS` checkout.
-#[test]
-#[cfg(unix)]
-fn eperm_from_hard_link_downgrades_the_auto_ladder() {
-    let state = AtomicU8::new(LINK_STATE_HARDLINK);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"no hardlinks here");
-    let dst = tmp.path().join("nested/dst.txt");
-    fs::create_dir_all(dst.parent().unwrap()).unwrap();
-
-    auto_link::<SilentReporter, EpermHardLink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EPERM on the hardlink tier falls through to a tier that works");
-
-    assert_eq!(fs::read(&dst).unwrap(), b"no hardlinks here");
-    assert_ne!(inode(&src), inode(&dst), "the file was not hardlinked");
-    assert_ne!(
-        state.load(Ordering::Relaxed),
-        LINK_STATE_HARDLINK,
-        "the hardlink tier is retired for the rest of the process",
-    );
-}
-/// `EPERM` from the reflink tier is the same capability signal: the
-/// ladder moves on and the file lands.
-#[test]
-#[cfg(unix)]
-fn eperm_from_reflink_downgrades_the_clone_tier() {
-    let state = AtomicU8::new(LINK_STATE_CLONE);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"no clones here");
-    let dst = tmp.path().join("nested/dst.txt");
-    fs::create_dir_all(dst.parent().unwrap()).unwrap();
-
-    auto_link::<SilentReporter, EpermReflink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EPERM on the clone tier falls through to a tier that works");
-
-    assert_eq!(fs::read(&dst).unwrap(), b"no clones here");
-    assert_ne!(state.load(Ordering::Relaxed), LINK_STATE_CLONE, "the clone tier is retired");
-}
-/// `CloneOrCopy` has only the copy tier to fall to, and it must get
-/// there on `EPERM` too: this is the `pnpm deploy` project-file import
-/// of pnpm/pnpm#14722.
-#[test]
-#[cfg(unix)]
-fn eperm_from_reflink_downgrades_clone_or_copy_to_copy() {
-    let state = AtomicU8::new(LINK_STATE_CLONE);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"copied instead");
-    let dst = tmp.path().join("nested/dst.txt");
-    fs::create_dir_all(dst.parent().unwrap()).unwrap();
-
-    clone_or_copy_link::<SilentReporter, EpermReflink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EPERM on the clone tier falls through to copy");
-
-    assert_eq!(fs::read(&dst).unwrap(), b"copied instead");
-    assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY);
-}
-#[test]
-#[cfg(unix)]
-fn eacces_from_hard_link_downgrades_the_auto_ladder() {
-    let state = AtomicU8::new(LINK_STATE_HARDLINK);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"no hardlinks here");
-    let dst = tmp.path().join("dst.txt");
-
-    auto_link::<SilentReporter, EaccesHardLink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EACCES on the hardlink tier falls through");
-
-    assert_eq!(fs::read(&dst).unwrap(), b"no hardlinks here");
-    assert_ne!(inode(&src), inode(&dst), "the file was not hardlinked");
-    assert_ne!(state.load(Ordering::Relaxed), LINK_STATE_HARDLINK, "hardlinks are retired");
-}
-#[test]
-#[cfg(unix)]
-fn eacces_from_both_link_tiers_copies_at_the_store_entry_mode() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "source-exec", b"executable");
-    // A mode-matching source is what drives the link attempt (and its
-    // EACCES); the store-entry mode is what the copy tier then lands.
-    let expected = pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask());
-    fs::set_permissions(&src, fs::Permissions::from_mode(expected)).unwrap();
-
-    for first_tier in [LINK_STATE_CLONE, LINK_STATE_HARDLINK] {
-        let state = AtomicU8::new(first_tier);
-        let logged = AtomicU8::new(0);
-        let dst = tmp
-            .path()
-            .join(format!("target-{first_tier}"));
-        auto_link::<SilentReporter, EaccesLinks>(&logged, &state, &src, &dst)
-            .expect("copy works when link permissions are denied");
-
-        assert_eq!(fs::read(&dst).unwrap(), b"executable");
-        assert_ne!(inode(&src), inode(&dst), "copy has its own inode");
-        assert_eq!(
-            fs::metadata(&dst)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            expected,
-            "the copy carries the umask's executable store-entry mode",
-        );
-        assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY);
-        assert_eq!(logged.load(Ordering::Relaxed), super::super::LOG_FLAG_COPY);
-    }
-}
-#[test]
-#[cfg(unix)]
-fn eacces_from_reflink_downgrades_clone_or_copy() {
-    let state = AtomicU8::new(LINK_STATE_CLONE);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"copied");
-    let dst = tmp.path().join("dst.txt");
-
-    clone_or_copy_link::<SilentReporter, EaccesLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("copy works when reflink permissions are denied");
-
-    assert_eq!(fs::read(&dst).unwrap(), b"copied");
-    assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY);
-}
-#[test]
-#[cfg(unix)]
-fn explicit_link_methods_propagate_eacces() {
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"explicit");
-    let dst = tmp.path().join("dst.txt");
-
-    for method in [PackageImportMethod::Hardlink, PackageImportMethod::Clone] {
-        let err = try_import::<SilentReporter, EaccesLinks>(method, &AtomicU8::new(0), &src, &dst)
-            .expect_err("explicit link methods must surface EACCES");
-        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
-    }
-}
-/// The explicit `hardlink` method has no ladder to downgrade, and it
-/// must not answer `EPERM` with a copy: a filesystem that refuses links
-/// would copy every package, which is what choosing `hardlink` rules
-/// out. The error surfaces so the user can pick another method.
-#[test]
-#[cfg(unix)]
-fn explicit_hardlink_propagates_eperm() {
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"explicit");
-    let dst = tmp.path().join("dst.txt");
-
-    let err = try_import::<SilentReporter, EpermHardLink>(
-        PackageImportMethod::Hardlink,
-        &AtomicU8::new(0),
-        &src,
-        &dst,
-    )
-    .expect_err("EPERM on an explicit hardlink is not hidden behind a copy");
-
-    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
-    assert!(!dst.exists(), "nothing was written");
-}
-#[test]
-#[cfg(unix)]
-fn is_link_permission_error_accepts_only_eperm_and_eacces() {
-    assert!(is_link_permission_error(&io::Error::from_raw_os_error(libc::EPERM)));
-    assert!(is_link_permission_error(&io::Error::from_raw_os_error(libc::EACCES)));
-    assert!(!is_link_permission_error(&io::Error::from(io::ErrorKind::PermissionDenied)));
-}
-/// The link limit belongs to one file, so the `Auto` ladder copies that
-/// file and keeps hardlinking everything after it. Retiring the tier
-/// would make one popular store entry downgrade the whole install.
-#[test]
-fn too_many_links_copies_one_file_and_keeps_the_hardlink_tier() {
-    let state = AtomicU8::new(LINK_STATE_HARDLINK);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"out of names");
-    let dst = tmp.path().join("dst.txt");
-
-    auto_link::<SilentReporter, OutOfLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("a source out of names is copied, not failed");
-
-    assert_eq!(fs::read(&dst).unwrap(), b"out of names");
-    assert_eq!(
-        state.load(Ordering::Relaxed),
-        LINK_STATE_HARDLINK,
-        "the tier stays: the next file has names left",
-    );
-    fs::write(&src, b"rewritten").unwrap();
-    assert_eq!(fs::read(&dst).unwrap(), b"out of names", "the copy is independent of the source");
-}
-/// The explicit `hardlink` method copies here for the same reason it
-/// copies on `EXDEV`: it costs one file rather than the install, so it
-/// is not the silent whole-install copy that `EPERM` would be.
-#[test]
-fn explicit_hardlink_copies_on_too_many_links() {
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"explicit");
-    let dst = tmp.path().join("dst.txt");
-
-    try_import::<SilentReporter, OutOfLinks>(
-        PackageImportMethod::Hardlink,
-        &AtomicU8::new(0),
-        &src,
-        &dst,
-    )
-    .expect("a source out of names is copied, not failed");
-
-    assert_eq!(fs::read(&dst).unwrap(), b"explicit");
-    fs::write(&src, b"rewritten").unwrap();
-    assert_eq!(fs::read(&dst).unwrap(), b"explicit", "the copy is independent of the source");
 }
 /// The fresh-target import skips the stat short-circuit, so a symlink
 /// squatting at the target reaches the import call itself. `fs::copy`

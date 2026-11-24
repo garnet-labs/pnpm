@@ -1,14 +1,34 @@
 use super::{
     TufError,
     metadata::{
-        FileList, MetaFile, RoleMetadata, Root, Signed, Snapshot, Targets, Timestamp, parse,
+        FileList,
+        MetaFile,
+        RoleMetadata,
+        Root,
+        Signed,
+        Snapshot,
+        Targets,
+        Timestamp,
+        parse,
     },
-    role::{HashRequirement, check_file, verify_role},
+    role::{
+        HashRequirement,
+        check_file,
+        verify_role,
+    },
 };
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeSet, fmt};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use sha2::{
+    Digest as _,
+    Sha256,
+};
+use std::{
+    collections::BTreeSet,
+    fmt,
+};
 
 /// The versions a client trusted last, persisted between runs so that a
 /// repository cannot roll metadata back.
@@ -104,7 +124,7 @@ impl TrustedRepository {
     /// Verifies timestamp metadata after the last root update. Fails if the
     /// trusted root itself expired, which stops a freeze attack. The trusted
     /// snapshot and targets must then be verified again against it.
-    pub fn update_timestamp(&mut self, bytes: &[u8], now: DateTime<Utc>) -> Result<(), TufError> {
+    pub fn update_timestamp(&mut self, bytes: &[u8], now: jiff::Timestamp) -> Result<(), TufError> {
         self.root.body.header.check_expiry(Root::ROLE, now)?;
         let timestamp = parse::<Timestamp>(bytes)?;
         verify_role(&self.root.body, Timestamp::ROLE, &timestamp)?;
@@ -121,7 +141,7 @@ impl TrustedRepository {
 
     /// Verifies snapshot metadata against the trusted timestamp. The trusted
     /// targets must then be verified again against it.
-    pub fn update_snapshot(&mut self, bytes: &[u8], now: DateTime<Utc>) -> Result<(), TufError> {
+    pub fn update_snapshot(&mut self, bytes: &[u8], now: jiff::Timestamp) -> Result<(), TufError> {
         let timestamp = self.timestamp
             .as_ref()
             .ok_or(TufError::NotLoaded { role: Timestamp::ROLE })?;
@@ -147,7 +167,7 @@ impl TrustedRepository {
     }
 
     /// Verifies top-level targets metadata against the trusted snapshot.
-    pub fn update_targets(&mut self, bytes: &[u8], now: DateTime<Utc>) -> Result<(), TufError> {
+    pub fn update_targets(&mut self, bytes: &[u8], now: jiff::Timestamp) -> Result<(), TufError> {
         let snapshot = self.snapshot
             .as_ref()
             .ok_or(TufError::NotLoaded { role: Snapshot::ROLE })?;
@@ -174,7 +194,7 @@ impl TrustedRepository {
         &self,
         path: &str,
         bytes: &[u8],
-        now: DateTime<Utc>,
+        now: jiff::Timestamp,
     ) -> Result<(), TufError> {
         let targets = self.targets
             .as_ref()

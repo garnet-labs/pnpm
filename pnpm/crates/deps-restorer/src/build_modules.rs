@@ -3,53 +3,106 @@ pub(crate) mod build_one_snapshot;
 pub(crate) mod skills_policy;
 pub(crate) mod slots;
 pub use allow_build_policy::{
-    AllowBuildPolicy, allow_build_key_from_ignored_build, is_git_hosted_dep_path,
-    normalize_build_dep_path, parse_allow_build_selector, short_package_label,
+    AllowBuildPolicy,
+    allow_build_key_from_ignored_build,
+    is_git_hosted_dep_path,
+    normalize_build_dep_path,
+    parse_allow_build_selector,
+    parse_dep_path_name_version,
+    short_package_label,
 };
 pub(crate) use build_one_snapshot::build_one_snapshot;
 pub(crate) use build_requirements::deferred_builds;
-pub use build_requirements::{ScheduledBuilds, ScheduledBuildsInputs};
-pub use skills_policy::SkillsPolicy;
+pub use build_requirements::{
+    ScheduledBuilds,
+    ScheduledBuildsInputs,
+};
+pub use skills_policy::{
+    SkillsPolicy,
+    is_local_directory_version,
+    skill_approval_key,
+};
 pub use slots::parse_name_version_from_key;
 pub(crate) use slots::{
-    PkgRoots, bin_dirs_in_all_parent_dirs, discard_skipped_optional_dependency,
-    is_started_build_marker, mark_global_virtual_store_build_started, materialize_side_effects,
-    slot_carries_overlay,
+    PkgRoots,
+    bin_dirs_in_all_parent_dirs,
+    discard_skipped_optional_dependency,
+    materialize_side_effects,
 };
 
 mod build_requirements;
 
 use build_requirements::{
-    RequiresBuildInputs, SideEffectsCacheGate, requires_build_by_key,
+    RequiresBuildInputs,
+    SideEffectsCacheGate,
+    requires_build_by_key,
     side_effects_cache_gate_active,
 };
 
 use crate::{
-    ImportIndexedDirError, ImportIndexedDirOpts, NEEDS_BUILD_MARKER, SkippedSnapshots,
+    ImportIndexedDirError,
+    ImportIndexedDirOpts,
+    SkippedSnapshots,
     build_graph::build_graph,
-    find_root_runtime_node_key, import_indexed_dir, store_index_key_for_resolution,
+    find_root_runtime_node_key,
+    import_indexed_dir,
+    store_index_key_for_resolution,
     version_policy::{
-        PackageVersionPolicy, PolicyMatch, VersionPolicyError, create_package_version_policy,
-        expand_package_version_spec, expand_package_version_specs,
+        PackageVersionPolicy,
+        PolicyMatch,
+        VersionPolicyError,
+        create_package_version_policy,
+        expand_package_version_spec,
+        expand_package_version_specs,
     },
 };
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
-use pnpm_deps_path::{get_pkg_id_with_patch_hash, index_of_dep_path_suffix, remove_suffix};
-use pnpm_executor::{LifecycleScriptError, RunPostinstallHooks, run_postinstall_hooks};
-use pnpm_lockfile::{PackageKey, SnapshotEntry};
-use pnpm_patching::{PatchApplyError, apply_patch_to_dir};
+use pnpm_deps_path::{
+    get_pkg_id_with_patch_hash,
+    remove_suffix,
+};
+use pnpm_executor::{
+    LifecycleScriptError,
+    RunPostinstallHooks,
+    run_postinstall_hooks,
+};
+use pnpm_lockfile::{
+    PackageKey,
+    SnapshotEntry,
+};
+use pnpm_patching::{
+    PatchApplyError,
+    apply_patch_to_dir,
+};
 use pnpm_reporter::{
-    LogEvent, LogLevel, Reporter, SkippedOptionalDependencyLog, SkippedOptionalPackage,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
     SkippedOptionalReason,
 };
-use pnpm_workspace_task_scheduler::{ScheduleGraphOptions, TaskCompletion, schedule_graph};
+use pnpm_workspace_task_scheduler::{
+    ScheduleGraphOptions,
+    TaskCompletion,
+    schedule_graph,
+};
 use std::{
-    borrow::Cow,
-    collections::{BTreeSet, HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeSet,
+        HashMap,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Mutex,
 };
 
@@ -74,7 +127,7 @@ pub enum BuildModulesError {
     #[diagnostic(code(ERR_PNPM_PATCHED_MANIFEST_UNREADABLE))]
     PatchedManifestUnreadable { dep_path: String },
 
-    /// `ERR_PNPM_PATCH_FILE_PATH_MISSING` — fired when a snapshot's
+    /// `ERR_PNPM_PATCH_FILE_PATH_MISSING`: fired when a snapshot's
     /// resolved patch carries a hash but
     /// no `patch_file_path`. The hash-without-path shape can come
     /// from the lockfile when no live config provides the path, so
@@ -105,9 +158,9 @@ pub enum BuildModulesError {
     /// inside the store, so applying a patch or running an approved
     /// lifecycle script writes into the store. `frozen_store` promises
     /// the store is complete and read-only, so the build cannot run.
-    /// A complete seed never reaches here — patched and built packages
+    /// A complete seed never reaches here (patched and built packages
     /// are imported from the side-effects cache and skipped by the
-    /// `is_built` gate — so this means the seed is missing build
+    /// `is_built` gate) so this means the seed is missing build
     /// output, surfaced as `ERR_PNPM_FROZEN_STORE_NEEDS_BUILD`.
     #[display("Cannot build {package} because the store is read-only (frozenStore is enabled)")]
     #[diagnostic(
@@ -120,7 +173,7 @@ pub enum BuildModulesError {
 
     /// Re-materializing a cached build's side-effects overlay into the
     /// already-linked slot failed. Fired from the `is_built` gate in
-    /// `build_one_snapshot` when the warm reinstall has to apply the
+    /// the per-snapshot build when the warm reinstall has to apply the
     /// stored `added` / `deleted` diff on top of the pristine files.
     #[diagnostic(transparent)]
     MaterializeSideEffects(#[error(source)] ImportIndexedDirError),
@@ -134,11 +187,10 @@ pub enum BuildModulesError {
         source: std::io::Error,
     },
 
-    /// A global-virtual-store slot's `.pnpm-needs-build` marker exists but
-    /// cannot be read, so whether another install's build left the slot
-    /// half-built is unknown.
-    #[display("Failed to read the build marker at {}: {source}", path.display())]
-    ReadBuildMarker {
+    /// A built package could not be renamed into its global virtual store
+    /// slot.
+    #[display("Failed to place the built package at {}: {source}", path.display())]
+    PlaceBuiltPackage {
         path: PathBuf,
         #[error(source)]
         source: std::io::Error,
@@ -160,7 +212,7 @@ pub enum BuildModulesError {
 ///
 /// Effect on [`BuildModules`]: a selected package is built even when the
 /// side-effects cache reports it already built (an explicit rebuild always
-/// re-runs the scripts). The allow-policy gate is unchanged — a rebuild
+/// re-runs the scripts). The allow-policy gate is unchanged, a rebuild
 /// never builds a disallowed package. A package outside the selection is
 /// neither inspected nor built, as under pnpm's `rebuild <pkg>`; the
 /// ignored-builds record keeps the entries of the packages a partial
@@ -168,7 +220,7 @@ pub enum BuildModulesError {
 #[derive(Debug, Default, Clone)]
 pub struct RebuildOptions {
     /// Allow-build keys (the package name for registry deps, the full
-    /// pkgId for git/tarball artifacts — see
+    /// pkgId for git/tarball artifacts; see
     /// [`allow_build_key_from_ignored_build`]) to force past the
     /// side-effects `is_built` gate. `None` forces every build-needing
     /// package (`pnpm rebuild` with no arguments); `Some(keys)` forces
@@ -177,8 +229,11 @@ pub struct RebuildOptions {
     /// `pnpm rebuild <name>` and an `approve-builds` key both select it.
     pub selected_names: Option<HashSet<String>>,
 
+    /// Exact snapshot keys to rebuild. When present, this overrides name selection.
+    pub selected_snapshots: Option<HashSet<PackageKey>>,
+
     /// Importer ids whose own deferred install scripts this rebuild
-    /// should run — `pnpm rebuild --pending` reads them out of
+    /// should run, `pnpm rebuild --pending` reads them out of
     /// `.modules.yaml`'s `pendingBuilds`. A dependency's build is settled
     /// by the rebuild itself; a project's is only settled by running its
     /// scripts, which nothing else in the rebuild path does.
@@ -213,7 +268,7 @@ impl RebuildOptions {
     }
 
     /// Whether this rebuild discharges the workspace project recorded
-    /// under `importer_id`, which only running its own scripts can do —
+    /// under `importer_id`, which only running its own scripts can do,
     /// dropping one the rebuild never ran would forget the debt rather
     /// than settle it.
     #[must_use]
@@ -227,20 +282,37 @@ impl RebuildOptions {
     /// `dep_path`, which it does by rebuilding it.
     ///
     /// The caller decides which of the two a `.modules.yaml`
-    /// `pendingBuilds` entry is — an importer id and a dep path are both
+    /// `pendingBuilds` entry is, an importer id and a dep path are both
     /// plain strings on disk, and a workspace directory named
     /// `foo@1.0.0` parses as either.
     #[must_use]
     pub fn settles_dependency(&self, dep_path: &str) -> bool {
+        if let Some(snapshots) = &self.selected_snapshots {
+            return dep_path
+                .parse::<PackageKey>()
+                .is_ok_and(|key| snapshots.contains(&key));
+        }
         let (name, _) = parse_name_version_from_key(remove_suffix(dep_path));
         self.is_selected(&name) || self.is_selected(&allow_build_key_from_ignored_build(dep_path))
     }
 
-    /// Whether the snapshot installed under `key` is in the rebuild
-    /// selection, by its package name or its allow-build key.
+    /// Whether this rebuild runs on installed files the user may have
+    /// changed, which an exact snapshot selection does. Their build
+    /// requirements are then read from the files rather than the store
+    /// index, and a failed optional build is reported rather than removing
+    /// the package and the changes with it.
+    #[must_use]
+    pub fn rebuilds_edited_files(&self) -> bool {
+        self.selected_snapshots.is_some()
+    }
+
+    /// Whether the snapshot installed under `key` is in the rebuild selection.
     #[must_use]
     pub fn selects_snapshot(&self, key: &PackageKey) -> bool {
-        self.selected_names.is_none() || self.settles_dependency(&key.to_string())
+        match &self.selected_snapshots {
+            Some(snapshots) => snapshots.contains(key),
+            None => self.selected_names.is_none() || self.settles_dependency(&key.to_string()),
+        }
     }
 }
 
@@ -264,7 +336,7 @@ pub struct BuildModules<'a> {
     /// disk.
     pub skipped: &'a SkippedSnapshots,
 
-    /// Forced-rebuild selection. `None` for a normal install — every
+    /// Forced-rebuild selection. `None` for a normal install; every
     /// package follows the standard `requires_build` + allow-policy +
     /// side-effects-cache gates. `Some` (a `pacquet rebuild` /
     /// `approve-builds`) restricts the inspection and the build to the
@@ -287,12 +359,12 @@ pub struct BuildModulesOutput {
     /// ignored. These become `.modules.yaml`'s `pendingBuilds`, which
     /// `pnpm rebuild --pending` later drains.
     ///
-    /// Peers are kept here — unlike `ignored_builds`, whose keys are an
+    /// Peers are kept here, unlike `ignored_builds`, whose keys are an
     /// `allowBuilds` lookup, these address a materialized slot.
     pub deferred_builds: Vec<String>,
 
     /// Whether any linked slot's contents may have changed during the
-    /// build phase — a side-effects overlay was applied, a patch ran,
+    /// build phase, a side-effects overlay was applied, a patch ran,
     /// or a lifecycle script was attempted. `false` on the common warm
     /// install where every candidate was ignored, deferred, or already
     /// built, which lets the post-build importer bin relink skip
@@ -322,7 +394,7 @@ fn empty_build_output(bin_state: &crate::build_options::BuildBinState) -> BuildM
 
 impl BuildModules<'_> {
     /// Run the build, reporting the packages that needed one but did
-    /// not get it — see [`BuildModulesOutput`].
+    /// not get it; see [`BuildModulesOutput`].
     pub fn run<Reporter: self::Reporter>(self) -> Result<BuildModulesOutput, BuildModulesError> {
         self.run_with_bin_state::<Reporter>(&crate::build_options::BuildBinState::default())
     }
@@ -350,7 +422,7 @@ impl BuildModules<'_> {
         );
 
         // Collect peer-stripped keys so the final list is unique and
-        // sorted lexicographically — matches `dedupePackageNamesFromIgnoredBuilds`.
+        // sorted lexicographically, matches `dedupePackageNamesFromIgnoredBuilds`.
         // `Mutex` for the same parallelism reason as the dep-state cache.
         let ignored_builds: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
         let project_bin_dirs = self.project_bin_dirs(snapshots);
@@ -369,7 +441,7 @@ impl BuildModules<'_> {
 
         // If a scheduler worker panicked while holding the
         // `ignored_builds` lock, the scheduler will have
-        // already propagated the panic (or returned an Err) — so a
+        // already propagated the panic (or returned an Err), so a
         // poisoned mutex here can only mean the protected state is
         // mid-insertion. A `BTreeSet::insert` is one atomic
         // operation from the data-structure's POV (no torn writes),
@@ -436,7 +508,8 @@ impl BuildModules<'_> {
         let hoisted_bin_dir = self.scripts.path.private_hoisting
             .then_some(self.scripts.patched_engines.install_state_dir)
             .flatten()
-            .map(|install_state_dir| install_state_dir.join("node_modules").join(".bin"));
+            .map(|install_state_dir| install_state_dir.join("node_modules"))
+            .map(|joined| joined.join(".bin"));
         self.runtime_node_bin_dir(snapshots)
             .into_iter()
             .chain(hoisted_bin_dir)
@@ -499,7 +572,7 @@ impl BuildModules<'_> {
     }
 
     /// Build the dep graph + state cache only when the
-    /// side-effects-cache gate has a chance of firing — on either the
+    /// side-effects-cache gate has a chance of firing, on either the
     /// READ side (prefetch surfaced cache rows) or the WRITE side (the
     /// install will be populating new cache entries after a successful
     /// build).
@@ -512,7 +585,7 @@ impl BuildModules<'_> {
     /// produces the exact same cache keys as the full graph for every
     /// root we'll query. A pure-JS install with no `requires_build`
     /// snapshots feeds in an empty root iterator and the function
-    /// returns immediately — O(0) walk for that path.
+    /// returns immediately, O(0) walk for that path.
     fn dep_states(
         &self,
         snapshots: &HashMap<PackageKey, SnapshotEntry>,
@@ -524,8 +597,7 @@ impl BuildModules<'_> {
             has_publisher: self.cache.publisher.is_some(),
             frozen_store: self.cache.frozen_store,
             has_engine_name: self.cache.engine_name.is_some(),
-            can_write_store: self.cache.store_index_writer.is_some()
-                && self.cache.store_dir.is_some(),
+            can_write_store: self.cache.store.is_some(),
             has_packages: self.graph.packages.is_some(),
             // A rebuild that skips cached builds also reads the empty rows
             // the overlays leave out.
@@ -541,10 +613,11 @@ impl BuildModules<'_> {
                 .iter()
                 .filter(|&(_, &requires_build)| requires_build)
                 .map(|(key, _)| key.clone());
+            let host = crate::host_platform_selector();
             crate::build_deps_subgraph(
                 snapshots,
                 self.graph.packages.expect("`cache_gate_active` requires packages: Some"),
-                roots,
+                (roots, self.graph.variations_platform.unwrap_or(&host)),
             )
         });
         let cache = Mutex::new(pnpm_graph_hasher::DepsStateCache::new());

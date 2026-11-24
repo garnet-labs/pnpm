@@ -1,22 +1,148 @@
 use super::{
-    super::{Install, ProjectMutation},
-    InstallDirs, is_modules_yaml_consistent, run_purge_regression_install,
+    InstallDirs,
+    is_modules_yaml_consistent,
+    run_purge_regression_install,
     run_purge_regression_install_with_lockfile,
 };
-use crate::PolicyExcludes;
+use crate::{
+    PolicyExcludes,
+    install::{
+        Install,
+        ProjectMutation,
+        effective_node_version,
+    },
+};
 use pipe_trait::Pipe;
 use pnpm_config::Config;
-use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
-use pnpm_modules_yaml::{
-    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH, Host, LayoutVersion, Modules, NodeLinker,
-    read_modules_manifest, write_modules_manifest,
+use pnpm_lockfile::{
+    Lockfile,
+    MaybeLazyLockfile,
 };
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_modules_yaml::{
+    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH,
+    Host,
+    LayoutVersion,
+    Modules,
+    NodeLinker,
+    read_modules_manifest,
+    write_modules_manifest,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::SilentReporter;
 use pnpm_testing_utils::registry::TestRegistry;
-use std::fs;
+use std::{
+    fs,
+    path::Path,
+};
 use tempfile::tempdir;
 use text_block_macros::text_block;
+
+#[test]
+fn effective_node_version_uses_the_first_included_runtime_group() {
+    let config = Config::new();
+    let manifest = PackageManifest::from_value(
+        Path::new("package.json").to_path_buf(),
+        serde_json::json!({
+            "engines": { "runtime": { "name": "node", "version": "24.0.0", "onFail": "download" } },
+            "devEngines": { "runtime": { "name": "node", "version": "26.0.0", "onFail": "download" } },
+        }),
+    );
+
+    assert_eq!(
+        effective_node_version(&config, &manifest, &[DependencyGroup::Prod]),
+        Some("24.0.0".to_string()),
+    );
+    assert_eq!(
+        effective_node_version(&config, &manifest, &[DependencyGroup::Dev]),
+        Some("26.0.0".to_string()),
+    );
+}
+
+#[test]
+fn effective_node_version_skips_included_groups_without_a_runtime_pin() {
+    let config = Config::new();
+    let manifest = PackageManifest::from_value(
+        Path::new("package.json").to_path_buf(),
+        serde_json::json!({
+            "devEngines": { "runtime": { "name": "node", "version": "26.0.0", "onFail": "download" } },
+        }),
+    );
+
+    assert_eq!(
+        effective_node_version(&config, &manifest, &[DependencyGroup::Prod, DependencyGroup::Dev]),
+        Some("26.0.0".to_string()),
+    );
+}
+
+#[test]
+fn effective_node_version_ignores_a_matching_runtime_dependency_when_policy_disables_it() {
+    let mut config = Config::new();
+    config.runtime_on_fail = Some(pnpm_config::RuntimeOnFail::Ignore);
+    let manifest = PackageManifest::from_value(
+        Path::new("package.json").to_path_buf(),
+        serde_json::json!({
+            "engines": { "runtime": { "name": "node", "version": "^99.0.0", "onFail": "download" } },
+            "dependencies": { "node": "runtime:^99.0.0" },
+        }),
+    );
+
+    assert_eq!(effective_node_version(&config, &manifest, &[DependencyGroup::Prod]), None);
+}
+
+#[test]
+fn effective_node_version_uses_an_exact_runtime_pin_that_is_not_downloaded() {
+    let config = Config::new();
+    let manifest = PackageManifest::from_value(
+        Path::new("package.json").to_path_buf(),
+        serde_json::json!({
+            "devEngines": { "runtime": { "name": "node", "version": "22.0.0", "onFail": "error" } },
+        }),
+    );
+
+    assert_eq!(
+        effective_node_version(&config, &manifest, &[DependencyGroup::Prod, DependencyGroup::Dev]),
+        Some("22.0.0".to_string()),
+    );
+}
+
+#[test]
+fn effective_node_version_prefers_a_downloaded_runtime_over_an_exact_pin() {
+    let config = Config::new();
+    let manifest = PackageManifest::from_value(
+        Path::new("package.json").to_path_buf(),
+        serde_json::json!({
+            "engines": { "runtime": { "name": "node", "version": "20.0.0", "onFail": "warn" } },
+            "devEngines": { "runtime": { "name": "node", "version": "24.0.0", "onFail": "download" } },
+        }),
+    );
+
+    assert_eq!(
+        effective_node_version(&config, &manifest, &[DependencyGroup::Prod, DependencyGroup::Dev]),
+        Some("24.0.0".to_string()),
+    );
+}
+
+#[test]
+fn effective_node_version_keeps_a_different_runtime_dependency_when_policy_disables_engine_runtime()
+{
+    let mut config = Config::new();
+    config.runtime_on_fail = Some(pnpm_config::RuntimeOnFail::Ignore);
+    let manifest = PackageManifest::from_value(
+        Path::new("package.json").to_path_buf(),
+        serde_json::json!({
+            "engines": { "runtime": { "name": "node", "version": "99.0.0", "onFail": "download" } },
+            "dependencies": { "node": "runtime:20.0.0" },
+        }),
+    );
+
+    assert_eq!(
+        effective_node_version(&config, &manifest, &[DependencyGroup::Prod]),
+        Some("20.0.0".to_string()),
+    );
+}
 
 /// The prune deletes directories under `virtual_store_dir`, which can be
 /// set by repo-controlled workspace config. When that path escapes the
@@ -60,6 +186,7 @@ async fn install_skips_prune_when_virtual_store_escapes_node_modules() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -75,6 +202,7 @@ async fn install_skips_prune_when_virtual_store_escapes_node_modules() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -116,7 +244,7 @@ async fn install_skips_prune_when_virtual_store_escapes_node_modules() {
     drop((dir, mock_instance));
 }
 /// Hoisted install must NOT create the virtual-store slot
-/// directories the isolated linker would write — that's the whole
+/// directories the isolated linker would write; that's the whole
 /// point of skipping [`crate::CreateVirtualDirBySnapshot`] under
 /// hoisted. With no snapshots in the lockfile the assertion is
 /// vacuous (the directory is empty regardless of linker choice),
@@ -153,6 +281,7 @@ async fn hoisted_node_linker_does_not_create_virtual_store_root() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -168,6 +297,7 @@ async fn hoisted_node_linker_does_not_create_virtual_store_root() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -237,6 +367,7 @@ async fn fresh_install_hoisted_node_linker_records_modules_yaml() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -252,6 +383,7 @@ async fn fresh_install_hoisted_node_linker_records_modules_yaml() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -329,6 +461,7 @@ async fn fresh_install_honors_skip_runtimes() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -344,6 +477,7 @@ async fn fresh_install_honors_skip_runtimes() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -382,8 +516,94 @@ async fn fresh_install_honors_skip_runtimes() {
 
     drop(dirs.dir);
 }
+
+#[cfg_attr(
+    feature = "runtime-provisioning",
+    ignore = "requires a build without runtime provisioning"
+)]
+#[tokio::test]
+async fn fresh_install_reports_unavailable_runtime_provisioning() {
+    let dirs = InstallDirs::new();
+
+    let manifest_path = dirs.path().join("package.json");
+    let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
+    manifest.add_dependency("node", "runtime:22", DependencyGroup::Prod).unwrap();
+    manifest.save().unwrap();
+
+    let mut config = Config::new();
+    config.store_dir = dirs.store_dir.clone().into();
+    config.modules_dir = dirs.modules_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    // Nothing listens here, so a request that reaches the network fails
+    // with a connection error, not the provisioning error.
+    config.registry = "http://127.0.0.1:9/".to_string();
+    let config = config.leak();
+
+    let error = Install {
+        lockfile_policy: crate::InstallLockfilePolicy {
+            frozen: false,
+            prefer_frozen: None,
+            ignore_manifest_check: false,
+            ignore_settings_check: false,
+            trust: false,
+            update_checksums: false,
+            excludes: PolicyExcludes::Persist,
+            disable_optimistic_repeat: false,
+        },
+        execution: crate::InstallExecution {
+            skip_runtimes: false,
+            mutation: ProjectMutation::InstallWorkspace,
+            installs_only: true,
+            node_linker: pnpm_config::NodeLinker::default(),
+            lockfile_only: true,
+            dry_run: false,
+        },
+        resolution: crate::ResolutionInputs {
+            update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
+            preferred_versions_override: None,
+            auth_override: None,
+            observer: None,
+            peer_issues_sink: None,
+            deps_requiring_build_sink: None,
+        },
+        context: crate::InstallInvocation {
+            http_client: &Default::default(),
+            config,
+            manifest: &manifest,
+            emit_initial_manifest: true,
+            lockfile: MaybeLazyLockfile::Loaded(None),
+            lockfile_path: None,
+        },
+        fetching: crate::InstallFetching {
+            tarball_mem_cache: Default::default(),
+            http_client_arc: std::sync::Arc::new(Default::default()),
+            resolved_packages: &Default::default(),
+        },
+        projects: crate::InstallProjects {
+            dependency_groups: [DependencyGroup::Prod],
+            supported_architectures: None,
+            catalogs_override: None,
+            pnpmfile_hook_override: None,
+            workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
+        },
+    }
+    .run::<SilentReporter>()
+    .await
+    .expect_err("runtime provisioning is disabled");
+
+    let rendered = format!("{:?}", miette::Report::new(error));
+    assert!(
+        rendered.contains("Runtime provisioning is not enabled in this build for node@runtime:22"),
+        "expected the provisioning error, got: {rendered}",
+    );
+
+    drop(dirs.dir);
+}
 /// `nodeLinker` drift between `.modules.yaml` and the current config
-/// disqualifies the up-to-date short-circuit — a different linker
+/// disqualifies the up-to-date short-circuit, a different linker
 /// forces a full rebuild of `node_modules` rather than a fast no-op.
 #[test]
 fn is_modules_yaml_consistent_returns_false_when_node_linker_drifts() {
@@ -463,7 +683,7 @@ async fn included_drift_keeps_user_node_modules_entry_while_layout_drift_wipes_i
     let vendored = dirs.modules_dir.join("vendored-by-user.txt");
     fs::write(&vendored, b"keep me").unwrap();
 
-    // 2. Switching to --prod is an included drift only, so the file survives —
+    // 2. Switching to --prod is an included drift only, so the file survives,
     // but the now-excluded dev dep's link and bin shim must be pruned.
     run_purge_regression_install(
         &dirs,
@@ -546,7 +766,7 @@ async fn test_install_purges_node_modules_on_layout_mismatch() {
     let dir = tempdir().unwrap();
     let project_root = dir.path().join("project");
     let modules_dir = project_root.join("node_modules");
-    // Where the default store lands — see [`pnpm_config::store_path`].
+    // Where the default store lands; see [`pnpm_config::store_path`].
     let store_dir = modules_dir.join(".pnpm-store");
     let virtual_store_dir = modules_dir.join(".pacquet");
 
@@ -586,6 +806,7 @@ async fn test_install_purges_node_modules_on_layout_mismatch() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -601,6 +822,7 @@ async fn test_install_purges_node_modules_on_layout_mismatch() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -649,6 +871,7 @@ async fn test_install_purges_node_modules_on_layout_mismatch() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -664,6 +887,7 @@ async fn test_install_purges_node_modules_on_layout_mismatch() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,

@@ -17,7 +17,10 @@ pub(super) fn check_token_restrictions(
 ) -> Result<(), RegistryError> {
     if record.readonly && is_write_request(method, path) {
         return Err(RegistryError::Forbidden {
-            user: record.username.clone(),
+            user: record
+                .owner_name()
+                .unwrap_or(&record.user_id)
+                .to_string(),
             action: "write with",
             resource: "a read-only token".to_string(),
         });
@@ -26,7 +29,10 @@ pub(super) fn check_token_restrictions(
         let allowed = client_ip.is_some_and(|ip| cidr_whitelist_allows(&record.cidr_whitelist, ip));
         if !allowed {
             return Err(RegistryError::Forbidden {
-                user: record.username.clone(),
+                user: record
+                    .owner_name()
+                    .unwrap_or(&record.user_id)
+                    .to_string(),
                 action: "use",
                 resource: "this token from your network address".to_string(),
             });
@@ -78,7 +84,6 @@ fn is_read_only_post_path(path: &str) -> bool {
         "/-/pnpr/v0/resolve"
             | "/-/pnpr/v0/verify-lockfile"
             | "/-/pnpr/v0/artifacts/resolve"
-            | "/-/pnpr/v0/artifacts/blob"
             | "/-/oidc/handoff",
     )
 }
@@ -93,7 +98,5 @@ pub(super) fn cidr_whitelist_allows(whitelist: &[String], client_ip: IpAddr) -> 
 /// address, or a non-numeric / out-of-range prefix) matches nothing, so
 /// the restriction fails closed rather than open.
 pub(super) fn cidr_contains(entry: &str, client_ip: IpAddr) -> bool {
-    pnpr_config::IpNetwork::parse(entry.trim())
-        .ok()
-        .is_some_and(|net| net.contains(client_ip))
+    pnpr_config::IpNetwork::parse(entry.trim()).is_ok_and(|net| net.contains(client_ip))
 }

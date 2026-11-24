@@ -1,9 +1,20 @@
 //! The policy pnpm resolves and verifies config dependencies and the package
 //! manager under, before the configuration they contribute is loaded.
 
-use crate::{Config, TrustPolicy, WorkspaceSettings};
-use pnpm_workspace::{IncludeSource, SettingOwner, SettingSlot};
-use serde::{Deserialize, Serialize};
+use crate::{
+    Config,
+    TrustPolicy,
+    WorkspaceSettings,
+};
+use pnpm_workspace::{
+    IncludeSource,
+    SettingOwner,
+    SettingSlot,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 /// The `bootConfig` block of `pnpm-workspace.yaml`, and the values the boot
 /// phase falls back to.
@@ -130,6 +141,16 @@ impl Config {
             .clone()
             .apply_to(&mut config);
         config
+    }
+
+    /// Whether the workspace itself declares the `overrides` entry
+    /// `selector`, in `pnpm-workspace.yaml` or a local file it includes.
+    /// An entry a config dependency or an `updateConfig` hook adds is not
+    /// declared by the workspace.
+    #[must_use]
+    pub fn declares_override(&self, selector: &str) -> bool {
+        !self.is_owned_by_config_dependency("overrides")
+            && !self.hook_added_overrides.contains(selector)
     }
 
     fn is_owned_by_config_dependency(&self, setting: &str) -> bool {

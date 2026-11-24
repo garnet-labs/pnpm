@@ -4,36 +4,43 @@ use _utils::append_workspace_yaml_key;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_patching::create_hex_hash_from_file;
-use pnpm_store_dir::{StoreDir, StoreIndex};
+use pnpm_store_dir::{
+    StoreDir,
+    StoreIndex,
+};
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     fs::is_symlink_or_junction,
     git_repo::GitRepoFixture,
 };
 use serde_json::Value;
-use std::{ffi::OsStr, fmt::Write as _, fs, path::Path, process::Command};
+use std::{
+    ffi::OsStr,
+    fmt::Write as _,
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
-const IS_POSITIVE_PATCH: &str = include_str!(
-    "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0.patch"
-);
+const IS_POSITIVE_PATCH: &str = include_str!("../fixtures/patches/is-positive@1.0.0.patch");
 
 /// Adds a `postinstall` script the published package does not declare,
 /// plus the script it runs.
-const IS_POSITIVE_POSTINSTALL_PATCH: &str = include_str!(
-    "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0-postinstall.patch"
-);
+const IS_POSITIVE_POSTINSTALL_PATCH: &str =
+    include_str!("../fixtures/patches/is-positive@1.0.0-postinstall.patch");
 
 /// Creates a `binding.gyp`, which the lifecycle runner turns into an
 /// implicit `node-gyp rebuild`.
-const IS_POSITIVE_BINDING_GYP_PATCH: &str = include_str!(
-    "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0-binding-gyp.patch"
-);
+const IS_POSITIVE_BINDING_GYP_PATCH: &str =
+    include_str!("../fixtures/patches/is-positive@1.0.0-binding-gyp.patch");
 
 /// Creates a plain file named `.hooks`, which is not a hook directory.
-const IS_POSITIVE_HOOKS_FILE_PATCH: &str = include_str!(
-    "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0-hooks-file.patch"
-);
+const IS_POSITIVE_HOOKS_FILE_PATCH: &str =
+    include_str!("../fixtures/patches/is-positive@1.0.0-hooks-file.patch");
 
 /// Drops the `gypfile: false` from `@pnpm.e2e/gypfile-false`, which puts the
 /// `binding.gyp` the package already ships back in scope for the implicit
@@ -322,7 +329,7 @@ fn is_positive_store_row(store_dir: &Path) -> pnpm_store_dir::PackageFilesIndex 
 
 /// Assert the store kept the patched `index.js` as a side-effects overlay
 /// rather than overwriting the pristine one it shares with every other
-/// project. The overlay's cache key ends in `;patch=<hash>` — pacquet
+/// project. The overlay's cache key ends in `;patch=<hash>`, pacquet
 /// composes it in `pnpm_graph_hasher::calc_dep_state`, and the row it
 /// hangs off is keyed by the peer- and patch-free `is-positive@1.0.0`.
 fn assert_patched_side_effects_cached(store_dir: &Path, patch_hash: &str) {
@@ -552,7 +559,7 @@ fn patch_workflow_runs_with_default_ndjson_and_silent_reporters() {
 
         let mut patch_cmd = pacquet(&workspace, ["patch", "is-positive@1.0.0"]);
         if let Some(reporter) = reporter {
-            patch_cmd.arg(reporter);
+            patch_cmd = patch_cmd.with_arg(reporter);
         }
         patch_cmd.assert().success();
 
@@ -562,7 +569,7 @@ fn patch_workflow_runs_with_default_ndjson_and_silent_reporters() {
         let mut patch_commit_cmd =
             pacquet(&workspace, ["patch-commit", edit_dir.to_str().expect("utf8 edit dir")]);
         if let Some(reporter) = reporter {
-            patch_commit_cmd.arg(reporter);
+            patch_commit_cmd = patch_commit_cmd.with_arg(reporter);
         }
         patch_commit_cmd.assert().success();
 
@@ -573,7 +580,7 @@ fn patch_workflow_runs_with_default_ndjson_and_silent_reporters() {
 
         let mut patch_remove_cmd = pacquet(&workspace, ["patch-remove", "is-positive@1.0.0"]);
         if let Some(reporter) = reporter {
-            patch_remove_cmd.arg(reporter);
+            patch_remove_cmd = patch_remove_cmd.with_arg(reporter);
         }
         patch_remove_cmd.assert().success();
 
@@ -584,6 +591,9 @@ fn patch_workflow_runs_with_default_ndjson_and_silent_reporters() {
             "workspace yaml: {workspace_yaml}",
         );
         assert!(!workspace.join("patches/is-positive@1.0.0.patch").exists());
+        assert!(!edit_dir.exists());
+        assert!(!workspace.join("node_modules/.pnpm_patches/state.json").exists());
+        assert!(!workspace.join("node_modules/.pnpm_patches").exists());
 
         drop((root, mock_instance));
     }
@@ -931,5 +941,7 @@ fn installing_with_no_modules_directory_and_a_patched_dependency() {
 mod application;
 
 mod commit;
+
+mod commit_lockfile;
 
 mod removal;

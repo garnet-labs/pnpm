@@ -1,6 +1,14 @@
-use super::{EmulatedOutput, ShellEmulatorError, execute_emulated};
+use super::{
+    EmulatedOutput,
+    ShellEmulatorError,
+    execute_emulated,
+};
 use pnpm_reporter::LifecycleStdio;
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::Mutex,
+};
 use tempfile::tempdir;
 
 /// Run `script` in `cwd`, returning its exit code and the lines it wrote,
@@ -252,7 +260,8 @@ fn keeps_a_shell_operator_in_a_default_as_word_text() {
 fn keeps_an_operator_literal_behind_any_backslash_run() {
     let dir = tempdir().expect("create a temp dir");
 
-    for (operator, backslashes) in [';', '&', '|', '<', '>'].into_iter().flat_map(with_run_lengths)
+    for (operator, backslashes) in
+        [';', '&', '|', '<', '>', '(', ')'].into_iter().flat_map(with_run_lengths)
     {
         let run_of = r"\".repeat(backslashes);
         let script = format!("echo [${{MISSING:-a{run_of}{operator}b}}] && echo second");
@@ -338,6 +347,132 @@ fn bounds_fruitless_scanning_without_bounding_a_body() {
     let (code, lines) = run(&format!("echo {unclosed}"), dir.path(), &env);
     assert_eq!(code, 0);
     assert_eq!(lines, vec![(LifecycleStdio::Stdout, unclosed)]);
+
+    for unclosed_sub in ["$(".repeat(20_000), format!("`{}", "${".repeat(20_000))] {
+        let input = format!("echo {unclosed_sub}");
+        assert_eq!(super::braced_parameters::prepare(&input).text, input);
+    }
+}
+
+/// Inside double quotes `\\` is one literal backslash, so it neither escapes
+/// the closing `"` nor suppresses a `${...}` expansion right behind it.
+#[test]
+fn handles_escaped_backslashes_inside_double_quotes() {
+    let dir = tempdir().expect("create a temp dir");
+    let unset = HashMap::new();
+    let set = HashMap::from([("OUT_DIR".to_string(), "two words".to_string())]);
+
+    for (script, env, expected) in [
+        (r#"echo "a\\""#, &unset, r"a\"),
+        (r#"echo "\\""#, &unset, r"\"),
+        (r#"echo "a\\\\""#, &unset, r"a\\"),
+        (r#"echo "a\\\"b""#, &unset, r#"a\"b"#),
+        (r#"echo "a\\" '${UNSET:-fallback}'"#, &unset, r"a\ ${UNSET:-fallback}"),
+        (r#"echo "dist\\${OUT_DIR:-app}""#, &unset, r"dist\app"),
+        (r#"echo "dist\\${OUT_DIR:-app}""#, &set, r"dist\two words"),
+        (r#"echo "dist\\\${OUT_DIR:-app}""#, &set, r"dist\${OUT_DIR:-app}"),
+    ] {
+        let (code, lines) = run(script, dir.path(), env);
+        dbg!(&lines);
+        assert_eq!(code, 0, "`{script}` must exit zero");
+        assert_eq!(lines, vec![(LifecycleStdio::Stdout, expected.to_string())], "`{script}`");
+    }
+
+    let (code, _) = run(r#"mkdir -p "dist\\${OUT_DIR:-app}""#, dir.path(), &set);
+    assert_eq!(code, 0);
+    let split_dir = dir.path().join("words");
+    dbg!(&split_dir, split_dir.exists());
+    assert!(
+        !split_dir.exists(),
+        r"double-quoted `\\${{...}}` must stay one argument rather than splitting on spaces",
+    );
+}
+
+/// Outside quotes, `\'` is a literal apostrophe that leaves later `${...}`
+/// expansions active, `\\` is a literal backslash, and `'a\'` closes at the
+/// second `'` because POSIX single quotes give `\` no special meaning.
+#[test]
+fn handles_unquoted_backslash_escapes_and_single_quotes() {
+    let dir = tempdir().expect("create a temp dir");
+    let env = HashMap::from([("OUT_DIR".to_string(), "custom".to_string())]);
+
+    for (script, expected) in [
+        (r"echo \' ${OUT_DIR:-app}", "' custom"),
+        (r"echo it\'s ${OUT_DIR:-app}", "it's custom"),
+        (r"echo \'${OUT_DIR:-app}\'", "'custom'"),
+        (r"echo \\", r"\"),
+        (r"echo a\\b", r"a\b"),
+        (r"echo dist\\${OUT_DIR:-app}", r"dist\custom"),
+        (r"echo \\'${UNSET:-literal}'", r"\${UNSET:-literal}"),
+        (r"echo \; ${OUT_DIR:-app}", "; custom"),
+        (r"echo \  ${OUT_DIR:-app}", "  custom"),
+        (r"echo 'a\' ${OUT_DIR:-app}", r"a\ custom"),
+    ] {
+        let (code, lines) = run(script, dir.path(), &env);
+        dbg!(&lines);
+        assert_eq!(code, 0, "`{script}` must exit zero");
+        assert_eq!(lines, vec![(LifecycleStdio::Stdout, expected.to_string())], "`{script}`");
+    }
+}
+
+#[test]
+fn handles_nested_quotes_and_escapes_inside_parameter_defaults() {
+    let dir = tempdir().expect("create a temp dir");
+    let env = HashMap::from([("FOO".to_string(), "hello".to_string())]);
+
+    for (script, expected) in [
+        (r#"echo ${MISSING:-"a\\"}"#, r"a\"),
+        (r#"echo ${MISSING:-"a\"}"}"#, r#"a"}"#),
+        (r#"echo "${MISSING:-a\\}""#, r"a\"),
+        (r#"echo "${MISSING:-"a\\"}""#, r"a\"),
+        (r#"echo "${MISSING:-"a   b"}""#, "a   b"),
+        (r#"echo "${MISSING:-"it's"}""#, "it's"),
+        (r#"echo "${MISSING:-"$FOO"suffix}""#, "hellosuffix"),
+        (r#"echo "${MISSING:-"${FOO}"suffix}""#, "hellosuffix"),
+        (r#"echo ${MISSING:-"$FOO"suffix}"#, "hellosuffix"),
+        (r#"echo "${MISSING:-a\}b}""#, "a}b"),
+        (r"echo ${MISSING:-'a\'}!", r"a\!"),
+        (r"echo ${MISSING:-a\'b}", "a'b"),
+        (r"echo ${MISSING:-a\\}", r"a\"),
+    ] {
+        let (code, lines) = run(script, dir.path(), &env);
+        dbg!(&lines);
+        assert_eq!(code, 0, "`{script}` must exit zero");
+        assert_eq!(lines, vec![(LifecycleStdio::Stdout, expected.to_string())], "`{script}`");
+    }
+}
+
+#[test]
+fn tracks_quotes_across_command_substitutions_and_comments() {
+    let dir = tempdir().expect("create a temp dir");
+    let env = HashMap::from([("OUT_DIR".to_string(), "custom".to_string())]);
+
+    for (script, expected) in [
+        (r#"echo "$(echo "a\\")" '${UNSET:-literal}'"#, r"a\ ${UNSET:-literal}"),
+        (r#"echo "$(echo '${UNSET:-literal}')""#, "${UNSET:-literal}"),
+        (r#"echo "${MISSING:-$(echo '}')}""#, "}"),
+        (r#"echo ${MISSING:-"$(echo "}")"}"#, "}"),
+        (r#"echo "${MISSING:-"$(echo "}")"}""#, "}"),
+        (r#"echo "${MISSING:-"${UNSET:-"}"}"}""#, "}"),
+        ("echo ${MISSING:-$(echo ${OUT_DIR:-)})}", "custom"),
+        ("echo ${MISSING:-$(echo ${UNSET:-)})}", ")"),
+        ("echo ${MISSING:-$(echo ${UNSET:-(})}", "("),
+        ("echo ${MISSING:-$(echo ${UNSET:-#fallback})}", "#fallback"),
+        ("echo ${MISSING:-$(echo ${OUT_DIR:-)}#tail)}", "custom#tail"),
+        (r#"echo "${MISSING:-$(echo "${OUT_DIR:-")"}")}""#, "custom"),
+        (r#"echo "${MISSING:-$(echo "${UNSET:-")"}")}""#, ")"),
+        ("echo [${MISSING:-$(echo first && echo second)}]", "[first second]"),
+        (r#"echo `echo "a\\"` '${UNSET:-literal}'"#, r"a\ ${UNSET:-literal}"),
+        (r#"echo "`echo '${UNSET:-literal}'`""#, "${UNSET:-literal}"),
+        (r"echo \`echo hi\` ${OUT_DIR:-app}", "`echo hi` custom"),
+        (r#"echo "\`echo hi\`" ${OUT_DIR:-app}"#, "`echo hi` custom"),
+        ("# don't\necho ${OUT_DIR:-app}", "custom"),
+    ] {
+        let (code, lines) = run(script, dir.path(), &env);
+        dbg!(&lines);
+        assert_eq!(code, 0, "`{script}` must exit zero");
+        assert_eq!(lines, vec![(LifecycleStdio::Stdout, expected.to_string())], "`{script}`");
+    }
 }
 
 /// An expansion the `$NAME` form cannot stand in for keeps the behavior it
@@ -378,4 +513,134 @@ fn rejects_a_script_the_shell_cannot_parse() {
     .expect_err("an unparsable script is an error, not an exit code");
     dbg!(&error);
     assert!(matches!(error, ShellEmulatorError::Parse { .. }));
+}
+
+#[test]
+fn parameter_expansion_reads_assignments_at_execution_time() {
+    let dir = tempdir().unwrap();
+    let script = "export MODE=prod && echo ${MODE:-dev} && MODE=local && echo ${MODE:+set} && MODE= && echo ${MODE:-empty} && echo ${MODE-default} && echo ${MODE+present}";
+    let (code, lines) = run(script, dir.path(), &HashMap::new());
+    assert_eq!(code, 0);
+    assert_eq!(lines_from(&lines, LifecycleStdio::Stdout), ["prod", "set", "empty", "", "present"]);
+}
+
+#[test]
+fn parameter_expansion_is_lazy_and_respects_subshell_scope() {
+    let dir = tempdir().unwrap();
+    let script = "MODE=outer && echo ${MODE:-$(touch unexpected)} && (MODE=inner && echo ${MODE:-missing}) && echo ${MODE:-missing} && echo $(MODE=nested && echo ${MODE:-missing}) && echo ${MODE:+${MISSING:-fallback}}";
+    let (code, lines) = run(script, dir.path(), &HashMap::new());
+    assert_eq!(code, 0);
+    assert!(!dir.path().join("unexpected").exists());
+    assert_eq!(
+        lines_from(&lines, LifecycleStdio::Stdout),
+        ["outer", "inner", "outer", "nested", "fallback"],
+    );
+}
+
+#[test]
+fn runtime_parameter_values_never_become_shell_source() {
+    let dir = tempdir().unwrap();
+    let script =
+        r#"MODE='$(touch injected); & | > <' && echo "${MODE:-fallback}" && echo "${MODE:+safe}""#;
+    let (code, lines) = run(script, dir.path(), &HashMap::new());
+    assert_eq!(code, 0);
+    assert!(!dir.path().join("injected").exists());
+    assert_eq!(lines_from(&lines, LifecycleStdio::Stdout), ["$(touch injected); & | > <", "safe"]);
+}
+
+#[test]
+fn parameter_replacement_words_preserve_field_boundaries_and_suffixes() {
+    let dir = tempdir().unwrap();
+    let script = r#"echo pre${MISSING:- one two }post && echo "pre${MISSING:- one two }post" && echo pre${MISSING:-"one two"}post && echo ${MISSING:-{a,b}}"#;
+    let (code, lines) = run(script, dir.path(), &HashMap::new());
+    assert_eq!(code, 0);
+    assert_eq!(
+        lines_from(&lines, LifecycleStdio::Stdout),
+        ["pre one two post", "pre one two post", "preone twopost", "{a,b}"],
+    );
+}
+
+#[test]
+fn runtime_parameters_preserve_argument_count_and_empty_values() {
+    let dir = tempdir().unwrap();
+    let env = HashMap::from([("PATH".to_string(), std::env::var("PATH").unwrap())]);
+    let script = r#"MODE= && node -e "console.log(JSON.stringify(process.argv.slice(1)))" ${MODE:-} "${MODE:-}" pre${MODE:- one two }post ${MODE:-"one two"} && MODE=value && node -e "console.log(JSON.stringify(process.argv.slice(1)))" "${MODE:+}" ${MODE:+}"#;
+    let (code, lines) = run(script, dir.path(), &env);
+    assert_eq!(code, 0);
+    assert_eq!(
+        lines_from(&lines, LifecycleStdio::Stdout),
+        [r#"["","pre","one","two","post","one two"]"#, r#"[""]"#],
+    );
+}
+
+#[test]
+fn parameter_placeholders_do_not_alias_user_variables() {
+    let dir = tempdir().unwrap();
+    let script =
+        "__PNPM_PARAMETER_0_0=user && MODE=prod && echo $__PNPM_PARAMETER_0_0 ${MODE:-dev}";
+    let (code, lines) = run(script, dir.path(), &HashMap::new());
+    assert_eq!(code, 0);
+    assert_eq!(lines_from(&lines, LifecycleStdio::Stdout), ["user prod"]);
+}
+
+#[test]
+fn parameter_defaults_expand_home_paths() {
+    let dir = tempdir().unwrap();
+    let (code, lines) = run(
+        "echo ~ && echo ${MISSING:-~} && echo ${MISSING:-~/out} && echo ${MISSING:- ~ } && echo ${MISSING:-prefix ~}",
+        dir.path(),
+        &HashMap::new(),
+    );
+    assert_eq!(code, 0);
+    let stdout = lines_from(&lines, LifecycleStdio::Stdout);
+    assert_eq!(stdout[1], stdout[0]);
+    assert_eq!(stdout[2], format!("{}/out", stdout[0]));
+    assert_eq!(stdout[3], stdout[0]);
+    assert_eq!(stdout[4], format!("prefix {}", stdout[0]));
+}
+
+#[test]
+fn unsupported_nested_parameter_forms_remain_literal() {
+    let dir = tempdir().unwrap();
+    for word in ["${B:=x;y}", "${B:=x,y}", "${B:=x&y}"] {
+        let (code, lines) = run(&format!("echo ${{A:-{word}}}"), dir.path(), &HashMap::new());
+        assert_eq!(code, 0);
+        assert_eq!(lines_from(&lines, LifecycleStdio::Stdout), [word]);
+    }
+}
+
+#[test]
+fn quoted_parameter_defaults_keep_tildes_literal() {
+    let dir = tempdir().unwrap();
+    for script in [
+        r#"echo "${MISSING:-~/out}" "${MISSING:-~literal}""#,
+        r#"echo ${MISSING:-"~/out"} ${MISSING:-"~literal"}"#,
+        r#"VALUE=set && echo "${VALUE:-~literal}""#,
+    ] {
+        let (code, lines) = run(script, dir.path(), &HashMap::new());
+        assert_eq!(code, 0);
+        let expected = if script.starts_with("VALUE=") { "set" } else { "~/out ~literal" };
+        assert_eq!(lines_from(&lines, LifecycleStdio::Stdout), [expected]);
+    }
+}
+
+#[test]
+fn quoted_runtime_parameter_values_preserve_whitespace() {
+    let dir = tempdir().unwrap();
+    let value = "North  Wing\troom";
+    let env = HashMap::from([("LABEL".to_string(), value.to_string())]);
+    let (code, lines) = run(r#"echo "${LABEL:-fallback}""#, dir.path(), &env);
+    assert_eq!(code, 0);
+    assert_eq!(lines_from(&lines, LifecycleStdio::Stdout), [value]);
+}
+
+#[test]
+fn unsupported_replacement_syntax_errors_only_when_selected() {
+    let dir = tempdir().unwrap();
+    let (code, lines) = run(r#"MODE=prod && echo "${MODE:-$#}""#, dir.path(), &HashMap::new());
+    assert_eq!(code, 0);
+    assert_eq!(lines_from(&lines, LifecycleStdio::Stdout), ["prod"]);
+    let (code, lines) = run(r#"echo "${MISSING:-$#}""#, dir.path(), &HashMap::new());
+    assert_ne!(code, 0);
+    assert!(!lines_from(&lines, LifecycleStdio::Stderr).is_empty());
 }

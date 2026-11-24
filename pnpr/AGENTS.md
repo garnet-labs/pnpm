@@ -21,8 +21,8 @@ the `Cargo.lock` stays unified.
 
 ## Relationship to pacquet and pre-1.0 policy
 
-- **`pnpm/`** is pnpm v12 and the target for new feature development. See
-  [`../pnpm/AGENTS.md`](../pnpm/AGENTS.md) for its version policy.
+- **`pnpm/`** is the pnpm CLI. See
+  [`../pnpm/AGENTS.md`](../pnpm/AGENTS.md) for its rules.
 - **`pnpr/`** has no pnpm-CLI counterpart to mirror. It is a new
   server. Behavior here is designed, not ported.
 - **`pnpr/` is pre-1.0 (`0.1.0-alpha.x`, experimental per [`../PHILOSOPHY.md`](../PHILOSOPHY.md)).**
@@ -30,8 +30,7 @@ the `Cargo.lock` stays unified.
   CLI flags in place. Do not add backward-compatibility fallbacks, serde aliases
   for old field names, or migration commands between alpha builds.
 
-The pnpm v12 and v11 coverage policy governs the CLI implementations, not
-pnpr. The registry can pick its own architecture, flags, and config format. It
+The pnpm CLI's compatibility rules do not govern pnpr. The registry can pick its own architecture, flags, and config format. It
 must still be compatible with the npm registry protocol that pnpm (and npm,
 yarn, etc.) clients speak.
 
@@ -101,13 +100,13 @@ the root with the `pnpr-` prefix so other crates can use
 Use the `pnpr-` prefix exclusively for registry-only crates.
 Don't reach for `pnpm-` to name something new on the registry side.
 
-**Also add it to `deny.toml`.** The `pnpr*` crates are licensed under
+**Also add it to `.config/deny.toml`.** The `pnpr*` crates are licensed under
 PolyForm Shield rather than the workspace's MIT, and cargo-deny scores that
 license text below its confidence threshold. A new crate therefore needs both
 an `licenses.exceptions` entry and a `[[licenses.clarify]]` block pinning
 `../../LICENSE.md` by hash — without them `Rust CI / Cargo Deny` fails the
 crate as `unlicensed`. That job is path-filtered on `Cargo.lock` and
-`deny.toml`, so it only runs on PRs that touch one of them; adding a crate
+`.config/deny.toml`, so it only runs on PRs that touch one of them; adding a crate
 always does.
 
 Name crates for what they hold, not for where they sit in the graph. The
@@ -129,6 +128,12 @@ pacquet contributing guide ([`../pnpm/CONTRIBUTING.md`](../pnpm/CONTRIBUTING.md)
 for Rust-level conventions — imports, naming, ownership, error handling,
 test layout. They are written for pacquet but apply to any Rust code in
 this workspace.
+
+### `unsafe`
+
+[`../UNSAFE_POLICY.md`](../UNSAFE_POLICY.md) governs every `pnpr-*` crate:
+each takes the workspace's `unsafe_code` lint, and a foreign call goes into
+the `pnpm-ffi-*` crate that owns its surface.
 
 ### Comments
 

@@ -1,9 +1,16 @@
 //! Candidate identity: which package provides a bin, and the
 //! fingerprint a trust approval is bound to.
 
-use pnpm_crypto_hash::{create_hex_hash, create_hex_hash_bytes, create_hex_hash_from_file};
+use pnpm_crypto_hash::{
+    create_hex_hash,
+    create_hex_hash_bytes,
+    create_hex_hash_from_file,
+};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 pub(super) const MAX_HASHED_BIN_SIZE: u64 = 1024 * 1024;
 
@@ -95,7 +102,8 @@ pub(super) fn file_identity(path: &Path) -> Option<String> {
     let modified_ns = metadata
         .modified()
         .ok()
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|modified| modified.duration_since(std::time::UNIX_EPOCH))
+        .and_then(Result::ok)
         .map_or(0, |duration| duration.as_nanos());
     #[cfg(unix)]
     let platform_identity = {
@@ -127,23 +135,16 @@ pub(super) fn small_file_hash(path: &Path, expected_len: u64) -> Option<String> 
 
 #[cfg(windows)]
 pub(super) fn windows_file_identity(path: &Path) -> Option<String> {
-    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    let file = std::fs::File::open(path).ok()?;
-    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    // SAFETY: `file` owns a valid handle for this call and `info` points to
-    // writable storage of the exact structure the API initializes.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr()) } == 0
-    {
-        return None;
-    }
-    // SAFETY: a successful `GetFileInformationByHandle` initializes `info`.
-    let info = unsafe { info.assume_init() };
-    Some(format!("{}:{}:{}", info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+    // The halves of the file index are printed separately because this
+    // string feeds the fingerprint a trust decision is stored against;
+    // joining them would invalidate every approval already on disk.
+    let info = pnpm_ffi_fs::file_information(path).ok()?;
+    Some(format!(
+        "{}:{}:{}",
+        info.volume_serial,
+        info.index >> 32,
+        info.index & u64::from(u32::MAX),
+    ))
 }
 
 pub(super) fn read_shim_target_from_content(content: &str) -> Option<PathBuf> {

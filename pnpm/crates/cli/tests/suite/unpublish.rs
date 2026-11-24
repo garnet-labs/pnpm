@@ -10,11 +10,17 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use mockito::Matcher;
-use pnpm_testing_utils::{bin::CommandTempCwd, diagnostics::assert_diagnostic_contains};
+use pnpm_testing_utils::{
+    bin::CommandTempCwd,
+    diagnostics::assert_diagnostic_contains,
+};
 use serde_json::json;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 
@@ -88,6 +94,7 @@ fn fails_when_package_is_not_found() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/nonexistent-package-99999")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(404)
         .create();
     let auth_file = empty_auth_file(root.path());
@@ -113,6 +120,7 @@ fn fails_when_the_package_has_no_versions() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(r#"{"name":"test-pkg","versions":{}}"#)
         .create();
@@ -134,6 +142,7 @@ fn fails_when_no_versions_match_the_range() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -156,6 +165,7 @@ fn refuses_a_full_unpublish_without_force() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -184,6 +194,7 @@ fn a_range_matching_every_version_is_a_full_unpublish() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -211,6 +222,7 @@ fn force_unpublishes_the_entire_package() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -241,6 +253,7 @@ fn unpublishes_a_specific_version_and_repoints_dist_tags() {
     // The refetch before each tarball delete hits GET again.
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server_url))
         .expect_at_least(2)
@@ -287,6 +300,7 @@ fn a_tarball_delete_404_is_tolerated() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .expect_at_least(2)
@@ -319,6 +333,7 @@ fn a_405_on_a_full_unpublish_reports_unpublish_forbidden() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -346,6 +361,7 @@ fn an_unauthorized_delete_reports_unauthorized() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -379,6 +395,7 @@ fn a_web_auth_challenge_without_a_terminal_reports_otp_non_interactive() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -417,6 +434,7 @@ fn a_classic_otp_challenge_without_a_terminal_reports_otp_non_interactive() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -448,6 +466,7 @@ fn the_otp_flag_sends_the_code_under_the_legacy_auth_type() {
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create();
@@ -486,6 +505,7 @@ fn the_force_hint_lists_versions_in_packument_order() {
     // them, the TypeScript CLI's Object.keys does not.
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(
             r#"{"name":"test-pkg","_rev":"3-abc","versions":{"1.9.0":{},"1.10.0":{},"1.2.0":{}}}"#,

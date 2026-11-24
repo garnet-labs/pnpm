@@ -1,7 +1,7 @@
 //! Single-package `pacquet publish` integration tests: drive the real binary
 //! against a `mockito` registry. The pnpr `TestRegistry` runs in proxy mode and
 //! rejects path-less publishes ("routes to an upstream registry"), so a mocked
-//! `PUT` is the portable harness here — it exercises the whole
+//! `PUT` is the portable harness here; it exercises the whole
 //! pack → build-document → `PUT /:pkg` path, mirroring pnpm's
 //! `test/publish/publish.ts` scenarios that don't need OIDC / provenance / OTP.
 //!
@@ -12,8 +12,16 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use mockito::Matcher;
-use serde_json::{Value, json};
-use std::{fs, path::Path, process::Command};
+use pnpm_testing_utils::command_env::CommandTestExt;
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
 fn pacquet(workspace: &Path) -> Command {
     Command::cargo_bin("pnpm")
@@ -24,6 +32,12 @@ fn pacquet(workspace: &Path) -> Command {
         .without_env("NPM_ID_TOKEN")
         .without_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         .without_env("ACTIONS_ID_TOKEN_REQUEST_URL")
+        // These tests turn on publish settings a developer may also have set
+        // globally, so pin every layer below `pnpm-workspace.yaml` to nothing.
+        // `XDG_CONFIG_HOME` points at the workspace, which has no `pnpm/`
+        // subdirectory to read a global `config.yaml` from.
+        .with_env("XDG_CONFIG_HOME", workspace)
+        .without_ambient_pnpm_config()
 }
 
 /// Run `pacquet publish --no-git-checks` in `workspace` with `args` appended.
@@ -255,6 +269,207 @@ fn tag_flag_registers_the_version_under_that_dist_tag() {
 }
 
 #[test]
+fn workspace_yaml_supplies_the_dist_tag_and_access() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "@scope/from-yaml", "version": "2.3.4" }),
+    );
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "tag: next\naccess: restricted\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let mock = server
+        .mock("PUT", "/@scope%2ffrom-yaml")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::PartialJsonString(r#"{"dist-tags":{"next":"2.3.4"}}"#.to_owned()),
+            Matcher::PartialJsonString(r#"{"access":"restricted"}"#.to_owned()),
+        ]))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    assert_success(&publish(dir.path(), &[]));
+    mock.assert();
+}
+
+#[test]
+fn the_tag_flag_outranks_the_workspace_yaml_tag() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "test-publish-tag-flag", "version": "1.2.3" }),
+    );
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "tag: from-yaml\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let mock = server
+        .mock("PUT", "/test-publish-tag-flag")
+        .match_body(Matcher::PartialJsonString(r#"{"dist-tags":{"from-flag":"1.2.3"}}"#.to_owned()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    assert_success(&publish(dir.path(), &["--tag", "from-flag"]));
+    mock.assert();
+}
+
+#[test]
+fn pnpm_config_tag_env_var_outranks_the_workspace_yaml_tag() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "test-publish-tag-env", "version": "1.2.3" }),
+    );
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "tag: from-yaml\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let mock = server
+        .mock("PUT", "/test-publish-tag-env")
+        .match_body(Matcher::PartialJsonString(r#"{"dist-tags":{"from-env":"1.2.3"}}"#.to_owned()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    let output = pacquet(dir.path())
+        .with_arg("publish")
+        .with_arg("--no-git-checks")
+        .with_env("PNPM_CONFIG_TAG", "from-env")
+        .output()
+        .expect("spawn pacquet publish");
+    assert_success(&output);
+    mock.assert();
+}
+
+/// The manifest's `publishConfig.access` is the fallback for an *unset*
+/// access level, so a configured one has to win over it.
+#[test]
+fn the_configured_access_outranks_publish_config_access() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({
+            "name": "@scope/access-precedence",
+            "version": "1.0.0",
+            "publishConfig": { "access": "public" },
+        }),
+    );
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "access: restricted\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let mock = server
+        .mock("PUT", "/@scope%2faccess-precedence")
+        .match_body(Matcher::PartialJsonString(r#"{"access":"restricted"}"#.to_owned()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    assert_success(&publish(dir.path(), &[]));
+    mock.assert();
+}
+
+/// `--config.<key>=<value>` is applied after the whole config chain, so it has
+/// to beat both `pnpm-workspace.yaml` and `PNPM_CONFIG_*`.
+#[test]
+fn the_config_override_outranks_the_workspace_yaml_and_the_env_var() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "test-publish-config-override", "version": "1.2.3" }),
+    );
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "tag: from-yaml\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let mock = server
+        .mock("PUT", "/test-publish-config-override")
+        .match_body(Matcher::PartialJsonString(r#"{"dist-tags":{"from-cli":"1.2.3"}}"#.to_owned()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    let output = pacquet(dir.path())
+        .with_arg("--config.tag=from-cli")
+        .with_arg("publish")
+        .with_arg("--no-git-checks")
+        .with_env("PNPM_CONFIG_TAG", "from-env")
+        .output()
+        .expect("spawn pacquet publish");
+    assert_success(&output);
+    mock.assert();
+}
+
+/// The OTP rides on the first `PUT` rather than waiting for a 2FA challenge,
+/// so whichever channel supplies it is observable as a header. A one-time
+/// password is not a file setting: `pnpm-workspace.yaml` supplies nothing,
+/// `PNPM_CONFIG_OTP` supplies the header.
+#[test]
+fn the_otp_comes_from_the_environment_and_never_from_the_workspace_yaml() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "test-publish-otp", "version": "1.0.0" }),
+    );
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "otp: '135791'\n")
+        .expect("write pnpm-workspace.yaml");
+
+    let from_yaml = server
+        .mock("PUT", "/test-publish-otp")
+        .match_header("npm-otp", "135791")
+        .expect(0)
+        .create();
+    let without_otp = server
+        .mock("PUT", "/test-publish-otp")
+        .match_header("npm-otp", Matcher::Missing)
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    assert_success(&publish(dir.path(), &[]));
+    from_yaml.assert();
+    without_otp.assert();
+
+    let from_env = server
+        .mock("PUT", "/test-publish-otp")
+        .match_header("npm-otp", "246810")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    let output = pacquet(dir.path())
+        .with_arg("publish")
+        .with_arg("--no-git-checks")
+        .with_env("PNPM_CONFIG_OTP", "246810")
+        .output()
+        .expect("spawn pacquet publish");
+    assert_success(&output);
+    from_env.assert();
+}
+
+#[test]
 fn scoped_package_publishes_to_the_slash_escaped_path() {
     let dir = tempfile::tempdir().expect("workspace");
     let mut server = mockito::Server::new();
@@ -330,7 +545,7 @@ fn publish_a_directory_argument_publishes_that_package() {
 }
 
 /// A registry that rejects the `PUT` with a 5xx makes `pacquet publish` fail
-/// with the failed-to-publish error — the response completed, so this is not a
+/// with the failed-to-publish error, the response completed, so this is not a
 /// transport error.
 #[test]
 fn errors_when_the_registry_rejects_the_publish() {
@@ -784,4 +999,162 @@ fn workspace_npmrc_registry_is_effective_for_package_publish() {
     mock.assert();
 }
 
+#[test]
+fn new_version_flag_sets_the_manifest_version_and_publishes_it() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "test-publish-new-version", "version": "1.0.0" }),
+    );
+
+    let mock = server
+        .mock("PUT", "/test-publish-new-version")
+        .match_body(Matcher::AllOf(vec![
+            Matcher::PartialJsonString(
+                r#"{"versions":{"2.0.0-alpha.1":{"version":"2.0.0-alpha.1"}}}"#.to_owned(),
+            ),
+            Matcher::PartialJsonString(r#"{"dist-tags":{"alpha":"2.0.0-alpha.1"}}"#.to_owned()),
+        ]))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    assert_success(&publish(dir.path(), &["--new-version", "2.0.0-alpha.1", "--tag", "alpha"]));
+    mock.assert();
+
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("package.json")).expect("read"))
+            .expect("parse package.json");
+    assert_eq!(manifest["version"], "2.0.0-alpha.1", "--new-version must update package.json");
+    assert_eq!(manifest["name"], "test-publish-new-version");
+}
+
+/// The version write is part of what `publish --new-version` does; `--dry-run`
+/// only suppresses the upload.
+#[test]
+fn new_version_with_dry_run_updates_the_manifest_but_uploads_nothing() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "test-publish-new-version-dry", "version": "1.0.0" }),
+    );
+    let mock = server
+        .mock("PUT", Matcher::Any)
+        .expect(0)
+        .create();
+
+    assert_success(&publish(dir.path(), &["--dry-run", "--new-version", "2.0.0"]));
+    mock.assert();
+
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("package.json")).expect("read"))
+            .expect("parse package.json");
+    assert_eq!(manifest["version"], "2.0.0");
+}
+
+#[test]
+fn new_version_flag_rejects_an_invalid_version() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(
+        dir.path(),
+        &registry,
+        &json!({ "name": "test-publish-bad-version", "version": "1.0.0" }),
+    );
+    let mock = server
+        .mock("PUT", Matcher::Any)
+        .expect(0)
+        .create();
+
+    let output = publish(dir.path(), &["--new-version", "not-a-version"]);
+    assert!(!output.status.success(), "an invalid --new-version must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ERR_PNPM_INVALID_VERSION_BUMP"), "stderr: {stderr}");
+    mock.assert();
+
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("package.json")).expect("read"))
+            .expect("parse package.json");
+    assert_eq!(manifest["version"], "1.0.0", "a rejected run must not touch package.json");
+}
+
+#[test]
+fn new_version_flag_rejects_a_tarball_argument() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let registry = "https://registry.example/";
+    fs::write(dir.path().join(".npmrc"), format!("registry={registry}\n")).expect("write .npmrc");
+    fs::write(dir.path().join("package.json"), r#"{"name":"pkg","version":"1.0.0"}"#)
+        .expect("write package.json");
+
+    let output = publish(dir.path(), &["pkg-1.0.0.tgz", "--new-version", "2.0.0"]);
+    assert!(!output.status.success(), "--new-version with a tarball must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ERR_PNPM_NEW_VERSION_WITH_TARBALL"), "stderr: {stderr}");
+}
+
+/// `--new-version` bumps only the published package: an unbumped workspace
+/// dependency keeps the installed-copy-first resolution a plain publish
+/// uses, even when the workspace source manifest disagrees with what
+/// `node_modules` holds.
+#[test]
+fn publish_new_version_keeps_installed_workspace_dep_versions() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+
+    // A workspace of two: the package being published, and the dependency
+    // it consumes over the workspace protocol.
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "packages:\n  - pkg\n  - dep\n")
+        .expect("write pnpm-workspace.yaml");
+    // A workspace reads its registry from the root .npmrc, not the
+    // publishing project's.
+    fs::write(dir.path().join(".npmrc"), format!("registry={registry}\n"))
+        .expect("write the workspace .npmrc");
+    fs::create_dir_all(dir.path().join("dep")).expect("create the dep dir");
+    fs::create_dir_all(dir.path().join("pkg")).expect("create the pkg dir");
+    write_project(
+        &dir.path().join("dep"),
+        &registry,
+        &json!({ "name": "dep", "version": "2.0.0" }),
+    );
+    write_project(
+        &dir.path().join("pkg"),
+        &registry,
+        &json!({
+            "name": "test-publish-ws-pkg",
+            "version": "1.0.0",
+            "dependencies": { "dep": "workspace:*" },
+        }),
+    );
+    // The installed copy predates the dependency's source manifest.
+    let installed = dir.path().join("pkg/node_modules/dep");
+    fs::create_dir_all(&installed).expect("create the installed copy");
+    fs::write(installed.join("package.json"), r#"{"name":"dep","version":"1.0.0"}"#)
+        .expect("write the stale installed manifest");
+
+    let mock = server
+        .mock("PUT", "/test-publish-ws-pkg")
+        .match_body(Matcher::PartialJsonString(
+            r#"{"versions":{"3.0.0":{"dependencies":{"dep":"1.0.0"}}}}"#.to_owned(),
+        ))
+        .with_status(200)
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create();
+
+    let pkg = dir.path().join("pkg");
+    assert_success(&publish(&pkg, &["--new-version", "3.0.0"]));
+    mock.assert();
+}
+
+mod dir_flag;
+mod publish_directory;
 mod wait;

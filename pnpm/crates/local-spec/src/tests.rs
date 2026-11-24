@@ -70,6 +70,19 @@ fn leaves_a_home_relative_specifier_alone() {
     }
 }
 
+#[test]
+fn keeps_a_home_relative_specifier_that_leaves_the_home_directory() {
+    for specifier in ["link:~/../shared", "file:~/../shared/x.tgz"] {
+        assert_eq!(render(specifier, Some("packages/foo")), specifier);
+        assert_eq!(render(specifier, None), specifier);
+    }
+    assert_eq!(
+        render_filesystem("~/../shared", Some("packages/foo")).as_deref(),
+        Some("~/../shared"),
+    );
+    assert_eq!(render(r"link:~\..\shared", Some("packages/foo")), "link:~/../shared");
+}
+
 /// A home-relative path is recognized only after normalization, so the
 /// backslash spelling needs its own case: were the two ever reordered,
 /// this form would be re-anchored under the workspace instead.
@@ -147,6 +160,15 @@ fn keeps_a_reanchored_workspace_path_relative() {
     assert_eq!(
         render_workspace_path("workspace:./packages/target", "packages/target").as_deref(),
         Some("workspace:."),
+    );
+}
+
+#[test]
+fn keeps_an_absolute_workspace_path_absolute() {
+    let absolute = format!("workspace:{}/packages/target", ROOT.replace('\\', "/"));
+    assert_eq!(
+        render_workspace_path(&absolute, "packages/deep/consumer").as_deref(),
+        Some(absolute.as_str()),
     );
 }
 
@@ -248,7 +270,7 @@ fn reads_a_rooted_path_the_same_way_on_every_host() {
 
 /// The resolver strips the slashes after a protocol and then keeps a
 /// dot, tilde or drive prefix relative, so `file:/./deps/x` resolves
-/// from the project rather than the filesystem root — `pnpm install`
+/// from the project rather than the filesystem root, `pnpm install`
 /// records it as `file:deps/x`. Anchoring shares that normalization
 /// rather than repeating part of it.
 #[test]
@@ -301,4 +323,212 @@ fn recognizes_filespec_shapes() {
     assert!(!is_filespec("pkg@^1.0.0"));
     assert!(!is_filespec("^1.0.0"));
     assert!(!is_filespec("*"));
+}
+
+#[test]
+fn distinguishes_unambiguous_bare_paths_from_registry_and_git_specs() {
+    use super::bare_path_is_unambiguous;
+
+    assert!(bare_path_is_unambiguous("../child.tgz"));
+    assert!(bare_path_is_unambiguous("./child"));
+    assert!(bare_path_is_unambiguous(r"..\child.tgz"));
+    assert!(!bare_path_is_unambiguous("release.tgz"));
+    assert!(!bare_path_is_unambiguous("user/repo.tgz"));
+    assert!(!bare_path_is_unambiguous("c:^1.0.0"));
+}
+
+#[test]
+fn classifies_host_filesystem_specifiers() {
+    use super::is_host_filesystem_specifier;
+
+    for local in [
+        "file:/path/on/server",
+        "file:../dir",
+        "file:./local.tgz",
+        "file:///path/on/server",
+        "FILE:/path/on/server",
+        "link:/path/on/server",
+        "link:../dir",
+        "git+file:/path/on/server",
+        "git+file:///path/on/server",
+        "./foo",
+        "../foo",
+        "/foo",
+        "~/foo",
+        r"\foo",
+        "C:/foo",
+        r"C:\foo",
+        "C:tools",
+        "packages/foo/bar",
+        "a/../../outside",
+        "workspace:/path/on/server",
+        "workspace:../outside",
+        "workspace:~/outside",
+        "npm:pkg@file:../outside",
+        "lib@file:///workspace/packages/lib",
+        "@scope/lib@link:../lib",
+    ] {
+        assert!(
+            is_host_filesystem_specifier(local, ".", |_| false),
+            "expected {local:?} to be classified as host-filesystem",
+        );
+    }
+
+    for non_local in [
+        "^1.0.0",
+        "~1.2.3",
+        "~",
+        "*",
+        "",
+        "latest",
+        "release.tgz",
+        "npm:lodash@^4.17.21",
+        "npm:@scope/pkg@^1.0.0",
+        "jsr:@std/path@^1.0.0",
+        "catalog:",
+        "catalog:default",
+        "workspace:*",
+        "workspace:^1.0.0",
+        "workspace:@scope/pkg@^1.0.0",
+        "workspace:./packages/target",
+        "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz",
+        "git+https://github.com/org/repo.git#main",
+        "github:org/repo",
+        "org/repo",
+        "org/repo#release.tgz",
+        "gh:@scope/pkg@1.0.0",
+        "$react",
+        "lib@1.0.0",
+        "@scope/lib@^1.0.0",
+    ] {
+        assert!(
+            !is_host_filesystem_specifier(non_local, ".", |_| false),
+            "expected {non_local:?} not to be classified as host-filesystem",
+        );
+    }
+
+    assert!(!is_host_filesystem_specifier("workspace:../lib", "packages/app", |_| false));
+    assert!(!is_host_filesystem_specifier("workspace:~", ".", |_| false));
+    assert!(is_host_filesystem_specifier("workspace:../../../outside", "packages/app", |_| false));
+    assert!(!is_host_filesystem_specifier("c:pkg@1.0.0", ".", |prefix| prefix == "c"));
+    assert!(is_host_filesystem_specifier("c:/pkg", ".", |prefix| prefix == "c"));
+}
+
+#[test]
+fn classifies_non_local_filesystem_subdep_specifiers() {
+    use super::{
+        escapes_workspace_root,
+        is_non_local_filesystem_subdep_spec,
+    };
+
+    for forbidden in [
+        "file:~/.config/gh",
+        "file:/etc",
+        "file:../secret",
+        "file:./sub.tgz",
+        "file:a/../../b",
+        r"file:C:\secret",
+        "FILE:../secret",
+        "link:~/.config/gh",
+        "link:../secret",
+        "path:../secret",
+        "git+file:///tmp/repo",
+        "GIT+FILE:///tmp/repo",
+        "npm:alias@file:~/.config/gh",
+        "npm:alias@git+file:///tmp/repo",
+        "npm:outer@npm:inner@link:../secret",
+        "workspace:../secret",
+        "workspace:./packages/a",
+        "workspace:/etc",
+        "workspace:~/.config/gh",
+        r"workspace:~\.config\gh",
+        r"workspace:C:\secret",
+        "workspace:pkg@file:../secret",
+        "../secret",
+        "./secret",
+        "/etc",
+        r"\etc",
+        "file:~",
+        "~/.config/gh",
+        r"~\.config\gh",
+        "C:/secret",
+        r"C:\secret",
+        "C:secret",
+        "a/b/c",
+        "a/../../secret",
+        "host@file:~/.config/gh",
+        "@scope/host@link:../secret",
+    ] {
+        assert!(
+            is_non_local_filesystem_subdep_spec(forbidden, |_| false),
+            "expected {forbidden:?} to be rejected on non-local manifests",
+        );
+    }
+
+    for allowed in [
+        "^1.0.0",
+        "~1.2.3",
+        "~",
+        "*",
+        "latest",
+        "npm:lodash@^4.17.21",
+        "jsr:@std/path@^1.0.0",
+        "workspace:*",
+        "workspace:^",
+        "workspace:~",
+        "workspace:^1.0.0",
+        "workspace:@scope/pkg@~",
+        "https://example.com/pkg.tgz",
+        "git+https://github.com/org/repo.git",
+        "github:org/repo",
+        "org/repo",
+    ] {
+        assert!(
+            !is_non_local_filesystem_subdep_spec(allowed, |_| false),
+            "expected {allowed:?} to be allowed past local-filesystem check",
+        );
+    }
+
+    assert!(!is_non_local_filesystem_subdep_spec("c:pkg@1.0.0", |prefix| prefix == "c"));
+    assert!(is_non_local_filesystem_subdep_spec("c:/pkg", |prefix| prefix == "c"));
+
+    assert!(escapes_workspace_root(".", "../secret"));
+    assert!(escapes_workspace_root(".", "a/../../secret"));
+    assert!(escapes_workspace_root(".", "/etc"));
+    assert!(escapes_workspace_root(".", "~/.config/gh"));
+    assert!(!escapes_workspace_root(".", "packages/a"));
+    assert!(!escapes_workspace_root("packages/a", "../../inside"));
+    assert!(escapes_workspace_root("packages/a", "../../../outside"));
+    assert!(escapes_workspace_root("packages/../app", "../../secret"));
+    assert!(!escapes_workspace_root("packages/../app", "../inside"));
+    assert!(escapes_workspace_root("../outside", "inside"));
+}
+
+#[test]
+fn strips_the_package_name_from_a_key_shaped_local_specifier() {
+    use super::strip_package_name_from_local_spec;
+
+    assert_eq!(
+        strip_package_name_from_local_spec("lib@file:///workspace/lib"),
+        Some("file:///workspace/lib"),
+    );
+    assert_eq!(strip_package_name_from_local_spec("@scope/lib@link:../lib"), Some("link:../lib"));
+    assert_eq!(strip_package_name_from_local_spec("lib@path:../lib"), Some("path:../lib"));
+    for not_key_shaped in [
+        "",
+        "@",
+        "lib@1.0.0",
+        "@scope/lib@^1.0.0",
+        "@scope@file:../lib",
+        "a/b@file:../lib",
+        "npm:lib@file:../lib",
+        "./lib@file:../lib",
+        "file:../lib@file:../other",
+    ] {
+        assert_eq!(
+            strip_package_name_from_local_spec(not_key_shaped),
+            None,
+            "expected {not_key_shaped:?} not to be read as a key-shaped local specifier",
+        );
+    }
 }

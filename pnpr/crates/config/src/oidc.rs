@@ -17,8 +17,12 @@ pub struct OidcProvider {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OidcLogin {
     #[serde(default)]
-    pub client_secret: Option<String>,
+    pub client_secret: Option<crate::Secret>,
+    #[serde(default)]
     pub users: Vec<OidcBinding>,
+    /// Bind verified subjects through SCIM externalId.
+    #[serde(default)]
+    pub scim: bool,
     /// Team memberships a signed-in session gets from the groups its ID token
     /// lists.
     #[serde(default)]
@@ -36,14 +40,13 @@ pub struct OidcGroups {
     pub teams: Vec<OidcTeamGrant>,
 }
 
-/// A session whose groups claim lists `group` is a member of `team` on the
-/// hosted registry `registry`.
+/// A session whose groups claim lists `group` is a member of the team
+/// `team_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OidcTeamGrant {
     pub group: String,
-    pub registry: String,
-    pub team: String,
+    pub team_id: String,
 }
 
 fn default_groups_claim() -> String {
@@ -55,6 +58,7 @@ impl std::fmt::Debug for OidcLogin {
         formatter
             .debug_struct("OidcLogin")
             .field("users", &self.users)
+            .field("scim", &self.scim)
             .field("groups", &self.groups)
             .finish_non_exhaustive()
     }
@@ -64,7 +68,7 @@ impl std::fmt::Debug for OidcLogin {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OidcBinding {
     pub subject: String,
-    pub username: String,
+    pub user_id: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub claims: BTreeMap<String, String>,
 }

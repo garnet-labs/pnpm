@@ -1,4 +1,4 @@
-//! `pacquet store` — read and act on the content-addressable store.
+//! `pacquet store`: read and act on the content-addressable store.
 //!
 //! `status` and `add` are the two subcommands that reach past the store
 //! directory's own bookkeeping: `status` re-hashes what the store expanded
@@ -14,11 +14,29 @@ use crate::{
     cli_args::dlx::clean_expired_dlx_cache,
     engine_pm::install::remove_orphaned_private_engine_installs,
 };
-use clap::{Args, Subcommand};
-use miette::{Context, IntoDiagnostic};
-use pnpm_config::{Config, Host, default_pnpm_home_dir};
+use clap::{
+    Args,
+    Subcommand,
+};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Context,
+    Diagnostic,
+    IntoDiagnostic,
+};
+use pnpm_config::{
+    Config,
+    Host,
+    default_pnpm_home_dir,
+};
 use pnpm_reporter::Reporter;
-use std::{path::Path, time::SystemTime};
+use std::{
+    path::Path,
+    time::SystemTime,
+};
 
 #[derive(Debug, Subcommand)]
 pub enum StoreCommand {
@@ -41,7 +59,8 @@ pub enum StoreCommand {
 #[derive(Debug, Args)]
 pub struct StoreAddArgs {
     /// The packages to fetch into the store, e.g. `express@4`, or package
-    /// tarballs on disk, e.g. `./express-4.22.1.tgz`.
+    /// tarballs or directories of tarballs on disk, e.g. `./express-4.22.1.tgz`
+    /// or `./tarballs`.
     pub packages: Vec<String>,
 }
 
@@ -64,7 +83,17 @@ impl StoreCommand {
     }
 }
 
+/// `pnpm store prune` asked to remove files from a store `frozenStore`
+/// keeps read-only.
+#[derive(Debug, Display, Error, Diagnostic)]
+#[display("Cannot prune the store because frozenStore is enabled (the store is opened read-only)")]
+#[diagnostic(code(ERR_PNPM_FROZEN_STORE_WRITE), help("Turn off frozenStore to prune the store."))]
+pub struct FrozenStorePruneError;
+
 fn prune(config: &Config) -> miette::Result<()> {
+    if config.frozen_store {
+        return Err(FrozenStorePruneError.into());
+    }
     // The dlx cache holds hard links into the store, so it is
     // cleaned first to let this prune reclaim what the expired
     // entries used.

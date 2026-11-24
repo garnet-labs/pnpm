@@ -1,15 +1,35 @@
 use super::{
-    BuildEnvironment, BuiltWheel, PythonPrepare, backend, host, run_hook, unapproved,
+    BuildEnvironment,
+    BuiltWheel,
+    PythonPrepare,
+    backend,
+    host,
+    run_hook,
+    unapproved,
     validation::identify_identity,
 };
 use crate::{
-    environment::Shared, interpreter::Interpreters, manifest::Manifest, targets::Environments,
+    environment::Shared,
+    interpreter::Interpreters,
+    manifest::Manifest,
+    targets::Environments,
     workspace::members::Membership,
 };
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -166,7 +186,7 @@ impl Shared<'_> {
             }
             interpreter = selected;
         }
-        bail!("dynamic Python metadata at {} did not select a stable interpreter", root.display())
+        bail!("dynamic Python metadata at {} did not select a stable interpreter", root.display());
     }
 
     /// Prepare the metadata of a shared membership's members with the
@@ -200,7 +220,7 @@ impl Shared<'_> {
         bail!(
             "dynamic Python metadata in the workspace at {} did not select a stable interpreter",
             root.display(),
-        )
+        );
     }
 
     /// Prepare one project's metadata with `interpreter` and record it on

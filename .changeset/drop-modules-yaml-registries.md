@@ -1,13 +1,4 @@
 ---
-"@pnpm/building.after-install": major
-"@pnpm/building.commands": major
-"@pnpm/deps.inspection.tree-builder": major
-"@pnpm/installing.context": major
-"@pnpm/installing.deps-installer": major
-"@pnpm/installing.deps-restorer": major
-"@pnpm/installing.modules-yaml": major
-"@pnpm/installing.read-projects-context": major
-"pacquet": minor
 "pnpm": minor
 ---
 

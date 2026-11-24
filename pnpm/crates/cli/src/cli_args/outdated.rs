@@ -1,21 +1,33 @@
-//! `pacquet outdated` — report direct dependencies that have a newer
+//! `pacquet outdated`: report direct dependencies that have a newer
 //! version available.
 
 pub(crate) mod query;
 
-pub use query::{OutdatedPackage, OutdatedQuery, TargetVersion, collect_outdated};
+pub use query::{
+    OutdatedPackage,
+    OutdatedQuery,
+    TargetVersion,
+};
 pub(crate) use query::{
-    OutdatedRun, collect_outdated_for_importer, collect_outdated_for_importer_in_run,
+    OutdatedRun,
+    TrustChange,
+    collect_outdated_for_importer,
+    collect_outdated_for_importer_in_run,
     ignored_dependencies_matcher,
 };
-pub(crate) use render::colorize_target;
+pub(crate) use render::{
+    colorize_target,
+    render_trust_change,
+};
+
+pub(crate) use workspace::standalone_project_outdated;
 
 use crate::{
     State,
     cli_args::{
         catalogs::configured_catalogs,
         ecosystem_deps::{
-            EcosystemFilterKind, declared_ecosystem_dep_names, patterns_for_ecosystem,
+            declared_ecosystem_dep_names,
             requires_ecosystem_lockfile,
         },
         install::resolve_bool_override,
@@ -24,14 +36,19 @@ use crate::{
         sanitize::sanitize_inline,
     },
 };
-use clap::{Args, ValueEnum};
+use clap::{
+    Args,
+    ValueEnum,
+};
 use filters::OutdatedFilters;
 use miette::IntoDiagnostic;
 use node_semver::Version;
 use owo_colors::Stream;
 use pnpm_catalogs_protocol_parser::parse_catalog_protocol;
 use pnpm_catalogs_resolver::{
-    CatalogAnchor, CatalogResolutionResult, WantedDependency as CatalogWantedDependency,
+    CatalogAnchor,
+    CatalogResolutionResult,
+    WantedDependency as CatalogWantedDependency,
     resolve_from_catalog,
 };
 use pnpm_catalogs_types::Catalogs;
@@ -39,21 +56,51 @@ use pnpm_config::Config;
 use pnpm_config_parse_overrides::parse_overrides_iter;
 use pnpm_github_actions as github_actions;
 use pnpm_lockfile::Lockfile;
-use pnpm_matcher::{Matcher, create_matcher};
+use pnpm_matcher::{
+    Matcher,
+    create_matcher,
+};
 use pnpm_network::ThrottledClient;
-use pnpm_package_manager::{PickPolicy, VersionsOverrider, create_configured_registry_resolver};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manager::{
+    PickPolicy,
+    VersionsOverrider,
+    create_configured_registry_resolver,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::Reporter;
 use pnpm_resolving_default_resolver::DefaultResolver;
 use pnpm_resolving_resolver_base::{
-    LatestQuery, ResolveOptions, WantedDependency as ResolverWantedDependency,
+    LatestQuery,
+    ResolveOptions,
+    WantedDependency as ResolverWantedDependency,
 };
 use render::{
-    render_json, render_list, render_recursive_json, render_recursive_list, render_recursive_table,
-    render_table, sort_outdated, sort_workspace_outdated, write_output,
+    render_json,
+    render_list,
+    render_recursive_json,
+    render_recursive_list,
+    render_recursive_table,
+    render_table,
+    sort_outdated,
+    sort_workspace_outdated,
+    write_output,
 };
-use std::{borrow::Cow, collections::HashMap, io::Write, path::PathBuf, sync::Arc};
-use workspace::{OutdatedInWorkspace, loaded_lockfile, no_lockfile_error, project_dir};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+};
+use workspace::{
+    OutdatedInWorkspace,
+    loaded_lockfile,
+    no_lockfile_error,
+    project_dir,
+};
 
 /// Output format for `pnpm outdated`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -173,14 +220,22 @@ impl OutdatedArgs {
         let filters =
             OutdatedFilters::validated(&self, config, &package_patterns, [manifest], false)?;
         let lockfile = loaded_lockfile(&state)?;
-        if self.requires_lockfile(manifest, config, &filters, &package_patterns, lockfile)? {
+        let query = filters.query(self.target_version());
+        if !self.selects_github_actions_only(&package_patterns)
+            && requires_ecosystem_lockfile(
+                project_dir(manifest),
+                config,
+                &query,
+                &package_patterns,
+            )?
+        {
             return Err(no_lockfile_error(project_dir(manifest)));
         }
         let mut outdated = Box::pin(self.collect_single_project_outdated(
             &state,
             &filters,
             package_patterns,
-            lockfile,
+            lockfile.as_deref(),
         ))
         .await?;
         let root = config.workspace_dir.as_deref().unwrap_or_else(|| project_dir(manifest));
@@ -240,11 +295,11 @@ impl OutdatedArgs {
     }
 
     pub(super) fn package_patterns(&self) -> Vec<String> {
-        self.packages
-            .iter()
-            .filter(|selector| !github_actions::is_selector(selector))
-            .cloned()
-            .collect()
+        crate::github_actions::without_action_selectors(&self.packages)
+    }
+
+    fn selects_github_actions_only(&self, package_patterns: &[String]) -> bool {
+        crate::github_actions::selects_actions_only(&self.packages, package_patterns)
     }
 
     fn write_rendered(
@@ -281,7 +336,7 @@ impl OutdatedArgs {
         write_output(&notes::with_notes(output, format, &packages, &notes))
     }
 
-    pub(super) fn target_version(&self) -> TargetVersion {
+    pub(super) fn target_version(&self) -> TargetVersion<'static> {
         if self.compatible { TargetVersion::WithinRange } else { TargetVersion::Latest }
     }
 
@@ -299,33 +354,7 @@ impl OutdatedArgs {
             || !crate::cli_args::engine_deps::declared_engine_deps(manifest, config, include)
                 .is_empty()
             || !declared_ecosystem_dep_names(project_dir(manifest), config, include)?.is_empty();
-        Ok(has_any_dependency && (self.packages.is_empty() || !package_patterns.is_empty()))
-    }
-
-    fn requires_lockfile(
-        &self,
-        manifest: &PackageManifest,
-        config: &Config,
-        filters: &OutdatedFilters,
-        package_patterns: &[String],
-        lockfile: Option<&Lockfile>,
-    ) -> miette::Result<bool> {
-        if !self.packages.is_empty() && package_patterns.is_empty() {
-            return Ok(false);
-        }
-        let node_patterns = patterns_for_ecosystem(package_patterns, EcosystemFilterKind::Node)?;
-        let checks_node = package_patterns.is_empty() || !node_patterns.is_empty();
-        let query = filters.query(self.target_version());
-        let needs_node_lockfile = checks_node
-            && lockfile.is_none()
-            && manifest
-                .dependencies(filters.include.iter().copied())
-                .any(|(name, spec)| {
-                    !pnpm_tool_protocol::is_tool_specifier(spec) && query.matches_name(name)
-                });
-        let needs_eco_lockfile =
-            requires_ecosystem_lockfile(project_dir(manifest), config, &query, package_patterns)?;
-        Ok(needs_node_lockfile || needs_eco_lockfile)
+        Ok(has_any_dependency && !self.selects_github_actions_only(package_patterns))
     }
 
     pub(super) async fn outdated_actions<Reporter: self::Reporter>(
@@ -348,6 +377,13 @@ impl OutdatedArgs {
             crate::github_actions::release_age(config)?.as_ref(),
         )
         .await
+    }
+
+    pub(crate) fn uses_json_output(&self) -> bool {
+        match self.resolve_format() {
+            OutdatedFormat::Json => true,
+            OutdatedFormat::Table | OutdatedFormat::List => false,
+        }
     }
 
     fn resolve_format(&self) -> OutdatedFormat {

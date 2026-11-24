@@ -4,39 +4,79 @@ mod update;
 use super::{
     EcosystemUpdateStepOptions,
     cargo_manifest_ops::{
-        DeclaredCargoDep, apply_manifest_edits, declared_cargo_deps, find_cargo_workspace_root,
-        format_cargo_saved_spec, read_locked_cargo_versions, same_declared_dep,
-        select_locked_version, without_build_metadata,
+        DeclaredCargoDep,
+        ManifestEdit,
+        apply_manifest_edits,
+        declared_cargo_deps,
+        find_cargo_workspace_root,
+        format_cargo_saved_spec,
+        read_locked_cargo_versions,
+        same_declared_dep,
+        select_locked_version,
+        without_build_metadata,
     },
     cargo_selection::{
-        SelectedCargoDep, SelectedCargoTarget, admits_enabled_features, is_held_as_downgrade,
-        is_held_by_patch, select_cargo_deps_to_update, target_requirement,
+        SelectedCargoDep,
+        SelectedCargoTarget,
+        admits_enabled_features,
+        is_held_as_downgrade,
+        is_held_by_patch,
+        select_cargo_deps_to_update,
+        target_requirement,
     },
-    cargo_workspace_scope::{CargoWorkspaceScope, resolve_cargo_workspace_scope},
+    cargo_workspace_scope::{
+        CargoWorkspaceScope,
+        resolve_cargo_workspace_scope,
+    },
     selectors::CargoUpdateSelector,
 };
 use crate::{
     cargo_deps::{
-        self, CargoLockfilePolicy, cargo_auth_headers, checkout, fetch_crate_index_file,
-        metadata_paths, provision_toolchain, resolve_target_version,
+        self,
+        CargoLockfilePolicy,
+        cargo_auth_headers,
+        checkout,
+        fetch_crate_index_file,
+        metadata_paths,
+        provision_toolchain,
+        resolve_target_version,
     },
     cli_args::outdated::{
-        OutdatedPackage, OutdatedQuery, TargetVersion,
-        query::{OutdatedDisplayVersions, OutdatedMetadata},
+        OutdatedPackage,
+        OutdatedQuery,
+        TargetVersion,
+        query::{
+            OutdatedDisplayVersions,
+            OutdatedMetadata,
+        },
     },
     ecosystem_install::InstallContext,
 };
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use pnpm_config::Config;
-use pnpm_install_coordinator::{InstallPlan, InstallTask};
+use pnpm_install_coordinator::{
+    InstallPlan,
+    InstallTask,
+};
 use pnpm_matcher::Matcher;
 use pnpm_network::ThrottledClient;
 use pnpm_reporter::Reporter;
 use semver::Version;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 pub(crate) struct CargoUpdateOptions<'a> {
@@ -73,9 +113,7 @@ pub(crate) async fn collect_cargo_outdated(
     let auth_headers = cargo_auth_headers(config)?;
     let mut outdated = Vec::new();
     for dep in declared {
-        if !query.include_direct.contains(&dep.group)
-            || !(query.matches_name(&dep.alias) || query.matches_name(&dep.package_name))
-        {
+        if !query.include_direct.contains(&dep.group) || !dep.matches_query(query) {
             continue;
         }
         if let Some(pkg) = resolve_outdated_cargo_dep(
@@ -118,6 +156,7 @@ async fn resolve_outdated_cargo_dep(
     .unwrap_or_else(|| current.clone());
     let target = match query.target_version {
         TargetVersion::WithinRange => wanted.clone(),
+        TargetVersion::Tag(_) => return Ok(None),
         TargetVersion::Latest => {
             let Some(latest) =
                 resolve_target_version(config, auth_headers, &dep.package_name, None, http_client)
@@ -148,7 +187,7 @@ fn build_cargo_outdated_package(
     let homepage = pnpm_cargo_resolver::is_crates_io(index_url)
         .then(|| format!("https://crates.io/crates/{}", dep.package_name));
     OutdatedPackage {
-        alias: dep.alias.clone(),
+        alias: dep.primary_alias().to_string(),
         package_name: dep.package_name.clone(),
         belongs_to: dep.group,
         current: semver_to_node_version(current),
@@ -156,7 +195,9 @@ fn build_cargo_outdated_package(
         wanted: semver_to_node_version(wanted),
         github_action: false,
         metadata: OutdatedMetadata {
+            update_prefix: "crate:",
             deprecated: None,
+            repository: None,
             homepage,
             workspace: workspace_name.map(str::to_string),
             display_versions: Some(Box::new(OutdatedDisplayVersions {
@@ -164,6 +205,7 @@ fn build_cargo_outdated_package(
                 target: target.to_string(),
                 wanted: wanted.to_string(),
             })),
+            trust: None,
         },
     }
 }
@@ -202,7 +244,7 @@ pub(crate) fn validate_explicit_cargo_requests(
     for req in explicit {
         if !all_declared
             .iter()
-            .any(|dep| dep.alias == req.name || dep.package_name == req.name)
+            .any(|dep| dep.matches_name(&req.name))
         {
             bail!("crate {} is not a declared dependency in Cargo.toml", req.name);
         }
@@ -244,7 +286,7 @@ async fn execute_cargo_update<Reporter: self::Reporter + 'static>(
             context,
             vec![cargo_root.clone()],
             checkout_dir,
-            CargoLockfilePolicy::Resolve,
+            update_lockfile_policy(options),
         ),
     );
     let run_res = InstallPlan::new(cargo_root).with_task(task).run().await;
@@ -256,7 +298,16 @@ async fn execute_cargo_update<Reporter: self::Reporter + 'static>(
     Ok(())
 }
 
-type ManifestEdit = (PathBuf, &'static str, String, String);
+/// A targeted update moves only what the selected crates require, as
+/// `cargo update -p` does. An untargeted one re-resolves every crate, as
+/// `cargo update` does.
+fn update_lockfile_policy(options: &CargoUpdateOptions<'_>) -> CargoLockfilePolicy {
+    if options.restrict_to_selectors && !options.update_all_except_exclusions {
+        CargoLockfilePolicy::KeepLocked
+    } else {
+        CargoLockfilePolicy::Resolve
+    }
+}
 
 /// The manifest edits that stage the update for Cargo and the ones saved
 /// after it.
@@ -292,14 +343,23 @@ async fn build_cargo_update_edits<Reporter: self::Reporter>(
 }
 
 /// The edits that pin each dependency the update leaves alone to its
-/// locked version while Cargo resolves. A crate `[patch.crates-io]`
-/// replaces is left as declared: that requirement is what selects the
-/// replacement, and its `Cargo.lock` entry is not a registry version.
+/// locked version while Cargo resolves. Left as declared are:
+///
+/// - a crate `[patch.crates-io]` replaces: that requirement is what selects
+///   the replacement, and its `Cargo.lock` entry is not a registry version.
+/// - a declaration locked to the same crate version as an updated one, such
+///   as a crate in both `[dependencies]` and `[dev-dependencies]` when only
+///   one group is updated. Cargo unifies both on one version, so pinning one
+///   to the old version would conflict with the other's new one.
 fn pin_unchanged_deps(
     scope: &CargoWorkspaceScope,
     locked: &HashMap<String, Vec<Version>>,
     updated: &[&DeclaredCargoDep],
 ) -> Vec<ManifestEdit> {
+    let updated_crates = updated
+        .iter()
+        .filter_map(|dep| Some((dep.package_name.as_str(), select_locked_version(locked, dep)?)))
+        .collect::<Vec<_>>();
     scope.declared
         .iter()
         .filter(|dep| {
@@ -308,10 +368,13 @@ fn pin_unchanged_deps(
         })
         .filter_map(|dep| {
             let locked_ver = select_locked_version(locked, dep)?;
+            if updated_crates.contains(&(dep.package_name.as_str(), locked_ver)) {
+                return None;
+            }
             Some((
                 dep.manifest_path.clone(),
-                dep.table,
-                dep.alias.clone(),
+                dep.table.clone(),
+                dep.manifest_key.clone(),
                 format!("={}", without_build_metadata(locked_ver)),
             ))
         })
@@ -355,11 +418,12 @@ async fn resolve_selected_cargo_edit<Reporter: self::Reporter>(
     let saved_spec = format_cargo_saved_spec(&dep.raw_spec, &resolved, explicit_spec);
     let staged = (
         dep.manifest_path.clone(),
-        dep.table,
-        dep.alias.clone(),
+        dep.table.clone(),
+        dep.manifest_key.clone(),
         format!("={}", without_build_metadata(&resolved)),
     );
-    let finalized = (dep.manifest_path.clone(), dep.table, dep.alias.clone(), saved_spec);
+    let finalized =
+        (dep.manifest_path.clone(), dep.table.clone(), dep.manifest_key.clone(), saved_spec);
     Ok(Some((staged, finalized)))
 }
 

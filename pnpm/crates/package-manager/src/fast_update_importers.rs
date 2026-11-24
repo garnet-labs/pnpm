@@ -2,25 +2,42 @@ pub(crate) use locked_versions::locked_version_resolution_would_pick;
 
 mod importer_update;
 use importer_update::{
-    ImporterUpdate, LockedInputs, apply_one_importer_update, drop_stale_importers,
+    ImporterUpdate,
+    LockedInputs,
+    apply_one_importer_update,
+    drop_stale_importers,
 };
 
 mod locked_versions;
 
 use crate::{
-    fast_update_compose::Drift, fast_update_lockfile::GraphEdits,
-    fast_update_overrides::get_peer_names, fast_update_settings::workspace_package_names,
+    fast_update_compose::Drift,
+    fast_update_lockfile::GraphEdits,
+    fast_update_overrides::get_peer_names,
+    fast_update_settings::workspace_package_names,
 };
-use node_semver::Range;
+use node_semver::Version;
 use pnpm_lockfile::{
-    Lockfile, PkgName, ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec,
+    Lockfile,
+    PkgName,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
 };
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_semver_include_prerelease::parse_strict_semver_range;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::PathBuf,
+    sync::OnceLock,
 };
 
 /// Each manifest alias with its specifier and the group it is
@@ -41,19 +58,38 @@ pub(crate) struct ImportersPlan<'a, 'manifest> {
     /// under one of them changes what the peer binds to, which only the
     /// resolver can redo.
     peer_names: HashSet<PkgName>,
+    lockfile: &'a Lockfile,
+    peer_dependents: OnceLock<HashSet<(PkgName, Version)>>,
     /// Whether `resolutionMode` resolves a direct dependency to its
     /// lowest satisfying version rather than its highest.
     resolution_picks_lowest: bool,
 }
 
+impl ImportersPlan<'_, '_> {
+    fn has_peer_dependent_subtree(&self, alias: &PkgName, version: &Version) -> bool {
+        self.peer_dependents
+            .get_or_init(|| {
+                crate::fast_update_lockfile::peer_sensitive_packages(self.lockfile)
+                    .into_iter()
+                    .filter_map(|key| {
+                        key.suffix
+                            .version_semver()
+                            .map(|version| (key.name.clone(), version.clone()))
+                    })
+                    .collect()
+            })
+            .contains(&(alias.clone(), version.clone()))
+    }
+}
+
 /// Whether the importers' records diverge from the manifests, without
 /// cloning anything. [`Drift::Resolve`] when an alias cannot be parsed
 /// (which the resolver reports) or when a changed specifier is one
-/// [`apply_importers_update`] is certain to refuse — bailing here keeps
+/// [`apply_importers_update`] is certain to refuse, bailing here keeps
 /// the compose from cloning a workspace-scale lockfile it would then
 /// throw away.
 pub(crate) fn detect_importers_drift<'a, 'manifest>(
-    lockfile: &Lockfile,
+    lockfile: &'a Lockfile,
     manifests: &'a [(String, &'manifest PackageManifest)],
     project_manifests: &[(PathBuf, &PackageManifest)],
     prune_stale_importers: bool,
@@ -82,6 +118,8 @@ pub(crate) fn detect_importers_drift<'a, 'manifest>(
             stale,
             workspace_package_names: workspace_package_names(project_manifests),
             peer_names: get_peer_names(lockfile),
+            lockfile,
+            peer_dependents: OnceLock::new(),
             resolution_picks_lowest,
         })
     } else {
@@ -126,7 +164,7 @@ fn stale_importer_ids(
 }
 
 /// Whether any importer's record drifted from its manifest. `None` when one
-/// of them can only be reconciled by resolving — bailing before the compose
+/// of them can only be reconciled by resolving, bailing before the compose
 /// clones the whole lockfile, since the apply would fail on it regardless.
 fn any_importer_diverged(
     lockfile: &Lockfile,
@@ -154,8 +192,8 @@ fn any_importer_diverged(
 /// Replay the manifests' drift onto `candidate`: compatible specifier
 /// changes, group moves, and removals, with the dropped aliases and
 /// optionality moves recorded in `edits` for the shared epilogue.
-/// `false` — an incompatible or non-semver change, or an alias the
-/// lockfile does not record — leaves the caller on the full-resolution
+/// `false` (an incompatible or non-semver change, or an alias the
+/// lockfile does not record) leaves the caller on the full-resolution
 /// path.
 pub(crate) fn apply_importers_update(
     candidate: &mut Lockfile,
@@ -195,11 +233,7 @@ fn importer_divergence(
     manifest_dependencies: &ManifestDependencies<'_>,
 ) -> ImporterDivergence {
     let Some(importer) = lockfile.importers.get(importer_id) else {
-        return if manifest_dependencies.is_empty() {
-            ImporterDivergence::Clean
-        } else {
-            ImporterDivergence::Absorbable
-        };
+        return ImporterDivergence::Absorbable;
     };
     let recorded_but_undeclared = [
         importer.dependencies.as_ref(),
@@ -242,7 +276,7 @@ fn alias_divergence(
         // changed specifier to before it consults the locked
         // versions; a specifier they reject (a `workspace:` range
         // above all) can only resolve.
-        if Range::parse(specifier).is_err()
+        if parse_strict_semver_range(specifier).is_none()
             || dependency.version
                 .ver_peer()
                 .and_then(|ver_peer| ver_peer.version_semver())

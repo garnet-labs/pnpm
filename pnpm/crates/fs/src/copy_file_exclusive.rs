@@ -1,4 +1,12 @@
-use std::{fs, io, path::Path};
+use crate::{
+    FsCopyContents,
+    Host,
+};
+use std::{
+    fs,
+    io,
+    path::Path,
+};
 
 /// The permission state a copy carries from one file to another.
 ///
@@ -84,7 +92,7 @@ impl CopyPermissions {
         }
         #[cfg(target_os = "wasi")]
         {
-            crate::file_mode::set_path_permissions(path, self.0)
+            crate::file_mode::set_path_permissions(path, crate::FileMode::from_mode(self.0))
         }
     }
 }
@@ -98,7 +106,9 @@ pub fn copy_permissions(source: &Path) -> io::Result<CopyPermissions> {
 pub fn read_file_permissions(file: &fs::File) -> io::Result<CopyPermissions> {
     #[cfg(not(target_os = "wasi"))]
     {
-        file.metadata().map(|metadata| CopyPermissions(metadata.permissions()))
+        file.metadata()
+            .map(|metadata| metadata.permissions())
+            .map(CopyPermissions)
     }
     #[cfg(target_os = "wasi")]
     {
@@ -122,7 +132,7 @@ pub fn read_file_permissions(file: &fs::File) -> io::Result<CopyPermissions> {
 /// does not bring it into being.
 ///
 /// Everything after the creation goes through that one handle rather
-/// than the path — the bytes, the mode, and whatever `finish` does
+/// than the path, the bytes, the mode, and whatever `finish` does
 /// with it. A writer that swaps the dirent mid-copy therefore cannot
 /// redirect any of it onto a file elsewhere, the way re-opening
 /// `target_path` by name could. The mode is also supplied at creation,
@@ -139,9 +149,19 @@ pub fn copy_file_exclusive(
     permissions: &CopyPermissions,
     finish: impl FnOnce(&fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
+    copy_file_exclusive_with::<Host>(source_path, target_path, permissions, finish)
+}
+
+/// [`copy_file_exclusive`] with the bytes moved by `Sys`.
+pub fn copy_file_exclusive_with<Sys: FsCopyContents>(
+    source_path: &Path,
+    target_path: &Path,
+    permissions: &CopyPermissions,
+    finish: impl FnOnce(&fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     let mut source = fs::File::open(source_path)?;
     let mut target = create_new_with_permissions(target_path, permissions)?;
-    io::copy(&mut source, &mut target)
+    Sys::copy_contents(&mut source, &mut target)
         .and_then(|_| permissions.apply_to_file(&target))
         .and_then(|()| finish(&target))
         .inspect_err(|_| {

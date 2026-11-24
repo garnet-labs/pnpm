@@ -1,6 +1,9 @@
 //! The `--workspace` flag shared by `pnpm add` and `pnpm update`.
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use std::path::Path;
 
@@ -8,7 +11,11 @@ use std::path::Path;
 pub(crate) enum WorkspaceOptionError {
     #[display("Cannot use --latest with --workspace simultaneously")]
     #[diagnostic(code(ERR_PNPM_BAD_OPTIONS))]
-    LatestWithWorkspace,
+    WithLatest,
+
+    #[display("Cannot use --tag with --workspace simultaneously")]
+    #[diagnostic(code(ERR_PNPM_BAD_OPTIONS))]
+    WithTag,
 
     #[display("--workspace can only be used inside a workspace")]
     #[diagnostic(code(ERR_PNPM_WORKSPACE_OPTION_OUTSIDE_WORKSPACE))]

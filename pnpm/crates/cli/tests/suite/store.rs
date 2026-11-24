@@ -5,12 +5,21 @@ use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pipe_trait::Pipe;
 use pnpm_store_dir::STORE_VERSION;
-use pnpm_testing_utils::{bin::CommandTempCwd, command_env::CommandTestExt};
+use pnpm_testing_utils::{
+    bin::CommandTempCwd,
+    command_env::CommandTestExt,
+};
 use pretty_assertions::assert_eq;
 use std::{
     fs,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::{
+        Command,
+        Stdio,
+    },
 };
 
 fn pacquet_at(workspace: &Path) -> Command {
@@ -64,7 +73,7 @@ fn store_path_accepts_the_silent_shorthand() {
 
 #[test]
 fn store_path_should_return_store_dir_from_pnpm_workspace_yaml() {
-    // `storeDir` is a project-structural setting — in pnpm 11 (and
+    // `storeDir` is a project-structural setting, in pnpm 11 (and
     // pacquet) it's only honoured from `pnpm-workspace.yaml`, not `.npmrc`.
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
 
@@ -107,14 +116,15 @@ fn store_path_resolves_global_and_dotted_overrides_from_workspace_root() {
     for (store_arg, expected_name) in [
         ("--store-dir=global-store", "global-store"),
         ("--config.store-dir=dotted-store", "dotted-store"),
+        ("--config.storeDir=camel-dotted-store", "camel-dotted-store"),
     ] {
         let output = Command::cargo_bin("pnpm")
             .expect("find the pnpm binary")
             .with_current_dir(root.path())
-            .arg("--dir")
-            .arg(&package_dir)
-            .arg(store_arg)
-            .args(["store", "path"])
+            .with_arg("--dir")
+            .with_arg(&package_dir)
+            .with_arg(store_arg)
+            .with_args(["store", "path"])
             .output()
             .expect("run pacquet store path with override");
         eprintln!("stderr={}", String::from_utf8_lossy(&output.stderr));
@@ -138,8 +148,8 @@ fn store_path_expands_a_quoted_home_override() {
     fs::create_dir_all(&home_dir).expect("create home directory");
     let output = pacquet
         .with_args(["store", "path", "--store-dir=~/pacquet-quoted-store"])
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
+        .with_env("HOME", &home_dir)
+        .with_env("USERPROFILE", &home_dir)
         .output()
         .expect("run pacquet store path with home-relative override");
     if !output.status.success() {
@@ -164,7 +174,7 @@ fn empty_store_dir_override_restores_the_platform_default() {
     let default_output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .args(["store", "path"])
+        .with_args(["store", "path"])
         .output()
         .expect("read the default store path");
     eprintln!("default status={}", default_output.status);
@@ -175,11 +185,11 @@ fn empty_store_dir_override_restores_the_platform_default() {
 
     fs::write(workspace.join("pnpm-workspace.yaml"), "storeDir: yaml-store\n")
         .expect("write configured store directory");
-    for store_arg in ["--store-dir=", "--config.store-dir="] {
+    for store_arg in ["--store-dir=", "--config.store-dir=", "--config.storeDir="] {
         let output = Command::cargo_bin("pnpm")
             .expect("find the pnpm binary")
             .with_current_dir(&workspace)
-            .args(["store", "path", store_arg])
+            .with_args(["store", "path", store_arg])
             .output()
             .expect("run store path with an empty override");
         eprintln!("stderr={}", String::from_utf8_lossy(&output.stderr));
@@ -192,19 +202,18 @@ fn empty_store_dir_override_restores_the_platform_default() {
 
 #[test]
 fn store_status_reports_an_untouched_store() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     pacquet
-        .arg("add")
-        .arg("is-odd@3.0.1")
+        .with_arg("add")
+        .with_arg("is-odd@3.0.1")
         .assert()
         .success();
 
     let output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .expect("run pacquet store status");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -215,12 +224,11 @@ fn store_status_reports_an_untouched_store() {
 
 #[test]
 fn store_status_reports_a_package_edited_after_it_was_linked_out() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     pacquet
-        .arg("add")
-        .arg("is-odd@3.0.1")
+        .with_arg("add")
+        .with_arg("is-odd@3.0.1")
         .assert()
         .success();
 
@@ -231,7 +239,7 @@ fn store_status_reports_a_package_edited_after_it_was_linked_out() {
     let output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .expect("run pacquet store status");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -250,15 +258,14 @@ fn store_status_reports_a_package_edited_after_it_was_linked_out() {
 /// disk and reports every peer-resolved package as modified.
 #[test]
 fn store_status_checks_packages_in_peer_suffixed_slots() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     // `@pnpm.e2e/abc` peer-depends on peer-a, peer-b, and peer-c. With
     // auto-install-peers (the default) all three resolve, suffixing
     // abc's snapshot key.
     pacquet
-        .arg("add")
-        .arg("@pnpm.e2e/abc@1.0.0")
+        .with_arg("add")
+        .with_arg("@pnpm.e2e/abc@1.0.0")
         .assert()
         .success();
 
@@ -278,7 +285,7 @@ fn store_status_checks_packages_in_peer_suffixed_slots() {
     let output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .expect("run pacquet store status");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -299,7 +306,7 @@ fn store_status_checks_packages_in_peer_suffixed_slots() {
     let output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .expect("run pacquet store status");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -321,7 +328,7 @@ fn store_status_checks_packages_in_peer_suffixed_slots() {
 #[test]
 fn store_status_ignores_skipped_optional_packages() {
     let CommandTempCwd {
-        mut pacquet,
+        pacquet,
         workspace,
         root: _root,
         npmrc_info,
@@ -342,7 +349,7 @@ fn store_status_ignores_skipped_optional_packages() {
     );
 
     pacquet
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
 
@@ -397,7 +404,7 @@ fn store_status_ignores_skipped_optional_packages() {
     let output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .expect("run pacquet store status");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -411,20 +418,19 @@ fn store_status_ignores_skipped_optional_packages() {
 
 #[test]
 fn store_status_does_not_falsely_report_package_with_postinstall_script_as_modified() {
-    let CommandTempCwd {
-        mut pacquet, workspace, root: _root, ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    let CommandTempCwd { pacquet, workspace, root: _root, .. } =
+        CommandTempCwd::init().add_mocked_registry();
     pacquet
-        .arg("add")
-        .arg("@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0")
-        .arg("--allow-build=@pnpm.e2e/pre-and-postinstall-scripts-example")
+        .with_arg("add")
+        .with_arg("@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0")
+        .with_arg("--allow-build=@pnpm.e2e/pre-and-postinstall-scripts-example")
         .assert()
         .success();
 
     let output = Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .args(["store", "status"])
+        .with_args(["store", "status"])
         .output()
         .expect("run pacquet store status");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -466,6 +472,77 @@ fn store_add_fetches_a_package_without_touching_the_project() {
 }
 
 #[test]
+fn store_add_indexes_a_direct_tarball_url_without_integrity() {
+    let CommandTempCwd {
+        pacquet, root: _root, npmrc_info, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    // `localhost` keeps the URL outside the registry prefix, so it resolves
+    // as a direct tarball without an integrity value.
+    let tarball_url = format!("{}@pnpm.e2e/foo/-/foo-100.0.0.tgz", npmrc_info.mock_instance.url())
+        .replace("127.0.0.1", "localhost");
+
+    pacquet
+        .with_args(["store", "add", &tarball_url])
+        .assert()
+        .success();
+
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir);
+    let store_index = pnpm_store_dir::StoreIndex::open_readonly_in(&store_dir)
+        .expect("open the store index store add just wrote");
+    let keys = store_index.keys().expect("read the store index keys");
+    assert_eq!(keys.len(), 1, "store add must index the downloaded tarball: {keys:?}");
+    let row = store_index
+        .get(&keys[0])
+        .expect("read the downloaded tarball's index row")
+        .expect("store add must write the downloaded tarball's index row");
+    assert_eq!(
+        row.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.get("name"))
+            .and_then(serde_json::Value::as_str),
+        Some("@pnpm.e2e/foo"),
+    );
+}
+
+#[test]
+fn store_add_reports_no_added_package_when_the_index_write_fails() {
+    let CommandTempCwd {
+        pacquet,
+        root: _root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    pacquet_at(&workspace)
+        .with_args(["store", "add", "is-odd@3.0.1"])
+        .assert()
+        .success();
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir.clone());
+    rusqlite::Connection::open(store_dir.root().join("index.db"))
+        .expect("open the seeded store index")
+        .execute_batch(
+            "CREATE TRIGGER fail_write BEFORE INSERT ON package_index
+             BEGIN SELECT RAISE(FAIL, 'injected write failure'); END",
+        )
+        .expect("install the failing trigger");
+    let tarball_url = format!("{}@pnpm.e2e/foo/-/foo-100.0.0.tgz", npmrc_info.mock_instance.url());
+
+    let output = pacquet
+        .with_args(["store", "add", &tarball_url])
+        .output()
+        .expect("run store add");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+    assert!(!output.status.success());
+    assert!(stderr.contains("ERR_PNPM_STORE_DIR_STORE_INDEX_WRITE"));
+    assert!(
+        !stdout.contains("+ ") && !stderr.contains("+ "),
+        "no package may be reported as added",
+    );
+}
+
+#[test]
 fn store_add_fails_without_touching_a_frozen_store() {
     let CommandTempCwd {
         pacquet, root: _root, npmrc_info, ..
@@ -480,6 +557,26 @@ fn store_add_fails_without_touching_a_frozen_store() {
     assert!(!output.status.success());
     assert!(stderr.contains("ERR_PNPM_FROZEN_STORE_WRITE"));
     assert!(!npmrc_info.store_dir.exists(), "a frozen store must stay untouched");
+}
+
+#[test]
+fn store_prune_fails_without_touching_a_frozen_store() {
+    let CommandTempCwd {
+        pacquet, root: _root, npmrc_info, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let unreferenced = npmrc_info.store_dir.join(STORE_VERSION).join("files/00/unreferenced");
+    fs::create_dir_all(unreferenced.parent().unwrap()).unwrap();
+    fs::write(&unreferenced, "").unwrap();
+
+    let output = pacquet
+        .with_args(["store", "prune", "--frozen-store"])
+        .output()
+        .expect("run store prune");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("STDERR:\n{stderr}");
+    assert!(!output.status.success());
+    assert!(stderr.contains("ERR_PNPM_FROZEN_STORE_WRITE"));
+    assert!(unreferenced.exists(), "a frozen store must stay untouched");
 }
 
 /// The hash a lockfile entry pins a registry package's tarball by.
@@ -541,8 +638,15 @@ fn assert_downloaded_tarballs_warm_the_store_for_an_offline_install(
     }
 
     let storage = root.path().join("registry-storage");
+    // The registry stores archives by their bytes' identity; `store add`
+    // takes a downloaded `.tgz`, so each is copied out under its name.
     let tarballs = ["@pnpm.e2e/foo", "@pnpm.e2e/bar"].map(|package| {
-        pnpr_fixtures::tarball_path(&storage, package, "100.0.0")
+        let downloaded = root
+            .path()
+            .join(format!("{}.tgz", package.replace('/', "-")));
+        fs::copy(pnpr_fixtures::tarball_path(&storage, package, "100.0.0"), &downloaded)
+            .expect("copy the tarball");
+        downloaded
     });
     if pinned == PinnedHash::Sha1 {
         pin_lockfile_to_sha1(&workspace.join("pnpm-lock.yaml"), &tarballs);
@@ -706,6 +810,223 @@ fn store_add_of_downloaded_tarballs_serves_named_registry_lockfile_keys() {
     assert_downloaded_tarballs_warm_the_store_for_an_offline_install(PinnedHash::Sha512, "work:");
 }
 
+/// The tarball `store add` takes in place of the registry's
+/// `@pnpm.e2e/foo@100.0.0`, and the project's build policy for it.
+#[derive(Default)]
+struct DownloadedFoo<'a> {
+    /// Replaces the registry's tarball. The lockfile entry is pinned to it.
+    tarball: Option<Vec<u8>>,
+    allow_build: Option<AllowBuild<'a>>,
+}
+
+/// An `allowBuilds` entry of the project.
+#[derive(Clone, Copy)]
+struct AllowBuild<'a> {
+    key: &'a str,
+    allowed: bool,
+}
+
+/// A lockfile entry whose id is the tarball's URL, which the tarball itself
+/// does not reveal, so only the lockfile can tell `store add` to key it so.
+/// Returns the project after its offline install succeeded.
+fn install_offline_from_a_downloaded_tarball_url_entry(
+    url: &str,
+    downloaded_foo: DownloadedFoo<'_>,
+) -> (tempfile::TempDir, PathBuf) {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    // Spelled with a host other than the configured registry's, the URL
+    // resolves to a tarball entry rather than a registry one.
+    let registry = npmrc_info.mock_instance.url();
+    let served =
+        format!("{registry}@pnpm.e2e/foo/-/foo-100.0.0.tgz").replace("127.0.0.1", "localhost");
+    assert!(!served.starts_with(registry), "{served}");
+    let manifest = workspace.join("package.json");
+    fs::write(
+        &manifest,
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/foo": served } }).to_string(),
+    )
+    .expect("write package.json");
+    if let Some(AllowBuild { key, allowed }) = downloaded_foo.allow_build {
+        _utils::append_workspace_yaml_key(
+            &workspace,
+            "allowBuilds",
+            format!("{{ '{key}': {allowed} }}"),
+        );
+    }
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    let published = fs::read(pnpr_fixtures::tarball_path(
+        &root.path().join("registry-storage"),
+        "@pnpm.e2e/foo",
+        "100.0.0",
+    ))
+    .expect("read the published tarball");
+    let downloaded = downloaded_foo.tarball.unwrap_or_else(|| published.clone());
+    let sha512 = |bytes: &[u8]| {
+        ssri::IntegrityOpts::new()
+            .algorithm(ssri::Algorithm::Sha512)
+            .chain(bytes)
+            .result()
+            .to_string()
+    };
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    for path in [&manifest, &lockfile_path] {
+        let text = fs::read_to_string(path).expect("read the project file");
+        assert!(text.contains(&served), "{text}");
+        let text = text
+            .replace(&served, url)
+            .replace(&sha512(&published), &sha512(&downloaded));
+        fs::write(path, text).expect("point the project at the URL");
+    }
+    if npmrc_info.store_dir.exists() {
+        fs::remove_dir_all(&npmrc_info.store_dir).expect("empty the store");
+    }
+
+    let downloaded_path = root.path().join("foo.tgz");
+    fs::write(&downloaded_path, downloaded).expect("write the downloaded tarball");
+    pacquet_at(&workspace)
+        .with_args(["store", "add"])
+        .with_arg(&downloaded_path)
+        .assert()
+        .success();
+
+    let output = pacquet_at(&workspace)
+        .with_args(["install", "--offline", "--frozen-lockfile"])
+        .output()
+        .expect("run the offline install");
+    assert!(output.status.success(), "{output:?}");
+    assert!(workspace.join("node_modules/@pnpm.e2e/foo/package.json").exists());
+    (root, workspace)
+}
+
+#[test]
+fn store_add_of_a_downloaded_tarball_serves_a_tarball_url_lockfile_entry() {
+    install_offline_from_a_downloaded_tarball_url_entry(
+        "https://tarballs.example.invalid/foo-100.0.0.tgz",
+        DownloadedFoo::default(),
+    );
+}
+
+const GIT_HOSTED_FOO: &str =
+    "https://codeload.github.com/pnpm-e2e/foo/tar.gz/98e8ff1da1a89f93d1397a24d7413ed15421c139";
+
+#[test]
+fn store_add_of_a_downloaded_tarball_serves_a_git_hosted_lockfile_entry() {
+    install_offline_from_a_downloaded_tarball_url_entry(GIT_HOSTED_FOO, DownloadedFoo::default());
+}
+
+/// `store add` leaves a git-hosted package as its source, and the install
+/// prepares it under the project's build policy.
+fn assert_offline_install_prepares_a_downloaded_git_hosted_package(allow_build: AllowBuild<'_>) {
+    let manifest = serde_json::json!({
+        "name": "@pnpm.e2e/foo",
+        "version": "100.0.0",
+        "scripts": {
+            "prepare": r#"node -e "require('fs').writeFileSync('prepare.txt', 'prepared')""#,
+        },
+    })
+    .to_string();
+    let tarball = _utils::gzipped_tarball(&[
+        ("package/package.json", &manifest),
+        ("package/index.js", "module.exports = 42"),
+    ]);
+    let (_root, workspace) = install_offline_from_a_downloaded_tarball_url_entry(
+        GIT_HOSTED_FOO,
+        DownloadedFoo { tarball: Some(tarball), allow_build: Some(allow_build) },
+    );
+    let package = workspace.join("node_modules/@pnpm.e2e/foo");
+    assert_eq!(fs::read_to_string(package.join("index.js")).unwrap(), "module.exports = 42");
+    assert_eq!(package.join("prepare.txt").exists(), allow_build.allowed);
+}
+
+#[test]
+fn store_add_of_a_downloaded_git_hosted_package_is_prepared_when_its_build_is_allowed() {
+    assert_offline_install_prepares_a_downloaded_git_hosted_package(AllowBuild {
+        key: &format!("@pnpm.e2e/foo@{GIT_HOSTED_FOO}"),
+        allowed: true,
+    });
+}
+
+#[test]
+fn store_add_of_a_downloaded_git_hosted_package_stays_unprepared_when_its_build_is_denied() {
+    assert_offline_install_prepares_a_downloaded_git_hosted_package(AllowBuild {
+        key: "@pnpm.e2e/foo",
+        allowed: false,
+    });
+}
+
+/// <https://github.com/pnpm/pnpm/issues/17875>
+#[test]
+fn store_add_of_a_tarball_directory_warms_the_store_recursively() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": {
+                "@pnpm.e2e/foo": "100.0.0",
+                "@pnpm.e2e/bar": "100.0.0",
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    if npmrc_info.store_dir.exists() {
+        fs::remove_dir_all(&npmrc_info.store_dir).expect("empty the store");
+    }
+
+    let storage = root.path().join("registry-storage");
+    let tarballs_dir = workspace.join(".pnpm-tarballs");
+    fs::create_dir_all(tarballs_dir.join("@pnpm.e2e")).expect("create nested tarball dir");
+    fs::copy(
+        pnpr_fixtures::tarball_path(&storage, "@pnpm.e2e/foo", "100.0.0"),
+        tarballs_dir.join("@pnpm.e2e/foo-100.0.0.tgz"),
+    )
+    .expect("copy foo tarball");
+    fs::copy(
+        pnpr_fixtures::tarball_path(&storage, "@pnpm.e2e/bar", "100.0.0"),
+        tarballs_dir.join("bar-100.0.0.tgz"),
+    )
+    .expect("copy bar tarball");
+
+    pacquet_at(&workspace)
+        .with_args(["store", "add", ".pnpm-tarballs"])
+        .assert()
+        .success();
+
+    let output = pacquet_at(&workspace)
+        .with_args(["install", "--offline", "--frozen-lockfile"])
+        .output()
+        .expect("run the offline install");
+    assert!(output.status.success(), "{output:?}");
+    for name in ["foo", "bar"] {
+        assert!(
+            workspace
+                .join("node_modules/@pnpm.e2e")
+                .join(name)
+                .join("package.json")
+                .exists(),
+        );
+    }
+}
+
 #[test]
 fn store_add_waits_for_the_store_operation_lock() {
     let CommandTempCwd {
@@ -733,11 +1054,11 @@ fn store_add_waits_for_the_store_operation_lock() {
             "add",
             "@pnpm.e2e/foo@100.0.0",
         ])
-        .env("TMPDIR", &alternate_temp)
-        .env("TEMP", &alternate_temp)
-        .env("TMP", &alternate_temp)
-        .stdout(Stdio::null())
-        .stderr(fs::File::create(&output_path).expect("create store add output"))
+        .with_env("TMPDIR", &alternate_temp)
+        .with_env("TEMP", &alternate_temp)
+        .with_env("TMP", &alternate_temp)
+        .with_stdout(Stdio::null())
+        .with_stderr(fs::File::create(&output_path).expect("create store add output").into())
         .spawn()
         .expect("spawn store add");
     _utils::wait_for_child_output(
@@ -766,13 +1087,14 @@ fn store_operation_lock_lives_in_the_xdg_runtime_dir() {
 
     pacquet
         .with_args(["store", "add", "@pnpm.e2e/foo@100.0.0"])
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .with_env("XDG_RUNTIME_DIR", &runtime_dir)
         .assert()
         .success();
 
     let lock_dirs: Vec<_> = fs::read_dir(&runtime_dir)
         .expect("read XDG_RUNTIME_DIR")
-        .map(|entry| entry.expect("read XDG_RUNTIME_DIR entry").path())
+        .map(|entry| entry.expect("read XDG_RUNTIME_DIR entry"))
+        .map(|value| value.path())
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -1028,6 +1350,9 @@ fn store_prune_reclaims_packages_of_an_expired_dlx_cache_entry() {
     } = CommandTempCwd::init().add_mocked_registry();
     _utils::append_workspace_yaml_key(&workspace, "packageImportMethod", "hardlink");
     pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_STORE_DIR", &npmrc_info.store_dir)
+        .with_env("PNPM_CONFIG_CACHE_DIR", &npmrc_info.cache_dir)
+        .with_env("PNPM_CONFIG_PACKAGE_IMPORT_METHOD", "hardlink")
         .with_args(["dlx", "--package=is-positive@1.0.0", "node", "-e", "0"])
         .assert()
         .success();
@@ -1067,7 +1392,10 @@ fn store_prune_reclaims_packages_of_an_expired_dlx_cache_entry() {
 #[test]
 fn install_keeps_a_group_writable_store() {
     use pnpm_testing_utils::bin::AddMockedRegistry;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{
+        MetadataExt,
+        PermissionsExt,
+    };
 
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
@@ -1103,7 +1431,7 @@ fn install_keeps_a_group_writable_store() {
     };
 
     pacquet_at(&workspace)
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     assert_index("first install");
@@ -1127,7 +1455,7 @@ fn install_keeps_a_group_writable_store() {
     }
 
     pacquet_at(&workspace)
-        .arg("install")
+        .with_arg("install")
         .assert()
         .success();
     assert_index("second install");

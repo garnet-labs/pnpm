@@ -34,7 +34,7 @@ export interface NodeApiProject {
    * Manifest used when this project is resolved as a *dependency* of another
    * importer (an injected workspace instance) instead of `manifest`. Lets a
    * host pre-transform its importer manifests (e.g. strip workspace-sibling
-   * deps it links itself) while dependency instances keep the raw graph —
+   * deps it links itself) while dependency instances keep the raw graph,
    * without a `readPackage` hook round trip. Omit when both views are the
    * same.
    */
@@ -55,7 +55,7 @@ export interface NetworkConfig {
   strictSsl?: boolean
   /**
    * Maximum number of concurrent connections (sockets) to a single registry
-   * origin — pnpm's `maxSockets`. Bounds each `scheme://host[:port]` origin
+   * origin (pnpm's `maxSockets`). Bounds each `scheme://host[:port]` origin
    * independently; the global `networkConcurrency` remains the outer cap.
    */
   maxSockets?: number
@@ -93,7 +93,7 @@ export interface SharedEngineOptions {
   registries?: Record<string, string>
   /**
    * Pre-computed `Authorization` header values keyed by nerf-darted registry
-   * URI (`//host/path/`), plus `''` for the default registry — e.g.
+   * URI (`//host/path/`), plus `''` for the default registry. For example:
    * `{ '': 'Bearer abc', '//npm.example.com/': 'Basic <base64(user:pass)>' }`. The
    * host resolves these from its `authConfig`; the engine applies them as-is.
    * The `''` entry is pinned to the `registry` / `registries.default` passed
@@ -117,13 +117,18 @@ export interface PackageExtension {
 export interface InstallOptions extends SharedEngineOptions {
   /** Lockfile / workspace root directory. */
   dir: string
+  /**
+   * The importers to install, replacing the workspace's own project list.
+   * Must include the project at `dir`, unless an `install` call sets
+   * `ignorePackageManifest`.
+   */
   projects: NodeApiProject[]
   storeDir?: string
   /** Slow metadata-request warning threshold in milliseconds. Overrides `networkConfig`. */
   fetchWarnTimeoutMs?: number
   /** Minimum average tarball download speed in KiB/s. Overrides `networkConfig`. */
   fetchMinSpeedKiBps?: number
-  nodeLinker?: 'hoisted' | 'isolated'
+  nodeLinker?: 'isolated' | 'hoisted' | 'pnp' | 'loaded'
   /**
    * pnpm's `linkWorkspacePackages`. When `true`/`'deep'`, a bare-semver
    * dependency (including an auto-installed peer) may resolve to a workspace
@@ -142,7 +147,14 @@ export interface InstallOptions extends SharedEngineOptions {
   lockfileOnly?: boolean
   frozenLockfile?: boolean
   preferFrozenLockfile?: boolean
-  packageImportMethod?: 'auto' | 'hardlink' | 'copy' | 'clone'
+  /**
+   * The format the wanted lockfile is written in (the `lockfile.format`
+   * setting). `'v13'` writes the experimental `lockfileVersion: '13.0'`
+   * format. When omitted, the `lockfile.format` setting of
+   * `pnpm-workspace.yaml` applies, which defaults to `'v9'`.
+   */
+  lockfileFormat?: 'v9' | 'v13'
+  packageImportMethod?: 'auto' | 'hardlink' | 'copy' | 'clone' | 'clone-or-copy'
   preferOffline?: boolean
   offline?: boolean
   virtualStoreDirMaxLength?: number
@@ -176,6 +188,12 @@ export interface InstallOptions extends SharedEngineOptions {
    * or the install re-resolves from scratch.
    */
   addMissingPeerTypes?: boolean
+  /**
+   * Install a missing optional peer only from a version the project's own
+   * dependencies resolve (the `projectScopedOptionalPeers` setting). Has no
+   * effect while `dedupePeerDependents` is `false`.
+   */
+  projectScopedOptionalPeers?: boolean
   dedupeDirectDeps?: boolean
   dedupeInjectedDeps?: boolean
   resolvePeersFromWorkspaceRoot?: boolean
@@ -221,8 +239,8 @@ export interface InstallOptions extends SharedEngineOptions {
    */
   enableModulesDir?: boolean
   /**
-   * Install from the lockfile alone, ignoring the project manifests —
-   * pnpm's `pnpm fetch` semantics. The resolution step and the
+   * Install from the lockfile alone, ignoring the project manifests
+   * (pnpm's `pnpm fetch` semantics). The resolution step and the
    * `package.json` ↔ `pnpm-lock.yaml` freshness check are skipped, every
    * importer the lockfile records is imported into the virtual store, and
    * no post-import linking is performed: no importer symlinks, no `.bin`
@@ -230,10 +248,18 @@ export interface InstallOptions extends SharedEngineOptions {
    */
   ignorePackageManifest?: boolean
   /**
+   * Do not compare the `settings` recorded in `pnpm-lock.yaml` with the
+   * current configuration. A mismatch no longer fails a frozen install with
+   * `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` and no longer makes the install
+   * resolve again. The current `overrides` still apply to the project
+   * manifests, so a changed override still makes them outdated.
+   */
+  ignoreLockfileSettingsChecks?: boolean
+  /**
    * The pnpm home directory the default store location is resolved under
    * when no `storeDir` is configured (`<pnpmHomeDir>/store`, with pnpm's
-   * same-volume fallback). An explicit `storeDir` — passed here or set by
-   * a config source — wins.
+   * same-volume fallback). An explicit `storeDir`, passed here or set by
+   * a config source, wins.
    */
   pnpmHomeDir?: string
   /**
@@ -281,7 +307,7 @@ export interface PeerDependencyRules {
  * pnpm's own terminal output, rendered by the engine.
  *
  * Without this the host gets only the `onLog` event stream and has to
- * render it itself — in practice by keeping `@pnpm/logger` and
+ * render it itself. In practice it does so by keeping `@pnpm/logger` and
  * `@pnpm/cli.default-reporter` and feeding the events into them, a
  * coupling between one pnpm line's reporter and another's event stream
  * that the host then has to maintain. Set `reporter` and the engine
@@ -318,7 +344,7 @@ export interface ReporterOptions {
   ignoredBuildsInstructionText?: string
   /**
    * Package-name patterns whose *linked* entries are left out of the
-   * packages-diff summary — an entry is linked when it was symlinked in
+   * packages-diff summary. An entry is linked when it was symlinked in
    * rather than materialized from the store. A host that links its own
    * runtime into every project silences that noise without silencing the
    * same packages when they are really installed.
@@ -346,8 +372,8 @@ export interface ReporterOptions {
 /**
  * Receives each rendered output chunk instead of the engine writing it to
  * a file descriptor. For a host that has redirected its own output at the
- * JavaScript level — a monkey-patched `process.stdout.write`, a stream
- * that forwards to a remote terminal — where a write from the engine would
+ * JavaScript level (a monkey-patched `process.stdout.write`, a stream
+ * that forwards to a remote terminal), where a write from the engine would
  * bypass the redirection. Chunks arrive in order and already carry their
  * newlines and cursor-control sequences; write them verbatim.
  */
@@ -458,7 +484,7 @@ export interface ResolveResult {
   resolvedVia: string
   normalizedBareSpecifier?: string
   latest?: string
-  resolution?: Record<string, unknown>
+  resolution: Record<string, unknown>
 }
 
 export function resolveDependency(wanted: WantedDependency, options: ResolveOptions): Promise<ResolveResult>
@@ -501,7 +527,7 @@ export function parseBareSpecifier(spec: string, alias?: string): ParsedBareSpec
 
 export interface ReadConfigOptions {
   /**
-   * Directory whose config cascade to resolve — its `.npmrc`, the enclosing
+   * Directory whose config cascade to resolve: its `.npmrc`, the enclosing
    * workspace's `pnpm-workspace.yaml` and `.npmrc`, the user and global
    * config files, and `npm_config_*` environment variables.
    */
@@ -525,7 +551,7 @@ export interface ResolvedConfig {
   registries: ResolvedRegistry[]
   /**
    * Static `Authorization` headers keyed by nerf-darted registry URI
-   * (`//host[:port]/path/`) — the shape `install`'s `authHeaderByUri`
+   * (`//host[:port]/path/`), the shape `install`'s `authHeaderByUri`
    * accepts.
    */
   authHeaderByUri: Record<string, string>
@@ -560,7 +586,7 @@ export interface ResolvedConfig {
   fetchMinSpeedKiBps: number
   /**
    * The explicitly configured user agent, when the cascade set one. The
-   * engine's own computed default is omitted — an embedder that passes
+   * engine's own computed default is omitted. An embedder that passes
    * nothing back to `install` gets that same default.
    */
   userAgent?: string
@@ -576,8 +602,8 @@ export interface ResolvedConfig {
    */
   shamefullyHoist: boolean
   /**
-   * The engine's pnpm home directory (`PNPM_HOME` or the platform default) —
-   * not a per-project setting. Absent when no home directory is resolvable.
+   * The engine's pnpm home directory (`PNPM_HOME` or the platform default).
+   * It is not a per-project setting. Absent when no home directory is resolvable.
    */
   pnpmHomeDir?: string
   /**
@@ -590,14 +616,14 @@ export interface ResolvedConfig {
 }
 
 /**
- * Resolve the configuration the engine's own installs use — registries,
- * credentials, proxy, TLS, and network settings from the `.npmrc` cascade —
+ * Resolve the configuration the engine's own installs use (registries,
+ * credentials, proxy, TLS, and network settings from the `.npmrc` cascade),
  * so the embedder needs no JavaScript config reader.
  */
 export function readConfig(options: ReadConfigOptions): ResolvedConfig
 
 /**
- * Inputs for {@link getDependents} — the engine side of `pnpm why`.
+ * Inputs for {@link getDependents}, the engine side of `pnpm why`.
  *
  * The reverse tree is pure lockfile analysis, so a host that asks the
  * engine for it needs neither `@pnpm/deps.inspection.tree-builder` and
@@ -638,15 +664,25 @@ export interface DependentsOptions {
    * `manifest`. A host that renames nodes after a manifest field asks for
    * that field here, writes `displayName` on the returned trees, and
    * passes them to {@link renderDependents}. Nodes whose manifest is
-   * unreadable — and every workspace-project node — carry none.
+   * unreadable (and every workspace-project node) carry none.
    */
   manifestFields?: string[]
+  /**
+   * Whether to fill each dependent's `requires`. Default `false`, which
+   * reads no dependency manifest for it.
+   */
+  includeRequires?: boolean
   /**
    * Whether a `devDependencies` entry of the root importer provides a peer to
    * every importer when a walk that leaves out a group decides which
    * optional-peer edges to skip. Default `false`.
    */
   resolvePeersFromWorkspaceRoot?: boolean
+  /**
+   * Whether to leave out the packages reached only as a resolved peer
+   * dependency, as `pnpm why --exclude-peers` does. Default `false`.
+   */
+  excludePeerDependencies?: boolean
 }
 
 /** One entry of a {@link DependentsTree}'s reverse tree. */
@@ -655,6 +691,11 @@ export interface DependentNode {
   /** Rendered in place of `name`, when set. */
   displayName?: string
   version: string
+  /**
+   * The raw dependency specifier the parent declared for this edge. Set
+   * only with `includeRequires`.
+   */
+  requires?: string
   /** The node was reached again on its own path; the walk stopped there. */
   circular?: boolean
   /** Short hash distinguishing peer-dependency variants of a `name@version`. */
@@ -702,8 +743,8 @@ export interface RenderDependentsOptions {
 }
 
 /**
- * Render trees from {@link getDependents} — after any `displayName` the
- * caller wrote onto them — the way `pnpm why` renders its own.
+ * Render trees from {@link getDependents} (after any `displayName` the
+ * caller wrote onto them) the way `pnpm why` renders its own.
  */
 export function renderDependents(
   trees: DependentsTree[],
@@ -711,7 +752,7 @@ export function renderDependents(
 ): string
 
 /**
- * A `pnpm-lock.yaml` as JSON — the file's own shape, which is
+ * A `pnpm-lock.yaml` as JSON in the file's own shape, which is
  * `LockfileFile` in `@pnpm/lockfile.types` terms: each importer dependency
  * is an `{ specifier, version }` pair, and `packages` (metadata) and
  * `snapshots` (edges) are separate maps. There is no in-memory-only
@@ -722,8 +763,8 @@ export function renderDependents(
  * block, and write the file back without losing anything else.
  *
  * The lockfile functions are generic over this so a host that already has
- * a precise type for the format — `LockfileFile` from
- * `@pnpm/lockfile.types`, or its own extension of it — can name it rather
+ * a precise type for the format (`LockfileFile` from
+ * `@pnpm/lockfile.types`, or its own extension of it) can name it rather
  * than casting: `readLockfile<MyLockfile>({ dir })`.
  */
 export type LockfileFile = Record<string, unknown>
@@ -774,7 +815,7 @@ export interface FilterLockfileOptions {
   /** Whether they keep their `optionalDependencies`. Default `true`. */
   includeOptionalDependencies?: boolean
   /**
-   * Dep paths to treat as already visited — the optional dependencies this
+   * Dep paths to treat as already visited: the optional dependencies this
    * platform did not install. Neither they nor anything reachable only
    * through them is kept.
    */
@@ -782,8 +823,8 @@ export interface FilterLockfileOptions {
   /**
    * Whether a dependency reference with no `snapshots` entry fails with
    * `ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY`. Defaults to `false`, which
-   * drops the reference and keeps walking — what a caller inspecting a
-   * possibly-stale lockfile wants.
+   * drops the reference and keeps walking. That is what a caller inspecting
+   * a possibly-stale lockfile wants.
    */
   failOnMissingDependencies?: boolean
   /**
@@ -798,7 +839,7 @@ export interface FilterLockfileOptions {
  * The lockfile narrowed to what `importerIds` reaches: those importers keep
  * only the dependency groups asked for, and `packages` / `snapshots` are
  * pruned to the transitive closure of what they still depend on. Every
- * other importer entry is carried through untouched — the filter narrows
+ * other importer entry is carried through untouched. The filter narrows
  * the package graph, not the workspace.
  *
  * Synchronous: a transform over data the caller already holds.

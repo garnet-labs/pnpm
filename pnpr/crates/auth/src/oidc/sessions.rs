@@ -1,10 +1,26 @@
-use std::{collections::HashMap, sync::Mutex};
+use jiff::Timestamp;
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 use super::{
-    MAX_ENTRIES, OidcState, Result, SESSION_PREFIX, SessionUser, Utc, handoffs::Handoff,
-    random_secret, rejected, unavailable, web_login::WebLogins,
+    MAX_ENTRIES,
+    OidcState,
+    RegistryError,
+    Result,
+    SESSION_PREFIX,
+    SessionUser,
+    handoffs::Handoff,
+    random_secret,
+    rejected,
+    unavailable,
+    web_login::WebLogins,
 };
 
 /// Browser sign-ins on this process: the sessions pnpr issued, the
@@ -37,8 +53,9 @@ pub enum LoginReturn {
     /// The web UI, which redeems a [handoff code](OidcState::hand_off) for
     /// the token.
     Ui,
-    /// CLI web login session flow (`/-/v1/login`).
-    Cli { session: String },
+    /// The CLI web login (`/-/v1/login`) that a browser claimed with its
+    /// user code.
+    Cli { login_id: String },
 }
 
 impl OidcState {
@@ -47,7 +64,7 @@ impl OidcState {
         if !raw.starts_with(SESSION_PREFIX) {
             return Ok(None);
         }
-        let now = Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
         let mut sessions = self.browser.sessions.lock().expect("OIDC session mutex poisoned");
         let hash = super::super::sha256_hex(raw.as_bytes());
         if let Some(session) = sessions.get(&hash)
@@ -59,6 +76,16 @@ impl OidcState {
         Err(rejected())
     }
 
+    /// When the unexpired browser session `raw` expires, in Unix seconds.
+    pub fn session_expires(&self, raw: &str) -> Option<i64> {
+        let now = Timestamp::now().as_second();
+        let sessions = self.browser.sessions.lock().expect("OIDC session mutex poisoned");
+        sessions
+            .get(&super::super::sha256_hex(raw.as_bytes()))
+            .map(|session| session.expires)
+            .filter(|expires| *expires > now)
+    }
+
     pub fn revoke_session(&self, raw: &str) -> bool {
         self.browser.sessions
             .lock()
@@ -67,13 +94,21 @@ impl OidcState {
             .is_some()
     }
 
-    /// Revoke every browser session `username` holds on this process,
+    /// Revoke every browser session `user_id` holds on this process,
     /// returning how many there were.
-    pub fn revoke_user_sessions(&self, username: &str) -> usize {
+    pub fn revoke_user_sessions(&self, user_id: &str) -> usize {
         let mut sessions = self.browser.sessions.lock().expect("OIDC session mutex poisoned");
         let before = sessions.len();
-        sessions.retain(|_, session| session.user.username != username);
+        sessions.retain(|_, session| session.user.user_id != user_id);
         before - sessions.len()
+    }
+
+    /// Revoke browser sessions when a failed password operation still committed.
+    pub fn revoke_committed_password_sessions(&self, error: &RegistryError) -> usize {
+        error
+            .committed_password_user()
+            .map(|user_id| self.revoke_user_sessions(user_id))
+            .unwrap_or(0)
     }
 
     pub(super) fn issue_session(
@@ -82,7 +117,7 @@ impl OidcState {
         expiration: i64,
         returns_to: LoginReturn,
     ) -> Result<LoginSession> {
-        let now = Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
         let expires = expiration.min(now + 3600);
         if expires <= now {
             return Err(rejected());

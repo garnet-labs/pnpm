@@ -7,8 +7,8 @@ pub(super) enum BlockPlacement {
     Pinned,
 }
 
-/// Lazily-assigned block indices for one logical output stream — its
-/// non-fixed (`block`) and fixed (`fixed`) slots in the frame — the
+/// Lazily-assigned block indices for one logical output stream (its
+/// non-fixed (`block`) and fixed (`fixed`) slots in the frame) the
 /// per-stream `currentBlockNo` / `currentFixedBlockNo` pair.
 #[derive(Debug, Default, Clone)]
 pub(super) struct BlockSlot {
@@ -17,7 +17,7 @@ pub(super) struct BlockSlot {
 }
 
 /// The frame buffer: scrolling `blocks` rendered above pinned `fixed_blocks`,
-/// or — in append-only mode — a list of `pending` lines to print as they
+/// or (in append-only mode) a list of `pending` lines to print as they
 /// arrive.
 #[derive(Debug, Default)]
 pub(super) struct Frame {
@@ -72,6 +72,17 @@ impl Frame {
                 }
                 self.blocks[idx] = Some(msg);
             }
+        }
+    }
+
+    /// Drop the message `slot` holds. Append-only output has printed it
+    /// already.
+    pub(super) fn clear(&mut self, slot: &mut BlockSlot) {
+        if let Some(block) = slot.block.take() {
+            self.blocks[block] = None;
+        }
+        if let Some(fixed) = slot.fixed.take() {
+            self.fixed_blocks[fixed] = None;
         }
     }
 

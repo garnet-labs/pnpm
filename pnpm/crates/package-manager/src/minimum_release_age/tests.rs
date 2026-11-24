@@ -1,14 +1,27 @@
-use std::{fs, sync::Mutex};
+use std::{
+    fs,
+    sync::Mutex,
+};
 
 use pnpm_config::Config;
-use pnpm_lockfile::{LockfileResolution, RegistryResolution};
-use pnpm_reporter::{LogEvent, PromptAction, Reporter, SilentReporter};
+use pnpm_lockfile::{
+    LockfileResolution,
+    RegistryResolution,
+};
+use pnpm_reporter::{
+    LogEvent,
+    PromptAction,
+    Reporter,
+    SilentReporter,
+};
 use pnpm_resolving_resolver_base::ResolutionPolicyViolation;
 use ssri::Integrity;
 use tempfile::tempdir;
 
 use super::{
-    ApprovalPrompt, MinimumReleaseAgeError, PolicyExcludes,
+    ApprovalPrompt,
+    MinimumReleaseAgeError,
+    PolicyExcludes,
     handle_minimum_release_age_violations_with,
 };
 
@@ -84,11 +97,24 @@ macro_rules! recording_reporter {
                 .collect()
         }
     };
+    (@helper pnpm_messages) => {
+        fn pnpm_messages() -> Vec<String> {
+            EVENTS
+                .lock()
+                .expect("event lock")
+                .iter()
+                .filter_map(|event| match event {
+                    LogEvent::Pnpm(log) => Some(log.message.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    };
     (@helper $unknown:ident) => {
         compile_error!(concat!(
             "unknown `recording_reporter!` helper `",
             stringify!($unknown),
-            "`; expected one of: reset_events, prompt_actions",
+            "`; expected one of: reset_events, prompt_actions, pnpm_messages",
         ));
     };
 }
@@ -204,7 +230,7 @@ async fn non_interactive_strict_mode_reports_every_immature_pick() {
 
 #[tokio::test]
 async fn approval_persists_canonical_excludes_and_brackets_the_prompt() {
-    recording_reporter!(reset_events, prompt_actions);
+    recording_reporter!(reset_events, prompt_actions, pnpm_messages);
     reset_events();
     let dir = tempdir().expect("temp dir");
     fs::write(
@@ -246,11 +272,49 @@ async fn approval_persists_canonical_excludes_and_brackets_the_prompt() {
     assert!(workspace.contains("- bar@3.0.0"));
 
     assert_eq!(prompt_actions(), [PromptAction::Start, PromptAction::End]);
+
+    let messages = pnpm_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        "Added 2 entries to minimumReleaseAgeExclude in pnpm-workspace.yaml (approved at the prompt)",
+    );
+}
+
+#[tokio::test]
+async fn approval_with_single_entry_uses_singular_and_omits_list() {
+    recording_reporter!(reset_events, pnpm_messages);
+    reset_events();
+    let dir = tempdir().expect("temp dir");
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write workspace manifest");
+    let mut config = Config::new();
+    config.minimum_release_age_strict = Some(true);
+    let mut prompt = FakePrompt { answer: true, messages: Vec::new() };
+    let violations = vec![violation("foo", "1.0.0", "MINIMUM_RELEASE_AGE_VIOLATION")];
+
+    handle_minimum_release_age_violations_with::<RecordingReporter, _>(
+        &config,
+        dir.path(),
+        &violations,
+        true,
+        PolicyExcludes::Persist,
+        &mut prompt,
+    )
+    .await
+    .expect("approval should continue");
+
+    let messages = pnpm_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        "Added 1 entry to minimumReleaseAgeExclude in pnpm-workspace.yaml (approved at the prompt)",
+    );
 }
 
 #[tokio::test]
 async fn loose_mode_persists_excludes_without_prompting() {
-    recording_reporter!(reset_events);
+    recording_reporter!(reset_events, pnpm_messages);
     reset_events();
     let dir = tempdir().expect("temp dir");
     fs::write(
@@ -284,15 +348,7 @@ async fn loose_mode_persists_excludes_without_prompting() {
         .expect("read workspace manifest");
     assert!(workspace.contains("- foo@1.0.0 || 2.0.0"));
     assert!(workspace.contains("- bar@3.0.0"));
-    let messages: Vec<String> = EVENTS
-        .lock()
-        .expect("event lock")
-        .iter()
-        .filter_map(|event| match event {
-            LogEvent::Pnpm(log) => Some(log.message.clone()),
-            _ => None,
-        })
-        .collect();
+    let messages = pnpm_messages();
     assert_eq!(messages.len(), 1);
     assert_eq!(
         messages[0],

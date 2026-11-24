@@ -1,7 +1,12 @@
+use command_extra::CommandExtra;
 use std::{
     collections::BTreeSet,
-    fs, io,
-    path::{Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 
@@ -91,17 +96,23 @@ impl Tree for GitRevision {
     }
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+    String::from_utf8(git_bytes(root, args)?)
+        .map_err(|error| format!("git {args:?} printed non-UTF-8: {error}"))
+}
+
+/// The standard output of `git`, which holds paths as they are on disk
+/// when asked for `-z` output, in any encoding.
+pub fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
+        .with_arg("-C")
+        .with_arg(root)
+        .with_args(args)
         .output()
         .map_err(|error| format!("run git {args:?}: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git {args:?} failed: {}", stderr.trim()));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|error| format!("git {args:?} printed non-UTF-8: {error}"))
+    Ok(output.stdout)
 }

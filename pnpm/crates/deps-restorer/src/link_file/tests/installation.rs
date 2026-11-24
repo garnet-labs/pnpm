@@ -1,15 +1,25 @@
-use super::{
-    super::{
-        AUTO_FIRST_TIER, Host, LINK_STATE_CLONE, LINK_STATE_HARDLINK, LinkFileError, auto_link,
-        clone_or_copy_link, downgrade_auto_tier, is_call_error, link_file, next_auto_tier,
-        recover_from_concurrent_import,
-    },
-    STORE_ENTRY, write_source,
-};
 #[cfg(unix)]
 use super::{
-    super::{LINK_STATE_COPY, import_into_fresh_target},
-    EaccesLinks, EpermLinks, FreshClone, STORE_EXEC_ENTRY,
+    super::import_into_fresh_target,
+    FreshClone,
+    STORE_EXEC_ENTRY,
+};
+use super::{
+    super::{
+        AUTO_FIRST_TIER,
+        Host,
+        LINK_STATE_CLONE,
+        LINK_STATE_HARDLINK,
+        LinkFileError,
+        auto_link,
+        clone_or_copy_link,
+        downgrade_auto_tier,
+        link_file,
+        next_auto_tier,
+        recover_from_concurrent_import,
+    },
+    STORE_ENTRY,
+    write_source,
 };
 use pnpm_config::PackageImportMethod;
 #[cfg(unix)]
@@ -17,8 +27,12 @@ use pnpm_reporter::PackageImportMethod as WireImportMethod;
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
 use std::{
-    fs, io,
-    sync::atomic::{AtomicU8, Ordering},
+    fs,
+    io,
+    sync::atomic::{
+        AtomicU8,
+        Ordering,
+    },
 };
 use tempfile::tempdir;
 
@@ -62,7 +76,8 @@ fn copy_restores_executable_mode_from_cas_suffix() {
     link_file::<SilentReporter>(&AtomicU8::new(0), PackageImportMethod::Copy, &src, &dst)
         .expect("copy should land the executable store-entry mode");
 
-    let expected = pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask());
+    let expected =
+        pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask()).mode();
     let dst_mode = fs::metadata(&dst)
         .unwrap()
         .permissions()
@@ -84,7 +99,8 @@ fn copy_does_not_widen_non_exec_mode() {
     link_file::<SilentReporter>(&AtomicU8::new(0), PackageImportMethod::Copy, &src, &dst)
         .expect("copy should succeed");
 
-    let expected = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let expected =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     let dst_mode = fs::metadata(&dst)
         .unwrap()
         .permissions()
@@ -100,7 +116,8 @@ fn hardlink_mode_mismatch_copies_at_the_store_entry_mode() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempdir().unwrap();
-    let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let desired =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
     fs::set_permissions(&src, fs::Permissions::from_mode(desired ^ 0o001)).unwrap();
     let dst = tmp.path().join("dst.txt");
@@ -129,7 +146,8 @@ fn hardlink_mode_match_shares_the_store_inode() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempdir().unwrap();
-    let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let desired =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
     fs::set_permissions(&src, fs::Permissions::from_mode(desired)).unwrap();
     let dst = tmp.path().join("dst.txt");
@@ -155,7 +173,7 @@ fn hardlink_uses_the_known_mode_of_the_source() {
     let tmp = tempdir().unwrap();
     let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
-    fs::set_permissions(&src, fs::Permissions::from_mode(desired ^ 0o001)).unwrap();
+    fs::set_permissions(&src, fs::Permissions::from_mode(desired.mode() ^ 0o001)).unwrap();
     let src = pnpm_fs::StoreFile::with_mode(src.path, Some(desired));
     let dst = tmp.path().join("dst.txt");
     link_file::<SilentReporter>(&AtomicU8::new(0), PackageImportMethod::Hardlink, &src, &dst)
@@ -173,7 +191,8 @@ fn hardlink_shares_a_store_inode_that_differs_only_in_group_write() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempdir().unwrap();
-    let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let desired =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
     fs::set_permissions(&src, fs::Permissions::from_mode(desired ^ 0o020)).unwrap();
     let dst = tmp.path().join("dst.txt");
@@ -227,8 +246,8 @@ fn local_directory_files_keep_their_own_mode() {
 }
 
 /// A mode miss belongs to one store file, not to the filesystem: the
-/// `Auto` ladder keeps the hardlink tier, like [`is_too_many_links`]
-/// does for a source out of names.
+/// `Auto` ladder keeps the hardlink tier, as it does for a source out of
+/// names.
 #[test]
 #[cfg(unix)]
 fn auto_keeps_the_hardlink_tier_across_a_mode_mismatch() {
@@ -236,7 +255,8 @@ fn auto_keeps_the_hardlink_tier_across_a_mode_mismatch() {
 
     let state = AtomicU8::new(LINK_STATE_HARDLINK);
     let tmp = tempdir().unwrap();
-    let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let desired =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
     fs::set_permissions(&src, fs::Permissions::from_mode(desired ^ 0o001)).unwrap();
     let dst = tmp.path().join("dst.txt");
@@ -263,7 +283,8 @@ fn clone_tier_aligns_modes_to_the_current_umask() {
         let expected = pnpm_fs::file_mode::store_entry_mode(
             pnpm_fs::file_mode::cas_path_is_executable(name.as_ref()),
             pnpm_fs::file_mode::current_umask(),
-        );
+        )
+        .mode();
         for stored in [expected ^ 0o001, 0o600] {
             let src = write_source(tmp.path(), name, contents);
             fs::set_permissions(&src, fs::Permissions::from_mode(stored)).unwrap();
@@ -301,7 +322,8 @@ fn recover_from_concurrent_import_preserves_hardlink_with_desired_mode() {
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
     let dst = tmp.path().join("dst");
 
-    let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let desired =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     fs::set_permissions(&src, fs::Permissions::from_mode(desired)).unwrap();
     fs::hard_link(&src, &dst).unwrap();
 
@@ -330,7 +352,8 @@ fn recover_from_concurrent_import_replaces_hardlink_with_mismatched_mode() {
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
     let dst = tmp.path().join("dst");
 
-    let desired = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let desired =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     let mismatched = desired ^ 0o001;
 
     fs::hard_link(&src, &dst).unwrap();
@@ -380,7 +403,8 @@ fn eexist_restores_executable_mode_from_cas_suffix() {
     )
     .expect("EEXIST import should align the exec mode");
 
-    let expected = pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask());
+    let expected =
+        pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask()).mode();
     let dst_mode = fs::metadata(&dst)
         .unwrap()
         .permissions()
@@ -400,7 +424,8 @@ fn eexist_aligns_a_non_exec_target_without_adding_exec_bits() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempdir().unwrap();
-    let expected = pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask());
+    let expected =
+        pnpm_fs::file_mode::store_entry_mode(false, pnpm_fs::file_mode::current_umask()).mode();
     let src = write_source(tmp.path(), STORE_ENTRY, b"private data\n");
     fs::set_permissions(&src, fs::Permissions::from_mode(expected | 0o004)).unwrap();
     let dst = write_source(tmp.path(), "dst", b"private data\n");
@@ -453,7 +478,8 @@ fn spurious_not_found_with_an_existing_target_is_adopted() {
     recover_from_concurrent_import(io::Error::from(io::ErrorKind::NotFound), &src, &dst)
         .expect("a NotFound against an existing target is a concurrent import");
 
-    let expected = pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask());
+    let expected =
+        pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask()).mode();
     let dst_mode = fs::metadata(&dst)
         .unwrap()
         .permissions()
@@ -502,7 +528,7 @@ fn other_import_errors_propagate() {
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 }
 /// `Auto` must succeed on any filesystem because it falls through to
-/// `fs::copy`. We point it at a `tmpfs`-like temp dir — reflink and
+/// `fs::copy`. We point it at a `tmpfs`-like temp dir, reflink and
 /// hardlink may or may not be available, but copy always is.
 #[test]
 fn auto_falls_through_to_a_working_method() {
@@ -515,7 +541,7 @@ fn auto_falls_through_to_a_working_method() {
         .expect("Auto should always succeed");
     assert_eq!(fs::read(&dst).unwrap(), b"auto");
 }
-/// If the target already exists, `link_file` is a no-op — it must not
+/// If the target already exists, `link_file` is a no-op; it must not
 /// error (which `fs::hard_link` / `reflink` would do on their own) or
 /// overwrite the existing contents.
 #[test]
@@ -540,7 +566,7 @@ fn existing_target_is_preserved() {
 /// `CloneOrCopy` has to succeed on any filesystem because
 /// `clone_or_copy_link` falls back to `fs::copy` when the reflink
 /// attempt fails with a capability error. This hits the match arm
-/// directly — the [`existing_target_is_preserved`] loop
+/// directly, the [`existing_target_is_preserved`] loop
 /// short-circuits before the arm ever runs, so without this we had
 /// no coverage of the real code path.
 #[test]
@@ -570,7 +596,7 @@ fn explicit_clone_surfaces_errors() {
     assert!(matches!(err, LinkFileError::Import { .. }), "got: {err:?}");
 }
 /// A one-off `NotFound` / `AlreadyExists` on
-/// a single file must not downgrade the cache — those are
+/// a single file must not downgrade the cache; those are
 /// per-call errors, not capability errors. A different source /
 /// target later in the install would still succeed at the current
 /// tier, and we'd have permanently disabled it for no reason.
@@ -582,7 +608,7 @@ fn explicit_clone_surfaces_errors() {
 /// `reflink_copy::reflink` on non-macOS platforms rewrites a
 /// missing-source `NotFound` into `ErrorKind::InvalidInput` for
 /// diagnostic purposes (see `reflink-copy/src/lib.rs:64`). That
-/// makes `NotFound` a poor test for "call errors propagate" — the
+/// makes `NotFound` a poor test for "call errors propagate", the
 /// error surfaces as `InvalidInput` on Linux / Windows and the
 /// test would silently pass via the fallback path instead of the
 /// propagation path we want to exercise.
@@ -603,19 +629,17 @@ fn auto_call_errors_propagate_without_downgrading() {
         "AlreadyExists must not poison the cache",
     );
 }
-/// The platform ladder itself: hardlink before clone on Linux, clone
-/// first everywhere else (`next_auto_tier` carries the why). Pinned so
-/// a refactor of the downgrade machinery can't quietly put Linux back
-/// on the reflink tier.
+/// Pinned so a refactor of the downgrade machinery cannot quietly change
+/// the platform ladder. `next_auto_tier` carries the why.
 #[test]
 fn auto_ladder_order_is_platform_specific() {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         assert_eq!(AUTO_FIRST_TIER, LINK_STATE_HARDLINK);
         assert_eq!(next_auto_tier(LINK_STATE_HARDLINK), LINK_STATE_CLONE);
         assert_eq!(next_auto_tier(LINK_STATE_CLONE), super::super::LINK_STATE_COPY);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         assert_eq!(AUTO_FIRST_TIER, LINK_STATE_CLONE);
         assert_eq!(next_auto_tier(LINK_STATE_CLONE), LINK_STATE_HARDLINK);
@@ -639,7 +663,7 @@ fn stale_downgrades_neither_skip_nor_regress() {
     downgrade_auto_tier(&state, AUTO_FIRST_TIER);
     assert_eq!(state.load(Ordering::Relaxed), second);
 
-    // Only the current tier failing moves the ladder again — and a
+    // Only the current tier failing moves the ladder again, and a
     // last stale report from the head still cannot move it back.
     downgrade_auto_tier(&state, second);
     assert_eq!(state.load(Ordering::Relaxed), super::super::LINK_STATE_COPY);
@@ -648,7 +672,7 @@ fn stale_downgrades_neither_skip_nor_regress() {
 }
 /// Same propagate-on-call-error property for `CloneOrCopy`. Uses
 /// `AlreadyExists` trigger for the same reason
-/// [`auto_call_errors_propagate_without_downgrading`] does —
+/// [`auto_call_errors_propagate_without_downgrading`] does.
 /// `NotFound` gets rewritten to `InvalidInput` inside reflink-copy
 /// on non-macOS and would take the fallback path instead of the
 /// propagation path.
@@ -668,77 +692,6 @@ fn clone_or_copy_call_errors_propagate_without_downgrading() {
         LINK_STATE_CLONE,
         "AlreadyExists must not poison the cache",
     );
-}
-/// Pin the deny-list classifier. The state-machine tests above
-/// exercise `NotFound` on the common path, but we also care that
-/// the capability-style errors we see on real filesystems —
-/// notably Windows NTFS's `ERROR_INVALID_FUNCTION` for
-/// `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, which Rust maps to
-/// `InvalidInput` — fall through to the next tier instead of
-/// propagating.
-#[test]
-fn is_call_error_rejects_capability_codes() {
-    // Call-shape errors: must propagate.
-    for kind in
-        [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied, io::ErrorKind::AlreadyExists]
-    {
-        let err = io::Error::from(kind);
-        assert!(is_call_error(&err), "kind {kind:?} should be a call error");
-    }
-
-    // Capability / cross-device / weird OS codes: must fall
-    // through, so they must NOT be classified as call errors.
-    for err in [
-        io::Error::from(io::ErrorKind::Unsupported),
-        io::Error::from(io::ErrorKind::InvalidInput), // Windows ERROR_INVALID_FUNCTION lands here
-        io::Error::from_raw_os_error(18),             // EXDEV
-        io::Error::from_raw_os_error(25),             // ENOTTY — ext4 reflink rejection
-        io::Error::from_raw_os_error(95),             // EOPNOTSUPP
-    ] {
-        assert!(!is_call_error(&err), "{err:?} should trigger fallback, not propagate");
-    }
-
-    // Link permissions can be denied while ordinary copying is allowed.
-    #[cfg(unix)]
-    {
-        let eperm = io::Error::from_raw_os_error(libc::EPERM);
-        assert!(!is_call_error(&eperm), "EPERM is a capability signal, not a call error");
-        let eacces = io::Error::from_raw_os_error(libc::EACCES);
-        assert!(!is_call_error(&eacces), "EACCES should allow a copy fallback");
-    }
-}
-#[test]
-#[cfg(unix)]
-fn eacces_downgrade_still_surfaces_a_failed_copy() {
-    let state = AtomicU8::new(AUTO_FIRST_TIER);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"unreachable target");
-    let dst = tmp.path().join("missing-parent/dst.txt");
-
-    let err = auto_link::<SilentReporter, EaccesLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect_err("copy cannot create a file under a missing directory");
-
-    assert_eq!(err.kind(), io::ErrorKind::NotFound);
-    assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY);
-}
-/// Downgrading on `EPERM` does not swallow what the copy tier then
-/// finds wrong with the paths: with both links refused and no parent
-/// directory for the target, the ladder reaches the copy tier, the copy
-/// fails, and that error is the one the caller sees.
-#[test]
-#[cfg(unix)]
-fn eperm_downgrade_still_surfaces_a_failed_copy() {
-    let state = AtomicU8::new(LINK_STATE_HARDLINK);
-    let tmp = tempdir().unwrap();
-    let src = write_source(tmp.path(), "src.txt", b"unreachable target");
-    let dst = tmp.path().join("missing-parent/dst.txt");
-
-    let err = auto_link::<SilentReporter, EpermLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect_err("the copy tier cannot create a file under a missing directory");
-
-    assert_eq!(err.kind(), io::ErrorKind::NotFound);
-    assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY, "both link tiers were retired");
-    assert!(!dst.exists());
 }
 /// A copy that dies partway must not leave its half-written target
 /// behind. The next import reads an occupied target as a concurrent

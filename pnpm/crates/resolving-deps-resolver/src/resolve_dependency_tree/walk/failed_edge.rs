@@ -1,6 +1,12 @@
 use super::{
-    ChildEdge, ResolveDependencyTreeError, ResolveOptions, SkippedOptionalDependency, TreeCtx,
-    WantedDependency, pkgs_info_from_ids, wanted_lockfile_contains_satisfying_entry,
+    ChildEdge,
+    ResolveDependencyTreeError,
+    ResolveOptions,
+    SkippedOptionalDependency,
+    TreeCtx,
+    WantedDependency,
+    pkgs_info_from_ids,
+    wanted_lockfile_contains_satisfying_entry,
 };
 
 /// A resolution failure inside an optional subtree drops the edge instead of
@@ -21,6 +27,9 @@ use super::{
 pub(super) enum SkippedOptionalReport {
     Emit,
     Suppress,
+    /// The edge is resolved only to read its manifest. It is dropped as an
+    /// optional edge would be, optional or not, without a report.
+    Detached,
 }
 
 pub(super) fn drop_failed_edge(
@@ -31,7 +40,7 @@ pub(super) fn drop_failed_edge(
     err: ResolveDependencyTreeError,
     report: SkippedOptionalReport,
 ) -> Result<(), ResolveDependencyTreeError> {
-    let optional = wanted.optional.unwrap_or(false);
+    let optional = wanted.optional.unwrap_or(false) || report == SkippedOptionalReport::Detached;
     let broken_parent = edge.ancestor_ids
         .last()
         .filter(|_| !optional && edge.parent_optional);
@@ -53,7 +62,7 @@ pub(super) fn drop_failed_edge(
     }
     match report {
         SkippedOptionalReport::Emit => {}
-        SkippedOptionalReport::Suppress => return Ok(()),
+        SkippedOptionalReport::Suppress | SkippedOptionalReport::Detached => return Ok(()),
     }
     if let Some(log) = ctx.workspace.hooks.skipped_optional_log.as_ref() {
         log(SkippedOptionalDependency {
@@ -77,6 +86,7 @@ pub(super) fn is_droppable_resolve_error(err: &ResolveDependencyTreeError) -> bo
         err,
         ResolveDependencyTreeError::Resolve(_)
             | ResolveDependencyTreeError::NoMatchingVersion(_)
+            | ResolveDependencyTreeError::OverrideNoMatchingVersion(_)
             | ResolveDependencyTreeError::RegistryResponse(_)
             | ResolveDependencyTreeError::GitResolve(_)
             | ResolveDependencyTreeError::UnsupportedProtocol(_)
@@ -92,6 +102,14 @@ fn with_dependency_context(
     opts: &ResolveOptions,
     source: ResolveDependencyTreeError,
 ) -> ResolveDependencyTreeError {
+    // The override entry, not the dependency path, is what the user has to fix.
+    if matches!(
+        source,
+        ResolveDependencyTreeError::OverrideNoMatchingVersion(_)
+            | ResolveDependencyTreeError::LocalSubdepNotAllowed { .. },
+    ) {
+        return source;
+    }
     ResolveDependencyTreeError::DependencyContext(super::super::DependencyResolutionError {
         alias: wanted.alias.clone().unwrap_or_default(),
         specifier: wanted.bare_specifier.clone().unwrap_or_default(),

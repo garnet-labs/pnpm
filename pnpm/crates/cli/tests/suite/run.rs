@@ -3,9 +3,17 @@ use crate::_utils::write_executable;
 use crate::_utils::write_fake_bin;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::{bin::CommandTempCwd, diagnostics::assert_diagnostic_contains};
+use pnpm_testing_utils::{
+    bin::CommandTempCwd,
+    diagnostics::assert_diagnostic_contains,
+};
 use serde_json::json;
-use std::{fs, io, process::Stdio, time::Duration};
+use std::{
+    fs,
+    io,
+    process::Stdio,
+    time::Duration,
+};
 
 /// `pacquet run <script>` looks up the named entry under
 /// `scripts` in the workspace's `package.json` and spawns it via
@@ -88,7 +96,7 @@ fn run_passes_extra_arguments_to_the_script() {
 /// shaped like an option of the script's own program reaches the script
 /// instead of being claimed by it (pnpm/pnpm#13295). Asserts what the
 /// script received rather than the echoed command line, and mirrors the
-/// TypeScript counterpart in `pnpm11/pnpm/test/run.ts` ("run: pass the
+/// TypeScript counterpart in [`pnpm11/pnpm/test/run.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/pnpm/test/run.ts) ("run: pass the
 /// args to the command that is specified in the build script"), down to
 /// only the main stage seeing the arguments.
 #[test]
@@ -248,7 +256,7 @@ fn run_start_without_script_or_server_errors() {
 
 /// An empty `start` script (`"start": ""`) is falsy in pnpm
 /// (`!m.scripts.start`), so it falls back to the `node server.js` path
-/// like a missing one — and with no `server.js` it must raise
+/// like a missing one, and with no `server.js` it must raise
 /// `NO_SCRIPT_OR_SERVER` rather than silently exit 0.
 #[test]
 fn run_empty_start_script_hits_server_js_guard() {
@@ -636,7 +644,7 @@ fn top_level_fallback_accepts_short_sequential_before_the_script() {
 }
 
 /// npm's `--prefix` is accepted as a spelling of `--dir`
-/// (<https://github.com/pnpm/pnpm/issues/13583>) — ahead of the
+/// (<https://github.com/pnpm/pnpm/issues/13583>), ahead of the
 /// subcommand, where pnpm's own options live. Past the script name the
 /// same token is the script's, so the script records what it received.
 #[test]
@@ -680,7 +688,7 @@ fn prefix_selects_the_dir_before_the_subcommand_and_is_the_script_s_after_it() {
 /// error, and the verify-deps-before-run gate (here on its `install`
 /// action) must skip the directory rather than spawn an install that
 /// has no manifest to work with. Mirrors the TypeScript regression
-/// tests in `pnpm11/deps/status/test/checkDepsStatus.test.ts`
+/// tests in [`pnpm11/deps/status/test/checkDepsStatus.test.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/status/test/checkDepsStatus.test.ts)
 /// ("missing workspace state").
 #[test]
 fn top_level_fallback_without_manifest_does_not_attempt_an_install() {
@@ -711,7 +719,7 @@ fn top_level_fallback_without_manifest_does_not_attempt_an_install() {
 }
 
 /// With a non-silent reporter (the default, or e.g. `--reporter=ndjson`),
-/// `pacquet run` echoes `$ <script>` to stderr before spawning the script —
+/// `pacquet run` echoes `$ <script>` to stderr before spawning the script,
 /// matching pnpm's `runLifecycleHook.ts:110`
 /// (`process.stderr.write(chalk.dim($ ${...})...)`). Only `--reporter=silent`
 /// suppresses it.
@@ -831,7 +839,7 @@ fn run_start_fallback_uses_dir_for_server_js_probe() {
     drop(root);
 }
 
-/// `pnpm test` / `start` / `stop` name no command in pnpm — they reach
+/// `pnpm test` / `start` / `stop` name no command in pnpm; they reach
 /// `run` through the `pnpm <script>` fallback, so every token after the
 /// command name is the script's, a `--` separator and anything shaped
 /// like a pnpm flag included.
@@ -933,7 +941,11 @@ mod shell_emulator {
     use command_extra::CommandExtra;
     use pnpm_testing_utils::bin::CommandTempCwd;
     use serde_json::json;
-    use std::{fmt::Write as _, fs, path::Path};
+    use std::{
+        fmt::Write as _,
+        fs,
+        path::Path,
+    };
 
     fn write_project(workspace: &Path, scripts: &serde_json::Value, shell_emulator: bool) {
         write_configured_project(workspace, scripts, None, shell_emulator);
@@ -997,12 +1009,13 @@ mod shell_emulator {
             .expect("write argument recorder");
 
             if streamed {
-                pacquet.args(["--recursive", "--include-workspace-root", "--stream"]);
+                pacquet =
+                    pacquet.with_args(["--recursive", "--include-workspace-root", "--stream"]);
             }
-            pacquet
-                .args(["run", "record"])
-                .args(args)
-                .env("PNPM_QUOTING_TEST", "expanded");
+            pacquet = pacquet
+                .with_args(["run", "record"])
+                .with_args(args)
+                .with_env("PNPM_QUOTING_TEST", "expanded");
             pacquet.assert().success();
 
             let recorded: Vec<String> = serde_json::from_slice(
@@ -1172,7 +1185,7 @@ fn run_with_a_missing_script_shell_names_it() {
         .expect("write pnpm-workspace.yaml");
 
         if streamed {
-            pacquet.args(["--recursive", "--include-workspace-root", "--stream"]);
+            pacquet = pacquet.with_args(["--recursive", "--include-workspace-root", "--stream"]);
         }
         let output = pacquet
             .with_args(["run", "build"])

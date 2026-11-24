@@ -1,6 +1,14 @@
 use super::{
-    CliCommand, CommandFuture, ExecutionTimeLog, LogEvent, LogLevel, OtpNonInteractiveError,
-    RunCtx, dispatch_install, dispatch_query, dispatch_script,
+    CliCommand,
+    CommandFuture,
+    ExecutionTimeLog,
+    LogEvent,
+    LogLevel,
+    OtpNonInteractiveError,
+    RunCtx,
+    dispatch_install,
+    dispatch_query,
+    dispatch_script,
 };
 
 /// Route the command and await it, so a routing failure and a command
@@ -25,6 +33,7 @@ pub(super) fn route<'a>(
 ) -> miette::Result<CommandFuture<'a>> {
     match command {
         CliCommand::Add(args) => dispatch_install::add(ctx, args),
+        CliCommand::Edit(args) => dispatch_install::edit(ctx, args),
         CliCommand::Install(args) => dispatch_install::install(ctx, args),
         CliCommand::InstallTest(args) => dispatch_install::install_test(ctx, args),
         CliCommand::Ci(args) => dispatch_install::ci(ctx, args),
@@ -96,8 +105,7 @@ fn route_project<'a>(command: CliCommand, ctx: &RunCtx<'a>) -> miette::Result<Co
         CliCommand::Stop(args) => dispatch_script::stop(ctx, args),
         CliCommand::Restart(args) => dispatch_script::restart(ctx, args),
         CliCommand::Pkg(args) => dispatch_script::pkg(ctx, args),
-        CliCommand::Edit(_) => dispatch_query::not_implemented("edit"),
-        CliCommand::Xmas(_) => dispatch_query::not_implemented("xmas"),
+        CliCommand::Catalog(args) => dispatch_script::catalog(ctx, args),
         command => route_maintenance(command, ctx),
     }
 }
@@ -114,6 +122,7 @@ fn route_maintenance<'a>(
         CliCommand::List(args) => dispatch_query::list(ctx, args),
         CliCommand::Ll(args) => dispatch_query::ll(ctx, args),
         CliCommand::Licenses(args) => dispatch_query::licenses(ctx, args),
+        CliCommand::Fund(args) => dispatch_query::fund(ctx, args),
         CliCommand::Why(args) => dispatch_query::why(ctx, args),
         CliCommand::Sbom(args) => dispatch_query::sbom(ctx, args),
         CliCommand::Doctor(args) => dispatch_query::doctor(ctx, args),
@@ -163,17 +172,11 @@ pub(super) fn exit_on_json_error(
     result
 }
 
-pub(super) fn prints_json_errors(command: &CliCommand) -> bool {
-    match command {
-        CliCommand::Publish(args) => args.flags.output.json,
-        CliCommand::View(args) => args.json,
-        CliCommand::Pack(args) => args.json,
-        _ => false,
-    }
-}
-
 pub(super) fn print_json_error(error: &miette::Report) {
-    let code = error.code().map_or_else(|| "pnpm".to_string(), |code| code.to_string());
+    let code = error
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "pnpm".to_string());
     let message = json_error_message(error);
     let mut error_body = serde_json::json!({
         "code": code,

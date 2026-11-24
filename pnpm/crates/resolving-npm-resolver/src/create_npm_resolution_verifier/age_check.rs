@@ -1,7 +1,18 @@
 use super::{
-    Arc, DateTime, MINIMUM_RELEASE_AGE_VIOLATION_CODE, NpmResolutionVerifier, OnceCell, PkgName,
-    ResolutionVerification, SkippedTimeCheck, Utc, package_key, parse_packument_timestamp,
-    to_registry_url, uncheckable, version_key, warn_missing_time_once,
+    Arc,
+    MINIMUM_RELEASE_AGE_VIOLATION_CODE,
+    NpmResolutionVerifier,
+    OnceCell,
+    PkgName,
+    ResolutionVerification,
+    SkippedTimeCheck,
+    Timestamp,
+    package_key,
+    parse_packument_timestamp,
+    to_registry_url,
+    uncheckable,
+    version_key,
+    warn_missing_time_once,
 };
 
 impl NpmResolutionVerifier {
@@ -36,7 +47,7 @@ impl NpmResolutionVerifier {
         // Cheapest layer: for an entry whose canonical tarball this
         // install fetches (existence fail-closed by the fetch itself),
         // a package-level `Last-Modified` older than the cutoff bounds
-        // every version's publish time — no metadata body needed. The
+        // every version's publish time, no metadata body needed. The
         // evidence cell is consulted before the probe so installs that
         // never fill it (no materialization, or a resolver alongside)
         // send no extra request.
@@ -70,8 +81,10 @@ impl NpmResolutionVerifier {
             return Some(ResolutionVerification::Err {
                 code: MINIMUM_RELEASE_AGE_VIOLATION_CODE,
                 reason: format!(
-                    "was published at {published}, within the minimumReleaseAge cutoff ({cutoff})",
-                    cutoff = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    "was published at {published}, within the minimumReleaseAge cutoff ({cutoff}{counted_from})",
+                    cutoff = pnpm_time::format_millis(cutoff),
+                    counted_from =
+                        if self.now.is_some() { ", counted back from referenceTime" } else { "" },
                 ),
             });
         }
@@ -82,10 +95,10 @@ impl NpmResolutionVerifier {
     /// reports is older than `cutoff` by more than the header's own
     /// one-second resolution. HTTP dates carry whole seconds, and a
     /// registry that truncates a fractional `time.modified` understates
-    /// it by up to 999ms — the guard band keeps the comparison an upper
+    /// it by up to 999ms, the guard band keeps the comparison an upper
     /// bound regardless of how the server rounds. `false` when the
     /// probe fails, the header is missing or unparsable, or the
-    /// registry is unreachable — the caller falls through to the
+    /// registry is unreachable, the caller falls through to the
     /// metadata-backed layers, so the probe can only ever *save* a
     /// body, never widen what passes. Trust-wise the header is the same
     /// statement as the packument body's `time.modified`, served by the
@@ -95,7 +108,7 @@ impl NpmResolutionVerifier {
         &self,
         registry: &str,
         name: &PkgName,
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
     ) -> bool {
         if self.metadata.offline {
             return false;
@@ -112,30 +125,48 @@ impl NpmResolutionVerifier {
         let modified = cell.get_or_init(|| self.fetch_head_modified(registry, name)).await;
         modified
             .as_deref()
-            .and_then(|value| httpdate::parse_http_date(value).ok())
-            .map(DateTime::<Utc>::from)
-            .is_some_and(|parsed| parsed + chrono::Duration::seconds(1) <= cutoff)
+            .map(httpdate::parse_http_date)
+            .and_then(Result::ok)
+            .map(Timestamp::try_from)
+            .and_then(Result::ok)
+            .and_then(|parsed| {
+                parsed
+                    .checked_add(jiff::SignedDuration::from_secs(1))
+                    .ok()
+            })
+            .is_some_and(|upper_bound| upper_bound <= cutoff)
     }
 
     async fn fetch_head_modified(&self, registry: &str, name: &PkgName) -> Option<String> {
         let url = to_registry_url(registry, &name.to_string());
-        let guard =
-            self.metadata.http_client.acquire_for_url_with_priority(&url, pnpm_network::BACKGROUND)
-                .await;
-        let mut request = guard.head(&url);
-        if let Some(value) =
-            self.metadata.auth_headers.for_url_with_package(&url, Some(&name.to_string()))
-        {
-            request = request.header("authorization", value);
-        }
-        let response = match request.send().await {
+        let package = name.to_string();
+        let sent = match self.metadata.auth_headers.fetch_local(
+            &url,
+            Some(&package),
+            reqwest::header::HeaderMap::new(),
+        ) {
+            Some(response) => Ok(response.await),
+            None => pnpm_network::PackageRequest {
+                url: &url,
+                package: &package,
+                auth: &self.metadata.auth_headers,
+                headers: reqwest::header::HeaderMap::new(),
+                method: reqwest::Method::HEAD,
+                priority: pnpm_network::BACKGROUND,
+            }
+            .send_once(&self.metadata.http_client)
+            .await
+            .map(|(_, response)| response),
+        };
+        let response = match sent {
             Ok(response) if response.status().is_success() => response,
             _ => return None,
         };
         response
             .headers()
             .get("last-modified")
-            .and_then(|value| value.to_str().ok())
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok)
             .map(str::to_string)
     }
 
@@ -165,18 +196,19 @@ impl NpmResolutionVerifier {
     /// 1. **Abbreviated-`modified` shortcut.** Abbreviated metadata is
     ///    a small per-name document the resolver typically already
     ///    holds. Its package-level `modified` is an upper bound on
-    ///    every version's publish time — if it's older than the
+    ///    every version's publish time, if it's older than the
     ///    cutoff *and* the pinned version is still listed in
     ///    `versions`, the gate is satisfied without per-version
     ///    timestamps. Costs at most one abbreviated GET per name on
     ///    cold cache; the full-meta fallback below is hundreds of KB
     ///    bigger per package.
-    /// 2. **Abbreviated per-version `time`** — only with
-    ///    `registrySupportsTimeField`. Registries that serve the `time`
-    ///    map in abbreviated metadata (Verdaccio 5.15.1+, pnpr) already
-    ///    gave us the exact per-version timestamp in the document step 1
-    ///    fetched, so a recent `modified` does not have to escalate to
-    ///    the per-version fallbacks below.
+    /// 2. **Abbreviated per-version `time`.** When the document step 1
+    ///    read carries a `time` map, it already holds the exact
+    ///    per-version timestamp, so a recent `modified` does not have
+    ///    to escalate to the per-version fallbacks below. Registries
+    ///    that serve `time` in abbreviated metadata (Verdaccio 5.15.1+,
+    ///    pnpr) do, and so does a mirror the resolver upgraded to the
+    ///    full document for its own release-age check.
     /// 3. **On-disk full-meta mirror.** If a previous verification
     ///    populated `<cache_dir>/v12/metadata-full/.../<name>.jsonl`,
     ///    take the per-version timestamp from there with no network.
@@ -193,9 +225,7 @@ impl NpmResolutionVerifier {
         if let Some(value) = self.try_abbreviated_modified_shortcut(registry, name, version).await {
             return Ok(Some(value));
         }
-        if self.supports_time_field(registry)
-            && let Some(value) = self.abbreviated_version_time(registry, name, version).await
-        {
+        if let Some(value) = self.abbreviated_version_time(registry, name, version).await {
             return Ok(Some(value));
         }
         if let Some(map) = self.read_local_meta_time(registry, name).await
@@ -211,7 +241,7 @@ impl NpmResolutionVerifier {
     }
 
     /// Returns the package's `modified` timestamp *iff* it proves the
-    /// gate would pass — i.e. it's strictly older than the policy
+    /// gate would pass, i.e. it's strictly older than the policy
     /// cutoff *and* the pinned version is still listed in the
     /// package's current versions map.
     ///
@@ -247,9 +277,8 @@ impl NpmResolutionVerifier {
 
     /// The pinned version's publish timestamp from the abbreviated
     /// document's `time` map. Reuses the same cached projection as the
-    /// `modified` shortcut, so with `registrySupportsTimeField` the
-    /// whole lookup stays within the one document the verifier already
-    /// holds. A fetch failure or an absent entry falls through to the
+    /// `modified` shortcut, so the whole lookup stays within the one
+    /// document the verifier already holds. A fetch failure or an absent entry falls through to the
     /// per-version fallbacks, exactly like the shortcut above.
     pub(super) async fn abbreviated_version_time(
         &self,
@@ -262,5 +291,24 @@ impl NpmResolutionVerifier {
             .as_ref()?
             .get(version)
             .cloned()
+    }
+}
+
+impl super::ReleaseAgeCheck {
+    pub(super) fn new(opts: super::VerificationReleaseAgeOptions, now: Option<Timestamp>) -> Self {
+        let checked_at = now.unwrap_or_else(Timestamp::now);
+        let cutoff = super::policy_snapshot::minimum_release_age_cutoff(&opts, Some(checked_at));
+        let sorted_excludes = super::policy_snapshot::sorted_unique(opts.exclude_patterns);
+        Self {
+            minimum_minutes: opts.minimum_minutes,
+            checked_at,
+            cutoff,
+            exclude: opts.exclude,
+            sorted_excludes,
+        }
+    }
+
+    pub(super) fn age_check_active(&self) -> bool {
+        self.minimum_minutes.is_some_and(|minutes| minutes > 0)
     }
 }

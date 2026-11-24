@@ -18,27 +18,38 @@
 //! key. A missing file fails the command loudly rather than running with a
 //! partial environment.
 //!
-//! The load runs on the main thread before the startup thread exists, the
-//! only place `std::env::set_var` may run. `--env-file` is this binary's
-//! own option: [`strip_flags`] removes its tokens from the argv a
-//! dispatched pnpm receives (an older pnpm would reject the unknown flag),
-//! and the loaded variables travel by environment inheritance instead.
-//! Tokens past the passthrough point — script arguments after `--`, or
-//! after a `run`/`exec` script name — are left alone (see
-//! `crate::parse_boundary`).
+//! `--env-file` is this binary's own option: [`strip_flags`] removes its
+//! tokens from the argv a dispatched pnpm receives (an older pnpm would
+//! reject the unknown flag), and the loaded variables travel by
+//! environment inheritance instead. Tokens past the passthrough point
+//! (script arguments after `--`, or after a `run`/`exec` script name) are
+//! left alone (see `crate::parse_boundary`).
 
 mod parse;
 
 use crate::{
     flag_relocation::ArgTable,
-    parse_boundary::{option_width, passthrough_from, union_arity},
+    parse_boundary::{
+        option_width,
+        passthrough_from,
+        union_arity,
+    },
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use std::{
     collections::HashSet,
-    ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
+    ffi::{
+        OsStr,
+        OsString,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Raised when an `--env-file` file cannot be read.
@@ -51,31 +62,43 @@ pub enum EnvFileError {
     Read { path: PathBuf, source: std::io::Error },
 }
 
-/// Load each file in order, layering its variables into the process
-/// environment. Later files override earlier files, and variables the
-/// environment already defines are left untouched.
-pub fn load<PathItem: AsRef<Path>>(paths: &[PathItem]) -> miette::Result<()> {
+/// Load each file in order, handing every variable it defines to `set`.
+/// Later files override earlier files, and variables the environment
+/// already defines are left untouched.
+fn load<PathItem: AsRef<Path>>(
+    paths: &[PathItem],
+    mut set: impl FnMut(&str, &str),
+) -> miette::Result<HashSet<String>> {
+    let mut names = HashSet::new();
     let mut loaded_keys = HashSet::new();
     for path in paths {
-        load_one(path.as_ref(), &mut loaded_keys)?;
+        names.extend(load_one(path.as_ref(), &mut loaded_keys, &mut set)?);
     }
-    Ok(())
+    Ok(names)
 }
 
-/// Scan `argv` for `--env-file` paths and load them. Runs on the main
-/// thread before the startup thread exists (see [`crate::main`]), which is
-/// what makes the `set_var` calls in [`load`] sound. Best-effort by
-/// necessity: around an option this binary does not know, the width
-/// computation can only guess, but such a command line is rejected or
-/// forwarded to another pnpm anyway.
-pub fn load_from_argv(argv: &[OsString]) -> miette::Result<()> {
-    load(&scan(argv).0)
+/// Scan `argv` for `--env-file` paths and load them.
+///
+/// `single_threaded` is what permits the environment change, and so what
+/// pins this call to the stretch of `main` before any thread starts.
+/// Best-effort by necessity: around an option this binary does not know,
+/// the width computation can only guess, but such a command line is
+/// rejected or forwarded to another pnpm anyway.
+pub fn load_from_argv(
+    argv: &[OsString],
+    single_threaded: &pnpm_ffi_process::SingleThreaded,
+) -> miette::Result<()> {
+    let names = load(&scan(argv).0, |name: &str, value: &str| {
+        single_threaded.set_var(name, value);
+    })?;
+    crate::invocation_environment::record_env_file(names);
+    Ok(())
 }
 
 /// Remove the `--env-file` tokens from an argv that still carries the
 /// program name at index 0 (the shape the entry point builds the child argv
-/// from), keeping every other token — including tokens past the passthrough
-/// point — in place.
+/// from), keeping every other token (including tokens past the passthrough
+/// point) in place.
 pub fn strip_flags(argv: &[OsString]) -> Vec<OsString> {
     scan(argv).1
 }
@@ -84,7 +107,12 @@ pub fn strip_flags(argv: &[OsString]) -> Vec<OsString> {
 /// file. Without stripping it, the first key would carry a leading U+FEFF.
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
-fn load_one(path: &Path, loaded_keys: &mut HashSet<String>) -> miette::Result<()> {
+fn load_one(
+    path: &Path,
+    loaded_keys: &mut HashSet<String>,
+    mut set: impl FnMut(&str, &str),
+) -> miette::Result<Vec<String>> {
+    let mut names = Vec::new();
     let bytes =
         std::fs::read(path).map_err(|source| EnvFileError::Read { path: path.to_owned(), source })?;
     let stripped = bytes.strip_prefix(&UTF8_BOM).unwrap_or(&bytes);
@@ -95,18 +123,14 @@ fn load_one(path: &Path, loaded_keys: &mut HashSet<String>) -> miette::Result<()
         if key.is_empty() {
             continue;
         }
+        names.push(key.to_string());
         let id = env_key_id(key);
         if std::env::var_os(key).is_none() || loaded_keys.contains(&id) {
             loaded_keys.insert(id);
-            // SAFETY: `load` runs on the main thread before `run_on_big_stack`
-            // spawns the startup thread, so no other thread exists that
-            // could access the environment concurrently.
-            unsafe {
-                std::env::set_var(key, value);
-            }
+            set(key, value);
         }
     }
-    Ok(())
+    Ok(names)
 }
 
 fn until_nul(text: &str) -> &str {
@@ -128,7 +152,7 @@ fn env_key_id(key: &str) -> String {
 /// [`claimable_value`]); a valueless `--env-file` stays in place for clap
 /// to report. The `--env-file=<path>` form always carries its own value.
 fn scan(argv: &[OsString]) -> (Vec<PathBuf>, Vec<OsString>) {
-    let passthrough = child_argv_boundary(argv);
+    let passthrough = passthrough_from(argv);
     let arity = union_arity();
     let mut paths = Vec::new();
     let mut remaining = Vec::with_capacity(argv.len());
@@ -149,21 +173,6 @@ fn scan(argv: &[OsString]) -> (Vec<PathBuf>, Vec<OsString>) {
         }
     }
     (paths, remaining)
-}
-
-/// The first argv index that must reach the child untouched, over an argv
-/// that still carries the program name at index 0.
-///
-/// `pm` forces the built-in command but is not a subcommand of its own, so
-/// the boundary is computed as if the prefix were absent and shifted back
-/// afterwards. Without that, everything after a leading `pm` would look
-/// forwarded and `--env-file` would never be stripped.
-fn child_argv_boundary(argv: &[OsString]) -> Option<usize> {
-    let pm_prefix = usize::from(
-        argv.get(1)
-            .is_some_and(|token| token == "pm"),
-    );
-    passthrough_from(&argv[pm_prefix..]).map(|boundary| boundary + pm_prefix)
 }
 
 /// The `--env-file` path named at `index`, with the number of argv slots
@@ -204,15 +213,20 @@ fn strip_env_file_prefix(token: &OsStr) -> Option<PathBuf> {
         token
             .as_bytes()
             .strip_prefix(b"--env-file=")
-            .map(|bytes| PathBuf::from(OsStr::from_bytes(bytes)))
+            .map(OsStr::from_bytes)
+            .map(PathBuf::from)
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use std::os::windows::ffi::{
+            OsStrExt as _,
+            OsStringExt as _,
+        };
         let wide: Vec<u16> = token.encode_wide().collect();
         let prefix: Vec<u16> = "--env-file=".encode_utf16().collect();
         wide.strip_prefix(prefix.as_slice())
-            .map(|rest| PathBuf::from(OsString::from_wide(rest)))
+            .map(OsString::from_wide)
+            .map(PathBuf::from)
     }
     #[cfg(not(any(unix, target_os = "wasi", windows)))]
     {

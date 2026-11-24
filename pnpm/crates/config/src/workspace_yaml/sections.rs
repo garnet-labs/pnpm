@@ -1,6 +1,21 @@
-pub use remote::{RemoteCacheSettings, RemoteSideEffectsCacheSettings};
+pub use pnpm_resolving_resolver_base::{
+    PackageExtension,
+    PeerDependencyMeta,
+};
+pub use remote::{
+    RemoteCacheSettings,
+    RemoteSideEffectsCacheSettings,
+};
 
-use super::{AuditLevel, BTreeMap, Deserialize, Deserializer, HashMap, IndexMap, overlay_some};
+use super::{
+    AuditLevel,
+    BTreeMap,
+    Deserialize,
+    Deserializer,
+    HashMap,
+    IndexMap,
+    overlay_some,
+};
 
 mod remote;
 
@@ -223,7 +238,7 @@ pub const DEFAULT_RUST_DIST_SERVER: &str = "https://static.rust-lang.org";
 
 /// `lockfile` as written: either a bare boolean, or the section that turns
 /// the lockfile on and configures what it records.
-#[derive(Debug, PartialEq, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum LockfileSetting {
     Enabled(bool),
@@ -231,16 +246,17 @@ pub enum LockfileSetting {
 }
 
 /// What the lockfile records beyond the resolved dependency graph.
-#[derive(Debug, Default, PartialEq, serde::Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct LockfileSettings {
     pub include_resolution_settings: Option<bool>,
     pub integrity_target: Option<pnpm_lockfile::IntegrityTarget>,
+    pub format: Option<pnpm_lockfile::LockfileFormat>,
 }
 
 /// `sideEffectsCache` as written: either a bare boolean, or the declaration
 /// carrying all three parts.
-#[derive(Debug, PartialEq, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SideEffectsCacheSetting {
     Enabled(bool),
@@ -250,9 +266,9 @@ pub enum SideEffectsCacheSetting {
     Settings(Box<SideEffectsCacheSettings>),
 }
 
-/// Where a dependency's build output may be reused from: this machine, and —
-/// through [`Self::remote`] — other machines in the same organization.
-#[derive(Debug, Default, PartialEq, serde::Serialize, Deserialize)]
+/// Where a dependency's build output may be reused from: this machine, and,
+/// through [`Self::remote`], other machines in the same organization.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SideEffectsCacheSettings {
     /// Restore a package's build from the cache when one is present.
@@ -363,7 +379,7 @@ pub struct TaskSettings {
     ///
     /// A task with no declaration behaves as `dependsOn: ['^<its own
     /// name>']`. An entry with `dependsOn` omitted declares an empty
-    /// dependency list — the task depends on nothing and may start
+    /// dependency list, the task depends on nothing and may start
     /// immediately.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<Vec<String>>,
@@ -439,7 +455,9 @@ struct RawTaskSettings {
 
 impl<'de> Deserialize<'de> for TaskSettings {
     fn deserialize<De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
-        let raw = RawTaskSettings::deserialize(deserializer)?;
+        use serde::de::Error as _;
+        let raw = Option::<RawTaskSettings>::deserialize(deserializer)?
+            .ok_or_else(|| De::Error::custom(EMPTY_TASK_ENTRY_ERROR))?;
         let concurrency = raw.concurrency.as_ref().and_then(serde_json::Value::as_i64);
         let invalid_concurrency = raw.concurrency.filter(|value| value.as_i64().is_none());
         let priority = raw.priority.as_ref().and_then(json_i32);
@@ -461,10 +479,15 @@ impl<'de> Deserialize<'de> for TaskSettings {
     }
 }
 
+const EMPTY_TASK_ENTRY_ERROR: &str = "a `tasks` entry must be a mapping. \
+    Write `{}` for a task with no settings, or remove the entry to keep the default \
+    `dependsOn: ['^<task>']`";
+
 fn json_i32(value: &serde_json::Value) -> Option<i32> {
     value
         .as_i64()
-        .and_then(|n| i32::try_from(n).ok())
+        .map(i32::try_from)
+        .and_then(Result::ok)
 }
 
 /// `updateConfig` entry: settings that tune `pnpm update`.
@@ -516,31 +539,6 @@ pub struct PeerDependencyRules {
     pub allow_any: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_versions: Option<BTreeMap<String, String>>,
-}
-
-/// One `packageExtensions` entry: a subset of a manifest's dependency
-/// groups, merged onto every matching manifest at install time. The
-/// fields are `dependencies`, `optionalDependencies`,
-/// `peerDependencies`, and `peerDependenciesMeta`.
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PackageExtension {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dependencies: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub optional_dependencies: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peer_dependencies: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peer_dependencies_meta: Option<BTreeMap<String, PeerDependencyMeta>>,
-}
-
-/// `peerDependenciesMeta` entry shape: a single `optional` flag.
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PeerDependencyMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub optional: Option<bool>,
 }
 
 /// Refuse `channels` for a tool that publishes one line of builds, where

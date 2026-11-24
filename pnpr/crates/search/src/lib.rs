@@ -1,15 +1,18 @@
 //! Local implementation of the npm `/-/v1/search` endpoint.
 //!
 //! Verdaccio (which this server replaces in `@pnpm/registry-mock`)
-//! does **not** proxy search to its upstream npmjs — it scans the
+//! does **not** proxy search to its upstream npmjs; it scans the
 //! local storage and matches on package name. Tests rely on that
 //! behavior.
 
 use pnpr_error::Result;
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_storage::Storage;
-use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchText {
@@ -30,10 +33,9 @@ pub fn parse_params(query_string: &str, default_size: usize) -> Option<SearchPar
     let text = query
         .strip_prefix("maintainer:")
         .filter(|maintainer| !maintainer.is_empty())
-        .map_or_else(
-            || SearchText::Package(query.clone()),
-            |maintainer| SearchText::Maintainer(maintainer.to_string()),
-        );
+        .map(std::string::ToString::to_string)
+        .map(SearchText::Maintainer)
+        .unwrap_or_else(|| SearchText::Package(query.clone()));
     Some(SearchParams {
         text,
         from: parse_from(query_string),
@@ -49,17 +51,13 @@ pub fn parse_params(query_string: &str, default_size: usize) -> Option<SearchPar
 #[must_use]
 pub fn parse_query(query_string: &str) -> Option<String> {
     let mut fallback: Option<String> = None;
-    for pair in query_string.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let decoded = percent_decode(value);
-        if decoded.is_empty() {
+    for (key, value) in url::form_urlencoded::parse(query_string.as_bytes()) {
+        if value.is_empty() {
             continue;
         }
-        match key {
-            "text" => return Some(decoded),
-            "q" if fallback.is_none() => fallback = Some(decoded),
+        match key.as_ref() {
+            "text" => return Some(value.into_owned()),
+            "q" if fallback.is_none() => fallback = Some(value.into_owned()),
             _ => {}
         }
     }
@@ -112,7 +110,7 @@ pub async fn local_search_names(
         SearchText::Package(query) | SearchText::Maintainer(query) => query.to_lowercase(),
     };
     let mut matches = Vec::new();
-    let mut names = storage.hosted_package_names().await?;
+    let mut names = storage.hosted_published_package_names().await?;
     names.sort();
 
     for name in names {
@@ -142,27 +140,15 @@ async fn hosted_package_has_maintainer(storage: &Storage, name: &str, needle: &s
     packument_has_maintainer(&packument, needle)
 }
 
-pub async fn local_search_entry(storage: &Storage, name: &str) -> Value {
-    let entry = async {
-        let parsed = CanonicalPackageName::parse(name, pnpr_package_name::Ecosystem::Npm).ok()?;
-        let bytes = storage.read_hosted_document(&parsed).await.ok()??;
-        let packument = serde_json::from_slice::<Value>(&bytes).ok()?;
-        build_search_entry(name, &packument)
-    }
-    .await;
-    entry.unwrap_or_else(|| build_minimal_search_entry(name))
-}
-
-fn build_minimal_search_entry(name: &str) -> Value {
-    json!({
-        "package": { "name": name },
-        "score": { "final": 1.0 },
-        "searchScore": 1.0,
-    })
+pub async fn local_search_entry(storage: &Storage, name: &str) -> Option<Value> {
+    let parsed = CanonicalPackageName::parse(name, pnpr_package_name::Ecosystem::Npm).ok()?;
+    let bytes = storage.read_hosted_document(&parsed).await.ok()??;
+    let packument = serde_json::from_slice::<Value>(&bytes).ok()?;
+    build_search_entry(name.to_owned(), &packument)
 }
 
 /// Construct one entry for the `objects` array.
-fn build_search_entry(name: &str, packument: &Value) -> Option<Value> {
+fn build_search_entry(name: String, packument: &Value) -> Option<Value> {
     Some(json!({
         "package": build_search_package(name, packument)?,
         "score": {"final": 1.0, "detail": {"quality": 1.0, "popularity": 1.0, "maintenance": 1.0}},
@@ -172,34 +158,41 @@ fn build_search_entry(name: &str, packument: &Value) -> Option<Value> {
 
 /// Project a packument into the subset of fields npm's search
 /// endpoint returns per result.
-fn build_search_package(name: &str, packument: &Value) -> Option<Value> {
+fn build_search_package(name: String, packument: &Value) -> Option<Value> {
     let obj = packument.as_object()?;
     let versions = obj.get("versions").and_then(Value::as_object)?;
     let version_id = latest_version_id(obj, versions)?;
     let version_obj = versions.get(version_id).and_then(Value::as_object);
     let mut pkg = Map::new();
-    pkg.insert("name".to_string(), Value::String(name.to_string()));
+    pkg.insert("name".to_string(), Value::String(name));
     pkg.insert("version".to_string(), Value::String(version_id.to_string()));
     insert_version_fields(&mut pkg, version_obj);
-    if let Some(maintainers) = obj
+    let maintainers = obj
         .get("maintainers")
         .or_else(|| version_obj.and_then(|version| version.get("maintainers")))
-    {
-        pkg.insert("maintainers".to_string(), maintainers.clone());
-    }
+        .map(search_maintainers)
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    pkg.insert("maintainers".to_string(), maintainers);
     if let Some(time) = obj.get("time").and_then(Value::as_object) {
         let date = time
             .get(version_id)
-            .cloned()
-            .or_else(|| time.get("modified").cloned());
+            .or_else(|| time.get("modified"))
+            .filter(|value| value.is_string())
+            .cloned();
         if let Some(date) = date {
             pkg.insert("date".to_string(), date);
         }
     }
-    if let Some(npm_user) = version_obj.and_then(|v| v.get("_npmUser")) {
-        pkg.insert("publisher".to_string(), npm_user.clone());
+    if let Some(publisher) = version_obj
+        .and_then(|version| {
+            version
+                .get("_npmUser")
+                .or_else(|| version.get("publisher"))
+        })
+        .and_then(search_user)
+    {
+        pkg.insert("publisher".to_string(), publisher);
     }
-    pkg.insert("links".to_string(), package_links(name)?);
     Some(Value::Object(pkg))
 }
 
@@ -221,12 +214,27 @@ fn latest_version_id<'p>(
         })
 }
 
-/// `links.npm` is what the npm website surfaces. Synthesized
-/// from the name so the search response looks the part.
-fn package_links(name: &str) -> Option<Value> {
-    let mut links = BTreeMap::new();
-    links.insert("npm".to_string(), Value::String(format!("https://npmx.dev/package/{name}")));
-    serde_json::to_value(links).ok()
+fn search_maintainers(maintainers: &Value) -> Value {
+    Value::Array(
+        maintainers
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(search_user)
+            .collect(),
+    )
+}
+
+fn search_user(user: &Value) -> Option<Value> {
+    let username = user
+        .get("username")
+        .and_then(Value::as_str)
+        .or_else(|| user.get("name").and_then(Value::as_str))?;
+    let mut result = json!({ "username": username });
+    if let Some(email) = user.get("email").and_then(Value::as_str) {
+        result["email"] = json!(email);
+    }
+    Some(result)
 }
 
 /// Copy the per-version fields npm's search results carry.
@@ -242,19 +250,23 @@ fn insert_version_fields(pkg: &mut Map<String, Value>, version_obj: Option<&Map<
 }
 
 fn packument_has_maintainer(packument: &Value, needle: &str) -> bool {
+    let Some(versions) = packument
+        .get("versions")
+        .and_then(Value::as_object)
+        .filter(|versions| !versions.is_empty())
+    else {
+        return false;
+    };
     if maintainer_value_matches(packument.get("maintainers"), needle) {
         return true;
     }
-    let versions = packument.get("versions").and_then(Value::as_object);
-    versions.is_some_and(|versions| {
-        versions
-            .values()
-            .any(|version| {
-                maintainer_value_matches(version.get("maintainers"), needle)
-                    || maintainer_value_matches(version.get("_npmUser"), needle)
-                    || maintainer_value_matches(version.get("publisher"), needle)
-            })
-    })
+    versions
+        .values()
+        .any(|version| {
+            maintainer_value_matches(version.get("maintainers"), needle)
+                || maintainer_value_matches(version.get("_npmUser"), needle)
+                || maintainer_value_matches(version.get("publisher"), needle)
+        })
 }
 
 fn maintainer_value_matches(value: Option<&Value>, needle: &str) -> bool {
@@ -266,46 +278,10 @@ fn maintainer_value_matches(value: Option<&Value>, needle: &str) -> bool {
         Some(Value::Object(value)) => ["username", "name", "email"]
             .iter()
             .filter_map(|field| value.get(*field).and_then(Value::as_str))
-            .any(|value| value.to_lowercase().contains(needle)),
+            .map(str::to_lowercase)
+            .any(|lowercase| lowercase.contains(needle)),
         _ => false,
     }
-}
-
-/// Decode a percent-encoded query value. ASCII-oriented: multi-byte UTF-8
-/// sequences decode byte-by-byte, which is lossless for the ASCII values
-/// (package names, numbers) the query parsers here feed it.
-#[must_use]
-pub fn percent_decode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut bytes = input.bytes();
-    while let Some(byte) = bytes.next() {
-        match byte {
-            b'+' => out.push(' '),
-            b'%' => {
-                let Some(hi) = bytes.next() else {
-                    out.push('%');
-                    return out;
-                };
-                let Some(lo) = bytes.next() else {
-                    out.push('%');
-                    out.push(hi as char);
-                    return out;
-                };
-                let pair = [hi, lo];
-                if let Ok(s) = std::str::from_utf8(&pair)
-                    && let Ok(decoded) = u8::from_str_radix(s, 16)
-                {
-                    out.push(decoded as char);
-                } else {
-                    out.push('%');
-                    out.push(hi as char);
-                    out.push(lo as char);
-                }
-            }
-            other => out.push(other as char),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

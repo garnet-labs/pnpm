@@ -10,6 +10,7 @@ import type { Duplex } from 'node:stream'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import zlib from 'node:zlib'
 
+import { downloadPnpmExecutableWithNpmRegistry } from '../lib/downloadExecutable.js'
 import { downloadPnpmExecutable } from '../lib/index.js'
 import { platformPackageName } from '../lib/platformPackageName.js'
 import type { SigningKey } from '../lib/verifySignature.js'
@@ -27,17 +28,24 @@ const KEYS: SigningKey[] = [{
 }]
 
 /** One thing broken per run, to drive each refusal separately. */
-type Mode = 'ok' | 'bad-tarball' | 'bad-signature' | 'unsigned' | 'root-signatures' | 'root-bad-signature' | 'no-integrity' | 'no-executable' | 'npm-tarball-url' | 'truncated'
+type Mode = 'ok' | 'bad-tarball' | 'bad-signature' | 'unsigned' | 'root-signatures' | 'root-bad-signature' | 'no-version-document' | 'npm-signatures' | 'npm-bad-signature' | 'no-integrity' | 'no-executable' | 'npm-tarball-url' | 'same-origin-tarball' | 'truncated'
 
 let tmpDir: string
 let server: http.Server
+/** Stands in for npm's registry, where signatures a registry strips are looked up. */
+let npm: http.Server
 let cdn: http.Server
 let proxy: http.Server
 /** An origin nothing downloads from, to probe the route a request takes. */
 let probe: http.Server
+/** How many requests reached `probe`. */
+let probeRequests = 0
+/** Statuses to answer the next requests to npm with, one per request, instead of serving them. */
+let npmStatuses: number[] = []
 let registry: string
 let mode: Mode = 'ok'
 let requests: Array<{ path: string, authorization?: string }> = []
+let npmRequests: Array<{ path: string, authorization?: string }> = []
 let cdnRequests: Array<{ path: string, authorization?: string }> = []
 /** `host:port` of every origin a client reached through the proxy. */
 let proxiedOrigins: string[] = []
@@ -77,6 +85,7 @@ describe('downloadPnpmExecutable', () => {
     await listen(cdn)
 
     probe = http.createServer((req, res) => {
+      probeRequests++
       res.end()
     })
     await listen(probe)
@@ -84,6 +93,9 @@ describe('downloadPnpmExecutable', () => {
     server = http.createServer(handleRegistryRequest)
     await listen(server)
     registry = `${addressOf(server)}/`
+
+    npm = http.createServer(handleNpmRequest)
+    await listen(npm)
 
     // A forwarding proxy. Which of the two forms a proxied client uses for a
     // plain-http origin depends on the Node release: a CONNECT tunnel, or a
@@ -97,13 +109,14 @@ describe('downloadPnpmExecutable', () => {
   })
 
   after(async () => {
-    await Promise.all([close(server), close(cdn), close(proxy), close(probe)])
+    await Promise.all([close(server), close(npm), close(cdn), close(proxy), close(probe)])
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
 
   beforeEach(() => {
     mode = 'ok'
     requests = []
+    npmRequests = []
     cdnRequests = []
     proxiedOrigins = []
     holdSecondTarball = null
@@ -113,6 +126,8 @@ describe('downloadPnpmExecutable', () => {
     registryStatuses = []
     registryEmptiesRemaining = 0
     tarballEmptiesRemaining = 0
+    probeRequests = 0
+    npmStatuses = []
   })
 
   test('places the executable and nothing else', async () => {
@@ -146,6 +161,18 @@ describe('downloadPnpmExecutable', () => {
 
     assert.equal(requests[0]!.authorization, 'Bearer a-token')
     assert.equal(cdnRequests[0]!.authorization, undefined)
+  })
+
+  test('withholds credentials scoped to the registry path from a same-origin tarball outside it', async () => {
+    mode = 'same-origin-tarball'
+    const headers = { authorization: 'Bearer a-token' }
+
+    await downloadPnpmExecutable({ version: VERSION, registry: `${addressOf(server)}/npm/`, authPath: '/npm/', destPath: destIn('auth-path'), headers, keys: KEYS })
+
+    assert.deepEqual(requests, [
+      { path: `/npm/${packageNameFor()}/${VERSION}`, authorization: 'Bearer a-token' },
+      { path: `/${packageNameFor()}/-/tarball.tgz`, authorization: undefined },
+    ])
   })
 
   test('routes the download through the proxy the environment names', { skip: PROXY_UNSUPPORTED }, async () => {
@@ -316,14 +343,15 @@ describe('downloadPnpmExecutable', () => {
   })
 
   test('does not retry a registry request answered with a 404', async () => {
-    registryStatuses = [404]
+    registryStatuses = [404, 404]
     const destPath = destIn('registry-404')
 
     await assert.rejects(
       downloadPnpmExecutable({ version: VERSION, registry, destPath, keys: KEYS }),
       /404/
     )
-    assert.equal(requests.length, 1)
+    // The package document is asked once, in case only the version document is missing.
+    assert.deepEqual(requests.map(({ path: asked }) => asked), [`/${packageNameFor()}/${VERSION}`, `/${packageNameFor()}`])
   })
 
   test('re-hosts an npm tarball URL onto the registry that served the metadata', async () => {
@@ -363,7 +391,7 @@ describe('downloadPnpmExecutable', () => {
     assert.deepEqual(fs.readdirSync(path.dirname(destPath)), [path.basename(destPath)])
   })
 
-  // The errno differs per platform — EISDIR on Linux, EPERM on Windows — so
+  // The errno differs per platform (EISDIR on Linux, EPERM on Windows), so
   // what is asserted is that the directory survives rather than how it says so.
   test('refuses a destination that is not a file', async () => {
     const destPath = destIn('directory')
@@ -410,6 +438,64 @@ describe('downloadPnpmExecutable', () => {
     mode = 'root-bad-signature'
 
     await assert.rejects(download(destIn('root-bad-signature')), /is not valid/)
+  })
+
+  test('takes the version from the package document when the registry serves no version documents', async () => {
+    mode = 'no-version-document'
+    const destPath = destIn('no-version-document')
+
+    await download(destPath)
+
+    assert.equal(fs.readFileSync(destPath, 'utf8'), CONTENT)
+    assert.deepEqual(requests.map(({ path: asked }) => asked), [`/${packageNameFor()}/${VERSION}`, `/${packageNameFor()}`])
+    assert.deepEqual(npmRequests, [])
+  })
+
+  test('reports the 404 for a version that is not in the package document either', async () => {
+    mode = 'no-version-document'
+
+    await assert.rejects(
+      downloadPnpmExecutable({ version: '98.0.0', registry, destPath: destIn('missing-version'), keys: KEYS }),
+      /98\.0\.0: 404/
+    )
+  })
+
+  test('takes npm\'s signatures when the registry serves none, without its credentials', async () => {
+    mode = 'npm-signatures'
+    const destPath = destIn('npm-signatures')
+
+    await downloadPnpmExecutableWithNpmRegistry({ version: VERSION, registry, destPath, keys: KEYS, npmRegistry: npmRegistryUrl(), headers: { authorization: 'Bearer secret' } })
+
+    assert.equal(fs.readFileSync(destPath, 'utf8'), CONTENT)
+    assert.deepEqual(requests.map(({ path: asked }) => asked), [`/${packageNameFor()}/${VERSION}`, `/${packageNameFor()}`])
+    assert.deepEqual(npmRequests, [{ path: `/${packageNameFor()}/${VERSION}`, authorization: undefined }])
+  })
+
+  test('retries the lookup on npm that npm answered with a 503', async () => {
+    mode = 'npm-signatures'
+    npmStatuses = [503]
+    const destPath = destIn('npm-retried')
+
+    await downloadPnpmExecutableWithNpmRegistry({ version: VERSION, registry, destPath, keys: KEYS, npmRegistry: npmRegistryUrl() })
+
+    assert.equal(fs.readFileSync(destPath, 'utf8'), CONTENT)
+    assert.equal(npmRequests.length, 2)
+  })
+
+  test('refuses npm signatures that do not cover the checksum served', async () => {
+    mode = 'npm-bad-signature'
+
+    await assert.rejects(download(destIn('npm-bad-signature')), /is not valid/)
+  })
+
+  test('reports the package unsigned when npm cannot be reached for its signatures', async () => {
+    mode = 'npm-signatures'
+
+    await assert.rejects(
+      downloadPnpmExecutableWithNpmRegistry({ version: VERSION, registry, destPath: destIn('npm-unreachable'), keys: KEYS, npmRegistry: `${addressOf(probe)}/` }),
+      /carries no npm registry signature/
+    )
+    assert.equal(probeRequests, 1, 'the lookup on npm is not retried')
   })
 
   test('does not request the package document when the version document is signed', async () => {
@@ -513,6 +599,11 @@ function handleRegistryRequest (req: http.IncomingMessage, res: http.ServerRespo
     res.end('not now')
     return
   }
+  if (STRIPS_VERSION_DOCUMENTS.has(mode) && /\/\d+\.\d+\.\d+$/.test(url)) {
+    res.writeHead(404)
+    res.end('not found')
+    return
+  }
   if (url.endsWith(`/${VERSION}`)) {
     // The registry may be served from a subpath, which is not part of the
     // package name the signature covers.
@@ -530,23 +621,51 @@ function handleRegistryRequest (req: http.IncomingMessage, res: http.ServerRespo
   serveTarball(res)
 }
 
+/** Modes in which the registry, like Azure Artifacts, serves no version documents. */
+const STRIPS_VERSION_DOCUMENTS = new Set<Mode>(['no-version-document', 'npm-signatures', 'npm-bad-signature'])
+const STRIPS_ALL_SIGNATURES = new Set<Mode>(['npm-signatures', 'npm-bad-signature'])
+
+function handleNpmRequest (req: http.IncomingMessage, res: http.ServerResponse): void {
+  const url = decodeURIComponent(req.url!)
+  npmRequests.push({ path: url, authorization: req.headers.authorization })
+  const status = npmStatuses.shift()
+  if (status != null) {
+    res.writeHead(status)
+    res.end('not now')
+    return
+  }
+  const name = url.slice(1, url.lastIndexOf('/'))
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ dist: { integrity: integrityOf(bytesFor(mode)), signatures: signaturesFor(name) } }))
+}
+
+function tarballOrigin (): string {
+  if (mode === 'npm-tarball-url') return 'https://registry.npmjs.org'
+  return addressOf(mode === 'same-origin-tarball' ? server : cdn)
+}
+
+function npmRegistryUrl (): string {
+  return `${addressOf(npm)}/`
+}
+
 function versionMetaFor (name: string): unknown {
   const integrity = integrityOf(bytesFor(mode))
   return {
     dist: {
       // An npm URL is what a registry proxying npm hands back, and has to
       // be re-hosted onto the registry that answered.
-      tarball: mode === 'npm-tarball-url'
-        ? `https://registry.npmjs.org/${name}/-/tarball.tgz`
-        : `${addressOf(cdn)}/${name}/-/tarball.tgz`,
+      tarball: `${tarballOrigin()}/${name}/-/tarball.tgz`,
       ...(mode === 'no-integrity' ? {} : { integrity }),
       // A proxy that strips the signatures here leaves them in the package document.
-      ...(mode === 'root-signatures' || mode === 'root-bad-signature' ? {} : { signatures: signaturesFor(name) }),
+      ...(mode === 'root-signatures' || mode === 'root-bad-signature' || STRIPS_ALL_SIGNATURES.has(mode) ? {} : { signatures: signaturesFor(name) }),
     },
   }
 }
 
 function packumentFor (name: string): unknown {
+  if (STRIPS_VERSION_DOCUMENTS.has(mode)) {
+    return { 'dist-tags': { latest: VERSION }, versions: { [VERSION]: versionMetaFor(name) } }
+  }
   const signed = mode === 'root-signatures' || mode === 'root-bad-signature'
   return {
     'dist-tags': { latest: VERSION },
@@ -558,7 +677,7 @@ function signaturesFor (name: string): unknown[] {
   if (mode === 'unsigned') return []
   // Signing a checksum other than the one served is what a tampered checksum
   // looks like: bytes and metadata agree, the signature does not cover them.
-  const signed = mode === 'bad-signature' || mode === 'root-bad-signature'
+  const signed = mode === 'bad-signature' || mode === 'root-bad-signature' || mode === 'npm-bad-signature'
     ? `sha512-${'A'.repeat(86)}==`
     : integrityOf(bytesFor(mode))
   return [{
@@ -628,7 +747,7 @@ async function withEnv (vars: Record<string, string | undefined>, fn: () => Prom
 }
 
 async function download (destPath: string): Promise<unknown> {
-  return downloadPnpmExecutable({ version: VERSION, registry, destPath, keys: KEYS })
+  return downloadPnpmExecutableWithNpmRegistry({ version: VERSION, registry, destPath, keys: KEYS, npmRegistry: npmRegistryUrl() })
 }
 
 function packageNameFor (): string {

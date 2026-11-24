@@ -2,15 +2,23 @@
 //! against an unchanged registry, sharing one metadata cache. The cases and
 //! their metadata request logs are shared with pnpm v11, see the table's
 //! `description`.
+use command_extra::CommandExtra;
 
 use assert_cmd::prelude::*;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     registry::RecordedRequest,
 };
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use std::{collections::HashMap, fs, io};
+use std::{
+    collections::HashMap,
+    fs,
+    io,
+};
 
 const CASE_TABLE: &str =
     include_str!("../../../../../pnpr/.fixtures/request-logs/metadata-three-installs.json");
@@ -36,7 +44,8 @@ fn every_case_of_the_shared_table() {
             .as_array()
             .expect("case args")
             .iter()
-            .map(|arg| arg.as_str().expect("case arg"))
+            .map(Value::as_str)
+            .map(|text| text.expect("case arg"))
             .collect();
         let expected: Vec<Vec<String>> =
             serde_json::from_value(case["installs"].clone()).expect("case installs");
@@ -45,6 +54,62 @@ fn every_case_of_the_shared_table() {
         assert_eq!(metadata, expected, "{name}");
         assert_eq!(tarballs, [vec![DEP_TARBALL, PKG_TARBALL], vec![], vec![]], "{name}");
     }
+}
+
+#[test]
+fn explicit_default_lockfile_dir_does_not_add_frozen_metadata_requests() {
+    let unset = frozen_install_metadata_requests(LockfileDirCase::Unset);
+    let explicit = frozen_install_metadata_requests(LockfileDirCase::ExplicitDefault);
+
+    assert_eq!(explicit, unset, "explicit lockfileDir added frozen-install metadata requests");
+}
+
+#[derive(Clone, Copy)]
+enum LockfileDirCase {
+    Unset,
+    ExplicitDefault,
+}
+
+fn frozen_install_metadata_requests(
+    lockfile_dir_case: LockfileDirCase,
+) -> Vec<(String, Option<String>, u16)> {
+    let CommandTempCwd {
+        mut pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_recording_mocked_registry();
+    let AddMockedRegistry { mock_instance, cache_dir, .. } = npmrc_info;
+    let manifest = serde_json::json!({
+        "dependencies": { "@pnpm.e2e/pkg-with-1-dep": "100.1.0" }
+    });
+    fs::write(workspace.join("package.json"), manifest.to_string()).expect("write package.json");
+
+    pacquet = pacquet.with_arg("install");
+    pacquet.assert().success();
+    drop(mock_instance.take_requests());
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove installed modules");
+    fs::remove_dir_all(cache_dir.join("v12/metadata")).expect("clear registry metadata cache");
+
+    if matches!(lockfile_dir_case, LockfileDirCase::ExplicitDefault) {
+        let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+        let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+        fs::write(&workspace_yaml, format!("{yaml}lockfileDir: .\n"))
+            .expect("set default-equivalent lockfileDir");
+    }
+
+    pacquet = pacquet.with_arg("--frozen-lockfile");
+    pacquet.assert().success();
+    let mut requests: Vec<_> = mock_instance
+        .take_requests()
+        .into_iter()
+        .filter(|request| !is_tarball(request))
+        .map(|request| (request.path, request.accept, request.status))
+        .collect();
+    requests.sort();
+    drop(root);
+    requests
 }
 
 type InstallLogs = Vec<Vec<String>>;
@@ -70,7 +135,7 @@ fn three_installs(
     let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
     fs::write(&workspace_yaml, format!("{yaml}{}\n", settings.join("\n")))
         .expect("write pnpm-workspace.yaml");
-    pacquet.arg("install").args(args);
+    pacquet = pacquet.with_arg("install").with_args(args);
 
     let installs: Vec<Vec<RecordedRequest>> = (0..3)
         .map(|_| {

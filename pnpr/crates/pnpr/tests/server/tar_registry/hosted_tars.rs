@@ -1,7 +1,26 @@
 use super::{
-    AuthState, Body, Config, Ecosystem, PackagePattern, Registries, Registry, Request, ServiceExt,
-    StatusCode, TempDir, body_bytes, body_json, config_for, get, gzip, header,
-    hosted_publish_request, hosted_with_access, issue_token, router_with_auth, sha512_integrity,
+    AuthState,
+    Body,
+    Config,
+    Ecosystem,
+    PackagePattern,
+    Registries,
+    Registry,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    body_bytes,
+    body_json,
+    config_for,
+    get,
+    gzip,
+    header,
+    hosted_publish_request,
+    hosted_with_access,
+    issue_token,
+    router_with_auth,
+    sha512_integrity,
     widget_tar,
 };
 
@@ -27,38 +46,18 @@ fn tar_acme_config(storage: std::path::PathBuf) -> Config {
     config
 }
 
-/// The path of the file named `name` under `dir`.
-fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            if let Some(found) = find_file(&entry.path(), name) {
-                return Some(found);
-            }
-        } else if entry.file_name() == name {
-            return Some(entry.path());
-        }
-    }
-    None
+/// The one archive the `acme` npm namespace of the store at `dir` holds,
+/// `None` when it holds none.
+fn stored_archive(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut stored = crate::storage::stored_archives(dir, "acme", Ecosystem::Npm);
+    assert!(stored.len() <= 1, "{stored:?}");
+    let key = stored.pop()?;
+    Some(pnpr_storage::layout::local_archive_path(dir.to_path_buf(), "acme", Ecosystem::Npm, &key))
 }
 
-/// The names of every file under `dir`.
-fn file_names(dir: &std::path::Path) -> Vec<String> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            names.extend(file_names(&entry.path()));
-        } else {
-            names.push(
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-    }
-    names
+/// What the `acme` registry's store serves as `file` of `@acme/widget`.
+async fn served(config: &Config, file: &str) -> Option<Vec<u8>> {
+    crate::storage::served_file(config, ("acme", Ecosystem::Npm), "@acme/widget", file).await
 }
 
 async fn publish(app: &axum::Router, token: &str, version: &str, tgz: &[u8]) -> StatusCode {
@@ -84,14 +83,11 @@ async fn a_hosted_tar_registry_stores_and_serves_only_the_tar() {
     let tar = widget_tar();
     assert_eq!(publish(&app, &token, "1.0.0", &gzip(&tar)).await, StatusCode::CREATED);
 
-    let files = file_names(tmp.path());
-    assert!(files.contains(&"widget-1.0.0.tar.zst".to_string()), "{files:?}");
-    assert!(
-        !files
-            .iter()
-            .any(|file| file.ends_with(".tgz")),
-        "{files:?}",
-    );
+    let config = tar_acme_config(tmp.path().to_path_buf());
+    let stored = std::fs::read(stored_archive(tmp.path()).unwrap()).unwrap();
+    assert_eq!(served(&config, "widget-1.0.0.tar.zst").await, Some(stored.clone()));
+    assert_eq!(zstd::decode_all(stored.as_slice()).unwrap(), tar);
+    assert!(served(&config, "widget-1.0.0.tgz").await.is_none());
 
     let packument = body_json(get(&app, "/npm/@acme%2Fwidget", None).await.into_body()).await;
     assert_eq!(packument["versions"]["1.0.0"]["dist"]["integrity"], sha512_integrity(&tar));
@@ -148,13 +144,9 @@ async fn a_hosted_tar_registry_refuses_a_tgz_that_does_not_decode() {
     let mut truncated = gzip(&widget_tar());
     truncated.truncate(truncated.len() - 8);
     assert_eq!(publish(&app, &token, "1.0.0", &truncated).await, StatusCode::BAD_REQUEST);
-    let files = file_names(tmp.path());
-    assert!(
-        !files
-            .iter()
-            .any(|file| file.contains("widget-1.0.0")),
-        "{files:?}",
-    );
+    assert!(stored_archive(tmp.path()).is_none());
+    let config = tar_acme_config(tmp.path().to_path_buf());
+    assert!(served(&config, "widget-1.0.0.tar.zst").await.is_none());
 }
 
 #[tokio::test]
@@ -165,6 +157,7 @@ async fn deleting_a_version_of_a_hosted_tar_registry_removes_its_tar() {
     let app = router_with_auth(tar_acme_config(tmp.path().to_path_buf()), auth);
     let tar = widget_tar();
     assert_eq!(publish(&app, &token, "1.0.0", &gzip(&tar)).await, StatusCode::CREATED);
+    assert!(stored_archive(tmp.path()).is_some());
 
     let delete = app
         .clone()
@@ -177,8 +170,7 @@ async fn deleting_a_version_of_a_hosted_tar_registry_removes_its_tar() {
         .await
         .unwrap();
     assert_eq!(delete.status(), StatusCode::CREATED);
-    let files = file_names(tmp.path());
-    assert!(!files.contains(&"widget-1.0.0.tar.zst".to_string()), "{files:?}");
+    assert!(stored_archive(tmp.path()).is_none());
     let served = get(&app, "/npm/@acme/widget@1.0.0", Some("zstd")).await;
     assert_eq!(served.status(), StatusCode::NOT_FOUND);
 }
@@ -193,20 +185,40 @@ async fn verify_checks_a_stored_tar_against_its_tar_integrity() {
 
     let config = tar_acme_config(tmp.path().to_path_buf());
     pnpr_storage::layout::write_local_layout_marker(&config.storage.hosted_dir).unwrap();
-    let options =
-        pnpr::verify::VerifyOptions { check_hashes: true, prune_orphans: false, min_age_secs: 0 };
+    let options = pnpr::verify::VerifyOptions { check_hashes: true };
     let report = pnpr::verify::verify_storage(&config, &options).await.unwrap();
     assert_eq!(report.blobs_checked, 1);
     assert!(report.corrupted_blobs.is_empty(), "{:?}", report.corrupted_blobs);
     assert!(report.orphaned_blobs.is_empty(), "{:?}", report.orphaned_blobs);
 
-    let stored = find_file(tmp.path(), "widget-1.0.0.tar.zst").unwrap();
+    let stored = stored_archive(tmp.path()).unwrap();
     std::fs::write(&stored, zstd::encode_all(&b"another tar"[..], 3).unwrap()).unwrap();
     let report = pnpr::verify::verify_storage(&config, &options).await.unwrap();
     assert_eq!(report.corrupted_blobs.len(), 1, "{:?}", report.corrupted_blobs);
     assert!(
-        report.corrupted_blobs[0].contains("tar integrity mismatch"),
+        report.corrupted_blobs[0].contains("failed integrity verification"),
         "{:?}",
         report.corrupted_blobs,
     );
+}
+
+#[tokio::test]
+async fn cdn_public_hosted_tar_downloads_are_cacheable() {
+    let tmp = TempDir::new().unwrap();
+    let auth = AuthState::in_memory();
+    let token = issue_token(&auth, "alice").await;
+    let mut config = tar_acme_config(tmp.path().to_path_buf());
+    config.http.cloudflare_cdn = Some(pnpr_config::CloudflareCdnConfig {
+        zone_id: "0".repeat(32),
+        api_token: "test-token".into(),
+        cache_tag: "example".into(),
+    });
+    let app = router_with_auth(config, auth);
+    assert_eq!(publish(&app, &token, "1.0.0", &gzip(&widget_tar())).await, StatusCode::CREATED);
+    for encoding in [None, Some("zstd")] {
+        let response = get(&app, "/npm/@acme/widget@1.0.0", encoding).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/x-tar");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "public, max-age=300");
+    }
 }

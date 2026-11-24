@@ -1,4 +1,8 @@
-use serde::Deserialize;
+use pnpr_error::RegistryError;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 /// A byte size representation parsed from YAML or string input.
 ///
@@ -7,6 +11,15 @@ use serde::Deserialize;
 /// `PB`, `PiB`), case-insensitively.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ByteSize(pub String);
+
+impl Serialize for ByteSize {
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
 
 impl<'de> Deserialize<'de> for ByteSize {
     fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
@@ -39,6 +52,22 @@ impl<'de> Deserialize<'de> for ByteSize {
         }
         deserializer.deserialize_any(ByteSizeVisitor)
     }
+}
+
+/// The bytes `raw` names, refusing an unparsable or zero size. `field` is the
+/// YAML path the error names.
+pub(crate) fn parse_positive_byte_size(field: &str, raw: &ByteSize) -> Result<u64, RegistryError> {
+    let ByteSize(text) = raw;
+    let bytes = parse_byte_size(text)
+        .ok_or_else(|| RegistryError::InvalidConfig {
+            reason: format!("{field} {text:?} is not a valid byte size"),
+        })?;
+    if bytes == 0 {
+        return Err(RegistryError::InvalidConfig {
+            reason: format!("{field} must be greater than zero"),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Parse a byte size string with optional SI or binary suffix into bytes.
@@ -77,7 +106,8 @@ pub fn parse_byte_size(raw: &str) -> Option<u64> {
         _ => return None,
     };
     let total = num * multiplier;
-    if total < 0.0 || total > (u64::MAX as f64) {
+    // `u64::MAX as f64` rounds up to 2^64, so a total equal to it overflows.
+    if total < 0.0 || total >= (u64::MAX as f64) {
         return None;
     }
     Some(total as u64)

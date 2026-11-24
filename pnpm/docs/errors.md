@@ -7,6 +7,18 @@ An error pnpm raises carries a code that starts with `ERR_PNPM_`. The code is pr
 
 The codes are listed in alphabetical order. A code that is not listed here is explained by its own message.
 
+## ERR_PNPM_BAD_RUNTIME_VERSION
+
+The root project declares a runtime in [`devEngines.runtime`](./package_json.md#devenginesruntime) or `engines.runtime` with `onFail` set to `error`, and the installed version of that runtime does not satisfy the declared range. The message names the wanted range and the current version.
+
+Install a matching version of the runtime, or set `onFail` to `download` to let pnpm fetch it. To check without failing, set [`runtimeOnFail`](./settings/cli.md#runtimeonfail) to `warn` or `ignore`.
+
+## ERR_PNPM_CONFIG_UNRESOLVED_ENV_VAR
+
+A setting in `pnpm-workspace.yaml` or the [global configuration file](./cli/config.md) references an environment variable that isn't set or is empty, and the reference has no fallback. The error names the reference, for example `${MY_STORE_DIR}`.
+
+Set the variable, or give the reference a fallback, such as `${NAME:-fallback}`, or `${NAME?}` for an empty string.
+
 ## ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE
 
 A frozen install (`pnpm install --frozen-lockfile`, the default in CI) found that the boot document of `pnpm-lock.yaml` is not up to date. The boot document records the [config dependencies](./config-dependencies.md) and the pinned package manager. It changes when `configDependencies` in `pnpm-workspace.yaml` changes, or when the pnpm version pinned in `package.json` changes.
@@ -29,11 +41,23 @@ Run [`pnpm approve-builds`](./cli/approve-builds.md) to allow the builds you tru
 
 The [`nodeVersion`](./settings/cli.md#nodeversion) setting is not an exact semver version, such as `22.22.3`.
 
+## ERR_PNPM_INVALID_RUNTIME_VERSION_RANGE
+
+The `version` of a runtime declared in [`devEngines.runtime`](./package_json.md#devenginesruntime) or `engines.runtime` is not a valid semver range, and `onFail` is `error`.
+
+Fix the range in `package.json`. To check without failing, set [`runtimeOnFail`](./settings/cli.md#runtimeonfail) to `warn` or `ignore`.
+
 ## ERR_PNPM_LOCKFILE_CONFIG_MISMATCH
 
 A frozen install found that a setting recorded in `pnpm-lock.yaml` differs from the current configuration. The message names the setting. The lockfile records `overrides`, `patchedDependencies`, `catalogs`, `ignoredOptionalDependencies`, the checksums of `packageExtensions` and the pnpmfile, and the resolution settings in its `settings` block, such as `autoInstallPeers` and `dedupePeers`.
 
 Run `pnpm install` without `--frozen-lockfile` and commit the updated lockfile.
+
+## ERR_PNPM_MISSING_RUNTIME_VERSION_RANGE
+
+A runtime declared in [`devEngines.runtime`](./package_json.md#devenginesruntime) or `engines.runtime` has no `version`, and `onFail` is `error`.
+
+Add a version range to the runtime entry in `package.json`. To check without failing, set [`runtimeOnFail`](./settings/cli.md#runtimeonfail) to `warn` or `ignore`.
 
 ## ERR_PNPM_NODE_LINKER_DIFF
 
@@ -96,6 +120,12 @@ The registry answered a request for one package with the metadata of a different
 
 Check that the registry configured for the package, or for its scope, is correct. A misconfigured proxy or a registry that serves the wrong document can cause this error.
 
+## ERR_PNPM_RUNTIME_NOT_FOUND
+
+A runtime declared in [`devEngines.runtime`](./package_json.md#devenginesruntime) or `engines.runtime` with `onFail` set to `error` is not installed on the system.
+
+Install the runtime, or set `onFail` to `download` to let pnpm fetch it. To check without failing, set [`runtimeOnFail`](./settings/cli.md#runtimeonfail) to `warn` or `ignore`.
+
 ## ERR_PNPM_TARBALL_INTEGRITY
 
 This error indicates that the downloaded package's tarball did not match the expected integrity checksum.
@@ -126,11 +156,11 @@ If you changed the store directory intentionally, run `pnpm install` and pnpm wi
 
 ## ERR_PNPM_UNSUPPORTED_ENGINE
 
-A package's `engines.node` range does not accept the current Node.js version. The message names the package, the wanted range, and the current version.
+A project's `engines.node` or `engines.pnpm` range, or a dependency's `engines.node` range, does not accept the current version. The message names the package, the wanted range, and the current version.
 
-pnpm raises this error only with [`engineStrict`](./settings/cli.md#enginestrict) enabled. The check covers the project's own `engines` field and the `engines` field of every dependency. Without `engineStrict`, a dependency that does not accept the current version produces a warning.
+A project's incompatible `engines.pnpm` always raises this error. For `engines.node`, pnpm raises it only with [`engineStrict`](./settings/cli.md#enginestrict) enabled. Without it, an incompatible `engines.node` in the project or a required dependency produces a warning.
 
-To fix this error, switch to a Node.js version the package accepts, or turn `engineStrict` off.
+To fix this error, switch to a Node.js or pnpm version the package accepts, or turn `engineStrict` off for an `engines.node` mismatch.
 
 ## ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF
 

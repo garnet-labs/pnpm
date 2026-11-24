@@ -1,9 +1,30 @@
 use super::{
-    BTreeMap, Config, ConfigAuditLevel, HashMap, HashSet, InstalledPackages, PackumentPublishInfo,
-    Range, RangeSpecStyle, advisory_choices, age_cutoff, classify_for_update, create_overrides,
-    deprecate, filter_advisories_for_fix, fix_advisory, format_fix_with_update_output,
-    is_range_subset, minimum_release_age_excludes, patched_range_for_style,
-    prune_subsumed_advisories, publish_times, report_fixed_remaining, report_of,
+    AdvisoryId,
+    BTreeMap,
+    Config,
+    ConfigAuditLevel,
+    HashMap,
+    HashSet,
+    InstalledPackages,
+    PackumentPublishInfo,
+    PublishInfoLookup,
+    Range,
+    RangeSpecStyle,
+    advisory_choices,
+    age_cutoff,
+    classify_for_update,
+    create_overrides,
+    deprecate,
+    filter_advisories_for_fix,
+    fix_advisory,
+    format_fix_with_update_output,
+    is_range_subset,
+    minimum_release_age_excludes,
+    patched_range_for_style,
+    prune_subsumed_advisories,
+    publish_times,
+    report_fixed_remaining,
+    report_of,
 };
 
 #[test]
@@ -302,7 +323,11 @@ fn format_fix_with_update_output_lists_fixed_and_remaining() {
         ),
     ]);
 
-    let output = format_fix_with_update_output(&[1], &[2], &advisories);
+    let output = format_fix_with_update_output(
+        &[AdvisoryId::Number(1)],
+        &[AdvisoryId::Number(2)],
+        &advisories,
+    );
 
     assert!(output.contains("1 vulnerability was fixed, 1 vulnerability remains."));
     assert!(output.contains("The fixed vulnerabilities are:"));
@@ -337,14 +362,14 @@ fn minimum_release_age_excludes_drops_versions_older_than_the_cutoff() {
     let times = HashMap::from([
         (
             "old".to_string(),
-            Some(PackumentPublishInfo {
+            PublishInfoLookup::Resolved(PackumentPublishInfo {
                 time: HashMap::from([("2.0.0".to_string(), "2020-01-01T00:00:00Z".to_string())]),
                 deprecated: HashSet::new(),
             }),
         ),
         (
             "fresh".to_string(),
-            Some(PackumentPublishInfo {
+            PublishInfoLookup::Resolved(PackumentPublishInfo {
                 time: HashMap::from([("3.0.0".to_string(), "2026-06-01T00:00:00Z".to_string())]),
                 deprecated: HashSet::new(),
             }),
@@ -381,19 +406,22 @@ fn minimum_release_age_excludes_keeps_versions_with_unknown_publish_times() {
     let advisories = report_of(vec![
         fix_advisory(2, "garbled", "<3.0.0", Some(">=3.0.0"), ConfigAuditLevel::High, "GHSA-b"),
         fix_advisory(3, "unfetchable", "<4.0.0", Some(">=4.0.0"), ConfigAuditLevel::High, "GHSA-c"),
+        fix_advisory(4, "ambiguous", "<5.0.0", Some(">=5.0.0"), ConfigAuditLevel::High, "GHSA-d"),
     ])
     .advisories;
     let times = HashMap::from([
         // The timestamp does not parse.
         (
             "garbled".to_string(),
-            Some(PackumentPublishInfo {
+            PublishInfoLookup::Resolved(PackumentPublishInfo {
                 time: HashMap::from([("3.0.0".to_string(), "not-a-date".to_string())]),
                 deprecated: HashSet::new(),
             }),
         ),
         // The fetch failed outright.
-        ("unfetchable".to_string(), None),
+        ("unfetchable".to_string(), PublishInfoLookup::Unavailable),
+        // Mixed/undeclared registry origin must not authorize a bypass.
+        ("ambiguous".to_string(), PublishInfoLookup::AmbiguousOrigin),
     ]);
 
     let excludes =
@@ -492,8 +520,8 @@ fn minimum_release_age_excludes_skips_deprecated_versions_spelled_differently() 
         "GHSA-a",
     )])
     .advisories;
-    // The `time` map spells 4.18.0 with a leading `v` while `versions` — the
-    // source of the deprecation set — does not.
+    // The `time` map spells 4.18.0 with a leading `v` while `versions` (the
+    // source of the deprecation set) does not.
     let mut info = publish_times(
         "lodash-es",
         &[("v4.18.0", "2026-06-01T00:00:00Z"), ("4.18.1", "2026-06-01T01:00:00Z")],
@@ -558,7 +586,11 @@ fn classify_for_update_routes_unparsable_ranges_to_remaining() {
         classification.unfixable.contains_key("padded"),
         "a padded sentinel is still unfixable",
     );
-    assert_eq!(classification.unparsable, vec![3], "an unparsable range must not be dropped");
+    assert_eq!(
+        classification.unparsable,
+        vec![AdvisoryId::Number(3)],
+        "an unparsable range must not be dropped",
+    );
 }
 
 #[test]
@@ -583,10 +615,19 @@ fn classify_for_update_trims_module_names() {
 
 #[test]
 fn report_fixed_remaining_keeps_non_semver_installed_packages_remaining() {
-    let mut vulnerabilities: HashMap<String, Vec<(u64, Range)>> = HashMap::new();
-    vulnerabilities.insert("gone".to_string(), vec![(1, "<2.0.0".parse().unwrap())]);
-    vulnerabilities.insert("bumped".to_string(), vec![(2, "<2.0.0".parse().unwrap())]);
-    vulnerabilities.insert("non-semver".to_string(), vec![(3, "<2.0.0".parse().unwrap())]);
+    let mut vulnerabilities: HashMap<String, Vec<(AdvisoryId, Range)>> = HashMap::new();
+    vulnerabilities.insert(
+        "gone".to_string(),
+        vec![(AdvisoryId::Number(1), "<2.0.0".parse().unwrap())],
+    );
+    vulnerabilities.insert(
+        "bumped".to_string(),
+        vec![(AdvisoryId::Number(2), "<2.0.0".parse().unwrap())],
+    );
+    vulnerabilities.insert(
+        "non-semver".to_string(),
+        vec![(AdvisoryId::Number(3), "<2.0.0".parse().unwrap())],
+    );
 
     // `non-semver` is still installed but only under a non-semver key, so its
     // version can't be range-checked.
@@ -598,11 +639,49 @@ fn report_fixed_remaining_keeps_non_semver_installed_packages_remaining() {
     let (fixed, remaining) =
         report_fixed_remaining(&vulnerabilities, &HashMap::new(), &[], &installed);
 
-    assert!(fixed.contains(&1), "an absent package is fixed");
-    assert!(fixed.contains(&2), "a package bumped out of range is fixed");
+    assert!(fixed.contains(&AdvisoryId::Number(1)), "an absent package is fixed");
+    assert!(fixed.contains(&AdvisoryId::Number(2)), "a package bumped out of range is fixed");
     assert!(
-        remaining.contains(&3),
+        remaining.contains(&AdvisoryId::Number(3)),
         "a package surviving only under a non-semver key cannot be proven fixed",
     );
-    assert!(!fixed.contains(&3));
+    assert!(!fixed.contains(&AdvisoryId::Number(3)));
+}
+
+#[test]
+fn fix_with_update_tracks_string_advisory_ids() {
+    let with_string_id = |id: &str, module_name: &str, severity: ConfigAuditLevel| {
+        let mut advisory =
+            fix_advisory(0, module_name, "<2.0.0", Some(">=2.0.0"), severity, "GHSA-a");
+        advisory.id = AdvisoryId::String(id.to_string());
+        advisory
+    };
+    let advisories = report_of(vec![
+        with_string_id("CUSTOM-1", "bumped", ConfigAuditLevel::High),
+        with_string_id("CUSTOM-2", "stuck", ConfigAuditLevel::Low),
+    ])
+    .advisories;
+
+    let classification = classify_for_update(&advisories);
+    let installed = InstalledPackages {
+        names: ["bumped".to_string(), "stuck".to_string()].into_iter().collect(),
+        versions: HashMap::from([
+            ("bumped".to_string(), vec!["2.0.0".parse().unwrap()]),
+            ("stuck".to_string(), vec!["1.0.0".parse().unwrap()]),
+        ]),
+    };
+    let (fixed, remaining) = report_fixed_remaining(
+        &classification.vulnerabilities,
+        &classification.unfixable,
+        &classification.unparsable,
+        &installed,
+    );
+
+    assert_eq!(fixed, vec![AdvisoryId::String("CUSTOM-1".to_string())]);
+    assert_eq!(remaining, vec![AdvisoryId::String("CUSTOM-2".to_string())]);
+
+    let output = format_fix_with_update_output(&fixed, &remaining, &advisories);
+    assert!(output.contains("bumped"));
+    assert!(output.contains("stuck"));
+    assert!(!output.contains("details not found"));
 }

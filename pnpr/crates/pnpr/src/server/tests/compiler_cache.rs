@@ -2,14 +2,26 @@ mod cargo;
 
 use axum::{
     Router,
-    body::{Body, Bytes, to_bytes},
-    http::{Method, Request, StatusCode, header},
+    body::{
+        Body,
+        Bytes,
+        to_bytes,
+    },
+    http::{
+        Method,
+        Request,
+        StatusCode,
+        header,
+    },
 };
 use pnpr_config::Config;
 use tempfile::TempDir;
 use tower::ServiceExt as _;
 
-use super::{app_with_config_and_token, record};
+use super::{
+    app_with_config_and_token,
+    record,
+};
 
 const ENTRY: &str = "/-/pnpr/v0/compiler-cache/acme/a/b/cache-key";
 
@@ -85,13 +97,13 @@ async fn compiler_cache_limits_upload_size_and_rejects_invalid_keys() {
 
 fn config(directory: &TempDir) -> Config {
     let path = directory.path().join("pnpr.yaml");
-    std::fs::write(&path, "resolver:\n  enabled: false\nartifacts:\n  enabled: true\n  orgs:\n    acme:\n      access: [ci, developer]\n      publish: ci\n    other:\n      access: ci\n      publish: ci\n").unwrap();
+    std::fs::write(&path, "secret: test-secret-key-32-chars-long-12\nresolver:\n  enabled: false\nartifacts:\n  enabled: true\n  owners:\n    acme:\n      access: [ci, developer]\n      publish: ci\n    other:\n      access: ci\n      publish: ci\n").unwrap();
     Config::from_yaml(&path, "127.0.0.1:0".parse().unwrap(), None).unwrap()
 }
 
 fn app(config: Config, username: &str, readonly: bool) -> Router {
     let mut token = record(readonly, &[]);
-    token.username = username.to_string();
+    token.user_id = username.to_string();
     app_with_config_and_token(config, "token", token)
 }
 
@@ -204,7 +216,7 @@ async fn unauthorized_or_readonly_publishers_are_rejected_before_reading_bodies(
 async fn disabled_artifacts_and_undeclared_caches_are_not_served() {
     let directory = TempDir::new().unwrap();
     let mut config = config(&directory);
-    config.features.artifacts.orgs.clear();
+    config.features.artifacts.owners.clear();
     assert_eq!(
         app(config.clone(), "ci", false)
             .oneshot(request(Method::GET, ENTRY, Body::empty()))

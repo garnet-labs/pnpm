@@ -1,13 +1,26 @@
+pub(crate) use peer_contexts::peer_sensitive_packages;
+
+mod peer_contexts;
+
 use pnpm_lockfile::{
-    Lockfile, PkgName, PkgNameVerPeer, Prefix, ResolvedDependencySpec, SnapshotDepRef,
-    SnapshotEntry, VersionPart,
+    Lockfile,
+    PkgName,
+    PkgNameVerPeer,
+    Prefix,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
+    SnapshotEntry,
+    VersionPart,
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::{
+    HashSet,
+    VecDeque,
+};
 
 /// What the fast-update handlers did to the dependency graph, so the
-/// maintenance that keeps the lockfile consistent — pruning, the
+/// maintenance that keeps the lockfile consistent (pruning, the
 /// peer-suffix safety check, catalog entry pruning, and the `optional`
-/// flag recompute — runs once over the combined result instead of once
+/// flag recompute) runs once over the combined result instead of once
 /// per handler.
 #[derive(Default)]
 pub(crate) struct GraphEdits {
@@ -22,8 +35,8 @@ pub(crate) struct GraphEdits {
 /// What the edges a fast update severed pointed at, each written the way
 /// a peer suffix names a package: `name@version`, or a bare `name@` when
 /// the reference pins no version a suffix segment can be compared
-/// against — a link or a tarball, whose suffix segment carries the
-/// resolved manifest version instead — which makes every suffix naming
+/// against (a link or a tarball, whose suffix segment carries the
+/// resolved manifest version instead) which makes every suffix naming
 /// that name suspect.
 #[derive(Default)]
 pub(crate) struct DroppedEdges(HashSet<String>);
@@ -64,7 +77,12 @@ impl DroppedEdges {
         self.0.insert(peer_id);
     }
 
-    /// Whether `peers` — the peer suffix of a snapshot key — names none
+    fn contains_package(&self, key: &PkgNameVerPeer) -> bool {
+        self.0.contains(&format!("{}@", key.name))
+            || peer_id_of(key).is_some_and(|peer_id| self.0.contains(&peer_id))
+    }
+
+    /// Whether `peers` (the peer suffix of a snapshot key) names none
     /// of the severed edges' targets, at any nesting depth. Without
     /// `dedupePeers` a peer is named by its whole dep path, and the peers
     /// that path pins are as much a part of the dependent's key as the
@@ -73,7 +91,8 @@ impl DroppedEdges {
     fn are_absent_from(&self, peers: &str) -> bool {
         peers
             .split(['(', ')'])
-            .filter(|peer_id| !peer_id.is_empty() && !peer_id.starts_with("patch_hash="))
+            .filter(|peer_id| !peer_id.is_empty())
+            .filter(|peer_id| !peer_id.starts_with("patch_hash="))
             .all(|peer_id| {
                 // The `@` of a scoped name is not the separator, and a
                 // segment the lockfile put a multi-byte character in front
@@ -112,8 +131,9 @@ fn peer_id_of(key: &PkgNameVerPeer) -> Option<String> {
 /// path.
 pub(crate) fn finish_graph_edits(candidate: &mut Lockfile, edits: &GraphEdits) -> bool {
     if !edits.dropped.is_empty() {
+        let affected = edits.dropped.including_subtrees(candidate);
         prune_unreachable_packages(candidate);
-        if !peer_suffixes_are_independent_of(candidate, &edits.dropped) {
+        if !peer_contexts_are_independent_of(candidate, &affected) {
             return false;
         }
         prune_unreferenced_catalog_entries(candidate);
@@ -124,19 +144,20 @@ pub(crate) fn finish_graph_edits(candidate: &mut Lockfile, edits: &GraphEdits) -
     true
 }
 
-/// Whether no surviving snapshot resolves a peer through one of `dropped`.
-///
-/// A dropped package that some snapshot reaches as a peer is embedded in
-/// that snapshot's key, so removing it would rekey the dependent rather
-/// than only prune. A package the same alias still provides at another
-/// version is no such peer: the suffix names the version, not the alias.
-fn peer_suffixes_are_independent_of(lockfile: &Lockfile, dropped: &DroppedEdges) -> bool {
+/// Whether surviving peer contexts are independent of the removed subtrees.
+/// Shared peer dependents can change bindings after deduplication even when
+/// their provider remains reachable.
+fn peer_contexts_are_independent_of(lockfile: &Lockfile, dropped: &DroppedEdges) -> bool {
     let Some(snapshots) = lockfile.snapshots.as_ref() else {
         return true;
     };
     snapshots
         .keys()
-        .all(|key| dropped.are_absent_from(key.suffix.peer()))
+        .all(|key| {
+            let changes_peer_owner =
+                dropped.contains_package(key) && peer_contexts::has_declared_peers(lockfile, key);
+            !changes_peer_owner && dropped.are_absent_from(key.suffix.peer())
+        })
 }
 
 pub fn prune_unreachable_packages(lockfile: &mut Lockfile) {
@@ -175,9 +196,16 @@ pub(crate) fn reachable_from(
     is_root: impl Fn(&str, &PkgName) -> bool,
     follows: impl Fn(&PkgNameVerPeer, &PkgName) -> bool,
 ) -> Option<HashSet<PkgNameVerPeer>> {
+    reachable_from_keys(lockfile, importer_root_keys(lockfile, is_root), follows)
+}
+
+fn reachable_from_keys(
+    lockfile: &Lockfile,
+    mut queue: VecDeque<PkgNameVerPeer>,
+    follows: impl Fn(&PkgNameVerPeer, &PkgName) -> bool,
+) -> Option<HashSet<PkgNameVerPeer>> {
     let snapshots = lockfile.snapshots.as_ref()?;
     let mut reachable = HashSet::new();
-    let mut queue = importer_root_keys(lockfile, is_root);
     while let Some(key) = queue.pop_front() {
         if !reachable.insert(key.clone()) {
             continue;
@@ -309,12 +337,14 @@ fn snapshot_optional_children(
         })
 }
 
-/// Drop every catalog snapshot entry that no importer references any
+/// Drop every catalog snapshot entry that no dependency references any
 /// more, matching what a full resolution records after the same removal.
 pub(crate) fn prune_unreferenced_catalog_entries(lockfile: &mut Lockfile) {
     let Some(catalogs) = lockfile.catalogs.as_ref() else {
         return;
     };
+    let peer_references: HashSet<_> =
+        crate::fast_update_catalogs::directory_peer_catalog_references(lockfile).collect();
     let stale: Vec<(String, String)> = catalogs
         .iter()
         .flat_map(|(catalog_name, entries)| {
@@ -323,7 +353,12 @@ pub(crate) fn prune_unreferenced_catalog_entries(lockfile: &mut Lockfile) {
                 .map(move |alias| (catalog_name.clone(), alias.clone()))
         })
         .filter(|(catalog_name, alias)| {
-            !crate::fast_update_catalogs::catalog_entry_is_referenced(lockfile, catalog_name, alias)
+            !peer_references.contains(&(catalog_name.as_str(), alias.as_str()))
+                && !crate::fast_update_catalogs::importer_references_catalog(
+                    lockfile,
+                    catalog_name,
+                    alias,
+                )
         })
         .collect();
     if stale.is_empty() {

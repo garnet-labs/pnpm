@@ -2,22 +2,37 @@
 //! lacks, with the remote side-effects resolution alongside.
 
 use super::{
-    CasIndexes, ColdInputs, ConcurrentCheck, CreateVirtualStore, CreateVirtualStoreError,
-    partition, run_checked,
+    CasIndexes,
+    ColdInputs,
+    ConcurrentCheck,
+    CreateVirtualStore,
+    CreateVirtualStoreError,
+    partition,
+    run_checked,
 };
 use crate::{
     InstallPackageBySnapshot,
     create_virtual_store::{
         RemoteSideEffectsQuarantineBySnapshot,
-        cold::{ColdBatch, ColdBatchState, run_cold_batch, unlink_fetch_failed_children},
+        cold::{
+            ColdBatch,
+            ColdBatchState,
+            run_cold_batch,
+            unlink_fetch_failed_children,
+        },
     },
     install_package_by_snapshot::runtime_platform_selector,
     shared_side_effects::{
-        PreparedSharedSideEffects, ResolvedSharedSideEffects, resolve_prepared_side_effects,
+        PreparedSharedSideEffects,
+        ResolvedSharedSideEffects,
+        resolve_prepared_side_effects,
     },
 };
 use futures_util::FutureExt;
-use pnpm_lockfile::{PackageKey, PlatformSelector};
+use pnpm_lockfile::{
+    PackageKey,
+    PlatformSelector,
+};
 use pnpm_reporter::Reporter;
 use std::collections::HashSet;
 
@@ -76,6 +91,7 @@ impl<'a> CreateVirtualStore<'a> {
             allow_build_policy: self.ctx.allow_build_policy,
             store_index_writer: self.fetching.store_index_writer,
             importers: self.importers,
+            supported_architectures: self.selection.supported_architectures,
         }
     }
 
@@ -94,8 +110,8 @@ impl<'a> CreateVirtualStore<'a> {
             ColdBatch {
                 cold: &partition.cold,
                 installer: self.cold_installer(&inputs, &runtime_platform_selector),
-                reuse: self.slot_reuse(inputs.wanted.packages),
-                marker_source: inputs.marker_source,
+                reuse: self.slot_reuse(inputs.wanted.packages, inputs.links),
+                slot_builds: inputs.slot_builds,
                 removed_aliases_by_key: &inputs.links.removed_aliases_by_key,
                 link_template: &inputs.links.template,
                 shared_packages: inputs.links.shared_packages.as_ref(),

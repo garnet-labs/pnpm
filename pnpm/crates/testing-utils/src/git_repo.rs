@@ -1,25 +1,82 @@
 //! Local git repositories for tests that install a git-hosted dependency.
 //!
 //! A test points its manifest at a repo on disk (`git+file://...`) rather
-//! than a real forge, so the whole git install path — `ls-remote`
-//! resolution, clone, `prepare`, packlist, link — runs without network
+//! than a real forge, so the whole git install path (`ls-remote`
+//! resolution, clone, `prepare`, packlist, link) runs without network
 //! access. The TypeScript suite uses the same technique for its
 //! `prepare`-script coverage (`createGitPreparePackage` in
 //! `installing/deps-installer/test/install/lifecycleScripts.ts`).
 //!
 //! Repos that need a *host* identity (a `codeload.github.com` archive
-//! URL, `gitHosted: true`) can't be modeled this way — those resolve to
+//! URL, `gitHosted: true`) can't be modeled this way; those resolve to
 //! a tarball and are covered at the resolver level instead.
+use command_extra::CommandExtra;
 
 use std::{
     fmt::Write as _,
     fs,
-    io::Write,
-    path::{Path, PathBuf},
+    io::{
+        BufRead,
+        BufReader,
+        Write,
+    },
+    net::{
+        SocketAddr,
+        TcpListener,
+        TcpStream,
+    },
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
     process::Command,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+    },
+    thread,
+    time::Duration,
 };
 
 use url::Url;
+
+/// Loopback dumb-HTTP git server exposing a [`GitRepoFixture`]'s bare clone
+/// over `git+http://127.0.0.1:<port>/<name>.git` for tests where a remote
+/// registry manifest references a git repository.
+pub struct ServedGitRepo {
+    addr: SocketAddr,
+    repo_name: String,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ServedGitRepo {
+    /// `http://127.0.0.1:<port>/<name>.git` URL of the bare repository.
+    #[must_use]
+    pub fn http_url(&self) -> String {
+        format!("http://{}/{}", self.addr, self.repo_name)
+    }
+
+    /// `git+http://127.0.0.1:<port>/<name>.git#<committish>` specifier.
+    #[must_use]
+    pub fn git_url_at(&self, committish: &str) -> String {
+        format!("git+{}#{committish}", self.http_url())
+    }
+}
+
+impl Drop for ServedGitRepo {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 /// A git work tree plus the bare clone a test's manifest points at.
 ///
@@ -34,7 +91,7 @@ impl GitRepoFixture {
     /// Create an empty repo under `root`, as a work tree at
     /// `<root>/<name>-src` and a bare clone at `<root>/<name>.git`.
     ///
-    /// Put `root` outside the project being installed into — a git repo
+    /// Put `root` outside the project being installed into, a git repo
     /// nested inside the workspace would be picked up as part of it.
     #[must_use]
     pub fn init(root: &Path, name: &str) -> Self {
@@ -115,6 +172,7 @@ impl GitRepoFixture {
                 "refs/tags/*:refs/tags/*",
             ],
         );
+        git(&self.bare, &["update-server-info"]);
     }
 
     /// SHA of the work tree's current `HEAD`.
@@ -123,7 +181,36 @@ impl GitRepoFixture {
         git(&self.work, &["rev-parse", "HEAD"]).trim().to_string()
     }
 
-    /// `file://` URL of the bare repo — the transport half of a git
+    /// Expose this bare clone over loopback HTTP (`git+http://127.0.0.1:<port>/...`)
+    /// until the returned [`ServedGitRepo`] is dropped.
+    #[must_use]
+    pub fn serve_http(&self) -> ServedGitRepo {
+        git(&self.bare, &["update-server-info"]);
+        let root = self.bare
+            .parent()
+            .expect("bare repo has parent directory")
+            .to_path_buf();
+        let repo_name = self.bare
+            .file_name()
+            .expect("bare repo has file name")
+            .to_string_lossy()
+            .into_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback git http server");
+        let addr = listener.local_addr().expect("read local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                serve_git_http_request(&root, stream);
+            }
+        });
+        ServedGitRepo { addr, repo_name, stop, handle: Some(handle) }
+    }
+
+    /// `file://` URL of the bare repo, the transport half of a git
     /// specifier, and the `repo` field a `type: git` resolution records.
     #[must_use]
     pub fn file_url(&self) -> String {
@@ -271,13 +358,13 @@ fn quote_config_value(value: &str) -> String {
 
 /// Run `git` with `args` in `cwd` and return its stdout.
 ///
-/// Panics when `git` is missing or the command fails — per
+/// Panics when `git` is missing or the command fails, per
 /// `pnpm/AGENTS.md`, a test must not tolerate an under-provisioned
 /// environment by skipping.
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+        .with_args(args)
+        .with_current_dir(cwd)
         .output()
         .unwrap_or_else(|err| panic!("run `git {}`: {err}", args.join(" ")));
     assert!(
@@ -288,6 +375,66 @@ fn git(cwd: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr),
     );
     String::from_utf8(output.stdout).expect("git stdout is UTF-8")
+}
+
+fn serve_git_http_request(root: &Path, mut stream: TcpStream) {
+    let io_timeout = Some(Duration::from_secs(5));
+    let _ = stream.set_read_timeout(io_timeout);
+    let _ = stream.set_write_timeout(io_timeout);
+    let Some(rel) = read_http_request_rel_path(BufReader::new(&stream)) else {
+        return;
+    };
+    if is_safe_relative_http_path(&rel)
+        && let Ok(bytes) = fs::read(root.join(&rel))
+    {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len(),
+        );
+        let _ = stream.write_all(&bytes);
+    } else {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    }
+}
+
+fn read_http_request_rel_path(mut reader: BufReader<&TcpStream>) -> Option<String> {
+    let mut request_line = String::new();
+    let bytes_read = reader.read_line(&mut request_line).ok()?;
+    if bytes_read == 0 || !request_line.ends_with('\n') {
+        return None;
+    }
+    loop {
+        let mut header = String::new();
+        let hdr_bytes = reader.read_line(&mut header).ok()?;
+        if hdr_bytes == 0 || !header.ends_with('\n') {
+            return None;
+        }
+        if header.trim().is_empty() {
+            break;
+        }
+    }
+    let raw_target = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/");
+    let rel = raw_target
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .trim_start_matches('/');
+    Some(rel.to_string())
+}
+
+fn is_safe_relative_http_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.contains('\\')
+        && Path::new(rel)
+            .components()
+            .all(|comp| matches!(comp, Component::Normal(_)))
 }
 
 /// A forwarding Git wrapper that records acquisition and `ls-remote` commands
@@ -311,7 +458,7 @@ impl GitCommandLog {
         let log = bin_dir.join("acquisitions.log");
         let ls_remote_log = bin_dir.join("ls-remote.log");
         let output = Command::new("sh")
-            .args(["-c", "command -v git"])
+            .with_args(["-c", "command -v git"])
             .output()
             .unwrap();
         assert!(output.status.success(), "locate git: {output:?}");

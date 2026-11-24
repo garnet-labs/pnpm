@@ -1,10 +1,28 @@
-use super::{RebuildOptions, slots::PkgRoots};
-use pnpm_lockfile::{PackageKey, PackageMetadata, SnapshotEntry};
-use pnpm_package_manifest::{
-    BINDING_GYP, files_build_triggers, parse_manifest, pkg_build_triggers, pkg_requires_build,
+use super::{
+    RebuildOptions,
+    slots::PkgRoots,
 };
-use pnpm_patching::{ExtendedPatchInfo, MANIFEST_FILE_NAME, preview_patch};
-use std::collections::{HashMap, HashSet};
+use pnpm_lockfile::{
+    PackageKey,
+    PackageMetadata,
+    SnapshotEntry,
+};
+use pnpm_package_manifest::{
+    BINDING_GYP,
+    files_build_triggers,
+    parse_manifest,
+    pkg_build_triggers,
+    pkg_requires_build,
+};
+use pnpm_patching::{
+    ExtendedPatchInfo,
+    MANIFEST_FILE_NAME,
+    preview_patch,
+};
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 
 fn is_selected(rebuild: Option<&RebuildOptions>, key: &PackageKey) -> bool {
     rebuild.is_none_or(|rebuild| rebuild.selects_snapshot(key))
@@ -54,6 +72,40 @@ pub(super) struct RequiresBuildInputs<'a> {
 /// answers `false` for every snapshot outside it without looking at the
 /// package: inspecting a package reads its directory, which on a lazily
 /// populated `node_modules` fetches the package.
+/// Whether the installed snapshot `key` needs a build. A rebuild of edited
+/// files reads every copy; otherwise the prefetched answer wins over reading
+/// the canonical copy.
+fn installed_requires_build(
+    pkg_roots: PkgRoots<'_>,
+    prefetched: Option<&crate::RequiresBuildBySnapshot>,
+    rebuild: Option<&RebuildOptions>,
+    key: &PackageKey,
+) -> bool {
+    if rebuild.is_some_and(RebuildOptions::rebuilds_edited_files) {
+        return edited_copy_requires_build(pkg_roots, key);
+    }
+    match (
+        pkg_roots.canonical(key).as_deref(),
+        prefetched
+            .and_then(|map| map.get(key))
+            .copied(),
+    ) {
+        (None, _) => false,
+        (_, Some(requires)) => requires,
+        (Some(pkg_root), None) => pkg_requires_build(pkg_root),
+    }
+}
+
+/// Whether any installed copy of `key` needs a build, read from the files on
+/// disk: the user may have edited any one copy, and the store index records
+/// the published package.
+fn edited_copy_requires_build(pkg_roots: PkgRoots<'_>, key: &PackageKey) -> bool {
+    pkg_roots
+        .all(key)
+        .iter()
+        .any(|pkg_root| pkg_requires_build(pkg_root))
+}
+
 pub(super) fn requires_build_by_key(inputs: RequiresBuildInputs<'_>) -> HashMap<PackageKey, bool> {
     let RequiresBuildInputs {
         snapshots,
@@ -67,19 +119,12 @@ pub(super) fn requires_build_by_key(inputs: RequiresBuildInputs<'_>) -> HashMap<
         .keys()
         // Skip snapshots that never landed on disk. `pkg_requires_build`
         // would just return `false` for a missing dir, but the walk would
-        // still spend a syscall per skipped key — the filter
+        // still spend a syscall per skipped key, the filter
         // short-circuits that on installs with large optional fan-out.
         .filter(|key| !skipped.contains(key))
         .map(|key| {
             let requires = is_selected(rebuild, key)
-                && match (
-                    pkg_roots.canonical(key).as_deref(),
-                    prefetched.and_then(|map| map.get(key).copied()),
-                ) {
-                    (None, _) => false,
-                    (_, Some(requires)) => requires,
-                    (Some(pkg_root), None) => pkg_requires_build(pkg_root),
-                };
+                && installed_requires_build(pkg_roots, prefetched, rebuild, key);
             (key.clone(), requires)
         })
         .collect();
@@ -120,8 +165,8 @@ pub(super) fn side_effects_cache_gate_active(gate: &SideEffectsCacheGate) -> boo
 /// Whether each configured patch adds build work its package's published
 /// manifest does not declare, keyed by the peer-stripped package key.
 ///
-/// Everything keyed off `requiresBuild` — the allow-build gate, the build
-/// graph, the side-effects cache key — is decided before the build phase
+/// Everything keyed off `requiresBuild` (the allow-build gate, the build
+/// graph, the side-effects cache key) is decided before the build phase
 /// applies the patch, so build work a patch introduces would otherwise
 /// stay invisible until after the decisions that need it. Previewing the
 /// patch keeps all three describing the package that ends up on disk.
@@ -200,7 +245,8 @@ pub(super) fn previewed_patch_adds_build(
     // from, so its scripts and its `gypfile` value are what the build sees.
     if let Some(patched) = preview.manifest
         .as_deref()
-        .and_then(|raw| parse_manifest(raw).ok())
+        .map(parse_manifest)
+        .and_then(Result::ok)
     {
         triggers.read_manifest(&patched);
     }
@@ -269,7 +315,9 @@ impl<'a> ScheduledBuilds<'a> {
                 })
             })
             .filter(|key| {
-                inputs.allow_build_policy.check(&key.without_peer().to_string()) == Some(true)
+                inputs.allow_build_policy
+                    .check(&key.without_peer().to_string())
+                    .unwrap_or(false)
             })
             .collect();
         Some(ScheduledBuilds { snapshots })

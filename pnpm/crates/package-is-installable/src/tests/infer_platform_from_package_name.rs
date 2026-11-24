@@ -3,8 +3,13 @@
 //! inference drives.
 
 use crate::{
-    ArchitectureAxes, InstallabilityOptions, InstallabilityVerdict, PackageInstallabilityManifest,
-    SupportedArchitectures, WantedPlatform, infer_platform_from_package_name,
+    ArchitectureAxes,
+    InstallabilityOptions,
+    InstallabilityVerdict,
+    PackageInstallabilityManifest,
+    SupportedArchitectures,
+    WantedPlatform,
+    infer_platform_from_package_name,
     package_is_installable,
 };
 use pretty_assertions::assert_eq;
@@ -159,6 +164,16 @@ fn package_without_declared_fields_is_not_skipped_without_an_os_token() {
         PackageInstallabilityManifest { name: "is-arm".to_string(), ..Default::default() };
     let verdict =
         package_is_installable("is-arm@1.0.0", &manifest, &optional_on_linux_x64(None)).unwrap();
+    assert_eq!(verdict, InstallabilityVerdict::Installable);
+}
+
+#[test]
+fn package_without_declared_fields_is_not_skipped_by_an_os_token_alone() {
+    let manifest =
+        PackageInstallabilityManifest { name: "get-windows".to_string(), ..Default::default() };
+    let verdict =
+        package_is_installable("get-windows@9.3.0", &manifest, &optional_on_linux_x64(None))
+            .unwrap();
     assert_eq!(verdict, InstallabilityVerdict::Installable);
 }
 

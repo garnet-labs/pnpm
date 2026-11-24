@@ -1,10 +1,29 @@
 use super::{
-    AddMockedRegistry, BINDING_GYP_DELETION_HUNK, CommandTempCwd, GYPFILE_FALSE_REMOVAL_PATCH,
-    GitRepoFixture, IS_POSITIVE_BINDING_GYP_PATCH, IS_POSITIVE_HOOKS_FILE_PATCH,
-    IS_POSITIVE_POSTINSTALL_PATCH, MANIFEST_DELETION_PATCH, MARKER_PATCH, Path, Value,
-    append_workspace_yaml_key, assert_patch_apply_failure, assert_patch_install_scenario, fs,
-    is_positive_store_row, pacquet, patch_file_hash, read_installed_index, read_wanted_lockfile,
-    remove_dir_if_exists, setup_configured_patch, setup_configured_patch_with_yaml, snapshot_keys,
+    AddMockedRegistry,
+    BINDING_GYP_DELETION_HUNK,
+    CommandTempCwd,
+    GYPFILE_FALSE_REMOVAL_PATCH,
+    GitRepoFixture,
+    IS_POSITIVE_BINDING_GYP_PATCH,
+    IS_POSITIVE_HOOKS_FILE_PATCH,
+    IS_POSITIVE_POSTINSTALL_PATCH,
+    MANIFEST_DELETION_PATCH,
+    MARKER_PATCH,
+    Path,
+    Value,
+    append_workspace_yaml_key,
+    assert_patch_apply_failure,
+    assert_patch_install_scenario,
+    fs,
+    is_positive_store_row,
+    pacquet,
+    patch_file_hash,
+    read_installed_index,
+    read_wanted_lockfile,
+    remove_dir_if_exists,
+    setup_configured_patch,
+    setup_configured_patch_with_yaml,
+    snapshot_keys,
 };
 use assert_cmd::assert::OutputAssertExt;
 use pnpm_testing_utils::fs::bump_mtime;
@@ -54,7 +73,7 @@ fn install_level_patch_applies_when_scripts_are_ignored() {
 
 /// TS: `patch package when the package is not in allowBuilds list`
 /// (`patch.ts:386`). An empty `allowBuilds` forbids every build, but a
-/// patch is not a build — it still applies.
+/// patch is not a build; it still applies.
 #[test]
 fn install_level_patch_applies_when_the_package_is_not_in_allow_builds() {
     assert_patch_install_scenario(
@@ -265,6 +284,48 @@ fn git_dependency_patch_applies_on_fresh_and_frozen_install() {
     drop((root, mock_instance));
 }
 
+#[test]
+fn wildcard_patch_applies_to_a_local_directory_on_fresh_and_frozen_install() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let local_dir = workspace.join("local-pkg");
+    fs::create_dir_all(&local_dir).expect("create local package");
+    fs::write(
+        local_dir.join("package.json"),
+        serde_json::json!({ "name": "is-positive", "version": "3.1.0" }).to_string(),
+    )
+    .expect("write local package.json");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "is-positive": "file:./local-pkg" } }).to_string(),
+    )
+    .expect("write package.json");
+    fs::create_dir_all(workspace.join("patches")).expect("create patches dir");
+    fs::write(workspace.join("patches/is-positive.patch"), MARKER_PATCH).expect("write patch file");
+    append_workspace_yaml_key(
+        &workspace,
+        "patchedDependencies",
+        "\n  is-positive: patches/is-positive.patch",
+    );
+
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+    let marker = workspace.join("node_modules/is-positive/patched-marker.txt");
+    assert_eq!(fs::read_to_string(&marker).expect("read fresh marker"), "patched\n");
+    let patch_hash = patch_file_hash(&workspace, "is-positive.patch");
+    let snapshots = snapshot_keys(&read_wanted_lockfile(&workspace));
+    assert!(
+        snapshots.contains(&format!("is-positive@file:local-pkg(patch_hash={patch_hash})")),
+        "snapshots: {snapshots:?}",
+    );
+
+    remove_dir_if_exists(&workspace.join("node_modules"));
+    pacquet(&workspace, ["install", "--frozen-lockfile", "--reporter=silent"]).assert().success();
+    assert_eq!(fs::read_to_string(&marker).expect("read frozen marker"), "patched\n");
+
+    drop((root, mock_instance));
+}
+
 /// TS: `the patched package is updated if the patch is modified`
 /// (`patch.ts:269`).
 #[test]
@@ -398,7 +459,7 @@ fn install_level_patch_applies_to_a_package_reached_multiple_times() {
 
 /// The hoisted linker nests a second copy of a package under each
 /// consumer when a version conflict keeps it out of the root, and every
-/// copy has to carry the patch — the TypeScript CLI patches all of them.
+/// copy has to carry the patch, the TypeScript CLI patches all of them.
 /// `send` and `finalhandler` both need `debug@2.6.9` while the root pins
 /// `debug@4.3.4`, so `2.6.9` nests twice.
 ///

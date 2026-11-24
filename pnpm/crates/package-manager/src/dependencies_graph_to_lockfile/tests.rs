@@ -17,17 +17,30 @@ mod lockfile;
 mod links;
 
 use super::{
-    DependenciesGraphToLockfileError, GraphToLockfileOptions, ImporterLockfileInput,
+    DependenciesGraphToLockfileError,
+    GraphToLockfileOptions,
+    ImporterLockfileInput,
     dependencies_graph_to_lockfile as try_dependencies_graph_to_lockfile,
 };
 use indexmap::IndexMap;
 use pnpm_deps_path::DepPath;
 use pnpm_lockfile::{
-    DirectoryResolution, LockfileResolution, PkgNameVer, RegistryResolution, TarballResolution,
+    DirectoryResolution,
+    LockfileResolution,
+    PkgNameVer,
+    RegistryResolution,
+    TarballResolution,
 };
 use pnpm_package_manifest::PackageManifest;
-use pnpm_resolving_deps_resolver::{DependenciesGraph, DependenciesGraphNode, PeerDep};
-use pnpm_resolving_resolver_base::{PkgResolutionId, ResolveResult};
+use pnpm_resolving_deps_resolver::{
+    DependenciesGraph,
+    DependenciesGraphNode,
+    PeerDep,
+};
+use pnpm_resolving_resolver_base::{
+    PkgResolutionId,
+    ResolveResult,
+};
 use rustc_hash::FxHashSet as HashSet;
 
 static EMPTY_REGISTRY_OPTIONS: std::collections::BTreeMap<String, pnpm_lockfile::RegistryOptions> =
@@ -42,7 +55,11 @@ static NPM_REGISTRIES: std::sync::LazyLock<std::collections::HashMap<String, Str
     });
 use serde_json::json;
 use ssri::Integrity;
-use std::{collections::BTreeMap, str::FromStr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+    sync::Arc,
+};
 use tempfile::TempDir;
 
 fn dependencies_graph_to_lockfile(opts: GraphToLockfileOptions<'_>) -> pnpm_lockfile::Lockfile {
@@ -79,12 +96,14 @@ fn single_importer_opts<'a>(
             dedupe_peers: None,
             exclude_links_from_lockfile,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,
@@ -161,6 +180,7 @@ fn make_node_with_optional(
 ) -> DependenciesGraphNode {
     let dep_path = DepPath::from(format!("{name}@{version}"));
     DependenciesGraphNode {
+        recorded_peer_bindings: None,
         dep_path,
         resolved_package_id: format!("{name}@{version}"),
         resolve_result: std::sync::Arc::new(make_resolve_result(name, version, manifest)),
@@ -222,6 +242,7 @@ fn git_hosted_node(alias: &str) -> (DepPath, DependenciesGraphNode) {
         },
     };
     let node = DependenciesGraphNode {
+        recorded_peer_bindings: None,
         dep_path: dep_path.clone(),
         resolved_package_id: dep_path.to_string(),
         resolve_result: Arc::new(resolve_result),
@@ -291,6 +312,7 @@ fn make_link_node(target: &str, manifest: serde_json::Value) -> DependenciesGrap
         },
     };
     DependenciesGraphNode {
+        recorded_peer_bindings: None,
         dep_path: DepPath::from(id_text.clone()),
         resolved_package_id: id_text,
         resolve_result: std::sync::Arc::new(resolve_result),
@@ -309,7 +331,7 @@ fn make_link_node(target: &str, manifest: serde_json::Value) -> DependenciesGrap
 
 /// Build a fake `DependenciesGraphNode` for a package resolved from a
 /// local directory (`file:<dir>`). The local resolver keys these by
-/// `<name>@file:<dir>` and leaves `name_ver` as `None` — the name lives
+/// `<name>@file:<dir>` and leaves `name_ver` as `None`, the name lives
 /// in the fetched manifest only.
 fn make_file_node(name: &str, directory: &str) -> DependenciesGraphNode {
     let id_text = format!("file:{directory}");
@@ -332,6 +354,7 @@ fn make_file_node(name: &str, directory: &str) -> DependenciesGraphNode {
         },
     };
     DependenciesGraphNode {
+        recorded_peer_bindings: None,
         resolved_package_id: dep_path.to_string(),
         dep_path,
         resolve_result: Arc::new(resolve_result),
@@ -398,6 +421,7 @@ fn make_named_registry_node(
         },
     };
     DependenciesGraphNode {
+        recorded_peer_bindings: None,
         dep_path,
         resolved_package_id: format!("{name}@{registry_name}:{version}"),
         resolve_result: std::sync::Arc::new(resolve_result),

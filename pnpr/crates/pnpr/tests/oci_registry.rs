@@ -8,11 +8,17 @@ mod referrers;
 #[path = "oci_registry/authorization.rs"]
 mod authorization;
 
+#[path = "oci_registry/upload_authorization.rs"]
+mod upload_authorization;
+
 #[path = "oci_registry/discovery.rs"]
 mod discovery;
 
 #[path = "oci_registry/manifests.rs"]
 mod manifests;
+
+#[path = "oci_registry/upload_hint.rs"]
+mod upload_hint;
 
 #[path = "oci_registry/uploads.rs"]
 mod uploads;
@@ -20,7 +26,10 @@ mod uploads;
 #[path = "oci_registry/behavior.rs"]
 mod behavior;
 
-use crate::{ecosystem as common, pausing_store};
+use crate::{
+    ecosystem as common,
+    pausing_store,
+};
 
 #[path = "../src/server/striped_locks.rs"]
 #[allow(dead_code, reason = "the collision fixture uses the production stripe mapping")]
@@ -29,14 +38,32 @@ mod striped_locks;
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode, header},
+    http::{
+        Request,
+        StatusCode,
+        header,
+    },
 };
-use common::{HostedSource, body_bytes, mixed_router_config, sha256_hex};
+use common::{
+    HostedSource,
+    body_bytes,
+    mixed_router_config,
+    sha256_hex,
+};
 use pnpr::{
-    AccessList, AuthState, Config, Ecosystem, PackagePattern, PackageRule, PackageRules,
+    AccessList,
+    AuthState,
+    Config,
+    Ecosystem,
+    PackagePattern,
+    PackageRule,
+    PackageRules,
     router_with_auth,
 };
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::path::PathBuf;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -53,7 +80,7 @@ fn oci_config(storage: PathBuf, hosted_access: &str) -> Config {
         Ecosystem::Oci,
         HostedSource {
             name: "images",
-            org: "images",
+            namespace: "images",
             access: hosted_access,
             packages: &["acme/*"],
         },
@@ -83,7 +110,7 @@ async fn token(app: &Router) -> String {
     let body = json!({
         "_id": "org.couchdb.user:alice",
         "name": "alice",
-        "password": "secret",
+        "password": "secret123",
         "email": "alice@example.com",
         "type": "user",
         "roles": [],
@@ -107,7 +134,10 @@ async fn token(app: &Router) -> String {
 
 /// `docker login` sends the token as the `Basic` password.
 fn basic(token: &str) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD,
+    };
     format!("Basic {}", STANDARD.encode(format!("alice:{token}")))
 }
 
@@ -478,4 +508,87 @@ fn repository_with_colliding_lock_keys() -> String {
             locks.stripe_index(name) == locks.stripe_index(&format!("oci-referrers:{name}"))
         })
         .expect("a repository whose lock keys collide")
+}
+
+#[cfg(feature = "backend-libsql")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsynced_libsql_replica_serves_oci_manifests_and_blobs_from_the_primary() {
+    use object_store::{
+        ObjectStore,
+        memory::InMemory,
+    };
+    use pnpr::HostedStoreConfig;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (primary, address, server) =
+        pnpr_libsql::testing::serve_primary(tmp.path().join("primary.db")).await;
+
+    let instance = |name: &str| {
+        let mut config = oci_config(tmp.path().join(name), "$all");
+        config.storage.hosted_backend =
+            HostedStoreConfig::ObjectStore { store: Arc::clone(&store), prefix: String::new() };
+        config.storage.database =
+            pnpr_config::DatabaseBackend::Libsql(pnpr_config::LibsqlSettings {
+                url: format!("http://{address}"),
+                auth_token: None,
+                replica_path: Some(tmp.path().join(name).join("replica.db")),
+                sync_interval_secs: Some(3600),
+                max_connections: None,
+            });
+        router_with_auth(config, AuthState::in_memory())
+    };
+    let writer = instance("writer");
+    let reader = instance("reader");
+    let auth = basic(&token(&writer).await);
+
+    push_image(&writer, &auth, "acme/app", "1.0").await;
+    assert_eq!(get(&reader, "/v2/acme/app/tags/list").await.status(), StatusCode::OK);
+
+    let layer_v2 = push_blob(&writer, &auth, "acme/app", b"layer-v2").await;
+    push_blob(&writer, &auth, "acme/app", b"cfg-v2").await;
+    let manifest_v2 = image_manifest("cfg-v2", &["layer-v2"]);
+    let digest_v2 = digest_of(&manifest_v2);
+    let put = Request::put("/v2/acme/app/manifests/2.0")
+        .header(header::AUTHORIZATION, &auth)
+        .header(header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+        .body(Body::from(manifest_v2.clone()))
+        .unwrap();
+    assert_eq!(
+        writer
+            .clone()
+            .oneshot(put)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED,
+    );
+
+    let by_tag = get(&reader, "/v2/acme/app/manifests/2.0").await;
+    assert_eq!(by_tag.status(), StatusCode::OK);
+    assert_eq!(body_bytes(by_tag.into_body()).await, manifest_v2);
+    assert_eq!(
+        get(&reader, &format!("/v2/acme/app/manifests/{digest_v2}")).await.status(),
+        StatusCode::OK,
+    );
+
+    let blob = get(&reader, &format!("/v2/acme/app/blobs/{layer_v2}")).await;
+    assert_eq!(blob.status(), StatusCode::OK);
+    assert_eq!(body_bytes(blob.into_body()).await, b"layer-v2");
+
+    let missing = get(&reader, "/v2/acme/app/manifests/9.9").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing_body: Value =
+        serde_json::from_slice(&body_bytes(missing.into_body()).await).unwrap();
+    assert_eq!(missing_body["errors"][0]["code"], "MANIFEST_UNKNOWN");
+
+    let unknown = get(&reader, "/v2/acme/never/manifests/1.0").await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let unknown_body: Value =
+        serde_json::from_slice(&body_bytes(unknown.into_body()).await).unwrap();
+    assert_eq!(unknown_body["errors"][0]["code"], "NAME_UNKNOWN");
+
+    drop(primary);
+    server.abort();
 }

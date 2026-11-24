@@ -1,18 +1,36 @@
-use crate::State;
 #[cfg(target_family = "wasm")]
 use crate::dialoguer_wasm::MultiSelect;
+use crate::{
+    State,
+    cli_args::patch_state::{
+        StateFileError,
+        clean_patch_state_and_edit_dirs,
+        read_all_edit_dir_states,
+    },
+};
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 #[cfg(not(target_family = "wasm"))]
 use dialoguer::MultiSelect;
 use indexmap::IndexMap;
 use miette::Diagnostic;
-use pnpm_fs::{is_subdir, lexical_normalize};
+use pnpm_fs::{
+    is_subdir,
+    lexical_normalize,
+};
 use pnpm_workspace_manifest_writer::UpdateWorkspaceManifestError;
 use std::{
     collections::HashSet,
-    fs, io,
-    path::{Component, Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
 };
 
 #[derive(Debug, Args)]
@@ -24,7 +42,7 @@ pub struct PatchRemoveArgs {
 
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
-pub enum PatchRemoveError {
+pub(crate) enum PatchRemoveError {
     #[display("There are no patches that need to be removed")]
     #[diagnostic(code(ERR_PNPM_NO_PATCHES_TO_REMOVE))]
     NoPatchesToRemove,
@@ -74,13 +92,16 @@ pub enum PatchRemoveError {
     },
 
     #[diagnostic(transparent)]
+    StateFile(#[error(source)] StateFileError),
+
+    #[diagnostic(transparent)]
     UpdateWorkspaceManifest(#[error(source)] UpdateWorkspaceManifestError),
 }
 
 impl PatchRemoveArgs {
     /// Remove the patches and return the `patchedDependencies` now
     /// recorded in the workspace, for the install that follows to run with.
-    pub async fn run(
+    pub(crate) async fn run(
         self,
         dir: &Path,
         state: State,
@@ -89,47 +110,73 @@ impl PatchRemoveArgs {
             state.config.patched_dependencies.clone().unwrap_or_default();
         let patches_to_remove =
             patches_to_remove(self.patches, &patched_dependencies, &DialoguerPatchRemovePrompt)?;
-        for patch in &patches_to_remove {
-            if !patched_dependencies.contains_key(patch) {
-                return Err(PatchRemoveError::PatchNotFound { patch: patch.clone() });
-            }
-        }
+        validate_patches_exist(&patches_to_remove, &patched_dependencies)?;
 
         let lockfile_dir = state.config.workspace_dir.clone().unwrap_or_else(|| dir.to_path_buf());
         let ctx = PatchRemovalContext::new(
             &lockfile_dir,
             state.config.patches_dir.as_deref().unwrap_or("patches"),
         )?;
-        let targets = patches_to_remove
-            .iter()
-            .map(|patch| {
-                let patch_file = patched_dependencies
-                    .get(patch)
-                    .ok_or_else(|| PatchRemoveError::PatchNotFound { patch: patch.clone() })?;
-                PatchRemovalTarget::new(patch, patch_file, &ctx)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let remaining_patch_files =
-            remaining_patch_files(&patched_dependencies, &patches_to_remove, &ctx)?;
+        let targets = collect_removal_targets(&patches_to_remove, &patched_dependencies, &ctx)?;
+        let remaining = remaining_patch_files(&patched_dependencies, &patches_to_remove, &ctx)?;
 
-        for target in &targets {
-            if !remaining_patch_files.contains(&target.target_path) {
-                unlink_patch_if_exists(target)?;
-            }
-        }
+        read_all_edit_dir_states(&state.config.modules_dir).map_err(PatchRemoveError::StateFile)?;
+
+        unlink_removed_patches(&targets, &remaining)?;
         for target in &targets {
             patched_dependencies.shift_remove(&target.patch);
         }
         remove_empty_patch_dirs(&targets)?;
-
         pnpm_workspace_manifest_writer::set_patched_dependencies(
             &lockfile_dir,
             &patched_dependencies,
         )
         .map_err(PatchRemoveError::UpdateWorkspaceManifest)?;
+        clean_patch_state_and_edit_dirs(&state.config.modules_dir, &patches_to_remove)
+            .map_err(PatchRemoveError::StateFile)?;
 
         Ok(patched_dependencies)
     }
+}
+
+fn validate_patches_exist(
+    patches: &[String],
+    patched_dependencies: &IndexMap<String, String>,
+) -> Result<(), PatchRemoveError> {
+    for patch in patches {
+        if !patched_dependencies.contains_key(patch) {
+            return Err(PatchRemoveError::PatchNotFound { patch: patch.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn collect_removal_targets(
+    patches: &[String],
+    patched_dependencies: &IndexMap<String, String>,
+    ctx: &PatchRemovalContext,
+) -> Result<Vec<PatchRemovalTarget>, PatchRemoveError> {
+    patches
+        .iter()
+        .map(|patch| {
+            let patch_file = patched_dependencies
+                .get(patch)
+                .ok_or_else(|| PatchRemoveError::PatchNotFound { patch: patch.clone() })?;
+            PatchRemovalTarget::new(patch, patch_file, ctx)
+        })
+        .collect()
+}
+
+fn unlink_removed_patches(
+    targets: &[PatchRemovalTarget],
+    remaining: &HashSet<PathBuf>,
+) -> Result<(), PatchRemoveError> {
+    for target in targets {
+        if !remaining.contains(&target.target_path) {
+            unlink_patch_if_exists(target)?;
+        }
+    }
+    Ok(())
 }
 
 fn patches_to_remove(
@@ -204,7 +251,7 @@ impl PatchRemovalContext {
         let project_root = lexical_normalize(lockfile_dir);
         let real_project_root =
             dunce::canonicalize(&project_root).unwrap_or_else(|_| project_root.clone());
-        let patches_dir = join_setting_path(&project_root, patches_dir_setting);
+        let patches_dir = join_setting_path(project_root.clone(), patches_dir_setting);
         if !is_subdir(&project_root, &patches_dir) {
             return Err(PatchRemoveError::PatchesDirOutsideProject {
                 patches_dir: patches_dir_setting.to_string(),
@@ -231,6 +278,13 @@ struct PatchRemovalTarget {
 }
 
 impl PatchRemovalTarget {
+    #[cfg_attr(
+        dylint_lib = "perfectionist",
+        expect(
+            perfectionist::needless_borrowed_parameters,
+            reason = "The patch name is copied only after validation succeeds, and the caller collecting target paths discards it."
+        )
+    )]
     fn new(
         patch: &str,
         patch_file: &str,
@@ -270,8 +324,8 @@ impl PatchRemovalTarget {
     }
 }
 
-fn join_setting_path(base: &Path, setting: &str) -> PathBuf {
-    let mut joined = base.to_path_buf();
+fn join_setting_path(base: PathBuf, setting: &str) -> PathBuf {
+    let mut joined = base;
     for component in Path::new(setting).components() {
         match component {
             Component::Prefix(_) | Component::RootDir => {}
@@ -355,7 +409,7 @@ struct RealPatchRemoveFs;
 
 impl PatchRemoveFs for RealPatchRemoveFs {
     fn is_dir_empty(&self, path: &Path) -> io::Result<bool> {
-        fs::read_dir(path).map(|mut entries| entries.next().is_none())
+        fs::read_dir(path).map(|mut entries| entries.next()).map(|next| next.is_none())
     }
 
     fn remove_dir(&self, path: &Path) -> io::Result<()> {

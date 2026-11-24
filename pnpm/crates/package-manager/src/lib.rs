@@ -1,20 +1,35 @@
 #![cfg_attr(target_family = "wasm", recursion_limit = "256")]
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
 
 pub use add::*;
 pub use agent_skills::{
-    AGENT_SKILL_LINK_PREFIX, AgentSkillsError, AgentSkillsState, ResyncAgentSkillsError,
-    SkillApprovalError, SkillApprovalOptions, SyncAgentSkills, agent_skills_dir_from_env,
-    detected_agent_dirs, resync_installed_agent_skills, skill_approval_options, sync_agent_skills,
+    AGENT_SKILL_LINK_PREFIX,
+    AgentSkillsError,
+    AgentSkillsState,
+    ResyncAgentSkillsError,
+    SkillApprovalError,
+    SkillApprovalOptions,
+    SyncAgentSkills,
+    agent_skills_dir_from_env,
+    detected_agent_dirs,
+    resync_installed_agent_skills,
+    skill_approval_options,
+    sync_agent_skills,
 };
 pub use build_resolution_verifiers::*;
 pub use build_snapshot::*;
-pub use catalog_cleanup::{WriteWorkspaceCatalogsError, prune_against_project_lockfiles};
+pub use catalog_cleanup::{
+    WriteWorkspaceCatalogsError,
+    prune_against_project_lockfiles,
+};
 pub use catalog_mode::*;
 pub use command_lockfile::CommandLockfile;
 pub use dependencies_graph_to_lockfile::*;
 pub use fast_update_lockfile::prune_unreachable_packages;
 pub(crate) use hoisted_selection::{
-    selected_materialization_closure, selected_materialization_ids,
+    selected_materialization_closure,
+    selected_materialization_ids,
 };
 pub use install::*;
 pub use install_state::*;
@@ -22,30 +37,59 @@ pub use install_with_fresh_lockfile::*;
 pub use link_manifest_link_deps::*;
 pub use linked_peer_dependencies::linked_peer_dependencies_warning;
 pub use lockfile_diff::*;
-pub use manifest_spec_bumps::{AppliedSpecBumps, ManifestSpecBumps};
-pub use minimum_release_age::{MinimumReleaseAgeError, PolicyExcludes};
+pub use manifest_spec_bumps::{
+    AppliedSpecBumps,
+    ManifestSpecBumps,
+};
+pub use minimum_release_age::{
+    MinimumReleaseAgeError,
+    PolicyExcludes,
+    persist_loose_release_age_picks,
+};
 pub use optimistic_repeat_install::*;
 pub use overrides::*;
-pub use package_extender::*;
 pub use patch::*;
 pub use pnpm_deps_restorer::*;
-pub use pnpm_patching::{
-    PatchCommitError, PkgFilesForDiff, diff_folders, prepare_pkg_files_for_diff,
+pub use pnpm_local_spec::is_host_filesystem_specifier;
+pub use pnpm_package_extensions::{
+    InvalidPackageExtensionSelector,
+    PackageExtender,
 };
-pub use prefetch_downloads::{DownloadOutcome, PrefetchDownloads};
+pub use pnpm_patching::{
+    PatchCommitError,
+    PkgFilesForDiff,
+    diff_folders,
+    prepare_pkg_files_for_diff,
+};
+pub use pnpm_resolving_local_resolver::LocalFilesystemPolicy;
+pub use prefetch_downloads::{
+    DownloadOutcome,
+    PrefetchDownloads,
+};
 pub use prefetching_resolver::*;
 pub use rayon_pool::*;
 pub use remove::*;
 pub use resolution_observer::*;
-pub use resolution_policy::{PickPolicy, create_configured_registry_resolver};
+pub use resolution_policy::{
+    PickPolicy,
+    create_configured_registry_resolver,
+};
 pub use resolve_latest::ResolveLatestError;
+pub use runtime_on_fail::{
+    apply_runtime_on_fail,
+    apply_runtime_on_fail_to_projects,
+};
+#[cfg(feature = "runtime-provisioning")]
+pub use runtime_specifier::updated_node_runtime_specifier;
 pub(crate) use store_verification::StoreVerification;
 pub use tarball_prefetch::*;
 pub use update::*;
 pub use update_project_manifest::*;
 pub use update_project_manifest_object::*;
 pub use workspace_cycles::{
-    CyclicWorkspaceDependenciesError, install_scope_cycles, report_workspace_cycles,
+    CyclicWorkspaceDependenciesError,
+    install_scope_cycles,
+    report_workspace_cycles,
     workspace_cycles,
 };
 
@@ -57,7 +101,6 @@ mod catalog_cleanup;
 mod catalog_mode;
 mod check_custom_resolver_force_resolve;
 mod command_lockfile;
-mod compat_package_extensions;
 mod dependencies_graph_to_lockfile;
 mod early_materializer;
 mod fast_update_catalog_versions;
@@ -79,10 +122,8 @@ mod linked_peer_dependencies;
 mod lockfile_diff;
 mod manifest_spec_bumps;
 mod minimum_release_age;
-mod missing_peer_types;
 mod optimistic_repeat_install;
 mod overrides;
-mod package_extender;
 mod patch;
 mod peer_dependency_issues;
 mod prefetch_downloads;
@@ -94,6 +135,7 @@ mod remove;
 mod resolution_observer;
 mod resolution_policy;
 mod resolve_latest;
+mod runtime_on_fail;
 mod runtime_specifier;
 mod store_fetch;
 mod store_verification;
@@ -104,8 +146,8 @@ mod update_project_manifest_object;
 mod warn_on_stale_convergence_overrides;
 mod workspace_cycles;
 
-/// The dependency groups a project installs directly — `dependencies`,
-/// `devDependencies`, `optionalDependencies` — in the order pnpm's
+/// The dependency groups a project installs directly (`dependencies`,
+/// `devDependencies`, `optionalDependencies`) in the order pnpm's
 /// `updateProjectManifest` walks them. This is also the install `include`
 /// set for runs whose `dependency_groups` carries no user filter intent
 /// (`add`, `remove`, `update`): those mutations pick a manifest group to

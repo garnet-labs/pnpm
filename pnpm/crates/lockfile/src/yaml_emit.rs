@@ -4,27 +4,30 @@
 //! carrying lockfile-specific rendering rules that no general-purpose Rust YAML
 //! serializer reproduces:
 //!
-//! - **`blankLines`** — a blank line separates the entries of the top-level map
+//! - **`blankLines`**, a blank line separates the entries of the top-level map
 //!   and of the `packages:` / `importers:` / `snapshots:` maps.
-//! - **single-line keys** — `cpu`, `engines`, `os`, `libc`, and `resolution`
+//! - **single-line keys**, `cpu`, `engines`, `os`, `libc`, and `resolution`
 //!   (unless its `type` is `variations`/`binary`) render in flow style on one
 //!   line; everything else renders in block style.
-//! - **single-quote scalar style** — ambiguous scalars (`'9.0'`, `'>=10'`,
+//! - **single-quote scalar style**, ambiguous scalars (`'9.0'`, `'>=10'`,
 //!   `'@scope/name@1.0.0'`) are single-quoted, matching `js-yaml`'s default
 //!   `quotingType`, not double-quoted.
-//! - **`lineWidth: -1`, `noRefs: true`, `noCompatMode: true`** — no line
+//! - **`lineWidth: -1`, `noRefs: true`, `noCompatMode: true`**, no line
 //!   wrapping, no anchors/aliases, no legacy-bool/base-60 quoting.
 //!
 //! The input is first lowered to a [`serde_json::Value`] (the crate enables
 //! `serde_json/preserve_order`, so map order is retained), then its keys are
 //! reordered by [`sort_lockfile_keys`] to match pnpm's lockfile key sort,
-//! so the byte output is independent of pacquet's struct field order — and
+//! so the byte output is independent of pacquet's struct field order, and
 //! finally rendered by a faithful translation of the fork's `dumper.js`.
 //!
 //! [`@zkochan/js-yaml`]: https://github.com/pnpm/js-yaml
 
 use rayon::prelude::*;
-use serde_json::{Map, Value};
+use serde_json::{
+    Map,
+    Value,
+};
 use std::cmp::Ordering;
 
 /// Entry count from which a map's independent per-entry work (deep key
@@ -35,14 +38,18 @@ use std::cmp::Ordering;
 /// would dominate.
 const PARALLEL_ENTRY_THRESHOLD: usize = 64;
 
-/// Keys whose collection value always renders on a single line (flow style).
-/// Mirrors the fork's [`SINGLE_LINE_KEYS`][fork-single-line-keys].
-///
-/// [fork-single-line-keys]: https://cdn.jsdelivr.net/npm/@zkochan/js-yaml@0.0.11/lib/dumper.js
-const SINGLE_LINE_KEYS: [&str; 4] = ["cpu", "engines", "os", "libc"];
-
 /// One indentation level, in spaces (`js-yaml`'s default `indent`).
 const INDENT: usize = 2;
+
+mod flow;
+mod nesting;
+mod next_order;
+use nesting::{
+    Format,
+    is_single_line_key,
+    is_single_line_map,
+};
+use next_order::sort_next_sections;
 
 /// Per-package / per-snapshot key priority, matching pnpm's lockfile
 /// key sort.
@@ -70,7 +77,7 @@ const ORDERED_KEYS: [&str; 20] = [
 ];
 
 /// Top-level key priority, matching pnpm's lockfile root-key sort.
-const ROOT_KEYS: [&str; 10] = [
+const ROOT_KEYS: [&str; 11] = [
     "lockfileVersion",
     "settings",
     "catalogs",
@@ -80,22 +87,30 @@ const ROOT_KEYS: [&str; 10] = [
     "untrackedPnpmfileReadPackageHook",
     "patchedDependencies",
     "importers",
+    "projects",
     "packages",
 ];
 
 /// Render an already-normalized lockfile document to a YAML string
-/// matching pnpm's lockfile formatting.
+/// matching pnpm's lockfile formatting: today's block style, or the next
+/// format's [JSON](flow).
 pub(crate) fn to_string(value: Value) -> String {
-    let value = sort_lockfile_keys(value);
-    let mut dump = render(
-        &value,
-        0,
-        CollectionStyle::Block,
-        FirstEntry::OnKeyLine,
-        None,
-        ScalarLines::Multiline,
-    );
-    dump.push('\n');
+    let (value, format) = sort_lockfile_keys(value);
+    let dump = match format {
+        Format::Flow => flow::to_string(&value),
+        Format::Block => {
+            let mut dump = render(
+                &value,
+                0,
+                CollectionStyle::Block,
+                FirstEntry::OnKeyLine,
+                None,
+                ScalarLines::Multiline,
+            );
+            dump.push('\n');
+            dump
+        }
+    };
     pnpm_fs::background_drop(value);
     dump
 }
@@ -106,29 +121,41 @@ pub(crate) fn to_string(value: Value) -> String {
 /// entries are deep-sorted (by the priority map for packages/snapshots, by the
 /// root priority for importers, lexically for catalogs), and finally the root
 /// keys are ordered by priority.
-fn sort_lockfile_keys(value: Value) -> Value {
-    let Value::Object(mut root) = value else { return value };
+fn sort_lockfile_keys(value: Value) -> (Value, Format) {
+    let Value::Object(mut root) = value else { return (value, Format::Block) };
 
+    let next = sort_next_sections(&mut root);
     for (section, priority) in [
         ("importers", &ROOT_KEYS[..]),
         ("packages", &ORDERED_KEYS[..]),
         ("snapshots", &ORDERED_KEYS[..]),
     ] {
-        sort_entries_by_priority(&mut root, section, priority);
+        if !(next && matches!(section, "packages" | "importers" | "projects")) {
+            sort_entries_by_priority(&mut root, section, priority);
+        }
     }
 
+    let format = if next {
+        Format::Flow
+    } else {
+        sort_plain_sections(&mut root);
+        Format::Block
+    };
+    (Value::Object(sort_by_priority(root, &ROOT_KEYS, false)), format)
+}
+
+/// Sorts `catalogs` by catalog and entry, deep, and `time`,
+/// `patchedDependencies` and `settings` by their direct keys.
+fn sort_plain_sections(root: &mut Map<String, Value>) {
     if let Some(Value::Object(catalogs)) = root.remove("catalogs") {
         let sorted = map_values(sort_direct_keys(catalogs), sort_deep_keys);
         root.insert("catalogs".to_string(), Value::Object(sorted));
     }
-
     for section in ["time", "patchedDependencies", "settings"] {
         if let Some(Value::Object(map)) = root.remove(section) {
             root.insert(section.to_string(), Value::Object(sort_direct_keys(map)));
         }
     }
-
-    Value::Object(sort_by_priority(root, &ROOT_KEYS, false))
 }
 
 /// Sort one section's direct keys, then each entry's own keys by `priority`.
@@ -281,23 +308,6 @@ fn render_map(
     write_block_mapping(map, level, first_entry, spacing)
 }
 
-fn is_single_line_key(key: &str) -> bool {
-    SINGLE_LINE_KEYS.contains(&key)
-}
-
-/// Whether a map value renders on a single line. `resolution` is single-line
-/// except for the nested `variations`/`binary` shapes (detected by the `type`
-/// discriminator pnpm's tagged resolutions carry).
-fn is_single_line_map(object_key: Option<&str>, map: &serde_json::Map<String, Value>) -> bool {
-    match object_key {
-        Some(key) if is_single_line_key(key) => true,
-        Some("resolution") => {
-            !matches!(map.get("type").and_then(Value::as_str), Some("variations" | "binary"))
-        }
-        _ => false,
-    }
-}
-
 /// `generateNextLine`: a newline (doubled for [`EntrySpacing::BlankLine`])
 /// plus this level's indent.
 fn next_line(level: usize, spacing: EntrySpacing) -> String {
@@ -327,7 +337,7 @@ fn write_block_mapping(
     }
     // Each entry's rendering depends only on its own key and value, so a
     // large map fans its entries out across the rayon pool, and the serial
-    // stitch below applies the only order-dependent rule — the first entry
+    // stitch below applies the only order-dependent rule, the first entry
     // of a compact block omits its leading newline.
     let entries: Vec<String> = map
         .iter()
@@ -341,7 +351,7 @@ fn write_block_mapping(
         .collect();
     let mut result = String::new();
     for (index, entry) in entries.iter().enumerate() {
-        if index > 0 || !omits_leading_newline(first_entry) {
+        if index > 0 || !first_entry.omits_leading_newline() {
             result.push_str(&next_line(level, spacing));
         }
         result.push_str(entry);
@@ -349,7 +359,7 @@ fn write_block_mapping(
     if result.is_empty() { "{}".to_string() } else { result }
 }
 
-/// Small maps — the nested ones inside every package entry, above all —
+/// Small maps (the nested ones inside every package entry, above all)
 /// append straight into one buffer, chunk-free.
 fn write_block_mapping_serial(
     map: &serde_json::Map<String, Value>,
@@ -359,21 +369,12 @@ fn write_block_mapping_serial(
 ) -> String {
     let mut result = String::new();
     for (key, value) in map {
-        if !result.is_empty() || !omits_leading_newline(first_entry) {
+        if !result.is_empty() || !first_entry.omits_leading_newline() {
             result.push_str(&next_line(level, spacing));
         }
         render_entry_into(&mut result, key, value, level);
     }
     if result.is_empty() { "{}".to_string() } else { result }
-}
-
-/// Whether the first entry of a block collection starts on the line its key
-/// already opened, so no newline precedes it.
-fn omits_leading_newline(first_entry: FirstEntry) -> bool {
-    match first_entry {
-        FirstEntry::OnKeyLine => true,
-        FirstEntry::OnOwnLine => false,
-    }
 }
 
 fn render_entry_into(result: &mut String, key: &str, value: &Value, level: usize) {
@@ -415,7 +416,7 @@ fn write_block_sequence(seq: &[Value], level: usize, first_entry: FirstEntry) ->
             None,
             ScalarLines::Multiline,
         );
-        if !result.is_empty() || !omits_leading_newline(first_entry) {
+        if !result.is_empty() || !first_entry.omits_leading_newline() {
             result.push_str(&next_line(level, EntrySpacing::Tight));
         }
         result.push('-');
@@ -473,7 +474,12 @@ fn write_flow_sequence(seq: &[Value], level: usize) -> String {
 mod tests;
 
 mod style;
-use style::{CollectionStyle, EntrySpacing, FirstEntry, ScalarLines};
+use style::{
+    CollectionStyle,
+    EntrySpacing,
+    FirstEntry,
+    ScalarLines,
+};
 
 mod implicit;
 use implicit::resolves_implicitly;

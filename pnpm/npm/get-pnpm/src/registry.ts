@@ -17,6 +17,8 @@ export interface VersionMeta {
     integrity?: string
     signatures?: PackageSignature[]
   }
+  /** Read from the package document, so its signatures are already in `dist`. */
+  fromPackageDocument?: true
 }
 
 const ABBREVIATED_PACKUMENT = 'application/vnd.npm.install-v1+json'
@@ -164,6 +166,13 @@ export async function fetchPackument (
   )
 }
 
+/**
+ * The registry's document for `pkgName@version`.
+ *
+ * Some registry proxies, Azure Artifacts among them, answer 404 for every
+ * version document while serving the package document, so the version is
+ * looked up there instead.
+ */
 export async function fetchVersionMeta (
   registry: string,
   pkgName: string,
@@ -171,11 +180,33 @@ export async function fetchVersionMeta (
   headers?: RequestHeaders,
   headersPath?: string
 ): Promise<VersionMeta> {
-  return fetchJson<VersionMeta>(
-    new URL(`${pkgName}/${version}`, registry),
-    'application/json',
-    { registry, headers, headersPath }
-  )
+  try {
+    return await fetchJson<VersionMeta>(
+      new URL(`${pkgName}/${version}`, registry),
+      'application/json',
+      { registry, headers, headersPath }
+    )
+  } catch (err) {
+    if (!(err instanceof RequestFailure) || err.status !== 404) throw err
+    const packument = await fetchJson<VersionsPackument>(
+      new URL(escapePackageName(pkgName), registry),
+      ABBREVIATED_PACKUMENT,
+      { registry, headers, headersPath }
+    )
+    const meta = packument.versions?.[version]
+    // Not there either: the version is missing, which the 404 already says.
+    if (meta?.dist?.tarball == null) throw err
+    return { ...meta, fromPackageDocument: true }
+  }
+}
+
+interface VersionsPackument {
+  versions?: Record<string, VersionMeta | undefined>
+}
+
+/** Escaped the way npm requests a scoped package, which every registry serves. */
+function escapePackageName (pkgName: string): string {
+  return pkgName.replaceAll('/', '%2f')
 }
 
 /**
@@ -183,19 +214,58 @@ export async function fetchVersionMeta (
  *
  * Some registry proxies, JFrog Artifactory among them, strip `dist.signatures`
  * from the version document but keep them in the package document, so that is
- * where they are looked up when `meta` carries none. Only the signatures are
- * taken from it: they cover `<name>@<version>:<integrity>`, so they still have
- * to verify against the checksum in `meta`, which the tarball is checked
- * against.
+ * where they are looked up when `meta` carries none. Others, Azure Artifacts
+ * among them, carry none anywhere; given `npmRegistry`, npm's own are taken
+ * from there.
+ * Only the signatures are taken from either: they cover
+ * `<name>@<version>:<integrity>`, so they still have to verify against the
+ * checksum in `meta`, which the tarball is checked against.
  */
 export async function fetchSignatures (
   meta: VersionMeta,
-  opts: { registry: string, pkgName: string, version: string, headers?: RequestHeaders, headersPath?: string }
+  opts: {
+    registry: string
+    pkgName: string
+    version: string
+    headers?: RequestHeaders
+    headersPath?: string
+    /** Where npm's signatures are looked up when `registry` serves none. */
+    npmRegistry?: string
+  }
 ): Promise<PackageSignature[] | undefined> {
   if (meta.dist.signatures?.length) return meta.dist.signatures
-  // Escaped the way npm requests a scoped package, which every registry serves.
+  const signatures = meta.fromPackageDocument ? undefined : await fetchPackageDocumentSignatures(opts)
+  if (signatures?.length || opts.npmRegistry == null) return signatures
+  const npmRegistry = normalizeRegistry(opts.npmRegistry)
+  if (normalizeRegistry(opts.registry) === npmRegistry) return signatures
+  return fetchNpmSignatures(npmRegistry, opts.pkgName, opts.version)
+}
+
+/**
+ * npm's signatures for `pkgName@version`, or `undefined` when npm cannot be
+ * reached (from an air-gapped network, say), so the caller reports the
+ * package as unsigned rather than the failed request. No credentials are sent:
+ * they belong to the registry the package is downloaded from. Only a failure
+ * npm answered, such as a 503, is retried: a network that drops requests to
+ * npm waits out one timeout, not three.
+ */
+async function fetchNpmSignatures (npmRegistry: string, pkgName: string, version: string): Promise<PackageSignature[] | undefined> {
+  try {
+    const meta = await fetchJson<VersionMeta>(new URL(`${pkgName}/${version}`, npmRegistry), 'application/json', {
+      shouldRetry: (err) => err.status != null,
+    })
+    return meta.dist?.signatures
+  } catch (err) {
+    if (err instanceof RequestFailure) return undefined
+    throw err
+  }
+}
+
+async function fetchPackageDocumentSignatures (
+  opts: { registry: string, pkgName: string, version: string, headers?: RequestHeaders, headersPath?: string }
+): Promise<PackageSignature[] | undefined> {
   const packument = await fetchJson<SignedPackument>(
-    new URL(opts.pkgName.replaceAll('/', '%2f'), opts.registry),
+    new URL(escapePackageName(opts.pkgName), opts.registry),
     ABBREVIATED_PACKUMENT,
     { registry: opts.registry, headers: opts.headers, headersPath: opts.headersPath }
   )
@@ -208,7 +278,7 @@ interface SignedPackument {
 
 /**
  * Streams `meta.dist.tarball` to `dest`, verifying the checksum the registry
- * published for it. A mismatch removes nothing — the caller discards the whole
+ * published for it. A mismatch removes nothing. The caller discards the whole
  * temporary directory.
  *
  * `registry` re-hosts a tarball URL that points at npm onto that registry, so a
@@ -270,8 +340,8 @@ export interface TarballOptions extends ScopedHeadersOptions {
  * Where to download `meta`'s tarball from.
  *
  * Registries that proxy npm hand back npm's own URL. Following it would leave
- * the mirror the metadata came from — for an air-gapped one, it would not
- * resolve at all — so the path is re-hosted onto `registry`. Matched by origin,
+ * the mirror the metadata came from (for an air-gapped one, it would not
+ * resolve at all), so the path is re-hosted onto `registry`. Matched by origin,
  * so a host that merely starts with npm's is left alone.
  */
 export function tarballUrl (meta: VersionMeta, registry?: string): URL {
@@ -294,7 +364,7 @@ function headersFor (url: URL, opts: ScopedHeadersOptions): RequestHeaders | und
  *
  * `integrity` is an SRI string, which may hold several space-separated entries;
  * the first is used. Only the digest that the registry signature covers is
- * accepted — `shasum` is SHA-1, and a package without `integrity` has already
+ * accepted. `shasum` is SHA-1, and a package without `integrity` has already
  * been refused before any download starts.
  */
 function checksum (meta: VersionMeta): [algorithm: string, expected: string] {
@@ -309,34 +379,47 @@ function checksum (meta: VersionMeta): [algorithm: string, expected: string] {
   return [entry.slice(0, separator), entry.slice(separator + 1)]
 }
 
-async function fetchJson<Result> (url: URL, accept: string, opts: ScopedHeadersOptions = {}): Promise<Result> {
-  return withRetries(async () => {
-    const response = await request(url, accept, METADATA_TIMEOUT_MS, opts)
-    const chunks: Uint8Array[] = []
-    for await (const chunk of readBody(response, url, METADATA_TIMEOUT_MS)) chunks.push(chunk)
-    // Malformed JSON is what the server sent, and would be sent again, so a
-    // parse failure is not retried.
-    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Result
-  })
+async function fetchJson<Result> (
+  url: URL,
+  accept: string,
+  opts: ScopedHeadersOptions & { shouldRetry?: (err: RequestFailure) => boolean } = {}
+): Promise<Result> {
+  return withRetries(async () => fetchJsonOnce<Result>(url, accept, opts), opts.shouldRetry)
+}
+
+async function fetchJsonOnce<Result> (url: URL, accept: string, opts: ScopedHeadersOptions = {}): Promise<Result> {
+  const response = await request(url, accept, METADATA_TIMEOUT_MS, opts)
+  const chunks: Uint8Array[] = []
+  for await (const chunk of readBody(response, url, METADATA_TIMEOUT_MS)) chunks.push(chunk)
+  // Malformed JSON is what the server sent, and would be sent again, so a
+  // parse failure is not retried.
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Result
 }
 
 /** A request failure, marked so `withRetries` knows whether retrying it can help. */
 class RequestFailure extends Error {
   readonly retryable: boolean
+  /** The HTTP status the server answered with, if it answered. */
+  readonly status?: number
 
-  constructor (message: string, opts: { cause?: unknown, retryable: boolean }) {
+  constructor (message: string, opts: { cause?: unknown, retryable: boolean, status?: number }) {
     super(message, { cause: opts.cause })
     this.retryable = opts.retryable
+    this.status = opts.status
   }
 }
 
-async function withRetries<Result> (attempt: () => Promise<Result>): Promise<Result> {
+/** Retries an attempt that failed with a retryable {@link RequestFailure} that `shouldRetry` accepts. */
+async function withRetries<Result> (
+  attempt: () => Promise<Result>,
+  shouldRetry: (err: RequestFailure) => boolean = () => true
+): Promise<Result> {
   for (let attemptNo = 1; ; attemptNo++) {
     try {
       // eslint-disable-next-line no-await-in-loop -- each attempt waits for the previous one to fail
       return await attempt()
     } catch (err) {
-      if (attemptNo >= MAX_ATTEMPTS || !(err instanceof RequestFailure) || !err.retryable) throw err
+      if (attemptNo >= MAX_ATTEMPTS || !(err instanceof RequestFailure) || !err.retryable || !shouldRetry(err)) throw err
       // eslint-disable-next-line no-await-in-loop -- the delay is what spaces the attempts out
       await delay(RETRY_DELAY_MS * attemptNo)
     }
@@ -396,7 +479,7 @@ async function fetchHop (
 /** Where the redirect `response` points; throws for a response that is not one. */
 function redirectTarget (response: Response, url: URL): URL {
   if (!REDIRECT_STATUSES.has(response.status)) {
-    throw new RequestFailure(`Could not download ${url.href}: ${response.status} ${response.statusText}`, { retryable: isRetryableStatus(response.status) })
+    throw new RequestFailure(`Could not download ${url.href}: ${response.status} ${response.statusText}`, { retryable: isRetryableStatus(response.status), status: response.status })
   }
   const location = response.headers.get('location')
   if (location == null) {
@@ -471,7 +554,7 @@ function isRetryableError (err: unknown, timeoutMs: number): boolean {
 
 /**
  * A 4xx means the request itself is wrong (a missing package, a bad
- * credential) — retrying would just ask the same wrong question again. The
+ * credential). Retrying would just ask the same wrong question again. The
  * exceptions are a request timeout and rate limiting, which say "not now"
  * rather than "no". A 5xx is the server's problem, and often a transient one.
  */

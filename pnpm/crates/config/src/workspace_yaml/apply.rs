@@ -1,14 +1,29 @@
 use super::{
-    Config, LockfileSetting, NodePackageMapMode, Path, PnpmfileSetting, ProxyKeys, ProxyValue,
-    SideEffectsCacheSetting, StoreDir, UpdateConfig, WorkspaceSettings, no_proxy_scalar, overlay,
-    overlay_some, registries, resolve, resolve_child_concurrency, warn_deprecated_pairing,
+    Config,
+    LockfileSetting,
+    NodePackageMapMode,
+    Path,
+    PnpmfileSetting,
+    ProxyKeys,
+    ProxyValue,
+    SideEffectsCacheSetting,
+    StoreDir,
+    UpdateConfig,
+    WorkspaceSettings,
+    no_proxy_scalar,
+    overlay,
+    overlay_some,
+    registries,
+    resolve,
+    resolve_child_concurrency,
+    warn_deprecated_pairing,
 };
 use pnpm_network::normalize_registry_url;
 
 impl WorkspaceSettings {
     /// Apply every set field onto `config`, leaving unset ones untouched.
     ///
-    /// Path-valued settings are resolved against `base_dir` if relative —
+    /// Path-valued settings are resolved against `base_dir` if relative,
     /// anchored at the workspace root where the yaml was found, matching pnpm.
     /// `scriptShell` is the exception; see [`Self::resolve_script_shell`].
     pub fn apply_to(mut self, config: &mut Config, base_dir: &Path) {
@@ -115,6 +130,7 @@ impl WorkspaceSettings {
     pub(super) fn apply_optional_settings(&mut self, config: &mut Config) {
         overlay_some(&mut config.frozen_lockfile, self.frozen_lockfile.take());
         overlay_some(&mut config.provenance, self.provenance.take());
+        overlay_some(&mut config.access, self.access.take());
         overlay_some(
             &mut config.prefer_symlinked_executables,
             self.prefer_symlinked_executables.take(),
@@ -129,18 +145,18 @@ impl WorkspaceSettings {
         overlay_some(&mut config.save_prefix, self.save_prefix.take());
         overlay(&mut config.tag_version_prefix, self.tag_version_prefix.take());
 
-        if let Some(node_linker) = self.node_linker.take() {
-            node_linker.apply_to(config);
-        }
-
         overlay(&mut config.hoist_pattern, self.hoist_pattern.take());
         overlay(&mut config.public_hoist_pattern, self.public_hoist_pattern.take());
 
         // Applied AFTER `hoist_pattern` assignment so a yaml that sets
         // both `hoist: false` and `hoistPattern: ["..."]` still
-        // disables — `hoist: false` wins.
+        // disables, `hoist: false` wins.
         if !config.hoist {
             config.hoist_pattern = None;
+        }
+
+        if let Some(node_linker) = self.node_linker.take() {
+            node_linker.apply_to(config);
         }
     }
 
@@ -155,11 +171,8 @@ impl WorkspaceSettings {
         if let Some(v) = self.global_virtual_store_dir.take() {
             config.global_virtual_store_dir = resolve(base_dir, &v);
         }
-        // Last of the path-valued settings: pinning the lockfile dir
-        // re-resolves `modulesDir` / `virtualStoreDir` against it, so it
-        // must see whatever this layer set.
         if let Some(v) = self.lockfile_dir.take() {
-            config.pin_lockfile_dir(&resolve(base_dir, &v));
+            config.set_lockfile_dir(&resolve(base_dir, &v));
         }
         if let Some(v) = self.store_dir.take() {
             config.store_dir = StoreDir::from(resolve(base_dir, &v));
@@ -244,6 +257,7 @@ impl WorkspaceSettings {
                     .include_resolution_settings
                     .unwrap_or(false);
                 config.lockfile_integrity_target = settings.integrity_target.unwrap_or_default();
+                config.lockfile_format = settings.format.unwrap_or_default();
             }
             None => {}
         }
@@ -384,6 +398,18 @@ impl WorkspaceSettings {
             &mut config.minimum_release_age_strict,
             self.minimum_release_age_strict.take(),
         );
+        // A `pnpm-workspace.yaml` value was validated on load. A value from
+        // another source (`PNPM_CONFIG_*`, `--config.*`, a hook) is ignored
+        // with a warning, as other typed settings from those sources are.
+        if let Some(value) = self.reference_time.take() {
+            match super::validation::parse_reference_time(&value) {
+                Ok(time) => config.reference_time = Some(time),
+                Err(reason) => tracing::warn!(
+                    target: "pacquet::config",
+                    "Ignoring referenceTime: {value:?} {reason}",
+                ),
+            }
+        }
         overlay(&mut config.trust_lockfile, self.trust_lockfile.take());
         overlay(&mut config.trust_policy, self.trust_policy.take());
         overlay_some(&mut config.pm_on_fail, self.pm_on_fail.take());
@@ -432,7 +458,7 @@ impl WorkspaceSettings {
 
     /// Overlay this file's proxy keys onto the merged view and re-resolve.
     ///
-    /// A key named here occupies it even when the value reads as unset —
+    /// A key named here occupies it even when the value reads as unset;
     /// see the [`crate::proxy_keys`] module docs.
     pub(crate) fn apply_proxy_to(
         &self,

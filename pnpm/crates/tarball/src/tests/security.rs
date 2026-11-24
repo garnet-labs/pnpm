@@ -1,19 +1,43 @@
 use super::{
-    ArchiveStoreProjection, AuthHeaders, SharedVerifiedFilesCache, SilentReporter, TarballError,
-    ThrottledClient, assert_eq, build_zip, extract_tarball_entries, fast_retry_opts,
-    fetch_and_extract_with_retry, gzip_bytes, is_transient_error, tar_resources::sha512,
-    tar_with_raw_entry_name, tempdir_with_leaked_path,
+    ArchiveStoreProjection,
+    AuthHeaders,
+    SharedVerifiedFilesCache,
+    SilentReporter,
+    TarballError,
+    ThrottledClient,
+    assert_eq,
+    build_zip,
+    extract_tarball_entries,
+    fast_retry_opts,
+    fetch_and_extract_with_retry,
+    gzip_bytes,
+    is_transient_error,
+    tar_resources::sha512,
+    tar_with_raw_entry_name,
+    tempdir_with_leaked_path,
 };
-use crate::{IngestZipArchiveToStore, IntegrityKind, archive_integrity::ArchiveVerification};
+use crate::{
+    IngestZipArchiveToStore,
+    IntegrityKind,
+    archive_integrity::ArchiveVerification,
+};
 
 #[cfg(not(target_os = "windows"))]
 use super::{
-    CafsFileInfo, HashMap, IngestTarballToStore, PackageFilesIndex, StoreIndex, UNREACHABLE_URL,
-    fast_fail_client, integrity, store_index_key, test_retry_opts,
+    CafsFileInfo,
+    HashMap,
+    IngestTarballToStore,
+    PackageFilesIndex,
+    StoreIndex,
+    UNREACHABLE_URL,
+    fast_fail_client,
+    integrity,
+    store_index_key,
+    test_retry_opts,
 };
 
-/// A symlink at the CAFS path — even one pointing at a valid regular
-/// file — must not be trusted. A tampered / corrupted store could
+/// A symlink at the CAFS path (even one pointing at a valid regular
+/// file) must not be trusted. A tampered / corrupted store could
 /// place one pointing outside the store entirely, so we use
 /// `symlink_metadata()` and reject symlinks regardless of target.
 #[tokio::test]
@@ -77,7 +101,7 @@ async fn falls_through_when_cafs_path_is_a_symlink() {
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: StoreIndex::shared_readonly_in(store_path),
             index_writer: None,
             verify_integrity: true,
@@ -249,7 +273,7 @@ async fn fetch_does_not_retry_zip_path_traversal() {
             max_bytes: None,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: None,
             index_writer: None,
             verify_integrity: true,

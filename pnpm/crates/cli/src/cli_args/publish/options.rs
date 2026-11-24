@@ -1,5 +1,8 @@
 use pnpm_config::Config;
-use pnpm_publish::{Access, OidcHttpOptions, PublishPackedPkgOptions};
+use pnpm_publish::{
+    OidcHttpOptions,
+    PublishPackedPkgOptions,
+};
 
 use super::PublishArgs;
 use crate::cli_args::release_notes::notes_registries;
@@ -16,15 +19,6 @@ impl PublishArgs {
         if stage {
             self.publish_options(config, None, stage).validate()?;
         }
-        if self.flags.variants.no_variants
-            && !self.flags.variants.variant_integrity.is_empty()
-        {
-            return Err(miette::miette!(
-                code = "ERR_PNPM_INVALID_VARIANT_FLAGS",
-                help = "--no-variants publishes only the archive packed here that targets any; --variant-integrity publishes the archives other jobs uploaded. Pass one of them.",
-                "--no-variants and --variant-integrity cannot be used together",
-            ));
-        }
         if self.flags.batch && !recursive {
             return Err(miette::miette!(
                 code = "ERR_PNPM_BATCH_PUBLISH_REQUIRES_RECURSIVE",
@@ -32,6 +26,7 @@ impl PublishArgs {
                 "--batch can only be used together with --recursive",
             ));
         }
+        self.validate_new_version()?;
         Ok(())
     }
 
@@ -53,8 +48,8 @@ impl PublishArgs {
             registry: pnpm_publish::PublishRegistryOptions {
                 default: config.registry.clone(),
                 scoped: config.registries_by_scope.clone(),
-                access: self.flags.registry.access.as_deref().and_then(Access::parse),
-                tag: self.flags.registry.tag.clone().unwrap_or_else(|| "latest".to_owned()),
+                access: self.access(config),
+                tag: self.tag(config),
                 otp,
                 provenance: self.provenance(config),
                 http: OidcHttpOptions {
@@ -68,6 +63,20 @@ impl PublishArgs {
             release_notes: self.release_notes_target(config),
             pnpr_registries: notes_registries(config),
         }
+    }
+
+    /// `--access`, else the `access` setting. See [`pnpm_publish::resolve_access`]
+    /// for why the value is not validated here.
+    fn access(&self, config: &Config) -> Option<String> {
+        self.flags.registry.access.clone().or_else(|| config.access.clone())
+    }
+
+    /// `--tag`, else the `tag` setting, else `latest`.
+    fn tag(&self, config: &Config) -> String {
+        self.flags.registry.tag
+            .clone()
+            .or_else(|| config.tag.clone())
+            .unwrap_or_else(|| "latest".to_owned())
     }
 
     /// `None` leaves the decision to the OIDC flow.

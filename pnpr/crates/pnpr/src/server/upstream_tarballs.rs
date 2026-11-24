@@ -1,16 +1,43 @@
 pub(super) use self::background_scan::BackgroundTarScans;
 use self::background_scan::{
-    PromotedTarballScan, schedule_cached_tarball_scan, schedule_deferred_cached_tarball_scan,
+    PromotedTarballScan,
+    schedule_cached_tarball_scan,
+    schedule_deferred_cached_tarball_scan,
 };
 use super::{
-    AppState, CanonicalPackageName, Duration, FetchOutcome, Identity, Integrity, MAX_TARBALL_BYTES,
-    RegistryError, Response, TarballDist, Upstream, authorized_upstream, ensure_osv_allowed,
-    expected_tarball_dist, load_upstream_packument, not_found, streaming, tarball_response,
-    tarball_stream_error, timed, upstream_cache_namespace,
+    AppState,
+    CanonicalPackageName,
+    Duration,
+    FetchOutcome,
+    Identity,
+    Integrity,
+    RegistryError,
+    Response,
+    TarballDist,
+    Upstream,
+    UpstreamTarballRoute,
+    authorized_upstream,
+    ensure_osv_allowed,
+    expected_tarball_dist,
+    load_upstream_packument,
+    not_found,
+    reload_upstream_packument_lacking_version,
+    streaming,
+    tarball_response,
+    tarball_stream_error,
+    timed,
+    upstream_cache_namespace,
 };
 use axum::response::IntoResponse;
 
 mod background_scan;
+mod cached;
+mod expired_signature;
+
+use self::expired_signature::{
+    retry_expired_signed_tarball,
+    should_refresh_signed_tarball_url,
+};
 
 /// Serve a tarball through an upstream's `/~<name>/` endpoint. The version's
 /// `dist.integrity` is read from the upstream's own packument (served from the
@@ -38,14 +65,14 @@ pub(super) async fn serve_tarball_via_upstream(
         Ok(upstream) => upstream,
         Err(err) => return err.into_response(),
     };
-    serve_authorized_upstream_tarball(
+    Box::pin(serve_authorized_upstream_tarball(
         state,
-        upstream,
+        &upstream,
         &namespace,
         &name,
         &filename,
         parsed_version.as_deref(),
-    )
+    ))
     .await
 }
 
@@ -63,35 +90,12 @@ pub(super) async fn serve_authorized_upstream_tarball(
     if let Err(err) = screen_parsed_version(state, name, parsed_version) {
         return err.into_response();
     }
-    let ttl = upstream.maxage().unwrap_or(state.inner.config.http.packument_ttl);
-    // Serve a cached hit before touching the packument: a cached entry was
-    // bound to a declared version and verified against `dist.integrity` when
-    // it was written, and the client re-verifies what it receives, so no
-    // re-bind or re-hash is needed. The packument load — and the full-document
-    // JSON parse in `expected_tarball_dist` — costs milliseconds per request
-    // for a large package and would dominate warm tarball serving.
-    //
-    // Deliberately, a hit is NOT re-bound against the packument as it stands
-    // *now*: a version unpublished since the write stays downloadable from
-    // this disposable mirror until the entry is wiped (registry-CDN
-    // semantics; resolution already stops offering it once the refreshed
-    // packument drops it), and a hostile packument rewrite — say, duplicate
-    // `dist.tarball` basenames — cannot retroactively poison bytes that were
-    // verified on the way in. The fail-closed bind below protects the *fetch*
-    // of new bytes; end-to-end SRI (the client's lockfile) is the authority
-    // on what it accepts. Only OSV screening needs the packument-resolved
-    // version first, so with OSV enabled the cache read waits for the bind
-    // below. A `cache: false` upstream skips the cache and streams through.
-    if upstream.caches()
-        && state.inner.osv_index.is_none()
-        && let Some(response) = cached_upstream_tarball(state, namespace, name, filename).await
-    {
-        return response;
-    }
-    let dist = bind_tarball_to_packument(state, upstream, namespace, name, filename, ttl).await;
+    let ttl = upstream.packument_ttl().unwrap_or(state.inner.config.http.packument_ttl);
+    let dist =
+        Box::pin(bind_tarball_to_packument(state, upstream, namespace, name, filename, ttl)).await;
     let TarballDist {
         version,
-        version_route,
+        route,
         integrity,
         unpacked_size,
     } = match dist {
@@ -106,12 +110,12 @@ pub(super) async fn serve_authorized_upstream_tarball(
         namespace,
         name,
         filename,
-        version_route: version_route.as_deref(),
+        route: &route,
         integrity: &integrity,
         unpacked_size,
+        manifest_generation: None,
     };
     if upstream.caches()
-        && state.inner.osv_index.is_some()
         && let Some(response) = cached_upstream_tarball(state, namespace, name, filename).await
     {
         schedule_cached_tarball_scan(state, tarball);
@@ -127,7 +131,7 @@ pub(super) async fn serve_authorized_upstream_tarball(
 /// A canonical `<basename>-<version>.tgz` (or the scoped wire form) is
 /// normalized as usual. A non-canonical basename preserved verbatim from the
 /// upstream's `dist.tarball` (see `pnpr_upstream::rewrite_tarball_urls`) is
-/// accepted opaquely so long as it is safe as a cache path segment — the
+/// accepted opaquely so long as it is safe as a cache path segment, the
 /// packument match is what authorizes it, binding it to a declared version and
 /// integrity. Rejecting it here would make such a version un-fetchable through
 /// the very URL this server advertised.
@@ -147,8 +151,7 @@ pub(super) fn tarball_cache_name(
 /// Where a served upstream tarball's bytes came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TarballOrigin {
-    /// The namespaced cache, verified when it was written but not against the
-    /// packument as it stands now.
+    /// The namespaced cache, verified when it was written.
     Cache,
     /// The upstream, verified against `dist.integrity` as it streams.
     Upstream,
@@ -165,12 +168,15 @@ pub(super) async fn serve_bound_upstream_tarball(
     if let Err(err) = ensure_osv_allowed(state, tarball.name, version) {
         return (err.into_response(), TarballOrigin::Upstream);
     }
-    if upstream.caches()
-        && let Some(response) =
-            cached_upstream_tarball(state, tarball.namespace, tarball.name, tarball.filename).await
-    {
-        schedule_cached_tarball_scan(state, tarball);
-        return (response, TarballOrigin::Cache);
+    if upstream.caches() {
+        match cached::bound_cached_tarball(state, &tarball).await {
+            Ok(Some(response)) => {
+                schedule_cached_tarball_scan(state, tarball);
+                return (response, TarballOrigin::Cache);
+            }
+            Ok(None) => {}
+            Err(err) => return (err.into_response(), TarballOrigin::Cache),
+        }
     }
     (fetch_upstream_tarball(state, upstream, tarball).await, TarballOrigin::Upstream)
 }
@@ -195,7 +201,39 @@ pub(super) async fn bind_tarball_to_packument(
     let Some(packument) = packument else {
         return Ok(None);
     };
-    expected_tarball_dist(&packument, name, filename)
+    let mut result = parse_tarball_dist(state, packument.bytes, name, filename).await;
+    if matches!(result, Ok(None))
+        && let Some(err) = packument.stale_error
+    {
+        return Err(RegistryError::Shared(err));
+    }
+    if matches!(result, Ok(None))
+        && let Some(packument) =
+            reload_upstream_packument_lacking_version(state, namespace, upstream, name).await?
+    {
+        result = parse_tarball_dist(state, packument, name, filename).await;
+    }
+    if result.is_ok() {
+        return result;
+    }
+    super::upstream_integrity::wait_for_pin(state, namespace, upstream, name, filename).await?;
+    let Some(packument) = state.inner.storage.read_upstream_document_any(namespace, name).await?
+    else {
+        return result;
+    };
+    parse_tarball_dist(state, packument, name, filename).await
+}
+
+async fn parse_tarball_dist(
+    state: &AppState,
+    packument: Vec<u8>,
+    name: &CanonicalPackageName,
+    filename: &str,
+) -> Result<Option<TarballDist>, RegistryError> {
+    let name = name.clone();
+    let filename = filename.to_string();
+    state.inner.packuments.workers.run(move || expected_tarball_dist(&packument, &name, &filename))
+        .await?
 }
 
 /// Screen the version a canonical filename declares, so an advisory-blocked
@@ -231,9 +269,10 @@ pub(super) struct UpstreamTarball<'a> {
     pub(super) namespace: &'a str,
     pub(super) name: &'a CanonicalPackageName,
     pub(super) filename: &'a str,
-    pub(super) version_route: Option<&'a str>,
+    pub(super) route: &'a UpstreamTarballRoute,
     pub(super) integrity: &'a Integrity,
     pub(super) unpacked_size: Option<u64>,
+    pub(super) manifest_generation: Option<u64>,
 }
 
 /// Fetch the tarball from the upstream and stream it to the client, teeing it
@@ -244,19 +283,20 @@ pub(super) async fn fetch_upstream_tarball(
     tarball: UpstreamTarball<'_>,
 ) -> Response {
     let UpstreamTarball {
-        namespace,
-        name,
-        filename,
-        version_route,
-        integrity,
-        unpacked_size: _,
+        namespace, name, filename, route, ..
     } = tarball;
     let fetched = timed(
         "tarball:upstream_fetch",
         name.as_str(),
-        upstream.fetch_tarball_or_version_response(name, filename, version_route),
+        upstream.fetch_declared_tarball_response(name, filename, route),
     )
     .await;
+    let fetched = match fetched {
+        Err(err) if should_refresh_signed_tarball_url(route, &err) => {
+            retry_expired_signed_tarball(state, upstream, tarball, err).await
+        }
+        other => other,
+    };
     let response = match fetched {
         Ok(FetchOutcome::Ok(response)) => response,
         Ok(FetchOutcome::NotFound) => return not_found(),
@@ -267,7 +307,13 @@ pub(super) async fn fetch_upstream_tarball(
         Err(err) => return err.into_response(),
     };
     if !upstream.caches() {
-        return stream_verified_without_caching(response, write, integrity, name, filename).await;
+        return stream_verified_without_caching(
+            response,
+            write,
+            tarball,
+            state.max_tarball_bytes(),
+        )
+        .await;
     }
     stream_and_record_upstream_tarball(state, response, write, tarball)
 }
@@ -282,13 +328,17 @@ fn stream_and_record_upstream_tarball(
     // `stream_verified_to_cache`). No `Content-Length` is set: the upstream's
     // is attacker-controlled and unverifiable before streaming, so the body is
     // chunked and the client reads to EOF (then re-verifies the integrity).
+    let cached_path = write.final_path().to_path_buf();
     let scan = PromotedTarballScan::new(state, tarball);
-    let streamed = streaming::stream_verified_to_cache_and_then(
+    let manifest_generation = tarball.manifest_generation;
+    let state = state.clone();
+    let max_bytes = state.max_tarball_bytes();
+    let streamed = streaming::stream_verified_with_promotion(
         response,
         write,
         tarball.integrity,
-        MAX_TARBALL_BYTES,
-        move |cached_path| scan.spawn(cached_path),
+        max_bytes,
+        move |blob| scan.promote_if_current(state, blob, cached_path, manifest_generation),
     );
     match streamed {
         Ok(body) => tarball_response(body, None),
@@ -297,21 +347,21 @@ fn stream_and_record_upstream_tarball(
 }
 
 /// Fetch-through: verify and stream from the temp file, then remove it, so a
-/// `cache: false` upstream's tarball is never persisted.
+/// `cache: false` upstream's tarball is never persisted. `max_bytes` is the
+/// most the download may hold.
 pub(super) async fn stream_verified_without_caching(
     response: pnpm_network::ThrottledResponse,
     write: pnpr_storage::BlobWrite,
-    integrity: &ssri::Integrity,
-    name: &CanonicalPackageName,
-    filename: &str,
+    tarball: UpstreamTarball<'_>,
+    max_bytes: u64,
 ) -> Response {
     let downloaded =
-        streaming::download_verified_to_temp(response, write, integrity, MAX_TARBALL_BYTES).await;
+        streaming::download_verified_to_temp(response, write, tarball.integrity, max_bytes).await;
     match downloaded {
         Ok((file, len, tmp_path)) => {
             tarball_response(streaming::stream_file_and_remove(file, tmp_path), Some(len))
         }
-        Err(err) => tarball_stream_error(err, name, filename).into_response(),
+        Err(err) => tarball_stream_error(err, tarball.name, tarball.filename).into_response(),
     }
 }
 

@@ -1,7 +1,16 @@
 use super::{
-    LoadWorkspaceStateError, NodeLinker, ProjectEntry, UpdateWorkspaceStateError,
-    WORKSPACE_STATE_FILENAME, WorkspaceState, WorkspaceStateSettings, get_file_path,
-    load_workspace_state, now_millis, update_workspace_state,
+    LoadWorkspaceStateError,
+    NodeLinker,
+    ProjectEntry,
+    RuntimeOnFail,
+    UpdateWorkspaceStateError,
+    WORKSPACE_STATE_FILENAME,
+    WorkspaceState,
+    WorkspaceStateSettings,
+    get_file_path,
+    load_workspace_state,
+    now_millis,
+    update_workspace_state,
 };
 use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
@@ -132,6 +141,25 @@ fn node_linker_serializes_lowercase() {
     assert_eq!(value, serde_json::Value::from("hoisted"));
     let value = serde_json::to_value(NodeLinker::Pnp).expect("serialize");
     assert_eq!(value, serde_json::Value::from("pnp"));
+}
+
+/// pnpm v11 records `runtimeOnFail` under this key with these values, and
+/// each CLI compares the state the other one wrote.
+#[test]
+fn runtime_on_fail_round_trips_in_the_v11_wire_format() {
+    for (variant, wire) in [
+        (RuntimeOnFail::Download, "download"),
+        (RuntimeOnFail::Error, "error"),
+        (RuntimeOnFail::Warn, "warn"),
+        (RuntimeOnFail::Ignore, "ignore"),
+    ] {
+        let settings =
+            WorkspaceStateSettings { runtime_on_fail: Some(variant), ..Default::default() };
+        let value = serde_json::to_value(&settings).expect("serialize");
+        assert_eq!(value, serde_json::json!({ "runtimeOnFail": wire }));
+        let parsed: WorkspaceStateSettings = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.runtime_on_fail, Some(variant));
+    }
 }
 
 /// pnpm writes the flag only when it is set, so an entry without it reads
@@ -298,8 +326,8 @@ fn node_modules_entries(workspace_dir: &std::path::Path) -> Vec<String> {
 }
 
 /// The write survives another process holding the destination open
-/// without `FILE_SHARE_DELETE` — an antivirus scan or the search
-/// indexer — for as long as that handle lives
+/// without `FILE_SHARE_DELETE` (an antivirus scan or the search
+/// indexer) for as long as that handle lives
 /// ([#14550](https://github.com/pnpm/pnpm/issues/14550)). A single
 /// `MoveFileEx` fails such a rename with `ERROR_ACCESS_DENIED`, so
 /// without the retry this write reports

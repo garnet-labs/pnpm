@@ -2,11 +2,22 @@
 //! installs, and the source distribution it builds where none of them
 //! installs here.
 
-use crate::candidates::{WheelFilename, source_version, wheel_identity};
-use miette::{IntoDiagnostic, Result, bail};
+use crate::candidates::{
+    WheelFilename,
+    source_version,
+    wheel_identity,
+};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    bail,
+};
 use pep440_rs::Version;
 use pep508_rs::PackageName;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +53,7 @@ impl LockedWheel {
         version: &Version,
     ) -> Result<()> {
         let Some((wheel_name, wheel_version, _)) = wheel_identity(&self.name, tags)? else {
-            bail!("Python wheel is incompatible with this interpreter: {}", self.name)
+            bail!("Python wheel is incompatible with this interpreter: {}", self.name);
         };
         if wheel_name != *name || wheel_version != *version {
             bail!("Python lockfile wheel identity mismatch: {}", self.name);

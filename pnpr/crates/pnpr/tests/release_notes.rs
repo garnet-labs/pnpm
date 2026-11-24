@@ -6,14 +6,33 @@ use crate::npm::publish_doc;
 
 use axum::{
     Router,
-    body::{Body, to_bytes},
-    http::{HeaderMap, Request, StatusCode, header},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        HeaderMap,
+        Request,
+        StatusCode,
+        header,
+    },
 };
-use pnpr::{Config, MaxUsers, router};
-use pnpr_config::MetadataBackend;
+use pnpr::{
+    Config,
+    MaxUsers,
+    router,
+};
+use pnpr_config::DatabaseBackend;
 use pnpr_fixtures::MockConfigPresets;
-use serde_json::{Value, json};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use serde_json::{
+    Value,
+    json,
+};
+use std::net::{
+    Ipv4Addr,
+    SocketAddr,
+    SocketAddrV4,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -26,8 +45,8 @@ fn app_at(tmp: &TempDir, public_url: &str) -> Router {
     let listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873));
     let mut config = Config::static_serve(listen, tmp.path().to_path_buf());
     config.http.public_url = public_url.to_string();
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
-    config.storage.metadata = MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite"));
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
+    config.storage.database = DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite"));
     router(config)
 }
 
@@ -49,7 +68,8 @@ impl Answer {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .get(name)
-            .map(|value| value.to_str().unwrap())
+            .map(reqwest::header::HeaderValue::to_str)
+            .map(Result::unwrap)
     }
 }
 
@@ -73,7 +93,7 @@ fn json_body(value: &Value) -> Body {
 }
 
 async fn token(app: &Router) -> String {
-    let body = json!({ "name": "alice", "password": "secret", "type": "user", "roles": [] });
+    let body = json!({ "name": "alice", "password": "secret123", "type": "user", "roles": [] });
     let answer = send(app, "PUT", "/-/user/org.couchdb.user:alice", None, json_body(&body)).await;
     assert_eq!(answer.status, StatusCode::CREATED);
     answer.json()["token"]
@@ -169,6 +189,8 @@ async fn a_publication_note_is_reached_from_each_member() {
         .await
         .json();
     assert_eq!(listing["notes"][0]["version"], "1.0.0");
+    assert_eq!(listing["notes"][0]["publication"]["namespace"], "-");
+    assert!(listing["notes"][0]["publication"].get("org").is_none());
     assert_eq!(listing["notes"][0]["publication"]["name"], "v1.0.0");
     assert_eq!(listing["notes"][0]["publication"]["url"], "/-/publications/-/1/notes");
     assert!(listing["notes"][0].get("text").is_none());
@@ -226,8 +248,14 @@ async fn an_unpublished_version_serves_no_note() {
         .as_object_mut()
         .unwrap()
         .remove("1.0.0");
-    let rewritten =
-        send(&app, "PUT", "/npm/pruned/-rev/1", Some(&token), json_body(&packument)).await;
+    let rewritten = send(
+        &app,
+        "PUT",
+        &format!("/npm/pruned/-rev/{}", packument["_rev"].as_str().unwrap()),
+        Some(&token),
+        json_body(&packument),
+    )
+    .await;
     assert_eq!(rewritten.status, StatusCode::CREATED, "{}", rewritten.text());
 
     let removed = send(&app, "GET", "/npm/pruned/1.0.0/notes", None, Body::empty()).await;
@@ -247,7 +275,7 @@ async fn an_unpublished_version_serves_no_note() {
 }
 
 #[tokio::test]
-async fn a_version_spelled_dist_tag_names_the_version_it_points_at() {
+async fn a_version_spelled_dist_tag_is_rejected() {
     let tmp = TempDir::new().unwrap();
     let app = app(&tmp);
     let token = token(&app).await;
@@ -262,9 +290,9 @@ async fn a_version_spelled_dist_tag_names_the_version_it_points_at() {
         Body::from(r#""1.0.0""#),
     )
     .await;
-    assert_eq!(tag.status, StatusCode::CREATED, "{}", tag.text());
+    assert_eq!(tag.status, StatusCode::BAD_REQUEST, "{}", tag.text());
     let note = send(&app, "GET", "/npm/tagged/v9.9.9/notes", None, Body::empty()).await;
-    assert_eq!((note.status, note.text()), (StatusCode::OK, "- one\n"));
+    assert_eq!(note.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -312,7 +340,7 @@ async fn a_package_of_an_upstream_lists_no_notes() {
     let tmp = TempDir::new().unwrap();
     let listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873));
     let mut config = Config::proxy(listen, tmp.path().to_path_buf());
-    config.storage.metadata = MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite"));
+    config.storage.database = DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite"));
     let app = router(config);
     let listing = send(&app, "GET", "/npm/lodash/-/notes", None, Body::empty()).await;
     assert_eq!(listing.status, StatusCode::OK, "{}", listing.text());

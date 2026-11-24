@@ -15,16 +15,45 @@
 //! as a low-priority auth-file fallback.
 
 use crate::{
-    AuditLevel, CatalogMode, ColorMode, HoistingLimits, InitType, LinkWorkspacePackages, LogLevel,
-    NodeLinkerSetting, NodePackageMapMode, NodePackageMapType, PackageImportMethod, PmOnFail,
-    ReporterType, ResolutionMode, RuntimeOnFail, SaveWorkspaceProtocol, StoreIndexFormat,
-    TrustPolicy, VerifyDepsBeforeRun, VirtualStoreType, WorkspaceSettings,
+    AuditLevel,
+    CatalogMode,
+    ColorMode,
+    HoistingLimits,
+    InitType,
+    LinkWorkspacePackages,
+    LogLevel,
+    NodeLinkerSetting,
+    NodePackageMapMode,
+    NodePackageMapType,
+    PackageImportMethod,
+    PmOnFail,
+    ReporterType,
+    ResolutionMode,
+    RuntimeOnFail,
+    SaveWorkspaceProtocol,
+    StoreIndexFormat,
+    TrustPolicy,
+    VerifyDepsBeforeRun,
+    VirtualStoreType,
+    WorkspaceSettings,
     api::EnvVar,
-    workspace_yaml::{MachineSettings, TrustedSettings},
+    workspace_yaml::{
+        MachineSettings,
+        TrustedSettings,
+    },
 };
-use parse::{parse_json, parse_json_or_string, parse_tri_array};
+use parse::{
+    parse_json,
+    parse_json_or_string,
+    parse_tri_array,
+};
 use std::collections::BTreeMap;
-use string_reader::{StringReader, dotted_value, read_env, read_env_allow_empty};
+use string_reader::{
+    StringReader,
+    dotted_value,
+    read_env,
+    read_env_allow_empty,
+};
 
 mod parse;
 mod string_reader;
@@ -74,7 +103,7 @@ macro_rules! tri_array_field {
     };
 }
 // Env vars cannot express the "explicit null clears" state that
-// yaml supports (an empty value reads as unset — see `read_env`),
+// yaml supports (an empty value reads as unset; see `read_env`),
 // so a present env var always lands as `Some(Some(s))`, never
 // `Some(None)`. Same limitation as `tri_array_field!`.
 macro_rules! tri_string_field {
@@ -92,16 +121,24 @@ impl TrustedSettings {
     /// Build the settings `PNPM_CONFIG_*` env vars give.
     ///
     /// Env vars are read for the full schema, not just config-file
-    /// keys — `PNPM_CONFIG_HOIST=false`, `PNPM_CONFIG_NODE_LINKER=hoisted`
+    /// keys, `PNPM_CONFIG_HOIST=false`, `PNPM_CONFIG_NODE_LINKER=hoisted`
     /// etc. all work (no [`WorkspaceSettings::clear_workspace_only_fields`]
     /// call). Apply the returned settings via [`Self::apply_to`] *after*
     /// `pnpm-workspace.yaml` so env vars win over yaml.
     #[must_use]
     pub fn from_pnpm_config_env<Sys: EnvVar>() -> Self {
-        Self::from_reader(&StringReader {
+        let mut trusted = Self::from_reader(&StringReader {
             read: &|suffix| read_env::<Sys>(suffix),
             read_allow_empty: &|suffix| read_env_allow_empty::<Sys>(suffix),
-        })
+        });
+        // pnpm's env pass parses `access` against its npm type union and drops
+        // a value outside it, so an invalid `PNPM_CONFIG_ACCESS` cannot clobber
+        // a valid lower layer. Every other layer, `--config.access` included,
+        // is assigned unchecked.
+        trusted.settings.access = trusted.settings.access.filter(|access| {
+            matches!(access.as_str(), "public" | "restricted")
+        });
+        trusted
     }
 
     /// Build the overlay from a flat map of string settings, keyed by the
@@ -191,6 +228,7 @@ impl WorkspaceSettings {
         enum_field!(settings, reader, loglevel, "LOGLEVEL", LogLevel);
         enum_field!(settings, reader, reporter, "REPORTER", ReporterType);
         json_field!(settings, reader, embed_readme, "EMBED_README");
+        tri_string_field!(settings, reader, editor, "EDITOR");
         json_field!(settings, reader, ignore_pnpmfile, "IGNORE_PNPMFILE");
         json_field!(settings, reader, ignore_workspace_root_check, "IGNORE_WORKSPACE_ROOT_CHECK");
         json_field!(settings, reader, optional, "OPTIONAL");
@@ -341,6 +379,7 @@ impl WorkspaceSettings {
         string_field!(settings, reader, publish_branch, "PUBLISH_BRANCH");
         json_field!(settings, reader, publish_wait_timeout, "PUBLISH_WAIT_TIMEOUT");
         json_field!(settings, reader, provenance, "PROVENANCE");
+        string_field!(settings, reader, access, "ACCESS");
         string_field_allow_empty!(settings, reader, tag_version_prefix, "TAG_VERSION_PREFIX");
         json_field!(settings, reader, engine_strict, "ENGINE_STRICT");
         json_field!(settings, reader, force_ignores_platform, "FORCE_IGNORES_PLATFORM");
@@ -393,6 +432,7 @@ impl WorkspaceSettings {
             "MINIMUM_RELEASE_AGE_IGNORE_MISSING_TIME"
         );
         json_field!(settings, reader, minimum_release_age_strict, "MINIMUM_RELEASE_AGE_STRICT");
+        string_field!(settings, reader, reference_time, "REFERENCE_TIME");
         json_field!(settings, reader, trust_lockfile, "TRUST_LOCKFILE");
         enum_field!(settings, reader, trust_policy, "TRUST_POLICY", TrustPolicy);
         enum_field!(settings, reader, pm_on_fail, "PM_ON_FAIL", PmOnFail);
@@ -414,8 +454,8 @@ impl WorkspaceSettings {
         // pnpm applies this env var on presence alone (`!= null`) and
         // assigns the raw value without validation, so presence always
         // overrides the other config layers: an empty value assigns an
-        // empty string — falsy there, the gate is off — and an
-        // unrecognized value is truthy — the check runs but matches no
+        // empty string (falsy there, the gate is off) and an
+        // unrecognized value is truthy, the check runs but matches no
         // action. `value` filters empty values, so read the raw one.
         if let Some(s) = reader.value_allow_empty("VERIFY_DEPS_BEFORE_RUN") {
             settings.verify_deps_before_run = Some(if s.is_empty() {

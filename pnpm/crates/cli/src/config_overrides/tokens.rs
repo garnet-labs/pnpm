@@ -1,6 +1,14 @@
 use super::{
-    HashSet, LinkWorkspacePackages, NodeLinkerSetting, OsStr, PackageImportMethod, PmOnFail,
-    RuntimeOnFail, SaveWorkspaceProtocol, TrustPolicy,
+    HashSet,
+    LinkWorkspacePackages,
+    NodeLinkerSetting,
+    OsStr,
+    PackageImportMethod,
+    PmOnFail,
+    RuntimeOnFail,
+    SaveWorkspaceProtocol,
+    TrustPolicy,
+    to_kebab_case,
 };
 
 /// Whether the token at `index` belongs to the forwarded child command line.
@@ -13,7 +21,8 @@ pub(super) fn is_forwarded(passthrough_from: Option<usize>, index: usize) -> boo
 pub(super) fn verify_deps_env_is_set() -> bool {
     ["PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN", pnpm_executor::VERIFY_DEPS_BEFORE_RUN_ENV]
         .iter()
-        .any(|name| std::env::var(name).is_ok())
+        .map(std::env::var)
+        .any(|variable| variable.is_ok())
 }
 
 pub(super) enum ConfigToken<'a> {
@@ -38,11 +47,11 @@ pub(super) enum ConfigToken<'a> {
 /// returned untouched.
 ///
 /// `claimed_by_command` names the options the invoked command declares
-/// itself, which win over the setting of the same name — see
+/// itself, which win over the setting of the same name; see
 /// [`subcommand_option_names`].
 ///
-/// A setting given a value it does not take — a misspelled boolean, an
-/// unknown `--trust-policy`, a non-numeric `--child-concurrency` — is
+/// A setting given a value it does not take (a misspelled boolean, an
+/// unknown `--trust-policy`, a non-numeric `--child-concurrency`) is
 /// left for clap, which reports it as an unexpected argument. Dropping
 /// it instead would leave the install running under a setting the user
 /// believes they changed, which for a supply-chain setting like
@@ -137,7 +146,7 @@ pub(super) enum SettingArity {
     BooleanOr { takes: fn(&str) -> bool, bare_keyword: bool },
     /// A path, a glob pattern, or another free-form value: every spelling
     /// is one the setting takes, so the token after the flag is claimed
-    /// only when it cannot be anything else — see [`claims_as_value`].
+    /// only when it cannot be anything else; see [`claims_as_value`].
     Text,
     /// A value the carried predicate accepts, and only such a value.
     Parsed(fn(&str) -> bool),
@@ -154,7 +163,7 @@ pub(super) enum SettingArity {
 /// setting the invoked command declares as its own option is left for
 /// clap; a setting that collides with a *global* option would be claimed
 /// on every command line and so must not appear here at all.
-pub(super) const BARE_SETTING_FLAGS: [(&str, SettingArity); 49] = [
+pub(super) const BARE_SETTING_FLAGS: [(&str, SettingArity); 51] = [
     ("allow-unused-patches", SettingArity::Boolean),
     ("auto-dedupe", SettingArity::Boolean),
     ("cache-dir", SettingArity::Text),
@@ -180,6 +189,8 @@ pub(super) const BARE_SETTING_FLAGS: [(&str, SettingArity); 49] = [
     ("local-address", SettingArity::Text),
     ("merge-git-branch-lockfiles", SettingArity::Boolean),
     ("merge-git-branch-lockfiles-branch-pattern", SettingArity::Text),
+    ("minimum-release-age", SettingArity::Parsed(is_u64)),
+    ("minimum-release-age-exclude", SettingArity::Text),
     ("modules-dir", SettingArity::Text),
     ("node-experimental-package-map", SettingArity::Boolean),
     ("node-linker", SettingArity::Parsed(is_node_linker)),
@@ -220,13 +231,20 @@ fn is_u64(value: &str) -> bool {
     value.parse::<u64>().is_ok()
 }
 
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`SettingArity::Parsed` stores this as a `fn(&str) -> bool` pointer."
+    )
+)]
 fn is_enum<Value: serde::de::DeserializeOwned>(value: &str) -> bool {
-    parse_enum::<Value>(value).is_some()
+    parse_enum::<Value>(value.to_owned()).is_some()
 }
 
 fn is_node_linker(value: &str) -> bool {
     serde_json::from_str::<NodeLinkerSetting>(value).is_ok()
-        || parse_enum::<NodeLinkerSetting>(value).is_some()
+        || parse_enum::<NodeLinkerSetting>(value.to_owned()).is_some()
 }
 
 fn named_bare_setting_flag(key: &str) -> Option<(&'static str, SettingArity)> {
@@ -239,7 +257,7 @@ fn named_bare_setting_flag(key: &str) -> Option<(&'static str, SettingArity)> {
 /// key outside [`BARE_SETTING_FLAGS`], which keeps the `--config.<key>`
 /// tolerance for the settings pacquet has not ported.
 fn setting_takes(key: &str, value: &str) -> bool {
-    match named_bare_setting_flag(key) {
+    match named_bare_setting_flag(&to_kebab_case(key)) {
         Some((_, SettingArity::Boolean)) => parse_bool(value).is_some(),
         Some((_, SettingArity::BooleanOr { takes, .. })) => {
             parse_bool(value).is_some() || takes(value)
@@ -250,8 +268,8 @@ fn setting_takes(key: &str, value: &str) -> bool {
     }
 }
 
-/// Whether the `key` setting claims `token` — the argv token after its
-/// flag — as its value.
+/// Whether the `key` setting claims `token` (the argv token after its
+/// flag) as its value.
 ///
 /// A free-form setting refuses one that opens with `-`: that token is the
 /// `--` separator, another flag, or a short option, and claiming it would
@@ -270,7 +288,7 @@ pub(super) fn claims_as_value(key: &str, token: &str) -> bool {
 }
 
 /// Whether a token spells a boolean a bare `--<setting>` flag claims as
-/// its value — the same spellings the `--<setting>=<bool>` form takes,
+/// its value, the same spellings the `--<setting>=<bool>` form takes,
 /// so the two agree. Only a boolean is claimed, which is what leaves
 /// `pnpm --shamefully-hoist install` its command.
 fn is_boolean_value(token: &str) -> bool {
@@ -282,7 +300,7 @@ fn is_boolean_value(token: &str) -> bool {
 /// The scan that has to find the subcommand applies this ahead of clap's
 /// own arity: nothing else on a command line is spelled `true` /
 /// `false`, so stepping over that token is right whichever reading of
-/// the flag ends up applying — a command's option of the same name, or
+/// the flag ends up applying, a command's option of the same name, or
 /// the setting. Without it the two readings disagree on width for a name
 /// that is both, and `pnpm --lockfile true --config.registry=… install`
 /// loses everything past the boolean to the script fallback.
@@ -294,7 +312,7 @@ pub(crate) fn bare_boolean_setting_claims(flag: &str, next: Option<&str>) -> boo
 }
 
 /// How many argv slots a bare `--<setting>` flag occupies, given the
-/// token after it — for the scan that has to find the subcommand before
+/// token after it, for the scan that has to find the subcommand before
 /// the settings are stripped. `1` for a token that is not one of the
 /// [`BARE_SETTING_FLAGS`], or one whose value is missing, which
 /// [`ConfigOverrides::extract`](super::ConfigOverrides::extract) hands to clap intact.
@@ -304,23 +322,25 @@ pub(crate) fn bare_setting_flag_width(flag: &str, next: Option<&str>) -> usize {
 
 pub(super) fn scoped_registry_key(key: &str) -> Option<&str> {
     key.strip_suffix(":registry")
-        .filter(|scope| scope.starts_with('@') && scope.len() > 1 && !scope.contains('/'))
+        .filter(|scope| scope.starts_with('@'))
+        .filter(|scope| scope.len() > 1)
+        .filter(|scope| !scope.contains('/'))
 }
 
-pub(super) fn parse_enum<Value: serde::de::DeserializeOwned>(value: &str) -> Option<Value> {
-    serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+pub(super) fn parse_enum<Value: serde::de::DeserializeOwned>(value: String) -> Option<Value> {
+    serde_json::from_value(serde_json::Value::String(value)).ok()
 }
 
 /// A setting whose type is a boolean or a keyword, from either spelling.
 pub(super) fn parse_bool_or_enum<Value: serde::de::DeserializeOwned>(value: &str) -> Option<Value> {
     match parse_bool(value) {
         Some(boolean) => serde_json::from_value(serde_json::Value::Bool(boolean)).ok(),
-        None => parse_enum(value),
+        None => parse_enum(value.to_owned()),
     }
 }
 
-/// An enum setting's kebab-case spelling, for [`Config::explicit_settings`](pnpm_config::Config::explicit_settings)
-/// — the form the config files and `pnpm config get` use.
+/// An enum setting's kebab-case spelling, for [`Config::explicit_settings`](pnpm_config::Config::explicit_settings),
+/// the form the config files and `pnpm config get` use.
 pub(super) fn setting_value<Value: serde::Serialize>(value: Value) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }

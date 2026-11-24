@@ -1,14 +1,31 @@
 use super::{
-    BuildPhaseInputs, Config, HashMap, PackageKey, SkippedSnapshots,
-    auto_installed_peer_bin_locations, resolve_snapshot_patches, run_build_phase,
+    BuildPhaseInputs,
+    Config,
+    HashMap,
+    PackageKey,
+    SkippedSnapshots,
+    auto_installed_peer_bin_locations,
+    resolve_snapshot_patches,
+    run_build_phase,
 };
-use crate::{AllowBuildPolicy, VirtualStoreLayout};
+use crate::{
+    AllowBuildPolicy,
+    VirtualStoreLayout,
+};
 use pnpm_cmd_shim::LinkBinsOptions;
 use pnpm_lockfile::{
-    GitResolution, LockfileResolution, PackageMetadata, ProjectSnapshot, SnapshotEntry,
+    GitResolution,
+    LockfileResolution,
+    PackageMetadata,
+    ProjectSnapshot,
+    SnapshotEntry,
 };
 use pnpm_package_manifest::DependencyGroup;
-use pnpm_patching::{ExtendedPatchInfo, PatchGroup, PatchGroupRecord};
+use pnpm_patching::{
+    ExtendedPatchInfo,
+    PatchGroup,
+    PatchGroupRecord,
+};
 use pnpm_reporter::SilentReporter;
 use pnpm_store_dir::StoreIndexWriter;
 use std::sync::atomic::AtomicU8;
@@ -57,7 +74,6 @@ async fn build_generated_peer_bin_is_considered_without_lockfile_has_bin() {
         },
         directories: crate::BuildPhaseDirectories {
             workspace_root: temp_dir.path(),
-            top_level_bin_root: temp_dir.path(),
             layout: &layout,
             hoisted_pkg_roots_by_key: None,
             is_hoisted: false,
@@ -84,6 +100,7 @@ async fn build_generated_peer_bin_is_considered_without_lockfile_has_bin() {
         extra_env: &HashMap::new(),
         skipped: &SkippedSnapshots::default(),
         pending_bins: None,
+        supported_architectures: None,
     };
     assert_eq!(
         auto_installed_peer_bin_locations(&inputs, &importer),
@@ -135,7 +152,6 @@ async fn directory_peer_bin_is_considered_without_lockfile_has_bin() {
         },
         directories: crate::BuildPhaseDirectories {
             workspace_root: temp_dir.path(),
-            top_level_bin_root: temp_dir.path(),
             layout: &layout,
             hoisted_pkg_roots_by_key: None,
             is_hoisted: false,
@@ -162,6 +178,7 @@ async fn directory_peer_bin_is_considered_without_lockfile_has_bin() {
         extra_env: &HashMap::new(),
         skipped: &SkippedSnapshots::default(),
         pending_bins: None,
+        supported_architectures: None,
     };
     assert_eq!(
         auto_installed_peer_bin_locations(&inputs, &importer),
@@ -188,6 +205,7 @@ fn resolves_git_snapshot_patch_from_package_version() {
     let packages = HashMap::from([(
         key.without_peer(),
         PackageMetadata {
+            specifiers: None,
             resolution: LockfileResolution::Git(GitResolution {
                 repo: "file:///repo".to_string(),
                 commit: "0123456789012345678901234567890123456789".to_string(),
@@ -249,7 +267,6 @@ async fn ignored_scripts_fast_path_defers_only_materialized_snapshots() {
         },
         directories: crate::BuildPhaseDirectories {
             workspace_root: temp_dir.path(),
-            top_level_bin_root: temp_dir.path(),
             layout: &layout,
             hoisted_pkg_roots_by_key: None,
             is_hoisted: false,
@@ -278,6 +295,7 @@ async fn ignored_scripts_fast_path_defers_only_materialized_snapshots() {
 
         skipped: &skipped,
         pending_bins: None,
+        supported_architectures: None,
     })
     .expect("build phase succeeds");
 

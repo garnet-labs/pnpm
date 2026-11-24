@@ -1,10 +1,26 @@
 use super::{
-    IndexDiscovery, git_dependency_sources, latest_version, missing_index_names, resolve_inputs,
+    IndexDiscovery,
+    git_dependency_sources,
+    latest_version,
+    missing_index_names,
+    resolve_inputs,
     resolve_lockfile,
+    resolve_lockfile_with_preferences,
+    serves_registry,
+    verify_lockfile,
 };
-use crate::registry::CRATES_IO_SOURCE;
+use crate::{
+    preferences::parse as parse_preferred_versions,
+    registry::{
+        CRATES_IO_SOURCE,
+        Registry,
+    },
+};
 use cargo_lock::Lockfile;
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+};
 
 const METADATA: &str = r#"{
   "packages": [{
@@ -29,6 +45,36 @@ fn git_dependency_sources_preserve_the_requested_revision() {
 
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].to_string(), source);
+}
+
+#[test]
+fn ignores_git_dev_dependencies_of_a_path_dependency_outside_the_workspace() {
+    let metadata = r#"{
+  "packages": [
+    {
+      "id": "path+file:///workspace#app@0.1.0",
+      "name": "app",
+      "version": "0.1.0",
+      "dependencies": [{"name": "libfoo", "source": null, "req": "*"}]
+    },
+    {
+      "id": "path+file:///libfoo#0.1.0",
+      "name": "libfoo",
+      "version": "0.1.0",
+      "dependencies": [{
+        "name": "tool",
+        "source": "git+https://example.test/tool",
+        "req": "*",
+        "kind": "dev"
+      }]
+    }
+  ],
+  "workspace_members": ["path+file:///workspace#app@0.1.0"]
+}"#;
+
+    let sources = git_dependency_sources(metadata).unwrap();
+
+    assert!(sources.is_empty(), "{sources:?}");
 }
 
 #[test]
@@ -76,13 +122,19 @@ const WORKSPACE_OPTIONAL_METADATA: &str = r#"{
 #[test]
 fn discovers_transitive_sparse_index_files() {
     let mut files = BTreeMap::new();
-    assert_eq!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap(), ["foo"]);
+    assert_eq!(
+        missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
+        ["foo"],
+    );
 
     files.insert("foo".to_string(), FOO_INDEX.to_string());
-    assert_eq!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap(), ["bar"]);
+    assert_eq!(
+        missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
+        ["bar"],
+    );
 
     files.insert("bar".to_string(), BAR_INDEX.to_string());
-    assert!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap().is_empty());
+    assert!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap().is_empty());
 }
 
 #[test]
@@ -92,7 +144,7 @@ fn discovers_dependencies_from_every_viable_version() {
     let files = BTreeMap::from([("foo".to_string(), foo_index.to_string())]);
 
     assert_eq!(
-        missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap(),
+        missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
         ["new-dependency", "old-dependency"],
     );
 }
@@ -110,8 +162,9 @@ fn validates_registry_metadata_before_deduplicating_dependencies() {
         1,
     );
 
-    let error =
-        missing_index_names(&metadata, &BTreeMap::new(), CRATES_IO_SOURCE).unwrap_err().to_string();
+    let error = missing_index_names(&metadata, &BTreeMap::new(), CRATES_IO_SOURCE.to_owned())
+        .unwrap_err()
+        .to_string();
 
     assert!(error.contains("cannot be resolved from"), "{error}");
 }
@@ -154,6 +207,123 @@ fn resolves_newest_non_yanked_versions_into_a_cargo_lockfile() {
         lockfile.packages
             .iter()
             .any(|package| package.name.as_str() == "app" && package.source.is_none()),
+    );
+}
+
+#[test]
+fn prefers_compatible_locked_transitive_versions() {
+    let files = BTreeMap::from([
+        ("bar".to_string(), BAR_INDEX.to_string()),
+        ("foo".to_string(), FOO_INDEX.to_string()),
+    ]);
+    let preferences = BTreeMap::from([("foo".to_string(), vec!["1.0.0".to_string()])]);
+    let encoded =
+        super::resolve_lockfile_with_preferences(METADATA, &files, CRATES_IO_SOURCE, &preferences)
+            .unwrap();
+    let lockfile = Lockfile::from_str(&encoded).unwrap();
+
+    assert!(
+        lockfile.packages
+            .iter()
+            .any(|package| {
+                package.name.as_str() == "foo" && package.version == semver::Version::new(1, 0, 0)
+            }),
+    );
+}
+
+#[test]
+fn skips_incompatible_locked_versions() {
+    let files = BTreeMap::from([
+        ("bar".to_string(), BAR_INDEX.to_string()),
+        ("foo".to_string(), FOO_INDEX.to_string()),
+    ]);
+    let preferences = BTreeMap::from([("foo".to_string(), vec!["2.0.0".to_string()])]);
+    let encoded =
+        super::resolve_lockfile_with_preferences(METADATA, &files, CRATES_IO_SOURCE, &preferences)
+            .unwrap();
+    let lockfile = Lockfile::from_str(&encoded).unwrap();
+
+    assert!(
+        lockfile.packages
+            .iter()
+            .any(|package| {
+                package.name.as_str() == "foo" && package.version == semver::Version::new(1, 1, 0)
+            }),
+    );
+}
+
+#[test]
+fn keeps_a_yanked_compatible_locked_version() {
+    let files = BTreeMap::from([
+        ("bar".to_string(), BAR_INDEX.to_string()),
+        ("foo".to_string(), FOO_INDEX.to_string()),
+    ]);
+    let preferences = BTreeMap::from([("bar".to_string(), vec!["2.1.0".to_string()])]);
+    let encoded =
+        super::resolve_lockfile_with_preferences(METADATA, &files, CRATES_IO_SOURCE, &preferences)
+            .unwrap();
+    let lockfile = Lockfile::from_str(&encoded).unwrap();
+
+    assert!(
+        lockfile.packages
+            .iter()
+            .any(|package| {
+                package.name.as_str() == "bar" && package.version == semver::Version::new(2, 1, 0)
+            }),
+    );
+}
+
+#[test]
+fn prefers_a_locked_version_below_its_compatibility_line_representative() {
+    let metadata = METADATA.replace("^1.0", "*");
+    let foo_index = r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{},"yanked":false}
+{"name":"foo","vers":"1.1.0","deps":[],"cksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","features":{},"yanked":false}
+{"name":"foo","vers":"2.0.0","deps":[],"cksum":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","features":{},"yanked":false}"#;
+    let files = BTreeMap::from([("foo".to_string(), foo_index.to_string())]);
+    let preferences = BTreeMap::from([("foo".to_string(), vec!["1.0.0".to_string()])]);
+
+    let lockfile =
+        resolve_lockfile_with_preferences(&metadata, &files, CRATES_IO_SOURCE, &preferences)
+            .unwrap();
+    let lockfile = Lockfile::from_str(&lockfile).unwrap();
+
+    assert!(
+        lockfile.packages
+            .iter()
+            .any(|package| {
+                package.name.as_str() == "foo" && package.version == semver::Version::new(1, 0, 0)
+            }),
+    );
+}
+
+#[test]
+fn discovers_and_resolves_a_preferred_yanked_version_without_other_line_candidates() {
+    let foo_index = r#"{"name":"foo","vers":"1.0.0","deps":[{"name":"bar","req":"^2","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal","registry":null}],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{},"yanked":true}"#;
+    let preferences = BTreeMap::from([("foo".to_string(), vec!["1.0.0".to_string()])]);
+    let foo_file = BTreeMap::from([("foo".to_string(), foo_index.to_string())]);
+    let mut discovery =
+        IndexDiscovery::new_with_preferences(METADATA, CRATES_IO_SOURCE.to_owned(), &preferences)
+            .unwrap();
+
+    discovery.add_entries(&foo_file).unwrap();
+
+    assert_eq!(discovery.missing_names().unwrap(), ["bar"]);
+
+    let files = BTreeMap::from([
+        ("bar".to_string(), BAR_INDEX.to_string()),
+        ("foo".to_string(), foo_index.to_string()),
+    ]);
+    let lockfile =
+        resolve_lockfile_with_preferences(METADATA, &files, CRATES_IO_SOURCE, &preferences)
+            .unwrap();
+    let lockfile = Lockfile::from_str(&lockfile).unwrap();
+
+    assert!(
+        lockfile.packages
+            .iter()
+            .any(|package| {
+                package.name.as_str() == "foo" && package.version == semver::Version::new(1, 0, 0)
+            }),
     );
 }
 
@@ -203,15 +373,22 @@ fn locks_a_dependency_naming_the_configured_registry_against_it() {
 #[test]
 fn resolves_the_feature_unified_lock_graph() {
     let files = BTreeMap::from([("foo".to_string(), OPTIONAL_FOO_INDEX.to_string())]);
-    assert!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap().is_empty());
+    assert!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap().is_empty());
     assert_eq!(
-        missing_index_names(WORKSPACE_OPTIONAL_METADATA, &BTreeMap::new(), CRATES_IO_SOURCE)
-            .unwrap(),
+        missing_index_names(
+            WORKSPACE_OPTIONAL_METADATA,
+            &BTreeMap::new(),
+            CRATES_IO_SOURCE.to_owned()
+        )
+        .unwrap(),
         ["foo"],
     );
 
     let files = BTreeMap::from([("foo".to_string(), DEFAULT_FEATURE_FOO_INDEX.to_string())]);
-    assert_eq!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap(), ["bar"]);
+    assert_eq!(
+        missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
+        ["bar"],
+    );
 
     let files = BTreeMap::from([
         ("bar".to_string(), BAR_INDEX.to_string()),
@@ -225,7 +402,10 @@ fn resolves_the_feature_unified_lock_graph() {
 #[test]
 fn merges_duplicate_feature_names_across_index_feature_maps() {
     let files = BTreeMap::from([("foo".to_string(), SPLIT_DEFAULT_FEATURE_FOO_INDEX.to_string())]);
-    assert_eq!(missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap(), ["bar", "baz"]);
+    assert_eq!(
+        missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
+        ["bar", "baz"],
+    );
 
     let files = BTreeMap::from([
         ("bar".to_string(), BAR_INDEX.to_string()),
@@ -394,7 +574,9 @@ fn dep_activation_suppresses_the_implicit_optional_feature() {
     let foo_index = r#"{"name":"foo","vers":"1.0.0","deps":[{"name":"codec","req":"^1","features":[],"optional":true,"default_features":true,"target":null,"kind":"normal","registry":null}],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{"full":["dep:codec"]},"yanked":false}"#;
     let files = BTreeMap::from([("foo".to_string(), foo_index.to_string())]);
 
-    assert!(missing_index_names(&metadata, &files, CRATES_IO_SOURCE).unwrap().is_empty());
+    assert!(
+        missing_index_names(&metadata, &files, CRATES_IO_SOURCE.to_owned()).unwrap().is_empty(),
+    );
     assert!(resolve_lockfile(&metadata, &files, CRATES_IO_SOURCE).is_err());
 }
 
@@ -726,7 +908,7 @@ fn fetches_what_every_admissible_line_needs() {
     let files = BTreeMap::from([("foo".to_string(), foo_index.to_string())]);
 
     assert_eq!(
-        missing_index_names(SPANNING_METADATA, &files, CRATES_IO_SOURCE).unwrap(),
+        missing_index_names(SPANNING_METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
         ["legacy", "modern"],
     );
 }
@@ -781,6 +963,74 @@ fn prefers_the_newest_compatibility_line_that_resolves() {
     );
 }
 
+#[test]
+fn assigns_root_features_to_the_preferred_compatibility_line() {
+    const METADATA: &str = r#"{
+  "packages": [
+    {
+      "id": "path+file:///workspace#app@0.1.0",
+      "name": "app",
+      "version": "0.1.0",
+      "dependencies": [{
+        "name": "foo",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "req": "*",
+        "features": ["f"]
+      }]
+    },
+    {
+      "id": "path+file:///workspace#other@0.1.0",
+      "name": "other",
+      "version": "0.1.0",
+      "dependencies": [{
+        "name": "foo",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "req": "^2"
+      }]
+    }
+  ],
+  "workspace_members": [
+    "path+file:///workspace#app@0.1.0",
+    "path+file:///workspace#other@0.1.0"
+  ]
+}"#;
+    let foo_index = r#"{"name":"foo","vers":"1.0.0","deps":[{"name":"bar","req":"=1.0.0","features":[],"optional":false,"default_features":true,"target":null,"kind":"normal","registry":null},{"name":"baz","req":"^1","features":[],"optional":true,"default_features":true,"target":null,"kind":"normal","registry":null}],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{"f":["dep:baz"]},"yanked":false}
+{"name":"foo","vers":"2.0.0","deps":[{"name":"bar","req":"=1.1.0","features":[],"optional":true,"default_features":true,"target":null,"kind":"normal","registry":null}],"cksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","features":{"f":["dep:bar"]},"yanked":false}"#;
+    let bar_index = r#"{"name":"bar","vers":"1.0.0","deps":[],"cksum":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","features":{},"yanked":false}
+{"name":"bar","vers":"1.1.0","deps":[],"cksum":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","features":{},"yanked":false}"#;
+    let baz_index = r#"{"name":"baz","vers":"1.0.0","deps":[],"cksum":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","features":{},"yanked":false}"#;
+    let files = BTreeMap::from([
+        ("bar".to_string(), bar_index.to_string()),
+        ("baz".to_string(), baz_index.to_string()),
+        ("foo".to_string(), foo_index.to_string()),
+    ]);
+    let preferences = BTreeMap::from([("foo".to_string(), vec!["1.0.0".to_string()])]);
+
+    let lockfile = Lockfile::from_str(
+        &resolve_lockfile_with_preferences(METADATA, &files, CRATES_IO_SOURCE, &preferences)
+            .unwrap(),
+    )
+    .unwrap();
+    let dependencies = |version: semver::Version| {
+        lockfile.packages
+            .iter()
+            .filter(|package| package.name.as_str() == "foo")
+            .find(|package| package.version == version)
+            .map(|package| {
+                package.dependencies
+                    .iter()
+                    .map(|dependency| dependency.name.to_string())
+                    .collect::<Vec<_>>()
+            })
+    };
+
+    assert_eq!(
+        dependencies(semver::Version::new(1, 0, 0)),
+        Some(vec!["bar".to_string(), "baz".to_string()]),
+    );
+    assert_eq!(dependencies(semver::Version::new(2, 0, 0)), Some(Vec::new()));
+}
+
 /// Both lines of `foo` carry an `extra` feature, so only the selection each
 /// line was actually asked for decides whether `baz` is activated there.
 #[test]
@@ -828,7 +1078,8 @@ fn keeps_requested_features_on_the_line_that_asked_for_them() {
     let dependencies = |version: semver::Version| {
         lockfile.packages
             .iter()
-            .find(|package| package.name.as_str() == "foo" && package.version == version)
+            .filter(|package| package.name.as_str() == "foo")
+            .find(|package| package.version == version)
             .map(|package| {
                 package.dependencies
                     .iter()
@@ -1020,7 +1271,7 @@ fn fetches_what_each_requirement_activates_on_its_own_line() {
     let files = BTreeMap::from([("foo".to_string(), foo_index.to_string())]);
 
     assert_eq!(
-        missing_index_names(METADATA, &files, CRATES_IO_SOURCE).unwrap(),
+        missing_index_names(METADATA, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
         ["reader", "writer"],
     );
 }
@@ -1029,11 +1280,14 @@ fn fetches_what_each_requirement_activates_on_its_own_line() {
 /// each wave asks for what [`missing_index_names`] asks for given every file
 /// fetched so far, and return the fetched files.
 fn fetch_in_waves(metadata: &str, index: &BTreeMap<&str, &str>) -> BTreeMap<String, String> {
-    let mut discovery = IndexDiscovery::new(metadata, CRATES_IO_SOURCE).unwrap();
+    let mut discovery = IndexDiscovery::new(metadata, CRATES_IO_SOURCE.to_owned()).unwrap();
     let mut files = BTreeMap::new();
     loop {
         let missing = discovery.missing_names().unwrap();
-        assert_eq!(missing, missing_index_names(metadata, &files, CRATES_IO_SOURCE).unwrap());
+        assert_eq!(
+            missing,
+            missing_index_names(metadata, &files, CRATES_IO_SOURCE.to_owned()).unwrap(),
+        );
         if missing.is_empty() {
             return files;
         }
@@ -1057,6 +1311,132 @@ fn incremental_discovery_asks_for_what_a_full_walk_asks_for() {
     }
 }
 
+#[test]
+fn locks_an_unversioned_path_dependency_on_a_prerelease_workspace_member() {
+    const PRERELEASE_PATH_METADATA: &str = r#"{
+  "packages": [
+    {
+      "id": "path+file:///workspace/crates/app#0.1.0",
+      "name": "app",
+      "version": "0.1.0",
+      "dependencies": [{
+        "name": "shared",
+        "source": null,
+        "req": "*"
+      }]
+    },
+    {
+      "id": "path+file:///workspace/crates/shared#0.1.0-alpha.1",
+      "name": "shared",
+      "version": "0.1.0-alpha.1",
+      "dependencies": []
+    }
+  ],
+  "workspace_members": [
+    "path+file:///workspace/crates/app#0.1.0",
+    "path+file:///workspace/crates/shared#0.1.0-alpha.1"
+  ]
+}"#;
+
+    let encoded =
+        resolve_lockfile(PRERELEASE_PATH_METADATA, &BTreeMap::new(), CRATES_IO_SOURCE).unwrap();
+    verify_lockfile(PRERELEASE_PATH_METADATA, &encoded).unwrap();
+    let lockfile = Lockfile::from_str(&encoded).unwrap();
+    let app = lockfile.packages
+        .iter()
+        .find(|package| package.name.as_str() == "app")
+        .expect("app package locked");
+    assert_eq!(app.dependencies.len(), 1);
+    assert_eq!(app.dependencies[0].name.as_str(), "shared");
+    assert_eq!(app.dependencies[0].version.to_string(), "0.1.0-alpha.1");
+
+    let mismatched = PRERELEASE_PATH_METADATA.replace(r#""req": "*""#, r#""req": "^1.0""#);
+    let error =
+        resolve_lockfile(&mismatched, &BTreeMap::new(), CRATES_IO_SOURCE).unwrap_err().to_string();
+    assert_eq!(error, "path dependency shared ^1.0 does not match the package at its path");
+}
+
+mod cancellation;
 mod freshness;
 mod lockfile_features;
 mod missing_features;
+
+#[test]
+fn retain_offered_drops_versions_and_crates_the_index_lacks() {
+    let index = concat!(
+        r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{},"yanked":false}"#,
+        "\n",
+        r#"{"name":"foo","vers":"1.1.0","deps":[],"cksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","features":{},"yanked":true}"#,
+    );
+    let registry = Registry::new(
+        &BTreeMap::from([("foo".to_string(), index.to_string())]),
+        CRATES_IO_SOURCE.to_owned(),
+    )
+    .unwrap();
+    let mut preferred = parse_preferred_versions(&BTreeMap::from([
+        ("foo".to_string(), vec!["1.1.0".to_string(), "1.0.0".to_string(), "9.9.9".to_string()]),
+        ("bar".to_string(), vec!["1.0.0".to_string()]),
+    ]))
+    .unwrap();
+
+    registry.retain_offered(&mut preferred);
+
+    assert_eq!(
+        preferred,
+        BTreeMap::from([(
+            "foo".to_string(),
+            vec![semver::Version::new(1, 1, 0), semver::Version::new(1, 0, 0)],
+        )]),
+    );
+}
+
+#[test]
+fn a_registry_serves_its_own_crates_and_crates_io_but_not_another_registry() {
+    let source = "sparse+https://private.example/index/";
+
+    assert!(serves_registry(source, "sparse+https://private.example/index"));
+    assert!(serves_registry(source, "registry+https://private.example/index"));
+    assert!(serves_registry(source, CRATES_IO_SOURCE));
+    assert!(!serves_registry(source, "sparse+https://other.example/index/"));
+    assert!(!serves_registry(CRATES_IO_SOURCE, source));
+}
+
+#[test]
+fn skips_a_preferred_version_that_lacks_the_requested_features() {
+    const METADATA: &str = r#"{
+  "packages": [{
+    "id": "path+file:///workspace#app@0.1.0",
+    "name": "app",
+    "version": "0.1.0",
+    "dependencies": [{
+      "name": "foo",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "req": "*",
+      "features": ["f"]
+    }]
+  }],
+  "workspace_members": ["path+file:///workspace#app@0.1.0"]
+}"#;
+    let foo_index = [
+        r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{"f":[]},"yanked":false}"#,
+        r#"{"name":"foo","vers":"2.0.0","deps":[],"cksum":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","features":{},"yanked":false}"#,
+        r#"{"name":"foo","vers":"2.1.0","deps":[],"cksum":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","features":{"f":[]},"yanked":false}"#,
+    ]
+    .join("\n");
+    let files = BTreeMap::from([("foo".to_string(), foo_index)]);
+    let preferences =
+        BTreeMap::from([("foo".to_string(), vec!["2.0.0".to_string(), "1.0.0".to_string()])]);
+
+    let lockfile = Lockfile::from_str(
+        &resolve_lockfile_with_preferences(METADATA, &files, CRATES_IO_SOURCE, &preferences)
+            .unwrap(),
+    )
+    .unwrap();
+
+    let foo_versions = lockfile.packages
+        .iter()
+        .filter(|package| package.name.as_str() == "foo")
+        .map(|package| package.version.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(foo_versions, ["1.0.0"]);
+}

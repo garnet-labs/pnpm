@@ -1,11 +1,20 @@
 use super::{
-    BugsArgs, get_bugs_url_from_current_project, is_http_url, pick_bugs_url,
-    repository_to_issues_url, try_hosted_git_shorthand,
+    BugsArgs,
+    get_bugs_url_from_current_project,
+    is_http_url,
+    pick_bugs_url,
+    repository_to_issues_url,
+    try_hosted_git_shorthand,
 };
 use pnpm_config::Config;
 use pnpm_network_web_auth::OpenUrl;
 use serde_json::json;
-use std::{cell::RefCell, fs, io, path::Path};
+use std::{
+    cell::RefCell,
+    fs,
+    io,
+    path::Path,
+};
 
 #[test]
 fn current_project_bugs_uses_manifest_precedence() {
@@ -291,7 +300,7 @@ macro_rules! recording_browser {
 
         // [`OpenUrl`] fake standing in for the user's browser; mirrors the
         // mocked `open` module in the TypeScript tests
-        // (`pnpm11/deps/inspection/commands/test/bugs.ts`).
+        // (<https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/inspection/commands/test/bugs.ts>).
         struct RecordingBrowser;
 
         impl OpenUrl for RecordingBrowser {

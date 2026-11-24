@@ -1,8 +1,34 @@
 use super::{
-    AccessList, AuthState, Body, Config, Ecosystem, Ipv4Addr, PackagePattern, PackageRules,
-    Registries, Registry, Request, ServiceExt, SocketAddr, SocketAddrV4, StatusCode, TempDir,
-    Value, access_rule, body_bytes, body_json, config_for, fs, header, hosted_with_access, json,
-    router, router_with_auth, seed_hosted, seed_hosted_with_maintainer, to_bytes,
+    AccessList,
+    AuthState,
+    Body,
+    Config,
+    Ecosystem,
+    Ipv4Addr,
+    PackagePattern,
+    PackageRules,
+    Registries,
+    Registry,
+    Request,
+    ServiceExt,
+    SocketAddr,
+    SocketAddrV4,
+    StatusCode,
+    TempDir,
+    Value,
+    access_rule,
+    body_bytes,
+    body_json,
+    config_for,
+    fs,
+    header,
+    hosted_with_access,
+    json,
+    router,
+    router_with_auth,
+    seed_hosted,
+    seed_hosted_with_maintainer,
+    to_bytes,
 };
 use crate::tokens::issue_token;
 use pnpr_fixtures::MockConfigPresets;
@@ -30,6 +56,8 @@ async fn search_paginates_visible_results_and_filters_by_maintainer() {
     let page = body_json(page.into_body()).await;
     assert_eq!(page["total"], json!(3));
     assert_eq!(page["objects"][0]["package"]["name"], json!("tool-b"));
+    assert_eq!(page["objects"][0]["package"]["maintainers"][0]["username"], json!("bob"));
+    assert!(page["objects"][0]["package"].get("links").is_none());
 
     let maintained = app
         .oneshot(
@@ -399,8 +427,10 @@ async fn upstream_without_a_search_endpoint_is_skipped() {
 async fn registry_directory_hides_upstream_access_and_package_rule_metadata() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://example.invalid", tmp.path().to_path_buf());
-    config.routing.upstreams.get_mut("npmjs").unwrap().access =
-        Some(AccessList::from_tokens(["alice"]));
+    config.routing.upstreams
+        .get_mut("npmjs")
+        .unwrap()
+        .set_access(AccessList::from_tokens(["alice"]));
     let mut hosted = hosted_with_access("public", "$all");
     hosted.rules = PackageRules::new(
         vec![access_rule("secret-package", "alice")],
@@ -452,8 +482,8 @@ async fn registry_directory_hides_upstream_access_and_package_rule_metadata() {
 async fn registry_directory_describes_oci_only_named_endpoints() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.yaml");
-    fs::write(&path, "storage: ./storage\nregistries:\n  oci:\n    internal: {type: hosted}\ndefaultRegistry:\n  oci: internal\n").unwrap();
-    let config = Config::from_yaml(&path, "127.0.0.1:4873".parse().unwrap(), None).unwrap();
+    fs::write(&path, "storage: ./storage\nregistries:\n  internal: {type: hosted, ecosystem: oci}\ndefaultRegistry:\n  oci: internal\n").unwrap();
+    let config = pnpr_fixtures::load_seeded_config(&path, "127.0.0.1:4873".parse().unwrap(), None);
     let app = router(config);
     let response = app
         .clone()

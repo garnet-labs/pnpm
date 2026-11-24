@@ -1,28 +1,71 @@
+pub(crate) use bump::parse_exact_version;
 pub(crate) use release::selected_projects;
 
 use crate::cli_args::{
-    change::{render_release_plan, to_engine_projects},
-    changelog::{self, confirmed_published_versions, unpublished_release_dirs},
-    recursive::{AutoExcludeRoot, discover_workspace_projects, select_recursive_projects},
+    change::{
+        render_release_plan,
+        to_engine_projects,
+    },
+    changelog::{
+        self,
+        confirmed_published_versions,
+        unpublished_release_dirs,
+    },
+    recursive::{
+        AutoExcludeRoot,
+        discover_workspace_projects,
+        select_recursive_projects,
+    },
 };
-use bump::{Bump, inc, parse_bump, parse_current_version};
-use clap::Args;
+use bump::{
+    Bump,
+    inc,
+    parse_bump,
+    parse_current_version,
+};
+use clap::{
+    Args,
+    ValueHint,
+};
 use git::version_from_git;
 use miette::Context;
-use node_semver::{Identifier, Version};
+use node_semver::{
+    Identifier,
+    Version,
+};
 use pnpm_config::Config;
-use pnpm_executor::{RunPostinstallHooks, run_lifecycle_hook};
+use pnpm_executor::{
+    RunPostinstallHooks,
+    run_lifecycle_hook,
+};
 use pnpm_package_manifest::PackageManifest;
-use pnpm_publish::{Host, RunCommand, is_git_repo, is_working_tree_clean};
+use pnpm_publish::{
+    Host,
+    RunCommand,
+    is_git_repo,
+    is_working_tree_clean,
+};
 use pnpm_versioning::{
-    AssembleReleasePlanOptions, apply_release_plan, assemble_release_plan, read_change_intents,
+    AssembleReleasePlanOptions,
+    apply_release_plan,
+    assemble_release_plan,
+    read_change_intents,
     read_ledger,
 };
 
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Bump the version of a package: `pnpm version <bump|semver>` applies an
@@ -52,7 +95,7 @@ pub struct VersionArgs {
     /// intents for a registry declared `serverType: pnpr`: the publication's
     /// note, or the package's version note when the release has one
     /// package.
-    #[clap(long = "release-notes", value_name = "FILE")]
+    #[clap(long = "release-notes", value_name = "FILE", value_hint = ValueHint::FilePath)]
     pub release_notes: Option<String>,
     #[clap(flatten)]
     pub git: VersionGitArgs,
@@ -91,7 +134,7 @@ impl VersionArgs {
         recursive: bool,
     ) -> miette::Result<()> {
         match self.params.first().map(String::as_str) {
-            None if recursive => self.release_from_intents(config, dir).await,
+            None if recursive => self.release_from_intents::<Reporter>(config, dir).await,
             _ if self.release_notes.is_some() => {
                 Err(VersionError::ReleaseNotesWithoutIntents.into())
             }
@@ -104,7 +147,7 @@ impl VersionArgs {
         self.git.tag_version_prefix.as_deref().unwrap_or(&config.tag_version_prefix)
     }
 
-    /// Apply an npm-style bump — `pnpm version <major|minor|…|x.y.z>` — to
+    /// Apply an npm-style bump (`pnpm version <major|minor|…|x.y.z>`) to
     /// the package at `dir`, or to every selected workspace package when
     /// `recursive`. Mirrors the TypeScript handler: git-tree check, per-
     /// package bump with `preversion`/`version` hooks, a commit and tag for
@@ -229,7 +272,7 @@ impl VersionArgs {
 
     /// Bump one package's manifest, running its `preversion` and `version`
     /// lifecycle hooks around the write. Both the write and the hooks are
-    /// skipped on a dry run. Returns `None` — bumping nothing — when the
+    /// skipped on a dry run. Returns `None` (bumping nothing) when the
     /// manifest has no name or no version.
     fn bump_package_version<Reporter: pnpm_reporter::Reporter>(
         &self,
@@ -249,9 +292,9 @@ impl VersionArgs {
         let current_version = parse_current_version(pkg_dir, &current)?;
 
         self.preversion_hook::<Reporter>(
-            pkg_dir,
-            &manifest_path,
-            &name,
+            pkg_dir.to_path_buf(),
+            manifest_path.clone(),
+            name.clone(),
             &current,
             config,
             init_cwd,
@@ -259,12 +302,12 @@ impl VersionArgs {
 
         let new_version = self.next_package_version(&current_version, bump, &current)?;
 
-        manifest
-            .value_mut()
-            .as_object_mut()
-            .expect("package.json is an object — its version field was just read")
-            .insert("version".to_string(), Value::String(new_version.clone()));
         if !self.dry_run {
+            if !config.ignore_scripts && manifest.value()["scripts"]["preversion"].is_string() {
+                manifest = PackageManifest::from_path(manifest_path.clone())
+                    .wrap_err_with(|| format!("reading {}", manifest_path.display()))?;
+            }
+            set_manifest_version(&mut manifest, new_version.clone());
             manifest
                 .save()
                 .wrap_err_with(|| format!("saving {}", manifest_path.display()))?;
@@ -283,19 +326,19 @@ impl VersionArgs {
 
     fn preversion_hook<Reporter: pnpm_reporter::Reporter>(
         &self,
-        pkg_dir: &Path,
-        manifest_path: &Path,
-        name: &str,
+        pkg_dir: PathBuf,
+        manifest_path: PathBuf,
+        name: String,
         current: &str,
         config: &Config,
         init_cwd: &Path,
     ) -> miette::Result<()> {
         let pre_change = VersionChange {
-            name: name.to_string(),
+            name,
             current_version: current.to_string(),
             new_version: current.to_string(),
-            path: pkg_dir.to_path_buf(),
-            manifest_path: manifest_path.to_path_buf(),
+            path: pkg_dir,
+            manifest_path,
         };
         run_version_lifecycle_hook::<Reporter>(
             "preversion",
@@ -322,7 +365,11 @@ impl VersionArgs {
                 self.preid
                     .as_deref()
                     .filter(|preid| !preid.is_empty()),
-            ),
+            )
+            .ok_or_else(|| VersionError::BumpFailed {
+                current: current.to_string(),
+                bump: self.params[0].clone(),
+            })?,
         }
         .to_string();
 
@@ -390,14 +437,14 @@ fn project_scripts_bin_dir_and_env(
     change: &VersionChange,
     config: &Config,
 ) -> (PathBuf, HashMap<String, String>) {
-    let modules_dir_name = config.modules_dir_name_for(&change.path, Some(&change.name));
+    let modules_dir = config.project_modules_dir(&change.path, Some(&change.name));
     let mut extra_env = config.extra_env.clone();
     config.prepend_project_node_path::<pnpm_config::Host>(
         &mut extra_env,
         &change.path,
-        &modules_dir_name,
+        &modules_dir,
     );
-    (change.path.join(modules_dir_name).join(".bin"), extra_env)
+    (modules_dir.join(".bin"), extra_env)
 }
 
 /// One package's version bump: what it was, what it became, and where its
@@ -426,6 +473,16 @@ fn package_version_identity(manifest: &PackageManifest) -> Option<(String, Strin
         return None;
     }
     Some((name.to_string(), current.to_string()))
+}
+
+/// Set `version` in `manifest` without saving it. The manifest must be an
+/// object, which it is once any of its fields were read.
+pub(crate) fn set_manifest_version(manifest: &mut PackageManifest, version: String) {
+    manifest
+        .value_mut()
+        .as_object_mut()
+        .expect("a manifest whose fields were read is a JSON object")
+        .insert("version".to_owned(), Value::String(version));
 }
 
 #[cfg(test)]

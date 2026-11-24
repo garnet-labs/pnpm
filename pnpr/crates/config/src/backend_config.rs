@@ -1,26 +1,36 @@
 use super::{
-    AuthFile, BTreeSet, BackendFile, Deserialize, Duration, Identity, Interval, LibsqlFile, Path,
-    PathBuf, RegistryError, ScimConfig, SqlBackendFile, build_admins,
-    default_tokens_path_sibling_of, oidc, parse_interval, resolve_relative,
+    AuthFile,
+    BTreeSet,
+    Deserialize,
+    Duration,
+    Identity,
+    Interval,
+    LibsqlFile,
+    Path,
+    PathBuf,
+    RegistryError,
+    ScimConfig,
+    SqlBackendFile,
+    build_admins,
+    oidc,
+    parse_interval,
 };
+use pnpr_error::redact_connection_url;
 
-/// The resolved record-store backend for auth (users + tokens). Unlike
-/// [`crate::HostedStoreConfig`], this only carries the parsed settings — the
-/// fallible step (connecting to the database and ensuring its schema)
-/// is async, so it runs in `AuthState::load` rather than at
-/// config-parse time.
-#[derive(Debug, Default, Clone)]
+/// The database that holds accounts and tokens.
+/// Unlike [`crate::HostedStoreConfig`], this only carries the parsed
+/// settings, the fallible step (opening the database and ensuring its
+/// schema) runs in `AuthState::load` rather than at config-parse time.
+#[derive(Debug, Clone)]
 pub enum BackendConfig {
-    /// Local htpasswd users + `SQLite` tokens (or in-memory when no file
-    /// is configured).
-    #[default]
-    Local,
+    /// The `SQLite` database at this path.
+    Sqlite(PathBuf),
     /// Networked `SQLite` (libsql / Turso): both records live in one
     /// shared database reachable over the network.
     Libsql(LibsqlSettings),
     /// `PostgreSQL`: both records live in one shared database.
     Postgres(SqlBackendSettings),
-    /// `MySQL`-compatible database: both records live in one shared database.
+    /// `MySQL` database: both records live in one shared database.
     Mysql(SqlBackendSettings),
 }
 
@@ -40,7 +50,7 @@ pub struct LibsqlSettings {
     pub replica_path: Option<PathBuf>,
     /// How often (seconds) the embedded replica pulls from the primary.
     /// Only meaningful with `replicaPath`; bounds how stale a read can
-    /// be — most importantly, token-revocation lag. `0` disables
+    /// be, most importantly, token-revocation lag. `0` disables
     /// background sync (the replica then reflects the initial sync at
     /// startup and its own account and token changes; a token's last-used
     /// time waits for the next sync). Defaults to
@@ -70,10 +80,10 @@ impl LibsqlSettings {
     pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 }
 
-/// The YAML `backend.postgres:` and `backend.mysql:` blocks. Whole-file
+/// The settings of a `PostgreSQL` or `MySQL` `storage.database` block. Whole-file
 /// `${ENV}` substitution runs before parsing, so `url` can hold
 /// `${...}` refs and keep credentials out of the committed config.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SqlBackendSettings {
     /// Driver connection URL, e.g. `postgres://user:pass@host/db` or
@@ -82,7 +92,7 @@ pub struct SqlBackendSettings {
     /// Maximum connections in the backend pool. Defaults to the
     /// driver's pool default when omitted.
     pub max_connections: Option<u32>,
-    /// Deadline for request-path auth database operations.
+    /// Deadline for database operations.
     pub timeout: Duration,
     /// Deadline for initial auth database connect and schema setup.
     pub startup_timeout: Duration,
@@ -99,36 +109,6 @@ impl std::fmt::Debug for SqlBackendSettings {
     }
 }
 
-fn redact_connection_url(raw: &str) -> String {
-    let Ok(mut parsed) = url::Url::parse(raw) else {
-        return "[redacted]".to_string();
-    };
-    if parsed.password().is_some() {
-        let _ = parsed.set_password(Some("[redacted]"));
-    }
-    if !parsed.username().is_empty() {
-        let _ = parsed.set_username("[redacted]");
-    }
-    let query_pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(k, v)| {
-            let k_lower = k.to_ascii_lowercase();
-            if matches!(k_lower.as_str(), "password" | "token" | "authtoken" | "auth_token") {
-                (k.into_owned(), "[redacted]".to_string())
-            } else {
-                (k.into_owned(), v.into_owned())
-            }
-        })
-        .collect();
-    if !query_pairs.is_empty() {
-        parsed
-            .query_pairs_mut()
-            .clear()
-            .extend_pairs(query_pairs);
-    }
-    parsed.to_string()
-}
-
 impl SqlBackendSettings {
     /// Default request-path auth database deadline.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -141,31 +121,44 @@ impl SqlBackendSettings {
 #[derive(Debug, Default, Clone)]
 pub struct AuthConfig {
     pub oidc: Vec<oidc::OidcProvider>,
-    pub htpasswd: HtpasswdConfig,
+    pub users: UsersConfig,
     pub tokens: TokensConfig,
     /// The SCIM endpoints, off when `None`.
     pub scim: Option<ScimConfig>,
 }
 
-/// Where the htpasswd users file lives and how many users may sign
-/// up before registration is refused.
+/// How many users may sign up before registration is refused.
 #[derive(Debug, Default, Clone)]
-pub struct HtpasswdConfig {
-    /// Absolute path to the htpasswd file. `None` keeps user state
-    /// in memory (back-compat with `@pnpm/registry-mock`).
-    pub file: Option<PathBuf>,
+pub struct UsersConfig {
     /// Cap on new user registrations.
     pub max_users: MaxUsers,
 }
 
-/// Where the token database lives. SQLite-backed when `file` is
-/// set; an in-memory map otherwise.
-#[derive(Debug, Default, Clone)]
+/// How long the bearer tokens issued by a login or `POST /-/npm/v1/tokens`
+/// stay valid.
+#[derive(Debug, Clone)]
 pub struct TokensConfig {
-    pub file: Option<PathBuf>,
+    /// The lifetime of a token whose request sets no expiry. Defaults to
+    /// [`TokensConfig::DEFAULT_LIFETIME`].
+    pub default_lifetime: Duration,
+    /// The longest a token stays valid. `None` sets no limit.
+    pub max_lifetime: Option<Duration>,
 }
 
-/// Three-state cap on `auth.htpasswd.max_users`:
+impl TokensConfig {
+    pub const DEFAULT_LIFETIME: Duration = Duration::from_hours(90 * 24);
+    /// The shortest configurable lifetime. A shorter token could expire while
+    /// the login that issues it is still verifying the password.
+    pub const MIN_LIFETIME: Duration = Duration::from_mins(1);
+}
+
+impl Default for TokensConfig {
+    fn default() -> Self {
+        Self { default_lifetime: Self::DEFAULT_LIFETIME, max_lifetime: None }
+    }
+}
+
+/// Three-state cap on `auth.users.max_users`:
 ///
 /// * absent → registration disabled. Self-registration is opt-in:
 ///   leaving the key out denies new sign-ups. Verdaccio defaults this
@@ -188,7 +181,7 @@ impl MaxUsers {
     /// accepts any signed integer here; negative anything other than
     /// `-1` is nonsense and is treated as "disabled" to err on the
     /// side of rejecting unsafe configs. An omitted key never reaches
-    /// this function — it maps to [`MaxUsers::Disabled`] in
+    /// this function; it maps to [`MaxUsers::Disabled`] in
     /// [`build_auth_config`], so there is no YAML spelling for
     /// "unlimited".
     pub(super) fn from_yaml(value: i64) -> Self {
@@ -196,164 +189,103 @@ impl MaxUsers {
     }
 }
 
-/// Build the runtime [`AuthConfig`] from the YAML `auth:` block.
-/// Relative paths are resolved against `base_dir` so a path like
-/// `./htpasswd` lives next to the config file (verdaccio's
-/// convention). When `auth.htpasswd.file` is set but
-/// `auth.tokens.file` is not, tokens default to a `tokens.db`
-/// sibling of the htpasswd file — keeping credentials co-located in
-/// one directory the operator can lock down (`chmod 600`).
+/// Who may sign in and administer the registry, and where accounts live.
 #[derive(Debug, Clone)]
 pub struct IdentityConfig {
-    /// Where to read/write the htpasswd-format user file and the
-    /// token database. Both stores are in-memory when their paths
-    /// are `None`.
     pub auth: AuthConfig,
-    /// Which record store backs the auth state (users + tokens).
-    /// Defaults to [`BackendConfig::Local`] — today's htpasswd file
-    /// plus `SQLite` token database. The YAML `backend:` block can
-    /// switch both stores to one shared SQL database so several
-    /// stateless pnpr replicas see a consistent set of accounts.
+    /// The database that holds accounts and tokens, which is the metadata
+    /// database the `storage.database` block selects.
     pub backend: BackendConfig,
-    /// Usernames from `auth.admins`, who may administer every registry.
+    /// Account IDs from `auth.admins`, who may administer every registry.
     pub admins: BTreeSet<String>,
+    /// Account IDs from `auth.registryAdmins`, who may also change the
+    /// structure of a registry graph stored in the database.
+    pub registry_admins: BTreeSet<String>,
 }
 
 impl IdentityConfig {
     #[must_use]
     pub fn is_admin(&self, identity: &Identity) -> bool {
-        match identity {
-            Identity::User { username, .. } => self.admins.contains(username),
-            Identity::Anonymous | _ => false,
-        }
+        is_listed(&self.admins, identity)
     }
 
-    /// Whether `username` is a configured admin, an OIDC login user,
-    /// or an OIDC workload binding. Such names cannot be self-registered.
     #[must_use]
-    pub fn is_reserved_name(&self, username: &str) -> bool {
-        if self.admins.contains(username) {
-            return true;
-        }
-        for provider in &self.auth.oidc {
-            if provider.login
-                .as_ref()
-                .is_some_and(|login| {
-                    login.users
-                        .iter()
-                        .any(|binding| binding.username == username)
-                })
-            {
-                return true;
-            }
-            if provider.workloads
-                .iter()
-                .any(|workload| workload.identity.username == username)
-            {
-                return true;
-            }
-        }
-        false
+    pub fn is_registry_admin(&self, identity: &Identity) -> bool {
+        is_listed(&self.registry_admins, identity)
+    }
+}
+
+fn is_listed(accounts: &BTreeSet<String>, identity: &Identity) -> bool {
+    match identity {
+        Identity::User { id, .. } => accounts.contains(id),
+        Identity::Anonymous | _ => false,
     }
 }
 
 pub(super) fn build_identity_config(
     file: &AuthFile,
-    base_dir: &Path,
     backend: BackendConfig,
 ) -> Result<IdentityConfig, RegistryError> {
     if let Some(scim) = &file.scim {
         scim.validate()?;
     }
     Ok(IdentityConfig {
-        admins: build_admins(&file.admins)?,
-        auth: build_auth_config(file, base_dir),
+        admins: build_admins("auth.admins", &file.admins)?,
+        registry_admins: build_admins("auth.registryAdmins", &file.registry_admins)?,
+        auth: build_auth_config(file)?,
         backend,
     })
 }
 
-pub(super) fn build_auth_config(file: &AuthFile, base_dir: &Path) -> AuthConfig {
-    let htpasswd_file = file.htpasswd.file.as_deref().map(|raw| resolve_relative(raw, base_dir));
-    let tokens_file = file.tokens.file
-        .as_deref()
-        .map(|raw| resolve_relative(raw, base_dir))
-        .or_else(|| htpasswd_file.as_deref().map(default_tokens_path_sibling_of));
-    AuthConfig {
+pub(super) fn build_auth_config(file: &AuthFile) -> Result<AuthConfig, RegistryError> {
+    Ok(AuthConfig {
         oidc: file.oidc.clone(),
-        htpasswd: HtpasswdConfig {
-            file: htpasswd_file,
-            max_users: file.htpasswd.max_users.map_or(MaxUsers::Disabled, MaxUsers::from_yaml),
+        users: UsersConfig {
+            max_users: file.users.max_users.map_or(MaxUsers::Disabled, MaxUsers::from_yaml),
         },
-        tokens: TokensConfig { file: tokens_file },
+        tokens: TokensConfig {
+            default_lifetime: build_token_lifetime(
+                "defaultLifetime",
+                file.tokens.default_lifetime.as_ref(),
+            )?
+            .unwrap_or(TokensConfig::DEFAULT_LIFETIME),
+            max_lifetime: build_token_lifetime("maxLifetime", file.tokens.max_lifetime.as_ref())?,
+        },
         scim: file.scim.clone(),
-    }
+    })
 }
 
-pub(super) fn build_backend_config(
-    file: Option<BackendFile>,
-    base_dir: &Path,
-) -> Result<BackendConfig, RegistryError> {
-    let Some(file) = file else {
-        return Ok(BackendConfig::Local);
+/// The `auth.tokens.{key}` lifetime, at least [`TokensConfig::MIN_LIFETIME`].
+fn build_token_lifetime(
+    key: &str,
+    raw: Option<&Interval>,
+) -> Result<Option<Duration>, RegistryError> {
+    let Some(Interval(raw)) = raw else {
+        return Ok(None);
     };
-    let mut selected = Vec::new();
-    if let Some(settings) = file.libsql {
-        let libsql_settings = build_libsql_settings(settings, base_dir, "backend.libsql")?;
-        selected.push(("libsql", BackendConfig::Libsql(libsql_settings)));
-    }
-    if let Some(settings) = file.postgres {
-        selected.push((
-            "postgres",
-            BackendConfig::Postgres(build_sql_backend_settings("postgres", settings)?),
-        ));
-    }
-    if let Some(settings) = file.mysql {
-        selected.push((
-            "mysql",
-            BackendConfig::Mysql(build_sql_backend_settings("mysql", settings)?),
-        ));
-    }
-    select_backend(selected)
-}
-
-fn select_backend(
-    mut selected: Vec<(&str, BackendConfig)>,
-) -> Result<BackendConfig, RegistryError> {
-    match selected.len() {
-        0 => Err(RegistryError::InvalidConfig {
-            reason: "backend must select exactly one database backend".to_string(),
+    match parse_interval(raw) {
+        Some(lifetime) if lifetime >= TokensConfig::MIN_LIFETIME => Ok(Some(lifetime)),
+        _ => Err(RegistryError::InvalidConfig {
+            reason: format!("auth.tokens.{key} {raw:?} is not an interval of at least 1m"),
         }),
-        1 => Ok(selected.remove(0).1),
-        _ => {
-            let names = selected
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(RegistryError::InvalidConfig {
-                reason: format!("backend must select exactly one database backend, got {names}"),
-            })
-        }
     }
 }
 
 pub(super) fn build_sql_backend_settings(
-    backend: &str,
     file: SqlBackendFile,
 ) -> Result<SqlBackendSettings, RegistryError> {
-    let timeout = parse_backend_interval(backend, "timeout", file.timeout.as_ref())?
+    let timeout = parse_backend_interval("timeout", file.timeout.as_ref())?
         .unwrap_or(SqlBackendSettings::DEFAULT_TIMEOUT);
     if timeout.is_zero() {
         return Err(RegistryError::InvalidConfig {
-            reason: format!("backend.{backend}.timeout must be greater than 0"),
+            reason: "storage.database.timeout must be greater than 0".to_string(),
         });
     }
-    let startup_timeout =
-        parse_backend_interval(backend, "startupTimeout", file.startup_timeout.as_ref())?
-            .unwrap_or(SqlBackendSettings::DEFAULT_STARTUP_TIMEOUT);
+    let startup_timeout = parse_backend_interval("startupTimeout", file.startup_timeout.as_ref())?
+        .unwrap_or(SqlBackendSettings::DEFAULT_STARTUP_TIMEOUT);
     if startup_timeout.is_zero() {
         return Err(RegistryError::InvalidConfig {
-            reason: format!("backend.{backend}.startupTimeout must be greater than 0"),
+            reason: "storage.database.startupTimeout must be greater than 0".to_string(),
         });
     }
     Ok(SqlBackendSettings {
@@ -365,14 +297,13 @@ pub(super) fn build_sql_backend_settings(
 }
 
 pub(super) fn parse_backend_interval(
-    backend: &str,
     field: &str,
     raw: Option<&Interval>,
 ) -> Result<Option<Duration>, RegistryError> {
     raw.map(|Interval(value)| {
         parse_interval(value)
             .ok_or_else(|| RegistryError::InvalidConfig {
-                reason: format!("backend.{backend}.{field} has an invalid interval {value:?}"),
+                reason: format!("storage.database.{field} has an invalid interval {value:?}"),
             })
     })
     .transpose()
@@ -413,4 +344,23 @@ pub(crate) fn build_libsql_settings(
         sync_interval_secs,
         max_connections: file.max_connections,
     })
+}
+
+pub(super) fn build_backend_config(metadata: &crate::DatabaseBackend) -> BackendConfig {
+    use crate::DatabaseBackend;
+    match metadata {
+        DatabaseBackend::Sqlite(path) => BackendConfig::Sqlite(path.clone()),
+        DatabaseBackend::Libsql(settings) => {
+            let mut auth = settings.clone();
+            // Independent sync schedules need independent replica files.
+            auth.replica_path = auth.replica_path.map(|path| {
+                let mut path = path.into_os_string();
+                path.push(".auth");
+                PathBuf::from(path)
+            });
+            BackendConfig::Libsql(auth)
+        }
+        DatabaseBackend::Postgres(settings) => BackendConfig::Postgres(settings.clone()),
+        DatabaseBackend::Mysql(settings) => BackendConfig::Mysql(settings.clone()),
+    }
 }

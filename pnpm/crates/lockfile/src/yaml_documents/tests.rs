@@ -1,8 +1,14 @@
 use super::{
-    READ_BUFFER_SIZE, extract_env_document, extract_main_document, read_first_yaml_document,
+    READ_BUFFER_SIZE,
+    extract_env_document,
+    extract_main_document,
+    read_first_yaml_document,
     read_first_yaml_document_in_chunks,
 };
-use std::io::{self, Read};
+use std::io::{
+    self,
+    Read,
+};
 
 #[test]
 fn returns_entire_content_when_it_does_not_start_with_separator() {
@@ -18,6 +24,14 @@ fn reads_a_file_with_no_second_separator_as_env_only() {
         extract_env_document(content).as_deref(),
         Some("importers:\n  .:\n    configDependencies: {}"),
     );
+}
+
+#[test]
+fn reads_a_next_format_env_document_with_no_second_separator_as_env_only() {
+    let env = "{\n\t\"lockfileVersion\": \"13.0\",\n\n\t\"importers\": {\n\t\t\".\": {\n\t\t\t\"configDependencies\": {},\n\t\t},\n\t},\n}";
+    let content = format!("---\n{env}\n---");
+    assert_eq!(extract_main_document(&content), "");
+    assert_eq!(extract_env_document(&content).as_deref(), Some(env));
 }
 
 #[test]
@@ -48,8 +62,8 @@ fn normalizes_a_single_document_file() {
     assert_eq!(extract_env_document(content), None);
 }
 
-/// Every marker the streaming reader looks for — the byte-order mark,
-/// the document start, a CRLF pair, the separator — is longer than one
+/// Every marker the streaming reader looks for (the byte-order mark,
+/// the document start, a CRLF pair, the separator) is longer than one
 /// byte, so each chunk size puts a different one across a boundary.
 #[track_caller]
 fn assert_streams(content: &str, expected: Option<&str>) {

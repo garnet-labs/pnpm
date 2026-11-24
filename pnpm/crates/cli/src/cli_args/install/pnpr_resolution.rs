@@ -1,21 +1,54 @@
+mod persist_allowed_picks;
+
 use super::{
-    Catalogs, Display, Error, InstallFamilySelection, LocalLockfileInstall, Lockfile,
-    MaybeLazyLockfile, PnprBenchmarkRegistryOverride, PnprClient, PnprClientError, PnprLink,
-    PnprRequestInputs, PnprTarget, Reporter, ResolveProject, ResolveProjectsOptions, State,
-    TarballPrefetcher, WantedLockfileSatisfactionCheck, check_frozen_pnpmfile,
-    check_pnpr_applied_settings, full_workspace_importer_ids, install_from_local_lockfile,
-    link_pnpr_lockfile, merge_and_save_pnpr_lockfile, pnpr_catalogs,
-    pnpr_config_validation::validate_pnpr_config, pnpr_lockfile_dir, pnpr_request_inputs,
-    report_merged_lockfile_conflicts, resolve_projects_for_pnpr, resolve_projects_options,
-    selection_importer_ids, wanted_lockfile_satisfies_workspace,
+    Catalogs,
+    Display,
+    Error,
+    InstallFamilySelection,
+    LocalLockfileInstall,
+    Lockfile,
+    MaybeLazyLockfile,
+    PnprBenchmarkRegistryOverride,
+    PnprClient,
+    PnprClientError,
+    PnprLink,
+    PnprRequestInputs,
+    PnprTarget,
+    Reporter,
+    ResolveProject,
+    ResolveProjectsOptions,
+    State,
+    TarballPrefetcher,
+    WantedLockfileSatisfactionCheck,
+    check_pnpr_applied_settings,
+    full_workspace_importer_ids,
+    install_from_local_lockfile,
+    link_pnpr_lockfile,
+    merge_and_save_pnpr_lockfile,
+    pnpr_catalogs,
+    pnpr_local_specs::{
+        PnprLocalDependencyUnsupported,
+        check_pnpr_lockfile_specs_and_config,
+        check_pnpr_project_specs_and_config,
+    },
+    pnpr_lockfile_dir,
+    pnpr_request_inputs,
+    report_merged_lockfile_conflicts,
+    resolve_projects_for_pnpr,
+    resolve_projects_options,
+    selection_importer_ids,
+    verify_frozen_pnpr_preflight,
+    wanted_lockfile_satisfies_workspace,
 };
+use miette::WrapErr;
+use persist_allowed_picks::persist_allowed_picks;
 
 /// Resolve the active project or selected workspace projects through a
 /// `pnpr` server, then link them.
 ///
 /// Sends the client's registries to the server, which resolves against
 /// them and returns the resolved lockfile; writes that lockfile, then
-/// runs a frozen install to materialize `node_modules` from it — the
+/// runs a frozen install to materialize `node_modules` from it, the
 /// frozen install fetches every tarball from the registries itself, like
 /// a normal install. Under `--lockfile-only` it stops after writing the
 /// lockfile (fetch nothing, link nothing).
@@ -51,12 +84,10 @@ pub(super) async fn install_via_pnpr_inner<Reporter: self::Reporter + 'static>(
     selection: Option<&InstallFamilySelection>,
     link: PnprLink<'_>,
 ) -> miette::Result<()> {
-    validate_pnpr_config(state.config, link.lockfile.frozen)?;
-
     let pnpr_server = target.server;
     let lockfile_dir = pnpr_lockfile_dir(state, &link);
     let session = prepare_pnpr_session::<Reporter>(state, selection, &link, lockfile_dir).await?;
-    let inputs = pnpr_request_inputs(state, &link, lockfile_dir, target.pnpmfile_hook).await?;
+    let inputs = pnpr_request_inputs(state, &link, &session, target.pnpmfile_hook).await?;
 
     if (session.satisfied_without_server
         || (link.lockfile.frozen && (selection.is_some() || !link.lockfile.only)))
@@ -67,16 +98,7 @@ pub(super) async fn install_via_pnpr_inner<Reporter: self::Reporter + 'static>(
             pnpr_server,
             selection,
             &link,
-            &LocalLockfileInstall {
-                lockfile,
-                lockfile_dir,
-                lockfile_path: &inputs.lockfile_path,
-                selection_importer_ids: session.selection_importer_ids.as_ref(),
-                overrides: inputs.overrides.as_ref(),
-                resolve_registry: &inputs.resolve_registry,
-                prefetch_allowed: inputs.prefetch_allowed,
-                pnpmfile_hook: inputs.pnpmfile_hook,
-            },
+            &LocalLockfileInstall { lockfile, lockfile_dir, session: &session, inputs: &inputs },
         )
         .await;
     }
@@ -114,10 +136,18 @@ async fn prepare_pnpr_session<'a, Reporter: self::Reporter + 'static>(
     link: &PnprLink<'_>,
     lockfile_dir: &std::path::Path,
 ) -> miette::Result<PnprSession<'a>> {
+    if link.lockfile.frozen && link.lockfile.update_checksums {
+        return Err(pnpm_package_manager::InstallError::FrozenLockfileWithUpdateChecksums.into());
+    }
+    let projects = resolve_projects_for_pnpr(state, selection, link.use_state_lockfile)?;
+    let catalogs = pnpr_catalogs(state)?;
+    check_pnpr_project_specs_and_config(state.config, &projects, catalogs.as_ref(), link)?;
+
     let PreviousWanted {
         lockfile: previous_wanted,
         had_conflicts,
     } = load_previous_wanted::<Reporter>(state, link, lockfile_dir)?;
+    check_pnpr_lockfile_specs_and_config(state.config, previous_wanted, link)?;
     let merge_wanted = merge_source(state, link, previous_wanted)?;
 
     let selection_importer_ids = selection_importer_ids(state, selection);
@@ -126,11 +156,8 @@ async fn prepare_pnpr_session<'a, Reporter: self::Reporter + 'static>(
         .is_some_and(|(real_importer_ids, selected_importer_ids)| {
             real_importer_ids != selected_importer_ids
         });
-    let projects = resolve_projects_for_pnpr(state, selection, link.use_state_lockfile)?;
     let full_workspace_importer_ids =
         full_workspace_importer_ids(state, selection, link, &projects);
-
-    let catalogs = pnpr_catalogs(state)?;
 
     // A merged conflict makes the on-disk lockfile a file no install may
     // leave as it found it, and only the server exchange writes it back.
@@ -245,7 +272,43 @@ impl miette::Diagnostic for ServerErrorWithCode {
     }
 }
 
+/// The pnpr server refused to resolve because it cannot honor a setting or
+/// the lockfile format this client sent. See
+/// [`PnprClientError::is_unsupported_request`].
+#[derive(Debug, Display, Error)]
+pub(crate) struct PnprUnsupportedRequest {
+    message: String,
+}
+
+impl miette::Diagnostic for PnprUnsupportedRequest {}
+
+/// Whether `error` is a local-fallback refusal ([`PnprUnsupportedRequest`] or
+/// [`PnprLocalDependencyUnsupported`]), after warning that the install
+/// resolves locally instead.
+pub(crate) fn resolves_locally_after<Reporter: self::Reporter>(
+    error: &miette::Report,
+    server: &str,
+) -> bool {
+    let server = pnpm_network::redact_url_for_display(server);
+    if let Some(local) = error.downcast_ref::<PnprLocalDependencyUnsupported>() {
+        pnpm_reporter::emit_global_warning::<Reporter>(&format!(
+            "Resolving dependencies locally because the pnpr server at {server} cannot resolve local dependency {local}",
+        ));
+        return true;
+    }
+    let Some(refusal) = error.downcast_ref::<PnprUnsupportedRequest>() else {
+        return false;
+    };
+    pnpm_reporter::emit_global_warning::<Reporter>(&format!(
+        "Resolving dependencies locally because the pnpr server at {server} cannot handle this request: {refusal}",
+    ));
+    true
+}
+
 fn map_pnpr_client_error(err: PnprClientError) -> miette::Report {
+    if err.is_unsupported_request() {
+        return miette::Report::new(PnprUnsupportedRequest { message: err.to_string() });
+    }
     match err {
         PnprClientError::Verification(verify_err) => miette::Report::new(verify_err),
         PnprClientError::Server { message, code: Some(code) } => {
@@ -328,15 +391,15 @@ fn merge_source<'a>(
     }
     MaybeLazyLockfile::Repair(&state.lockfile)
         .get_for_merge()
-        .map_err(|err| miette::Report::new(err).wrap_err("load the lockfile for filtered merge"))
+        .wrap_err("load the lockfile for filtered merge")
 }
 
 /// Whether the on-disk lockfile already describes this install, so the
 /// server exchange can be skipped.
 ///
 /// Filtered installs keep the exchange even when satisfied: their merge
-/// semantics live there. A workspace-wide install has a selection too —
-/// every project — and skips the server like any single-project one.
+/// semantics live there. A workspace-wide install has a selection too
+/// (every project) and skips the server like any single-project one.
 async fn satisfied_without_server(
     state: &State,
     link: &PnprLink<'_>,
@@ -346,6 +409,7 @@ async fn satisfied_without_server(
 ) -> bool {
     let exchange_free = !link.lockfile.frozen
         && !link.lockfile.update_patches
+        && !link.lockfile.update_checksums
         && !link.lockfile.fix
         && !link.lockfile.only
         && link.lockfile.prefer_frozen
@@ -372,11 +436,7 @@ async fn resolve_and_link_pnpr<Reporter: self::Reporter + 'static>(
     mut session: PnprSession<'_>,
     mut inputs: PnprRequestInputs,
 ) -> miette::Result<()> {
-    if link.lockfile.frozen
-        && let Some(previous_wanted) = session.previous_wanted
-    {
-        check_frozen_pnpmfile(state, inputs.pnpmfile_hook.as_ref(), previous_wanted).await?;
-    }
+    verify_frozen_pnpr_preflight::<Reporter>(state, &link, &session, &inputs).await?;
     let prefetcher = streaming_prefetcher(state, lockfile_dir, &link, &session, &inputs).await;
     let opts = resolve_projects_options(state, pnpr_server, &link, &mut session, &mut inputs);
     let resolved = resolve_via_pnpr(
@@ -396,6 +456,7 @@ async fn resolve_and_link_pnpr<Reporter: self::Reporter + 'static>(
         resolved.outcome.lockfile,
     )
     .await?;
+    persist_allowed_picks::<Reporter>(state, lockfile_dir, &link, &resolved.outcome.allowed_picks)?;
     if !link.lockfile.only {
         link_pnpr_lockfile::<Reporter>(
             state,

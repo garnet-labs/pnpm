@@ -5,18 +5,31 @@
 
 #![cfg(unix)]
 
-use crate::_utils::{ManifestDeps, write_project_manifest};
+use crate::_utils::{
+    ManifestDeps,
+    write_project_manifest,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
+use pnpm_fs::file_mode::Umask;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     command_env::CommandTestExt,
 };
 use pnpm_workspace_state::WORKSPACE_STATE_FILENAME;
 use std::{
     fs,
-    os::unix::{fs::PermissionsExt, process::CommandExt},
-    path::{Path, PathBuf},
+    os::unix::{
+        fs::PermissionsExt,
+        process::ExitStatusExt,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 
@@ -34,27 +47,25 @@ const PLAIN_FILE_REL: &str = concat!(
     "node_modules/@pnpm.e2e/bravo-dep/package.json",
 );
 
-fn pnpm_with_umask(dir: &Path, umask: libc::mode_t, args: &[&str]) {
-    let mut command = Command::cargo_bin("pnpm")
-        .expect("find the pnpm binary")
+fn pnpm_with_umask(dir: &Path, umask: Umask, args: &[&str]) {
+    let pnpm = Command::cargo_bin("pnpm").expect("find the pnpm binary");
+    let mask = umask.mask();
+    // Set the mask before exec without a `pre_exec` hook.
+    let mut command = Command::new("/bin/sh")
         .with_current_dir(dir)
-        .without_ambient_pnpm_config();
-    // SAFETY: `umask` is always safe to call, and this closure runs in the
-    // forked child between `fork` and `exec`, where only async-signal-safe
-    // operations are allowed and a syscall is one.
-    unsafe {
-        command.pre_exec(move || {
-            libc::umask(umask);
-            Ok(())
-        });
-    }
-    let output = command
-        .args(args)
-        .output()
-        .expect("run pnpm");
+        .without_ambient_pnpm_config()
+        .with_arg("-c")
+        .with_arg(r#"umask "$1" || exit; shift; exec "$@""#)
+        .with_arg("sh")
+        .with_arg(format!("{mask:o}"))
+        .with_arg(pnpm.get_program())
+        .with_args(args);
+    let output = command.output().expect("run pnpm");
     assert!(
         output.status.success(),
-        "{args:?} under umask {umask:#o} failed\nstdout:\n{}\nstderr:\n{}",
+        "{args:?} under umask {mask:#o} failed: {} (signal: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.status.signal(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -103,8 +114,12 @@ fn installs_materialize_files_at_the_current_umask_even_from_a_stale_store() {
 
     // On APFS `auto` clones before it hardlinks, so the control project
     // pins the method that the inode assertion below can then check.
-    pnpm_with_umask(&workspace, 0o022, &["install", "--package-import-method=hardlink"]);
-    pnpm_with_umask(&other, 0o077, &["install"]);
+    pnpm_with_umask(
+        &workspace,
+        Umask::from_mask(0o022),
+        &["install", "--package-import-method=hardlink"],
+    );
+    pnpm_with_umask(&other, Umask::from_mask(0o077), &["install"]);
 
     assert_eq!(
         file_mode(&workspace.join(EXEC_FILE_REL)),
@@ -203,7 +218,7 @@ fn local_directory_dependency_files_keep_their_project_modes() {
     )
     .expect("write package.json");
 
-    pnpm_with_umask(&workspace, 0o077, &["install"]);
+    pnpm_with_umask(&workspace, Umask::from_mask(0o077), &["install"]);
 
     assert_eq!(
         file_mode(&workspace.join("node_modules/local-dep/run")),
@@ -233,7 +248,11 @@ fn installs_hardlink_from_a_world_writable_store_under_umask_000() {
     fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o777))
         .expect("make the store directory world-writable");
 
-    pnpm_with_umask(&workspace, 0o000, &["install", "--package-import-method=hardlink"]);
+    pnpm_with_umask(
+        &workspace,
+        Umask::from_mask(0o000),
+        &["install", "--package-import-method=hardlink"],
+    );
 
     let files_dir = store_dir.join(pnpm_store_dir::STORE_VERSION).join("files");
     let store_inodes: Vec<u64> = walkdir::WalkDir::new(&files_dir)
@@ -279,19 +298,20 @@ fn files_pnpm_writes_into_a_project_follow_the_umask() {
     }
     let edit_dir = workspace.join("node_modules/.pnpm_patches/@pnpm.e2e/bravo-dep@1.0.0");
 
-    pnpm_with_umask(&workspace, 0o022, &["install"]);
-    pnpm_with_umask(&workspace, 0o022, &["patch", "@pnpm.e2e/bravo-dep@1.0.0"]);
+    pnpm_with_umask(&workspace, Umask::from_mask(0o022), &["install"]);
+    pnpm_with_umask(&workspace, Umask::from_mask(0o022), &["patch", "@pnpm.e2e/bravo-dep@1.0.0"]);
     fs::write(edit_dir.join("index.js"), "module.exports = 'patched'\n").expect("edit the package");
     pnpm_with_umask(
         &workspace,
-        0o022,
+        Umask::from_mask(0o022),
         &["patch-commit", edit_dir.to_str().expect("a UTF-8 edit dir")],
     );
 
     let owner_only: Vec<_> = walkdir::WalkDir::new(&workspace)
         .into_iter()
         .map(|entry| entry.expect("walk the project"))
-        .filter(|entry| entry.file_type().is_file() && file_mode(entry.path()) & 0o044 == 0)
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| file_mode(entry.path()) & 0o044 == 0)
         .map(|entry| {
             entry
                 .path()

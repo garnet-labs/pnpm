@@ -1,16 +1,38 @@
 use super::{
-    AuthHeaders, InMemoryPackageMetaCache, PACKAGE_BODY, PickPackageContext, RetryOpts,
-    ThrottledClient, default_opts, persist_meta_to_mirror, pick_package, range_spec,
+    AuthHeaders,
+    InMemoryPackageMetaCache,
+    PACKAGE_BODY,
+    PickPackageContext,
+    RetryOpts,
+    ThrottledClient,
+    default_opts,
+    persist_meta_to_mirror,
+    pick_package,
+    range_spec,
     shared_packument_fetch_locker,
 };
-use crate::{OfflineStoreView, mirror::ABBREVIATED_META_DIR};
-use pnpm_store_dir::{PackageFilesIndex, StoreIndex, store_index_key};
+use crate::{
+    OfflineStoreView,
+    mirror::ABBREVIATED_META_DIR,
+};
+use pnpm_store_dir::{
+    PackageFilesIndex,
+    StoreIndex,
+    store_index_key,
+};
 use pretty_assertions::assert_eq;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc,
+        Mutex,
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
     },
 };
 use tempfile::TempDir;
@@ -196,7 +218,7 @@ async fn offline_pick_memo_survives_a_caller_that_blocked_the_store_held_version
         &auth_headers,
     );
 
-    // First caller blocks 1.0.0 — the only version the store holds — so the
+    // First caller blocks 1.0.0 (the only version the store holds) so the
     // adjustment finds nothing installable and keeps the newest pick.
     let mut blocked_opts = default_opts("https://registry.invalid/");
     let blocked = HashSet::from(["1.0.0".to_string()]);
@@ -334,7 +356,7 @@ async fn offline_pick_with_published_by_still_narrows_to_store_held_version() {
     );
 
     let mut opts = default_opts("https://registry.invalid/");
-    opts.policy.published_by = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    opts.policy.published_by = Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1));
 
     let result = pick_package(&ctx, &range_spec("acme", "^1.0.0"), &opts).await
         .expect("offline pick succeeds");

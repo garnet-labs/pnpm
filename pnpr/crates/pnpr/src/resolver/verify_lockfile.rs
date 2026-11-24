@@ -1,166 +1,447 @@
-use super::{
-    Arc, AuthHeaders, Bytes, Footprint, Identity, InMemoryPackageMetaCache, Lockfile, Mutex,
-    ObservedDistStats, OsvIndex, PackageMetaCache, PacquetConfig, ResolutionVerifier,
-    ResolveRequest, Resolver, Response, StatusCode, TOO_MANY_CONFIGS_MESSAGE, TarballRouter,
-    build_resolution_verifiers, collect_resolution_policy_violations, hash_lockfile, json_error,
-    ndjson_single_frame, observed_dist_stats_sink, osv_violations_for_lockfile,
-    reject_inline_url_auth, reject_invalid_registries, reject_off_allowlist_fetches,
-    verify_done_or_osv_violations, violations_frame,
+pub(super) mod cached_verdict;
+
+use self::cached_verdict::{
+    apply_cached_verdict,
+    compute_verdict_hash,
+    record_verdict,
 };
+use super::{
+    Arc,
+    AuthHeaders,
+    Bytes,
+    Footprint,
+    Identity,
+    InMemoryPackageMetaCache,
+    Lockfile,
+    Mutex,
+    ObservedDistStats,
+    OsvIndex,
+    PackageMetaCache,
+    PacquetConfig,
+    ResolutionVerifier,
+    ResolveRequest,
+    Resolver,
+    Response,
+    StatusCode,
+    StreamedResolveInputs,
+    TarballRouter,
+    VerificationArtifacts,
+    build_resolution_verifiers_with_artifacts,
+    collect_resolution_policy_violations,
+    collect_resolution_shape_violations,
+    extract_admitted_body,
+    json_error,
+    limits::{
+        AdmittedResolve,
+        CancelToken,
+        ResolvePermit,
+        reject_oversized_graph,
+        request_timeout_response,
+    },
+    ndjson_single_frame,
+    observed_dist_stats_sink,
+    osv_violations_for_lockfile_until,
+    parse_request,
+    reject_inline_url_auth,
+    reject_invalid_lockfile_dependency_names,
+    reject_invalid_registries,
+    reject_off_allowlist_fetches,
+    request_tarball_router,
+    verdict_cache,
+    verify_done_frame,
+    violations_frame,
+    with_offline_check_cache_identities,
+};
+
+/// Admit `POST /-/pnpr/v0/verify-lockfile` before buffering or parsing the
+/// body so excess concurrent callers are shed before allocating 32 MiB bodies.
+pub(crate) async fn serve_verify_lockfile_request(
+    runtime: &Resolver,
+    identity: Identity,
+    request: axum::extract::Request,
+) -> Response {
+    let deadline = runtime.limits.deadline_for_request(&request);
+    let admitted = match runtime.limits.admit(&identity) {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let body = match extract_admitted_body(request, deadline).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    handle_admitted_verify_lockfile(runtime, identity, body, deadline, admitted).await
+}
 
 /// Handle `POST /-/pnpr/v0/verify-lockfile`: verify the client's input
 /// lockfile under the client's policy, returning only a terminal NDJSON
 /// verdict frame. The client already knows the lockfile is fresh for
 /// the current manifests, so this endpoint deliberately does not
 /// resolve or echo the lockfile back.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "in-process entry point mirroring handle_resolve")
+)]
 pub(crate) async fn handle_verify_lockfile(
     runtime: &Resolver,
     identity: Identity,
     body: Bytes,
 ) -> Response {
-    let request: ResolveRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+    let deadline = runtime.limits.start_deadline();
+    let admitted = match runtime.limits.admit(&identity) {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
     };
+    handle_admitted_verify_lockfile(runtime, identity, body, deadline, admitted).await
+}
 
-    if let Some(response) = reject_invalid_registries(&request)
+async fn handle_admitted_verify_lockfile(
+    runtime: &Resolver,
+    identity: Identity,
+    body: Bytes,
+    deadline: tokio::time::Instant,
+    admitted: AdmittedResolve<'_>,
+) -> Response {
+    let request: ResolveRequest = match parse_request(&body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    drop(body);
+
+    if let Some(response) = reject_oversized_graph(&request, runtime.limits.max_npm_packages)
+        .or_else(|| reject_invalid_registries(&request))
         .or_else(|| reject_inline_url_auth(&request))
         .or_else(|| reject_off_allowlist_fetches(&request, &runtime.route_context))
+        .or_else(|| reject_invalid_lockfile_dependency_names(&request))
     {
         return response;
     }
 
-    let Some(input_lockfile) = request.lockfile.as_ref() else {
+    if request.lockfile.is_none() {
         return json_error(StatusCode::BAD_REQUEST, "`lockfile` is required");
-    };
-
-    if request.trust_lockfile {
-        return verify_done_or_osv_violations(runtime.osv_index.as_ref(), input_lockfile);
     }
 
-    let Some(config) = runtime.config_for(&request) else {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, TOO_MANY_CONFIGS_MESSAGE);
+    if request.trust_lockfile {
+        return verify_trusted_lockfile(runtime, request, deadline, admitted).await;
+    }
+
+    let config = match runtime.config_for(&request) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
-    // Verifier packument fetches run under the same route hook, so they
-    // select the same pnpr-managed credentials and are recorded in the
-    // same footprint as a resolve would be — a verifier can't read or
-    // populate a cache scope a resolve wouldn't.
+    let permit = match admitted.acquire(deadline).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    verify_with_permit(runtime, &config, identity, request, permit, deadline).await
+}
+
+async fn verify_trusted_lockfile(
+    runtime: &Resolver,
+    request: ResolveRequest,
+    deadline: tokio::time::Instant,
+    admitted: AdmittedResolve<'_>,
+) -> Response {
+    let permit = match admitted.acquire(deadline).await {
+        Ok(permit) => Arc::new(permit),
+        Err(response) => return response,
+    };
+    let done = verify_done_frame(&request);
+    let Some(raw_lockfile) = request.lockfile.as_ref() else {
+        return json_error(StatusCode::BAD_REQUEST, "`lockfile` is required");
+    };
+    let shape_violations = collect_resolution_shape_violations(raw_lockfile);
+    match scan_osv_until_deadline(
+        runtime.osv_index.clone(),
+        Arc::new(request.lockfile.expect("checked above")),
+        Arc::clone(&permit),
+        deadline,
+    )
+    .await
+    {
+        Ok(osv_violations) if shape_violations.is_empty() && osv_violations.is_empty() => {
+            let response = within_verify_deadline(ndjson_single_frame(done), deadline);
+            drop(permit);
+            response
+        }
+        Ok(osv_violations) => {
+            let rendered = render_violations(&shape_violations, osv_violations);
+            let response =
+                within_verify_deadline(ndjson_single_frame(violations_frame(&rendered)), deadline);
+            drop(permit);
+            response
+        }
+        Err(response) => response,
+    }
+}
+
+fn within_verify_deadline(response: Response, deadline: tokio::time::Instant) -> Response {
+    if tokio::time::Instant::now() < deadline { response } else { request_timeout_response() }
+}
+
+fn spawn_osv_violations_scan(
+    osv_index: Arc<OsvIndex>,
+    lockfile: Arc<Lockfile>,
+    permit: Arc<ResolvePermit>,
+    cancel: CancelToken,
+) -> tokio::task::JoinHandle<Option<Vec<serde_json::Value>>> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        osv_violations_for_lockfile_until(&osv_index, &lockfile, &|| cancel.is_cancelled())
+    })
+}
+
+async fn scan_osv_until_deadline(
+    osv_index: Option<Arc<OsvIndex>>,
+    lockfile: Arc<Lockfile>,
+    permit: Arc<ResolvePermit>,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<serde_json::Value>, Response> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(request_timeout_response());
+    }
+    let Some(osv_index) = osv_index else {
+        return Ok(Vec::new());
+    };
+    let (cancel, _guard) = CancelToken::new(deadline);
+    let mut scan = spawn_osv_violations_scan(osv_index, lockfile, permit, cancel.clone());
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => {
+            cancel.cancel();
+            Err(request_timeout_response())
+        }
+        joined = &mut scan => match joined {
+            Ok(Some(violations)) => Ok(violations),
+            Ok(None) => Err(request_timeout_response()),
+            Err(err) => Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string())),
+        },
+    }
+}
+
+async fn verify_with_permit(
+    runtime: &Resolver,
+    config: &PacquetConfig,
+    identity: Identity,
+    request: ResolveRequest,
+    permit: ResolvePermit,
+    deadline: tokio::time::Instant,
+) -> Response {
+    let Some(raw_lockfile) = request.lockfile.as_ref() else {
+        return json_error(StatusCode::BAD_REQUEST, "`lockfile` is required");
+    };
+    let permit = Arc::new(permit);
     let footprint = Arc::new(Mutex::new(Footprint::default()));
     let request_auth = runtime.hooked_auth(&request, &identity, &footprint);
-    let tarball_router = TarballRouter::new(
-        Arc::clone(&runtime.route_context),
-        identity.clone(),
-        runtime.public_url.clone(),
-        config
-            .resolved_registries()
-            .into_iter()
-            .collect(),
-    );
-    let input_lockfile = tarball_router.verification_lockfile(input_lockfile);
+    let tarball_router = request_tarball_router(runtime, &identity, config);
+    let outcome = verify_input_lockfile(
+        runtime,
+        &LockfileVerifyContext {
+            config,
+            identity: &identity,
+            auth_headers: &request_auth,
+            tarball_router: &tarball_router,
+            footprint: &footprint,
+            permit: &permit,
+            deadline,
+        },
+        raw_lockfile,
+    )
+    .await;
+    finish_verified_lockfile(&request, deadline, outcome)
+}
 
-    match verify_input_lockfile(runtime, config, &request_auth, &input_lockfile).await {
-        // The dist stats the verifier observed feed `/-/pnpr/v0/resolve`'s sized
-        // `package` frames; this endpoint's client prefetches from its own
-        // lockfile before the verdict arrives, so only the verdict is sent.
-        Ok(_) => verify_done_or_osv_violations(runtime.osv_index.as_ref(), &input_lockfile),
+struct LockfileVerifyContext<'a> {
+    config: &'a PacquetConfig,
+    identity: &'a Identity,
+    auth_headers: &'a Arc<AuthHeaders>,
+    tarball_router: &'a TarballRouter,
+    footprint: &'a Mutex<Footprint>,
+    permit: &'a Arc<ResolvePermit>,
+    deadline: tokio::time::Instant,
+}
+
+fn finish_verified_lockfile(
+    request: &ResolveRequest,
+    deadline: tokio::time::Instant,
+    outcome: Result<Option<ObservedDistStats>, VerifyFailure>,
+) -> Response {
+    match outcome {
+        Ok(_) => within_verify_deadline(ndjson_single_frame(verify_done_frame(request)), deadline),
         Err(VerifyFailure::Internal(response)) => response,
         Err(VerifyFailure::Violations(violations)) => {
-            ndjson_single_frame(&violations_frame(&violations))
+            within_verify_deadline(ndjson_single_frame(violations_frame(&violations)), deadline)
         }
+    }
+}
+
+/// Verify the *input* lockfile under the client's policy before any package is
+/// streamed ([pnpm/pnpm#12139](https://github.com/pnpm/pnpm/issues/12139)).
+///
+/// Offline resolution-shape invariants apply to every input lockfile, including
+/// under `trustLockfile`. `trustLockfile` opts out of the online supply-chain
+/// policy verifiers only; freshly-resolved entries are held to the active
+/// policy by the resolver's pick-time gate.
+pub(super) async fn verify_request_lockfile(
+    runtime: &Resolver,
+    identity: &Identity,
+    inputs: &StreamedResolveInputs,
+) -> Result<Option<ObservedDistStats>, Response> {
+    let Some(input_lockfile) = inputs.request.lockfile.as_ref() else {
+        return Ok(None);
+    };
+    if inputs.request.trust_lockfile {
+        let shape_violations = collect_resolution_shape_violations(input_lockfile);
+        if shape_violations.is_empty() {
+            return Ok(None);
+        }
+        let rendered = render_violations(&shape_violations, Vec::new());
+        return Err(within_verify_deadline(
+            ndjson_single_frame(violations_frame(&rendered)),
+            inputs.deadline,
+        ));
+    }
+    match verify_input_lockfile(
+        runtime,
+        &LockfileVerifyContext {
+            config: &inputs.config,
+            identity,
+            auth_headers: &inputs.request_auth,
+            tarball_router: &inputs.tarball_router,
+            footprint: &inputs.footprint,
+            permit: &inputs.permit,
+            deadline: inputs.deadline,
+        },
+        input_lockfile,
+    )
+    .await
+    {
+        Ok(stats) => Ok(stats),
+        Err(VerifyFailure::Internal(response)) => Err(response),
+        Err(VerifyFailure::Violations(violations)) => Err(within_verify_deadline(
+            ndjson_single_frame(violations_frame(&violations)),
+            inputs.deadline,
+        )),
     }
 }
 
 /// Why [`verify_input_lockfile`] failed: either the lockfile violated
 /// the client's policy (carry the rendered violations so the caller can
-/// shape them for the client's protocol) or the verifiers couldn't be
-/// built at all (a ready-made error response).
-pub(super) enum VerifyFailure {
+/// shape them for the client's protocol) or verification aborted with a
+/// ready-made error or timeout response.
+enum VerifyFailure {
     Violations(Vec<serde_json::Value>),
     Internal(Response),
 }
 
-/// Verify the client's input lockfile under the client's policy. On a
-/// clean pass returns the [`ObservedDistStats`] the verifier
-/// collected — `None` when the whole-lockfile verdict cache satisfied
-/// the check without a fan-out (no metadata was fetched, so no sizes
-/// exist). On a policy violation returns the rendered violations so
-/// the caller can deliver them to the client. A build-verifiers
-/// failure (e.g. an invalid exclude pattern) returns a ready-made 500.
-pub(super) async fn verify_input_lockfile(
-    runtime: &Resolver,
-    config: &'static PacquetConfig,
-    auth_headers: &Arc<AuthHeaders>,
+async fn collect_policy_violations_until(
     lockfile: &Lockfile,
-) -> Result<Option<ObservedDistStats>, VerifyFailure> {
-    // A fresh per-request packument cache shared with the verifier; the
-    // on-disk metadata mirror under `<cache_dir>/v11/metadata-full` is
-    // warm across requests and is the real verification cache.
-    let meta_cache = Arc::new(InMemoryPackageMetaCache::default());
-    let dist_stats = observed_dist_stats_sink();
-    let verifiers = build_resolution_verifiers(
-        config,
-        Arc::clone(&runtime.client),
-        Some(meta_cache as Arc<dyn PackageMetaCache>),
-        Some(Arc::clone(auth_headers)),
-        Some(Arc::clone(&dist_stats)),
-        None,
-        None,
+    verifiers: &[Arc<dyn ResolutionVerifier>],
+    deadline: tokio::time::Instant,
+) -> Result<Vec<pnpm_resolving_resolver_base::ResolutionPolicyViolation>, VerifyFailure> {
+    let Ok(result) = tokio::time::timeout_at(
+        deadline,
+        collect_resolution_policy_violations(lockfile, verifiers, None),
     )
-    .map_err(|err| {
-        VerifyFailure::Internal(json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()))
-    })?;
+    .await
+    else {
+        return Err(VerifyFailure::Internal(request_timeout_response()));
+    };
+    // A transport failure verifying an entry (the upstream registry couldn't be
+    // reached/authorized) is a gateway error, not a policy violation, surface
+    // the registry's own (credential-redacted) message to the client.
+    result.map_err(|message| VerifyFailure::Internal(json_error(StatusCode::BAD_GATEWAY, &message)))
+}
 
-    let hash = hash_lockfile(lockfile);
-    if past_verdict_trusted(runtime, &hash, &verifiers) {
+/// Verify the client's input lockfile under the client's policy.
+async fn verify_input_lockfile(
+    runtime: &Resolver,
+    context: &LockfileVerifyContext<'_>,
+    raw_lockfile: &Lockfile,
+) -> Result<Option<ObservedDistStats>, VerifyFailure> {
+    reject_shape_violations(runtime, context, raw_lockfile).await?;
+
+    let epoch = runtime.local_registry.verdict_epoch();
+    let hash = compute_verdict_hash(context, raw_lockfile)?;
+    let dist_stats = observed_dist_stats_sink();
+    let verifiers = build_input_verifiers(
+        runtime,
+        context.config,
+        context.auth_headers,
+        context.tarball_router,
+        &dist_stats,
+    )?;
+    let cache_verifiers = with_offline_check_cache_identities(&verifiers);
+    if apply_cached_verdict(runtime, context, &hash, epoch.as_deref(), &cache_verifiers) {
         return Ok(None);
     }
 
-    // A transport failure verifying an entry (the upstream registry couldn't be
-    // reached/authorized) is a gateway error, not a policy violation — surface
-    // the registry's own (credential-redacted) message to the client.
-    let violations = match collect_resolution_policy_violations(lockfile, &verifiers, None).await {
-        Ok(violations) => violations,
-        Err(message) => {
-            return Err(VerifyFailure::Internal(json_error(StatusCode::BAD_GATEWAY, &message)));
-        }
-    };
-    let osv_violations = runtime.osv_index
-        .as_ref()
-        .map_or_else(Vec::new, |index| osv_violations_for_lockfile(index, lockfile));
+    let violations =
+        collect_policy_violations_until(raw_lockfile, &verifiers, context.deadline).await?;
+    let lockfile = Arc::new(raw_lockfile.clone());
+    let osv_violations = scan_osv_until_deadline(
+        runtime.osv_index.clone(),
+        lockfile,
+        Arc::clone(context.permit),
+        context.deadline,
+    )
+    .await
+    .map_err(VerifyFailure::Internal)?;
     if violations.is_empty() && osv_violations.is_empty() {
-        if let Some(cache) = runtime.cache.verdicts.as_ref() {
-            cache.record(&hash, merge_policies(&verifiers, runtime.osv_index.as_ref()));
-        }
+        record_verdict(runtime, &hash, epoch.as_deref(), context.footprint, &cache_verifiers);
         return Ok(Some(dist_stats));
     }
 
     Err(VerifyFailure::Violations(render_violations(&violations, osv_violations)))
 }
 
-/// Whole-lockfile verdict cache: an O(1) hit when this exact lockfile
-/// already passed under a policy we still trust skips the whole fan-out
-/// (the dominant win for a shared pnpr — CI re-runs, a fleet building
-/// the same repo).
-pub(super) fn past_verdict_trusted(
+async fn reject_shape_violations(
     runtime: &Resolver,
-    hash: &str,
-    verifiers: &[Arc<dyn ResolutionVerifier>],
-) -> bool {
-    runtime.cache.verdicts
-        .as_ref()
-        .is_some_and(|cache| {
-            cache.is_verified(hash, |policy| {
-                verifiers
-                    .iter()
-                    .all(|verifier| verifier.can_trust_past_check(policy))
-                    && runtime.osv_index
-                        .as_ref()
-                        .is_none_or(|index| index.can_trust_policy(policy))
-            })
-        })
+    context: &LockfileVerifyContext<'_>,
+    raw_lockfile: &Lockfile,
+) -> Result<(), VerifyFailure> {
+    let shape_violations = collect_resolution_shape_violations(raw_lockfile);
+    if shape_violations.is_empty() {
+        return Ok(());
+    }
+    let osv_violations = scan_osv_until_deadline(
+        runtime.osv_index.clone(),
+        Arc::new(raw_lockfile.clone()),
+        Arc::clone(context.permit),
+        context.deadline,
+    )
+    .await
+    .map_err(VerifyFailure::Internal)?;
+    Err(VerifyFailure::Violations(render_violations(&shape_violations, osv_violations)))
 }
 
-pub(super) fn render_violations(
+fn build_input_verifiers(
+    runtime: &Resolver,
+    config: &PacquetConfig,
+    auth_headers: &Arc<AuthHeaders>,
+    tarball_router: &TarballRouter,
+    dist_stats: &ObservedDistStats,
+) -> Result<Vec<Arc<dyn ResolutionVerifier>>, VerifyFailure> {
+    let meta_cache = Arc::new(InMemoryPackageMetaCache::default());
+    let artifacts = VerificationArtifacts {
+        observed_stats: Some(Arc::clone(dist_stats)),
+        canonical_fetches: None,
+        lookups: None,
+        published_tarball_mapper: Some(tarball_router.published_tarball_mapper()),
+        reverse_routed_tarball_url: Some(tarball_router.reverse_routed_tarball_mapper()),
+    };
+    build_resolution_verifiers_with_artifacts(
+        config,
+        Arc::clone(&runtime.client),
+        Some(meta_cache as Arc<dyn PackageMetaCache>),
+        Some(Arc::clone(auth_headers)),
+        artifacts,
+    )
+    .map_err(|err| {
+        VerifyFailure::Internal(json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()))
+    })
+}
+
+fn render_violations(
     violations: &[pnpm_resolving_resolver_base::ResolutionPolicyViolation],
     osv_violations: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
@@ -177,25 +458,4 @@ pub(super) fn render_violations(
         .collect();
     rendered.extend(osv_violations);
     rendered
-}
-
-/// Merge every active verifier's policy snapshot into one bag, the key
-/// the verdict cache stores alongside the lockfile hash. Later verifiers
-/// overwrite earlier ones on a shared key — mirrors the local cache's
-/// [`merge_policies`] so a verdict recorded here is comparable to one the
-/// client's own cache would write.
-pub(super) fn merge_policies(
-    verifiers: &[Arc<dyn ResolutionVerifier>],
-    osv_index: Option<&Arc<OsvIndex>>,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut merged = serde_json::Map::new();
-    for verifier in verifiers {
-        for (key, value) in verifier.policy() {
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    if let Some(osv_index) = osv_index {
-        merged.extend(osv_index.policy());
-    }
-    merged
 }

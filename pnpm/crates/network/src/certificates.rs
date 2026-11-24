@@ -1,11 +1,11 @@
-use super::{Certificate, Identity, LazyLock, RegistryTls, TlsConfig, TlsError};
-
-#[cfg(target_vendor = "apple")]
-use core_foundation::{base::TCFType, string::CFString};
-#[cfg(target_vendor = "apple")]
-use security_framework::{policy::SecPolicy, secure_transport::SslProtocolSide};
-#[cfg(target_vendor = "apple")]
-use security_framework_sys::{base::SecPolicyRef, policy::SecPolicyCreateSSL};
+use super::{
+    Certificate,
+    Identity,
+    LazyLock,
+    RegistryTls,
+    TlsConfig,
+    TlsError,
+};
 
 /// Which trust anchors a client built by
 /// [`ThrottledClient::for_installs`](crate::ThrottledClient::for_installs) verifies registry certificates
@@ -25,7 +25,7 @@ pub(super) enum TrustRoots {
 }
 
 /// The Mozilla CA root set compiled into the binary, in reqwest's
-/// [`Certificate`] form. Parsed once — `for_installs` builds one
+/// [`Certificate`] form. Parsed once, `for_installs` builds one
 /// client per per-registry override, and the fallback path is taken
 /// by every one of them on a system without a trust store.
 #[must_use]
@@ -33,7 +33,8 @@ pub fn bundled_root_certs() -> &'static [Certificate] {
     static CERTS: LazyLock<Vec<Certificate>> = LazyLock::new(|| {
         webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
-            .map(|der| Certificate::from_der(der).expect("bundled Mozilla root is valid DER"))
+            .map(|der| Certificate::from_der(der))
+            .map(|from_der| from_der.expect("bundled Mozilla root is valid DER"))
             .collect()
     });
     &CERTS
@@ -52,12 +53,15 @@ pub fn bundled_root_certs() -> &'static [Certificate] {
 #[cfg(target_vendor = "apple")]
 pub(super) fn is_platform_verifier_available() -> bool {
     static AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
-        use security_framework::{certificate::SecCertificate, trust::SecTrust};
+        use security_framework::{
+            certificate::SecCertificate,
+            trust::SecTrust,
+        };
         let der = &webpki_root_certs::TLS_SERVER_ROOT_CERTS[0];
         let Ok(cert) = SecCertificate::from_der(der.as_ref()) else {
             return false;
         };
-        let Some(policy) = ssl_policy(SslProtocolSide::SERVER, "registry.npmjs.org") else {
+        let Some(policy) = pnpm_ffi_security::server_ssl_policy("registry.npmjs.org") else {
             return false;
         };
         let Ok(trust) = SecTrust::create_with_certificates(&[cert], &[policy]) else {
@@ -74,45 +78,6 @@ pub(super) fn is_platform_verifier_available() -> bool {
     *AVAILABLE
 }
 
-/// A server `SecPolicy` for `hostname`, or `None` when `Security.framework`
-/// declines to create one.
-///
-/// `SecPolicy::create_ssl` cannot report that refusal. It hands the C API's
-/// return value to `core-foundation`'s `wrap_under_create_rule`, which
-/// asserts the reference is non-NULL and panics with "Attempted to create a
-/// NULL object" otherwise. A framework that will not hand out a policy is
-/// one of the shapes an unusable platform verifier takes, so the probe asks
-/// the C API directly and reads the NULL as "no platform verifier", which
-/// sends the client builder to [`TrustRoots::Bundled`].
-///
-/// `std::panic::catch_unwind` around the panicking call would not do:
-/// releases are built with `panic = "abort"`, which turns the unwind into
-/// the very abort this avoids.
-#[cfg(target_vendor = "apple")]
-fn ssl_policy(protocol_side: SslProtocolSide, hostname: &str) -> Option<SecPolicy> {
-    let hostname = CFString::new(hostname);
-    let is_server = protocol_side == SslProtocolSide::SERVER;
-    // SAFETY: `SecPolicyCreateSSL` is a plain C function that only reads
-    // `hostname`, which is alive for the duration of the call.
-    let policy = unsafe { SecPolicyCreateSSL(is_server.into(), hostname.as_concrete_TypeRef()) };
-    ssl_policy_from_ref(policy)
-}
-
-/// Take ownership of the reference [`ssl_policy`] got, reading NULL as
-/// "no policy" rather than as the panic `wrap_under_create_rule` raises.
-///
-/// Separate from [`ssl_policy`] so a test can drive the NULL branch without
-/// a restricted `trustd`.
-#[cfg(target_vendor = "apple")]
-fn ssl_policy_from_ref(policy: SecPolicyRef) -> Option<SecPolicy> {
-    if policy.is_null() {
-        return None;
-    }
-    // SAFETY: `SecPolicyCreateSSL` returns a +1 reference, which the create
-    // rule adopts.
-    Some(unsafe { SecPolicy::wrap_under_create_rule(policy) })
-}
-
 /// Load the PEM bundle named by `NODE_EXTRA_CA_CERTS` as extra trust
 /// roots, to be added to every client `for_installs` builds.
 ///
@@ -122,14 +87,14 @@ fn ssl_policy_from_ref(policy: SecPolicyRef) -> Option<SecPolicy> {
 /// so to keep real-world parity for users behind a corporate MITM proxy
 /// it reads the variable explicitly.
 ///
-/// Read and parsed once per [`ThrottledClient::for_installs`](crate::ThrottledClient::for_installs) call —
+/// Read and parsed once per [`ThrottledClient::for_installs`](crate::ThrottledClient::for_installs) call,
 /// that constructor builds one client per per-registry override, so
 /// loading here (rather than inside the per-client builder) avoids
 /// re-reading and re-parsing the bundle N times during startup.
 ///
 /// The resulting certs are additive and lowest-priority: layered under
 /// the `.npmrc` `ca` / `cafile` roots that [`apply_tls`] adds afterward
-/// and under the platform trust store (ordering is immaterial — the
+/// and under the platform trust store (ordering is immaterial, the
 /// rustls root store is a union). A missing, unreadable, or malformed
 /// file yields an empty list, matching pnpm's silent treatment of a
 /// missing `cafile` rather than failing the client build.
@@ -162,7 +127,9 @@ pub(super) fn parse_ca_bundle(pem: &[u8]) -> Vec<Certificate> {
     }
     String::from_utf8_lossy(pem)
         .split_inclusive(END_CERTIFICATE)
-        .filter_map(|block| Certificate::from_pem_bundle(block.as_bytes()).ok())
+        .map(str::as_bytes)
+        .map(Certificate::from_pem_bundle)
+        .filter_map(Result::ok)
         .flatten()
         .collect()
 }
@@ -180,7 +147,7 @@ const END_CERTIFICATE: &str = "-----END CERTIFICATE-----";
 ///
 /// When the override has a `ca`, the effective top-level CA list is
 /// *replaced* (not merged) by a one-element list with the scoped PEM
-/// blob — which [`parse_ca_bundle`] handles fine since it accepts
+/// blob, which [`parse_ca_bundle`] handles fine since it accepts
 /// multi-cert PEM buffers.
 pub(super) fn merge_tls(top: &TlsConfig, override_: &RegistryTls) -> TlsConfig {
     TlsConfig {
@@ -196,13 +163,13 @@ pub(super) fn merge_tls(top: &TlsConfig, override_: &RegistryTls) -> TlsConfig {
 }
 
 /// Returns the modified builder unchanged when every field is `None` /
-/// empty — matching pnpm's "TLS-unset is default-TLS" semantics.
+/// empty, matching pnpm's "TLS-unset is default-TLS" semantics.
 ///
 /// A `cert` / `key` pair rustls rejects surfaces as
 /// [`TlsError::InvalidClientIdentity`] and bubbles through
 /// [`ForInstallsError`](crate::ForInstallsError), the way Node throws from
 /// `tls.createSecureContext`. Unreadable `ca` material is dropped
-/// instead — see [`parse_ca_bundle`].
+/// instead; see [`parse_ca_bundle`].
 pub(super) struct AppliedTls {
     pub(super) builder: reqwest::ClientBuilder,
     pub(super) has_custom_ca: bool,

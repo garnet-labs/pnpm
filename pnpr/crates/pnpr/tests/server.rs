@@ -1,3 +1,9 @@
+#[path = "server/resolver_local.rs"]
+mod resolver_local;
+
+#[path = "server/split_domain_upstream.rs"]
+mod split_domain_upstream;
+
 #[path = "server/registry_discovery.rs"]
 mod registry_discovery;
 
@@ -13,8 +19,12 @@ mod behavior;
 #[path = "server/surfaces.rs"]
 mod surfaces;
 
+#[path = "server/integrity_backfill.rs"]
+mod integrity_backfill;
 #[path = "server/tarball_verification.rs"]
 mod tarball_verification;
+#[path = "server/upstream_refresh.rs"]
+mod upstream_refresh;
 
 #[path = "server/revision_tarballs.rs"]
 mod revision_tarballs;
@@ -40,17 +50,20 @@ mod package_documents;
 #[path = "server/release_record_logs.rs"]
 mod release_record_logs;
 
-#[path = "server/platform_variants.rs"]
-mod platform_variants;
-
 #[path = "server/version_tarballs.rs"]
 mod version_tarballs;
+
+#[path = "server/unlisted_versions.rs"]
+mod unlisted_versions;
 
 #[path = "server/packument_caching.rs"]
 mod packument_caching;
 
 #[path = "server/resolver_access.rs"]
 mod resolver_access;
+
+#[path = "server/resolver_bounds.rs"]
+mod resolver_bounds;
 
 #[path = "server/web_ui.rs"]
 mod web_ui;
@@ -64,37 +77,81 @@ mod audit;
 #[path = "server/web_login.rs"]
 mod web_login;
 
-use crate::registry_groups;
+use crate::multi_ecosystem;
 
 use axum::{
     Router,
-    body::{Body, Bytes, to_bytes},
-    http::{HeaderValue, Request, StatusCode, header},
+    body::{
+        Body,
+        Bytes,
+        to_bytes,
+    },
+    http::{
+        HeaderValue,
+        Request,
+        StatusCode,
+        header,
+    },
 };
 use flate2::read::GzDecoder;
 use futures_util::stream;
 use pnpr::{
-    AccessList, AuthState, Config, Ecosystem, HostedConfig, IpNetwork, MaxUsers, PackagePattern,
-    PackageRule, PackageRules, PublicRoute, Registries, Registry, router, router_with_auth,
+    AccessList,
+    AuthState,
+    Config,
+    Ecosystem,
+    HostedConfig,
+    IpNetwork,
+    MaxUsers,
+    PackagePattern,
+    PackageRule,
+    PackageRules,
+    PublicRoute,
+    Registries,
+    Registry,
+    router,
+    router_with_auth,
 };
 use pnpr_fixtures::MockConfigPresets;
-use pnpr_storage::layout::{blob_segment, package_segments};
-use serde_json::{Value, json};
-use ssri::{Algorithm, IntegrityOpts};
+use pnpr_storage::layout::{
+    blob_segment,
+    package_segments,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use ssri::{
+    Algorithm,
+    IntegrityOpts,
+};
 use std::{
     convert::Infallible,
     fs,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::{Path, PathBuf},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
     },
     time::Duration,
 };
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    },
     net::TcpListener,
 };
 use tower::ServiceExt;
@@ -114,9 +171,9 @@ fn config_for(upstream: &str, storage: PathBuf) -> Config {
 /// the given registry-level default `access:`. Unpublish defaults to any
 /// authenticated user, the registry-mock contract these fixtures always ran
 /// under (the safe per-registry default would deny destructive writes).
-fn hosted_with_access(org: &str, access: &str) -> HostedConfig {
+fn hosted_with_access(namespace: &str, access: &str) -> HostedConfig {
     HostedConfig::new(
-        org,
+        namespace,
         PackageRules::new(Vec::new(), Some(AccessList::from_tokens([access])))
             .with_default_unpublish(AccessList::from_tokens(["$authenticated"])),
     )
@@ -323,7 +380,10 @@ fn hosted_publish_request(
     tarball: &[u8],
     token: &str,
 ) -> Request<Body> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
 
     let tarball = &crate::npm::publishable_tgz(package, version, tarball);
     let basename = package.rsplit('/').next().unwrap();
@@ -351,7 +411,10 @@ fn hosted_publish_request(
 /// The 40-char hex SHA-1 the way pre-2017 npm publishes carry it in the
 /// legacy `dist.shasum` field.
 fn sha1_hex_of(bytes: &[u8]) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
     let mut opts = IntegrityOpts::new().algorithm(Algorithm::Sha1);
     opts.input(bytes);
     let integrity = opts.result();
@@ -367,7 +430,7 @@ fn sha1_hex_of(bytes: &[u8]) -> String {
         })
 }
 
-fn osv_database(package: &str, versions: &[&str]) -> TempDir {
+pub(crate) fn osv_database(package: &str, versions: &[&str]) -> TempDir {
     let dir = TempDir::new().unwrap();
     let versions: Vec<Value> = versions
         .iter()
@@ -384,7 +447,7 @@ fn osv_database(package: &str, versions: &[&str]) -> TempDir {
     dir
 }
 
-fn enable_osv(config: &mut Config, path: &Path) {
+pub(crate) fn enable_osv(config: &mut Config, path: &Path) {
     config.osv.enabled = true;
     config.osv.path = Some(path.to_path_buf());
 }
@@ -416,7 +479,7 @@ async fn mock_packument_for_tarball(
         "dist-tags": { "latest": version },
         "versions": versions,
     });
-    let path = format!("/{package}");
+    let path = format!("/{}", pnpm_network::encode_package_name(package));
     upstream
         .mock("GET", path.as_str())
         .with_status(200)
@@ -434,8 +497,10 @@ async fn mock_packument_for_tarball(
 fn upstream_endpoint_config(upstream_url: &str, storage: PathBuf, access: &str) -> Config {
     let mut config = config_for(upstream_url, storage);
     config.http.public_url = "http://example.test".to_string();
-    config.routing.upstreams.get_mut("npmjs").expect("default `npmjs` upstream").access =
-        Some(AccessList::from_tokens([access]));
+    config.routing.upstreams
+        .get_mut("npmjs")
+        .expect("default `npmjs` upstream")
+        .set_access(AccessList::from_tokens([access]));
     config
 }
 
@@ -535,6 +600,14 @@ async fn await_no_tgz(dir: &std::path::Path, budget: Duration) -> bool {
     }
 }
 
+fn header_of(response: &axum::response::Response, name: impl header::AsHeaderName) -> Option<&str> {
+    response
+        .headers()
+        .get(name)
+        .map(HeaderValue::to_str)
+        .and_then(Result::ok)
+}
+
 fn foo_packument(upstream_url: &str) -> Value {
     json!({
         "name": "foo",
@@ -553,9 +626,7 @@ fn foo_packument(upstream_url: &str) -> Value {
     })
 }
 
-// --------------------------------------------------------------------
 // Registry routing (RFC: registries for pnpr).
-// --------------------------------------------------------------------
 
 /// Mock a one-version packument plus its tarball for `pkg` on `server`,
 /// returning the tarball bytes.
@@ -574,7 +645,7 @@ async fn mock_package(server: &mut mockito::Server, pkg: &str, marker: &str) -> 
         } } },
     });
     server
-        .mock("GET", format!("/{pkg}").as_str())
+        .mock("GET", format!("/{}", pnpm_network::encode_package_name(pkg)).as_str())
         .with_body(packument.to_string())
         .create_async()
         .await;
@@ -587,8 +658,8 @@ async fn mock_package(server: &mut mockito::Server, pkg: &str, marker: &str) -> 
     body
 }
 
-/// Build a config with two public upstream registries — `corp` claiming `@corp/*`
-/// and a pattern-less `npmjs` catch-all — and a `main` router over them,
+/// Build a config with two public upstream registries (`corp` claiming `@corp/*`
+/// and a pattern-less `npmjs` catch-all) and a `main` router over them,
 /// aliased by the path-less base.
 fn router_config(npmjs_url: &str, corp_url: &str, storage: PathBuf) -> Config {
     let mut config = config_for(npmjs_url, storage);
@@ -617,9 +688,9 @@ fn router_config(npmjs_url: &str, corp_url: &str, storage: PathBuf) -> Config {
     config
 }
 
-/// Seed a hosted package directly into `org`'s namespace of the hosted store
-/// at `storage` (`""` for the default namespace), as a publish would have.
-fn seed_hosted(storage: &Path, org: &str, pkg: &str) {
+/// Seed a hosted package directly into `namespace` of the hosted store at
+/// `storage` (`""` for the default namespace), as a publish would have.
+fn seed_hosted(storage: &Path, namespace: &str, pkg: &str) {
     let packument = json!({
         "name": pkg,
         "dist-tags": { "latest": "1.0.0" },
@@ -628,7 +699,7 @@ fn seed_hosted(storage: &Path, org: &str, pkg: &str) {
             "shasum": "abc",
         } } },
     });
-    write_hosted_packument(storage, org, pkg, &packument);
+    write_hosted_packument(storage, namespace, pkg, &packument);
 }
 
 fn seed_hosted_with_maintainer(storage: &Path, pkg: &str, maintainer: &str) {
@@ -638,24 +709,30 @@ fn seed_hosted_with_maintainer(storage: &Path, pkg: &str, maintainer: &str) {
     write_hosted_packument(storage, "", pkg, &packument);
 }
 
-/// The packument of `pkg` in `org`'s namespace of the hosted store at
-/// `storage`, as its metadata holds it.
-fn read_hosted_packument(storage: &Path, org: &str, pkg: &str) -> Option<Value> {
-    pnpr_fixtures::read_hosted_document(storage, org, pnpr_storage::Ecosystem::Npm, pkg)
+/// The packument of `pkg` in `namespace` of the hosted store at `storage`,
+/// as its metadata holds it.
+fn read_hosted_packument(storage: &Path, namespace: &str, pkg: &str) -> Option<Value> {
+    pnpr_fixtures::read_hosted_document(storage, namespace, pnpr_storage::Ecosystem::Npm, pkg)
         .map(|bytes| serde_json::from_slice(&bytes).unwrap())
 }
 
-fn write_hosted_packument(storage: &Path, org: &str, pkg: &str, packument: &Value) {
+fn write_hosted_packument(storage: &Path, namespace: &str, pkg: &str, packument: &Value) {
     let bytes = serde_json::to_vec(packument).unwrap();
-    pnpr_fixtures::write_hosted_document(storage, org, pnpr_storage::Ecosystem::Npm, pkg, &bytes);
+    pnpr_fixtures::write_hosted_document(
+        storage,
+        namespace,
+        pnpr_storage::Ecosystem::Npm,
+        pkg,
+        &bytes,
+    );
 }
 
-/// The grouped config declares `internal` and the `main` router over it in
-/// every ecosystem; a caller who cannot see them gets neither, and no default.
-fn assert_grouped_ecosystem(directory: &Value, ecosystem: Ecosystem, visible: bool) {
+/// A caller who cannot see a registry or its router gets neither in the
+/// directory, and no default.
+fn assert_ecosystem_directory(directory: &Value, ecosystem: Ecosystem, visible: bool) {
     assert_eq!(
         directory["defaultRegistries"][ecosystem.as_str()],
-        if visible { json!("main") } else { Value::Null },
+        if visible { json!(format!("{ecosystem}-main")) } else { Value::Null },
     );
     let entries: Vec<_> = directory["registries"]
         .as_array()
@@ -667,9 +744,9 @@ fn assert_grouped_ecosystem(directory: &Value, ecosystem: Ecosystem, visible: bo
     if !visible {
         return;
     }
-    assert_eq!(entries[0]["name"], "internal");
-    assert_eq!(entries[1]["name"], "main");
-    assert_eq!(entries[1]["sources"], json!(["internal"]));
+    assert_eq!(entries[0]["name"], format!("{ecosystem}-internal"));
+    assert_eq!(entries[1]["name"], format!("{ecosystem}-main"));
+    assert_eq!(entries[1]["sources"], json!([format!("{ecosystem}-internal")]));
 }
 
 /// The registry directory as one caller sees it.

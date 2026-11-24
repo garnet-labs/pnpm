@@ -1,9 +1,22 @@
 //! Reading the global `config.yaml`.
 
 use super::{
-    DroppedKeys, ErrorKind, GLOBAL_CONFIG_YAML_FILENAME, IgnoredAny, IndexMap,
-    LoadWorkspaceYamlError, MachineSettings, Path, SCHEMA_DIRECTIVE_KEY, SystemEnv,
-    TrustedSettings, fs, parse_settings, read_readable_settings, redact_and_sanitize,
+    DroppedKeys,
+    ErrorKind,
+    GLOBAL_CONFIG_YAML_FILENAME,
+    IgnoredAny,
+    IndexMap,
+    LoadWorkspaceYamlError,
+    MachineSettings,
+    Path,
+    SCHEMA_DIRECTIVE_KEY,
+    SystemEnv,
+    TrustedSettings,
+    fs,
+    parse_settings,
+    parse_settings_file,
+    read_readable_settings,
+    redact_and_sanitize,
     select_settings,
 };
 use crate::SettingsRead;
@@ -51,7 +64,15 @@ impl TrustedSettings {
                 MachineSettings::default()
             },
         };
-        settings.settings.validate_sections(settings_read.skips_unreadable())?;
+        let sections = std::iter::once(&mut settings.settings)
+            .chain(settings.machine.global_packages_config.as_deref_mut());
+        for section in sections {
+            if settings_read.skips_unreadable() {
+                section.drop_invalid_sections();
+            } else {
+                section.validate_all_sections()?;
+            }
+        }
         settings.settings.clear_workspace_only_fields();
         settings.warn_about_dropped_keys(&text, &path);
         Ok(Some(settings))
@@ -102,7 +123,9 @@ fn read_global<Settings: DeserializeOwned + Default>(
     path: &Path,
     settings_read: SettingsRead,
 ) -> Result<Settings, LoadWorkspaceYamlError> {
-    let read = parse_settings::<SystemEnv, Settings>;
-    if settings_read.skips_unreadable() { read_readable_settings(text, read) } else { read(text) }
+    if !settings_read.skips_unreadable() {
+        return parse_settings_file::<SystemEnv, Settings>(text, path);
+    }
+    read_readable_settings(text, parse_settings::<SystemEnv, Settings>)
         .map_err(|source| LoadWorkspaceYamlError::ParseYaml { path: path.to_path_buf(), source })
 }

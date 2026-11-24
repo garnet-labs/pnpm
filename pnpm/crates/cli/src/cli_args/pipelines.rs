@@ -1,22 +1,56 @@
 pub(crate) use configuration::{
-    apply_install_cli_config, derive_config_root, record_no_runtime_flag, warn_about_config_root,
+    apply_install_cli_config,
+    derive_config_root,
+    record_no_runtime_flag,
+    warn_about_config_root,
 };
-pub(crate) use install::InstallPipeline;
-pub(in crate::cli_args) use install::run_dedicated_lockfile_workspace_install;
-pub(crate) use maintenance::{DedupePipeline, PrunePipeline};
-pub(crate) use mutation::{AddPipeline, DeployPipeline, RemovePipeline, UpdatePipeline};
-pub(crate) use selection::{WorkspaceScope, select_workspace_projects};
+pub(in crate::cli_args) use dedicated_runs::{
+    init_dedicated_project_state,
+    run_dedicated_lockfile_workspace_install,
+};
+pub(crate) use fetch::run_fetch;
+pub(crate) use install::{
+    InstallPipeline,
+    ensure_project_manifest,
+};
+pub(crate) use maintenance::{
+    DedupePipeline,
+    PrunePipeline,
+};
+pub(crate) use mutation::{
+    AddPipeline,
+    DeployPipeline,
+    UpdatePipeline,
+};
+pub(crate) use remove::RemovePipeline;
+pub(crate) use selection::{
+    WorkspaceScope,
+    select_workspace_projects,
+};
 
-use selection::{InstallFamily, select_install_family, select_install_family_plan};
+use selection::{
+    InstallFamily,
+    select_install_family,
+    select_install_family_plan,
+};
 
 use super::{
     add::AddArgs,
-    dedupe::{self, DedupeArgs},
+    dedupe::{
+        self,
+        DedupeArgs,
+    },
     deploy::DeployArgs,
-    install::{InstallArgs, resolve_bool_override},
+    install::{
+        InstallArgs,
+        resolve_bool_override,
+    },
     package_manager::read_manifest_json,
     prune::PruneArgs,
-    recursive::{discover_workspace_projects, filtered_projects_dependencies},
+    recursive::{
+        discover_workspace_projects,
+        filtered_projects_dependencies,
+    },
     remove::RemoveArgs,
     update::UpdateArgs,
     update_changeset::UpdateChangesetContext,
@@ -24,12 +58,20 @@ use super::{
 use crate::{
     State,
     cli_args::{
-        config_warnings::{warn_unapplied_package_configs, warn_unmatched_registry_options},
+        config_warnings::{
+            warn_unapplied_package_configs,
+            warn_unmatched_registry_options,
+        },
         legacy_pnpm_field::warn_ignored_pnpm_manifest_fields,
         override_version_references::warn_deprecated_override_version_references,
-        reporter::{ReporterType, reporter_emit},
+        reporter::{
+            ReporterType,
+            reporter_emit,
+        },
     },
-    config_deps, ecosystem_add, ecosystem_install,
+    config_deps,
+    ecosystem_add,
+    ecosystem_install,
     package_specifier::EcosystemPackageSpecifier,
     state::check_root_project_engine,
 };
@@ -39,16 +81,31 @@ use install::init_shared_state;
 
 use miette::Context;
 
-use pnpm_config::{Config, Host};
+use pnpm_config::{
+    Config,
+    Host,
+};
 use pnpm_injected_deps_syncer::{
-    CopyFiles, injected_source_dirs, sync_injected_deps_of_modules_dir,
+    CopyFiles,
+    injected_source_dirs,
+    sync_injected_deps_of_modules_dir,
 };
 use pnpm_network::ThrottledClient;
-use pnpm_package_manager::{PathNode, graph_sequencer};
+use pnpm_package_manager::{
+    PathNode,
+    graph_sequencer,
+};
 use pnpm_reporter::Reporter;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -62,7 +119,7 @@ pub(crate) struct InstallFamilySelection {
     pub(crate) active_manifest_is_standin: bool,
     /// `Some` when the plan already ran the install's cycle search over
     /// the same graph the install would rebuild (the unnarrowed case);
-    /// empty means the projects are orderable. `None` — the install
+    /// empty means the projects are orderable. `None`, the install
     /// searches itself.
     pub(crate) workspace_cycles: Option<Vec<Vec<PathBuf>>>,
 }
@@ -104,14 +161,6 @@ enum RuntimePolicy {
     Config(bool),
 }
 
-impl RuntimePolicy {
-    fn use_manifest(self, config: &Config) -> bool {
-        match self {
-            Self::Config(no_runtime) => !(config.skip_runtimes || no_runtime),
-        }
-    }
-}
-
 async fn prepare_root_config<Reporter>(
     (manifest_path, config, config_root): (&Path, &mut Config, &Path),
     (frozen_lockfile, runtime_policy): (bool, RuntimePolicy),
@@ -122,11 +171,15 @@ where
     if matches!(runtime_policy, RuntimePolicy::Config(true)) {
         configuration::record_no_runtime_flag(config);
     }
-    if !config_deps::may_update_config(config, config_root) {
-        check_root_project_engine(manifest_path, config, runtime_policy.use_manifest(config))?;
+    let may_update_config = config_deps::may_update_config(config, config_root);
+    let has_config_dependencies = config.config_dependencies
+        .as_ref()
+        .is_some_and(|dependencies| !dependencies.is_empty());
+    if !may_update_config && !has_config_dependencies && config.engine_strict {
+        check_root_project_engine(manifest_path, config, Reporter::emit)?;
     }
     config_deps::prepare::<Reporter>(config, config_root, frozen_lockfile).await?;
-    check_root_project_engine(manifest_path, config, runtime_policy.use_manifest(config))?;
+    check_root_project_engine(manifest_path, config, Reporter::emit)?;
     Ok(())
 }
 
@@ -134,7 +187,7 @@ where
 /// recursive / filtered command installs one by one.
 pub(crate) struct DedicatedProjects {
     /// Which project must finish before which, keyed by project dir.
-    dependencies: IndexMap<PathBuf, Vec<PathBuf>>,
+    pub(crate) dependencies: IndexMap<PathBuf, Vec<PathBuf>>,
     /// The name each project is addressed by in `packageConfigs`, taken
     /// from the manifests the selection already parsed. Empty when the
     /// setting is unset, which is the only thing the names feed.
@@ -149,7 +202,7 @@ pub(crate) struct DedicatedProjects {
     /// projects they depend on. See [`pipelined_runs::early_starts`].
     early_starts: HashSet<PathBuf>,
     /// Every workspace project, as the command discovered them.
-    workspace: pnpm_package_manager::DiscoveredWorkspace,
+    pub(crate) workspace: pnpm_package_manager::DiscoveredWorkspace,
 }
 
 impl DedicatedProjects {
@@ -387,13 +440,16 @@ fn precomputed_workspace_cycles(
     )
 }
 
+mod ci_validation;
 mod dedicated_runs;
+mod fetch;
 mod install;
 mod nested_workspace_manifests;
 mod pipelined_runs;
 mod selection;
 
 mod mutation;
+mod remove;
 
 mod maintenance;
 

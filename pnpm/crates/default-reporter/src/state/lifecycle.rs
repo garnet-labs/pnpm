@@ -1,7 +1,21 @@
 use super::{
-    BlockPlacement, BlockSlot, COLOR_WHEEL, LifecycleEntry, LifecycleMessage, LifecycleState,
-    LifecycleStdio, RenderingContext, ReporterState, contains_path, cut_line, format_prefix,
-    format_prefix_no_trim, highlight_last_folder, lifecycle_ids, pretty_ms, printable_script_line,
+    BlockPlacement,
+    BlockSlot,
+    COLOR_WHEEL,
+    LifecycleEntry,
+    LifecycleMessage,
+    LifecycleState,
+    LifecycleStdio,
+    RenderingContext,
+    ReporterState,
+    contains_path,
+    cut_line,
+    format_prefix,
+    format_prefix_no_trim,
+    highlight_last_folder,
+    lifecycle_ids,
+    pretty_ms,
+    printable_script_line,
     visible_width,
 };
 use std::fmt::Write as _;
@@ -10,6 +24,7 @@ impl ReporterState {
     // --- lifecycle --------------------------------------------------------
 
     pub(super) fn on_lifecycle(&mut self, message: &LifecycleMessage) {
+        self.render_approvals_before_failure(message);
         let quiet = self.options.max_log_level < crate::MaxLogLevel::Info;
         if quiet
             || ((self.options.append_only || self.options.lifecycle.stream_output)
@@ -51,6 +66,14 @@ impl ReporterState {
         self.scripts.slots.insert(key, slot);
     }
 
+    fn render_approvals_before_failure(&mut self, message: &LifecycleMessage) {
+        if self.options.append_only
+            && matches!(message, LifecycleMessage::Exit { exit_code, .. } if *exit_code != 0)
+        {
+            self.render_pending_approvals();
+        }
+    }
+
     pub(super) fn update_lifecycle_cache(&mut self, key: &str, message: &LifecycleMessage) {
         match message {
             LifecycleMessage::Script { stage, wd, script, .. } => {
@@ -78,7 +101,9 @@ impl ReporterState {
         let time = self.scripts.entries
             .get(key)
             .and_then(|e| e.start)
-            .map(|start| pretty_ms(start.elapsed().as_millis()))
+            .map(|start| start.elapsed())
+            .map(|elapsed| elapsed.as_millis())
+            .map(pretty_ms)
             .unwrap_or_default();
         if exit_code == 0 {
             self.rendering.format_indented_status(&self.rendering.colors.magenta_bright(&format!(
@@ -143,7 +168,9 @@ impl ReporterState {
         let time = self.scripts.entries
             .get(key)
             .and_then(|e| e.start)
-            .map(|start| pretty_ms(start.elapsed().as_millis()))
+            .map(|start| start.elapsed())
+            .map(|elapsed| elapsed.as_millis())
+            .map(pretty_ms)
             .unwrap_or_default();
         if *exit_code == 0 {
             return format!("{label}, done in {time}");

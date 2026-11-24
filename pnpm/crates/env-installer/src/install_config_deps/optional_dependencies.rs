@@ -1,10 +1,32 @@
 use super::{
-    AtomicU8, BTreeMap, ConfigDepError, ConfigDepsInstallOptions, EnvLockfile, Integrity,
-    LockfileResolution, LogEvent, LogLevel, NormalizedConfigDep, NormalizedSubdep,
-    PackageInstallabilityManifest, Path, Reporter, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalReason, StartedGate, TarballUrlOptions,
-    calc_leaf_global_virtual_store_path, check_package, force_symlink, full_pkg_id,
-    join_global_virtual_store_path, materialize, npm_tarball_url, prune_unexpected_siblings,
+    AtomicU8,
+    BTreeMap,
+    ConfigDepError,
+    ConfigDepsInstallOptions,
+    EnvLockfile,
+    Integrity,
+    LockfileResolution,
+    LogEvent,
+    LogLevel,
+    NormalizedConfigDep,
+    NormalizedSubdep,
+    PackageInstallabilityManifest,
+    Path,
+    PathBuf,
+    Reporter,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
+    StartedGate,
+    TarballUrlOptions,
+    calc_leaf_global_virtual_store_path,
+    check_package,
+    force_symlink,
+    full_pkg_id,
+    join_global_virtual_store_path,
+    materialize,
+    npm_tarball_url,
+    prune_unexpected_siblings,
     symlink_points_to,
 };
 
@@ -35,7 +57,7 @@ pub(super) async fn install_optional_subdeps<Reporter: self::Reporter>(
     )?;
 
     for subdep in compatible {
-        let subdep_dir = subdep_dir(subdep, global_virtual_store_dir);
+        let subdep_dir = subdep_dir(subdep, global_virtual_store_dir.to_path_buf());
         if !subdep_dir.join("package.json").exists() {
             started.report::<Reporter>();
             materialize::<Reporter>(
@@ -78,15 +100,17 @@ pub(super) fn optional_subdeps_installed(
                 Ok(Some(_)),
             )
         })
-        .all(|subdep| subdep_dir(subdep, global_virtual_store_dir).join("package.json").exists())
+        .all(|subdep| {
+            subdep_dir(subdep, global_virtual_store_dir.to_path_buf()).join("package.json").exists()
+        })
 }
 
-fn subdep_dir(subdep: &NormalizedSubdep, global_virtual_store_dir: &Path) -> std::path::PathBuf {
+fn subdep_dir(subdep: &NormalizedSubdep, global_virtual_store_dir: PathBuf) -> PathBuf {
     let subdep_full_id = full_pkg_id(&subdep.name, &subdep.version, &subdep.integrity);
     let subdep_rel =
         calc_leaf_global_virtual_store_path(&subdep_full_id, &subdep.name, &subdep.version);
     pnpm_fs::join_slash_separated_path(
-        &join_global_virtual_store_path(global_virtual_store_dir, &subdep_rel).join("node_modules"),
+        join_global_virtual_store_path(global_virtual_store_dir, &subdep_rel).join("node_modules"),
         &subdep.name,
     )
 }
@@ -172,7 +196,7 @@ pub(super) fn normalize_from_lockfile(
             &pkg.resolution,
             name,
             &spec.version,
-            opts.verification.pick_registry(name),
+            opts.verification.tarball_url_options(name),
         )
         .ok_or_else(|| ConfigDepError::EnvLockfileCorrupted {
             message: format!(
@@ -247,7 +271,7 @@ fn read_optional_subdeps(
             &pkg.resolution,
             &subdep_name,
             &version,
-            opts.verification.pick_registry(&subdep_name),
+            opts.verification.tarball_url_options(&subdep_name),
         )
         .ok_or_else(|| ConfigDepError::EnvLockfileCorrupted {
             message: format!(
@@ -256,7 +280,7 @@ fn read_optional_subdeps(
             ),
         })?;
         subdeps.push(NormalizedSubdep {
-            name: subdep_name.clone(),
+            name: subdep_name,
             version,
             integrity,
             tarball,
@@ -292,12 +316,12 @@ fn integrity_and_tarball(
     resolution: &LockfileResolution,
     name: &str,
     version: &str,
-    registry: &str,
+    tarball_url_options: TarballUrlOptions<'_>,
 ) -> Option<(Integrity, String)> {
     match resolution {
         LockfileResolution::Registry(registry_resolution) => Some((
             registry_resolution.integrity.clone(),
-            npm_tarball_url(name, version, TarballUrlOptions { registry, server_type: None }),
+            npm_tarball_url(name, version, tarball_url_options),
         )),
         LockfileResolution::Tarball(tarball) => {
             let integrity = tarball.integrity.clone()?;

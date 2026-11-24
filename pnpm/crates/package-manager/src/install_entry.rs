@@ -3,20 +3,39 @@
 //! repeat-install fast path.
 
 use crate::{
-    LockfileCheckSink, LockfileVerificationOverride, RebuildOptions, ResolvedPackages,
+    LockfileCheckSink,
+    LockfileVerificationOverride,
+    RebuildOptions,
+    ResolvedPackages,
     install::{
-        Install, InstallError, InstallManifestOptions, InstallRunOptions, InstallSaveOptions,
-        ProjectMutation, WorkspaceInstallSelection,
+        Install,
+        InstallError,
+        InstallManifestOptions,
+        InstallRunOptions,
+        InstallSaveOptions,
+        InstallVerificationOptions,
+        ProjectMutation,
+        WorkspaceInstallSelection,
     },
     optimistic_repeat_install::check_optimistic_repeat_install_in,
 };
 use pnpm_config::Config;
 use pnpm_lockfile::MaybeLazyLockfile;
 use pnpm_network::ThrottledClient;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_reporter::Reporter;
 use pnpm_tarball::MemCache;
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::Arc,
+};
 
 impl<'a, DependencyGroupList> Install<'a, DependencyGroupList>
 where
@@ -28,7 +47,7 @@ where
         tarball_mem_cache: Arc<MemCache>,
         resolved_packages: &'a ResolvedPackages,
         http_client: (&'a ThrottledClient, Arc<ThrottledClient>),
-        config: &'static Config,
+        config: &'a Config,
         manifest: &'a PackageManifest,
         lockfile: MaybeLazyLockfile<'a>,
         dependency_groups: DependencyGroupList,
@@ -72,6 +91,16 @@ where
     /// Execute the subroutine.
     pub async fn run<Reporter: self::Reporter + 'static>(self) -> Result<(), InstallError> {
         Box::pin(self.run_inner::<Reporter>(InstallRunOptions::default())).await
+    }
+
+    /// Validate that the wanted lockfile exists, matches every project's
+    /// manifest and settings, and passes local tarball and resolution-policy
+    /// checks without writing or removing anything on disk.
+    pub async fn validate_frozen(
+        self,
+        selection: Option<WorkspaceInstallSelection<'_>>,
+    ) -> Result<(), InstallError> {
+        Box::pin(self.validate_frozen_silent(selection)).await
     }
 
     /// Execute `pacquet prune`, enabling extraneous direct-dependency
@@ -142,8 +171,7 @@ where
         .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn run_with_prompt_eligibility<Reporter: self::Reporter + 'static>(
+    pub async fn run_with_prompt_eligibility<Reporter: self::Reporter + 'static>(
         self,
         can_prompt: bool,
     ) -> Result<(), InstallError> {
@@ -159,7 +187,10 @@ where
         lockfile_verification_override: LockfileVerificationOverride<'a>,
     ) -> Result<(), InstallError> {
         Box::pin(self.run_inner::<Reporter>(InstallRunOptions {
-            lockfile_verification_override: Some(lockfile_verification_override),
+            verification: InstallVerificationOptions {
+                override_check: Some(lockfile_verification_override),
+                ..Default::default()
+            },
             ..Default::default()
         }))
         .await
@@ -231,7 +262,10 @@ where
         lockfile_verification_override: LockfileVerificationOverride<'a>,
     ) -> Result<(), InstallError> {
         Box::pin(self.run_inner::<Reporter>(InstallRunOptions {
-            lockfile_verification_override: Some(lockfile_verification_override),
+            verification: InstallVerificationOptions {
+                override_check: Some(lockfile_verification_override),
+                ..Default::default()
+            },
             selection: Some(selection),
             ..Default::default()
         }))
@@ -262,6 +296,45 @@ where
         .await
     }
 
+    pub async fn run_pnpr_link<Reporter: self::Reporter + 'static>(
+        mut self,
+        selection: Option<WorkspaceInstallSelection<'_>>,
+        lockfile_verification_override: Option<LockfileVerificationOverride<'a>>,
+        known_requires_build: Option<pnpm_deps_restorer::RequiresBuildBySnapshot>,
+        recorded_trust_lockfile: bool,
+    ) -> Result<(), InstallError> {
+        self.lockfile_policy.trust = true;
+        self.lockfile_policy.disable_optimistic_repeat =
+            recorded_trust_lockfile != self.context.config.trust_lockfile;
+        Box::pin(self.run_inner::<Reporter>(InstallRunOptions {
+            verification: InstallVerificationOptions {
+                override_check: lockfile_verification_override,
+                ..Default::default()
+            },
+            selection,
+            save: InstallSaveOptions {
+                recorded_trust_lockfile: Some(recorded_trust_lockfile),
+                ..InstallSaveOptions::default()
+            },
+            manifests: InstallManifestOptions { known_requires_build, ..Default::default() },
+            ..Default::default()
+        }))
+        .await
+    }
+
+    /// Execute a shared-lockfile `pacquet deploy` frozen install, preserving
+    /// workspace-project status for sibling workspace packages rewritten to `file:`.
+    pub async fn run_shared_deploy<Reporter: self::Reporter + 'static>(
+        self,
+        extra_workspace_dirs: Vec<String>,
+    ) -> Result<(), InstallError> {
+        Box::pin(self.run_inner::<Reporter>(InstallRunOptions {
+            verification: InstallVerificationOptions { extra_workspace_dirs, ..Default::default() },
+            ..Default::default()
+        }))
+        .await
+    }
+
     /// Execute the install a legacy `pacquet deploy` runs in its target
     /// directory: the deployed manifest is the sole root importer, while
     /// workspace discovery stays anchored at the source workspace so
@@ -273,16 +346,24 @@ where
     /// nothing is written to either (pnpm's `saveLockfile: false`).
     pub async fn run_legacy_deploy<Reporter: self::Reporter + 'static>(
         mut self,
+        overrides_root_dir: &'a Path,
+        extra_workspace_dirs: Vec<String>,
     ) -> Result<(), InstallError> {
         self.execution.mutation = ProjectMutation::Deploy;
         Box::pin(self.run_inner::<Reporter>(InstallRunOptions {
+            verification: InstallVerificationOptions { extra_workspace_dirs, ..Default::default() },
             root_manifest_as_workspace_root: true,
             save: InstallSaveOptions {
                 lockfile: false,
                 workspace_state: false,
                 lockfile_check: None,
+                recorded_trust_lockfile: None,
             },
-            manifests: InstallManifestOptions { deploy_hook: true, ..Default::default() },
+            manifests: InstallManifestOptions {
+                deploy_hook: true,
+                overrides_root_dir: Some(overrides_root_dir),
+                ..Default::default()
+            },
             ..Default::default()
         }))
         .await
@@ -329,20 +410,13 @@ impl Default for InstallRunOptions<'_, '_> {
     fn default() -> Self {
         InstallRunOptions {
             repeat_install: check_optimistic_repeat_install_in,
-            lockfile_verification_override: None,
+            verification: InstallVerificationOptions::default(),
             rebuild: None,
             selection: None,
             root_manifest_as_workspace_root: false,
             save: InstallSaveOptions::default(),
             prompt_eligibility_override: None,
-            manifests: InstallManifestOptions {
-                deploy_hook: false,
-                prune_direct_dependencies: false,
-                specifier_manifests: None,
-                hooked_paths: HashSet::new(),
-                spec_bumps: None,
-                known_requires_build: None,
-            },
+            manifests: InstallManifestOptions::default(),
         }
     }
 }

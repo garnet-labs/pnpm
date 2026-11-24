@@ -1,19 +1,47 @@
 use super::{
-    HoistedPackageMapOptions, PackageMapOptions, absolute_package_url,
-    dependencies_graph_to_package_map, link_target_id, lockfile_to_package_map,
-    make_node_package_map_option, make_node_require_option, to_relative_url,
+    HoistedPackageMapOptions,
+    PackageMapOptions,
+    absolute_package_url,
+    dependencies_graph_to_package_map,
+    link_target_id,
+    lockfile_to_package_map,
+    make_node_package_map_option,
+    make_node_require_option,
+    to_relative_url,
 };
-use crate::{DependenciesGraphNode, LockfileToDepGraphResult, VirtualStoreLayout};
+use crate::{
+    DependenciesGraphNode,
+    LockfileToDepGraphResult,
+    VirtualStoreLayout,
+};
 use pnpm_lockfile::{
-    ComVer, Lockfile, LockfileResolution, LockfileVersion, PackageKey, PackageMetadata,
-    PkgIdWithPatchHash, PkgName, ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec,
-    SnapshotDepRef, SnapshotEntry, TarballResolution,
+    ComVer,
+    Lockfile,
+    LockfileResolution,
+    LockfileVersion,
+    PackageKey,
+    PackageMetadata,
+    PkgIdWithPatchHash,
+    PkgName,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
+    SnapshotEntry,
+    TarballResolution,
 };
 use pnpm_modules_yaml::DepPath;
 use pnpm_package_manifest::PackageManifest;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[test]
@@ -25,7 +53,7 @@ fn builds_package_map_from_lockfile() {
     let linked_manifest = manifest("linked");
     let project_manifests = vec![
         (cwd.clone(), &root_manifest),
-        (cwd.join("packages/app"), &app_manifest),
+        (cwd.join("packages/app#?%20"), &app_manifest),
         (cwd.join("packages/linked"), &linked_manifest),
     ];
     let package_map = lockfile_to_package_map(
@@ -43,7 +71,7 @@ fn builds_package_map_from_lockfile() {
                     },
                 ),
                 (
-                    "packages/app".to_string(),
+                    "packages/app#?%20".to_string(),
                     ProjectSnapshot {
                         dependencies: Some(deps(&[
                             ("dep1", "1.0.0"),
@@ -104,10 +132,10 @@ fn builds_package_map_from_lockfile() {
                         "qar": "qar@3.0.0"
                     }
                 },
-                "packages/app": {
-                    "url": "../packages/app",
+                "packages/app#?%20": {
+                    "url": "../packages/app%23%3F%2520",
                     "dependencies": {
-                        "app": "packages/app",
+                        "app": "packages/app#?%20",
                         "dep1": "dep1@1.0.0",
                         "dep2-alias": "foo@2.0.0",
                         "linked": "packages/linked"
@@ -483,10 +511,11 @@ fn manifest(name: &str) -> PackageManifest {
     manifest
 }
 
-/// A metadata record whose value the package-map builder never inspects —
+/// A metadata record whose value the package-map builder never inspects,
 /// only the `packages:` key it is filed under matters.
 fn package_metadata() -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Tarball(TarballResolution {
             tarball: String::new(),
             integrity: None,
@@ -592,5 +621,29 @@ fn graph_node(name: &str, version: &str, dir: &Path) -> DependenciesGraphNode {
         optional_dependencies: BTreeSet::new(),
         present: false,
         children: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn execution_finds_the_package_map_in_the_lockfile_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let lockfile_dir = temp.path().join("lockfiles");
+    for modules_dir in [
+        lockfile_dir.join("vendor"),
+        lockfile_dir.join("../vendor"),
+        temp.path().join("absolute/vendor"),
+    ] {
+        std::fs::create_dir_all(&modules_dir).unwrap();
+        let map_path = modules_dir.join(super::PACKAGE_MAP_FILENAME);
+        std::fs::write(&map_path, "{}").unwrap();
+        let config = pnpm_config::Config {
+            workspace_dir: Some(workspace.clone()),
+            lockfile_dir: Some(lockfile_dir.clone()),
+            modules_dir,
+            node_package_map_mode: pnpm_config::NodePackageMapMode::Load,
+            ..Default::default()
+        };
+        assert_eq!(super::package_map_path_for_execution(&config, &workspace), Some(map_path));
     }
 }

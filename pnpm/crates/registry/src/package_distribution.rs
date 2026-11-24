@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use pnpm_package_manifest::PackageBin;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use ssri::Integrity;
 
 #[derive(Debug, Default, Clone, Eq, Serialize, Deserialize)]
@@ -17,8 +20,8 @@ pub struct PackageDistribution {
     /// Subresource integrity for the version's tarball.
     ///
     /// Decoded strictly, unlike the advisory fields below: a registry
-    /// package with no usable integrity cannot be locked at all — the
-    /// snapshot builder rejects it — so softening the parse would only
+    /// package with no usable integrity cannot be locked at all (the
+    /// snapshot builder rejects it) so softening the parse would only
     /// move "pnpm cannot verify this tarball" to a later, quieter
     /// failure. An unparsable value fails the manifest, and so the
     /// version, on purpose.
@@ -35,13 +38,13 @@ pub struct PackageDistribution {
     pub revisions: Option<serde_json::Value>,
     /// Number of files in the tarball, as the registry reports it.
     ///
-    /// Advisory: any integral, non-negative encoding decodes — `12`,
-    /// `12.0`, `"12"` — and anything else reads as "not reported".
+    /// Advisory: any integral, non-negative encoding decodes (`12`,
+    /// `12.0`, `"12"`) and anything else reads as "not reported".
     #[serde(default, deserialize_with = "crate::wire_tolerance::deserialize_advisory_count")]
     pub file_count: Option<usize>,
     /// Unpacked byte size of the tarball, as the registry reports it.
     /// Read only as an allocation hint by the tarball extractor, which
-    /// caps it — never trusted as fact.
+    /// caps it, never trusted as fact.
     ///
     /// Decoded as leniently as [`Self::file_count`].
     #[serde(default, deserialize_with = "crate::wire_tolerance::deserialize_advisory_count")]
@@ -92,11 +95,6 @@ pub struct PnprDistribution {
         skip_serializing_if = "Option::is_none"
     )]
     pub bins: Option<BTreeMap<String, PackageBin>>,
-    /// Platform variants of the version: archives the installer links in
-    /// place of the primary on a matching host. Read only from pnpr's own
-    /// package document.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub variants: Option<Vec<PnprVariant>>,
     /// How pnpr's own package document listed the version (see
     /// [`crate::parse_install_v2`]); `None` for a version read from npm's
     /// documents. Honored only for a registry declared `serverType: pnpr`.
@@ -113,23 +111,6 @@ pub enum InstallV2Entry {
     /// Only with what picking reads: the rest is in the version's release
     /// record.
     External,
-}
-
-/// One platform variant under `dist.pnpr.variants`.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PnprVariant {
-    pub tag: String,
-    /// The platforms the variant runs on, in the structured form of
-    /// `pnpm_platform_variants::Platform`. Kept as JSON so that a platform
-    /// with a field this client does not know makes only its variant
-    /// unselectable, not the version unreadable.
-    pub platforms: Vec<serde_json::Value>,
-    pub integrity: String,
-    /// The fields of the variant's manifest that differ from the version's;
-    /// each replaces the version's field, and `null` removes it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl PackageDistribution {

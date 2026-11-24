@@ -4,10 +4,30 @@ mod hosted_tars;
 mod mutations;
 
 use super::{
-    AuthState, Body, Config, Ecosystem, PackagePattern, Registries, Registry, Request, ServiceExt,
-    StatusCode, TempDir, body_bytes, body_json, config_for, enable_osv, gzip, header,
-    hosted_publish_request, hosted_with_access, osv_database, router, router_with_auth,
-    sha512_integrity, tar_of,
+    AuthState,
+    Body,
+    Config,
+    Ecosystem,
+    PackagePattern,
+    Registries,
+    Registry,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    body_bytes,
+    body_json,
+    config_for,
+    enable_osv,
+    gzip,
+    header,
+    hosted_publish_request,
+    hosted_with_access,
+    osv_database,
+    router,
+    router_with_auth,
+    sha512_integrity,
+    tar_of,
 };
 use crate::tokens::issue_token;
 use pnpr_storage::layout::package_segments;
@@ -70,7 +90,7 @@ async fn pnpr_entry(app: &axum::Router, uri: &str, version: &str) -> serde_json:
 /// pnpr's facts about an archive in an entry or release record, which npm's
 /// documents do not carry.
 fn pnpr_facts(entry: &serde_json::Value) -> serde_json::Value {
-    let facts = ["requiresBuild", "bins", "variants"]
+    let facts = ["requiresBuild", "bins"]
         .into_iter()
         .filter_map(|field| Some((field.to_string(), entry.get(field)?.clone())))
         .collect::<serde_json::Map<_, _>>();
@@ -371,7 +391,7 @@ async fn an_uncached_upstream_gets_no_tar_variants() {
 /// complete with the stale ones, or a client with no tar hash to check would
 /// install them.
 #[tokio::test]
-async fn a_stale_cached_tgz_fails_the_tar_response_and_is_refetched() {
+async fn a_changed_upstream_integrity_evicts_the_cached_tgz_before_serving() {
     for accept in [None, Some("gzip"), Some("zstd")] {
         stale_cached_tgz_scenario(accept).await;
     }
@@ -433,8 +453,8 @@ async fn stale_cached_tgz_scenario(accept: Option<&str>) {
         .await;
 
     assert!(
-        !completes_over_http(&app, "/npm/~zstd/left-pad@1.0.0", accept).await,
-        "stale bytes must not complete a tar response ({accept:?})",
+        completes_over_http(&app, "/npm/~zstd/left-pad@1.0.0", accept).await,
+        "refresh must evict stale bytes before serving the tar ({accept:?})",
     );
 
     let mut refetched = Vec::new();
@@ -513,11 +533,13 @@ async fn a_shasum_only_upstream_version_is_served_as_a_tar() {
 }
 
 #[tokio::test]
-async fn every_document_and_route_form_of_a_tar_registry_describes_the_tar() {
+async fn a_tar_registry_describes_the_served_archive_in_install_metadata() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
     let token = issue_token(&auth, "alice").await;
-    let app = router_with_auth(acme_config(tmp.path().to_path_buf()), auth);
+    let mut config = acme_config(tmp.path().to_path_buf());
+    config.http.package_documents.split_threshold = 0;
+    let app = router_with_auth(config, auth);
     let tar = widget_tar();
     let publish = app
         .clone()
@@ -539,7 +561,7 @@ async fn every_document_and_route_form_of_a_tar_registry_describes_the_tar() {
     assert!(version["dist"].get("tarball").is_none());
     let record =
         body_json(get(&app, "/npm/~zstd/@acme%2Fwidget/1.0.0+r0", None).await.into_body()).await;
-    assert_eq!(record["integrity"], sha512_integrity(&tar));
+    assert_eq!(record["integrity"], sha512_integrity(&gzip(&tar)));
     assert_eq!(record["requiresBuild"], serde_json::json!(false));
 
     let tgz_version =
@@ -578,22 +600,40 @@ async fn every_document_and_route_form_of_a_tar_registry_describes_the_tar() {
     let tgz_abbreviated = body_json(tgz_abbreviated.into_body()).await;
     assert!(tgz_abbreviated["versions"]["1.0.0"]["dist"].get("pnpr").is_none());
 
+    let newer = hosted_publish_request(
+        "/npm/~acme/@acme/widget",
+        "@acme/widget",
+        "1.0.1",
+        b"newer",
+        &token,
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(newer)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED,
+    );
+    let old = pnpr_entry(&app, "/npm/~zstd/@acme%2Fwidget", "1.0.0").await;
+    assert!(old["manifest"].is_object());
+    assert_eq!(old["integrity"], sha512_integrity(&tar));
+    let split = pnpr_entry(&app, "/npm/@acme%2Fwidget", "1.0.0").await;
+    assert!(split.get("manifest").is_none());
+
     let encoded = get(&app, "/npm/~zstd/@acme%2Fwidget@1.0.0", None).await;
     assert_eq!(encoded.status(), StatusCode::OK);
     assert_eq!(body_bytes(encoded.into_body()).await.as_slice(), tar.as_slice());
 }
 
-/// A release record accepted with a version names the `.tgz`'s integrity.
-/// A tar registry describes the version by its tar instead, and both routes
-/// hide a vulnerable version's record.
 #[tokio::test]
-async fn a_tar_registry_describes_an_accepted_record_by_its_tar() {
+async fn tar_and_tgz_routes_serve_the_same_accepted_record() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
     let token = issue_token(&auth, "alice").await;
     let mut config = acme_config(tmp.path().to_path_buf());
-    config.storage.metadata =
-        pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite"));
+    config.storage.database =
+        pnpr_config::DatabaseBackend::Sqlite(tmp.path().join("metadata.sqlite"));
     let osv = osv_database("@acme/widget", &["2.0.0"]);
     enable_osv(&mut config, osv.path());
     let app = router_with_auth(config, auth);
@@ -617,18 +657,16 @@ async fn a_tar_registry_describes_an_accepted_record_by_its_tar() {
         .headers()
         .get(header::CACHE_CONTROL)
         .cloned();
-    let accepted = body_json(accepted.into_body()).await;
+    let bytes = body_bytes(accepted.into_body()).await;
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(accepted["schema"], "pnpr-release-record/1");
     assert_eq!(accepted["integrity"], sha512_integrity(&tgz));
     assert_eq!(accepted["inputs"]["archive"]["integrity"], sha512_integrity(&tgz));
     assert_eq!(cache_control.unwrap(), "public, max-age=31536000, immutable");
 
-    let described =
-        body_json(get(&app, "/npm/~zstd/@acme%2Fwidget/1.0.0+r0", None).await.into_body()).await;
-    assert_eq!(described["integrity"], sha512_integrity(&tar));
-    let mut expected = accepted.clone();
-    expected["integrity"] = serde_json::json!(sha512_integrity(&tar));
-    assert_eq!(described, expected);
+    let response = get(&app, "/npm/~zstd/@acme%2Fwidget/1.0.0+r0", None).await;
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
+    assert_eq!(body_bytes(response.into_body()).await, bytes);
 
     let publish = app
         .clone()
@@ -680,7 +718,10 @@ async fn the_version_route_refuses_a_vulnerable_version() {
 
 #[tokio::test]
 async fn spoofed_dist_pnpr_is_stripped_and_replaced_by_tar_verified_requires_build() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
 
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
@@ -744,28 +785,34 @@ async fn spoofed_dist_pnpr_is_stripped_and_replaced_by_tar_verified_requires_bui
     let rewrite = app
         .clone()
         .oneshot(
-            Request::put("/npm/~acme/@acme%2Fnative/-rev/1-0")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(Body::from(packument.to_string()))
-                .unwrap(),
+            Request::put(format!(
+                "/npm/~acme/@acme%2Fnative/-rev/{}",
+                packument["_rev"].as_str().unwrap(),
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(packument.to_string()))
+            .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(rewrite.status(), StatusCode::CREATED);
 
-    let mut omitted = packument.clone();
+    let mut omitted = body_json(get(&app, "/npm/@acme%2Fnative", None).await.into_body()).await;
     let omitted_dist = omitted["versions"]["1.0.0"]["dist"].as_object_mut().unwrap();
     omitted_dist.remove("fileCount");
     omitted_dist.remove("unpackedSize");
     let rewrite_omitted = app
         .clone()
         .oneshot(
-            Request::put("/npm/~acme/@acme%2Fnative/-rev/2-0")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(Body::from(omitted.to_string()))
-                .unwrap(),
+            Request::put(format!(
+                "/npm/~acme/@acme%2Fnative/-rev/{}",
+                omitted["_rev"].as_str().unwrap(),
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(omitted.to_string()))
+            .unwrap(),
         )
         .await
         .unwrap();

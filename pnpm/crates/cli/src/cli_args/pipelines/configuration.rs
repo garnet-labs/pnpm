@@ -1,31 +1,22 @@
 use super::{
-    Config, Context, Host, InstallArgs, Path, PathBuf, ReporterType, read_manifest_json,
-    reporter_emit, resolve_bool_override, warn_deprecated_override_version_references,
-    warn_ignored_pnpm_manifest_fields, warn_unapplied_package_configs,
+    Config,
+    Context,
+    Host,
+    InstallArgs,
+    Path,
+    PathBuf,
+    ReporterType,
+    read_manifest_json,
+    reporter_emit,
+    warn_deprecated_override_version_references,
+    warn_ignored_pnpm_manifest_fields,
+    warn_unapplied_package_configs,
     warn_unmatched_registry_options,
 };
 use crate::cli_args::yarn_workspaces_field::{
-    create_workspace_yaml_from_yarn_workspaces, warn_about_workspaces_field,
+    create_workspace_yaml_from_yarn_workspaces,
+    warn_about_workspaces_field,
 };
-
-/// [`select_workspace_projects`](super::select_workspace_projects), optionally running the install's
-/// workspace-cycle search over the selection graph while it is still in
-/// hand. Callers pass `true` only for a run that is certain to reach
-/// the cycle check — the "Already up to date" fast path returns before
-/// it, and a search it never reads would tax exactly that path.
-/// `runtimeOnFail` is a workspace-level override the projects carry into
-/// their own installs, so it is applied to each manifest as it is read.
-pub(super) fn apply_runtime_on_fail(cfg: &Config, projects: &mut [pnpm_workspace::Project]) {
-    let Some(runtime_on_fail) = cfg.runtime_on_fail else {
-        return;
-    };
-    for project in projects {
-        pnpm_package_manifest::apply_runtime_on_fail_override(
-            project.manifest.value_mut(),
-            runtime_on_fail.as_str(),
-        );
-    }
-}
 
 /// Shared workspace-root and package-manager policy derivation.
 pub(crate) fn derive_config_root(
@@ -77,14 +68,7 @@ fn apply_install_materialization_config(
     cfg: &mut Config,
     materialization: &crate::cli_args::install::InstallMaterializationArgs,
 ) {
-    if materialization.frozen_store || materialization.no_frozen_store {
-        cfg.cli_settings.insert("frozenStore".to_string());
-    }
-    cfg.frozen_store = resolve_bool_override(
-        materialization.frozen_store,
-        materialization.no_frozen_store,
-        cfg.frozen_store,
-    );
+    materialization.store.apply(cfg);
     if materialization.force {
         cfg.cli_settings.insert("force".to_string());
     }
@@ -127,7 +111,7 @@ fn apply_install_git_branch_lockfiles_config(
 ) {
     // pnpm merges its CLI options into the config *before* deciding
     // `mergeGitBranchLockfiles`, so a pattern given on the command line
-    // still gets matched against the current branch — and an explicit
+    // still gets matched against the current branch, and an explicit
     // `--merge-git-branch-lockfiles` settles the question without it.
     if lockfile_updates.merge_git_branch_lockfiles {
         cfg.cli_settings.insert("mergeGitBranchLockfiles".to_string());
@@ -142,6 +126,9 @@ fn apply_install_git_branch_lockfiles_config(
 }
 
 pub(crate) fn apply_install_cli_config(cfg: &mut Config, args: &InstallArgs) {
+    args.dependency_options.apply(cfg);
+    cfg.cli.included_dependency_groups =
+        Some(args.dependency_options.dependency_groups(cfg.optional).collect());
     args.network_cache.apply(cfg);
     args.lockfile_updates.dedupe.apply(cfg);
     args.scripts.apply(cfg);

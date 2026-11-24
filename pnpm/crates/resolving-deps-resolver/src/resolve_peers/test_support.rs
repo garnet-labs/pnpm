@@ -5,19 +5,39 @@ use crate::{
     resolve_peers::{
         ResolvePeersOptions,
         discovery::PeerDiscoveryCaches,
-        walker::{PeerWalkMode, Walker},
+        walker::{
+            PeerWalkMode,
+            Walker,
+        },
     },
     resolved_tree::{
-        ChildEdge, DependenciesTreeNode, DirectDep, PeerDep, ResolvedPackage, ResolvedPackageInput,
-        ResolvedTree, TreeChildren,
+        ChildEdge,
+        DependenciesTreeNode,
+        DirectDep,
+        PeerDep,
+        ResolvedPackage,
+        ResolvedPackageInput,
+        ResolvedTree,
+        TreeChildren,
     },
 };
 use pnpm_lockfile::{
-    DirectoryResolution, LockfileResolution, PkgName, PkgNameVer, TarballResolution,
+    DirectoryResolution,
+    LockfileResolution,
+    PkgName,
+    PkgNameVer,
+    TarballResolution,
 };
-use pnpm_resolving_resolver_base::{PkgResolutionId, ResolveResult};
+use pnpm_resolving_resolver_base::{
+    PkgResolutionId,
+    ResolveResult,
+};
 use rustc_hash::FxHashMap as HashMap;
-use std::{collections::BTreeMap, str::FromStr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+    sync::Arc,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) enum PeerCacheMode {
@@ -170,7 +190,8 @@ pub(super) fn resolve_with_cache_oracle(
     let mut full_tree = tree.clone();
     let mut full_opts = opts.clone();
     full_opts.cache_mode = PeerCacheMode::Bypass;
-    let cached = super::resolve_peers_workspace(tree, importers, lockfile_dir, settings, opts);
+    let cached =
+        super::resolve_peers_workspace(tree, importers, lockfile_dir, settings.clone(), opts);
     let full = super::resolve_peers_workspace(
         &mut full_tree,
         importers,

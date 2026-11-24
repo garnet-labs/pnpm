@@ -1,10 +1,22 @@
 use crate::{
-    DirectoryResolution, ImporterDepVersion, LazyLockfile, LoadLockfileError, Lockfile,
-    LockfileResolution, PackageKey, PkgName, SnapshotDepRef, WantedLockfileSelection,
+    DirectoryResolution,
+    ImporterDepVersion,
+    LazyLockfile,
+    LoadLockfileError,
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+    PkgName,
+    SnapshotDepRef,
+    WantedLockfileSelection,
 };
 use pnpm_diagnostics::miette::Diagnostic;
 use pretty_assertions::assert_eq;
-use std::{collections::BTreeMap, fmt::Write, path::Path};
+use std::{
+    collections::BTreeMap,
+    fmt::Write,
+    path::Path,
+};
 use tempfile::tempdir;
 use text_block_macros::text_block;
 
@@ -204,6 +216,117 @@ fn parses_main_document_from_combined_yaml() {
     assert_eq!(combined_loaded, main_only_loaded);
 }
 
+/// The repair loader keeps a next-format entry that has only its
+/// `integrity`, narrows one whose generated fields do not decode, and drops
+/// one that names nothing.
+#[test]
+fn fix_loader_keeps_next_format_entries_pinned_by_integrity() {
+    let tmp = tempdir().expect("create tempdir");
+    std::fs::write(
+        tmp.path().join(Lockfile::FILE_NAME),
+        text_block! {
+            "{"
+            r#"	"lockfileVersion": "13.0","#
+            r#"	"settings": "invalid","#
+            r#"	"projects": {".": {"dependencies": {"valid": "1.0.0"}}},"#
+            r#"	"packages": {"#
+            r#"		"broken@1.0.0": {"engines": "invalid"},"#
+            r#"		"valid@1.0.0": {"#
+            r#"			"integrity": "sha512-TIE61hcgbI/SlJh/0c1sT1SZbBlpg7WiZcs65WPJhoIZQPhH1SCpcGA7LgrVXT15lwN3HV4GQM/MJ9aKEn3Qfg==","#
+            r#"			"engines": "invalid","#
+            r#"			"dependencies": {"child": "1.0.0"},"#
+            "		},"
+            r#"		"child@1.0.0": {"#
+            r#"			"integrity": "sha512-TIE61hcgbI/SlJh/0c1sT1SZbBlpg7WiZcs65WPJhoIZQPhH1SCpcGA7LgrVXT15lwN3HV4GQM/MJ9aKEn3Qfg==","#
+            "		},"
+            "	},"
+            "}"
+        },
+    )
+    .expect("write wanted lockfile");
+
+    let lazy = LazyLockfile::deferred(tmp.path().to_path_buf(), WantedLockfileSelection::default());
+    let lockfile = lazy
+        .get_for_fix()
+        .expect("load for repair")
+        .expect("lockfile present");
+    assert!(lockfile.settings.is_none());
+    let packages = lockfile.packages.as_ref().expect("packages present");
+    assert!(!packages.contains_key(&"broken@1.0.0".parse().expect("broken key")));
+    let valid = packages
+        .get(&"valid@1.0.0".parse().expect("valid key"))
+        .expect("valid entry");
+    assert!(valid.engines.is_none());
+    let snapshots = lockfile.snapshots.as_ref().expect("snapshots present");
+    let valid = snapshots
+        .get(&"valid@1.0.0".parse().expect("valid snapshot key"))
+        .expect("valid snapshot");
+    assert!(
+        valid.dependencies
+            .as_ref()
+            .is_some_and(|deps| deps.len() == 1),
+    );
+}
+
+/// The repair loader drops a malformed `settings` field without the
+/// catalogs beside it, keeps the pin of an entry whose edges do not decode,
+/// drops a registry entry that names no resolution, and keeps an injected
+/// package whose resolution follows from its key.
+#[test]
+fn fix_loader_narrows_next_format_settings_and_pins() {
+    let tmp = tempdir().expect("create tempdir");
+    std::fs::write(
+        tmp.path().join(Lockfile::FILE_NAME),
+        text_block! {
+            "{"
+            r#"	"lockfileVersion": "13.0","#
+            r#"	"settings": {"#
+            r#"		"overrides": "invalid","#
+            r#"		"catalogs": {"default": {"from-catalog": {"specifier": "^2.0.0", "version": "2.0.0"}}},"#
+            "	},"
+            r#"	"projects": {"#
+            r#"		".": {"dependencies": {"from-catalog": "catalog:", "injected": "workspace:*"}},"#
+            "	},"
+            r#"	"packages": {"#
+            r#"		"from-catalog@2.0.0": {"#
+            r#"			"integrity": "sha512-TIE61hcgbI/SlJh/0c1sT1SZbBlpg7WiZcs65WPJhoIZQPhH1SCpcGA7LgrVXT15lwN3HV4GQM/MJ9aKEn3Qfg==","#
+            r#"			"dependencies": "invalid","#
+            "		},"
+            r#"		"nothing@1.0.0": {},"#
+            r#"		"injected@file:packages/injected": {},"#
+            "	},"
+            "}"
+        },
+    )
+    .expect("write wanted lockfile");
+
+    let lazy = LazyLockfile::deferred(tmp.path().to_path_buf(), WantedLockfileSelection::default());
+    let lockfile = lazy
+        .get_for_fix()
+        .expect("load for repair")
+        .expect("lockfile present");
+    assert!(lockfile.overrides.is_none());
+    assert!(lockfile.catalogs.is_some());
+    let root = lockfile.importers.get(".").expect("root project");
+    let from_catalog = root.dependencies
+        .as_ref()
+        .and_then(|deps| deps.get(&"from-catalog".parse().expect("name")))
+        .expect("catalog dependency");
+    assert_eq!(from_catalog.version.to_string(), "2.0.0");
+    let packages = lockfile.packages.as_ref().expect("packages present");
+    assert!(!packages.contains_key(&"nothing@1.0.0".parse().expect("nothing key")));
+    assert!(packages.contains_key(&"from-catalog@2.0.0".parse().expect("pinned key")));
+    let injected = packages
+        .get(&"injected@file:packages/injected".parse().expect("injected key"))
+        .expect("injected entry");
+    assert!(matches!(injected.resolution, LockfileResolution::Directory(_)));
+    let snapshots = lockfile.snapshots.as_ref().expect("snapshots present");
+    let pinned = snapshots
+        .get(&"from-catalog@2.0.0".parse().expect("pinned snapshot key"))
+        .expect("pinned snapshot");
+    assert!(pinned.dependencies.is_none());
+}
+
 #[test]
 fn fix_loader_discards_broken_and_derived_package_fields() {
     let tmp = tempdir().expect("create tempdir");
@@ -340,10 +463,8 @@ fn parses_lockfile_larger_than_default_yaml_scalar_byte_budget() {
     assert_eq!(lockfile.pnpmfile_checksum.unwrap().len(), huge_string_len);
 }
 
-// A regression here makes every subsequent install re-resolve from
-// scratch after failing to read the lockfile it just wrote.
-#[test]
-fn snapshot_key_over_simple_key_limit_round_trips() {
+/// A snapshot key longer than YAML's 1,024-character simple-key limit.
+fn snapshot_key_over_simple_key_limit() -> String {
     let long_key = (0..40).fold(String::from("@scope/pkg@1.0.0"), |mut key, index| {
         write!(key, "(@scope/very-long-peer-dependency-name-{index:02}@33.44.55)").expect(
             "write peer suffix",
@@ -351,6 +472,14 @@ fn snapshot_key_over_simple_key_limit_round_trips() {
         key
     });
     assert!(long_key.len() > 1024, "fixture key must exceed the simple-key limit");
+    long_key
+}
+
+// A regression here makes every subsequent install re-resolve from
+// scratch after failing to read the lockfile it just wrote.
+#[test]
+fn snapshot_key_over_simple_key_limit_round_trips() {
+    let long_key = snapshot_key_over_simple_key_limit();
 
     let content = format!(
         "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {{}}\n\nsnapshots:\n\n  ? '{long_key}'\n  : {{}}\n",
@@ -372,6 +501,69 @@ fn snapshot_key_over_simple_key_limit_round_trips() {
         .expect("reparse emitted lockfile")
         .expect("reparsed lockfile should be present");
     assert_eq!(reparsed, lockfile);
+}
+
+// pnpm v11 reads a long key in implicit form, which a tool that rewrites
+// the paths inside a lockfile can leave behind.
+#[test]
+fn implicit_snapshot_key_over_simple_key_limit_is_read() {
+    let long_key = snapshot_key_over_simple_key_limit();
+    let lockfile_with = |entry: &str| {
+        format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {{}}\n\nsnapshots:\n\n{entry}\n    dependencies:\n      '@scope/very-long-peer-dependency-name-00': 33.44.55\n",
+        )
+    };
+    let implicit = lockfile_with(&format!("  '{long_key}':"));
+    let explicit = lockfile_with(&format!("  ? '{long_key}'\n  :"));
+    let unscoped_key = long_key.strip_prefix("@scope/").expect("scoped fixture key");
+    let plain = lockfile_with(&format!("  {unscoped_key}:"));
+
+    let parse = |content: &str| {
+        Lockfile::parse(content, Path::new(Lockfile::FILE_NAME))
+            .expect("parse lockfile with a long snapshot key")
+            .expect("lockfile should be present")
+    };
+    let lockfile = parse(&implicit);
+    let key: PackageKey = long_key.parse().expect("parse long snapshot key");
+    let snapshot = lockfile.snapshots
+        .as_ref()
+        .expect("snapshots")
+        .get(&key)
+        .expect("long key");
+    assert_eq!(
+        snapshot.dependencies
+            .as_ref()
+            .expect("dependencies")
+            .len(),
+        1,
+    );
+    let explicit_lockfile = parse(&explicit);
+    dbg!(&lockfile, &explicit_lockfile);
+    assert_eq!(lockfile, explicit_lockfile);
+
+    let key: PackageKey = unscoped_key.parse().expect("parse long unscoped snapshot key");
+    assert!(
+        parse(&plain).snapshots
+            .as_ref()
+            .expect("snapshots")
+            .contains_key(&key),
+        "an unquoted key goes through the plain-scalar scanner",
+    );
+}
+
+#[test]
+fn implicit_key_over_one_mebibyte_is_refused() {
+    let long_key = (0..45_000).fold(String::from("@scope/pkg@1.0.0"), |mut key, index| {
+        write!(key, "(@scope/peer-{index:05}@1.0.0)").expect("write peer suffix");
+        key
+    });
+    assert!(long_key.len() > 1024 * 1024, "fixture key must exceed the lookahead cap");
+    let content = format!(
+        "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {{}}\n\nsnapshots:\n\n  '{long_key}': {{}}\n",
+    );
+    let error = Lockfile::parse(&content, Path::new(Lockfile::FILE_NAME))
+        .expect_err("a key past the lookahead cap is refused");
+    assert!(matches!(error, LoadLockfileError::ParseYaml { .. }), "{error:?}");
 }
 
 #[test]
@@ -565,8 +757,8 @@ fn parses_pnpm_10_patched_dependencies_entries() {
 /// Regression test for <https://github.com/pnpm/pnpm/issues/11775>.
 /// An injected workspace package's snapshot can hold a `link:<path>`
 /// value in its `dependencies:` map when the dep is a workspace
-/// sibling. The shape is valid — a `link:` reference resolves to
-/// `null` at use time — so pacquet's parser must accept it.
+/// sibling. The shape is valid, a `link:` reference resolves to
+/// `null` at use time, so pacquet's parser must accept it.
 #[test]
 fn parses_link_dep_in_injected_snapshot() {
     let lockfile_text = text_block! {

@@ -7,17 +7,17 @@
 //! Produces a [`DependenciesGraph`] keyed by depPath plus the
 //! `direct → DepPath` map the install layer consumes.
 //!
-//! Beyond the correctness surface — peer matching, depPath construction
+//! Beyond the correctness surface (peer matching, depPath construction
 //! with per-occurrence variation, missing / bad peer issue collection,
-//! transitive-peer propagation, and the basic cycle break — the walk
+//! transitive-peer propagation, and the basic cycle break) the walk
 //! carries two performance caches:
 //!
-//! - **`peersCache`** — caches resolved peer combinations keyed by
+//! - **`peersCache`**, caches resolved peer combinations keyed by
 //!   `pkgIdWithPatchHash` so a repeat visit short-circuits the walk
 //!   when the current parent peer context matches one the cache has
 //!   already seen. Stored on [`crate::resolve_peers::discovery::PeerDiscoveryCaches::peers_cache`] and matched via
 //!   [`Walker::find_hit`] + [`Walker::provider_identity_match`].
-//! - **`purePkgs` fast path** — a pure package (no resolved / missing
+//! - **`purePkgs` fast path**, a pure package (no resolved / missing
 //!   peers across its entire subtree) gets its `depPath` equal to its
 //!   `pkgIdWithPatchHash` without recursing. Stored on
 //!   [`crate::resolve_peers::discovery::PeerDiscoveryCaches::pure_pkgs`] and consulted at the top of
@@ -30,44 +30,79 @@
 //! `in_progress` set, where a re-entry on the same `NodeId` falls back
 //! to `name@version` as the peer-id.
 
+pub(crate) mod locked;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub(crate) use context::{SharedChain, satisfies_with_prereleases, split_peer_suffix_segments};
-pub(crate) use discovery::{PeerDiscoveryResult, PeerHoistDiscovery, apply_hoist_missing_scope};
+pub(crate) use context::{
+    SharedChain,
+    satisfies_with_prereleases,
+    split_peer_suffix_segments,
+};
+pub(crate) use discovery::{
+    PeerDiscoveryResult,
+    PeerHoistDiscovery,
+    apply_hoist_missing_scope,
+};
 pub(crate) use finalize::merge_additional_edges;
 pub(crate) use provider_peers::{
-    CandidatePeerRanges, peers_accept_provided_versions, resolved_name_and_version,
+    CandidatePeer,
+    CandidatePeers,
+    accepts_optional_peer_candidate,
+    resolved_name_and_version,
 };
-pub(crate) use walker::{MissingNames, index_missing_names};
+pub(crate) use walker::{
+    MissingNames,
+    index_missing_names,
+};
 
 mod cache;
 mod context;
 mod discovery;
 mod finalize;
+mod optional_peer_ranges;
 mod provider_peers;
 mod walker;
+mod workspace_graph;
 
 use crate::{
-    dedupe_injected_deps::dedupe_injected_deps,
-    dedupe_peer_dependents::{PeerSuffixes, dedupe_peer_dependents},
-    dependencies_graph::{DependenciesGraph, PeerDependencyIssues},
+    dependencies_graph::{
+        DependenciesGraph,
+        PeerDependencyIssues,
+    },
     node_id::NodeId,
-    resolved_tree::{DirectDep, ResolvedTree},
+    resolved_tree::{
+        DirectDep,
+        ResolvedTree,
+    },
 };
 use context::{
-    ChainSuffixMemo, CurrentProviderSource, ParentRefs, importer_relative_link_dep_path,
+    ChainSuffixMemo,
+    CurrentProviderSource,
+    ParentRefs,
 };
 use discovery::PeerDiscoveryCaches;
-use finalize::{FinalDepPaths, PeerIdRecording};
-use pnpm_deps_path::{DepPath, PeerId};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use locked::build_node_ids_by_previous_dep_path;
+use pnpm_deps_path::DepPath;
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
-use walker::{NodeWalkContext, PeerWalkMode, Walker};
+use walker::{
+    NodeWalkContext,
+    PeerWalkMode,
+    Walker,
+};
+use workspace_graph::finish_workspace_graph;
 
 /// Options threaded into [`fn@resolve_peers`].
 #[derive(Debug, Clone)]
@@ -98,7 +133,7 @@ pub struct PeerResolutionScope {
     /// whose root package's shared children context is owned by a
     /// *different* importer are not emitted. The peer-hoist loop sets
     /// this so a non-owner package occurrence keeps the missing-peer
-    /// report computed under the owner occurrence's alias chain —
+    /// report computed under the owner occurrence's alias chain,
     /// only the package's *own* peers are re-evaluated per occurrence.
     /// The final workspace-wide pass leaves this `None` so warnings
     /// still cover every importer. Held by `Arc`: the maps inside are
@@ -168,22 +203,26 @@ impl Default for ResolvePeersOptions {
 
 /// The workspace-wide settings [`fn@resolve_peers_workspace`] takes as one
 /// parameter.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct WorkspacePeerSettings {
     /// `true` enables the cross-importer dedupe pass:
     /// `dependenciesMeta[<alias>].injected: true` workspace edges collapse
     /// back to `link:` when the injected snapshot's children are a subset
     /// of the target project's own direct deps.
     pub dedupe_injected_deps: bool,
-    /// `true` enables the peer-dependent dedupe pass: peer-suffixed
-    /// variants of one package that are a subset of a larger compatible
-    /// variant collapse into it. Maps to the `dedupePeerDependents`
-    /// setting.
-    pub dedupe_peer_dependents: bool,
+    /// The peer-dependent dedupe pass: peer-suffixed variants of one
+    /// package that are a subset of a larger compatible variant collapse
+    /// into it. Maps to `dedupePeerDependents` and
+    /// `projectScopedOptionalPeers`.
+    pub dedupe_peer_dependents: crate::PeerDependentsDedupe,
     /// When true, non-root importers can resolve peers from the workspace
     /// root's direct dependencies. Maps to the
     /// `resolvePeersFromWorkspaceRoot` setting.
     pub resolve_peers_from_workspace_root: bool,
+    /// Optional cap on distinct peer-resolved snapshots in the workspace graph.
+    pub max_snapshots: Option<usize>,
+    /// Optional cooperative cancellation probe polled during the peer walk.
+    pub cancel: crate::ResolutionCancel,
 }
 
 /// See [`crate::PeerResolutionScope::hoist_missing_scope`].
@@ -200,7 +239,7 @@ pub struct HoistMissingScope {
     /// children-owner context, from
     /// the workspace's recorded first-walk misses. A
     /// missing peer inside a foreign-claimed subtree is suppressed
-    /// only when the owner's walk did *not* report it missing —
+    /// only when the owner's walk did *not* report it missing,
     /// i.e. that context satisfied it, so the shared children report
     /// filtered it out at walk time. Misses the owner walk could not
     /// satisfy stay visible to every importer (and each hoists its
@@ -233,7 +272,7 @@ impl HoistMissingScope {
     }
 
     /// Whether another importer's shared walk of `pkg_id` already
-    /// reported on `peer_name` — and found it satisfied.
+    /// reported on `peer_name`, and found it satisfied.
     fn covers(&self, pkg_id: &str, peer_name: &str) -> bool {
         self.first_importer_by_pkg
             .get(pkg_id)
@@ -262,19 +301,21 @@ pub struct ResolvePeersResult {
     /// can tell which descendant misses the owner resolver's context
     /// already satisfied. See [`HoistMissingScope`].
     pub missing_names_by_pkg: HashMap<String, HashSet<String>>,
-    /// Final `DepPath` of every walked node — the upstream
+    /// Final `DepPath` of every walked node, the upstream
     /// `pathsByNodeId`. Feed it back through
     /// [`crate::PeerResolutionScope::resolved_peer_provider_paths`] to run a
     /// locked-peer-provider reuse pass.
     pub paths_by_node_id: HashMap<NodeId, DepPath>,
 }
 
-/// One importer's input to the multi-importer [`fn@resolve_peers_workspace`]
-/// — the lockfile importer id, the importer's `directNodeIdsByAlias`
+/// One importer's input to the multi-importer [`fn@resolve_peers_workspace`],
+/// the lockfile importer id, the importer's `directNodeIdsByAlias`
 /// slice, the absolute project root, and the per-importer
 /// `modules_dir` used by the `excludeLinksFromLockfile` link-remap.
 #[derive(Debug, Clone)]
 pub struct ImporterPeerInput {
+    pub declared_direct_dependencies: HashSet<String>,
+    pub explicitly_requested_direct_dependencies: HashSet<String>,
     pub id: String,
     pub direct: Vec<DirectDep>,
     /// Absolute root of this importer. Threaded into
@@ -288,24 +329,44 @@ pub struct ImporterPeerInput {
     /// remap uses the correct per-importer target. `None` disables
     /// the remap for this importer.
     pub modules_dir: Option<PathBuf>,
+    /// Missing optional peers with rejected providers in the current graph.
+    /// A variant of this importer's closure that leaves one of
+    /// them unbound never collapses into a variant that resolves it.
+    pub rejected_optional_peers: HashSet<String>,
+    /// This importer's share of
+    /// [`PeerResolutionScope::hoisted_peer_provider_node_ids`]. A leaf's
+    /// [`NodeId`] is the same in every importer, so another importer's hoist
+    /// does not make this importer's own dependency a hoisted provider.
+    pub hoisted_peer_provider_node_ids: HashSet<NodeId>,
 }
 
-/// Output of [`fn@resolve_peers_workspace`] — the cross-importer
+/// Reason a workspace or discovery peer walk stopped early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerWalkAbort {
+    /// Distinct peer-resolved snapshots exceeded [`WorkspacePeerSettings::max_snapshots`].
+    SnapshotLimitExceeded,
+    /// Cooperative cancellation was signalled via [`WorkspacePeerSettings::cancel`].
+    Cancelled,
+}
+
+/// Output of [`fn@resolve_peers_workspace`], the cross-importer
 /// dedupe map plus per-importer `direct_dependencies_by_alias` slices.
 #[derive(Debug, Default)]
 pub struct WorkspaceResolvePeersResult {
     pub graph: DependenciesGraph,
     pub direct_dependencies_by_importer: BTreeMap<String, BTreeMap<String, DepPath>>,
     pub peer_dependency_issues_by_importer: BTreeMap<String, PeerDependencyIssues>,
-    /// Final `DepPath` of every walked node — the upstream
+    /// Final `DepPath` of every walked node, the upstream
     /// `pathsByNodeId`. See [`ResolvePeersResult::paths_by_node_id`].
     pub paths_by_node_id: HashMap<NodeId, DepPath>,
+    /// Early-stop outcome when the peer walk hit a snapshot limit or cancellation.
+    pub abort: Option<PeerWalkAbort>,
 }
 
 /// Resolve peer dependencies for `tree` and emit a depPath-keyed graph.
 ///
 /// Takes `tree` by `&mut` because lazy [`crate::TreeChildren`] entries are
-/// realised in-place during the walk — every revisit's `(alias →
+/// realised in-place during the walk; every revisit's `(alias →
 /// NodeId)` children map is allocated on first descent and the
 /// parent's `TreeChildren::Lazy` flips to `Realized` so a second
 /// visitor reuses the map without redoing the work. Pure subtrees
@@ -363,35 +424,79 @@ pub fn resolve_peers_workspace(
         PeerDiscoveryCaches::default(),
         PeerWalkMode::Final,
     );
+    walker.traversal.snapshot_budget.max_snapshots = settings.max_snapshots;
+    walker.traversal.snapshot_budget.cancel.set_probe(settings.cancel);
     let importers = sorted_importer_inputs(importers);
     let peer_dependency_issues_by_importer =
         walk_importers(&mut walker, &importers, settings.resolve_peers_from_workspace_root);
+    let _ = walker.traversal.snapshot_budget.poll_cancelled();
+    if let Some(abort) = walker.traversal.snapshot_budget.abort {
+        return WorkspaceResolvePeersResult { abort: Some(abort), ..Default::default() };
+    }
+    finish_resolved_workspace_peers(
+        walker,
+        &importers,
+        lockfile_dir,
+        FinishDedupeSettings {
+            peer_dependents: settings.dedupe_peer_dependents,
+            injected_deps: settings.dedupe_injected_deps,
+        },
+        peer_dependency_issues_by_importer,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct FinishDedupeSettings {
+    peer_dependents: crate::PeerDependentsDedupe,
+    injected_deps: bool,
+}
+
+fn finish_resolved_workspace_peers(
+    mut walker: Walker<'_>,
+    importers: &[&ImporterPeerInput],
+    lockfile_dir: &Path,
+    dedupe: FinishDedupeSettings,
+    peer_dependency_issues_by_importer: BTreeMap<String, PeerDependencyIssues>,
+) -> WorkspaceResolvePeersResult {
     walker.patch_pending_peer_edges();
-    let peer_id_recording = if settings.dedupe_peer_dependents {
-        PeerIdRecording::Record
-    } else {
-        PeerIdRecording::Skip
-    };
-    let mut finished = finish_workspace_graph(&walker, &importers, lockfile_dir, peer_id_recording);
-    if settings.dedupe_peer_dependents {
-        finished.dedupe_peer_dependents(walker.opts.peers_suffix_max_length);
+    let mut finished =
+        finish_workspace_graph(&mut walker, importers, lockfile_dir, dedupe.peer_dependents);
+    if walker.traversal.snapshot_budget.poll_cancelled() {
+        return WorkspaceResolvePeersResult {
+            abort: Some(PeerWalkAbort::Cancelled),
+            ..Default::default()
+        };
     }
-    if settings.dedupe_injected_deps {
-        dedupe_injected_deps(
-            &mut finished.graph,
-            &mut finished.direct_dependencies_by_importer,
-            &importers
-                .iter()
-                .map(|importer| (importer.id.clone(), importer.root_dir.clone()))
-                .collect(),
-            lockfile_dir,
-        );
+    if walker.traversal.snapshot_budget.max_snapshots.is_some_and(|max| {
+        finished.graph.len() > max
+    }) {
+        return WorkspaceResolvePeersResult {
+            abort: Some(PeerWalkAbort::SnapshotLimitExceeded),
+            ..Default::default()
+        };
     }
+    finished.dedupe_peer_dependents(
+        walker.opts.peers_suffix_max_length,
+        dedupe.peer_dependents,
+        importers,
+    );
+    if walker.traversal.snapshot_budget.poll_cancelled() {
+        return WorkspaceResolvePeersResult {
+            abort: Some(PeerWalkAbort::Cancelled),
+            ..Default::default()
+        };
+    }
+    if dedupe.injected_deps {
+        finished.dedupe_injected_deps(importers);
+    }
+    let abort =
+        walker.traversal.snapshot_budget.poll_cancelled().then_some(PeerWalkAbort::Cancelled);
     WorkspaceResolvePeersResult {
         graph: finished.graph,
         direct_dependencies_by_importer: finished.direct_dependencies_by_importer,
         peer_dependency_issues_by_importer,
         paths_by_node_id: finished.paths_by_node_id,
+        abort,
     }
 }
 
@@ -426,76 +531,23 @@ fn walk_importers(
             (walker.opts.project_dir.clone(), walker.opts.links.modules_dir.clone());
         walker.opts.project_dir = Some(importer.root_dir.clone());
         walker.opts.links.modules_dir.clone_from(&importer.modules_dir);
-        let parents = walker.build_importer_parents_from(&importer.direct);
+        let parents = importer_own_parent_refs(walker, importer);
         (walker.opts.project_dir, walker.opts.links.modules_dir) = previous_dirs;
         parents
     });
     let mut issues_by_importer = BTreeMap::new();
     for importer in importers {
+        if walker.traversal.snapshot_budget.poll_cancelled()
+            || walker.traversal.snapshot_budget.is_stopped()
+        {
+            break;
+        }
         let issues = walk_importer(walker, importer, root_importer, root_parents.as_ref());
         if !issues.bad.is_empty() || !issues.missing.is_empty() {
             issues_by_importer.insert(importer.id.clone(), issues);
         }
     }
     issues_by_importer
-}
-
-struct FinishedWorkspaceGraph {
-    graph: DependenciesGraph,
-    direct_dependencies_by_importer: BTreeMap<String, BTreeMap<String, DepPath>>,
-    paths_by_node_id: HashMap<NodeId, DepPath>,
-    peer_ids: HashMap<DepPath, Vec<PeerId>>,
-}
-
-impl FinishedWorkspaceGraph {
-    fn dedupe_peer_dependents(&mut self, peers_suffix_max_length: usize) {
-        dedupe_peer_dependents(
-            &mut self.graph,
-            &mut self.direct_dependencies_by_importer,
-            &PeerSuffixes { peer_ids: &self.peer_ids, max_length: peers_suffix_max_length },
-        );
-    }
-}
-
-/// Recompute depPaths with full peer suffixes once, after every importer
-/// is walked, then rebuild the graph and re-key each importer's direct
-/// deps.
-fn finish_workspace_graph(
-    walker: &Walker<'_>,
-    importers: &[&ImporterPeerInput],
-    lockfile_dir: &Path,
-    recording: PeerIdRecording,
-) -> FinishedWorkspaceGraph {
-    let FinalDepPaths {
-        by_node_id: final_dep_paths,
-        peer_ids,
-        ..
-    } = walker.build_final_dep_paths(recording);
-    let direct_dependencies_by_importer = importers
-        .iter()
-        .map(|importer| {
-            let anchor = crate::link_target::ImporterAnchor::new(&importer.root_dir, lockfile_dir);
-            let direct_by_alias = importer.direct
-                .iter()
-                .map(|dep| {
-                    let dep_path = importer_relative_link_dep_path(
-                        &walker.final_dep_path_of(&dep.node_id, &final_dep_paths),
-                        &anchor,
-                        Some(lockfile_dir),
-                        Some(&importer.root_dir),
-                    );
-                    (dep.alias.clone(), dep_path)
-                })
-                .collect();
-            (importer.id.clone(), direct_by_alias)
-        })
-        .collect();
-    FinishedWorkspaceGraph {
-        graph: walker.build_final_graph(&final_dep_paths),
-        direct_dependencies_by_importer,
-        paths_by_node_id: walker.final_paths_by_node_id(&final_dep_paths),
-        peer_ids,
-    }
 }
 
 /// Walk one importer's direct dependencies, returning the peer-dependency
@@ -538,6 +590,11 @@ fn walk_importer(
         );
     }
     for dep in &own_direct {
+        if walker.traversal.snapshot_budget.poll_cancelled()
+            || walker.traversal.snapshot_budget.is_stopped()
+        {
+            return std::mem::take(&mut walker.output.issues);
+        }
         walker.resolve_importer_dep(dep, &walk);
     }
     walker.resolve_pruned_peer_providers(&provider_direct, &walk);
@@ -556,17 +613,19 @@ fn importer_parent_refs(
 ) -> ParentRefs {
     if root_importer.is_some_and(|root| root.id != importer.id) {
         let mut refs = root_parents.cloned().unwrap_or_default();
-        refs.extend(walker.build_importer_parents_from(&importer.direct));
+        refs.extend(importer_own_parent_refs(walker, importer));
         return refs;
     }
-    walker.build_importer_parents_from(&importer.direct)
+    importer_own_parent_refs(walker, importer)
+}
+
+fn importer_own_parent_refs(walker: &Walker<'_>, importer: &ImporterPeerInput) -> ParentRefs {
+    walker.build_importer_parents_from(&importer.direct, &importer.hoisted_peer_provider_node_ids)
 }
 
 /// The current-provider sources visible while walking `importer`: its
 /// own direct dependencies, plus the workspace root importer's when
-/// that is a different project. The workspace path carries no
-/// declared/explicitly-requested alias sets yet, so those guards stay
-/// empty here.
+/// that is a different project.
 fn importer_provider_sources(
     importer: &ImporterPeerInput,
     root_importer: Option<&ImporterPeerInput>,
@@ -576,8 +635,10 @@ fn importer_provider_sources(
             .iter()
             .map(|dep| (dep.alias.clone(), dep.node_id.clone()))
             .collect(),
-        declared_direct_dependencies: HashSet::default(),
-        explicitly_requested_direct_dependencies: HashSet::default(),
+        declared_direct_dependencies: importer.declared_direct_dependencies.clone(),
+        explicitly_requested_direct_dependencies: importer
+            .explicitly_requested_direct_dependencies
+            .clone(),
     };
     let mut sources = vec![source_of(importer)];
     if let Some(root) = root_importer
@@ -586,29 +647,6 @@ fn importer_provider_sources(
         sources.push(source_of(root));
     }
     sources
-}
-
-/// The upstream `getNodeIdsByPreviousDepPath`: first node (in
-/// deterministic id order) claiming each `previous_dep_path`. Empty
-/// unless a locked-peer reuse pass was requested.
-fn build_node_ids_by_previous_dep_path(
-    tree: &ResolvedTree,
-    opts: &ResolvePeersOptions,
-) -> HashMap<DepPath, NodeId> {
-    let mut map = HashMap::default();
-    if opts.scope.resolved_peer_provider_paths.is_none() {
-        return map;
-    }
-    let mut node_ids: Vec<&NodeId> = tree.dependencies_tree.keys().collect();
-    node_ids.sort();
-    for node_id in node_ids {
-        if let Some(previous) = tree.dependencies_tree[node_id].previous_dep_path()
-            && !map.contains_key(previous)
-        {
-            map.insert(previous.clone(), node_id.clone());
-        }
-    }
-    map
 }
 
 #[cfg(test)]

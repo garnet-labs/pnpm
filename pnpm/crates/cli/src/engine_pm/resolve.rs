@@ -5,8 +5,14 @@
 //! same answer before it can install them.
 
 use crate::{
-    config_deps::{ResolvedEngine, resolve_engine_version},
-    engine_pm::{channel::PackageManager, error::EngineError},
+    config_deps::{
+        ResolvedEngine,
+        resolve_engine_version,
+    },
+    engine_pm::{
+        channel::PackageManager,
+        error::EngineError,
+    },
 };
 use miette::Context;
 use pnpm_config::Config;
@@ -22,5 +28,5 @@ pub(crate) async fn resolve_release(
 ) -> miette::Result<ResolvedEngine> {
     resolve_engine_version(config, package, version_spec).await
         .wrap_err_with(|| format!("resolve {}@{version_spec}", pm.name()))?
-        .ok_or_else(|| EngineError::cannot_resolve(pm, version_spec).into())
+        .ok_or_else(|| EngineError::cannot_resolve(pm, version_spec.to_owned()).into())
 }

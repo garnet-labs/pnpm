@@ -6,12 +6,25 @@
 //! [`Reach::Recorded`] or [`Reach::BlocksFastPath`] is proven by changing it.
 //! The other buckets carry the reason, which the test cannot check.
 
-use super::{super::config_blocks_fast_path, current_settings, isolated_included};
+use super::{
+    super::config_blocks_fast_path,
+    current_settings,
+    isolated_included,
+};
 use crate::install_state::first_setting_drift;
 use indexmap::IndexMap;
-use pnpm_config::{Config, LinkWorkspacePackages, NodeLinker, TrustPolicy};
+use pnpm_config::{
+    Config,
+    LinkWorkspacePackages,
+    NodeLinker,
+    RuntimeOnFail,
+    TrustPolicy,
+};
 use pnpm_workspace_state::WorkspaceState;
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+};
 
 /// How a [`Config`] field reaches the fast path.
 enum Reach {
@@ -41,7 +54,13 @@ impl Reach {
     }
 }
 
-use Reach::{BlocksFastPath, NotAnInput, Recorded, Through, Unseen};
+use Reach::{
+    BlocksFastPath,
+    NotAnInput,
+    Recorded,
+    Through,
+    Unseen,
+};
 
 const CLI_ONLY: &str = "a command-line or output setting";
 const NETWORK: &str = "how packages are fetched, not which";
@@ -56,6 +75,7 @@ const AUTH: &str = "credentials, not what is installed";
 
 #[rustfmt::skip]
 const CLASSIFICATION: &[(&str, Reach)] = &[
+    ("access", NotAnInput(OTHER_COMMAND)),
     ("add_missing_peer_types", Recorded { key: "addMissingPeerTypes", change: |config| config.add_missing_peer_types = !config.add_missing_peer_types }),
     ("aggregate_output", NotAnInput(CLI_ONLY)),
     ("agent_skills_disabled", Through("the agent skill targets, compared after the fast path")),
@@ -72,7 +92,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("auto_install_peers", Recorded { key: "autoInstallPeers", change: |config| config.auto_install_peers = !config.auto_install_peers }),
     ("auto_install_peers_from_highest_match", NotAnInput(RESOLUTION_ONLY)),
     ("bail", NotAnInput(CLI_ONLY)),
-    ("block_exotic_subdeps", NotAnInput(RESOLUTION_ONLY)),
+    ("block_exotic_subdeps", Recorded { key: "blockExoticSubdeps", change: |config| config.block_exotic_subdeps = !config.block_exotic_subdeps }),
     ("boot_config", NotAnInput("selects the pnpm that runs, before any install")),
     ("boot_inherited", NotAnInput("selects the pnpm that runs, before any install")),
     ("boot_overrides", NotAnInput("selects the pnpm that runs, before any install")),
@@ -90,6 +110,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("concurrency_groups", NotAnInput(OTHER_COMMAND)),
     ("config_dependencies", Through("compared by the config-dependencies check")),
     ("config_dir", NotAnInput("where the global config is read from")),
+    ("configured_lockfile_dir", Through(LOCKFILE_LOCATION)),
     ("configured_virtual_store_dir", Through("the configured `virtualStoreDir`, recorded as `virtualStoreDir`")),
     ("dangerously_allow_all_builds", Recorded { key: "dangerouslyAllowAllBuilds", change: |config| config.dangerously_allow_all_builds = !config.dangerously_allow_all_builds }),
     ("dedupe_direct_deps", Recorded { key: "dedupeDirectDeps", change: |config| config.dedupe_direct_deps = !config.dedupe_direct_deps }),
@@ -98,7 +119,9 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("dedupe_peers", Recorded { key: "dedupePeers", change: |config| config.dedupe_peers = !config.dedupe_peers }),
     ("deploy_all_files", NotAnInput(OTHER_COMMAND)),
     ("disallow_workspace_cycles", NotAnInput("whether a cycle fails the install")),
+    ("dir", Through("the modules directory and project selection the checks run in")),
     ("dlx_cache_max_age", NotAnInput(OTHER_COMMAND)),
+    ("editor", NotAnInput(OTHER_COMMAND)),
     ("embed_readme", NotAnInput(OTHER_COMMAND)),
     ("enable_global_virtual_store", Recorded { key: "enableGlobalVirtualStore", change: |config| config.enable_global_virtual_store = !config.enable_global_virtual_store }),
     ("enable_modules_dir", Unseen("neither the fast path nor the frozen-tree check sees it, only an install into an empty modules directory applies it")),
@@ -119,6 +142,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("fetch_timeout", NotAnInput(NETWORK)),
     ("fetch_warn_timeout_ms", NotAnInput(NETWORK)),
     ("filter", Through("the selection the fast path is scoped to")),
+    ("filter_order", Through("the selection the fast path is scoped to")),
     ("filter_prod", Through("the selection the fast path is scoped to")),
     ("force", Through("skips the fast path before it runs")),
     ("force_ignores_platform", Through("acts only with `force`, which skips the fast path")),
@@ -133,6 +157,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("global_bin", NotAnInput("the global packages, which a project install does not touch")),
     ("global_bin_dir", NotAnInput("the global packages, which a project install does not touch")),
     ("global_dir", NotAnInput("the global packages, which a project install does not touch")),
+    ("global_packages_config", Through("the settings the config loader applies from it, for the global packages only")),
     ("global_pkg_dir", NotAnInput("the global packages, which a project install does not touch")),
     ("global_pnpmfile", Through("the pnpmfile list, compared as `pnpmfiles`")),
     ("global_shims", NotAnInput("the global packages, which a project install does not touch")),
@@ -142,6 +167,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("hoist_pattern", Recorded { key: "hoistPattern", change: |config| config.hoist_pattern = Some(vec!["foo".into()]) }),
     ("hoist_patterns_before_virtual_store_only", Through(DERIVED)),
     ("hoist_workspace_packages", Recorded { key: "hoistWorkspacePackages", change: |config| config.hoist_workspace_packages = !config.hoist_workspace_packages }),
+    ("hook_added_overrides", NotAnInput("which unused overrides are reported")),
     ("hoisting_limits", Unseen("neither the fast path nor the frozen-tree check sees it, only an install into an empty modules directory applies it")),
     ("ignore_compatibility_db", NotAnInput(RESOLUTION_ONLY)),
     ("ignore_pnpmfile", Through("the pnpmfile list, compared as `pnpmfiles`")),
@@ -166,6 +192,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("link_workspace_packages", Recorded { key: "linkWorkspacePackages", change: |config| config.link_workspace_packages = LinkWorkspacePackages::Deep }),
     ("lockfile", NotAnInput("whether `pnpm-lock.yaml` is written, not what is installed")),
     ("lockfile_dir", Through(LOCKFILE_LOCATION)),
+    ("lockfile_format", Recorded { key: "lockfile.format", change: |config| config.lockfile_format = pnpm_lockfile::LockfileFormat::V13 }),
     ("lockfile_include_resolution_settings", Recorded { key: "lockfile.includeResolutionSettings", change: |config| config.lockfile_include_resolution_settings = !config.lockfile_include_resolution_settings }),
     ("lockfile_include_tarball_url", NotAnInput(RESOLUTION_ONLY)),
     ("lockfile_integrity_target", Recorded { key: "lockfile.integrityTarget", change: |config| config.lockfile_integrity_target = pnpm_lockfile::IntegrityTarget::Tar }),
@@ -179,12 +206,13 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("minimum_release_age_exclude", Recorded { key: "minimumReleaseAgeExclude", change: |config| config.minimum_release_age_exclude = Some(vec!["foo".into()]) }),
     ("minimum_release_age_exclude_prune", NotAnInput("prunes exclude entries from the workspace manifest")),
     ("minimum_release_age_ignore_missing_time", Recorded { key: "minimumReleaseAgeIgnoreMissingTime", change: |config| config.minimum_release_age_ignore_missing_time = !config.minimum_release_age_ignore_missing_time }),
+    ("reference_time", Recorded { key: "referenceTime", change: |config| config.reference_time = Some(jiff::Timestamp::UNIX_EPOCH) }),
     ("minimum_release_age_strict", Recorded { key: "minimumReleaseAgeStrict", change: |config| config.minimum_release_age_strict = Some(false) }),
     ("modules_cache_max_age", NotAnInput("when orphans are pruned, not what is installed")),
     ("modules_dir", Through("the modules directory the workspace state is read from")),
     ("network_concurrency", NotAnInput(NETWORK)),
     ("network_concurrency_by_registry", NotAnInput(NETWORK)),
-    ("node_download_mirrors", NotAnInput(NETWORK)),
+    ("node_download_mirrors", Recorded { key: "nodeDownloadMirrors", change: |config| { config.node_download_mirrors.insert("release".into(), "https://mirror.example.test/node/".into()); } }),
     ("node_linker", Through("the layout's node linker, compared as `nodeLinker`")),
     ("node_linker_excluded", Through("recorded only for the `loaded` linker, which rules the fast path out")),
     ("node_options", NotAnInput(SCRIPTS)),
@@ -218,6 +246,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("prefer_symlinked_executables", NotAnInput("a full install leaves the bins it linked")),
     ("prefer_workspace_packages", Recorded { key: "preferWorkspacePackages", change: |config| config.prefer_workspace_packages = !config.prefer_workspace_packages }),
     ("progress", NotAnInput(CLI_ONLY)),
+    ("project_scoped_optional_peers", Recorded { key: "projectScopedOptionalPeers", change: |config| config.project_scoped_optional_peers = !config.project_scoped_optional_peers }),
     ("provenance", NotAnInput(OTHER_COMMAND)),
     ("proxy", NotAnInput(NETWORK)),
     ("proxy_keys", NotAnInput(NETWORK)),
@@ -243,7 +272,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("resolution_mode", NotAnInput(RESOLUTION_ONLY)),
     ("resolve_peers_from_workspace_root", NotAnInput(RESOLUTION_ONLY)),
     ("reverse", NotAnInput(CLI_ONLY)),
-    ("runtime_on_fail", NotAnInput("whether a missing runtime fails the command")),
+    ("runtime_on_fail", Recorded { key: "runtimeOnFail", change: |config| config.runtime_on_fail = Some(RuntimeOnFail::Download) }),
     ("save_catalog_name", NotAnInput(OTHER_COMMAND)),
     ("save_exact", NotAnInput(OTHER_COMMAND)),
     ("save_peer", NotAnInput(OTHER_COMMAND)),
@@ -287,7 +316,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("test_pattern", NotAnInput(OTHER_COMMAND)),
     ("tls", NotAnInput(NETWORK)),
     ("tls_by_uri", NotAnInput(NETWORK)),
-    ("tools", NotAnInput("tools are installed by their own step")),
+    ("tools", Recorded { key: "toolMirrors", change: |config| { config.tools.insert(pnpm_config::Tool::Node, pnpm_config::ToolSettings { mirror: Some("https://mirror.example.test/node".into()), ..Default::default() }); } }),
     ("trust_lockfile", Recorded { key: "trustLockfile", change: |config| config.trust_lockfile = !config.trust_lockfile }),
     ("trust_policy", Recorded { key: "trustPolicy", change: |config| { config.explicit_settings.insert("trustPolicy".into(), "off".into()); config.trust_policy = TrustPolicy::Off; } }),
     ("trust_policy_exclude", Recorded { key: "trustPolicyExclude", change: |config| config.trust_policy_exclude = Some(vec!["foo".into()]) }),
@@ -305,6 +334,7 @@ const CLASSIFICATION: &[(&str, Reach)] = &[
     ("versioning", NotAnInput(OTHER_COMMAND)),
     ("virtual_store_dir_max_length", Recorded { key: "virtualStoreDirMaxLength", change: |config| config.virtual_store_dir_max_length += 1 }),
     ("virtual_store_only", NotAnInput("only `pnpm fetch` sets it, which does not take the fast path")),
+    ("warn_unused_overrides", NotAnInput(CLI_ONLY)),
     ("workspace_concurrency", NotAnInput(SCRIPTS)),
     ("workspace_dir", Through("the workspace root the checks run in")),
     ("workspace_includes", Through("the project list, compared by the project-structure check")),

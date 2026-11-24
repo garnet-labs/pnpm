@@ -1,6 +1,21 @@
 use super::{
-    AuthState, Body, Duration, Request, ServiceExt, StatusCode, TempDir, body_bytes, config_for,
-    foo_packument, header, json, router, router_with_auth,
+    AuthState,
+    Body,
+    Duration,
+    PackageRules,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    access_rule,
+    body_bytes,
+    config_for,
+    foo_packument,
+    header,
+    header_of,
+    json,
+    router,
+    router_with_auth,
 };
 use crate::tokens::issue_token;
 
@@ -36,20 +51,23 @@ async fn public_packument_responses_carry_caching_headers() {
         response
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("public, max-age=300"),
     );
     assert_eq!(
         response
             .headers()
             .get(header::VARY)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("Accept"),
     );
     let full_etag = response
         .headers()
         .get(header::ETAG)
-        .and_then(|header_value| header_value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .expect("ETag header must be present")
         .to_string();
     assert!(full_etag.starts_with('"') && full_etag.ends_with('"'));
@@ -69,20 +87,23 @@ async fn public_packument_responses_carry_caching_headers() {
         abbrev_response
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("public, max-age=300"),
     );
     assert_eq!(
         abbrev_response
             .headers()
             .get(header::VARY)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("Accept"),
     );
     let abbrev_etag = abbrev_response
         .headers()
         .get(header::ETAG)
-        .and_then(|header_value| header_value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .expect("ETag header must be present")
         .to_string();
     assert_ne!(full_etag, abbrev_etag, "abbreviated packument has distinct body and ETag");
@@ -139,21 +160,24 @@ async fn packument_conditional_if_none_match() {
         not_modified
             .headers()
             .get(header::ETAG)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some(etag.as_str()),
     );
     assert_eq!(
         not_modified
             .headers()
             .get(header::VARY)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("Accept"),
     );
     assert_eq!(
         not_modified
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("public, max-age=300"),
     );
     assert_eq!(body_bytes(not_modified.into_body()).await.len(), 0);
@@ -306,7 +330,8 @@ async fn packument_conditional_if_modified_since() {
         ims_exact
             .headers()
             .get(header::LAST_MODIFIED)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some(last_modified.as_str()),
     );
     assert_eq!(body_bytes(ims_exact.into_body()).await.len(), 0);
@@ -370,61 +395,69 @@ async fn packument_conditional_if_modified_since() {
 }
 
 #[tokio::test]
-async fn private_and_named_registry_packuments_scoped_cache_control_and_vary() {
+async fn named_registry_packuments_are_caller_scoped_only_for_restricted_packages() {
     let mut upstream = mockito::Server::new_async().await;
-    let packument = foo_packument(&upstream.url());
-    let _mock = upstream
+    let _foo = upstream
         .mock("GET", "/foo")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(packument.to_string())
+        .with_body(foo_packument(&upstream.url()).to_string())
+        .create_async()
+        .await;
+    let _restricted = upstream
+        .mock("GET", "/restricted")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "name": "restricted",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": { "1.0.0": { "name": "restricted", "version": "1.0.0" } },
+            })
+            .to_string(),
+        )
         .create_async()
         .await;
 
     let tmp = TempDir::new().unwrap();
-    let config = config_for(&upstream.url(), tmp.path().to_path_buf());
+    let mut config = config_for(&upstream.url(), tmp.path().to_path_buf());
+    config.routing.upstreams.get_mut("npmjs").expect("default `npmjs` upstream").rules =
+        PackageRules::new(vec![access_rule("restricted", "$authenticated")], None);
     let auth = AuthState::in_memory();
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
-    // Named registry: /~npmjs/foo is always caller-scoped
-    let response = app
+    let public = app
         .clone()
         .oneshot(
             Request::get("/npm/~npmjs/foo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(public.status(), StatusCode::OK);
+    assert_eq!(header_of(&public, header::CACHE_CONTROL), Some("public, max-age=60"));
+    assert_eq!(header_of(&public, header::VARY), Some("Accept"));
+
+    let restricted = app
+        .clone()
+        .oneshot(
+            Request::get("/npm/~npmjs/restricted")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
-        Some("private, no-store"),
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get(header::VARY)
-            .and_then(|header_value| header_value.to_str().ok()),
-        Some("Accept, Authorization"),
-    );
-    let etag = response
-        .headers()
-        .get(header::ETAG)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(restricted.status(), StatusCode::OK);
+    assert_eq!(header_of(&restricted, header::CACHE_CONTROL), Some("private, no-store"));
+    assert_eq!(header_of(&restricted, header::VARY), Some("Accept, Authorization"));
+    let etag = header_of(&restricted, header::ETAG).unwrap().to_string();
 
-    // Conditional 304 on named registry preserves private, no-store and Accept, Authorization
     let not_modified = app
         .oneshot(
-            Request::get("/npm/~npmjs/foo")
+            Request::get("/npm/~npmjs/restricted")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::IF_NONE_MATCH, &etag)
                 .body(Body::empty())
@@ -433,24 +466,12 @@ async fn private_and_named_registry_packuments_scoped_cache_control_and_vary() {
         .await
         .unwrap();
     assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
-    assert_eq!(
-        not_modified
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
-        Some("private, no-store"),
-    );
-    assert_eq!(
-        not_modified
-            .headers()
-            .get(header::VARY)
-            .and_then(|header_value| header_value.to_str().ok()),
-        Some("Accept, Authorization"),
-    );
+    assert_eq!(header_of(&not_modified, header::CACHE_CONTROL), Some("private, no-store"));
+    assert_eq!(header_of(&not_modified, header::VARY), Some("Accept, Authorization"));
 }
 
 #[tokio::test]
-async fn per_upstream_maxage_overrides_global_ttl_in_cache_control() {
+async fn per_upstream_packument_ttl_overrides_global_ttl_in_cache_control() {
     let mut upstream = mockito::Server::new_async().await;
     let packument = foo_packument(&upstream.url());
     let _mock = upstream
@@ -464,7 +485,8 @@ async fn per_upstream_maxage_overrides_global_ttl_in_cache_control() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for(&upstream.url(), tmp.path().to_path_buf());
     config.http.packument_ttl = Duration::from_mins(1);
-    config.routing.upstreams.get_mut("npmjs").unwrap().maxage = Some(Duration::from_mins(15));
+    config.routing.upstreams.get_mut("npmjs").unwrap().packument_ttl =
+        Some(Duration::from_mins(15));
     let app = router(config);
 
     let response = app
@@ -480,7 +502,8 @@ async fn per_upstream_maxage_overrides_global_ttl_in_cache_control() {
         response
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("public, max-age=900"),
     );
 }
@@ -533,20 +556,23 @@ async fn hosted_packument_responses_use_global_packument_ttl_in_cache_control() 
         response
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("public, max-age=120"),
     );
     assert_eq!(
         response
             .headers()
             .get(header::VARY)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("Accept"),
     );
     let etag = response
         .headers()
         .get(header::ETAG)
-        .and_then(|header_value| header_value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .unwrap();
     assert!(etag.starts_with('"') && etag.ends_with('"'));
 }
@@ -604,14 +630,16 @@ async fn anonymous_only_package_carries_private_cache_headers_and_denies_authent
         response
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("private, no-store"),
     );
     assert_eq!(
         response
             .headers()
             .get(header::VARY)
-            .and_then(|header_value| header_value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("Accept, Authorization"),
     );
 

@@ -9,18 +9,35 @@
 //! they hold back only releases that carry their real date.
 
 use crate::{
-    ActionReference, GIT_CONCURRENCY, RepoVersion, find_current, global_warn,
-    process::{Command, Stdio},
+    ActionReference,
+    GIT_CONCURRENCY,
+    RepoVersion,
+    find_current,
+    global_warn,
+    process::{
+        Command,
+        Stdio,
+    },
 };
 
-use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, stream};
+use futures_util::{
+    StreamExt,
+    stream,
+};
+use jiff::Timestamp;
 use node_semver::Version;
-use pnpm_config::version_policy::{PackageVersionPolicy, PolicyMatch};
+use pnpm_config::version_policy::{
+    PackageVersionPolicy,
+    PolicyMatch,
+};
 use pnpm_network::redact_and_sanitize;
 use pnpm_reporter::Reporter;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+    },
     future::Future,
     io::Write,
     path::Path,
@@ -30,7 +47,7 @@ use std::{
 /// The `minimumReleaseAge` policy applied to GitHub Actions versions.
 pub struct ReleaseAge {
     /// Versions tagged after this instant are not offered.
-    pub published_by: DateTime<Utc>,
+    pub published_by: Timestamp,
     /// `minimumReleaseAgeExclude`, matched against the action name and its
     /// repository.
     pub exclude: Option<PackageVersionPolicy>,
@@ -49,7 +66,9 @@ impl ReleaseAge {
     }
 
     fn admits(&self, created_at: Option<i64>) -> bool {
-        created_at.is_some_and(|created_at| created_at <= self.published_by.timestamp())
+        created_at.is_some_and(|created_at| {
+            i128::from(created_at) * 1_000_000_000 <= self.published_by.as_nanosecond()
+        })
     }
 
     /// Whether `candidate` is a version newer than `current` whose age the
@@ -70,7 +89,8 @@ impl ReleaseAge {
 fn lists_version(versions: &[String], version: &Version) -> bool {
     versions
         .iter()
-        .filter_map(|listed| Version::parse(listed).ok())
+        .map(Version::parse)
+        .filter_map(Result::ok)
         .any(|listed| &listed == version)
 }
 

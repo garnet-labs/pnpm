@@ -1,51 +1,108 @@
 pub(crate) use context::{
-    CommandFuture, CommandLoaders, CommandLocations, RunCtx, WorkspaceInvocation,
+    CommandFuture,
+    CommandLoaders,
+    CommandLocations,
+    RunCtx,
+    WorkspaceInvocation,
 };
 
-pub(super) use super::pre_command::{apply_cli_layers, seed_config};
-pub(super) use configuration::apply_update_config;
+pub(super) use super::pre_command::{
+    apply_cli_layers,
+    seed_config,
+};
+pub(super) use configuration::{
+    apply_global_update_config,
+    apply_update_config,
+};
 
 use super::{
-    cli_command::{CliArgs, CliCommand},
-    config_warnings::{ConfigWarnings, warn_shared_workspace_lockfile_outside_workspace},
-    dispatch_install, dispatch_query, dispatch_script,
-    install::{InstallArgs, resolve_bool_override},
+    cli_command::{
+        CliArgs,
+        CliCommand,
+    },
+    config_warnings::{
+        ConfigWarnings,
+        warn_shared_workspace_lockfile_outside_workspace,
+    },
+    dispatch_install,
+    dispatch_query,
+    dispatch_script,
+    install::{
+        InstallArgs,
+        resolve_bool_override,
+    },
     pre_command::Invocation,
     reporter::{
-        DefaultReporterSetup, ReporterType, configure_color, configure_default_reporter,
-        configure_max_log_level, reporter_emit,
+        DefaultReporterSetup,
+        ReporterType,
+        configure_color,
+        configure_default_reporter,
+        configure_max_log_level,
+        reporter_emit,
     },
 };
 use crate::{
-    cli_args::reporter::{select_reporter, selected_reporter},
+    cli_args::reporter::{
+        select_reporter,
+        selected_reporter,
+    },
     config_deps::prepare_config,
     config_overrides::ConfigOverrides,
 };
+use config_scope::ConfigScope;
 use configuration::{
-    ConfigTarget, ProjectSelectors, RunAnchors, RunSetup, StoreUse, apply_project_selectors,
-    apply_run_output_config, warn_fast_path_config,
+    ConfigTarget,
+    ProjectSelectors,
+    RunAnchors,
+    RunSetup,
+    StoreUse,
+    apply_project_selectors,
+    apply_run_output_config,
+    warn_fast_path_config,
 };
 use context::take_preloaded_config;
-use miette::{Context, IntoDiagnostic};
-use pnpm_config::{ColorMode, Config, ConfigLoadFailure, Host, default_pnpm_home_dir};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
+use pnpm_config::{
+    ColorMode,
+    Config,
+    ConfigLoadFailure,
+    Host,
+    default_pnpm_home_dir,
+};
 use pnpm_default_reporter::SummaryScope;
 use pnpm_network_web_auth::OtpNonInteractiveError;
-use pnpm_reporter::{ExecutionTimeLog, LogEvent, LogLevel};
+use pnpm_reporter::{
+    ExecutionTimeLog,
+    LogEvent,
+    LogLevel,
+};
 use routing::{
-    emit_execution_time, exit_on_json_error, now_millis, prints_json_errors, run_routed_command,
+    emit_execution_time,
+    exit_on_json_error,
+    now_millis,
+    run_routed_command,
 };
 use std::{
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
     },
 };
 
 impl CliArgs {
     /// Seed the process-global default-reporter state from the parsed
     /// arguments. The entry point calls this before the pre-command
-    /// checks, which are the first thing that can emit — the state is set
+    /// checks, which are the first thing that can emit, the state is set
     /// once, so whoever emits first must already see the real values. A
     /// `--color` / `--no-color` on the command line is seeded here for
     /// that reason; the `color` *setting* can only be read once the
@@ -60,12 +117,13 @@ impl CliArgs {
     /// reporter only uses it to shorten the paths it prints.
     pub fn configure_reporter(&self) {
         pnpm_default_reporter::set_is_global(super::pre_command::is_global(&self.command));
+        pnpm_default_reporter::set_edits_manifests(self.command.edits_manifests());
         if let Some(color) = self.output.presentation.color.or_else(|| {
             self.output.presentation.no_color.then_some(ColorMode::Never)
         }) {
             configure_color(color);
         }
-        let dir = dunce::canonicalize(&self.paths.dir)
+        let dir = pnpm_fs::canonicalize_preserving_mapped_drive(&self.paths.dir)
             .unwrap_or_else(|_| self.paths.dir.clone());
         pnpm_default_reporter::set_progress(self.progress_enabled(true));
         configure_default_reporter(&DefaultReporterSetup {
@@ -132,7 +190,7 @@ impl CliArgs {
         {
             return None;
         }
-        let dir = dunce::canonicalize(&self.paths.dir).ok()?;
+        let dir = pnpm_fs::canonicalize_preserving_mapped_drive(&self.paths.dir).ok()?;
         let mut config =
             self.take_or_load_fast_path_config(&dir, config_overrides, preloaded_config)?;
         if self.report_fast_path_warnings(&config, &dir).is_none()
@@ -142,11 +200,7 @@ impl CliArgs {
             return None;
         }
         install_args.lockfile.directory.apply_to(&mut config, &dir);
-        config.frozen_store = resolve_bool_override(
-            install_args.materialization.frozen_store,
-            install_args.materialization.no_frozen_store,
-            config.frozen_store,
-        );
+        install_args.materialization.store.apply(&mut config);
         if install_args.materialization.no_runtime {
             super::pipelines::record_no_runtime_flag(&mut config);
         }
@@ -164,7 +218,7 @@ impl CliArgs {
     /// Try to finish `pacquet install` synchronously through the
     /// repeat-install fast path, before the caller builds the async
     /// runtime. `true` means the install completed (the "Already up to
-    /// date" events were emitted); `false` means undecided — proceed
+    /// date" events were emitted); `false` means undecided, proceed
     /// with [`Self::run`], reusing any already-loaded configuration.
     pub(crate) fn finished_via_install_fast_path(
         &self,
@@ -242,6 +296,7 @@ impl CliArgs {
         if setup.is_install_family && !builtin_replaced_by_script {
             emit_execution_time(reporter_emit(selected_reporter()), setup.started_at);
         }
+        crate::flush_held_notices(pnpm_default_reporter::state::CommandOutcome::Succeeded);
 
         Ok(())
     }
@@ -263,13 +318,8 @@ impl CliArgs {
         let target_template =
             (command.npm_command_name(), StoreUse::of(&command), ConfigWarnings::of(&command));
         let preloaded_config = Mutex::new(preloaded_config);
-        let load_config = |anchor: &Path, is_global: bool| {
-            let target = ConfigTarget {
-                anchor,
-                is_global,
-                store_use: target_template.1,
-                warnings: target_template.2,
-            };
+        let load_config = |scope: ConfigScope| {
+            let target = scope.target(anchors, target_template.1, target_template.2);
             self.load_and_finalize_config(
                 &target,
                 invocation,
@@ -277,13 +327,12 @@ impl CliArgs {
                 setup,
                 anchors,
                 target_template.0,
-                take_preloaded_config(&preloaded_config, anchor, is_global, &anchors.dir),
+                take_preloaded_config(&preloaded_config, &target, &anchors.dir),
             )
         };
         // Resolve `.npmrc` / `pnpm-workspace.yaml` from the canonicalized
         // `--dir` rather than the process cwd, matching pnpm 11 (which
         // builds its `localPrefix` from `cliOptions.dir`, not `cwd`).
-        let config = || load_config(&anchors.dir, false);
         let config_self_update =
             || self.load_self_update_config(invocation, config_overrides, setup, anchors);
         let builtin_replaced_by_script = AtomicBool::new(false);
@@ -294,8 +343,10 @@ impl CliArgs {
             locations: CommandLocations::from(anchors),
             workspace: WorkspaceInvocation::from(&self.workspace),
             loaders: CommandLoaders {
-                config: &config,
-                global_config: &|| load_config(&anchors.global_config, true),
+                config: &|| load_config(ConfigScope::Dir),
+                dlx_config: &|| load_config(ConfigScope::Dlx),
+                global_config: &|| load_config(ConfigScope::PnpmHome),
+                global_packages_config: &|| load_config(ConfigScope::GlobalPackages),
                 config_self_update: &config_self_update,
             },
         };
@@ -320,6 +371,7 @@ impl CliArgs {
         let ConfigTarget {
             anchor,
             is_global,
+            command_target,
             store_use,
             warnings,
         } = *target;
@@ -330,7 +382,7 @@ impl CliArgs {
                 return Err(miette::Report::new(failure.error)).wrap_err("load configuration");
             }
             Some(Ok(_)) | None => store_use.load(|place_store| {
-                self.load_config_at(anchor, place_store, config_overrides, warnings)
+                self.load_config_at(anchor, command_target, place_store, config_overrides, warnings)
             })?,
         };
         warnings.report(&cfg, anchor)?;
@@ -377,9 +429,11 @@ impl CliArgs {
             &ProjectSelectors {
                 recursive: self.workspace.recursive,
                 recursive_from_command_line: self.workspace.recursive_from_command_line,
+                no_recursive_from_command_line: self.workspace.no_recursive_from_command_line,
                 recursive_by_default_command: setup.recursive_by_default,
                 filter: &self.workspace.selection.filter,
                 filter_prod: &self.workspace.selection.filter_prod,
+                filter_order: &self.workspace.selection.filter_order,
                 workspace_root: self.workspace.selection.workspace_root,
             },
         );
@@ -397,5 +451,7 @@ mod tests;
 mod routing;
 
 mod configuration;
+
+mod config_scope;
 
 mod context;

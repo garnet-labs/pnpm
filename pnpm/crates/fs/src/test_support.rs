@@ -1,10 +1,21 @@
 //! Coordination for tests that exercise real Windows filesystem retries.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{
+        HashMap,
+        hash_map::Entry,
+    },
     io,
-    path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, PoisonError},
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        LazyLock,
+        Mutex,
+        PoisonError,
+    },
 };
 
 type Observer = Arc<Mutex<Box<dyn FnMut(&io::Result<()>) + Send>>>;
@@ -22,11 +33,10 @@ static OBSERVERS: LazyLock<Mutex<HashMap<PathBuf, Observer>>> =
 /// operation on `path` itself or wait for another observer to run.
 /// Registration is removed when the operation returns or unwinds.
 pub fn with_retry_observer<Output>(
-    path: &Path,
+    path: PathBuf,
     observer: impl FnMut(&io::Result<()>) + Send + 'static,
     operation: impl FnOnce() -> Output,
 ) -> Output {
-    let path = path.to_path_buf();
     {
         let mut observers = OBSERVERS.lock().unwrap_or_else(PoisonError::into_inner);
         match observers.entry(path.clone()) {

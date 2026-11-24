@@ -13,16 +13,44 @@
 
 mod releases;
 
-use super::{InterpreterCommand, VersionRequest, command::interpreter_in};
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
-use pnpm_config::{Config, DEFAULT_PYTHON_DOWNLOAD_URL, RuntimeOnFail, Tool};
-use pnpm_crypto_shasums_file::{ShasumsFileItem, fetch_moving_shasums_file_cached};
-use pnpm_network::{AuthHeaders, ThrottledClient};
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
+use super::{
+    InterpreterCommand,
+    VersionRequest,
+    command::interpreter_in,
+};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
+use pnpm_config::{
+    Config,
+    DEFAULT_PYTHON_DOWNLOAD_URL,
+    RuntimeOnFail,
+    Tool,
+};
+use pnpm_crypto_shasums_file::{
+    ShasumsFileItem,
+    fetch_moving_shasums_file_cached,
+};
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
 use pnpm_tarball::BoundedReader;
 use std::{
     io::Write as _,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     time::Duration,
 };
 
@@ -160,7 +188,8 @@ pub(super) fn exact_version(
                     pep440_rs::Operator::Equal | pep440_rs::Operator::ExactEqual,
                 )
             })
-            .map(|specifier| specifier.version().clone())
+            .map(pep440_rs::VersionSpecifier::version)
+            .cloned()
     });
     required.or_else(|| {
         requested.filter(|version| {
@@ -313,6 +342,13 @@ fn builds_in(index: &[ShasumsFileItem]) -> Vec<Build> {
 /// something else or names it in a way pnpm will not use as a file name:
 /// the index decides what pnpm downloads and where it puts it, so every
 /// part of it is checked rather than trusted.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the triple is copied only for a row that names a usable build, and the caller checks every row of the index against one triple"
+    )
+)]
 fn read_build(item: &ShasumsFileItem, triple: &str, suffix: &str) -> Option<Build> {
     if item.integrity.len() != SHA256_INTEGRITY_LEN {
         return None;

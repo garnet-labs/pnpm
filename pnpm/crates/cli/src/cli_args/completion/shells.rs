@@ -31,11 +31,15 @@ impl CompletionShell {
 
 pub(super) const BASH_COMPLETION: &str = r#"###-begin-pnpm-completion-###
 _pnpm_completion() {
-  local line="$COMP_LINE" word completion replaced_prefix=""
+  local line="${COMP_LINE:0:COMP_POINT}" word remaining completion replaced_prefix=""
   local -a words=()
   local i
   for ((i = 0; i <= COMP_CWORD; i++)); do
     word="${COMP_WORDS[i]}"
+    if ((i == COMP_CWORD)); then
+      remaining="${line#"${line%%[![:space:]]*}"}"
+      word="${word:0:${#remaining}}"
+    fi
     if ((${#words[@]} > 0)) && [[ -n "$word" && "$line" != [[:space:]]* ]]; then
       words[${#words[@]}-1]+="$word"
     else
@@ -56,6 +60,9 @@ _pnpm_completion() {
     printf -v completion '%q' "${completion#"$replaced_prefix"}"
     COMPREPLY+=("$completion")
   done < <(COMP_CWORD="$((${#words[@]} - 1))" COMP_LINE="$COMP_LINE" COMP_POINT="$COMP_POINT" SHELL=bash pnpm completion-server -- "${words[@]}")
+  if [[ ${#COMPREPLY[@]} -eq 1 && ${COMPREPLY[0]} == */ ]]; then
+    compopt -o nospace 2>/dev/null || true
+  fi
 }
 complete -F _pnpm_completion pnpm pn
 ###-end-pnpm-completion-###
@@ -86,17 +93,24 @@ Register-ArgumentCompleter -Native -CommandName pnpm,pn -ScriptBlock {
   $env:SHELL = "pwsh"
   $env:COMP_LINE = $commandAst.ToString()
   $env:COMP_POINT = $cursorPosition
-  $elements = @($commandAst.CommandElements | ForEach-Object {
-    if ($_ -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $_.Value }
-    else { $_.Extent.Text }
-  })
-  $last = $commandAst.CommandElements[-1]
-  if ($last -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $last.Extent.Text -eq $wordToComplete) {
-    $wordToComplete = $last.Value
+  $elements = @()
+  foreach ($token in $commandAst.CommandElements) {
+    if ($token.Extent.StartOffset -ge $cursorPosition) { break }
+    if ($token.Extent.EndOffset -ge $cursorPosition) {
+      if ($token.Extent.EndOffset -eq $cursorPosition -and $token -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        $wordToComplete = $token.Value
+      } elseif ($token.Extent.EndOffset -gt $cursorPosition) {
+        $prefix = $token.Extent.Text.Substring(0, $cursorPosition - $token.Extent.StartOffset)
+        $parsed = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseInput($prefix, [ref]$parsed, [ref]$null)
+        $wordToComplete = if ($parsed[0] -is [System.Management.Automation.Language.StringToken]) { $parsed[0].Value } else { $prefix }
+      }
+      break
+    }
+    if ($token -is [System.Management.Automation.Language.StringConstantExpressionAst] -and ($token.StringConstantType -eq 'BareWord' -or $token.Value -notlike '~*')) { $elements += $token.Value }
+    else { $elements += $token.Extent.Text }
   }
-  if ($elements.Count -eq 0 -or $elements[-1] -ne $wordToComplete) {
-    $elements += $wordToComplete
-  }
+  $elements += $wordToComplete
   pnpm completion-server -- @elements | Where-Object { $_ } | ForEach-Object {
     $escaped = $_ -replace '\s|#|@|\$|;|,|''|\{|\}|\(|\)|"|`|\||<|>|&','`$&'
     [System.Management.Automation.CompletionResult]::new($escaped, $_, 'ParameterValue', $_)
@@ -108,9 +122,18 @@ Register-ArgumentCompleter -Native -CommandName pnpm,pn -ScriptBlock {
 pub(super) const ZSH_COMPLETION: &str = r#"#compdef pnpm pn
 ###-begin-pnpm-completion-###
 _pnpm_completion() {
-  local reply
-  reply=("${(@f)$(COMP_CWORD=$((CURRENT-1)) COMP_LINE="$BUFFER" COMP_POINT="$CURSOR" SHELL=zsh pnpm completion-server -- "${words[@]}")}")
-  _describe 'values' reply
+  local -a reply dirs values tokens
+  tokens=("${(@)words[1,CURRENT]}")
+  tokens[-1]="$PREFIX"
+  reply=("${(@f)$(COMP_CWORD=$((CURRENT-1)) COMP_LINE="$BUFFER" COMP_POINT="$CURSOR" SHELL=zsh pnpm completion-server -- "${tokens[@]}")}")
+  dirs=(${(M)reply:#*/})
+  values=(${reply:#*/})
+  if (( ${#dirs} )); then
+    _describe 'values' dirs -S ''
+  fi
+  if (( ${#values} )); then
+    _describe 'values' values
+  fi
 }
 compdef _pnpm_completion pnpm pn
 ###-end-pnpm-completion-###

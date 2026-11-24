@@ -185,6 +185,25 @@ Directories inside the pnpm home are skipped, since global installs are not proj
 
 If the project provides nothing, or the lookup is declined, the globally installed version runs. Commands never fail merely because dispatch did not apply.
 
+### Runtime download mirrors
+
+Project-aware global runtime commands download their pinned versions using the [global configuration file](./cli/config.md) and environment settings. They do not automatically load the project's `pnpm-workspace.yaml`. A project's mirror settings still apply to runtime dependencies installed by `pnpm install`.
+
+An explicit `PNPM_CONFIG_WORKSPACE_DIR` or `NPM_CONFIG_WORKSPACE_DIR` environment setting selects a workspace whose `pnpm-workspace.yaml` can supply settings, including `nodeDownloadMirrors`. Lowercase spellings of these variables also work.
+
+For example, to use a Node.js mirror for the global `node` command, put this in the global configuration file:
+
+```yaml title="config.yaml"
+nodeDownloadMirrors:
+  release: https://npmmirror.com/mirrors/node/
+```
+
+Alternatively, configure [`tools.node.channels.release`](./settings/cli.md#tools).
+
+If `pnpm install` prints `pnpm: failed to prepare node@runtime:...`, check whether `node --version` fails the same way inside the project. A command launched through `node` can fail while preparing Node.js before the install starts. Check the mirror settings in the global configuration and any explicitly selected workspace, plus the `PNPM_CONFIG_TOOLS` and `PNPM_CONFIG_NODE_DOWNLOAD_MIRRORS` environment variables. See [mirror-setting precedence](./settings/cli.md#nodedownloadmirrors).
+
+Runtime preparation failures explain which configuration applies, including workspace-directory environment overrides. For Node.js, the diagnostic also lists the global mirror settings and environment variables to check.
+
 ### `.nvmrc` and `.node-version`
 
 Added in: v12.7.0
@@ -277,6 +296,10 @@ pnpm add -g .
 
 This registers the package's `bin` entries so they can be invoked from anywhere. See [`pnpm link`](./cli/link.md#add-a-binary-globally) for more details.
 
+## Configuration
+
+Global packages use the [global configuration](./configuring.md#global-configuration). To change a setting only for global packages, set it under [`globalPackagesConfig`](./configuring.md#settings-for-global-packages) in the global `config.yaml`.
+
 ## Build script approval
 
 Global packages that have build scripts (e.g., `postinstall`) require approval. When you install a global package that needs to run build scripts, pnpm will prompt you to approve or deny the build interactively.
@@ -289,8 +312,8 @@ pnpm add -g --allow-build=esbuild esbuild
 
 [`pnpm approve-builds --global`](./cli/approve-builds.md#--global--g)
 lets you decide after the fact instead. It collects the packages awaiting approval from every
-install group, asks about them once, and writes one `allowBuilds` policy into the
-`pnpm-workspace.yaml` of the global packages directory, then rebuilds only the
+install group, asks about them once, and writes the decisions to
+`globalPackagesConfig.permissions` in the global `config.yaml`, then rebuilds only the
 groups that contain something you approved:
 
 ```sh

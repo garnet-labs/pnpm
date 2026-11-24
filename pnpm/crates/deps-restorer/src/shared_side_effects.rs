@@ -1,38 +1,81 @@
 mod platform;
 use platform::{
-    ArtifactPlatform, artifact_platform, digest_integrity, package_version, patch_hash,
+    ArtifactPlatform,
+    artifact_platform,
+    digest_integrity,
+    package_version,
+    patch_hash,
 };
 
 mod persisted;
 use persisted::{
-    decoded_trusted_keys, insert_side_effects_map, quarantine_remote_side_effects, store_holds,
-    stored_remote_side_effects_are_verified, stored_remote_side_effects_blobs_are_valid,
+    decoded_trusted_keys,
+    insert_side_effects_map,
+    quarantine_remote_side_effects,
+    store_holds,
+    stored_remote_side_effects_are_verified,
+    stored_remote_side_effects_blobs_are_valid,
     take_persisted_remote_side_effects,
 };
 
 mod remote;
 use remote::{
-    ApplyResolvedRemoteArtifacts, RemoteCacheSetup, apply_resolved_remote_artifacts,
-    remote_cache_setup, resolve_remote_artifacts,
+    ApplyResolvedRemoteArtifacts,
+    RemoteCacheSetup,
+    apply_resolved_remote_artifacts,
+    remote_cache_setup,
+    resolve_remote_artifacts,
 };
 
 mod planning;
-use planning::{CandidatePlan, plan_candidate_groups, plan_eligible_roots};
+use planning::{
+    CandidatePlan,
+    plan_candidate_groups,
+    plan_eligible_roots,
+};
 
 use crate::{
-    AllowBuildPolicy, RemoteSideEffectsQuarantineBySnapshot, RequiresBuildBySnapshot,
-    SideEffectsBySnapshot, SideEffectsMapsBySnapshot, StoreIndexKeysBySnapshot,
+    AllowBuildPolicy,
+    RemoteSideEffectsQuarantineBySnapshot,
+    RequiresBuildBySnapshot,
+    SideEffectsBySnapshot,
+    SideEffectsMapsBySnapshot,
+    StoreIndexKeysBySnapshot,
+    artifact_signer_settings,
+    artifact_store_options,
 };
 use pnpm_config::Config;
-use pnpm_lockfile::{PackageKey, PackageMetadata, ProjectSnapshot, SnapshotEntry};
-use pnpm_pnpr_client::{
-    ARTIFACT_KIND, ArtifactBlobSource, ArtifactCandidate, ArtifactFile, ArtifactManifest,
-    ArtifactPayload, ArtifactPublication, ArtifactSigner, ArtifactStore, ArtifactSubject,
-    CompatibilityConstraints, OwnerScope, PackageIdentity,
+use pnpm_lockfile::{
+    PackageKey,
+    PackageMetadata,
+    ProjectSnapshot,
+    SnapshotEntry,
 };
-use pnpm_store_dir::{CafsFileInfo, StoreIndexWriter};
+use pnpm_pnpr_client::{
+    ARTIFACT_KIND,
+    ArtifactBlobSource,
+    ArtifactCandidate,
+    ArtifactFile,
+    ArtifactManifest,
+    ArtifactPayload,
+    ArtifactPublication,
+    ArtifactSigner,
+    ArtifactStore,
+    ArtifactSubject,
+    CompatibilityConstraints,
+    OwnerScope,
+    PackageIdentity,
+};
+use pnpm_store_dir::{
+    CafsFileInfo,
+    StoreIndexWriter,
+};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
     sync::Arc,
 };
 
@@ -50,12 +93,14 @@ pub struct SharedSideEffectsPublisher {
 pub(crate) struct ApplySharedSideEffectsOptions<'a> {
     pub cached: SharedSideEffectsCacheRows<'a>,
     pub config: &'a Config,
-    pub snapshots: &'a HashMap<PackageKey, SnapshotEntry>,
-    pub packages: &'a HashMap<PackageKey, PackageMetadata>,
+    /// The wanted lockfile's snapshots and packages.
+    pub wanted: (&'a HashMap<PackageKey, SnapshotEntry>, &'a HashMap<PackageKey, PackageMetadata>),
     pub requires_build_by_snapshot: &'a RequiresBuildBySnapshot,
     pub allow_build_policy: &'a AllowBuildPolicy,
     pub side_effects_maps_by_snapshot: &'a mut SideEffectsMapsBySnapshot,
     pub store_index_writer: &'a Arc<StoreIndexWriter>,
+    /// The platforms the install links, with the CLI's overrides.
+    pub supported_architectures: Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
 }
 
 pub(crate) struct PreparedSharedSideEffects {
@@ -104,11 +149,12 @@ pub(crate) async fn prepare_shared_side_effects(
     let groups = plan_candidate_groups(
         &CandidatePlan {
             config: options.config,
-            snapshots: options.snapshots,
-            packages: options.packages,
+            snapshots: options.wanted.0,
+            packages: options.wanted.1,
             setup: &setup,
             side_effects_by_snapshot: options.cached.by_snapshot,
             store_index_keys_by_snapshot: options.cached.store_index_keys_by_snapshot,
+            supported_architectures: options.supported_architectures,
         },
         roots,
         persisted_remote,
@@ -182,14 +228,14 @@ pub(crate) fn shared_side_effects_publisher(
 ) -> Option<SharedSideEffectsPublisher> {
     let packages = &config.remote_side_effects_cache.as_ref()?.packages;
     let settings = config.remote_cache_settings();
-    if settings.publish != Some(true) {
+    if !settings.publish.unwrap_or(false) {
         return None;
     }
     let platform = artifact_platform(importers)?;
     let organization = non_empty(settings.org.as_deref()?)?.to_string();
-    let store = ArtifactStore::from_config(config, &settings).ok()??;
+    let store = ArtifactStore::from_options(artifact_store_options(config, &settings)).ok()??;
     Some(SharedSideEffectsPublisher {
-        signer: ArtifactSigner::from_settings(&settings).ok()?,
+        signer: ArtifactSigner::from_settings(artifact_signer_settings(&settings)).ok()?,
         store,
         organization,
         packages: packages.iter().cloned().collect(),

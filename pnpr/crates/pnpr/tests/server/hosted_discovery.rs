@@ -1,11 +1,32 @@
 use super::{
-    AccessList, AuthState, Body, Ecosystem, PackagePattern, PackageRules, Registries, Registry,
-    Request, ServiceExt, StatusCode, TempDir, Value, access_rule, body_json, config_for, header,
-    hosted_with_access, json, router, router_config, router_with_auth, seed_hosted,
-    sha512_integrity, to_bytes,
+    AccessList,
+    AuthState,
+    Body,
+    Ecosystem,
+    PackagePattern,
+    PackageRules,
+    Registries,
+    Registry,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    Value,
+    access_rule,
+    body_json,
+    config_for,
+    header,
+    hosted_with_access,
+    json,
+    router,
+    router_config,
+    router_with_auth,
+    seed_hosted,
+    sha512_integrity,
+    to_bytes,
 };
 use crate::tokens::issue_token;
-use pnpr_storage::layout::{local_blob_path, local_package_dir};
+use command_extra::CommandExtra;
 
 #[tokio::test]
 async fn search_paginates_across_hosted_and_upstream_sources() {
@@ -194,12 +215,15 @@ async fn starved_upstream_still_counts_toward_the_search_total() {
 /// `/~<name>/...` (RFC "registries", implementation point 7): dist-tag
 /// read/add/remove, whoami, search, the version manifest, and the whole
 /// unpublish flow. The registry here is deliberately *not* reachable from any
-/// default target — without the registry-addressed surface these operations
+/// default target, without the registry-addressed surface these operations
 /// would be impossible for it.
 #[tokio::test]
 async fn registry_addressed_surface_serves_dist_tags_unpublish_whoami_search_and_version_manifest()
 {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
 
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
@@ -209,7 +233,10 @@ async fn registry_addressed_surface_serves_dist_tags_unpublish_whoami_search_and
         vec![("acme".to_string(), Registry::Hosted { patterns: vec![] })].into_iter().collect(),
         None,
     );
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(
+        &config,
+        &[("alice", "password"), ("bob", "password"), ("ci", "password")],
+    );
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
     let authed = |request: axum::http::request::Builder| {
@@ -346,28 +373,40 @@ async fn registry_addressed_surface_serves_dist_tags_unpublish_whoami_search_and
     );
 
     assert!(
-        local_blob_path(
+        pnpr_fixtures::read_hosted_file(
             tmp.path(),
-            "acme",
-            pnpr_storage::Ecosystem::Npm,
+            ("acme", pnpr_storage::Ecosystem::Npm),
             "@acme/widget",
             "widget-1.0.0.tgz"
         )
-        .exists(),
+        .is_some(),
     );
 
     // The unpublish flow: PUT back a packument without the version, delete
     // its tarball (the unencoded scoped 7-segment form), then delete the
-    // package — all through the registry.
+    // package; all through the registry.
+    let current = app
+        .clone()
+        .oneshot(
+            authed(Request::get("/npm/~acme/@acme%2Fwidget"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let current = body_json(current.into_body()).await;
     let put_back = app
         .clone()
         .oneshot(
-            authed(Request::put("/npm/~acme/@acme%2Fwidget/-rev/1"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({ "name": "@acme/widget", "versions": {}, "dist-tags": {} }).to_string(),
-                ))
-                .unwrap(),
+            authed(Request::put(format!(
+                "/npm/~acme/@acme%2Fwidget/-rev/{}",
+                current["_rev"].as_str().unwrap(),
+            )))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "name": "@acme/widget", "versions": {}, "dist-tags": {} }).to_string(),
+            ))
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -383,19 +422,18 @@ async fn registry_addressed_surface_serves_dist_tags_unpublish_whoami_search_and
         .unwrap();
     assert_eq!(delete_tar.status(), StatusCode::CREATED);
     assert!(
-        !local_blob_path(
+        pnpr_fixtures::read_hosted_file(
             tmp.path(),
-            "acme",
-            pnpr_storage::Ecosystem::Npm,
+            ("acme", pnpr_storage::Ecosystem::Npm),
             "@acme/widget",
             "widget-1.0.0.tgz"
         )
-        .exists(),
+        .is_none(),
     );
     let delete_pkg = app
         .clone()
         .oneshot(
-            authed(Request::delete("/npm/~acme/@acme%2Fwidget/-rev/1"))
+            authed(Request::delete("/npm/~acme/@acme%2Fwidget"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -403,14 +441,19 @@ async fn registry_addressed_surface_serves_dist_tags_unpublish_whoami_search_and
         .unwrap();
     assert_eq!(delete_pkg.status(), StatusCode::CREATED);
     assert!(
-        !local_package_dir(tmp.path(), "acme", pnpr_storage::Ecosystem::Npm, "@acme/widget")
-            .exists(),
+        pnpr_fixtures::read_hosted_document(
+            tmp.path(),
+            "acme",
+            pnpr_storage::Ecosystem::Npm,
+            "@acme/widget"
+        )
+        .is_none(),
     );
 }
 
 /// Path-less responses resolved to a private registry carry the same
 /// `Cache-Control: private, no-store` / `Vary: Authorization` headers the
-/// `/~<name>/` surface applies — same content, same defense against a shared
+/// `/~<name>/` surface applies, same content, same defense against a shared
 /// HTTP cache. A public resolution stays cacheable.
 #[tokio::test]
 async fn pathless_private_registry_responses_carry_private_cache_headers() {
@@ -423,7 +466,10 @@ async fn pathless_private_registry_responses_carry_private_cache_headers() {
         vec![("acme".to_string(), Registry::Hosted { patterns: vec![] })].into_iter().collect(),
         Some("acme".to_string()),
     );
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(
+        &config,
+        &[("alice", "password"), ("bob", "password"), ("ci", "password")],
+    );
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -447,7 +493,8 @@ async fn pathless_private_registry_responses_carry_private_cache_headers() {
             response
                 .headers()
                 .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
+                .map(reqwest::header::HeaderValue::to_str)
+                .and_then(Result::ok),
             Some("private, no-store"),
             "missing private cache header on {path}",
         );
@@ -455,7 +502,8 @@ async fn pathless_private_registry_responses_carry_private_cache_headers() {
             response
                 .headers()
                 .get(header::VARY)
-                .and_then(|value| value.to_str().ok()),
+                .map(reqwest::header::HeaderValue::to_str)
+                .and_then(Result::ok),
             if path == "/npm/@acme/widget" {
                 Some("Accept, Authorization")
             } else {
@@ -488,7 +536,8 @@ async fn pathless_private_registry_responses_carry_private_cache_headers() {
         response
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("public, max-age=60"),
         "a public path-less response must stay cacheable",
     );
@@ -496,7 +545,7 @@ async fn pathless_private_registry_responses_carry_private_cache_headers() {
 
 /// A per-package ACL that denies anonymous callers makes the path-less
 /// response vary by `Authorization` even when the source registry itself is
-/// public, so it must carry the private-cache headers — otherwise a shared
+/// public, so it must carry the private-cache headers; otherwise a shared
 /// HTTP cache could replay an authenticated 200 to an anonymous caller.
 #[tokio::test]
 async fn pathless_acl_gated_package_carries_private_cache_headers() {
@@ -514,7 +563,10 @@ async fn pathless_acl_gated_package_carries_private_cache_headers() {
         .expect("hosted acme")
         .rules
         .push_rule(access_rule("@acme/widget", "$authenticated"));
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(
+        &config,
+        &[("alice", "password"), ("bob", "password"), ("ci", "password")],
+    );
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -532,7 +584,8 @@ async fn pathless_acl_gated_package_carries_private_cache_headers() {
         response
             .headers()
             .get(header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("private, no-store"),
         "an ACL-gated path-less response must not be shared-cacheable",
     );
@@ -540,7 +593,8 @@ async fn pathless_acl_gated_package_carries_private_cache_headers() {
         response
             .headers()
             .get(header::VARY)
-            .and_then(|value| value.to_str().ok()),
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok),
         Some("Accept, Authorization"),
     );
 }
@@ -548,7 +602,7 @@ async fn pathless_acl_gated_package_carries_private_cache_headers() {
 #[test]
 fn pipeline_viewer_renders_publisher_data_as_text() {
     let output = std::process::Command::new("node")
-        .args(["--test", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pipeline_ui.mjs")])
+        .with_args(["--test", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pipeline_ui.mjs")])
         .output()
         .unwrap();
     assert!(
@@ -668,8 +722,11 @@ async fn registry_directory_filters_private_registries_and_routing_details() {
         .collect(),
         Some("main".to_string()),
     )
-    .with_ecosystem("crates", Ecosystem::Cargo);
-    let auth = AuthState::in_memory();
+    .with_ecosystem("crates".to_owned(), Ecosystem::Cargo);
+    let auth = crate::tokens::seeded_auth(
+        &config,
+        &[("alice", "password"), ("bob", "password"), ("ci", "password")],
+    );
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
     for authenticated in [false, true] {

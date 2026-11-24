@@ -1,4 +1,7 @@
-use pnpm_network::{MetadataCacheScope, UpstreamRouteHook};
+use pnpm_network::{
+    MetadataCacheScope,
+    UpstreamRouteHook,
+};
 use pnpr_route::RouteHook;
 use std::sync::Arc;
 
@@ -6,8 +9,8 @@ use std::sync::Arc;
 /// package, so without this a route rule that names one would not reach
 /// the classification a resolve's fetch is made under.
 ///
-/// The name bound in is the ecosystem's canonical spelling of it — a
-/// crate's lowercase name, a Python project's PEP 503 name — which is what
+/// The name bound in is the ecosystem's canonical spelling of it (a
+/// crate's lowercase name, a Python project's PEP 503 name) which is what
 /// each registry surface matches its own rules against. It names a package,
 /// never a version of one.
 pub(super) struct PackageRoute {
@@ -22,8 +25,20 @@ impl PackageRoute {
 }
 
 impl UpstreamRouteHook for PackageRoute {
+    fn fetch_local(
+        &self,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+    ) -> Option<pnpm_network::LocalResponse> {
+        self.hook.fetch_local(url, headers)
+    }
+
     fn authorize(&self, url: &str, _package: Option<&str>) -> Option<String> {
         self.hook.authorize(url, Some(&self.canonical_name))
+    }
+
+    fn request_headers(&self, url: &str, _package: Option<&str>) -> reqwest::header::HeaderMap {
+        self.hook.request_headers(url, Some(&self.canonical_name))
     }
 
     fn allows_fetch(&self, url: &str) -> bool {

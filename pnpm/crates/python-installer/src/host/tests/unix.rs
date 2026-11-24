@@ -1,7 +1,13 @@
-use super::super::{inspect, install};
+use super::super::{
+    inspect,
+    install,
+};
 use base64::{
     Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    engine::general_purpose::{
+        STANDARD,
+        URL_SAFE_NO_PAD,
+    },
 };
 use pnpm_config::PackageImportMethod;
 use std::{
@@ -9,14 +15,17 @@ use std::{
     fmt::Write as _,
     fs,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 fn unpacked_wheel(root: &Path, mismatched_wheel_hash: bool) -> BTreeMap<String, PathBuf> {
     let mut files = BTreeMap::new();
     let mut record = String::new();
     for (name, body) in [
-        ("alpha-1.0.dist-info/METADATA", "Metadata-Version: 2.4\nName: alpha\nVersion: 1.0\n"),
+        ("alpha-1.0.dist-info/METADATA", "Metadata-Version: 1.1\nName: alpha\nVersion: 1.0\n"),
         (
             "alpha-1.0.dist-info/WHEEL",
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",

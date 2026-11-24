@@ -1,4 +1,7 @@
-use super::{ByteSize, parse_byte_size};
+use super::{
+    ByteSize,
+    parse_byte_size,
+};
 
 #[test]
 fn parse_byte_size_handles_integers_and_units() {
@@ -25,6 +28,14 @@ fn parse_byte_size_rejects_invalid_values() {
     assert_eq!(parse_byte_size("-10MB"), None);
     assert_eq!(parse_byte_size("invalid"), None);
     assert_eq!(parse_byte_size("100xyz"), None);
+}
+
+#[test]
+fn parse_byte_size_rejects_sizes_that_overflow_u64() {
+    assert_eq!(parse_byte_size("18446744073709551615"), Some(u64::MAX));
+    assert_eq!(parse_byte_size("18446744073709551616"), None);
+    assert_eq!(parse_byte_size("16777216TiB"), None);
+    assert_eq!(parse_byte_size("16384PiB"), None);
 }
 
 #[test]

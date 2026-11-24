@@ -14,12 +14,21 @@ use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use mockito::Matcher;
 use pnpr_fixtures::MockConfigPresets;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 
 const STAGE_ID: &str = "1de6f3db-2ed9-4d72-b3dd-8f0e2b474a2f";
@@ -145,7 +154,7 @@ fn list_stops_paginating_at_the_fail_safe_page_cap() {
         .expect(1000)
         .create();
 
-    let output = stage(dir.path(), &["list", "--json", "--reporter=silent"]);
+    let output = stage(dir.path(), &["list", "--json"]);
 
     mock.assert();
     assert_success(&output);
@@ -160,6 +169,7 @@ fn list_uses_package_scoped_auth_for_package_filters() {
     let mut server = mockito::Server::new();
     let registry = format!("{}/", server.url());
     write_registry_config(dir.path(), &registry);
+    fs::write(dir.path().join("package.json"), "{").expect("write invalid manifest");
     let host = registry.strip_prefix("http://").unwrap_or(&registry);
     let auth_file = dir.path().join("auth-npmrc");
     fs::write(
@@ -172,7 +182,7 @@ fn list_uses_package_scoped_auth_for_package_filters() {
         .match_query(Matcher::Any)
         .match_header("authorization", "Bearer scoped-token")
         .with_body(json!({ "items": [], "page": 0, "perPage": 100, "total": 0 }).to_string())
-        .expect(1)
+        .expect(2)
         .create();
 
     let mut command = pacquet(dir.path());
@@ -180,13 +190,20 @@ fn list_uses_package_scoped_auth_for_package_filters() {
     let output = command
         .with_arg("--npmrc-auth-file")
         .with_arg(&auth_file)
-        .with_arg("stage")
-        .with_args(["list", "@scope/example-package"])
+        .with_args(["stage", "list", "--registry", &registry, "@scope/example-package"])
         .output()
         .expect("spawn pacquet stage");
 
-    mock.assert();
     assert_success(&output);
+    write_project(dir.path(), &registry, &json!({ "name": "@scope/example-package" }));
+    let unfiltered = pacquet(dir.path())
+        .with_arg("--npmrc-auth-file")
+        .with_arg(&auth_file)
+        .with_args(["stage", "list", "--registry", &registry])
+        .output()
+        .expect("list with local package credentials");
+    assert_success(&unfiltered);
+    mock.assert();
 }
 
 #[test]
@@ -344,11 +361,9 @@ fn package_tarball(manifest: &Value) -> Vec<u8> {
     _utils::gzipped_tarball(&[("package/package.json", &manifest)])
 }
 
-// --------------------------------------------------------------------
 // End-to-end lifecycle against a hosted in-process pnpr. The shared
 // `pnpm_testing_utils` registry runs in proxy mode and rejects
 // publishes, so these tests serve their own static-mode instance.
-// --------------------------------------------------------------------
 
 /// A hosted pnpr on an ephemeral localhost port, backed by a fresh
 /// storage tempdir (returned so it outlives the test), and its npm registry
@@ -362,7 +377,7 @@ fn spawn_hosted_registry() -> (String, tempfile::TempDir) {
     let url = format!("http://{listen}/");
     let mut config = pnpr::Config::static_serve(listen, storage.path().to_path_buf());
     config.http.public_url = url.trim_end_matches('/').to_string();
-    config.identity.auth.htpasswd.max_users = pnpr::MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = pnpr::MaxUsers::Unlimited;
     std::thread::Builder::new()
         .name("stage-e2e-registry".to_string())
         .spawn(move || {
@@ -404,7 +419,7 @@ fn add_user(registry: &str) -> String {
     let body = json!({
         "_id": "org.couchdb.user:alice",
         "name": "alice",
-        "password": "secret",
+        "password": "secret123",
         "email": "alice@example.com",
         "type": "user",
         "roles": [],
@@ -477,10 +492,11 @@ fn stage_lifecycle_against_pnpr_publishes_only_on_approval() {
         &json!({ "name": "@stage-e2e/lifecycle", "version": "1.0.0" }),
     );
 
+    write_registry_config(dir.path(), "http://127.0.0.1:1/");
     let publish = stage_with_auth(
         dir.path(),
         &auth_file,
-        &["publish", "--json", "--no-git-checks", "--reporter=silent"],
+        &["publish", "--json", "--no-git-checks", "--registry", &registry],
     );
     assert_success(&publish);
     let keyed: Value =
@@ -495,7 +511,12 @@ fn stage_lifecycle_against_pnpr_publishes_only_on_approval() {
     // Held back: not installable until approved.
     assert_eq!(packument_status(&registry, &token, "@stage-e2e/lifecycle"), 404);
 
-    let list = stage_with_auth(dir.path(), &auth_file, &["list", "--json", "--reporter=silent"]);
+    fs::write(
+        dir.path().join(".npmrc"),
+        format!("registry=http://127.0.0.1:1/\n@stage-e2e:registry={registry}\n"),
+    )
+    .unwrap();
+    let list = stage_with_auth(dir.path(), &auth_file, &["list", "--json"]);
     assert_success(&list);
     let listed: Value =
         serde_json::from_str(&String::from_utf8_lossy(&list.stdout)).expect("list JSON output");
@@ -510,11 +531,12 @@ fn stage_lifecycle_against_pnpr_publishes_only_on_approval() {
     assert!(stdout.contains("package name: @stage-e2e/lifecycle"), "stdout: {stdout}");
     assert!(stdout.contains("staged by: alice (user)"), "stdout: {stdout}");
 
-    let download = stage_with_auth(
+    write_project(
         dir.path(),
-        &auth_file,
-        &["download", &stage_id, "--json", "--reporter=silent"],
+        "http://127.0.0.1:1/",
+        &json!({ "name": "@stage-e2e/lifecycle", "publishConfig": { "registry": registry } }),
     );
+    let download = stage_with_auth(dir.path(), &auth_file, &["download", &stage_id, "--json"]);
     assert_success(&download);
     let downloaded: Value = serde_json::from_str(&String::from_utf8_lossy(&download.stdout))
         .expect("download JSON output");
@@ -530,6 +552,10 @@ fn stage_lifecycle_against_pnpr_publishes_only_on_approval() {
         "the tarball must be written",
     );
 
+    assert_success(&stage_with_auth(dir.path(), &auth_file, &["list", "@stage-e2e/lifecycle"]));
+    let unconfirmed =
+        stage_with_auth(dir.path(), &auth_file, &["approve", &stage_id, "--otp", "123456"]);
+    assert_failure_with_code(&unconfirmed, "ERR_PNPM_STAGE_OTP_REGISTRY_REQUIRED");
     let approve = stage_with_auth(dir.path(), &auth_file, &["approve", &stage_id]);
     assert_success(&approve);
     assert_eq!(
@@ -634,11 +660,82 @@ fn stage_list_paginates_against_pnpr() {
         }
     });
 
-    let list = stage_with_auth(dir.path(), &auth_file, &["list", "--json", "--reporter=silent"]);
+    let list = stage_with_auth(dir.path(), &auth_file, &["list", "--json"]);
     assert_success(&list);
     let listed: Value =
         serde_json::from_str(&String::from_utf8_lossy(&list.stdout)).expect("list JSON output");
     assert_eq!(listed.as_array().map(Vec::len), Some(101));
+}
+
+#[test]
+fn stage_publish_json_keeps_stdout_parseable_on_dry_run_empty_workspace_and_error() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let registry = format!("{}/", server.url());
+    write_project(dir.path(), &registry, &json!({ "name": "demo-json", "version": "1.0.0" }));
+
+    let dry_run = stage(dir.path(), &["publish", "--dry-run", "--no-git-checks", "--json"]);
+    assert_success(&dry_run);
+    let dry_run_json: Value =
+        serde_json::from_slice(&dry_run.stdout).expect("dry-run stdout must be pure JSON");
+    assert_eq!(dry_run_json["demo-json"]["version"], "1.0.0");
+
+    let ws = tempfile::tempdir().expect("recursive workspace");
+    fs::write(ws.path().join(".npmrc"), format!("registry={registry}\n")).expect("write .npmrc");
+    fs::write(ws.path().join("pnpm-workspace.yaml"), "packages:\n  - pkg\n")
+        .expect("write pnpm-workspace.yaml");
+    let pkg_dir = ws.path().join("pkg");
+    fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    fs::write(
+        pkg_dir.join("package.json"),
+        json!({ "name": "already-published", "version": "1.0.0" }).to_string(),
+    )
+    .expect("write pkg package.json");
+    let packument = server
+        .mock("GET", "/already-published")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "name": "already-published",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "already-published",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{registry}already-published/-/already-published-1.0.0.tgz"),
+                        },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .create();
+    let mut recursive = pacquet(ws.path());
+    apply_test_registry(&mut recursive, ws.path());
+    let empty_publish = recursive
+        .with_args(["--reporter=default", "-r", "stage", "publish", "--no-git-checks", "--json"])
+        .output()
+        .expect("spawn recursive stage publish");
+    packument.assert();
+    assert_success(&empty_publish);
+    let empty_json: Value = serde_json::from_slice(&empty_publish.stdout)
+        .expect("empty recursive stage publish stdout must be pure JSON");
+    assert_eq!(empty_json, json!({}));
+
+    let bad_dir = tempfile::tempdir().expect("bad workspace");
+    write_project(bad_dir.path(), &registry, &json!({ "name": "missing-version" }));
+    let failed = stage(bad_dir.path(), &["publish", "--no-git-checks", "--json"]);
+    assert!(!failed.status.success(), "missing version must fail");
+    assert!(
+        failed.stderr.is_empty(),
+        "JSON error mode must not print miette output on stderr: {}",
+        String::from_utf8_lossy(&failed.stderr),
+    );
+    let err_json: Value =
+        serde_json::from_slice(&failed.stdout).expect("failed stage --json stdout must be JSON");
+    assert_eq!(err_json["error"]["code"], "ERR_PNPM_PACKAGE_VERSION_NOT_FOUND");
 }
 
 mod approval;

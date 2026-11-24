@@ -1,18 +1,28 @@
 use super::{
-    BTreeMap, DateTime, Digest, HashMap, JsonValue, Sha256, TrustPolicy, Utc,
+    BTreeMap,
+    Digest,
+    HashMap,
+    JsonValue,
+    Pipe,
+    ReleaseAgeCheck,
+    Sha256,
+    Timestamp,
+    TrustCheck,
+    TrustPolicy,
+    VerificationMetadataClient,
+    VerificationRegistryRoutes,
     VerificationReleaseAgeOptions,
+    normalized_registry_key,
 };
 
-pub(super) fn sorted_unique(values: &[String]) -> Vec<String> {
-    let mut deduped: Vec<String> = values.to_vec();
+pub(super) fn sorted_unique(values: Vec<String>) -> Vec<String> {
+    let mut deduped = values;
     deduped.sort();
     deduped.dedup();
     deduped
 }
 
-pub(super) fn named_registries_routing_digest(
-    registries_by_prefix: &HashMap<String, String>,
-) -> String {
+fn named_registries_routing_digest(registries_by_prefix: &HashMap<String, String>) -> String {
     let sorted: BTreeMap<&str, &str> = registries_by_prefix
         .iter()
         .map(|(alias, registry)| (alias.as_str(), registry.as_str()))
@@ -21,22 +31,40 @@ pub(super) fn named_registries_routing_digest(
     format!("{:x}", Sha256::digest(encoded))
 }
 
-/// Argument bundle for [`build_policy_snapshot`].
-#[derive(Clone, Copy)]
-pub(super) struct BuildPolicySnapshot<'a> {
-    pub(super) minimum_release_age: u64,
-    pub(super) sorted_min_age_excludes: &'a [String],
-    pub(super) ignore_missing_time_field: bool,
-    pub(super) trust_policy: Option<TrustPolicy>,
-    pub(super) sorted_trust_excludes: &'a [String],
-    pub(super) trust_policy_ignore_after: Option<u64>,
-    pub(super) named_registries_routing: &'a str,
+fn registries_routing_digest(registries: &HashMap<String, String>) -> String {
+    let sorted: BTreeMap<&str, String> = registries
+        .iter()
+        .map(|(scope, registry)| (scope.as_str(), canonical_registry_url(registry)))
+        .collect();
+    let encoded = serde_json::to_vec(&sorted).expect("registry mappings are serializable");
+    format!("{:x}", Sha256::digest(encoded))
 }
 
-pub(super) fn build_policy_snapshot(
-    opts: &BuildPolicySnapshot<'_>,
-) -> serde_json::Map<String, JsonValue> {
-    let mut map = serde_json::Map::new();
+fn canonical_registry_url(registry: &str) -> String {
+    normalized_registry_key(registry)
+        .filter(|key| !key.starts_with("null/"))
+        .unwrap_or_else(|| {
+            if registry.ends_with('/') { registry.to_string() } else { format!("{registry}/") }
+        })
+}
+
+fn registry_options_digest(
+    registry_options_by_url: Option<&BTreeMap<String, pnpm_lockfile::RegistryOptions>>,
+) -> String {
+    let non_default: BTreeMap<&str, &pnpm_lockfile::RegistryOptions> = registry_options_by_url
+        .into_iter()
+        .flatten()
+        .filter(|(_, options)| **options != pnpm_lockfile::RegistryOptions::default())
+        .map(|(url, options)| (url.as_str(), options))
+        .collect();
+    let encoded = serde_json::to_vec(&non_default).expect("registry options are serializable");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+fn insert_structural_and_routing_policy(
+    map: &mut serde_json::Map<String, JsonValue>,
+    routing: &VerificationRegistryRoutes,
+) {
     // Marks runs that enforced the (unconditional) tarball-URL binding so
     // `can_trust_past_check` rejects pre-rule cache records and re-verifies.
     map.insert("tarballUrlBinding".to_string(), JsonValue::Bool(true));
@@ -46,50 +74,112 @@ pub(super) fn build_policy_snapshot(
     map.insert("variationResolutionsVerified".to_string(), JsonValue::Bool(true));
     map.insert(
         "namedRegistriesRouting".to_string(),
-        JsonValue::String(opts.named_registries_routing.to_string()),
+        JsonValue::String(named_registries_routing_digest(&routing.registries_by_prefix)),
     );
-    map.insert("minimumReleaseAge".to_string(), JsonValue::from(opts.minimum_release_age));
+    map.insert(
+        "registriesRouting".to_string(),
+        JsonValue::String(registries_routing_digest(&routing.registries)),
+    );
+    map.insert(
+        "registryOptions".to_string(),
+        JsonValue::String(registry_options_digest(routing.registry_options_by_url.as_ref())),
+    );
+}
+
+pub(super) fn build_policy_snapshot(
+    release_age: &ReleaseAgeCheck,
+    trust: &TrustCheck,
+    routing: &VerificationRegistryRoutes,
+    metadata: &VerificationMetadataClient,
+    now: Option<Timestamp>,
+) -> serde_json::Map<String, JsonValue> {
+    let mut map = serde_json::Map::new();
+    insert_structural_and_routing_policy(&mut map, routing);
+    if let Some(now) = now {
+        map.insert(CHECK_TIME_KEY.to_string(), JsonValue::String(now.to_string()));
+    }
+    map.insert(
+        "minimumReleaseAge".to_string(),
+        JsonValue::from(release_age.minimum_minutes.unwrap_or(0)),
+    );
     map.insert(
         "minimumReleaseAgeExclude".to_string(),
-        policy_patterns_json(opts.sorted_min_age_excludes),
+        policy_patterns_json(&release_age.sorted_excludes),
     );
     map.insert(
         "trustPolicy".to_string(),
-        match opts.trust_policy {
+        match trust.policy {
             Some(TrustPolicy::NoDowngrade) => JsonValue::String("no-downgrade".to_string()),
             Some(TrustPolicy::Off) | None => JsonValue::Null,
         },
     );
-    map.insert("trustPolicyExclude".to_string(), policy_patterns_json(opts.sorted_trust_excludes));
+    map.insert("trustPolicyExclude".to_string(), policy_patterns_json(&trust.sorted_excludes));
     map.insert(
         "trustPolicyIgnoreAfter".to_string(),
-        match opts.trust_policy_ignore_after {
+        match trust.ignore_after {
             Some(value) => JsonValue::from(value),
             None => JsonValue::Null,
         },
     );
     map.insert(
         "minimumReleaseAgeIgnoreMissingTime".to_string(),
-        JsonValue::Bool(opts.ignore_missing_time_field),
+        JsonValue::Bool(metadata.ignore_missing_time_field),
     );
     map
 }
 
-/// Checked arithmetic makes an unrepresentable age disable the cutoff rather
-/// than wrap into a date in the wrong direction.
+/// Policy key for the fixed time a run checked at. Runs that check at the
+/// wall-clock time leave it out.
+const CHECK_TIME_KEY: &str = "referenceTime";
+
+/// Whether a cached run checked at `now` or earlier. An earlier time gives
+/// an earlier release-age cutoff and a shorter `trustPolicyIgnoreAfter`
+/// window, so that run accepted no version this run rejects. A cached run
+/// with no fixed time checked at its own wall-clock time: earlier than this
+/// run's `checked_at`, and unknown against a fixed `now`.
+pub(super) fn past_check_time_is_not_later(
+    cached_policy: &serde_json::Map<String, JsonValue>,
+    now: Option<Timestamp>,
+    checked_at: Timestamp,
+) -> bool {
+    let past = match cached_policy.get(CHECK_TIME_KEY) {
+        None => None,
+        Some(value) => {
+            let Some(time) = value
+                .as_str()
+                .map(pnpm_time::parse_rfc3339)
+                .and_then(Result::ok)
+            else {
+                return false;
+            };
+            Some(time)
+        }
+    };
+    match (past, now) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(past), _) => past <= checked_at,
+    }
+}
+
+/// `Some` whenever the age check is active. An age older than the earliest
+/// representable instant saturates to [`Timestamp::MIN`], so it rejects every
+/// version instead of disabling the check.
 pub(super) fn minimum_release_age_cutoff(
     opts: &VerificationReleaseAgeOptions,
-    now: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+    now: Option<Timestamp>,
+) -> Option<Timestamp> {
     let age_check_active = opts.minimum_minutes.is_some_and(|minutes| minutes > 0);
 
     if age_check_active {
         let minutes = opts.minimum_minutes.unwrap_or(0);
-        let now = now.unwrap_or_else(Utc::now);
+        let now = now.unwrap_or_else(Timestamp::now);
         i64::try_from(minutes)
             .ok()
-            .and_then(chrono::Duration::try_minutes)
-            .and_then(|duration| now.checked_sub_signed(duration))
+            .and_then(pnpm_time::duration_minutes)
+            .and_then(|duration| now.checked_sub(duration).ok())
+            .unwrap_or(Timestamp::MIN)
+            .pipe(Some)
     } else {
         None
     }
@@ -105,7 +195,8 @@ pub(super) fn cached_policy_patterns(
         .map(|values| {
             values
                 .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
+                .map(JsonValue::as_str)
+                .filter_map(|text| text.map(str::to_string))
                 .collect()
         })
         .unwrap_or_default()
@@ -115,7 +206,8 @@ pub(super) fn policy_patterns_json(patterns: &[String]) -> JsonValue {
     JsonValue::Array(
         patterns
             .iter()
-            .map(|spec| JsonValue::String(spec.clone()))
+            .cloned()
+            .map(JsonValue::String)
             .collect(),
     )
 }

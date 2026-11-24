@@ -30,7 +30,7 @@ const PLATFORMS = {
       glibc: '@pnpm/exe.linux-arm64/pnpm',
       musl: '@pnpm/exe.linux-arm64-musl/pnpm',
     },
-    // Only a glibc build is released for these three.
+    // Only a glibc build is released for these architectures.
     riscv64: {
       glibc: '@pnpm/exe.linux-riscv64/pnpm',
     },
@@ -40,9 +40,15 @@ const PLATFORMS = {
     s390x: {
       glibc: '@pnpm/exe.linux-s390x/pnpm',
     },
+    loong64: {
+      glibc: '@pnpm/exe.linux-loong64/pnpm',
+    },
   },
   freebsd: {
     x64: '@pnpm/exe.freebsd-x64/pnpm',
+  },
+  netbsd: {
+    x64: '@pnpm/exe.netbsd-x64/pnpm',
   },
   // Android is bionic, which is neither of the two libcs the linux entries
   // above are keyed on, so it takes a bare specifier of its own.

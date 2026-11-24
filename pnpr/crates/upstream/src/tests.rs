@@ -9,37 +9,53 @@ mod circuit_breaker;
 mod metadata_requests;
 
 use super::{
-    CacheValidators, CircuitBreaker, FetchOutcome, PackumentFetch, TarballRevision, Upstream,
-    abbreviate_packument, extract_upstream_revision_integrity, extract_version_manifest,
-    http::UPSTREAM_ERROR_BODY_LIMIT, rewrite_tarball_urls, rewrite_upstream_tarball_urls,
+    CacheValidators,
+    CircuitBreaker,
+    FetchOutcome,
+    PackumentFetch,
+    TarballRevision,
+    Upstream,
+    abbreviate_packument,
+    extract_upstream_revision_integrity,
+    extract_version_manifest,
+    http::UPSTREAM_ERROR_BODY_LIMIT,
+    rewrite_tarball_urls,
+    rewrite_upstream_tarball_urls,
     tarball_basename,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use pnpr_config::UpstreamConfig;
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{
+    AUTHORIZATION,
+    HeaderMap,
+    HeaderValue,
+};
 use serde_json::json;
 use std::time::Duration;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    },
     net::TcpListener,
 };
 
 /// Build an [`Upstream`] pointing at `url` with `headers`, all per-upstream
 /// tuning knobs at their verdaccio defaults.
 fn upstream(url: String, headers: HeaderMap) -> Upstream {
-    Upstream::new("npmjs", &UpstreamConfig::with_defaults(url, headers))
+    Upstream::new("npmjs".to_owned(), &UpstreamConfig::with_defaults(url, headers))
 }
 
 /// Fixed "current time" for abbreviation tests so the `time`-map
 /// coarsening (which buckets entries by age) is deterministic.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2024, 3, 20, 12, 0, 0).unwrap()
+fn now() -> Timestamp {
+    "2024-03-20T12:00:00Z".parse::<jiff::Timestamp>().unwrap()
 }
 
 /// Build a header map carrying a bearer `Authorization` plus one
-/// custom header — the resolved per-upstream set an [`Upstream`] is
+/// custom header, the resolved per-upstream set an [`Upstream`] is
 /// expected to attach to every request.
 fn auth_and_custom_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -53,25 +69,26 @@ fn auth_and_custom_headers() -> HeaderMap {
 /// open state and observe the short-circuit before the cooldown lapses.
 fn breaking_upstream(url: String, max_fails: u32) -> Upstream {
     Upstream::new(
-        "npmjs",
+        "npmjs".to_owned(),
         &UpstreamConfig {
             url,
             headers: HeaderMap::new(),
-            maxage: None,
+            packument_ttl: None,
             requests: pnpr_config::UpstreamRequestPolicy {
                 timeout: UpstreamConfig::DEFAULT_TIMEOUT,
+                max_packument_size: UpstreamConfig::DEFAULT_MAX_PACKUMENT_SIZE,
                 max_fails,
                 fail_timeout: Duration::from_mins(5),
             },
             cache: true,
             search: false,
-            access: None,
+            public: true,
             rules: pnpr_policy::PackageRules::default(),
         },
     )
 }
 
-async fn assert_redirect_timeout(delay_body: bool) {
+async fn assert_redirect_chain_shares_one_head_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -83,34 +100,13 @@ async fn assert_redirect_timeout(delay_body: bool) {
         drop(first);
         let (mut second, _) = listener.accept().await.unwrap();
         assert!(second.read(&mut request).await.unwrap() > 0);
-        if delay_body {
-            second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await.unwrap();
-        }
         tokio::time::sleep(Duration::from_millis(450)).await;
-        if !delay_body {
-            second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await.unwrap();
-        }
-        second.write_all(b"body").await.unwrap();
+        second.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody").await.unwrap();
     });
     let mut config = UpstreamConfig::with_defaults(url.clone(), HeaderMap::new());
     config.requests.timeout = Duration::from_millis(600);
-    let upstream = Upstream::new("test", &config);
+    let upstream = Upstream::new("test".to_owned(), &config);
     let result = upstream.fetch_artifact_response(&url).await;
-    if delay_body {
-        let FetchOutcome::Ok(response) = result.unwrap() else {
-            panic!("expected artifact response")
-        };
-        assert!(
-            response
-                .bytes()
-                .await
-                .unwrap_err()
-                .is_timeout(),
-        );
-    } else {
-        assert!(
-            matches!(result, Err(RegistryError::Upstream { source, .. }) if source.is_timeout()),
-        );
-    }
+    assert!(matches!(result, Err(RegistryError::UpstreamTimeout { .. })));
     server.abort();
 }

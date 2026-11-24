@@ -1,7 +1,19 @@
-use super::{project, python, python_project, serve, serve_backends, wheel};
+use super::{
+    project,
+    python,
+    python_project,
+    serve,
+    serve_backends,
+    wheel,
+};
 use crate::_utils::pacquet_in;
 use assert_cmd::prelude::*;
-use std::{fs, path::Path, process::Command};
+use command_extra::CommandExtra;
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
 /// A workspace project that declares nothing but its requirements.
 fn requirements_project(root: &Path, name: &str, dependencies: &[&str]) {
@@ -46,7 +58,7 @@ async fn a_filter_selects_python_projects_by_the_distribution_they_declare() {
     requirements_project(root.path(), "b", &["beta"]);
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "a", "--fail-if-no-match"])
+        .with_args(["install", "--filter", "a", "--fail-if-no-match"])
         .assert()
         .success();
 
@@ -54,7 +66,7 @@ async fn a_filter_selects_python_projects_by_the_distribution_they_declare() {
     assert!(!installed(root.path(), "b"), "b was not selected");
     assert!(!root.path().join("b/.venv").exists(), "b was not selected");
     python(&root.path().join("a"))
-        .args(["-c", "import alpha"])
+        .with_args(["-c", "import alpha"])
         .assert()
         .success();
 }
@@ -71,7 +83,7 @@ async fn a_recursive_install_without_a_filter_installs_every_python_project() {
     requirements_project(root.path(), "b", &["beta"]);
 
     pacquet_in(root.path())
-        .args(["install", "--recursive"])
+        .with_args(["install", "--recursive"])
         .assert()
         .success();
 
@@ -89,7 +101,8 @@ async fn a_filter_that_selects_no_project_at_all_ends_the_install() {
     requirements_project(root.path(), "a", &["alpha"]);
 
     assert_no_projects_matched(
-        pacquet_in(root.path()).args(["install", "--filter", "missing", "--fail-if-no-match"]),
+        &mut pacquet_in(root.path())
+            .with_args(["install", "--filter", "missing", "--fail-if-no-match"]),
     );
     assert!(!installed(root.path(), "a"));
 }
@@ -120,7 +133,7 @@ async fn a_filter_scopes_a_python_project_by_the_npm_project_in_its_directory() 
     .unwrap();
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "web"])
+        .with_args(["install", "--filter", "web"])
         .assert()
         .success();
 
@@ -130,11 +143,12 @@ async fn a_filter_scopes_a_python_project_by_the_npm_project_in_its_directory() 
     // The distribution the project declares does not name that directory:
     // the npm project in it does.
     assert_no_projects_matched(
-        pacquet_in(root.path()).args(["install", "--filter", "webapp", "--fail-if-no-match"]),
+        &mut pacquet_in(root.path())
+            .with_args(["install", "--filter", "webapp", "--fail-if-no-match"]),
     );
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "api"])
+        .with_args(["install", "--filter", "api"])
         .assert()
         .success();
     assert!(installed(root.path(), "api"));
@@ -158,20 +172,20 @@ async fn a_filtered_install_links_the_workspace_sources_the_selected_project_dec
     );
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "app"])
+        .with_args(["install", "--filter", "app"])
         .assert()
         .success();
 
     assert!(installed(root.path(), "packages/app"));
     assert!(!installed(root.path(), "packages/mylib"), "mylib was not selected");
     python(&root.path().join("packages/app"))
-        .args(["-c", "import mylib; print(mylib.MARKER)"])
+        .with_args(["-c", "import mylib; print(mylib.MARKER)"])
         .assert()
         .success()
         .stdout(if cfg!(windows) { "workspace mylib\r\n" } else { "workspace mylib\n" });
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "app..."])
+        .with_args(["install", "--filter", "app..."])
         .assert()
         .success();
     assert!(installed(root.path(), "packages/mylib"));
@@ -188,7 +202,7 @@ async fn a_filtered_add_writes_the_requirement_to_the_selected_project_only() {
     requirements_project(root.path(), "b", &[]);
 
     pacquet_in(root.path())
-        .args(["add", "--filter", "a", "pypi:alpha"])
+        .with_args(["add", "--filter", "a", "pypi:alpha"])
         .assert()
         .success();
 
@@ -220,7 +234,7 @@ async fn a_production_filter_does_not_follow_a_development_source() {
     );
 
     pacquet_in(root.path())
-        .args(["install", "--filter-prod", "app..."])
+        .with_args(["install", "--filter-prod", "app..."])
         .assert()
         .success();
 
@@ -228,7 +242,7 @@ async fn a_production_filter_does_not_follow_a_development_source() {
     assert!(!installed(root.path(), "packages/tool"), "only a dependency group requires it");
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "app..."])
+        .with_args(["install", "--filter", "app..."])
         .assert()
         .success();
     assert!(installed(root.path(), "packages/tool"));
@@ -255,7 +269,7 @@ async fn a_production_filter_follows_a_source_a_backend_may_require() {
     fs::write(root.path().join("packages/app/requirements.txt"), "tool\n").unwrap();
 
     pacquet_in(root.path())
-        .args(["install", "--filter-prod", "app..."])
+        .with_args(["install", "--filter-prod", "app..."])
         .assert()
         .success();
 
@@ -280,7 +294,7 @@ async fn a_recursive_add_leaves_the_workspace_root_alone() {
     requirements_project(root.path(), "a", &[]);
 
     pacquet_in(root.path())
-        .args(["add", "--recursive", "pypi:alpha"])
+        .with_args(["add", "--recursive", "pypi:alpha"])
         .assert()
         .success();
 
@@ -316,7 +330,7 @@ async fn a_filter_follows_the_source_a_project_declares_over_its_roots() {
     );
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "app..."])
+        .with_args(["install", "--filter", "app..."])
         .assert()
         .success();
 
@@ -347,7 +361,7 @@ async fn a_filter_does_not_reach_a_project_outside_the_declared_workspace() {
     );
 
     pacquet_in(root.path())
-        .args(["install", "--filter", "app..."])
+        .with_args(["install", "--filter", "app..."])
         .assert()
         .success();
 
@@ -356,4 +370,108 @@ async fn a_filter_does_not_reach_a_project_outside_the_declared_workspace() {
         !installed(root.path(), "packages/excluded"),
         "the workspace excludes it, so app does not reach it",
     );
+}
+
+#[tokio::test]
+async fn update_and_remove_select_a_standalone_python_member() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let _mocks = serve(&mut server, "alpha", &[("1.5", wheel("alpha", "1.5", "", &[]))]).await;
+    project(root.path(), &server.url(), &[]);
+    fs::remove_file(root.path().join("pyproject.toml")).unwrap();
+    requirements_project(root.path(), "one", &["Alpha>=1"]);
+    requirements_project(root.path(), "two", &["alpha>=1"]);
+    pacquet_in(root.path())
+        .with_args([
+            "--filter",
+            "one",
+            "--fail-if-no-match",
+            "update",
+            "pypi:ALp*",
+            "--lockfile-only",
+        ])
+        .assert()
+        .success();
+    assert!(installed(root.path(), "one"));
+    assert!(!installed(root.path(), "two"));
+    pacquet_in(root.path())
+        .with_args(["update", "-r", "Alp*", "--lockfile-only"])
+        .assert()
+        .success();
+    assert!(installed(root.path(), "two"));
+    pacquet_in(root.path())
+        .with_args(["--filter", "one", "remove", "pkg:pypi/ALPHA", "--lockfile-only"])
+        .assert()
+        .success();
+    let manifest = fs::read_to_string(root.path().join("one/pyproject.toml")).unwrap();
+    assert!(!manifest.to_ascii_lowercase().contains("alpha"), "{manifest}");
+    let lock = fs::read_to_string(root.path().join("one/pylock.toml")).unwrap();
+    assert!(!lock.contains("alpha"), "{lock}");
+}
+
+#[test]
+fn failed_python_remove_restores_the_manifest() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path(), "https://example.invalid", &["Some_Name>=1"]);
+    let path = root.path().join("pyproject.toml");
+    let original = fs::read(&path).unwrap();
+    for (selectors, message) in [
+        (["pypi:some.name", "pypi:missing-example"], "cannot remove missing-example"),
+        (["pypi:some.name", "!pypi:some-name"], "exclusions"),
+    ] {
+        let failure = pacquet_in(root.path())
+            .with_args(["remove", "--lockfile-only"])
+            .with_args(selectors)
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&failure.get_output().stderr);
+        assert!(stderr.contains(message), "{stderr}");
+    }
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert!(!root.path().join("pylock.toml").exists());
+    assert!(
+        !root
+            .path()
+            .join("package.json")
+            .exists(),
+    );
+}
+
+#[tokio::test]
+async fn dedicated_recursive_update_validates_explicit_requests_across_projects() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let _mocks = serve(&mut server, "alpha", &[("1.5", wheel("alpha", "1.5", "", &[]))]).await;
+    project(root.path(), &server.url(), &[]);
+    fs::remove_file(root.path().join("pyproject.toml")).unwrap();
+    let config = root.path().join("pnpm-workspace.yaml");
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(config, format!("{settings}\nsharedWorkspaceLockfile: false\n")).unwrap();
+    requirements_project(root.path(), "one", &["alpha>=1"]);
+    requirements_project(root.path(), "two", &["beta>=1"]);
+    pacquet_in(root.path())
+        .with_args(["update", "-r", "pypi:missing", "--lockfile-only"])
+        .assert()
+        .failure();
+    pacquet_in(root.path())
+        .with_args(["update", "-r", "pypi:alpha", "--lockfile-only"])
+        .assert()
+        .success();
+    assert!(installed(root.path(), "one"));
+    assert!(!installed(root.path(), "two"));
+}
+
+#[test]
+fn interactive_update_checks_the_selected_standalone_project() {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path(), "https://example.invalid", &[]);
+    fs::remove_file(root.path().join("pyproject.toml")).unwrap();
+    requirements_project(root.path(), "one", &["alpha>=1"]);
+    let failure = pacquet_in(root.path())
+        .with_args(["--filter", "one", "update", "--interactive", "pypi:alpha"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&failure.get_output().stderr);
+    assert!(stderr.contains("No lockfile in directory"), "{stderr}");
+    assert!(stderr.contains("one"), "{stderr}");
 }

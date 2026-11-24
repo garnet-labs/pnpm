@@ -1,17 +1,97 @@
 use super::{
-    AccessArgs, AddArgs, ApproveArgs, ApproveBuildsArgs, AuditArgs, BinArgs, BugsArgs,
-    CacheCommand, CatFileArgs, CatIndexArgs, ChangeArgs, CiArgs, CleanArgs, CompletionArgs,
-    CompletionServerArgs, ConfigArgs, ConfigGetAliasArgs, ConfigSetAliasArgs, CreateArgs,
-    DedupeArgs, DeployArgs, DeprecateArgs, DistTagArgs, DlxArgs, DocsArgs, DoctorArgs, EnvArgs,
-    ExecArgs, FetchArgs, FindHashArgs, IgnoredBuildsArgs, ImportArgs, InitArgs, InstallArgs,
-    InstallTestArgs, LaneArgs, LicensesArgs, LinkArgs, ListArgs, LoginArgs, LogoutArgs,
-    NotImplementedArgs, OutdatedArgs, OwnerArgs, PackAppArgs, PackArgs, PatchArgs, PatchCommitArgs,
-    PatchRemoveArgs, PeersArgs, PermissionsArgs, PingArgs, PipelineArgs, PkgArgs, PrefixArgs,
-    ProfileArgs, PruneArgs, PublishArgs, RebuildArgs, RemoveArgs, RepoArgs, RestartArgs, RootArgs,
-    RunArgs, RuntimeArgs, SbomArgs, ScriptShortcutArgs, SearchArgs, SelfUpdateArgs, SetScriptArgs,
-    SetupArgs, ShimArgs, StageArgs, StarArgs, StarsArgs, StoreCommand, Subcommand, SummaryScope,
-    TasksArgs, TeamArgs, TokenArgs, UndeprecateArgs, UnlinkArgs, UnpublishArgs, UnstarArgs,
-    UpdateArgs, VersionArgs, ViewArgs, WhoamiArgs, WhyArgs, WithArgs,
+    AccessArgs,
+    AddArgs,
+    ApproveArgs,
+    ApproveBuildsArgs,
+    AuditArgs,
+    BinArgs,
+    BugsArgs,
+    CacheCommand,
+    CatFileArgs,
+    CatIndexArgs,
+    CatalogArgs,
+    ChangeArgs,
+    CiArgs,
+    CleanArgs,
+    CompletionArgs,
+    CompletionServerArgs,
+    ConfigArgs,
+    ConfigGetAliasArgs,
+    ConfigSetAliasArgs,
+    CreateArgs,
+    DedupeArgs,
+    DeployArgs,
+    DeprecateArgs,
+    DistTagArgs,
+    DlxArgs,
+    DocsArgs,
+    DoctorArgs,
+    EditArgs,
+    EnvArgs,
+    ExecArgs,
+    FetchArgs,
+    FindHashArgs,
+    FundArgs,
+    IgnoredBuildsArgs,
+    ImportArgs,
+    InitArgs,
+    InstallArgs,
+    InstallTestArgs,
+    LaneArgs,
+    LicensesArgs,
+    LinkArgs,
+    ListArgs,
+    LoginArgs,
+    LogoutArgs,
+    OutdatedArgs,
+    OwnerArgs,
+    PackAppArgs,
+    PackArgs,
+    PatchArgs,
+    PatchCommitArgs,
+    PatchRemoveArgs,
+    PeersArgs,
+    PermissionsArgs,
+    PingArgs,
+    PipelineArgs,
+    PkgArgs,
+    PrefixArgs,
+    ProfileArgs,
+    PruneArgs,
+    PublishArgs,
+    RebuildArgs,
+    RemoveArgs,
+    RepoArgs,
+    RestartArgs,
+    RootArgs,
+    RunArgs,
+    RuntimeArgs,
+    SbomArgs,
+    ScriptShortcutArgs,
+    SearchArgs,
+    SelfUpdateArgs,
+    SetScriptArgs,
+    SetupArgs,
+    ShimArgs,
+    StageArgs,
+    StarArgs,
+    StarsArgs,
+    StoreCommand,
+    Subcommand,
+    SummaryScope,
+    TasksArgs,
+    TeamArgs,
+    TokenArgs,
+    UndeprecateArgs,
+    UnlinkArgs,
+    UnpublishArgs,
+    UnstarArgs,
+    UpdateArgs,
+    VersionArgs,
+    ViewArgs,
+    WhoamiArgs,
+    WhyArgs,
+    WithArgs,
 };
 
 #[derive(Debug, strum::IntoStaticStr, Subcommand)]
@@ -26,6 +106,8 @@ pub enum CliCommand {
     Recursive,
     /// Add a package
     Add(AddArgs),
+    /// Opens an installed package's folder in the default text editor.
+    Edit(EditArgs),
     /// Install packages
     #[clap(visible_alias = "i")]
     Install(InstallArgs),
@@ -58,6 +140,8 @@ pub enum CliCommand {
     /// Check the licenses of the installed packages.
     #[clap(visible_aliases = ["licences"])]
     Licenses(LicensesArgs),
+    /// Retrieve the funding information of the installed packages.
+    Fund(FundArgs),
     /// Shows the packages that depend on `pkg`
     Why(WhyArgs),
     /// View registry information about a package.
@@ -194,8 +278,8 @@ pub enum CliCommand {
     /// Manage the pnpm configuration files.
     #[clap(visible_alias = "c")]
     Config(ConfigArgs),
-    /// Print the config value for the provided key. Shorthand for
-    /// `pnpm config get`.
+    /// Print the config value at the provided property path, such as
+    /// `nodeVersion` or `catalog.react`. Shorthand for `pnpm config get`.
     Get(ConfigGetAliasArgs),
     /// Set the config key to the value provided. Shorthand for
     /// `pnpm config set`.
@@ -211,6 +295,8 @@ pub enum CliCommand {
     /// Inspect and manage the metadata cache.
     #[clap(subcommand)]
     Cache(CacheCommand),
+    /// Manage the catalogs of the workspace.
+    Catalog(CatalogArgs),
     /// Prints the contents of a file based on the hash value stored in the index file.
     CatFile(CatFileArgs),
     /// Prints the index file of a specific package from the store.
@@ -264,24 +350,18 @@ pub enum CliCommand {
     /// single invocation, ignoring the "packageManager" and
     /// "devEngines.packageManager" fields of the project's manifest.
     With(WithArgs),
-    /// Not implemented in pnpm. Use the npm CLI directly.
-    // Registered rather than left to the external-subcommand fallback so
-    // it names npm instead of failing as a missing package script.
-    Edit(NotImplementedArgs),
     /// Change settings on your registry profile.
     Profile(ProfileArgs),
     /// Manage authentication tokens on the registry.
     Token(TokenArgs),
-    /// Not implemented in pnpm. Use the npm CLI directly.
-    Xmas(NotImplementedArgs),
     #[clap(external_subcommand)]
     External(Vec<String>),
 }
 
 impl CliCommand {
     /// The name npm reports for the running command in the `npm_command`
-    /// environment variable. Running a script — `pnpm run`, the `test`,
-    /// `start` and `stop` shortcuts, and a bare `pnpm <script>` — reports
+    /// environment variable. Running a script (`pnpm run`, the `test`,
+    /// `start` and `stop` shortcuts, and a bare `pnpm <script>`) reports
     /// `run-script`; everything else reports the command's own name, with the
     /// variants that spell an alias reporting the name the command is
     /// registered under.
@@ -328,6 +408,7 @@ impl CliCommand {
             CliCommand::Root(args) => args.global,
             CliCommand::Runtime(args) => args.global,
             CliCommand::Update(args) => args.selection.global,
+            CliCommand::Why(args) => args.global,
             _ => false,
         }
     }
@@ -348,8 +429,10 @@ impl CliCommand {
             self,
             CliCommand::Bin(_)
                 | CliCommand::Clean(_)
+                | CliCommand::Edit(_)
                 | CliCommand::Exec(_)
                 | CliCommand::External(_)
+                | CliCommand::Fund(_)
                 | CliCommand::Pkg(_)
                 | CliCommand::Purge(_)
                 | CliCommand::Restart(_)
@@ -382,7 +465,7 @@ impl CliCommand {
     /// Whether this run prints the `Scope:` line naming the workspace
     /// projects it selected. pnpm gates this on two things at once: the
     /// command must be one of the few that report scope, and the run must
-    /// be workspace-wide — either asked for with `-r` / `--filter`, or
+    /// be workspace-wide; either asked for with `-r` / `--filter`, or
     /// because the command is workspace-wide by nature (`install`, `prune`).
     pub(crate) fn reports_scope(&self, recursive: bool) -> bool {
         let reports_scope = matches!(
@@ -403,8 +486,9 @@ impl CliCommand {
     }
 
     /// Whether reporter output (warnings, progress) goes to stderr so this
-    /// command's stdout stays a clean, machine-readable value — pnpm's
-    /// `COMMANDS_WITH_STDERR_REPORTER`.
+    /// command's stdout stays a clean, machine-readable value. Covers pnpm's
+    /// `COMMANDS_WITH_STDERR_REPORTER` plus invocations that select JSON or
+    /// parseable output.
     pub(crate) fn uses_stderr_reporter(&self) -> bool {
         matches!(
             self,
@@ -420,13 +504,50 @@ impl CliCommand {
                 | CliCommand::Prefix(_)
                 | CliCommand::Root(_)
                 | CliCommand::Bin(_),
-        ) || self.prints_upload_values()
+        ) || self.prints_structured_stdout()
     }
 
-    /// `publish --upload-variant` prints the values a later publish takes,
-    /// which a CI job captures from stdout.
-    fn prints_upload_values(&self) -> bool {
-        matches!(self, CliCommand::Publish(args) if !args.flags.variants.upload_variant.is_empty())
+    fn prints_structured_stdout(&self) -> bool {
+        self.prints_json_errors()
+            || match self {
+                CliCommand::Access(args) => args.json,
+                CliCommand::Cache(command) => cache_prints_structured_stdout(command),
+                CliCommand::CatIndex(_) => true,
+                CliCommand::Fund(args) => args.json,
+                CliCommand::List(args) | CliCommand::Ll(args) => args.output.parseable,
+                CliCommand::Pipeline(args) => args.prints_json_plan(),
+                CliCommand::Pkg(args) => pkg_prints_structured_stdout(args),
+                CliCommand::Profile(args) => args.json || args.parseable,
+                CliCommand::Run(args) => args.dry_run && args.json,
+                CliCommand::Search(args) => args.json,
+                CliCommand::Team(args) => args.json || args.parseable,
+                CliCommand::Token(args) => args.json || args.parseable,
+                CliCommand::Version(args) => args.json,
+                CliCommand::Why(args) => args.output.parseable,
+                _ => false,
+            }
+    }
+
+    pub(crate) fn prints_json_errors(&self) -> bool {
+        match self {
+            CliCommand::Publish(args) => args.flags.output.json,
+            CliCommand::Stage(args) => args.flags.output.json,
+            CliCommand::View(args) => args.json,
+            CliCommand::Pack(args) => args.json,
+            CliCommand::Audit(args) => args.json,
+            CliCommand::Doctor(args) => args.json,
+            CliCommand::Licenses(args) => args.json,
+            CliCommand::List(args) | CliCommand::Ll(args) => args.output.json,
+            CliCommand::Outdated(args) => args.uses_json_output(),
+            CliCommand::Peers(args) => args.json,
+            CliCommand::Why(args) => args.output.json,
+            _ => false,
+        }
+    }
+
+    /// See [`pnpm_default_reporter::set_edits_manifests`].
+    pub(crate) fn edits_manifests(&self) -> bool {
+        matches!(self, CliCommand::Add(_) | CliCommand::Remove(_) | CliCommand::Update(_))
     }
 
     pub(crate) fn default_reporter_summary_scope(&self) -> SummaryScope {
@@ -443,5 +564,24 @@ impl CliCommand {
             CliCommand::Dlx(_) | CliCommand::Create(_) => SummaryScope::AllPrefixes,
             _ => SummaryScope::CurrentPrefix,
         }
+    }
+}
+
+fn cache_prints_structured_stdout(command: &CacheCommand) -> bool {
+    match command {
+        CacheCommand::Path | CacheCommand::View { .. } => true,
+        CacheCommand::List { .. }
+        | CacheCommand::ListRegistries
+        | CacheCommand::Delete { .. }
+        | CacheCommand::Prune { .. } => false,
+    }
+}
+
+fn pkg_prints_structured_stdout(args: &PkgArgs) -> bool {
+    match args.command {
+        crate::cli_args::pkg::PkgSubcommand::Get(_) => true,
+        crate::cli_args::pkg::PkgSubcommand::Set(_)
+        | crate::cli_args::pkg::PkgSubcommand::Delete(_)
+        | crate::cli_args::pkg::PkgSubcommand::Fix => false,
     }
 }

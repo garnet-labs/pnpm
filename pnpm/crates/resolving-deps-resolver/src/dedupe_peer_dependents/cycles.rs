@@ -1,5 +1,11 @@
 use super::{
-    DepPath, DependenciesGraph, HashMap, HashSet, is_compatible_and_has_more_deps, sort_variants,
+    CollapseGuard,
+    DepPath,
+    DependenciesGraph,
+    HashMap,
+    HashSet,
+    is_compatible_and_has_more_deps,
+    sort_variants,
 };
 use crate::strongly_connected_components::SccPass;
 
@@ -14,6 +20,7 @@ struct Component<'a> {
 pub(super) fn collapse_cycles(
     graph: &DependenciesGraph,
     duplicates: &[Vec<DepPath>],
+    guard: CollapseGuard<'_>,
 ) -> HashMap<DepPath, DepPath> {
     let components = cycle_components(graph, duplicates);
     let mut changed = vec![false; components.len()];
@@ -29,8 +36,9 @@ pub(super) fn collapse_cycles(
         if !component.cyclic {
             continue;
         }
-        if let Some((candidate, target)) =
-            component.groups.iter().find_map(|group| compatible_pair(graph, group))
+        if let Some((candidate, target)) = component.groups
+            .iter()
+            .find_map(|group| compatible_pair(graph, (*group).clone(), guard))
         {
             replacements.insert(candidate, target);
             changed[index] = true;
@@ -39,14 +47,18 @@ pub(super) fn collapse_cycles(
     replacements
 }
 
-fn compatible_pair(graph: &DependenciesGraph, group: &[DepPath]) -> Option<(DepPath, DepPath)> {
-    let mut paths = group.to_vec();
+fn compatible_pair(
+    graph: &DependenciesGraph,
+    group: Vec<DepPath>,
+    guard: CollapseGuard<'_>,
+) -> Option<(DepPath, DepPath)> {
+    let mut paths = group;
     sort_variants(graph, &mut paths);
     while let Some(largest) = paths.pop() {
         let candidate = paths
             .iter()
             .rev()
-            .find(|candidate| is_compatible_and_has_more_deps(graph, &largest, candidate));
+            .find(|candidate| is_compatible_and_has_more_deps(graph, &largest, candidate, guard));
         if let Some(candidate) = candidate {
             return Some((candidate.clone(), largest));
         }
@@ -75,7 +87,7 @@ fn cycle_components<'a>(
         }
     }
     components.sccs
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(index, nodes)| component(index, nodes, &components.scc_of, &adjacency, duplicates))
         .collect()
@@ -83,12 +95,11 @@ fn cycle_components<'a>(
 
 fn component<'a>(
     index: usize,
-    nodes: &[usize],
+    mut nodes: Vec<usize>,
     component_of: &HashMap<usize, usize>,
     adjacency: &[Vec<usize>],
     duplicates: &'a [Vec<DepPath>],
 ) -> Component<'a> {
-    let mut nodes = nodes.to_vec();
     nodes.sort_unstable();
     let cyclic = nodes.len() > 1 || adjacency[nodes[0]].contains(&nodes[0]);
     let mut dependencies = HashSet::default();

@@ -1,29 +1,70 @@
 use super::{
-    FsGlobalRemoval, GlobalPackageBinSnapshot, activation::FsRename, check_virtual_shim_conflicts,
-    global_group_config, infer_local_package_alias, replacement_aliases,
-    should_replace_existing_package, snapshot_global_package, update_selectors,
+    FsGlobalRemoval,
+    GlobalPackageBinSnapshot,
+    GlobalUpdateMode,
+    RangeSpecStyle,
+    Version,
+    activation::FsRename,
+    apply_runtime_range_bumps,
+    check_virtual_shim_conflicts,
+    global_group_config,
+    has_pnpm_cli_dependency,
+    infer_local_package_alias,
+    replacement_aliases,
+    should_replace_existing_package,
+    snapshot_global_package,
+    update_selectors,
 };
 use crate::{
     cli_args::{
         global::{
-            cleanup::{FsRemoveDirAll, discard_install_dir_on_error_with_fs},
-            remove::{GlobalInstallCleanup, GlobalRemovalTransaction, commit_global_removal},
-            selectors::{is_windows_drive_path, resolve_local_param, split_comma_separated},
+            cleanup::{
+                FsRemoveDirAll,
+                discard_install_dir_on_error_with_fs,
+            },
+            remove::{
+                GlobalInstallCleanup,
+                GlobalRemovalTransaction,
+                commit_global_removal,
+            },
+            selectors::{
+                is_windows_drive_path,
+                resolve_local_param,
+                split_comma_separated,
+            },
         },
         shim::record_virtual_shim_state,
     },
-    shim_dispatch::{ShimTarget, install_native_shim, remove_native_shim},
+    shim_dispatch::{
+        ShimTarget,
+        install_native_shim,
+        remove_native_shim,
+    },
 };
 use miette::IntoDiagnostic;
-use pnpm_cmd_shim::{Host as CmdShimHost, PackageBinSource, remove_bin as remove_cmd_shim};
+use pnpm_cmd_shim::{
+    Host as CmdShimHost,
+    PackageBinSource,
+    remove_bin as remove_cmd_shim,
+};
 use pnpm_config::Config;
-use pnpm_fs::{force_symlink_dir, remove_symlink_dir};
+use pnpm_fs::{
+    force_symlink_dir,
+    remove_symlink_dir,
+};
 use pnpm_global::GlobalPackageInfo;
 use serde_json::json;
 use std::{
-    collections::{HashMap, HashSet},
-    fs, io,
-    path::{Path, PathBuf},
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 use tempfile::TempDir;
@@ -110,7 +151,7 @@ fn a_virtual_shim_only_yields_to_its_own_package() {
 
     remove_native_shim(&bin_dir, "tool").expect("remove virtual shim");
     fs::write(bin_dir.join("tool"), "globally installed shim").expect("replace virtual shim");
-    record_virtual_shim_state(&bin_dir, "owner", &["tool".to_string()])
+    record_virtual_shim_state(&bin_dir, "owner", vec!["tool".to_string()])
         .expect("record restoration state");
     let error = check_virtual_shim_conflicts(&[unrelated], &bin_dir).unwrap_err().to_string();
     assert!(error.contains(r#"project-aware shim for "owner""#), "{error}");
@@ -204,36 +245,89 @@ fn detects_windows_drive_paths() {
 }
 
 #[test]
-fn latest_update_uses_the_latest_tag_only_for_plain_version_dependencies() {
+fn latest_update_uses_the_latest_tag_for_plain_npm_alias_and_runtime_dependencies() {
     let dependencies = vec![
         ("private-linked-pkg".to_string(), "link:/home/user/private-linked-pkg".to_string()),
         ("local-tarball-pkg".to_string(), "file:/home/user/local-tarball-pkg.tgz".to_string()),
         ("git-pkg".to_string(), "github:user/git-pkg".to_string()),
         ("remote-tarball-pkg".to_string(), "https://example.com/pkg.tgz".to_string()),
         ("aliased-pkg".to_string(), "npm:other-pkg@^2.0.0".to_string()),
+        ("scoped-alias".to_string(), "npm:@scope/pkg@1.0.0".to_string()),
+        ("same-name-npm".to_string(), "npm:^1.0.0".to_string()),
+        ("same-name-exact".to_string(), "npm:1.0.0".to_string()),
         ("named-registry-pkg".to_string(), "gh:^3.0.0".to_string()),
+        ("node".to_string(), "runtime:^20.0.0".to_string()),
+        ("deno".to_string(), "runtime:^1.40.0".to_string()),
+        ("bun".to_string(), "runtime:1.1.0".to_string()),
         ("foo".to_string(), "^1.0.0".to_string()),
         ("bar".to_string(), "next".to_string()),
     ];
     assert_eq!(
-        update_selectors(&dependencies, true, &HashMap::new()),
+        update_selectors(&dependencies, GlobalUpdateMode::Latest, &HashMap::new()),
         vec![
             "private-linked-pkg@link:/home/user/private-linked-pkg",
             "local-tarball-pkg@file:/home/user/local-tarball-pkg.tgz",
             "git-pkg@github:user/git-pkg",
             "remote-tarball-pkg@https://example.com/pkg.tgz",
-            "aliased-pkg@npm:other-pkg@^2.0.0",
+            "aliased-pkg@npm:other-pkg@latest",
+            "scoped-alias@npm:@scope/pkg@latest",
+            "same-name-npm@npm:same-name-npm@latest",
+            "same-name-exact@npm:same-name-exact@latest",
             "named-registry-pkg@gh:^3.0.0",
+            "node@runtime:latest",
+            "deno@runtime:latest",
+            "bun@runtime:latest",
             "foo@latest",
             "bar@latest",
         ],
     );
     assert_eq!(
-        update_selectors(&dependencies, false, &HashMap::new()),
+        update_selectors(&dependencies, GlobalUpdateMode::DeclaredRange, &HashMap::new()),
         dependencies
             .iter()
             .map(|(alias, spec)| format!("{alias}@{spec}"))
             .collect::<Vec<String>>(),
+    );
+}
+
+#[test]
+fn tag_update_uses_the_tag_only_for_plain_version_dependencies() {
+    let dependencies = vec![
+        ("private-linked-pkg".to_string(), "link:/home/user/private-linked-pkg".to_string()),
+        ("aliased-pkg".to_string(), "npm:other-pkg@^2.0.0".to_string()),
+        ("named-registry-pkg".to_string(), "gh:^3.0.0".to_string()),
+        ("node".to_string(), "runtime:^20.0.0".to_string()),
+        ("git-shorthand-pkg".to_string(), "user/repo".to_string()),
+        ("relative-path-pkg".to_string(), "../local-pkg".to_string()),
+        ("foo".to_string(), "^1.0.0".to_string()),
+        ("bar".to_string(), "latest".to_string()),
+    ];
+    assert_eq!(
+        update_selectors(&dependencies, GlobalUpdateMode::Tag("next"), &HashMap::new()),
+        vec![
+            "private-linked-pkg@link:/home/user/private-linked-pkg",
+            "aliased-pkg@npm:other-pkg@^2.0.0",
+            "named-registry-pkg@gh:^3.0.0",
+            "node@runtime:^20.0.0",
+            "git-shorthand-pkg@user/repo",
+            "relative-path-pkg@../local-pkg",
+            "foo@next",
+            "bar@next",
+        ],
+    );
+    let pins = HashMap::from([("foo".to_string(), "1.5.0".to_string())]);
+    assert_eq!(
+        update_selectors(&dependencies[6..], GlobalUpdateMode::Tag("next"), &pins),
+        vec!["foo@1.5.0", "bar@next"],
+    );
+}
+
+#[test]
+fn latest_update_preserves_node_prerelease_channels() {
+    let dependencies = vec![("node".to_string(), "runtime:22.0.0-rc.1".to_string())];
+    assert_eq!(
+        update_selectors(&dependencies, GlobalUpdateMode::Latest, &HashMap::new()),
+        vec!["node@runtime:rc/latest"],
     );
 }
 
@@ -243,13 +337,27 @@ fn latest_update_uses_the_latest_tag_only_for_plain_version_dependencies() {
 fn a_pinned_dependency_is_held_at_its_installed_version() {
     let dependencies = vec![
         ("prerelease".to_string(), "^2.0.0".to_string()),
+        ("aliased".to_string(), "npm:other-pkg@^2.0.0".to_string()),
+        ("same-name-exact".to_string(), "npm:1.0.0".to_string()),
+        ("node".to_string(), "runtime:^22.0.0".to_string()),
         ("stable".to_string(), "^1.0.0".to_string()),
     ];
-    let pins = HashMap::from([("prerelease".to_string(), "2.0.0".to_string())]);
+    let pins = HashMap::from([
+        ("prerelease".to_string(), "2.0.0".to_string()),
+        ("aliased".to_string(), "2.5.0".to_string()),
+        ("same-name-exact".to_string(), "1.5.0".to_string()),
+        ("node".to_string(), "22.4.0".to_string()),
+    ]);
 
     assert_eq!(
-        update_selectors(&dependencies, true, &pins),
-        vec!["prerelease@2.0.0", "stable@latest"],
+        update_selectors(&dependencies, GlobalUpdateMode::Latest, &pins),
+        vec![
+            "prerelease@2.0.0",
+            "aliased@npm:other-pkg@2.5.0",
+            "same-name-exact@npm:same-name-exact@1.5.0",
+            "node@runtime:22.4.0",
+            "stable@latest",
+        ],
     );
 }
 
@@ -603,6 +711,51 @@ fn a_group_config_carries_the_persisted_minimum_release_age_excludes() {
     );
 }
 
+/// A group installed after an earlier group of the same command moved the
+/// legacy decisions into the global `config.yaml` still sees them, although
+/// the base config was loaded before the move.
+#[test]
+fn a_group_config_reads_the_decisions_recorded_after_the_base_config_loaded() {
+    let config_dir = TempDir::new().expect("config dir");
+    let global_pkg_dir = TempDir::new().expect("global packages dir");
+    fs::write(
+        config_dir.path().join("config.yaml"),
+        "globalPackagesConfig:\n  permissions:\n    esbuild:\n      build: true\n",
+    )
+    .expect("write the global config");
+    let mut base = Config::new();
+    base.config_dir = Some(config_dir.path().to_path_buf());
+
+    let config = global_group_config(&base, global_pkg_dir.path(), global_pkg_dir.path(), None)
+        .expect("build the group config");
+
+    assert_eq!(config.allow_builds.get("esbuild"), Some(&true));
+}
+
+/// The legacy decisions sit below every layer the loader applied, so they
+/// cannot turn on what the environment turned off.
+#[test]
+fn a_group_config_keeps_an_explicit_build_policy_over_the_legacy_one() {
+    let global_pkg_dir = TempDir::new().expect("global packages dir");
+    fs::write(
+        global_pkg_dir.path().join("pnpm-workspace.yaml"),
+        "dangerouslyAllowAllBuilds: true\nallowBuilds:\n  esbuild: true\n",
+    )
+    .expect("write the legacy settings");
+    let mut base = Config::new();
+    base.allow_builds.insert("esbuild".to_string(), false);
+    base.explicit_settings.insert(
+        "dangerouslyAllowAllBuilds".to_string(),
+        serde_json::Value::Bool(false),
+    );
+
+    let config = global_group_config(&base, global_pkg_dir.path(), global_pkg_dir.path(), None)
+        .expect("build the group config");
+
+    assert!(!config.dangerously_allow_all_builds);
+    assert_eq!(config.allow_builds.get("esbuild"), Some(&false));
+}
+
 #[test]
 fn a_group_config_resolves_hoisted_dependencies_from_its_own_install_dir() {
     let dir = TempDir::new().expect("temp dir");
@@ -625,4 +778,78 @@ fn a_group_config_resolves_hoisted_dependencies_from_its_own_install_dir() {
         ),
         "{node_path}",
     );
+}
+
+#[test]
+fn update_selectors_preserve_deno_bun_ranges_and_ignore_non_runtime_tools() {
+    let deps = vec![
+        ("node".to_string(), "runtime:rc/^20.0.0".to_string()),
+        ("deno".to_string(), "runtime:^1.40.0".to_string()),
+        ("bun".to_string(), "runtime:1.1.0".to_string()),
+        ("custom".to_string(), "tool:1.0.0".to_string()),
+    ];
+    let initial = update_selectors(&deps, GlobalUpdateMode::Latest, &HashMap::new());
+    assert_eq!(
+        initial,
+        vec![
+            "node@runtime:rc/latest",
+            "deno@runtime:latest",
+            "bun@runtime:latest",
+            "custom@tool:1.0.0",
+        ],
+    );
+
+    let resolved = HashMap::from([
+        ("node".to_string(), Version::parse("24.0.0-rc.4").expect("semver")),
+        ("deno".to_string(), Version::parse("2.4.2").expect("semver")),
+        ("bun".to_string(), Version::parse("1.2.19").expect("semver")),
+    ]);
+    let bumped = apply_runtime_range_bumps(
+        &deps,
+        &initial,
+        &HashMap::new(),
+        &resolved,
+        RangeSpecStyle::Major,
+    );
+    assert_eq!(
+        bumped,
+        vec![
+            "node@runtime:rc/latest",
+            "deno@runtime:^2.4.2",
+            "bun@runtime:1.2.19",
+            "custom@tool:1.0.0",
+        ],
+    );
+
+    let pins = HashMap::from([
+        ("node".to_string(), "24.0.0".to_string()),
+        ("deno".to_string(), "2.5.0".to_string()),
+    ]);
+    let pinned = update_selectors(&deps, GlobalUpdateMode::Latest, &pins);
+    assert_eq!(
+        pinned,
+        vec![
+            "node@runtime:rc/24.0.0",
+            "deno@runtime:2.5.0",
+            "bun@runtime:latest",
+            "custom@tool:1.0.0",
+        ],
+    );
+}
+
+#[test]
+fn has_pnpm_cli_dependency_detects_exact_npm_spec_and_malformed_union() {
+    let pnpm_exact_npm = GlobalPackageInfo {
+        install_dir: PathBuf::from("/global/v11/pnpm-group"),
+        hash: "hash-pnpm".to_string(),
+        dependencies: vec![("pnpm".to_string(), "npm:12.0.0".to_string())],
+    };
+    assert!(has_pnpm_cli_dependency(&pnpm_exact_npm));
+
+    let aliased_malformed_union = GlobalPackageInfo {
+        install_dir: PathBuf::from("/global/v11/pnpm-union"),
+        hash: "hash-pnpm-union".to_string(),
+        dependencies: vec![("foo".to_string(), "npm:pnpm@9||".to_string())],
+    };
+    assert!(has_pnpm_cli_dependency(&aliased_malformed_union));
 }

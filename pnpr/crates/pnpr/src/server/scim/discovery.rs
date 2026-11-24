@@ -1,7 +1,13 @@
 //! The SCIM discovery endpoints identity providers read before they
 //! provision: what pnpr supports, and the one resource type it serves.
 
-use super::{ScimClient, StatusCode, json, resources::USER_SCHEMA, scim_json};
+use super::{
+    ScimClient,
+    StatusCode,
+    json,
+    resources::USER_SCHEMA,
+    scim_json,
+};
 use axum::response::Response;
 
 /// `GET /ServiceProviderConfig`.
@@ -49,6 +55,7 @@ pub(super) async fn schemas(_client: ScimClient) -> Response {
             "multiValued": false,
             "required": required,
             "mutability": "readWrite",
+            "caseExact": name == "externalId",
             "returned": "default",
             "uniqueness": if name == "userName" { "server" } else { "none" },
         })
@@ -59,7 +66,11 @@ pub(super) async fn schemas(_client: ScimClient) -> Response {
             "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Schema"],
             "id": USER_SCHEMA,
             "name": "User",
-            "attributes": [attribute("userName", "string", true), attribute("active", "boolean", false)],
+            "attributes": [
+                attribute("userName", "string", true),
+                attribute("active", "boolean", false),
+                attribute("externalId", "string", false),
+            ],
         }]),
     )
 }

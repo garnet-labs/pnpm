@@ -2,10 +2,16 @@
 //! map, the shared ancestor chains threaded down the walk, `link:`
 //! node-id remapping, peer-suffix parsing, and range matching.
 
-pub(crate) use peer_specifier::satisfies_with_prereleases;
+pub(crate) use peer_specifier::{
+    ComparablePeerRange,
+    satisfies_with_prereleases,
+};
 pub(super) use peer_specifier::{
-    ComparablePeerRange, importer_relative_link_dep_path, link_node_id_as_dep_path, peer_id_pair,
-    peer_segment_names, remap_link_node_id,
+    importer_relative_link_dep_path,
+    link_node_id_as_dep_path,
+    peer_id_pair,
+    peer_segment_names,
+    remap_link_node_id,
 };
 pub(crate) use pnpm_lockfile::split_peer_suffix_segments;
 
@@ -14,34 +20,61 @@ use peer_specifier::version_gte;
 
 use crate::{
     node_id::NodeId,
-    resolve_peers::{ResolvePeersOptions, walker::Walker},
-    resolved_tree::{ResolvedPackage, TreeChildren, pkg_name},
+    resolve_peers::{
+        ResolvePeersOptions,
+        walker::Walker,
+    },
+    resolved_tree::{
+        ResolvedPackage,
+        TreeChildren,
+        pkg_name,
+    },
 };
-use node_semver::{Range, Version};
-use pnpm_deps_path::{DepPath, PeerId, index_of_dep_path_suffix};
-use pnpm_resolving_resolver_base::{ResolveResult, get_peer_version_range};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use node_semver::{
+    Range,
+    Version,
+};
+use pnpm_deps_path::{
+    DepPath,
+    PeerId,
+    index_of_dep_path_suffix,
+};
+use pnpm_resolving_resolver_base::{
+    ResolveResult,
+    get_peer_version_range,
+};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::{
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
 /// Per-name entry in the propagating [`ParentRefs`] map.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ParentRef {
     pub(super) version: Arc<str>,
     /// `None` for top-level deps that were already installed. Pacquet
-    /// doesn't surface those yet — `None` only appears on the
+    /// doesn't surface those yet. `None` only appears on the
     /// importer-level cycle-break fallback, where the `name@version`
     /// form of the peer-id is the only useful representation.
     pub(super) node_id: Option<NodeId>,
     /// Local install name in `node_modules`. May differ from the
     /// package's real name for npm-alias entries.
     pub(super) alias: Option<String>,
+    /// Set when the importer has this provider only because it was hoisted
+    /// for another subtree's peer. See
+    /// [`crate::ImporterPeerInput::hoisted_peer_provider_node_ids`].
+    pub(super) hoisted_provider: bool,
 }
 
 /// `name → ParentRef` map propagated down the walk. Entries are indexed
-/// by both the package's real name and its alias when the two differ —
+/// by both the package's real name and its alias when the two differ,
 /// `react-dom@npm:next` resolves a `peerDependencies.react-dom`
 /// requirement against the alias and `peerDependencies.next` against
 /// the real name.
@@ -103,7 +136,7 @@ impl<Element: PartialEq> SharedChain<Element> {
 ///
 /// Each entry keeps the link it is keyed on alive. Addresses are only
 /// unique among live allocations, so a dropped link could otherwise
-/// hand its address — and its answer — to whatever was allocated there
+/// hand its address (and its answer) to whatever was allocated there
 /// next.
 pub(super) struct ChainSuffixMemo<Element> {
     answers: HashMap<usize, (Arc<SharedChainLink<Element>>, bool)>,
@@ -441,12 +474,14 @@ pub(super) fn insert_parent_ref(
     direct_alias: &str,
     parent_node_id: NodeId,
     pkg: &ResolvedPackage,
+    hoisted_provider: bool,
 ) {
     let real_name: &str = pkg.name();
     let parent_ref = ParentRef {
         version: Arc::clone(pkg.version()),
         node_id: Some(parent_node_id),
         alias: (direct_alias != real_name).then(|| direct_alias.to_string()),
+        hoisted_provider,
     };
     update_parent_refs(refs, direct_alias, &parent_ref);
     if direct_alias != real_name {

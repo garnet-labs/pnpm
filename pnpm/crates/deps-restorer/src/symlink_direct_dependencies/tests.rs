@@ -1,16 +1,35 @@
 mod importer_paths;
 
-use super::{SymlinkDirectDependencies, SymlinkDirectDependenciesError};
+use super::{
+    SymlinkDirectDependencies,
+    SymlinkDirectDependenciesError,
+};
 use crate::SkippedSnapshots;
 use pnpm_cmd_shim::LinkBinsOptions;
 use pnpm_config::Config;
-use pnpm_lockfile::{Lockfile, ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec};
+use pnpm_lockfile::{
+    Lockfile,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+};
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_reporter::{
-    AddedRoot, DependencyType, LogEvent, Reporter, RootLog, RootMessage, SilentReporter,
+    AddedRoot,
+    DependencyType,
+    LogEvent,
+    Reporter,
+    RootLog,
+    RootMessage,
+    SilentReporter,
 };
 use pnpm_testing_utils::fs::is_symlink_or_junction;
-use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::Mutex,
+};
 use tempfile::tempdir;
 
 fn group_ids(groups: Vec<super::task_groups::ImporterTaskGroup<'_>>) -> Vec<Vec<&str>> {
@@ -44,13 +63,13 @@ fn importer_task_groups_fold_filesystem_name_aliases() {
 #[test]
 fn importer_task_groups_serialize_all_missing_dirs_together() {
     // None of these directories exist, so there is no filesystem
-    // answer to ask for — and no string transform can predict which
+    // answer to ask for, and no string transform can predict which
     // not-yet-created names (case variants, NFC/NFD normalization
     // pairs) the filesystem will later fold together. Every
     // canonicalization failure shares one serial group, on every
     // platform.
     let dir = tempdir().expect("tempdir");
-    let nfc = "packages/caf\u{e9}";
+    let nfc = "packages/café";
     let nfd = "packages/cafe\u{301}";
     let groups = group_ids(super::importer_task_groups(
         dir.path(),
@@ -63,9 +82,9 @@ fn importer_task_groups_serialize_all_missing_dirs_together() {
 #[test]
 fn importer_task_groups_fold_unicode_normalization_aliases() {
     // APFS resolves composed and decomposed forms to one directory;
-    // no string transform groups these — only the filesystem's answer.
+    // no string transform groups these, only the filesystem's answer.
     let dir = tempdir().expect("tempdir");
-    let nfc = "packages/caf\u{e9}";
+    let nfc = "packages/café";
     let nfd = "packages/cafe\u{301}";
     fs::create_dir_all(dir.path().join(nfc)).expect("create project dir");
     let groups = group_ids(super::importer_task_groups(dir.path(), vec![nfc, nfd]));
@@ -151,6 +170,8 @@ fn emits_pnpm_root_added_per_direct_dependency() {
     };
     let mut importers = HashMap::new();
     importers.insert(Lockfile::ROOT_IMPORTER_KEY.to_string(), project_snapshot);
+    let latest_versions: crate::LatestVersions =
+        [("fastify@4.0.0".parse().expect("parse fastify key"), "5.0.0".to_string())].into();
 
     SymlinkDirectDependencies {
         context: crate::ImporterLinkContext {
@@ -166,6 +187,7 @@ fn emits_pnpm_root_added_per_direct_dependency() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: Some(&latest_versions),
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,
@@ -184,7 +206,7 @@ fn emits_pnpm_root_added_per_direct_dependency() {
     .expect("symlink should succeed");
 
     // Both symlinks must land under `node_modules/` for the wire-
-    // shape assertion below to be meaningful — an emit without the
+    // shape assertion below to be meaningful, an emit without the
     // matching FS effect would mask a real regression.
     let fastify_link = modules_dir.join("fastify");
     let dev_dep_link = modules_dir.join("@pnpm.e2e/dev-dep");
@@ -225,6 +247,7 @@ fn emits_pnpm_root_added_per_direct_dependency() {
     assert_eq!(fastify.real_name, "fastify");
     assert_eq!(fastify.version.as_deref(), Some("4.0.0"));
     assert_eq!(fastify.dependency_type, Some(DependencyType::Prod));
+    assert_eq!(fastify.latest.as_deref(), Some("5.0.0"));
 
     let dev = added
         .iter()
@@ -233,6 +256,7 @@ fn emits_pnpm_root_added_per_direct_dependency() {
     assert_eq!(dev.real_name, "@pnpm.e2e/dev-dep");
     assert_eq!(dev.version.as_deref(), Some("1.2.3"));
     assert_eq!(dev.dependency_type, Some(DependencyType::Dev));
+    assert_eq!(dev.latest, None, "no latest was resolved for the dev dep");
 
     drop(dir);
 }
@@ -240,8 +264,8 @@ fn emits_pnpm_root_added_per_direct_dependency() {
 /// A malformed importer snapshot can list the same package name
 /// across multiple sections (e.g. both `dependencies` and
 /// `optionalDependencies`). The dedup pass must collapse that to
-/// one entry — first-wins per the caller-supplied
-/// `dependency_groups` order — so we don't race two
+/// one entry (first-wins per the caller-supplied
+/// `dependency_groups` order) so we don't race two
 /// `symlink_package` calls to the same `node_modules/<name>` and
 /// emit two `pnpm:root added` events for the same dep.
 #[test]
@@ -325,6 +349,7 @@ fn duplicate_dep_across_groups_collapses_to_one_entry() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: None,
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,
@@ -391,7 +416,7 @@ fn cross_importer_link_dep_symlinks_to_sibling_rootdir() {
     let config = config.leak();
 
     // Materialize the dependee project so the symlink target exists
-    // before we create it. (Platform-uniform — same reasoning as the
+    // before we create it. (Platform-uniform, same reasoning as the
     // single-importer test above.)
     let shared_dir = workspace_root.join("packages/shared");
     fs::create_dir_all(&shared_dir).unwrap();
@@ -427,6 +452,7 @@ fn cross_importer_link_dep_symlinks_to_sibling_rootdir() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: None,
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,
@@ -482,7 +508,7 @@ fn cross_importer_link_dep_symlinks_to_sibling_rootdir() {
     drop(dir);
 }
 
-/// An empty `importers` map is a valid (if degenerate) lockfile —
+/// An empty `importers` map is a valid (if degenerate) lockfile;
 /// nothing to link, no events emitted, no error. Each importer is
 /// installed independently ([#431]), so a lockfile with zero
 /// importers produces zero pnpm:root events; pin this so the
@@ -515,6 +541,7 @@ fn empty_importers_is_a_no_op() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: None,
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,
@@ -536,7 +563,7 @@ fn empty_importers_is_a_no_op() {
 }
 
 /// A symlink already pointing at its target is "reused", and a reused
-/// symlink is NOT a `pnpm:root added` — so a re-link (e.g. `pacquet add`
+/// symlink is NOT a `pnpm:root added`, so a re-link (e.g. `pacquet add`
 /// over an already-installed project) emits an event only for genuinely
 /// new dependencies, not every previously-linked one.
 #[test]
@@ -602,6 +629,7 @@ fn reused_symlinks_do_not_emit_pnpm_root_added() {
                 importers: &importers,
                 packages: None,
                 skipped: &SkippedSnapshots::default(),
+                latest_versions: None,
             },
             policy: crate::DirectLinkPolicy {
                 public_hoist_targets: None,
@@ -670,7 +698,7 @@ fn per_importer_prefix_in_pnpm_root_events() {
     let config = config.leak();
 
     // Materialize the virtual-store targets each importer's symlink
-    // points at — same precondition the single-importer test sets up.
+    // points at, same precondition the single-importer test sets up.
     for store_name in ["fastify@4.0.0", "react@18.0.0"] {
         let real_name = store_name.split('@').next().unwrap();
         let target = virtual_store_dir
@@ -727,6 +755,7 @@ fn per_importer_prefix_in_pnpm_root_events() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: None,
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,
@@ -777,7 +806,7 @@ fn per_importer_prefix_in_pnpm_root_events() {
 /// dir, not stay hard-coded to `node_modules`. Otherwise the symlink
 /// stage would write under `<importer>/node_modules/` while
 /// `.modules.yaml` writing and bin linking (which still use
-/// `config.modules_dir`) would target the configured name — two
+/// `config.modules_dir`) would target the configured name, two
 /// inconsistent layouts for the same install. `modulesDir` is one
 /// directory-name applied uniformly under every importer's `rootDir`.
 #[test]
@@ -832,6 +861,7 @@ fn custom_modules_dir_propagates_to_each_importer() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: None,
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,

@@ -1,7 +1,24 @@
 use super::{
-    Envelope, FetchingProgressLog, FetchingProgressMessage, LifecycleLog, LifecycleMessage,
-    LifecycleStdio, LogEvent, LogLevel, Mutex, PackageImportMethod, Pipe, ProgressLog,
-    ProgressMessage, Reporter, SilentReporter, Stage, StageLog, SummaryLog, Value, assert_eq,
+    Envelope,
+    FetchingProgressLog,
+    FetchingProgressMessage,
+    LifecycleLog,
+    LifecycleMessage,
+    LifecycleStdio,
+    LogEvent,
+    LogLevel,
+    Mutex,
+    PackageImportMethod,
+    Pipe,
+    ProgressLog,
+    ProgressMessage,
+    Reporter,
+    SilentReporter,
+    Stage,
+    StageLog,
+    SummaryLog,
+    Value,
+    assert_eq,
 };
 
 /// Summary log serializes with the channel name flattened into the
@@ -15,6 +32,8 @@ fn summary_event_matches_pnpm_wire_shape() {
     let event = LogEvent::Summary(SummaryLog {
         level: LogLevel::Debug,
         prefix: "/some/project".to_string(),
+        new_projects: None,
+        project_names: None,
     });
     let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
 
@@ -27,6 +46,19 @@ fn summary_event_matches_pnpm_wire_shape() {
     assert_eq!(json["name"], "pnpm:summary");
     assert_eq!(json["level"], "debug");
     assert_eq!(json["prefix"], "/some/project");
+    assert!(json.get("newProjects").is_none(), "{json}");
+}
+
+#[test]
+fn workspace_summary_event_lists_new_projects() {
+    let event = LogEvent::Summary(SummaryLog {
+        level: LogLevel::Debug,
+        prefix: "/ws".to_string(),
+        new_projects: Some(vec!["/ws/packages/a".to_string()]),
+        project_names: None,
+    });
+    let json: Value = event.pipe_ref(serde_json::to_value).expect("serialize event");
+    assert_eq!(json["newProjects"], serde_json::json!(["/ws/packages/a"]));
 }
 
 /// `pnpm:progress` flattens its `status`-tagged payload into the
@@ -97,7 +129,7 @@ fn progress_event_matches_pnpm_wire_shape() {
     assert_eq!(json["method"], "hardlink");
     assert_eq!(json["requester"], "/proj");
     assert_eq!(json["to"], "/proj/node_modules/.pacquet/react@18.0.0/node_modules/react");
-    // `imported` deliberately omits `packageId` — match pnpm's shape
+    // `imported` deliberately omits `packageId`, match pnpm's shape
     // so consumers that read `progress.packageId` only on the three
     // store-ish statuses don't trip on a stray field.
     assert!(json.get("packageId").is_none(), "imported must not carry packageId");

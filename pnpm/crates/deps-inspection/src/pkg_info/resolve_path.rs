@@ -1,11 +1,22 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
+};
 
+use pnpm_fs::lexical_normalize;
 use pnpm_lockfile::PkgNameVerPeer;
 
-use super::{EdgeContext, InspectionLayout};
+use super::{
+    EdgeContext,
+    InspectionLayout,
+};
 
 /// A lockfile-derived path component that could escape the directory
-/// it is joined under — the same guard `pnpm licenses` applies before
+/// it is joined under, the same guard `pnpm licenses` applies before
 /// dereferencing store paths built from lockfile keys. Rooted and
 /// prefixed components are rejected by shape, not `is_absolute()`:
 /// on Windows a rooted-but-prefixless `\escape` (or a prefix-only
@@ -36,12 +47,14 @@ pub fn resolve_package_path(
 ) -> PathBuf {
     let store_name = dep_path.to_virtual_store_name(layout.virtual_store_dir_max_length);
     if is_unsafe_path_component(&store_name) || is_unsafe_path_component(name) {
-        return layout.virtual_store_dir.clone();
+        return lexical_normalize(&layout.virtual_store_dir);
     }
-    if layout.is_hoisted {
-        return resolve_hoisted_package_path(layout, dep_path, name, version, alias, ctx);
-    }
-    resolve_virtual_store_package_path(layout, &store_name, name, alias, ctx)
+    let resolved = if layout.is_hoisted {
+        resolve_hoisted_package_path(layout, dep_path, name, version, alias, ctx)
+    } else {
+        resolve_virtual_store_package_path(layout, &store_name, name, alias, ctx)
+    };
+    lexical_normalize(&resolved)
 }
 
 /// The copy Node.js resolves from the parent package, or from the
@@ -99,7 +112,8 @@ fn owner_dir<'a>(pkg_dir: &'a Path, relative_modules_dir: &Path) -> Option<&'a P
     let mut modules_dir = pkg_dir.parent()?;
     if modules_dir
         .file_name()
-        .is_some_and(|component| component.to_string_lossy().starts_with('@'))
+        .map(OsStr::to_string_lossy)
+        .is_some_and(|text| text.starts_with('@'))
     {
         modules_dir = modules_dir.parent()?;
     }
@@ -148,7 +162,8 @@ fn find_hoisted_dirs<'a>(
 fn legacy_dep_path(dep_path: &str) -> String {
     dep_path
         .strip_prefix('/')
-        .map_or_else(|| format!("/{dep_path}"), str::to_string)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("/{dep_path}"))
 }
 
 /// The hoisted linker places a dependency under its alias, so an
@@ -213,7 +228,8 @@ fn resolve_virtual_store_package_path(
             // Scoped parents live one level deeper (`node_modules/@scope/pkg`).
             if dir
                 .file_name()
-                .is_some_and(|component| component.to_string_lossy().starts_with('@'))
+                .map(OsStr::to_string_lossy)
+                .is_some_and(|text| text.starts_with('@'))
                 && let Some(grandparent) = dir.parent()
             {
                 dir = grandparent.to_path_buf();
@@ -237,7 +253,9 @@ pub fn collect_hoisted_dirs(
     for (dep_path, locations) in locations_by_dep {
         let dirs: Vec<_> = locations
             .iter()
-            .filter_map(|location| pnpm_modules_yaml::hoisted_dir(lockfile_dir, location))
+            .filter_map(|location| {
+                pnpm_modules_yaml::hoisted_dir(lockfile_dir.to_path_buf(), location)
+            })
             .collect();
         if dirs.is_empty() {
             continue;

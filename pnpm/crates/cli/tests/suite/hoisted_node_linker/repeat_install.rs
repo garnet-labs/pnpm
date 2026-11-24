@@ -1,8 +1,22 @@
 use super::{
-    AddMockedRegistry, CommandExtra, CommandTempCwd, DirWitness, ModulesHost, fs,
-    fs_remove_dir_all, is_real_dir, is_symlink_or_junction, pacquet_at, pacquet_in,
-    read_modules_manifest, read_pkg_version, retouch_recorded_integrity, symlink_dir, symlink_file,
-    write_manifest, write_workspace_yaml,
+    AddMockedRegistry,
+    CommandExtra,
+    CommandTempCwd,
+    DirWitness,
+    ModulesHost,
+    fs,
+    fs_remove_dir_all,
+    is_real_dir,
+    is_symlink_or_junction,
+    pacquet_at,
+    pacquet_in,
+    read_modules_manifest,
+    read_pkg_version,
+    retouch_recorded_integrity,
+    symlink_dir,
+    symlink_file,
+    write_manifest,
+    write_workspace_yaml,
 };
 use assert_cmd::assert::OutputAssertExt;
 
@@ -116,7 +130,7 @@ fn a_repeat_frozen_install_leaves_present_hoisted_packages_alone() {
         .expect("run pnpm install");
     assert!(output.status.success(), "repeat install failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    assert!(stdout.contains("Packages: +1\n"), "stdout:\n{stdout}");
+    assert!(reports_added(&stdout, 1), "stdout:\n{stdout}");
 
     assert_eq!(
         fs::read_to_string(workspace.join("node_modules/local-pkg/marker.txt")).unwrap(),
@@ -193,7 +207,7 @@ fn a_repeat_frozen_install_leaves_present_patched_hoisted_packages_alone() {
         .expect("run pnpm install");
     assert!(output.status.success(), "repeat install failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    assert!(stdout.contains("Packages: +1\n"), "stdout:\n{stdout}");
+    assert!(reports_added(&stdout, 1), "stdout:\n{stdout}");
 
     assert!(
         witnesses.iter().all(DirWitness::is_intact),
@@ -297,7 +311,7 @@ fn adding_a_dependency_leaves_present_hoisted_packages_alone() {
         .expect("run pnpm add");
     assert!(output.status.success(), "add failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    assert!(stdout.contains("Packages: +1\n"), "stdout:\n{stdout}");
+    assert!(reports_added(&stdout, 1), "stdout:\n{stdout}");
 
     assert!(is_real_dir(&workspace, "node_modules/is-positive"), "the new package landed");
 
@@ -982,6 +996,10 @@ fn removing_a_linked_dependency_unlinks_it_under_the_hoisted_linker() {
         .success();
 
     assert!(fs::symlink_metadata(&link).is_err(), "the link should be removed");
+    assert!(
+        fs::symlink_metadata(workspace.join("node_modules/@local")).is_err(),
+        "the emptied scope directory should be removed",
+    );
     assert!(local.join("package.json").exists(), "the link target should be left alone");
     let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read the lockfile");
     assert!(!lockfile.contains("@local/pkg"), "the lockfile should drop the dependency");
@@ -1105,4 +1123,13 @@ fn an_interrupted_hoisted_install_forgets_the_locations_it_replaces() {
     assert_eq!(read_pkg_version(&workspace, &format!("node_modules/{REPLACED}")), "100.0.0");
 
     drop((root, mock_instance));
+}
+
+/// Whether the stats line reports exactly `count` added packages, with or
+/// without the share of downloaded or reused ones after it.
+fn reports_added(stdout: &str, count: u64) -> bool {
+    let line = format!("Packages: +{count}");
+    stdout
+        .lines()
+        .any(|printed| printed == line || printed.starts_with(&format!("{line} (")))
 }

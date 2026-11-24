@@ -1,14 +1,32 @@
 use super::{
-    AccessList, AuthState, Body, Ecosystem, PackagePattern, Registries, Registry, Request,
-    ServiceExt, StatusCode, TempDir, access_rule, body_bytes, body_json, config_for, header,
-    hosted_with_access, json, router_with_auth, seed_hosted, sha512_integrity,
+    AccessList,
+    AuthState,
+    Body,
+    Ecosystem,
+    PackagePattern,
+    Registries,
+    Registry,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    access_rule,
+    body_bytes,
+    body_json,
+    config_for,
+    header,
+    hosted_with_access,
+    json,
+    router_with_auth,
+    seed_hosted,
+    sha512_integrity,
 };
 use crate::tokens::issue_token;
 
 #[tokio::test]
 async fn hosted_registry_serves_only_what_it_hosts() {
     let tmp = TempDir::new().unwrap();
-    // The org "acme" stores under its own namespace (`<storage>/orgs/acme/`).
+    // Namespace "acme" stores under `<storage>/namespaces/acme/`.
     seed_hosted(tmp.path(), "acme", "@acme/widget");
 
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
@@ -19,7 +37,7 @@ async fn hosted_registry_serves_only_what_it_hosts() {
     );
     let app = router_with_auth(config, AuthState::in_memory());
 
-    // A hosted package is served from the org registry.
+    // A hosted package is served from the hosted registry.
     let hit = app
         .clone()
         .oneshot(
@@ -31,8 +49,8 @@ async fn hosted_registry_serves_only_what_it_hosts() {
         .unwrap();
     assert_eq!(hit.status(), StatusCode::OK);
 
-    // A name the org does not host is a definitive not-found — a hosted org has
-    // no upstream fall-through.
+    // A name the hosted registry does not host is a definitive not-found, a
+    // hosted registry has no upstream fall-through.
     let miss = app
         .oneshot(
             Request::get("/npm/~acme/@acme/absent")
@@ -47,7 +65,7 @@ async fn hosted_registry_serves_only_what_it_hosts() {
 #[tokio::test]
 async fn private_hosted_hides_existence_from_unauthorized_caller() {
     let tmp = TempDir::new().unwrap();
-    // The org "acme" stores under its own namespace (`<storage>/orgs/acme/`).
+    // Namespace "acme" stores under `<storage>/namespaces/acme/`.
     seed_hosted(tmp.path(), "acme", "@acme/widget");
 
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
@@ -56,12 +74,12 @@ async fn private_hosted_hides_existence_from_unauthorized_caller() {
         vec![("acme".to_string(), Registry::Hosted { patterns: vec![] })].into_iter().collect(),
         None,
     );
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
-    // An unauthorized (anonymous) caller gets 404, not 403 — the org's package
-    // existence is not revealed.
+    // An unauthorized (anonymous) caller gets 404, not 403, the hosted
+    // registry's package existence is not revealed.
     let anon = app
         .clone()
         .oneshot(
@@ -86,11 +104,11 @@ async fn private_hosted_hides_existence_from_unauthorized_caller() {
     assert_eq!(authed.status(), StatusCode::OK);
 }
 
-/// A private org's 404 mask must win over a *denying per-package ACL* on every
+/// A private hosted registry's 404 mask must win over a *denying per-package ACL* on every
 /// registry-served read path: otherwise the ACL's 401/403 would fire first and
 /// reveal that the package exists.
 #[tokio::test]
-async fn private_hosted_org_masks_before_the_package_acl() {
+async fn private_hosted_registry_masks_before_the_package_acl() {
     let tmp = TempDir::new().unwrap();
     seed_hosted(tmp.path(), "acme", "@acme/widget");
 
@@ -132,7 +150,7 @@ async fn private_hosted_org_masks_before_the_package_acl() {
 /// The same 404-before-ACL masking must hold on the path-less `dist-tags` reader
 /// (`load_packument_for_read`), which resolves through the default-target registry.
 #[tokio::test]
-async fn private_hosted_org_masks_dist_tags_before_the_package_acl() {
+async fn private_hosted_registry_masks_dist_tags_before_the_package_acl() {
     let tmp = TempDir::new().unwrap();
     seed_hosted(tmp.path(), "acme", "@acme/widget");
 
@@ -164,12 +182,15 @@ async fn private_hosted_org_masks_dist_tags_before_the_package_acl() {
 
 #[tokio::test]
 async fn publish_to_hosted_round_trips_in_its_own_namespace() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
 
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
     config.routing.hosted.insert("acme".to_string(), hosted_with_access("acme", "$authenticated"));
-    // npmjs already exists (from config_for); add a hosted org claiming
+    // npmjs already exists (from config_for); add a hosted registry claiming
     // `@acme/*` + a router over it and the pattern-less npmjs catch-all,
     // aliased path-less.
     let graph = vec![
@@ -187,13 +208,14 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
     ];
     config.routing.registries =
         Registries::new(graph.into_iter().collect(), Some("main".to_string()));
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
     let tarball = &crate::npm::npm_tgz("@acme/widget", "1.0.0", b"acme-widget-1.0.0-bytes");
     let body = json!({
         "name": "@acme/widget",
+        "access": null,
         "dist-tags": { "latest": "1.0.0" },
         "versions": { "1.0.0": {
             "name": "@acme/widget",
@@ -211,7 +233,7 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
         } },
     });
 
-    // Publish through the org's own `/~acme/` endpoint.
+    // Publish through the hosted registry's own `/~acme/` endpoint.
     let publish = app
         .clone()
         .oneshot(
@@ -225,7 +247,7 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
         .unwrap();
     assert_eq!(publish.status(), StatusCode::CREATED);
 
-    // It physically lands in the org's storage namespace, not the default one.
+    // It physically lands in the registry's storage namespace, not the default one.
     assert!(
         pnpr_fixtures::read_hosted_document(
             tmp.path(),
@@ -234,7 +256,7 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
             "@acme/widget"
         )
         .is_some(),
-        "published packument should be in the org namespace",
+        "published packument should be in the acme namespace",
     );
     assert!(
         pnpr_fixtures::read_hosted_document(
@@ -247,7 +269,7 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
         "nothing should be written to the default namespace",
     );
 
-    // It reads back through the org endpoint (authenticated)...
+    // It reads back through the hosted endpoint (authenticated)...
     let read = app
         .clone()
         .oneshot(
@@ -260,6 +282,12 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
         .unwrap();
     assert_eq!(read.status(), StatusCode::OK);
     let doc = body_json(read.into_body()).await;
+    assert!(doc.get("formatVersion").is_none());
+    assert!(doc.get("access").is_none());
+    assert_eq!(
+        doc["versions"]["1.0.0"]["dist"]["tarball"],
+        json!("http://example.test/npm/~acme/@acme/widget@1.0.0"),
+    );
     assert!(doc["versions"]["1.0.0"].is_object());
     assert_eq!(
         doc["versions"]["1.0.0"]["_npmUser"]["name"],
@@ -282,7 +310,7 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
     assert_eq!(search["total"], json!(1));
     assert_eq!(search["objects"][0]["package"]["name"], json!("@acme/widget"));
 
-    // ...and its tarball serves from the org namespace.
+    // ...and its tarball serves from the acme namespace.
     let tar = app
         .clone()
         .oneshot(
@@ -296,7 +324,7 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
     assert_eq!(tar.status(), StatusCode::OK);
     assert_eq!(body_bytes(tar.into_body()).await, *tarball);
 
-    // A publish routed to an upstream is rejected — a write can never land on
+    // A publish routed to an upstream is rejected, a write can never land on
     // an upstream registry.
     let rejected = app
         .oneshot(
@@ -313,12 +341,15 @@ async fn publish_to_hosted_round_trips_in_its_own_namespace() {
 
 /// A hosted registry's declared `patterns:` are enforced on the registry itself, on
 /// every path to it: an off-pattern publish is rejected and an off-pattern
-/// read is a definitive 404 — through a router and at the registry's own
-/// `/~<name>/` URL alike — so a typo'd scope can never squat in the hosted
+/// read is a definitive 404 (through a router and at the registry's own
+/// `/~<name>/` URL alike) so a typo'd scope can never squat in the hosted
 /// store and later surface as authoritative.
 #[tokio::test]
 async fn hosted_registry_patterns_bound_publish_and_reads_on_every_path() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
 
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
@@ -337,7 +368,7 @@ async fn hosted_registry_patterns_bound_publish_and_reads_on_every_path() {
     let registries = Registries::new(graph.into_iter().collect(), Some("main".to_string()));
     registries.validate().expect("patterned hosted config is valid");
     config.routing.registries = registries;
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -368,7 +399,7 @@ async fn hosted_registry_patterns_bound_publish_and_reads_on_every_path() {
     };
 
     // An off-pattern publish is rejected on the registry's own URL, through the
-    // router, and via the path-less base — and nothing lands in the store.
+    // router, and via the path-less base, and nothing lands in the store.
     for (url, pkg) in [
         ("/npm/~acme/@typo/widget", "@typo/widget"),
         ("/npm/~main/@typo/widget", "@typo/widget"),
@@ -436,7 +467,7 @@ async fn off_pattern_publish_is_masked_for_callers_the_registry_denies() {
         .collect(),
         None,
     );
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let member = issue_token(&auth, "alice").await;
     let outsider = issue_token(&auth, "mallory").await;
     let app = router_with_auth(config, auth);
@@ -465,15 +496,16 @@ async fn off_pattern_publish_is_masked_for_callers_the_registry_denies() {
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 }
 
-/// The programmatic path enforces the same name/org safety as YAML loading:
-/// a hosted `org` that could escape the storage root fails server startup.
+/// The programmatic path enforces the same name/namespace safety as YAML
+/// loading: a hosted `namespace` that could escape the storage root fails
+/// server startup.
 #[tokio::test]
-async fn building_the_server_rejects_an_unsafe_programmatic_hosted_org() {
+async fn building_the_server_rejects_an_unsafe_programmatic_hosted_namespace() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
     config.routing.hosted.insert("evil".to_string(), hosted_with_access("../escape", "$all"));
-    let err = pnpr::try_router(config).expect_err("a path-escaping org must fail startup");
-    assert!(err.to_string().contains("org"), "unexpected error: {err}");
+    let err = pnpr::try_router(config).expect_err("a path-escaping namespace must fail startup");
+    assert!(err.to_string().contains("namespace"), "unexpected error: {err}");
 }
 
 /// The write endpoints gate on a private upstream's `access:` exactly as
@@ -487,9 +519,9 @@ async fn publish_to_a_private_upstream_is_denied_before_the_upstream_rejection()
         .get("npmjs")
         .expect("default `npmjs` upstream")
         .clone();
-    corp.access = Some(AccessList::from_tokens(["alice"]));
+    corp.set_access(AccessList::from_tokens(["alice"]));
     config.routing.upstreams.insert("corp".to_string(), corp);
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let member = issue_token(&auth, "alice").await;
     let outsider = issue_token(&auth, "mallory").await;
     let app = router_with_auth(config, auth);
@@ -521,12 +553,15 @@ async fn publish_to_a_private_upstream_is_denied_before_the_upstream_rejection()
 /// The registry's access list gates writes exactly as it gates reads (RFC
 /// "registries", implementation point 9). An authenticated non-member
 /// passes the default per-package publish policy (`$authenticated`), so
-/// without the registry-level gate they could publish into — or retag and
-/// unpublish from — a private hosted org. The denial is the same 404 mask
+/// without the registry-level gate they could publish into (or retag and
+/// unpublish from) a private hosted registry. The denial is the same 404 mask
 /// reads use, so the write path reveals nothing about the registry either.
 #[tokio::test]
 async fn private_hosted_registry_denies_writes_from_non_members() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
 
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
@@ -537,7 +572,7 @@ async fn private_hosted_registry_denies_writes_from_non_members() {
         vec![("corp".to_string(), Registry::Hosted { patterns: vec![] })].into_iter().collect(),
         Some("corp".to_string()),
     );
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let member = issue_token(&auth, "alice").await;
     let outsider = issue_token(&auth, "mallory").await;
     let app = router_with_auth(config, auth);
@@ -572,8 +607,8 @@ async fn private_hosted_registry_denies_writes_from_non_members() {
             .unwrap()
     };
 
-    // The non-member publish is masked with 404 — not 401/403, which would
-    // reveal the private registry exists — and nothing lands on disk.
+    // The non-member publish is masked with 404 (not 401/403, which would
+    // reveal the private registry exists) and nothing lands on disk.
     let denied = app
         .clone()
         .oneshot(publish_as(&outsider))
@@ -646,7 +681,7 @@ async fn private_hosted_registry_denies_writes_from_non_members() {
 
 /// Search scans the flat hosted store, so it must apply the owning registry's
 /// access list, not only the per-package ACL: a private flat-root registry
-/// (`org: ""`) is 404-masked on packument reads and must not be enumerable
+/// (`namespace: ""`) is 404-masked on packument reads and must not be enumerable
 /// by name/version/description through `/-/v1/search`.
 #[tokio::test]
 async fn search_does_not_enumerate_a_private_flat_root_registry() {
@@ -670,7 +705,8 @@ async fn search_does_not_enumerate_a_private_flat_root_registry() {
             vec![("corp".to_string(), Registry::Hosted { patterns: vec![] })].into_iter().collect(),
             Some("corp".to_string()),
         );
-        let auth = AuthState::in_memory();
+        let auth =
+            crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
         let member = issue_token(&auth, "alice").await;
         let outsider = issue_token(&auth, "mallory").await;
         let app = router_with_auth(config, auth);

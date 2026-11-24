@@ -1,7 +1,20 @@
 use super::{
-    Duration, LibsqlAuth, MaxUsers, RegistryError, Result, TokenBackend, UpsertOutcome,
-    UserBackend, UserCreation, UserRemoval, first_row, is_unique_violation, params,
-    retry_database_conflicts, schema::ensure_user_counter, with_auth_timeout,
+    Duration,
+    LibsqlAuth,
+    MaxUsers,
+    RegistryError,
+    Result,
+    TokenBackend,
+    UpsertOutcome,
+    UserBackend,
+    UserCreation,
+    UserRemoval,
+    first_row,
+    is_unique_violation,
+    params,
+    retry_database_conflicts,
+    schema::ensure_user_counter,
+    with_auth_timeout,
 };
 use crate::token_store::sha256_hex;
 use libsql::Builder;
@@ -55,11 +68,11 @@ async fn with_auth_timeout_passes_a_fast_read_through() {
 async fn add_or_login_creates_then_logs_in() {
     let backend = local_backend(MaxUsers::Unlimited).await;
     assert!(matches!(
-        backend.add_or_login("alice", "secret").await.unwrap(),
+        backend.add_or_login("alice", "secret123").await.unwrap(),
         (UpsertOutcome::Created, _),
     ));
     assert!(matches!(
-        backend.add_or_login("alice", "secret").await.unwrap(),
+        backend.add_or_login("alice", "secret123").await.unwrap(),
         (UpsertOutcome::LoggedIn, _),
     ));
 }
@@ -67,7 +80,7 @@ async fn add_or_login_creates_then_logs_in() {
 #[tokio::test]
 async fn add_or_login_rejects_existing_user_with_wrong_password() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    backend.add_or_login("alice", "secret").await.unwrap();
+    backend.add_or_login("alice", "secret123").await.unwrap();
     let err = backend.add_or_login("alice", "different").await.unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::UNAUTHORIZED);
 }
@@ -75,14 +88,14 @@ async fn add_or_login_rejects_existing_user_with_wrong_password() {
 #[tokio::test]
 async fn max_users_disabled_rejects_registration() {
     let backend = local_backend(MaxUsers::Disabled).await;
-    let err = backend.add_or_login("alice", "x").await.unwrap_err();
+    let err = backend.add_or_login("alice", "password-x").await.unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn add_or_login_rejects_invalid_username_before_insert() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    let err = backend.add_or_login("alice ", "secret").await.unwrap_err();
+    let err = backend.add_or_login("alice ", "secret123").await.unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
 
     let mut rows = backend.pool
@@ -104,18 +117,19 @@ async fn add_or_login_rejects_invalid_username_before_insert() {
 #[tokio::test]
 async fn add_or_login_rejects_existing_invalid_username() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    let hash = bcrypt::hash("secret", 4).unwrap();
+    let hash = bcrypt::hash("secret123", 4).unwrap();
     backend.pool
         .connect()
         .unwrap()
         .execute(
-            "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
+            "INSERT INTO users (id, username, status, credential_kind, password_hash, created_at)
+             VALUES (?1, ?1, 'active', 'bcrypt', ?2, 1000)",
             params!["alice ", hash],
         )
         .await
         .unwrap();
 
-    let err = backend.add_or_login("alice ", "secret").await.unwrap_err();
+    let err = backend.add_or_login("alice ", "secret123").await.unwrap_err();
 
     assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
 }
@@ -127,26 +141,27 @@ async fn add_or_login_propagates_corrupt_hash_errors() {
         .connect()
         .unwrap()
         .execute(
-            "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
+            "INSERT INTO users (id, username, status, credential_kind, password_hash, created_at)
+             VALUES (?1, ?1, 'active', 'bcrypt', ?2, 1000)",
             params!["alice", "not-a-bcrypt-hash"],
         )
         .await
         .unwrap();
 
-    let err = backend.add_or_login("alice", "secret").await.unwrap_err();
+    let err = backend.add_or_login("alice", "secret123").await.unwrap_err();
 
-    assert!(matches!(err, RegistryError::Bcrypt(_)), "got {err:?}");
+    assert_eq!(err.status_code(), axum::http::StatusCode::INTERNAL_SERVER_ERROR, "got {err:?}");
 }
 
 #[tokio::test]
 async fn max_users_caps_registration() {
     let backend = local_backend(MaxUsers::Limited(1)).await;
-    backend.add_or_login("alice", "x").await.unwrap();
-    let err = backend.add_or_login("bob", "x").await.unwrap_err();
+    backend.add_or_login("alice", "password-x").await.unwrap();
+    let err = backend.add_or_login("bob", "password-x").await.unwrap_err();
     assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
     // The capped-out registrant can't sneak in, but existing users
     // still log in.
-    backend.add_or_login("alice", "x").await.unwrap();
+    backend.add_or_login("alice", "password-x").await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -156,7 +171,7 @@ async fn registration_cap_is_strict_under_concurrency() {
     for index in 0..6 {
         let backend = std::sync::Arc::clone(&backend);
         handles.push(tokio::spawn(async move {
-            backend.add_or_login(&format!("user{index}"), "x").await
+            backend.add_or_login(&format!("user{index}"), "password-x").await
         }));
     }
     let mut created = 0;
@@ -200,7 +215,7 @@ async fn registration_cap_is_strict_across_backend_instances() {
         let barrier = std::sync::Arc::clone(&barrier);
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            backend.add_or_login(&format!("user{index}"), "x").await
+            backend.add_or_login(&format!("user{index}"), "password-x").await
         }));
     }
     let mut created = 0;
@@ -238,8 +253,9 @@ async fn ensure_user_counter_reconciles_a_stale_counter() {
         .connect()
         .unwrap()
         .execute(
-            "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
-            params!["alice", "not-used-by-this-test"],
+            "INSERT INTO users (id, username, status, credential_kind, password_hash, created_at)
+             VALUES (?1, ?1, 'active', 'none', NULL, 1000)",
+            params!["alice"],
         )
         .await
         .unwrap();
@@ -271,7 +287,7 @@ async fn ensure_user_counter_reconciles_a_stale_counter() {
 #[tokio::test]
 async fn registration_cap_self_heals_an_overcounted_counter() {
     let backend = local_backend(MaxUsers::Limited(1)).await;
-    backend.add_or_login("alice", "x").await.unwrap();
+    backend.add_or_login("alice", "password-x").await.unwrap();
     backend.pool
         .connect()
         .unwrap()
@@ -279,9 +295,10 @@ async fn registration_cap_self_heals_an_overcounted_counter() {
         .await
         .unwrap();
 
-    assert!(
-        matches!(backend.add_or_login("bob", "x").await.unwrap(), (UpsertOutcome::Created, _),),
-    );
+    assert!(matches!(
+        backend.add_or_login("bob", "password-x").await.unwrap(),
+        (UpsertOutcome::Created, _),
+    ),);
 
     let mut rows = backend.pool
         .connect()
@@ -302,15 +319,20 @@ async fn registration_cap_self_heals_an_overcounted_counter() {
 #[tokio::test]
 async fn tokens_round_trip_and_revoke() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    backend.create_user("alice", "x").await.unwrap();
-    let token = backend.issue("alice").await.unwrap();
+    backend.create_user("alice", "password-x").await.unwrap();
+    let alice_id = backend
+        .account_id("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let token = backend.issue(&alice_id).await.unwrap();
     assert_eq!(
         backend
             .lookup(&token)
             .await
             .unwrap()
             .as_deref(),
-        Some("alice"),
+        Some(alice_id.as_str()),
     );
     assert!(
         backend
@@ -321,10 +343,10 @@ async fn tokens_round_trip_and_revoke() {
     );
 
     let key = sha256_hex(token.as_bytes());
-    let listed = backend.list_for_user("alice").await.unwrap();
+    let listed = backend.list_for_user(&alice_id).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0, key);
-    assert_eq!(listed[0].1.username, "alice");
+    assert_eq!(listed[0].1.user_id, alice_id);
 
     assert!(
         backend
@@ -369,7 +391,7 @@ async fn tokens_store_hash_not_raw() {
     assert_eq!(stored.len(), 64, "SHA-256 hex is 64 chars");
 }
 
-/// A store failure must surface as `Err`, never a silent `Ok(None)` —
+/// A store failure must surface as `Err`, never a silent `Ok(None)`;
 /// otherwise a database outage would read as "token not found" and the
 /// caller would answer 401 instead of 5xx.
 #[tokio::test]
@@ -414,7 +436,10 @@ async fn registration_waits_for_another_database_writer() {
 async fn registration_transaction_retries_only_remote_lock_conflicts() {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
     };
 
     for (code, expected_attempts) in [("SQLITE_BUSY", 9), ("SQLITE_AUTH", 1)] {
@@ -522,13 +547,16 @@ async fn libsql_supports_the_admin_operations() {
 #[tokio::test]
 async fn admin_created_users_count_against_the_registration_cap() {
     let backend = local_backend(MaxUsers::Limited(1)).await;
-    assert_eq!(backend.create_user("alice", "secret").await.unwrap(), UserCreation::Created);
-    let err = backend.add_or_login("bob", "secret").await.unwrap_err();
+    let UserCreation::Created(alice_id) = backend.create_user("alice", "secret123").await.unwrap()
+    else {
+        panic!("expected alice to be created");
+    };
+    let err = backend.add_or_login("bob", "secret123").await.unwrap_err();
     assert!(matches!(err, RegistryError::TooManyUsers { max: 1 }), "{err:?}");
 
-    assert_eq!(backend.delete_user("alice").await.unwrap(), UserRemoval::Removed);
+    assert_eq!(backend.delete_user(&alice_id).await.unwrap(), UserRemoval::Removed);
     assert!(matches!(
-        backend.add_or_login("bob", "secret").await.unwrap(),
+        backend.add_or_login("bob", "secret123").await.unwrap(),
         (UpsertOutcome::Created, _),
     ));
 }
@@ -536,9 +564,14 @@ async fn admin_created_users_count_against_the_registration_cap() {
 #[tokio::test]
 async fn a_removed_owner_disables_its_tokens_but_not_their_cleanup() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    backend.create_user("alice", "x").await.unwrap();
-    let token = backend.issue("alice").await.unwrap();
-    backend.delete_user("alice").await.unwrap();
+    backend.create_user("alice", "password-x").await.unwrap();
+    let alice_id = backend
+        .account_id("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let token = backend.issue(&alice_id).await.unwrap();
+    backend.delete_user(&alice_id).await.unwrap();
 
     assert!(
         backend
@@ -554,7 +587,7 @@ async fn a_removed_owner_disables_its_tokens_but_not_their_cleanup() {
             .unwrap()
             .is_none(),
     );
-    let listed = backend.list_for_user("alice").await.unwrap();
+    let listed = backend.list_for_user(&alice_id).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert!(
         backend
@@ -568,27 +601,45 @@ async fn a_removed_owner_disables_its_tokens_but_not_their_cleanup() {
 #[tokio::test]
 async fn sha1_user_authenticates_and_upgrades_to_bcrypt_in_libsql() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    let sha_hash = "{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=";
+    let sha_hash = "{SHA}eJy+BAeECxwgQcszRS/2Dxm/WMw=";
     backend.pool
         .connect()
         .unwrap()
         .execute(
-            "INSERT INTO users (username, bcrypt_hash) VALUES (?1, ?2)",
+            "INSERT INTO users (id, username, status, credential_kind, password_hash, created_at)
+             VALUES (?1, ?1, 'active', 'sha1', ?2, 1000)",
             params!["alice", sha_hash],
         )
         .await
         .unwrap();
 
-    let outcome = backend.add_or_login("alice", "test").await.unwrap();
+    let outcome = backend.add_or_login("alice", "test-password").await.unwrap();
     assert!(matches!(outcome, (UpsertOutcome::LoggedIn, _)));
 
     let updated = backend
-        .stored_hash("alice")
+        .stored_account("alice")
         .await
         .unwrap()
+        .unwrap()
+        .credential
+        .into_password_hash()
         .unwrap();
     assert!(updated.starts_with("$2y$") || updated.starts_with("$2b$"));
     assert_ne!(updated, sha_hash);
+    let mut rows = backend.pool
+        .connect()
+        .unwrap()
+        .query("SELECT credential_kind FROM users WHERE username = 'alice'", ())
+        .await
+        .unwrap();
+    let kind: String = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(kind, "bcrypt");
 }
 
 #[tokio::test]
@@ -597,7 +648,7 @@ async fn libsql_schema_migrations_runs_and_records_version() {
     let mut rows = backend.pool
         .connect()
         .unwrap()
-        .query("SELECT MAX(version) FROM auth_schema_migrations", ())
+        .query("SELECT MAX(version) FROM schema_migrations", ())
         .await
         .unwrap();
     let row = rows
@@ -610,36 +661,63 @@ async fn libsql_schema_migrations_runs_and_records_version() {
 }
 
 #[tokio::test]
-async fn libsql_tokens_persist_scopes_and_kind() {
+async fn libsql_tokens_persist_kind_and_delete_expired() {
     let backend = local_backend(MaxUsers::Unlimited).await;
-    backend.add_or_login("alice", "secret").await.unwrap();
+    backend.add_or_login("alice", "secret123").await.unwrap();
 
     let new_token = crate::NewToken::new()
-        .with_scopes(Some(vec!["scope:read".to_string(), "scope:write".to_string()]))
-        .with_kind(Some("granular".to_string()));
-    let (raw, record) = backend.issue_token("alice", new_token).await.unwrap();
-    assert_eq!(record.scopes, Some(vec!["scope:read".to_string(), "scope:write".to_string()]));
-    assert_eq!(record.kind.as_deref(), Some("granular"));
+        .with_kind(Some(crate::TokenKind::Granular))
+        .with_expires_at(Some(2_000_000_000_000));
+    let alice_id = backend
+        .account_id("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let (raw, record) = backend.issue_token(&alice_id, new_token).await.unwrap();
+    assert_eq!(record.kind, Some(crate::TokenKind::Granular));
 
     let looked_up = backend
         .lookup_record(&raw)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(looked_up.scopes, Some(vec!["scope:read".to_string(), "scope:write".to_string()]));
-    assert_eq!(looked_up.kind.as_deref(), Some("granular"));
+    assert_eq!(looked_up.kind, Some(crate::TokenKind::Granular));
+
+    let (_expired_raw, _) = backend
+        .issue_token(&alice_id, crate::NewToken::new().with_expires_at(Some(500)))
+        .await
+        .unwrap();
+    let (unexpiring_raw, _) = backend
+        .issue_token(&alice_id, crate::NewToken::new())
+        .await
+        .unwrap();
+    assert_eq!(backend.delete_expired(500).await.unwrap(), 1);
+    assert_eq!(backend.delete_expired(500).await.unwrap(), 0);
+    assert_eq!(
+        backend
+            .list_for_user(&alice_id)
+            .await
+            .unwrap()
+            .len(),
+        2,
+    );
+    assert!(
+        backend
+            .lookup_record(&unexpiring_raw)
+            .await
+            .unwrap()
+            .is_some(),
+    );
 }
 
 #[tokio::test]
 async fn libsql_schema_migrations_refuses_future_version() {
     let backend = local_backend(MaxUsers::Unlimited).await;
+    let future = pnpr_sql::schema::SCHEMA_VERSION + 1;
     backend.pool
         .connect()
         .unwrap()
-        .execute(
-            "INSERT INTO auth_schema_migrations (version, applied_at) VALUES (999, 123456789)",
-            (),
-        )
+        .execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 1)", [future])
         .await
         .unwrap();
 
@@ -650,7 +728,7 @@ async fn libsql_schema_migrations_refuses_future_version() {
     .unwrap_err();
     let err_str = err.to_string();
     assert!(
-        err_str.contains("newer than supported version"),
+        err_str.contains(&format!("schema version {future}")),
         "expected error about newer version, got: {err_str}",
     );
 }
@@ -659,7 +737,10 @@ async fn libsql_schema_migrations_refuses_future_version() {
 async fn reading_a_remote_row_keeps_the_connection_for_the_next_query() {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
     };
 
     let app = axum::Router::new()
@@ -715,4 +796,198 @@ async fn one_row_cursor() -> axum::body::Body {
     ];
     let lines = entries.map(|entry| Ok::<_, std::convert::Infallible>(format!("{entry}\n")));
     axum::body::Body::from_stream(futures_util::stream::iter(lines))
+}
+
+#[tokio::test]
+async fn immutable_account_ids_are_not_reassigned() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    crate::retirement_tests::assert_account_identity(&*backend).await;
+}
+
+#[tokio::test]
+async fn libsql_rejects_confusable_names() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    crate::validation::tests::assert_username_skeletons(&*backend).await;
+}
+
+#[tokio::test]
+async fn libsql_concurrent_confusable_registrations_create_only_one_account() {
+    let backend = local_backend(MaxUsers::Limited(2)).await;
+    let modern = backend.add_or_login("modern", "password");
+    let rnodern = backend.add_or_login("rnodern", "password");
+    let (first, second) = tokio::join!(modern, rnodern);
+    assert_ne!(first.is_ok(), second.is_ok());
+    assert_eq!(
+        backend
+            .list_users()
+            .await
+            .unwrap()
+            .len(),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn libsql_password_policy_applies_to_registration_and_login() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    crate::validation::tests::assert_password_policy(&*backend).await;
+}
+
+#[tokio::test]
+async fn password_updates_preserve_a_concurrent_admin_reset() {
+    let backend = local_backend(MaxUsers::Unlimited).await;
+    crate::password_login::tests::assert_password_update_keeps_concurrent_resets(&*backend).await;
+}
+
+#[tokio::test]
+async fn committed_password_changes_revoke_tokens_when_replica_refresh_fails() {
+    enum PasswordWrite {
+        Admin,
+        Profile,
+    }
+    for write in [PasswordWrite::Admin, PasswordWrite::Profile] {
+        let mut backend = local_backend(MaxUsers::Unlimited).await;
+        backend.create_user("example-user", "old-password").await.unwrap();
+        let id = backend
+            .account_id("example-user")
+            .await
+            .unwrap()
+            .unwrap();
+        let token = backend.issue(&id).await.unwrap();
+        let hash = backend
+            .credential("example-user")
+            .await
+            .unwrap()
+            .unwrap()
+            .into_password_hash()
+            .unwrap();
+        backend.backend.is_replica = true;
+        let LocalBackend { backend, _dir } = backend;
+        let backend = std::sync::Arc::new(backend);
+        let auth = crate::AuthState {
+            users: std::sync::Arc::clone(&backend) as std::sync::Arc<dyn UserBackend>,
+            tokens: std::sync::Arc::clone(&backend) as std::sync::Arc<dyn TokenBackend>,
+        };
+        let error = match write {
+            PasswordWrite::Profile => auth
+                .change_password_if_current(&id, "new-password", &hash)
+                .await
+                .unwrap_err(),
+            PasswordWrite::Admin => auth.change_password(&id, "new-password").await.unwrap_err(),
+        };
+        assert_eq!(error.committed_password_user(), Some(id.as_str()));
+        let stored = backend
+            .credential("example-user")
+            .await
+            .unwrap()
+            .unwrap()
+            .into_password_hash()
+            .unwrap();
+        assert!(crate::verify_bcrypt("new-password".to_string(), stored).await.unwrap());
+        assert_eq!(backend.lookup(&token).await.unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn conditional_renames_track_revisions_and_roll_back_unsynced_primary_writes() {
+    let mut backend = local_backend(MaxUsers::Unlimited).await;
+    let id = backend.provision_user("example-user").await.unwrap();
+    assert_eq!(
+        backend.account_login(&id).await.unwrap(),
+        Some(crate::AccountLogin { username: "example-user".to_string(), revision: 0 }),
+    );
+    assert_eq!(
+        backend.rename_user_if_current(&id, 0, "claimed").await.unwrap(),
+        crate::UserRename::Renamed(1),
+    );
+    backend.rename_user(&id, "admin-named").await.unwrap();
+    assert_eq!(
+        backend.rename_user_if_current(&id, 1, "stale").await.unwrap(),
+        crate::UserRename::CurrentChanged,
+    );
+    let current = backend
+        .account_login(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, crate::AccountLogin { username: "admin-named".to_string(), revision: 2 });
+    backend.set_password(&id, "secret123").await.unwrap();
+    let active_token = backend.issue(&id).await.unwrap();
+    assert_eq!(
+        backend.apply_account_status(&id, 1, crate::AccountLifecycle::Deactivated).await.unwrap(),
+        crate::AccountStatusOutcome::Applied,
+    );
+    assert_eq!(backend.lookup(&active_token).await.unwrap(), None);
+    assert!(
+        backend
+            .list_for_user(&id)
+            .await
+            .unwrap()
+            .is_empty(),
+    );
+    assert_eq!(backend.list_users().await.unwrap(), ["admin-named"]);
+    assert_eq!(
+        backend
+            .list_accounts()
+            .await
+            .unwrap()
+            .len(),
+        1,
+    );
+    assert_eq!(
+        backend.apply_account_status(&id, 1, crate::AccountLifecycle::Active).await.unwrap(),
+        crate::AccountStatusOutcome::Superseded,
+    );
+    assert_eq!(
+        backend.apply_account_status(&id, 2, crate::AccountLifecycle::Active).await.unwrap(),
+        crate::AccountStatusOutcome::Applied,
+    );
+    assert_eq!(
+        backend.credential("admin-named").await.unwrap(),
+        Some(crate::AccountCredential::None),
+    );
+    assert_eq!(
+        backend.account_login(&id).await.unwrap(),
+        Some(crate::AccountLogin { username: "admin-named".to_string(), revision: 2 }),
+    );
+
+    backend.backend.is_replica = true;
+    assert!(backend.rename_user_if_current(&id, 2, "unsynced").await.is_err());
+    assert_eq!(
+        backend
+            .account_name(&id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("admin-named"),
+    );
+}
+
+#[tokio::test]
+async fn deactivation_commits_token_and_password_cleanup_before_replica_sync_failure() {
+    let mut backend = local_backend(MaxUsers::Unlimited).await;
+    let id = backend.provision_user("replica-user").await.unwrap();
+    backend.set_password(&id, "secret123").await.unwrap();
+    let token = backend.issue(&id).await.unwrap();
+
+    backend.backend.is_replica = true;
+    assert!(
+        backend.apply_account_status(&id, 1, crate::AccountLifecycle::Deactivated).await.is_err(),
+    );
+
+    backend.backend.is_replica = false;
+    assert_eq!(backend.account_status(&id).await.unwrap(), Some(crate::AccountStatus::Deactivated));
+    assert_eq!(backend.credential("replica-user").await.unwrap(), None);
+    assert_eq!(backend.lookup(&token).await.unwrap(), None);
+    assert!(
+        backend
+            .list_for_user(&id)
+            .await
+            .unwrap()
+            .is_empty(),
+    );
+    assert_eq!(
+        backend.apply_account_status(&id, 1, crate::AccountLifecycle::Deactivated).await.unwrap(),
+        crate::AccountStatusOutcome::Applied,
+    );
 }

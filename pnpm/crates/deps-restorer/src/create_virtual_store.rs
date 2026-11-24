@@ -1,41 +1,84 @@
 pub(crate) mod cas;
-pub(crate) use cache_keys::{dir_clone_cacheable, package_content_changed};
+pub(crate) use cache_keys::{
+    dir_clone_cacheable,
+    package_content_changed,
+};
 pub use pnpm_package_manifest::requires_build_from_cas_paths;
 
+pub use output::{
+    CreateVirtualStoreOutput,
+    SideEffectsOutput,
+    SnapshotPlacement,
+};
+
+mod output;
 mod pipeline;
 
 mod warm;
 use warm::{
-    gvs_slot_needs_rebuild, snapshot_needs_build_marker, warm_cas_paths_by_pkg_id,
+    snapshot_needs_build_marker,
+    warm_cas_paths_by_pkg_id,
     warm_shared_base_cas_paths,
 };
 
 mod cold;
-use cold::{ColdCapture, add_cold_cas_paths};
+use cold::{
+    ColdCapture,
+    add_cold_cas_paths,
+};
 
 mod slot_linking;
 use slot_linking::LinkSlotsParallel;
 
 mod cache_keys;
+mod runtime_archives;
 use cache_keys::{
-    SnapshotCacheKey, derive_cache_keys, integrity_equal, prefetch_keys, snapshot_deps_equal,
+    SnapshotCacheKey,
+    derive_cache_keys,
+    integrity_equal,
+    prefetch_keys,
+    snapshot_deps_equal,
 };
+use runtime_archives::RuntimeArchives;
 
 use crate::{
-    CasPathsByPkgId, InstallPackageBySnapshotError, store_init::init_store_dir_best_effort,
+    CasPathsByPkgId,
+    InstallPackageBySnapshotError,
+    store_init::init_store_dir_best_effort,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
 use pnpm_deps_path::get_pkg_id_with_patch_hash;
 use pnpm_lockfile::{
-    LockfileEntries, LockfileResolution, PackageKey, PackageMetadata, PkgIdWithPatchHash, PkgName,
-    PkgNameVerPeer, ProjectSnapshot, SnapshotEntry,
+    LockfileEntries,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgIdWithPatchHash,
+    PkgName,
+    PkgNameVerPeer,
+    ProjectSnapshot,
+    SnapshotEntry,
 };
-use pnpm_store_dir::{SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreIndex};
-use pnpm_tarball::{PrefetchIntegrityCheck, PrefetchResult, prefetch_cas_paths};
+use pnpm_store_dir::{
+    SharedReadonlyStoreIndex,
+    SharedVerifiedFilesCache,
+    StoreIndex,
+};
+use pnpm_tarball::{
+    PrefetchIntegrityCheck,
+    PrefetchResult,
+    prefetch_cas_paths,
+};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::PathBuf,
     pin::Pin,
     sync::Arc,
@@ -80,18 +123,18 @@ pub fn lookup_known_bins<'a>(
 /// Per-snapshot side-effects-cache overlays, keyed by the snapshot's
 /// `PackageKey` and then by the dep-state cache key (the string
 /// `pnpm_graph_hasher::calc_dep_state` produces). The inner map
-/// is the post-build files map for that cache key — already with
+/// is the post-build files map for that cache key, already with
 /// the `added` / `deleted` overlay applied against the base files
 /// (see `pnpm_store_dir::VerifyResult.side_effects_maps`).
 ///
 /// Multiple snapshot peer-variants of the same package share one
-/// `Arc<_>` value — the store-index row is keyed peer-stripped, so
+/// `Arc<_>` value, the store-index row is keyed peer-stripped, so
 /// each `PackageKey::without_peer()` lookup returns the same
 /// underlying map.
 ///
 /// Hands off to `BuildModules`'s `is_built` gate (pnpm/pacquet#421):
 /// for a snapshot whose `calc_dep_state` cache key matches an entry
-/// here, the build is skipped — pacquet treats the package as
+/// here, the build is skipped, pacquet treats the package as
 /// already built (typically because pnpm seeded the cache on a
 /// previous install).
 pub type SideEffectsMapsBySnapshot =
@@ -142,9 +185,9 @@ pub struct CreateVirtualStoreStoreContext<'a> {
 ///
 /// [`CreateVirtualStore::run`] starts one itself when the caller passes
 /// none. A caller that has independent async work to do between
-/// planning and materialization — the frozen install path's
+/// planning and materialization (the frozen install path's
 /// installability host detection, whose `node --version` costs more
-/// than the entire prefetch — starts it early via [`Self::start`] and
+/// than the entire prefetch) starts it early via [`Self::start`] and
 /// hands it over through [`crate::VirtualStoreFetchInputs::cas_prefetch`], so the
 /// prefetch's store reads run under that work instead of after it.
 pub struct CasPrefetch {
@@ -170,7 +213,7 @@ impl CasPrefetch {
     /// Derive every snapshot's store-index cache key and spawn the
     /// warm-cache prefetch over the keys that exist. Read-only against
     /// the store apart from the `SQLite` open, so it is safe to run
-    /// concurrently with anything that does not write store rows —
+    /// concurrently with anything that does not write store rows,
     /// but, like the rest of the store planning, only after the
     /// offline lockfile checks.
     ///
@@ -178,13 +221,13 @@ impl CasPrefetch {
     /// [`CreateVirtualStore::run`]: the plan pass consumes one derived
     /// key per snapshot.
     pub async fn start(
-        config: &'static Config,
+        config: &Config,
         entries: LockfileEntries<'_>,
         allow_build_policy: &crate::AllowBuildPolicy,
         supported_architectures: Option<&pnpm_package_is_installable::SupportedArchitectures>,
         store_context: Option<&CreateVirtualStoreStoreContext<'_>>,
     ) -> Self {
-        let store_dir: &'static _ = &config.store_dir;
+        let store_dir = &config.store_dir;
         // Open the read-only SQLite index once for the whole run instead
         // of per snapshot. Every `InstallPackageBySnapshot` performs a
         // cache lookup against this index before falling through to the
@@ -193,7 +236,7 @@ impl CasPrefetch {
         // store (see <https://github.com/pnpm/pacquet/issues/260>). A
         // `None` here means the store has no `index.db` yet (first
         // install against an empty store), in which case every lookup
-        // would miss — so the handle stays `Option`al and lookups
+        // would miss, so the handle stays `Option`al and lookups
         // short-circuit. The open itself is synchronous SQLite I/O
         // parked on the blocking pool; `open_shared` degrades a
         // blocking-task failure to `None` so the install still makes
@@ -219,13 +262,14 @@ impl CasPrefetch {
         let keys = prefetch_keys(&cache_keys);
         #[cfg(test)]
         tests::record_prefetch_start(&keys);
-        let task = PrefetchTask::Running(tokio::spawn(prefetch_cas_paths(
-            store_index.clone(),
-            store_dir,
-            keys,
-            PrefetchIntegrityCheck::deferred_if(config.verify_store_integrity),
-            SharedVerifiedFilesCache::clone(&verified_files_cache),
-        )));
+        let owned_store_dir = store_dir.clone();
+        let task_index = store_index.clone();
+        let integrity_check = PrefetchIntegrityCheck::deferred_if(config.verify_store_integrity);
+        let task_verified = SharedVerifiedFilesCache::clone(&verified_files_cache);
+        let task = PrefetchTask::Running(tokio::spawn(async move {
+            prefetch_cas_paths(task_index, &owned_store_dir, keys, integrity_check, task_verified)
+                .await
+        }));
         CasPrefetch { store_index, verified_files_cache, cache_keys, task }
     }
 }
@@ -235,67 +279,13 @@ impl CasPrefetch {
 /// (directory and git), which therefore has no row to prefetch.
 pub(crate) type SnapshotWithCacheKey<'a> = (&'a PackageKey, &'a SnapshotEntry, Option<String>);
 
-/// Output of [`CreateVirtualStore::run`]. Bundles the bin-link
-/// manifest cache, the per-snapshot side-effects-cache overlays the
-/// build-phase needs, and the per-install fetch-failure set.
-///
-/// `fetch_failed` is the set of `optional: true` snapshots whose
-/// tarball / metadata / extract step blew up during this install.
-/// The caller (`InstallFrozenLockfile::run`) folds these into its
-/// own [`crate::SkippedSnapshots`] so downstream consumers
-/// (`build_graph`, `link_bins`, hoisting, etc.) treat them as
-/// absent — a failed-fetch optional snapshot is not present
-/// in the install graph.
-pub struct CreateVirtualStoreOutput {
-    pub package_manifests: PackageManifests,
-    pub package_bins: PackageBins,
-    pub side_effects_maps_by_snapshot: SideEffectsMapsBySnapshot,
-    /// The raw side-effects rows the overlays above were built from,
-    /// including the empty rows those overlays leave out.
-    pub side_effects_by_snapshot: SideEffectsBySnapshot,
-    pub requires_build_by_snapshot: RequiresBuildBySnapshot,
-    /// Snapshot keys whose package directories this run materialized.
-    /// The build phase uses this list to record only newly deferred
-    /// builds under `ignoreScripts`; earlier debt is retained from
-    /// `.modules.yaml` by the install orchestrator.
-    pub materialized_snapshots: Vec<PackageKey>,
-    pub fetch_failed: HashSet<PackageKey>,
-    /// Per-package CAS index, populated only when
-    /// [`crate::ModuleLinkerContext::kind`] is
-    /// [`NodeLinker::Hoisted`](pnpm_modules_yaml::NodeLinker::Hoisted). Threaded into
-    /// [`crate::link_hoisted_modules()`] which materializes the
-    /// hoisted `node_modules/` tree directly from these CAS paths
-    /// — there is no virtual store under hoisted, so this is the
-    /// only output that survives into the link phase. `None` for
-    /// the isolated and pnp linkers (their slot directories are
-    /// the bridge into the link phase instead). Pacquet decouples
-    /// fetch and walk, so the index is built here at fetch time.
-    pub cas_paths_by_pkg_id: Option<CasPathsByPkgId>,
-}
-
-impl CreateVirtualStoreOutput {
-    pub fn build_cache<'a>(
-        &'a self,
-        engine_name: Option<&'a str>,
-        store_index_writer: &'a std::sync::Arc<pnpm_store_dir::StoreIndexWriter>,
-    ) -> crate::BuildPhaseCache<'a> {
-        crate::BuildPhaseCache {
-            maps_by_snapshot: &self.side_effects_maps_by_snapshot,
-            diffs_by_snapshot: &self.side_effects_by_snapshot,
-            requires_build_by_snapshot: &self.requires_build_by_snapshot,
-            engine_name,
-            store_index_writer,
-        }
-    }
-}
-
 /// This subroutine generates filesystem layout for the virtual store at `node_modules/.pacquet`.
 #[must_use]
 pub struct CreateVirtualStore<'a> {
     pub fetching: crate::VirtualStoreFetchInputs<'a>,
     pub selection: crate::SnapshotSelection<'a>,
     pub ctx: &'a crate::InstallContext<'a>,
-    /// The wanted lockfile's entries — what this run materializes.
+    /// The wanted lockfile's entries, what this run materializes.
     pub entries: LockfileEntries<'a>,
     /// Entries recorded by the previous install, parsed from
     /// `<install_state_dir>/lock.yaml`. Used for reuse decisions and child-link
@@ -317,6 +307,17 @@ pub struct CreateVirtualStore<'a> {
 /// Error type of [`CreateVirtualStore`].
 #[derive(Debug, Display, Error, Diagnostic)]
 pub enum CreateVirtualStoreError {
+    #[diagnostic(transparent)]
+    LoadedBuild(#[error(source)] crate::BuildModulesError),
+    #[display("Cannot prepare a loaded installation at {}: {source}", path.display())]
+    #[diagnostic(code(ERR_PNPM_CAS_BUILD))]
+    LoadedBuildIo {
+        path: PathBuf,
+        #[error(source)]
+        source: std::io::Error,
+    },
+    #[diagnostic(transparent)]
+    LoadedBins(#[error(source)] crate::LinkVirtualStoreBinsError),
     #[display("Cannot install with nodeLinker.type=loaded: {message}")]
     #[diagnostic(code(ERR_PNPM_CAS_CONFIGURATION))]
     CasConfiguration { message: &'static str },
@@ -340,17 +341,17 @@ pub enum CreateVirtualStoreError {
     #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_MISSING_PACKAGES_SECTION))]
     MissingPackagesSection,
 
-    #[display("Failed to create the global virtual store build marker source at {path:?}: {error}")]
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_CREATE_BUILD_MARKER))]
-    CreateBuildMarker {
+    #[display("Failed to inspect optional dependency at {path:?}: {error}")]
+    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_INSPECT_OPTIONAL_DEPENDENCY))]
+    InspectOptionalDependency {
         path: PathBuf,
         #[error(source)]
         error: std::io::Error,
     },
 
-    #[display("Failed to inspect optional dependency at {path:?}: {error}")]
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_INSPECT_OPTIONAL_DEPENDENCY))]
-    InspectOptionalDependency {
+    #[display("Failed to record the installed runtime archive at {path:?}: {error}")]
+    #[diagnostic(code(ERR_PNPM_RECORD_RUNTIME_ARCHIVE))]
+    RecordRuntimeArchive {
         path: PathBuf,
         #[error(source)]
         error: std::io::Error,
@@ -391,7 +392,11 @@ async fn run_checked<Output>(
 ) -> Result<Output, CreateVirtualStoreError> {
     let Some(pending) = check.as_mut() else { return work.await };
     let mut work = std::pin::pin!(work);
+    // `select!` picks a random branch to poll first. Polling the check
+    // first keeps its requests (a frozen install's lockfile
+    // verification) from randomly trailing the downloads.
     let verdict = tokio::select! {
+        biased;
         verdict = pending => verdict,
         output = &mut work => return output,
     };
@@ -426,6 +431,7 @@ struct WantedEntries<'a> {
 
 /// What the warm and cold link batches share beyond their slots.
 struct LinkPlan<'a> {
+    runtime_archives: RuntimeArchives,
     /// Per-slot obsolete child aliases. Only survivors that already
     /// existed in the current lockfile and dropped a child contribute an
     /// entry; fresh packages and addition-only changes map to the empty
@@ -443,7 +449,7 @@ struct CasIndexes {
     /// pass.
     shared_base: crate::shared_side_effects::BaseCasPaths,
     /// Built only for the hoisted linker, which materializes
-    /// `node_modules/` straight from these paths — see
+    /// `node_modules/` straight from these paths; see
     /// [`CreateVirtualStoreOutput::cas_paths_by_pkg_id`]. Keyed by
     /// [`PkgIdWithPatchHash`], the key the walker assigns each
     /// [`crate::DependenciesGraphNode`]; until pacquet has end-to-end
@@ -475,15 +481,13 @@ impl CasIndexes {
 
 /// Look up the obsolete child aliases for a slot, defaulting to an
 /// empty slice. The extra indirection lets the [`SlotLink`](crate::create_virtual_store::slot_linking::SlotLink) builders
-/// pass their multiply-borrowed `snapshot_key` straight through —
+/// pass their multiply-borrowed `snapshot_key` straight through,
 /// deref coercion narrows it to `&PackageKey` at the call site.
 fn removed_aliases_for<'a>(
     removed_aliases_by_key: &'a HashMap<PackageKey, Vec<PkgName>>,
     snapshot_key: &PackageKey,
 ) -> &'a [PkgName] {
-    removed_aliases_by_key
-        .get(snapshot_key)
-        .map_or(&[], Vec::as_slice)
+    removed_aliases_by_key.get(snapshot_key).map_or_default(Vec::as_slice)
 }
 
 /// Child aliases linked by the previous install (`current`) that are
@@ -521,32 +525,11 @@ fn removed_child_aliases(
 /// `install_without_lockfile.rs`. Skipped under `frozenStore`: the store is
 /// read-only and complete, so no directory creation is attempted under its
 /// root.
-async fn init_store_dir_unless_frozen(
-    config: &Config,
-    store_dir: &'static pnpm_store_dir::StoreDir,
-) {
+async fn init_store_dir_unless_frozen(config: &Config, store_dir: &pnpm_store_dir::StoreDir) {
     if config.frozen_store {
         return;
     }
     init_store_dir_best_effort(store_dir).await;
-}
-
-/// The file a slot's `.pnpm-needs-build` marker is imported from, when this
-/// run can write one.
-fn create_build_marker_source(
-    config: &Config,
-    layout: &crate::VirtualStoreLayout,
-    store_dir: &pnpm_store_dir::StoreDir,
-) -> Result<Option<tempfile::NamedTempFile>, CreateVirtualStoreError> {
-    if config.frozen_store || !layout.enable_global_virtual_store() {
-        return Ok(None);
-    }
-    pnpm_fs::private_named_tempfile_in(store_dir.root())
-        .map(Some)
-        .map_err(|error| CreateVirtualStoreError::CreateBuildMarker {
-            path: store_dir.root().to_path_buf(),
-            error,
-        })
 }
 
 /// Publish the cold-batch fetch plan for the concurrent verification fan-out:
@@ -626,12 +609,12 @@ fn nothing_to_materialize(is_hoisted: bool) -> CreateVirtualStoreOutput {
     CreateVirtualStoreOutput {
         package_manifests: PackageManifests::new(),
         package_bins: PackageBins::new(),
-        side_effects_maps_by_snapshot: SideEffectsMapsBySnapshot::new(),
-        side_effects_by_snapshot: SideEffectsBySnapshot::new(),
+        side_effects: output::SideEffectsOutput::default(),
         requires_build_by_snapshot: RequiresBuildBySnapshot::new(),
-        materialized_snapshots: Vec::new(),
+        snapshot_placement: SnapshotPlacement::materialized(Vec::new()),
         fetch_failed: HashSet::new(),
         cas_paths_by_pkg_id: is_hoisted.then(CasPathsByPkgId::new),
+        cas_paths_by_snapshot: None,
     }
 }
 

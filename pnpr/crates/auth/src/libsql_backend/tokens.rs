@@ -1,43 +1,55 @@
-use super::{LibsqlAuth, RegistryError, Result, Row, TokenBackend, TokenRecord, first_row, params};
+use super::{
+    LibsqlAuth,
+    RegistryError,
+    Result,
+    Row,
+    TokenBackend,
+    TokenRecord,
+    first_row,
+    params,
+};
 use crate::{
     NewToken,
-    token_store::{mint_token, sha256_hex, unix_seconds},
+    TokenKind,
+    token_store::{
+        mint_token,
+        sha256_hex,
+        unix_millis,
+    },
     validation::{
-        token_scopes_from_sql, token_scopes_to_sql, token_timestamp_from_sql,
+        token_timestamp_from_sql,
         token_timestamp_to_sql,
     },
 };
 use async_trait::async_trait;
-use std::sync::atomic::Ordering;
 
 /// The `tokens` columns selected (in order) by every token read, so
 /// [`row_to_keyed_record`] can decode any of them the same way.
-const TOKEN_COLUMNS: &str = "token_hash, username, created_at, last_used_at, readonly, cidr_whitelist, name, expires_at, scopes, kind";
+const TOKEN_COLUMNS: &str = "token_hash, user_id, created_at, last_used_at, readonly, cidr_whitelist, name, expires_at, kind";
 
 /// [`TOKEN_COLUMNS`] of the `tokens` table aliased `t`, for the reads that
 /// join `users` to require a stored owner.
-const OWNED_TOKEN_COLUMNS: &str = "t.token_hash, t.username, t.created_at, t.last_used_at, t.readonly, t.cidr_whitelist, t.name, t.expires_at, t.scopes, t.kind";
+const OWNED_TOKEN_COLUMNS: &str = "t.token_hash, t.user_id, t.created_at, t.last_used_at, t.readonly, t.cidr_whitelist, t.name, t.expires_at, t.kind";
 
 #[async_trait]
 impl TokenBackend for LibsqlAuth {
     async fn issue_token(
         &self,
-        username: &str,
+        user_id: &str,
         new_token: NewToken,
     ) -> Result<(String, TokenRecord)> {
-        let nonce = self.counter.fetch_add(1, Ordering::Relaxed);
-        let raw = mint_token(&self.secret, nonce, username);
+        let raw = mint_token();
         let token_hash = sha256_hex(raw.as_bytes());
-        let now = unix_seconds();
+        let now = unix_millis();
         let record = TokenRecord {
-            username: username.to_string(),
+            owner_name: None,
+            user_id: user_id.to_string(),
             created_at: now,
             last_used_at: now,
             readonly: new_token.readonly,
             cidr_whitelist: new_token.cidr_whitelist,
             name: new_token.name,
             expires_at: new_token.expires_at,
-            scopes: new_token.scopes,
             kind: new_token.kind,
         };
         self.insert_token(token_hash, &record).await?;
@@ -45,8 +57,8 @@ impl TokenBackend for LibsqlAuth {
         Ok((raw, record))
     }
 
-    async fn issue(&self, username: &str) -> Result<String> {
-        let (raw, _) = self.issue_token(username, NewToken::default()).await?;
+    async fn issue(&self, user_id: &str) -> Result<String> {
+        let (raw, _) = self.issue_token(user_id, NewToken::default()).await?;
         Ok(raw)
     }
 
@@ -68,11 +80,12 @@ impl TokenBackend for LibsqlAuth {
 
     async fn lookup(&self, raw: &str) -> Result<Option<String>> {
         let token_hash = sha256_hex(raw.as_bytes());
-        let now = unix_seconds();
+        let token_hash = token_hash.as_str();
+        let now = unix_millis();
         self.pool.read(|conn| async move {
             let rows = conn
                 .query(
-                    "SELECT t.username, t.expires_at FROM tokens t JOIN users u ON u.username = t.username
+                    "SELECT t.user_id, t.expires_at FROM tokens t JOIN users u ON u.id = t.user_id AND u.status = 'active'
                      WHERE t.token_hash = ?1",
                     params![token_hash],
                 )
@@ -84,14 +97,19 @@ impl TokenBackend for LibsqlAuth {
 
     async fn lookup_record(&self, raw: &str) -> Result<Option<TokenRecord>> {
         let token_hash = sha256_hex(raw.as_bytes());
+        let token_hash = token_hash.as_str();
         let query = format!(
-            "SELECT {OWNED_TOKEN_COLUMNS} FROM tokens t JOIN users u ON u.username = t.username
+            "SELECT {OWNED_TOKEN_COLUMNS}, u.username FROM tokens t JOIN users u ON u.id = t.user_id AND u.status = 'active'
              WHERE t.token_hash = ?1",
         );
-        let now = unix_seconds();
+        let query = query.as_str();
+        let now = unix_millis();
         self.pool.read(|conn| async move {
-            let rows = conn.query(&query, params![token_hash]).await?;
-            let record = first_row(rows, |row| Ok(row_to_keyed_record(row)?.1)).await?;
+            let rows = conn.query(query, params![token_hash]).await?;
+            let record = first_row(rows, |row| {
+                Ok(row_to_keyed_record(row)?.1.with_owner_name(row.get::<String>(9)?))
+            })
+            .await?;
             Ok(record.and_then(|record| unexpired(record, now)))
         })
         .await
@@ -99,17 +117,19 @@ impl TokenBackend for LibsqlAuth {
 
     async fn find_by_key(&self, key: &str) -> Result<Option<TokenRecord>> {
         let query = format!("SELECT {TOKEN_COLUMNS} FROM tokens WHERE token_hash = ?1");
+        let query = query.as_str();
         self.pool.read(|conn| async move {
-            let rows = conn.query(&query, params![key]).await?;
+            let rows = conn.query(query, params![key]).await?;
             first_row(rows, |row| Ok(row_to_keyed_record(row)?.1)).await
         })
         .await
     }
 
-    async fn list_for_user(&self, username: &str) -> Result<Vec<(String, TokenRecord)>> {
-        let query = format!("SELECT {TOKEN_COLUMNS} FROM tokens WHERE username = ?1");
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<(String, TokenRecord)>> {
+        let query = format!("SELECT {TOKEN_COLUMNS} FROM tokens WHERE user_id = ?1");
+        let query = query.as_str();
         self.pool.read(|conn| async move {
-            let mut rows = conn.query(&query, params![username]).await?;
+            let mut rows = conn.query(query, params![user_id]).await?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().await? {
                 out.push(row_to_keyed_record(&row)?);
@@ -132,14 +152,30 @@ impl TokenBackend for LibsqlAuth {
         Ok(Some(record))
     }
 
-    async fn revoke_all_for_user(&self, username: &str) -> Result<usize> {
+    async fn revoke_all_for_user(&self, user_id: &str) -> Result<usize> {
         let removed = self.pool.write(|conn| async move {
-            Ok(conn.execute("DELETE FROM tokens WHERE username = ?1", params![username]).await?)
+            Ok(conn.execute("DELETE FROM tokens WHERE user_id = ?1", params![user_id]).await?)
         })
         .await?;
         // Another instance may have revoked the tokens this replica still
         // holds, so a zero-row delete does not settle whether to pull.
-        if removed > 0 || self.replica_holds_tokens(username).await? {
+        if removed > 0 || self.replica_holds_tokens(user_id).await? {
+            self.sync_replica().await?;
+        }
+        Ok(usize::try_from(removed).unwrap_or(usize::MAX))
+    }
+
+    async fn delete_expired(&self, now: u64) -> Result<usize> {
+        let sql_now = token_timestamp_to_sql(now);
+        let removed = self.pool.write(|conn| async move {
+            Ok(conn.execute(
+                "DELETE FROM tokens WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                params![sql_now],
+            )
+            .await?)
+        })
+        .await?;
+        if removed > 0 || self.replica_holds_expired_tokens(sql_now).await? {
             self.sync_replica().await?;
         }
         Ok(usize::try_from(removed).unwrap_or(usize::MAX))
@@ -154,23 +190,22 @@ impl LibsqlAuth {
     async fn insert_token(&self, token_hash: String, record: &TokenRecord) -> Result<()> {
         let cidr_json = serde_json::to_string(&record.cidr_whitelist)
             .expect("Vec<String> always serializes to JSON");
-        let scopes_json = token_scopes_to_sql(record.scopes.as_deref());
+        let (token_hash, cidr_json) = (token_hash.as_str(), cidr_json.as_str());
         self.pool.write(|conn| async move {
             conn.execute(
                 "INSERT INTO tokens
-                     (token_hash, username, created_at, last_used_at, readonly, cidr_whitelist, name, expires_at, scopes, kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     (token_hash, user_id, created_at, last_used_at, readonly, cidr_whitelist, name, expires_at, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     token_hash,
-                    record.username.clone(),
+                    record.user_id.clone(),
                     token_timestamp_to_sql(record.created_at),
                     token_timestamp_to_sql(record.last_used_at),
                     i64::from(record.readonly),
                     cidr_json,
                     record.name.as_deref(),
                     record.expires_at.map(token_timestamp_to_sql),
-                    scopes_json.as_deref(),
-                    record.kind.as_deref(),
+                    record.kind.map(TokenKind::as_str),
                 ],
             )
             .await?;
@@ -179,31 +214,46 @@ impl LibsqlAuth {
         .await
     }
 
-    /// Whether the embedded replica still lists a token of `username`;
+    /// Whether the embedded replica still lists a token of `user_id`;
     /// `false` without a replica, since the pool then reads the primary.
-    async fn replica_holds_tokens(&self, username: &str) -> Result<bool> {
+    async fn replica_holds_tokens(&self, user_id: &str) -> Result<bool> {
         if !self.is_replica {
             return Ok(false);
         }
         self.pool.read(|conn| async move {
             let rows =
-                conn.query("SELECT 1 FROM tokens WHERE username = ?1 LIMIT 1", params![username])
+                conn.query("SELECT 1 FROM tokens WHERE user_id = ?1 LIMIT 1", params![user_id])
                     .await?;
+            Ok(first_row(rows, |_| Ok(())).await?.is_some())
+        })
+        .await
+    }
+
+    async fn replica_holds_expired_tokens(&self, sql_now: i64) -> Result<bool> {
+        if !self.is_replica {
+            return Ok(false);
+        }
+        self.pool.read(|conn| async move {
+            let rows = conn.query(
+                "SELECT 1 FROM tokens WHERE expires_at IS NOT NULL AND expires_at <= ?1 LIMIT 1",
+                params![sql_now],
+            )
+            .await?;
             Ok(first_row(rows, |_| Ok(())).await?.is_some())
         })
         .await
     }
 }
 
-/// The owner of a token row selecting `username, expires_at`, unless the token
+/// The owner of a token row selecting `user_id, expires_at`, unless the token
 /// expired by `now`.
 fn unexpired_owner(row: &Row, now: u64) -> Result<Option<String>> {
-    let username: String = row.get(0)?;
+    let user_id: String = row.get(0)?;
     let expires_at: Option<i64> = row.get(1)?;
     let expired = expires_at
         .map(token_timestamp_from_sql)
         .is_some_and(|exp| exp <= now);
-    Ok((!expired).then_some(username))
+    Ok((!expired).then_some(user_id))
 }
 
 /// `record`, unless it expired by `now`.
@@ -221,21 +271,21 @@ fn row_to_keyed_record(row: &Row) -> Result<(String, TokenRecord)> {
         .map_err(|err| RegistryError::Internal {
             reason: format!("token {token_hash} has an unreadable cidr_whitelist: {err}"),
         })?;
-    let scopes_json: Option<String> = row.get(8)?;
-    let scopes = token_scopes_from_sql(scopes_json.as_deref(), &token_hash)?;
     let expires_at: Option<i64> = row.get(7)?;
+    let raw_kind: Option<String> = row.get(8)?;
+    let kind = TokenKind::from_sql(raw_kind.as_deref(), &token_hash)?;
     Ok((
         token_hash,
         TokenRecord {
-            username: row.get(1)?,
+            owner_name: None,
+            user_id: row.get(1)?,
             created_at: token_timestamp_from_sql(row.get(2)?),
             last_used_at: token_timestamp_from_sql(row.get(3)?),
             readonly: row.get::<i64>(4)? != 0,
             cidr_whitelist,
             name: row.get(6)?,
             expires_at: expires_at.map(token_timestamp_from_sql),
-            scopes,
-            kind: row.get(9)?,
+            kind,
         },
     ))
 }

@@ -1,4 +1,9 @@
-use crate::{CARGO_ECOSYSTEM, PYPI_ECOSYSTEM, PnprClient, server_resolves};
+use crate::{
+    CARGO_ECOSYSTEM,
+    PYPI_ECOSYSTEM,
+    PnprClient,
+    server_resolves,
+};
 
 #[tokio::test]
 async fn caches_supported_and_unsupported_ecosystems_across_clients() {
@@ -7,7 +12,7 @@ async fn caches_supported_and_unsupported_ecosystems_across_clients() {
         .mock("GET", "/cached-capabilities/-/pnpr")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"pnpr":{"versions":[0],"ecosystems":["pypi"]}}"#)
+        .with_body(r#"{"pnpr":{"protocols":{"resolver":{"versions":[0],"features":["projectTransforms"],"ecosystems":["pypi"]}}}}"#)
         .expect(2)
         .create_async()
         .await;

@@ -1,6 +1,18 @@
 use super::{
-    Config, ConfigOverrides, EnvVar, GetCurrentDir, GetHomeDir, LinkProbe, NodeLinker, Path,
-    PathBuf, STORE_VERSION, apply_state_dir_override, apply_store_dir_override, argv, assert_eq,
+    Config,
+    ConfigOverrides,
+    EnvVar,
+    GetCurrentDir,
+    GetHomeDir,
+    LinkProbe,
+    NodeLinker,
+    Path,
+    PathBuf,
+    STORE_VERSION,
+    apply_state_dir_override,
+    apply_store_dir_override,
+    argv,
+    assert_eq,
 };
 
 #[test]
@@ -140,8 +152,8 @@ fn node_linker_override_rederives_prefer_symlinked_executables() {
     overrides.apply(&mut config, Path::new("/workspace"));
     assert_eq!(config.prefer_symlinked_executables, Some(true));
 
-    // An explicit `false` — recorded in `explicit_settings` by the
-    // config layer that set it — outranks the hoisted default.
+    // An explicit `false` (recorded in `explicit_settings` by the
+    // config layer that set it) outranks the hoisted default.
     let (overrides, _) =
         ConfigOverrides::extract(argv(["pacquet", "--config.node-linker=hoisted", "install"]));
     let mut config = Config { prefer_symlinked_executables: Some(false), ..Config::default() };
@@ -492,4 +504,34 @@ fn store_dir_override_matching_the_relocated_default_does_not_warn() {
 
     assert_eq!(config.store_dir.root(), relocated.join(STORE_VERSION));
     assert_eq!(config.bypassed_home_store_warning(), None);
+}
+
+#[test]
+fn camel_case_dotted_store_and_state_dir_rewrite_to_global_flags() {
+    let (overrides, remaining) = ConfigOverrides::extract(argv([
+        "pacquet",
+        "--config.storeDir=dotted-store",
+        "--config.stateDir=/custom/state",
+        "install",
+    ]));
+    assert_eq!(
+        remaining,
+        argv(["pacquet", "--store-dir=dotted-store", "--state-dir=/custom/state", "install"]),
+    );
+    assert_eq!(
+        overrides.cli_layer(None).npmrc_tokens,
+        [
+            ("storeDir".to_owned(), "dotted-store".to_owned()),
+            ("stateDir".to_owned(), "/custom/state".to_owned()),
+        ],
+    );
+
+    let (_, remaining) = ConfigOverrides::extract(argv([
+        "pacquet",
+        "--config.storeDir=",
+        "--config.stateDir=",
+        "store",
+        "path",
+    ]));
+    assert_eq!(remaining, argv(["pacquet", "--store-dir=", "--state-dir=", "store", "path"]));
 }

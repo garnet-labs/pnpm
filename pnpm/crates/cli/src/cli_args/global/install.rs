@@ -1,9 +1,38 @@
 use super::{
-    AddGroups, CatalogMode, Config, Context, DependencyGroup, GlobalPackageBinSnapshot,
-    GlobalPackageInfo, HashMap, HashSet, ImporterDepVersion, Lockfile, PackageBinSource, Path,
-    PathBuf, RangeSpecStyle, Reporter, State, SupportedArchitectures, Version, WorkspaceSettings,
-    add_packages, apply_allow_build, infer_local_package_alias, installed_versions,
-    prompt_approve_install_builds, update_selectors,
+    AddGroups,
+    CatalogMode,
+    Config,
+    Context,
+    DependencyGroup,
+    GlobalPackageBinSnapshot,
+    GlobalPackageInfo,
+    GlobalUpdateMode,
+    HashMap,
+    HashSet,
+    Lockfile,
+    PackageBinSource,
+    Path,
+    PathBuf,
+    RangeSpecStyle,
+    Reporter,
+    State,
+    SupportedArchitectures,
+    Version,
+    WorkspaceSettings,
+    add_packages,
+    apply_allow_build,
+    apply_global_build_policy,
+    apply_pins,
+    apply_runtime_range_bumps,
+    global_approval_store,
+    infer_local_package_alias,
+    installed_versions,
+    is_registry_version_spec,
+    moves_past_declared_range,
+    needs_runtime_range_bump,
+    prompt_approve_install_builds,
+    tag_checked_selectors,
+    update_selectors,
 };
 use pnpm_config::Host;
 
@@ -17,6 +46,126 @@ pub(super) struct GlobalInstallTarget<'a> {
 pub(super) struct DowngradeCheck {
     pub(super) candidate_resolved: bool,
     pub(super) pins: HashMap<String, String>,
+}
+
+impl GlobalInstallTarget<'_> {
+    pub(super) async fn resolve_candidate_selectors<Reporter: self::Reporter + 'static>(
+        &self,
+        pkg: &GlobalPackageInfo,
+        install_dir: &Path,
+        mode: GlobalUpdateMode<'_>,
+        range_spec_style: RangeSpecStyle,
+        supported_architectures: Option<SupportedArchitectures>,
+    ) -> miette::Result<Vec<String>> {
+        let target_selectors = self.target_selectors::<Reporter>(pkg, mode).await?;
+        let downgrade_check = Box::pin(pins_for_downgrades::<Reporter>(
+            self.base_config,
+            self.global_pkg_dir,
+            install_dir,
+            pkg,
+            (mode, &target_selectors),
+            range_spec_style,
+            supported_architectures.clone(),
+        ))
+        .await?;
+        let mut selectors = apply_pins(&pkg.dependencies, target_selectors, &downgrade_check.pins);
+        if !downgrade_check.candidate_resolved || !downgrade_check.pins.is_empty() {
+            self.run_lockfile_only_install::<Reporter>(
+                install_dir,
+                &selectors,
+                range_spec_style,
+                supported_architectures.clone(),
+            )
+            .await?;
+        }
+        match mode {
+            GlobalUpdateMode::DeclaredRange | GlobalUpdateMode::Tag(_) => {}
+            GlobalUpdateMode::Latest => {
+                selectors = self.finalize_latest_runtime_selectors::<Reporter>(
+                    pkg,
+                    install_dir,
+                    selectors,
+                    &downgrade_check.pins,
+                    range_spec_style,
+                    supported_architectures,
+                )
+                .await?;
+            }
+        }
+        Ok(selectors)
+    }
+
+    /// The selectors `mode` resolves the group's dependencies with, before
+    /// any downgrade pin. Under `--tag` a dependency that does not publish
+    /// the tag keeps its recorded spec, so it cannot abort the whole group's
+    /// update.
+    async fn target_selectors<Reporter: self::Reporter>(
+        &self,
+        pkg: &GlobalPackageInfo,
+        mode: GlobalUpdateMode<'_>,
+    ) -> miette::Result<Vec<String>> {
+        match mode {
+            GlobalUpdateMode::Tag(tag)
+                if pkg.dependencies.iter().any(|(_, spec)| is_registry_version_spec(spec)) =>
+            {
+                tag_checked_selectors::<Reporter>(self.base_config, &pkg.dependencies, tag).await
+            }
+            _ => Ok(update_selectors(&pkg.dependencies, mode, &HashMap::new())),
+        }
+    }
+
+    async fn finalize_latest_runtime_selectors<Reporter: self::Reporter + 'static>(
+        &self,
+        pkg: &GlobalPackageInfo,
+        install_dir: &Path,
+        selectors: Vec<String>,
+        pins: &HashMap<String, String>,
+        range_spec_style: RangeSpecStyle,
+        supported_architectures: Option<SupportedArchitectures>,
+    ) -> miette::Result<Vec<String>> {
+        if !needs_runtime_range_bump(&pkg.dependencies, pins) {
+            return Ok(selectors);
+        }
+        let resolved = resolved_direct_versions(install_dir);
+        let bumped = apply_runtime_range_bumps(
+            &pkg.dependencies,
+            &selectors,
+            pins,
+            &resolved,
+            range_spec_style,
+        );
+        if bumped != selectors {
+            self.run_lockfile_only_install::<Reporter>(
+                install_dir,
+                &bumped,
+                range_spec_style,
+                supported_architectures,
+            )
+            .await?;
+        }
+        Ok(bumped)
+    }
+
+    async fn run_lockfile_only_install<Reporter: self::Reporter + 'static>(
+        &self,
+        install_dir: &Path,
+        selectors: &[String],
+        range_spec_style: RangeSpecStyle,
+        supported_architectures: Option<SupportedArchitectures>,
+    ) -> miette::Result<()> {
+        Box::pin(run_group_install::<Reporter>(GroupInstall {
+            base_config: self.base_config,
+            global_pkg_dir: self.global_pkg_dir,
+            install_dir,
+            selectors,
+            range_spec_style,
+            supported_architectures,
+            allow_build: &[],
+            lockfile_only: true,
+        }))
+        .await?;
+        Ok(())
+    }
 }
 
 /// A freshly installed group, ready to take over the global bins of the
@@ -36,34 +185,36 @@ pub(super) struct GroupActivation<'a> {
 /// otherwise move backwards. `--latest` resolves the `latest` dist-tag, which
 /// points at an older release than the one installed whenever that came from
 /// another tag, or from a major that has not been promoted to `latest` yet.
+/// `--tag` resolves a tag that may likewise point at an older release.
 ///
 /// The versions are resolved into `install_dir` without installing anything, so
 /// a release that is about to be rejected never gets the chance to run its
 /// lifecycle scripts. The install that follows reuses the lockfile written here
 /// and only re-resolves what a pin changes.
 ///
-/// Only plain version dependencies are considered: every other spec form says
-/// where the package comes from, so holding one at a bare version would resolve
-/// a different package from the default registry.
+/// Only plain version dependencies, `npm:` aliases, and `runtime:` dependencies
+/// are considered: every other spec form says where the package comes from, so
+/// holding one at a bare version would resolve a different package from the
+/// default registry.
 pub(super) async fn pins_for_downgrades<Reporter: self::Reporter + 'static>(
     base_config: &'static Config,
     global_pkg_dir: &Path,
     install_dir: &Path,
     pkg: &GlobalPackageInfo,
-    latest: bool,
+    (mode, target_selectors): (GlobalUpdateMode<'_>, &[String]),
     range_spec_style: RangeSpecStyle,
     supported_architectures: Option<SupportedArchitectures>,
 ) -> miette::Result<DowngradeCheck> {
-    // Only `--latest` can pick a version outside the recorded range, and only a
-    // plain version spec is rewritten to `@latest`. Other specs keep their source.
-    if !latest {
+    if mode == GlobalUpdateMode::DeclaredRange {
         return Ok(DowngradeCheck { candidate_resolved: false, pins: HashMap::new() });
     }
     let versions_before = installed_versions(&pkg.install_dir);
     // Nothing to compare a resolution against, so nothing to resolve.
     if !pkg.dependencies
         .iter()
-        .any(|(alias, spec)| is_plain_version_spec(spec) && versions_before.contains_key(alias))
+        .any(|(alias, spec)| {
+            moves_past_declared_range(mode, alias, spec) && versions_before.contains_key(alias)
+        })
     {
         return Ok(DowngradeCheck { candidate_resolved: false, pins: HashMap::new() });
     }
@@ -71,7 +222,7 @@ pub(super) async fn pins_for_downgrades<Reporter: self::Reporter + 'static>(
         base_config,
         global_pkg_dir,
         install_dir,
-        selectors: &update_selectors(&pkg.dependencies, latest, &HashMap::new()),
+        selectors: target_selectors,
         range_spec_style,
         supported_architectures,
         allow_build: &[],
@@ -82,7 +233,7 @@ pub(super) async fn pins_for_downgrades<Reporter: self::Reporter + 'static>(
 
     let pins = pkg.dependencies
         .iter()
-        .filter(|(_, spec)| is_plain_version_spec(spec))
+        .filter(|(alias, spec)| moves_past_declared_range(mode, alias, spec))
         .filter_map(|(alias, _)| {
             let before = Version::parse(versions_before.get(alias)?).ok()?;
             let now = resolved.get(alias)?;
@@ -93,8 +244,8 @@ pub(super) async fn pins_for_downgrades<Reporter: self::Reporter + 'static>(
 }
 
 /// The version each direct dependency resolved to, read from the lockfile the
-/// resolve pass wrote. Only the plain-semver shape is reported: it is the only
-/// one a plain version spec resolves to, and the only one a pin can hold.
+/// resolve pass wrote. Covers plain semver, `npm:` aliases, and `runtime:`
+/// dependencies.
 fn resolved_direct_versions(install_dir: &Path) -> HashMap<String, Version> {
     let Ok(Some(lockfile)) = Lockfile::load_from_path(&install_dir.join(Lockfile::FILE_NAME))
     else {
@@ -106,21 +257,16 @@ fn resolved_direct_versions(install_dir: &Path) -> HashMap<String, Version> {
     importer.dependencies
         .iter()
         .flatten()
-        .filter_map(|(alias, resolved)| match &resolved.version {
-            ImporterDepVersion::Regular(version) => {
-                Some((alias.to_string(), version.version_semver()?.clone()))
-            }
-            _ => None,
+        .filter_map(|(alias, resolved)| {
+            Some((
+                alias.to_string(),
+                resolved.version
+                    .ver_peer()?
+                    .version_semver()?
+                    .clone(),
+            ))
         })
         .collect()
-}
-
-/// Only a plain version spec may be replaced with `@latest`.
-/// Every other spec form (`link:`, `file:`, a git or tarball URL, an `npm:`
-/// alias, a named registry) also says where the package comes from. Replacing
-/// it would look up a different package in the default registry.
-pub(super) fn is_plain_version_spec(spec: &str) -> bool {
-    !spec.contains(':')
 }
 
 /// What to install into a fresh global group directory. See
@@ -152,7 +298,11 @@ pub(super) async fn run_group_install<Reporter: self::Reporter + 'static>(
         install.global_pkg_dir,
         install.supported_architectures,
     )?;
-    apply_allow_build(&mut cfg, install.allow_build, install.global_pkg_dir)?;
+    apply_allow_build(
+        &mut cfg,
+        install.allow_build,
+        global_approval_store(install.base_config, install.global_pkg_dir)?,
+    )?;
 
     let config: &'static Config = Config::leak(cfg);
 
@@ -177,7 +327,7 @@ pub(super) async fn run_group_install<Reporter: self::Reporter + 'static>(
         prompt_approve_install_builds::<Reporter>(
             config,
             install.install_dir,
-            install.global_pkg_dir,
+            global_approval_store(install.base_config, install.global_pkg_dir)?,
         )
         .await?;
     }
@@ -203,18 +353,18 @@ pub(super) fn global_group_config(
     // Persist a `pnpm-lock.yaml` in the group's install dir (pnpm sets
     // `lockfileDir = installDir`). `outdated -g` / `update -g` read these
     // pins to determine the currently-installed versions. A `lockfileDir`
-    // the environment set cannot redirect it — pnpm deletes the setting
+    // the environment set cannot redirect it, pnpm deletes the setting
     // under `--global`.
     cfg.lockfile = true;
+    cfg.configured_lockfile_dir = None;
     cfg.lockfile_dir = None;
     // Pin the group's workspace root to its own install dir (pnpm's
     // `rootProjectManifestDir: installDir`, `workspaceDir: undefined`). The
-    // install dir sits *under* the global packages dir, which carries a
-    // `pnpm-workspace.yaml` of global settings (`allowBuilds`, `catalog`,
-    // ...). Leaving this unset would let the install pipeline walk up, adopt
-    // that file as the workspace, and then fail trying to enumerate its
-    // non-existent root project. Anchoring here keeps the group install an
-    // isolated single project.
+    // install dir sits *under* the global packages dir, which may carry a
+    // `pnpm-workspace.yaml`. Leaving this unset would let the install
+    // pipeline walk up, adopt that file as the workspace, and then fail
+    // trying to enumerate its non-existent root project. Anchoring here
+    // keeps the group install an isolated single project.
     cfg.workspace_dir = Some(install_dir.to_path_buf());
     cfg.supported_architectures = supported_architectures;
     merge_persisted_minimum_release_age_excludes(&mut cfg, install_dir)?;
@@ -224,9 +374,9 @@ pub(super) fn global_group_config(
     // achieves this by running the install with `cwd` = the pnpm home dir;
     // pacquet clones the caller's already-loaded config, so drop those
     // project-scoped resolution settings explicitly. Inheriting `overrides`
-    // is what surfaced as `ERR_PNPM_CATALOG_IN_OVERRIDES` — a repo override
+    // is what surfaced as `ERR_PNPM_CATALOG_IN_OVERRIDES`, a repo override
     // referencing a `catalog:` the isolated install (with no catalogs) no
-    // longer resolves — and inheriting `catalogMode: strict` would likewise
+    // longer resolves, and inheriting `catalogMode: strict` would likewise
     // reject the install against an empty catalog.
     cfg.overrides = None;
     cfg.catalogs = None;
@@ -240,26 +390,8 @@ pub(super) fn global_group_config(
     cfg.extra_env.remove("NODE_OPTIONS");
     cfg.apply_global_virtual_store_node_path::<Host>();
 
-    // Build-script policy for global installs comes from the global packages
-    // directory, never the caller's repo — otherwise a repo-controlled
-    // `pnpm-workspace.yaml` could decide which lifecycle scripts run during
-    // `add -g` / `update -g`. Drop the inherited repo policy and load the
-    // global `allowBuilds` (where the approval prompt persists its
-    // decisions) instead.
-    cfg.dangerously_allow_all_builds = false;
-    cfg.allow_builds.clear();
     cfg.disable_agent_skills();
-    if let Some((_, settings)) = WorkspaceSettings::find_and_load(global_pkg_dir)
-        .map_err(miette::Report::new)
-        .wrap_err("load global allowBuilds")?
-    {
-        if let Some(allow_builds) = settings.decided_build_approvals() {
-            cfg.allow_builds = allow_builds;
-        }
-        if let Some(allow_all) = settings.dangerously_allow_all_builds {
-            cfg.dangerously_allow_all_builds = allow_all;
-        }
-    }
+    apply_global_build_policy(&mut cfg, global_pkg_dir)?;
     // Don't fail the install when a dependency's build is ignored; the
     // global approval prompt (run after the install) records the ignored
     // builds and prompts rather than erroring under `strictDepBuilds`.

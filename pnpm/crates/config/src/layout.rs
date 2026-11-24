@@ -1,9 +1,29 @@
 use super::{
-    Config, EnvVar, GetCurrentDir, GetHomeDir, GitHost, HashMap, HoistPatterns, LinkProbe,
-    Lockfile, NodeLinker, Path, StoreDir, StoreRelocation, SymlinkedLockfile, TrustedSettings,
-    WantedLockfileSelection, collect_explicit_trusted_settings, create_matcher, default_store_dir,
-    get_branches_containing_head, get_current_branch, store_path,
+    Config,
+    EnvVar,
+    GetCurrentDir,
+    GetHomeDir,
+    GitHost,
+    HashMap,
+    HoistPatterns,
+    LinkProbe,
+    Lockfile,
+    NodeLinker,
+    Path,
+    StoreDir,
+    StoreRelocation,
+    SymlinkedLockfile,
+    TrustedSettings,
+    WantedLockfileSelection,
+    collect_explicit_trusted_settings,
+    create_matcher,
+    default_store_dir,
+    get_branches_containing_head,
+    get_current_branch,
+    store_path,
 };
+
+mod pin_lockfile;
 
 impl Config {
     /// Settle the two directories a global virtual store separates:
@@ -72,13 +92,7 @@ impl Config {
     pub fn lockfile_dir_for<'a>(&'a self, project_dir: &'a Path) -> &'a Path {
         self.lockfile_dir
             .as_deref()
-            .unwrap_or_else(|| {
-                if self.shared_workspace_lockfile {
-                    self.workspace_dir.as_deref().unwrap_or(project_dir)
-                } else {
-                    project_dir
-                }
-            })
+            .unwrap_or_else(|| self.default_lockfile_dir_for(project_dir))
     }
 
     /// Whether one `pnpm-lock.yaml` covers every project the command
@@ -94,6 +108,24 @@ impl Config {
         self.lockfile_dir.is_some() || self.shared_workspace_lockfile
     }
 
+    /// Whether the lockfile records the resolution settings
+    /// ([`pnpm_lockfile::ResolutionSettings`]). The `v13` format always does.
+    /// The `v9` format does when [`Self::lockfile_include_resolution_settings`]
+    /// is on, since older pnpm versions drop the keys from a `v9` lockfile.
+    #[must_use]
+    pub fn lockfile_records_resolution_settings(&self) -> bool {
+        self.lockfile_include_resolution_settings
+            || self.lockfile_format == pnpm_lockfile::LockfileFormat::V13
+    }
+
+    /// Whether [`Self::project_scoped_optional_peers`] changes a resolution.
+    /// It has no effect while [`Self::dedupe_peer_dependents`] is off,
+    /// because optional peers are then project-scoped already.
+    #[must_use]
+    pub fn project_scoped_optional_peers_take_effect(&self) -> bool {
+        self.dedupe_peer_dependents && self.project_scoped_optional_peers
+    }
+
     /// How a walk that leaves out a dependency group classifies the lockfile's
     /// optional-peer edges.
     #[must_use]
@@ -105,7 +137,7 @@ impl Config {
 
     /// pnpm's `rootProjectManifestDir`: where the root `package.json`,
     /// the config dependencies (`node_modules/.pnpm-config`), and the
-    /// pnpmfile a command reads live — `lockfileDir ?? workspaceDir ??
+    /// pnpmfile a command reads live, `lockfileDir ?? workspaceDir ??
     /// dir`.
     ///
     /// Not the directory settings are *written* back to: `pnpm-workspace.yaml`
@@ -120,27 +152,18 @@ impl Config {
             .unwrap_or(dir)
     }
 
-    /// Pin [`lockfile_dir`] to `dir` and re-anchor the paths that follow
-    /// the lockfile with it.
-    ///
-    /// `dir` is normalized first: importer ids are a lexical path diff
-    /// against it, so an unnormalized `<workspace>/..` would not name the
-    /// project it points at.
-    ///
-    /// [`lockfile_dir`]: Self::lockfile_dir
-    pub fn pin_lockfile_dir(&mut self, dir: &Path) {
-        let dir = pnpm_fs::lexical_normalize(dir);
-        self.anchor_lockfile_paths(&dir);
-        self.lockfile_dir = Some(dir);
+    pub(crate) fn set_lockfile_dir(&mut self, dir: &Path) {
+        self.configured_lockfile_dir = Some(dir.to_path_buf());
+        self.lockfile_dir = Some(pnpm_fs::lexical_normalize(dir));
     }
 
-    /// Re-anchor the paths pnpm resolves against `lockfileDir` — the root
-    /// `node_modules` and the virtual store — onto `dir`.
+    /// Re-anchor the paths pnpm resolves against `lockfileDir` (the root
+    /// `node_modules` and the virtual store) onto `dir`.
     ///
     /// An explicitly configured `modulesDir` / `virtualStoreDir` keeps its
     /// raw value (recovered from [`explicit_settings`]) and is re-resolved
     /// against `dir`, so a multi-component or absolute setting keeps its
-    /// full shape — [`Path::join`] leaves an absolute value absolute.
+    /// full shape. [`Path::join`] leaves an absolute value absolute.
     /// Under a global virtual store a `virtualStoreDir` names the store's
     /// root, so it is not re-anchored.
     ///
@@ -254,17 +277,26 @@ impl Config {
     }
 
     /// The modules directory an install gives the project at
-    /// `project_dir`: the `packageConfigs` entry naming it, else the
-    /// configured `modulesDir`, resolved against `project_dir` and
-    /// lexically normalized. Unlike [`Self::modules_dir_name_for`] it
-    /// keeps a multi-component or absolute setting whole, as pnpm's
-    /// `pathAbsolute` does.
+    /// `project_dir`, lexically normalized:
+    ///
+    /// - a project that shares a lockfile with others but is not in the
+    ///   lockfile directory gets [`Self::modules_dir_name`] inside it;
+    /// - any other project gets the `packageConfigs` entry naming it, else
+    ///   the configured `modulesDir`, resolved against `project_dir` whole,
+    ///   as pnpm's `pathAbsolute` does.
     #[must_use]
     pub fn project_modules_dir(
         &self,
         project_dir: &Path,
         project_name: Option<&str>,
     ) -> std::path::PathBuf {
+        let project_dir = pnpm_fs::lexical_normalize(project_dir);
+        if self.shares_one_lockfile()
+            && pnpm_fs::lexical_normalize(self.lockfile_dir_for(&project_dir)) != project_dir
+        {
+            return pnpm_fs::lexical_normalize(&project_dir.join(self.modules_dir_name()));
+        }
+        let project_dir = project_dir.as_path();
         let modules_dir = self
             .applies_package_configs()
             .then(|| {
@@ -284,26 +316,24 @@ impl Config {
         pnpm_fs::lexical_normalize(&modules_dir)
     }
 
-    /// Put `<project_dir>/<modules_dir_name>` first on the `NODE_PATH` of
-    /// `env`, the environment of that project's scripts and commands, when
-    /// it is a custom modules directory and the project's executables are
+    /// Put `modules_dir`, the modules directory of the project at
+    /// `project_dir`, first on the `NODE_PATH` of `env`, the environment of
+    /// that project's scripts and commands, when it is not
+    /// `<project_dir>/node_modules` and the project's executables are
     /// symlinks, which have no shim to carry the entry. The rest of
     /// `NODE_PATH` is the one `env` sets, or else the inherited one.
     pub fn prepend_project_node_path<Sys: EnvVar>(
         &self,
         env: &mut HashMap<String, String>,
         project_dir: &Path,
-        modules_dir_name: &std::ffi::OsStr,
+        modules_dir: &Path,
     ) {
-        let symlinked =
-            cfg!(any(unix, target_os = "wasi")) && self.prefer_symlinked_executables == Some(true);
-        if !symlinked || !self.extend_node_path || modules_dir_name == "node_modules" {
+        let symlinked = cfg!(any(unix, target_os = "wasi"))
+            && self.prefer_symlinked_executables.unwrap_or(false);
+        if !symlinked || !self.extend_node_path || modules_dir == project_dir.join("node_modules") {
             return;
         }
-        let project_node_path = project_dir
-            .join(modules_dir_name)
-            .display()
-            .to_string();
+        let project_node_path = modules_dir.display().to_string();
         if project_node_path.contains(':') {
             return;
         }
@@ -315,7 +345,8 @@ impl Config {
         let node_path = std::iter::once(project_node_path.as_str())
             .chain(
                 rest.split(':')
-                    .filter(|entry| !entry.is_empty() && *entry != project_node_path),
+                    .filter(|entry| !entry.is_empty())
+                    .filter(|entry| *entry != project_node_path),
             )
             .collect::<Vec<_>>()
             .join(":");
@@ -325,7 +356,7 @@ impl Config {
     /// Clear both hoist patterns when [`virtual_store_only`] is set.
     ///
     /// A `virtualStoreOnly` install does no hoisting, so the patterns it
-    /// records in `.modules.yaml` must be empty — that is how the next
+    /// records in `.modules.yaml` must be empty, that is how the next
     /// ordinary install learns hoisting still has to be done from
     /// scratch rather than reading a pattern it never applied.
     ///
@@ -365,7 +396,7 @@ impl Config {
     /// the branch lockfile under `gitBranchLockfile`, `pnpm-lock.yaml`
     /// otherwise.
     ///
-    /// `mergeGitBranchLockfiles` wins over the branch name — the point of
+    /// `mergeGitBranchLockfiles` wins over the branch name, the point of
     /// that mode is to collapse the per-branch lockfiles back into the
     /// shared one.
     #[must_use]
@@ -401,17 +432,17 @@ impl Config {
     ///
     /// A detached HEAD names no branch. The checked-out commit still belongs
     /// to the branches whose history includes it, so their lockfiles join
-    /// the read path through [`Self::git_branch_lockfile_candidates`] — the
+    /// the read path through [`Self::git_branch_lockfile_candidates`], the
     /// read tries each before `pnpm-lock.yaml`. The write target stays
     /// `pnpm-lock.yaml`, the same behavior as `mergeGitBranchLockfiles`,
     /// because a branch containing HEAD need not have HEAD at its tip.
     ///
     /// The branch is read from the process's working directory, which is
-    /// where pnpm reads it from too — not from the workspace root, which
+    /// where pnpm reads it from too, not from the workspace root, which
     /// may sit in a different repository than the one the user is in.
     pub fn apply_git_branch_lockfile_derivation<Sys: GetCurrentDir>(&mut self) {
-        // An explicit `mergeGitBranchLockfiles` — including an explicit
-        // `false` — settles the question without consulting the pattern.
+        // An explicit `mergeGitBranchLockfiles` (including an explicit
+        // `false`) settles the question without consulting the pattern.
         let merge_is_explicit = self.explicit_settings.contains_key("mergeGitBranchLockfiles");
         let pattern_decides = !merge_is_explicit
             && !self.merge_git_branch_lockfiles_branch_pattern.is_empty();
@@ -455,25 +486,33 @@ impl Config {
     ///
     /// This runs after all config sources have been merged because an explicit
     /// `shamefullyHoist` value takes precedence over `publicHoistPattern`
-    /// regardless of which source supplied either setting.
+    /// regardless of which source supplied either setting. While
+    /// `virtualStoreOnly` keeps the active pattern empty, it applies to the
+    /// pattern that mode restores.
     pub fn apply_shamefully_hoist_derivation(&mut self) {
-        match self.explicit_settings.get("shamefullyHoist").and_then(serde_json::Value::as_bool) {
-            Some(true) => self.public_hoist_pattern = Some(vec!["*".to_string()]),
-            Some(false) => self.public_hoist_pattern = None,
-            None => {}
-        }
+        let Some(shamefully_hoist) =
+            self.explicit_settings.get("shamefullyHoist").and_then(serde_json::Value::as_bool)
+        else {
+            return;
+        };
+        let public_hoist_pattern =
+            match self.hoist_patterns_before_virtual_store_only.as_mut() {
+                Some(saved) => &mut saved.public_hoist_pattern,
+                None => &mut self.public_hoist_pattern,
+            };
+        *public_hoist_pattern = shamefully_hoist.then(|| vec!["*".to_string()]);
     }
 
     /// Turn [`prefer_symlinked_executables`] on when the hoisted
     /// `nodeLinker` is selected and the user has not configured the
-    /// setting — pnpm's `nodeLinker: hoisted` default. Runs *after* the
+    /// setting, pnpm's `nodeLinker: hoisted` default. Runs *after* the
     /// `NODE_PATH` export in [`Config::current`], so the derived `true`
     /// symlinks bins without exporting `NODE_PATH` (the hoisted layout
     /// has no hidden store to expose), exactly like pnpm's config
     /// reader.
     ///
-    /// A user-configured value — recorded in `explicit_settings` by
-    /// every config layer — is never touched. Otherwise the derived
+    /// A user-configured value (recorded in `explicit_settings` by
+    /// every config layer) is never touched. Otherwise the derived
     /// value tracks the *current* linker, so re-running after a linker
     /// override also clears a `true` derived for a linker that is no
     /// longer selected (pnpm merges CLI options before its `nodeLinker`
@@ -507,7 +546,7 @@ impl Config {
     }
 
     /// Resolve the default store location relative to an explicit pnpm home
-    /// directory instead of the ambient one — the programmatic counterpart
+    /// directory instead of the ambient one, the programmatic counterpart
     /// of the `pnpmHomeDir` input of pnpm's `getStorePath`. The store lands
     /// at `<pnpm_home_dir>/store/<version>` when `start_dir` can hardlink
     /// into that volume, with the same mount-point fallback as the ambient

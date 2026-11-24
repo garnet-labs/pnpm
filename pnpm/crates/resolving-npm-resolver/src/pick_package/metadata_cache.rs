@@ -1,15 +1,32 @@
-use super::{Arc, DashMap, Package, Semaphore};
+use super::{
+    Arc,
+    DashMap,
+    Package,
+    Semaphore,
+    Timestamp,
+};
 
-/// A cached packument together with its registry-verification state.
+/// A cached packument together with its source.
 /// The two travel as one value so a reader can never pair a packument
-/// with the verification state of a concurrent overwrite.
+/// with the source of a concurrent overwrite.
 #[derive(Debug, Clone)]
 pub struct CachedPackument {
     pub meta: Arc<Package>,
-    /// `false` when the packument was parsed straight from the
-    /// on-disk mirror without a validating registry round-trip (see
-    /// [`PackageMetaCache::set_unverified`]).
-    pub registry_verified: bool,
+    pub source: PackumentSource,
+}
+
+/// Where a [`CachedPackument`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackumentSource {
+    /// Fetched from, or revalidated by, the registry (see
+    /// [`PackageMetaCache::set`]).
+    Registry,
+    /// Parsed straight from the on-disk mirror without a validating
+    /// registry round-trip (see [`PackageMetaCache::set_unverified`]).
+    Mirror {
+        /// The mirror's mtime, when the pick that read the mirror checked it.
+        written_at: Option<Timestamp>,
+    },
 }
 
 /// In-memory packument cache the orchestrator consults before any
@@ -30,7 +47,7 @@ pub trait PackageMetaCache: Send + Sync {
     fn get(&self, key: &str) -> Option<CachedPackument>;
     /// Insert/overwrite `meta` under `key`. The orchestrator inserts
     /// after a fresh fetch and after any disk-fast-path that returns
-    /// successfully — populating the cache from the disk read avoids
+    /// successfully, populating the cache from the disk read avoids
     /// re-paying the `spawn_blocking` + `serde_json::from_str` for
     /// every later resolve of the same `(registry, name)` within the
     /// install. The cache is install-scoped, so a disk-loaded entry
@@ -49,16 +66,20 @@ pub trait PackageMetaCache: Send + Sync {
     /// registry-unverified: it was parsed straight from the on-disk
     /// mirror without a validating registry round-trip, so it may
     /// predate versions the registry has. [`fn@crate::pick_package`] uses the
-    /// state to fall through to a conditional registry request —
-    /// instead of failing the pick — when a cache hit on such an entry
+    /// state to fall through to a conditional registry request
+    /// (instead of failing the pick) when a cache hit on such an entry
     /// can't satisfy the requested spec and the resolver isn't offline.
     /// The verified [`PackageMetaCache::set`] the fetch then performs
     /// replaces the entry, so each package revalidates at most once.
     ///
+    /// `written_at` is the mirror's mtime, when the caller read it. A mirror
+    /// written at or after the `minimumReleaseAge` cutoff holds every mature
+    /// version, so a pick from it is served without revalidation.
+    ///
     /// Required (no default) on purpose: an implementation that stored
     /// these entries as verified would silently turn a recoverable
     /// stale-mirror miss into a terminal "no matching version".
-    fn set_unverified(&self, key: String, meta: Arc<Package>);
+    fn set_unverified(&self, key: String, meta: Arc<Package>, written_at: Option<Timestamp>);
 }
 
 /// The packument-fetching state one install owns, shared across every
@@ -68,7 +89,7 @@ pub trait PackageMetaCache: Send + Sync {
 /// Both maps key on the string [`PackageMetaCache`] uses
 /// (`{registry}\x00{name}` for abbreviated, `{registry}\x00{name}:full` for
 /// full), so two callers asking for different forms of the same packument
-/// don't accidentally serialize — the `metaDir` differentiator is embedded
+/// don't accidentally serialize, the `metaDir` differentiator is embedded
 /// in the key.
 ///
 /// The state is install-scoped rather than hung on [`Package`] because a
@@ -102,8 +123,8 @@ impl PackumentFetchState {
             .is_some_and(|checked| Arc::ptr_eq(checked.value(), meta))
     }
 
-    pub(super) fn mark_release_age_upgrade_checked(&self, cache_key: &str, meta: &Arc<Package>) {
-        self.release_age_upgrade_checked.insert(cache_key.to_string(), Arc::clone(meta));
+    pub(super) fn mark_release_age_upgrade_checked(&self, cache_key: String, meta: &Arc<Package>) {
+        self.release_age_upgrade_checked.insert(cache_key, Arc::clone(meta));
     }
 }
 
@@ -131,7 +152,7 @@ pub fn shared_packument_fetch_locker() -> PackumentFetchLocker {
 /// Shared across [`crate::NpmResolver`] (default + JSR registries)
 /// and [`crate::NamedRegistryResolver`] (`<alias>:` specifiers).
 /// The key includes `registry` because two registries can serve
-/// different artifacts under the same `name@version` — a public
+/// different artifacts under the same `name@version`, a public
 /// `lodash@4.17.21` and a privately-hosted package of the same
 /// name-version pair are not interchangeable, and a registry-
 /// agnostic key would hand one resolver the other's manifest,
@@ -152,7 +173,7 @@ pub fn shared_picked_manifest_cache() -> PickedManifestCache {
 ///
 /// Every resolve edge consults the cache before anything else, so on
 /// a large graph the map takes tens of thousands of lookups from all
-/// runtime workers at once — a single `Mutex<HashMap>` here was the
+/// runtime workers at once, a single `Mutex<HashMap>` here was the
 /// top contention point of a warm-resolve time profile.
 #[derive(Debug, Default)]
 pub struct InMemoryPackageMetaCache {
@@ -167,11 +188,14 @@ impl PackageMetaCache for InMemoryPackageMetaCache {
     }
 
     fn set(&self, key: String, meta: Arc<Package>) {
-        self.inner.insert(key, CachedPackument { meta, registry_verified: true });
+        self.inner.insert(key, CachedPackument { meta, source: PackumentSource::Registry });
     }
 
-    fn set_unverified(&self, key: String, meta: Arc<Package>) {
-        self.inner.insert(key, CachedPackument { meta, registry_verified: false });
+    fn set_unverified(&self, key: String, meta: Arc<Package>, written_at: Option<Timestamp>) {
+        self.inner.insert(
+            key,
+            CachedPackument { meta, source: PackumentSource::Mirror { written_at } },
+        );
     }
 }
 

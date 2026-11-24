@@ -1,6 +1,13 @@
-#[cfg(unix)]
-use super::file_from_descriptor;
-use super::{IntoDiagnostic, OsStr, OsString, Path, PathBuf, Result, fs, io};
+use super::{
+    IntoDiagnostic,
+    OsStr,
+    OsString,
+    Path,
+    PathBuf,
+    Result,
+    fs,
+    io,
+};
 use miette::WrapErr as _;
 
 pub(super) struct PinnedDirectory {
@@ -90,20 +97,8 @@ impl PinnedDirectory {
 
     #[cfg(unix)]
     fn open_child(&self, name: &OsStr) -> io::Result<Self> {
-        use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _};
-
-        let name = std::ffi::CString::new(name.as_bytes())?;
-        // SAFETY: `name` is NUL-terminated, the parent descriptor remains
-        // valid for the call, and the returned descriptor is owned on success.
-        let descriptor = unsafe {
-            libc::openat(
-                self.handle.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-            )
-        };
-        let handle = file_from_descriptor(descriptor)?;
-        Ok(Self { path: self.path.join(OsStr::from_bytes(name.as_bytes())), handle })
+        let handle = pnpm_ffi_fs::open_directory_at(&self.handle, name)?;
+        Ok(Self { path: self.path.join(name), handle })
     }
 
     #[cfg(windows)]
@@ -124,7 +119,10 @@ impl PinnedDirectory {
 fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
     // Deliberately omit FILE_SHARE_DELETE. Every component handle remains

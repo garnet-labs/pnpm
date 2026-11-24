@@ -4,16 +4,26 @@
 //! must really die from the signal, which no thread inside the test can
 //! stand in for. Windows has no SIGINT delivery to a child; `kill` there is
 //! `TerminateProcess`, against which no cleanup can run.
-
 #![cfg(unix)]
+
+use command_extra::CommandExtra;
 
 use std::{
     fs,
-    os::unix::{fs::PermissionsExt as _, process::ExitStatusExt as _},
+    os::unix::{
+        fs::PermissionsExt as _,
+        process::ExitStatusExt as _,
+    },
     path::Path,
-    process::{Child, Command},
+    process::{
+        Child,
+        Command,
+    },
     thread,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 use tempfile::tempdir;
 
@@ -26,15 +36,13 @@ fn a_sigint_mid_write_removes_the_staged_temp_file() {
     let root = tempdir().expect("create tempdir");
     let target = root.path().join("lock.yaml");
     let mut writer = Command::new(HOLDER_BIN)
-        .arg(&target)
+        .with_arg(&target)
         .spawn()
         .expect("spawn atomic_write_holder");
 
     wait_for_temp_file(root.path(), &mut writer);
-    // SAFETY: the writer is this test's own child and still running.
-    unsafe {
-        libc::kill(i32::try_from(writer.id()).expect("the child's pid fits in i32"), libc::SIGINT);
-    }
+    // The writer is this test's own child and still running.
+    pnpm_ffi_signal::signal_target(pnpm_ffi_signal::Target::Process(writer.id()), libc::SIGINT);
     let status = writer.wait().expect("reap the writer");
     assert_eq!(status.signal(), Some(libc::SIGINT), "the writer died from SIGINT");
 
@@ -56,7 +64,7 @@ fn a_replacement_of_an_owner_only_file_is_staged_owner_only() {
     fs::write(&target, "private").expect("seed the target");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("make it owner-only");
     let mut writer = Command::new(HOLDER_BIN)
-        .arg(&target)
+        .with_arg(&target)
         .spawn()
         .expect("spawn atomic_write_holder");
 

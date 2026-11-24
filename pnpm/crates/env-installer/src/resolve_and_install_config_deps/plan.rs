@@ -1,13 +1,28 @@
 //! Decide what each declared config dependency still needs before it can
 //! be installed.
 
-use super::{ConfigDepUpdates, config_dep, has_config_dep, migrate_into_lockfile, pkg_key};
-use crate::{
-    ConfigDepError, ConfigDepsInstallMode, options::ConfigDepsInstallOptions,
-    parse_integrity::parse_integrity, verify_env_lockfile::assert_valid_migrated_config_dep,
+use super::{
+    ConfigDepUpdates,
+    config_dep,
+    has_config_dep,
+    migrate_into_lockfile,
+    pkg_key,
 };
-use pnpm_lockfile::{EnvLockfile, retain_config_dependencies};
-use pnpm_workspace_state::{ConfigDependency, ConfigDependencyDetail};
+use crate::{
+    ConfigDepError,
+    ConfigDepsInstallMode,
+    options::ConfigDepsInstallOptions,
+    parse_integrity::parse_integrity,
+    verify_env_lockfile::assert_valid_migrated_config_dep,
+};
+use pnpm_lockfile::{
+    EnvLockfile,
+    retain_config_dependencies,
+};
+use pnpm_workspace_state::{
+    ConfigDependency,
+    ConfigDependencyDetail,
+};
 use ssri::Integrity;
 use std::collections::BTreeMap;
 
@@ -89,8 +104,8 @@ fn plan_detailed(
     let Some(tarball) = detail.tarball.clone() else {
         return Ok(ConfigDepPlan::Resolve { specifier: version, integrity: Some(integrity) });
     };
-    let registry = opts.verification.pick_registry(name);
-    migrate_into_lockfile(env_lockfile, name, &version, integrity, tarball, registry)?;
+    let tarball_url_options = opts.verification.tarball_url_options(name);
+    migrate_into_lockfile(env_lockfile, name, &version, integrity, tarball, tarball_url_options)?;
     Ok(ConfigDepPlan::Migrated)
 }
 

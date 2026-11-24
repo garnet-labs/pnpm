@@ -2,11 +2,14 @@ use super::HoistedModulesDirs;
 use std::{
     collections::HashSet,
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
-/// Pre-create the destination parents serially — cheap, deduplicated,
-/// and a no-op for dirs that already exist — so the parallel symlink
+/// Pre-create the destination parents serially (cheap, deduplicated,
+/// and a no-op for dirs that already exist) so the parallel symlink
 /// pass is one syscall per link.
 pub(super) fn create_parents(
     dirs: &HoistedModulesDirs<'_>,
@@ -54,7 +57,7 @@ fn create_hoist_root(root: &Path) -> Result<(), crate::SymlinkPackageError> {
         })
         .ok_or_else(|| {
             parent_dir_error(
-                root,
+                root.to_path_buf(),
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     "workspace hoist directory has no existing ancestor",
@@ -74,7 +77,10 @@ fn create_dirs_below(
     let relative = parent
         .strip_prefix(root)
         .map_err(|error| {
-            parent_dir_error(parent, io::Error::new(io::ErrorKind::InvalidInput, error))
+            parent_dir_error(
+                parent.to_path_buf(),
+                io::Error::new(io::ErrorKind::InvalidInput, error),
+            )
         })?;
     let mut current = root.to_path_buf();
     for component in relative.components() {
@@ -90,15 +96,15 @@ fn create_or_validate(dir: &Path, kind: ParentKind) -> Result<(), crate::Symlink
         Err(error) if error.kind() == io::ErrorKind::NotFound => match std::fs::create_dir(dir) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                probe(dir, kind).map_err(|error| parent_dir_error(dir, error))?
+                probe(dir, kind).map_err(|error| parent_dir_error(dir.to_path_buf(), error))?
             }
-            Err(error) => return Err(parent_dir_error(dir, error)),
+            Err(error) => return Err(parent_dir_error(dir.to_path_buf(), error)),
         },
-        Err(error) => return Err(parent_dir_error(dir, error)),
+        Err(error) => return Err(parent_dir_error(dir.to_path_buf(), error)),
     };
     if shape.is_symlink || !shape.is_dir {
         return Err(parent_dir_error(
-            dir,
+            dir.to_path_buf(),
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "workspace hoist directory is not a real directory",
@@ -139,29 +145,13 @@ fn probe(dir: &Path, kind: ParentKind) -> io::Result<ParentShape> {
 /// link itself, so a reparse point held this way passes only as a root.
 #[cfg(windows)]
 fn probe_attributes(dir: &Path, kind: ParentKind) -> io::Result<ParentShape> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW,
-        INVALID_FILE_ATTRIBUTES,
-    };
-
-    let path = dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: `path` is NUL-terminated and remains alive for the duration of the call.
-    let attributes = unsafe { GetFileAttributesW(path.as_ptr()) };
-    if attributes == INVALID_FILE_ATTRIBUTES {
-        return Err(io::Error::last_os_error());
-    }
+    let attributes = pnpm_ffi_fs::file_attributes(dir)?;
     Ok(ParentShape {
-        is_dir: attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
-        is_symlink: matches!(kind, ParentKind::Owned)
-            && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        is_dir: attributes.is_directory,
+        is_symlink: matches!(kind, ParentKind::Owned) && attributes.is_reparse_point,
     })
 }
 
-fn parent_dir_error(dir: &Path, error: io::Error) -> crate::SymlinkPackageError {
-    crate::SymlinkPackageError::CreateParentDir { dir: dir.to_path_buf(), error }
+fn parent_dir_error(dir: PathBuf, error: io::Error) -> crate::SymlinkPackageError {
+    crate::SymlinkPackageError::CreateParentDir { dir, error }
 }

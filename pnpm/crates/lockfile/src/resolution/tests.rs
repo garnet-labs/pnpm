@@ -1,10 +1,29 @@
 use super::{
-    BinaryArchive, BinaryResolution, BinarySpec, DirectoryResolution, GitResolution,
-    LockfileFormError, LockfileFormOptions, LockfileResolution, PlatformAssetResolution,
-    PlatformAssetTarget, PlatformSelector, RegistryOptions, RegistryResolution, RegistryServerType,
-    TarballResolution, TarballRevision, TarballUrlOptions, VariationsResolution,
-    is_git_hosted_tarball_url, is_on_revision_tarball_route, is_revision_registry_tarball_url,
-    libc_matches, npm_tarball_url, registry_server_type, revision_registry_tarball_url,
+    BinaryArchive,
+    BinaryResolution,
+    BinarySpec,
+    DirectoryResolution,
+    GitResolution,
+    LockfileFormError,
+    LockfileFormOptions,
+    LockfileResolution,
+    PlatformAssetResolution,
+    PlatformAssetTarget,
+    PlatformSelector,
+    RegistryOptions,
+    RegistryResolution,
+    RegistryServerType,
+    TarballResolution,
+    TarballRevision,
+    TarballUrlOptions,
+    VariationsResolution,
+    is_git_hosted_tarball_url,
+    is_on_revision_tarball_route,
+    is_revision_registry_tarball_url,
+    libc_matches,
+    npm_tarball_url,
+    registry_server_type,
+    revision_registry_tarball_url,
     select_platform_variant,
 };
 use crate::serialize_yaml;
@@ -15,7 +34,7 @@ use text_block_macros::text_block;
 
 const GIT_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// No declared server type — the strict default every registry but
+/// No declared server type, the strict default every registry but
 /// registry.npmjs.org is read with.
 fn undeclared_form(registry: &str, include_tarball_url: bool) -> LockfileFormOptions<'_> {
     LockfileFormOptions { registry, server_type: None, include_tarball_url }
@@ -45,9 +64,7 @@ fn render_resolution(resolution: &LockfileResolution) -> String {
         .join("\n")
 }
 
-// -----------------------------------------------------------------------------
-// `select_platform_variant` / `libc_matches` — Slice B
-// -----------------------------------------------------------------------------
+// `select_platform_variant` / `libc_matches`. Slice B
 
 fn binary_resolution(url: &str) -> LockfileResolution {
     LockfileResolution::Binary(BinaryResolution {
@@ -62,12 +79,7 @@ fn binary_resolution(url: &str) -> LockfileResolution {
 }
 
 fn target(os: &str, cpu: &str, libc: Option<&str>) -> PlatformAssetTarget {
-    PlatformAssetTarget {
-        os: os.to_string(),
-        cpu: cpu.to_string(),
-        libc: libc.map(str::to_string),
-        ..PlatformAssetTarget::default()
-    }
+    PlatformAssetTarget { os: os.to_string(), cpu: cpu.to_string(), libc: libc.map(str::to_string) }
 }
 
 fn variant(url: &str, targets: Vec<PlatformAssetTarget>) -> PlatformAssetResolution {
@@ -75,12 +87,7 @@ fn variant(url: &str, targets: Vec<PlatformAssetTarget>) -> PlatformAssetResolut
 }
 
 fn selector(os: &str, cpu: &str, libc: Option<&str>) -> PlatformSelector {
-    PlatformSelector {
-        os: os.to_string(),
-        cpu: cpu.to_string(),
-        libc: libc.map(str::to_string),
-        floors: None,
-    }
+    PlatformSelector { os: os.to_string(), cpu: cpu.to_string(), libc: libc.map(str::to_string) }
 }
 
 const SHA512: &str = "sha512-gf6ZldcfCDyNXPRiW3lQjEP1Z9rrUM/4Cn7BZbv3SdTA82zxWRP8OmLwvGR974uuENhGCFgFdN11z3n1Ofpprg==";
@@ -121,10 +128,6 @@ mod lockfile_deserialize_tarball_resolution;
 mod lockfile_deserialize_rejects_malformed_builtin;
 
 mod behavior;
-
-mod variant_selection;
-
-mod variant_lockfile_form;
 
 mod streaming;
 

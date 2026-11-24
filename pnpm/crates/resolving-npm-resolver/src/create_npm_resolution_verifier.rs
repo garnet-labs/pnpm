@@ -18,18 +18,20 @@
 //! [`PublishedAtLookupContext`] so verifying many pinned versions of
 //! the same package costs at most one fetch per layer.
 
+pub use registry_routes::VerificationRegistryRoutes;
+
 mod registry_tarball;
 use registry_tarball::npm_registry_tarball;
 
 mod registry_routes;
-use registry_routes::VerificationRegistryRoutes;
 
 mod trust_check;
 
 mod policy_snapshot;
 use policy_snapshot::{
-    BuildPolicySnapshot, build_policy_snapshot, cached_policy_patterns, minimum_release_age_cutoff,
-    named_registries_routing_digest, sorted_unique,
+    build_policy_snapshot,
+    cached_policy_patterns,
+    past_check_time_is_not_later,
 };
 
 mod registry_artifact;
@@ -40,62 +42,105 @@ mod age_check;
 
 mod artifact_binding;
 use artifact_binding::{
-    current_history_violation, current_revision_number, lockfile_revision,
-    missing_artifact_violation, select_revision, tarball_url_violation,
+    current_history_violation,
+    current_revision_number,
+    lockfile_revision,
+    mapped_tarball_url_violation,
+    missing_artifact_violation,
+    select_revision,
 };
 
 mod metadata_projection;
-
-mod variations;
-use metadata_projection::{load_local_meta_time, project_abbreviated_meta, project_trust_meta};
+use metadata_projection::{
+    load_local_meta_time,
+    project_abbreviated_meta,
+    project_trust_meta,
+};
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     path::PathBuf,
     sync::Arc,
 };
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use miette::Diagnostic as _;
 use pipe_trait::Pipe;
 use pnpm_lockfile::{
-    LockfileResolution, PkgName, TarballRevision, has_complete_sha512_digest,
-    is_git_hosted_tarball_url, is_revision_registry_tarball_url,
+    LockfileResolution,
+    PkgName,
+    TarballRevision,
+    has_complete_sha512_digest,
+    is_git_hosted_tarball_url,
+    is_revision_registry_tarball_url,
+    normalized_registry_key,
 };
-use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient, redact_url_credentials};
+use pnpm_network::{
+    AuthHeaders,
+    RetryOpts,
+    ThrottledClient,
+    redact_url_credentials,
+    redact_url_for_display,
+};
 use pnpm_registry::Package;
 use pnpm_resolving_resolver_base::{
-    ResolutionVerification, ResolutionVerifier, TrustPolicy, VerifyCtx, VerifyFuture,
+    ResolutionVerification,
+    ResolutionVerifier,
+    TrustPolicy,
+    VerifyCtx,
+    VerifyFuture,
     parse_packument_timestamp,
 };
 use pnpm_version_policy::PackageVersionPolicy;
 use serde_json::Value as JsonValue;
-use sha2::{Digest, Sha256};
+use sha2::{
+    Digest,
+    Sha256,
+};
 use tokio::sync::OnceCell;
 
 use crate::{
-    FetchAttestationOptions, FetchFullMetadataCachedOptions, TrustCheckOptions, TrustEvidence,
-    TrustHistory, TrustViolation, fetch_attestation_published_at, fetch_full_metadata_cached,
+    FetchAttestationOptions,
+    FetchFullMetadataCachedOptions,
+    TrustCheckOptions,
+    TrustEvidence,
+    TrustHistory,
+    TrustViolation,
+    fetch_attestation_published_at,
+    fetch_full_metadata_cached,
     fetch_full_metadata_cached::fetch_full_metadata_projected,
     lookup_context::{
-        PublishedAtLookupContext, PublishedAtTimeMap, RegistryArtifact, RegistryArtifactHistory,
-        TrustHistoryProjection, package_key, version_key,
+        PublishedAtLookupContext,
+        PublishedAtTimeMap,
+        RegistryArtifact,
+        RegistryArtifactHistory,
+        TrustHistoryProjection,
+        package_key,
+        version_key,
     },
-    named_registry::named_registry_tarball_prefixes,
-    pick_package::{PackageMetaCache, SkippedTimeCheck, warn_missing_time_once},
+    pick_package::{
+        PackageMetaCache,
+        SkippedTimeCheck,
+        warn_missing_time_once,
+    },
     registry_url::to_registry_url,
     trust_checks::fail_if_trust_downgraded,
     violation_codes::{
-        MINIMUM_RELEASE_AGE_VIOLATION_CODE, MISSING_TARBALL_INTEGRITY_VIOLATION_CODE,
-        TARBALL_REVISION_MISMATCH_VIOLATION_CODE, TARBALL_URL_MISMATCH_VIOLATION_CODE,
+        MINIMUM_RELEASE_AGE_VIOLATION_CODE,
+        MISSING_TARBALL_INTEGRITY_VIOLATION_CODE,
+        TARBALL_REVISION_MISMATCH_VIOLATION_CODE,
+        TARBALL_URL_MISMATCH_VIOLATION_CODE,
         TRUST_DOWNGRADE_VIOLATION_CODE,
     },
 };
 
 /// Per-version `dist` statistics that estimate a tarball's pipeline
 /// work: `unpackedSize` (transfer + decompress + hash bytes) and
-/// `fileCount` (per-file CAS-write overhead). Either may be absent —
+/// `fileCount` (per-file CAS-write overhead). Either may be absent,
 /// registries only publish them for packages uploaded since npm 6.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DistStats {
@@ -104,13 +149,25 @@ pub struct DistStats {
     pub requires_build: Option<bool>,
 }
 
-/// `(package name, version) → dist` work statistics filled by the
-/// verifier as a side product of the tarball-URL binding check. The
+/// `(registry, package name, version) → dist` work statistics filled by
+/// the verifier as a side product of the tarball-URL binding check. The
 /// metadata is already in hand per entry, so collecting costs no extra
 /// fetch; consumers (the pnpr server's frozen fast path) use the stats
-/// to schedule the most expensive tarball downloads first. Shared as an
-/// `Arc` so the caller keeps a handle while the verifier fan-out writes.
-pub type ObservedDistStats = Arc<DashMap<(String, String), DistStats>>;
+/// to schedule the most expensive tarball downloads first. Keyed by
+/// canonical registry URL so two registries serving the same
+/// `name@version` in one lockfile never overwrite each other's stats.
+pub type ObservedDistStats = Arc<DashMap<(String, String, String), DistStats>>;
+
+/// Build the normalized `(registry, name, version)` key used by
+/// [`ObservedDistStats`].
+#[must_use]
+pub fn observed_dist_stats_key(
+    registry: &str,
+    name: String,
+    version: String,
+) -> (String, String, String) {
+    (pnpm_network::normalize_registry_url(registry).into_owned(), name, version)
+}
 
 /// Construct a fresh sink for
 /// [`VerificationArtifacts::observed_stats`].
@@ -121,7 +178,7 @@ pub fn observed_dist_stats_sink() -> ObservedDistStats {
 
 /// Options bundle for [`create_npm_resolution_verifier`].
 ///
-/// The verifier owns the option bag once constructed — these fields
+/// The verifier owns the option bag once constructed; these fields
 /// flow into [`NpmResolutionVerifier`] verbatim.
 pub struct CreateNpmResolutionVerifierOptions {
     /// `default` + per-scope registry map. Keyed by `"default"` or
@@ -134,10 +191,12 @@ pub struct CreateNpmResolutionVerifierOptions {
     /// Per-registry options (`serverType`, `supportsTimeField`) keyed by URL.
     pub registry_options_by_url:
         Option<std::collections::BTreeMap<String, pnpm_lockfile::RegistryOptions>>,
-    /// Override for `Utc::now()` when computing the age cutoff and
+    /// Override for `Timestamp::now()` when computing the age cutoff and
     /// the `trustPolicyIgnoreAfter` window. `None` falls back to
-    /// wall-clock at construction time.
-    pub now: Option<DateTime<Utc>>,
+    /// wall-clock at construction time. While the age check or the
+    /// `trustPolicyIgnoreAfter` window is active, a fixed time is recorded in
+    /// the policy snapshot, and a cached run with a later time is not reused.
+    pub now: Option<Timestamp>,
     pub release_age: VerificationReleaseAgeOptions,
     pub trust: VerificationTrustOptions,
     pub metadata: VerificationMetadataClient,
@@ -152,7 +211,7 @@ pub struct VerificationReleaseAgeOptions {
     /// check. `None` (or empty) means "no exclusions".
     pub exclude: Option<PackageVersionPolicy>,
     /// Raw spec strings backing [`Self::exclude`].
-    /// The verifier keeps the strings — not the compiled policy — for
+    /// The verifier keeps the strings (not the compiled policy) for
     /// the cache snapshot in `policy()` so the persisted record can be
     /// compared byte-for-byte across runs.
     pub exclude_patterns: Vec<String>,
@@ -182,13 +241,6 @@ pub struct VerificationMetadataClient {
     /// is saying it never published this pin, which fails closed either
     /// way. Default `false`.
     pub ignore_missing_time_field: bool,
-    /// Backs `registrySupportsTimeField`: the registry serves the
-    /// per-version `time` map in abbreviated metadata (Verdaccio
-    /// 5.15.1+, pnpr), so the verifier can take a version's publish
-    /// timestamp from the document it already fetched instead of
-    /// paying an attestation round-trip and a full-packument download
-    /// per cold-cache package. Default `false`.
-    pub registry_supports_time_field: bool,
     pub http_client: Arc<ThrottledClient>,
     pub auth_headers: Arc<AuthHeaders>,
     /// Root of pnpm's on-disk metadata mirror. When set, the verifier
@@ -199,7 +251,7 @@ pub struct VerificationMetadataClient {
     pub cache_dir: Option<PathBuf>,
     /// Per-install [`PackageMetaCache`] shared with the npm resolver.
     /// When provided, the verifier reads a cached packument before
-    /// fetching — a name the resolver already pulled during the same
+    /// fetching, a name the resolver already pulled during the same
     /// install yields the cached document instead of a fresh
     /// disk/network round-trip. Optional: frozen-install paths and
     /// unit tests don't have a resolver running alongside, in which
@@ -214,6 +266,31 @@ pub struct VerificationMetadataClient {
     pub retry_opts: RetryOpts,
 }
 
+/// Expected tarball URL binding produced by [`PublishedTarballUrlMapper`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedTarballUrl {
+    /// Sanitized or routed URL formatted in `TARBALL_URL_MISMATCH` diagnostics.
+    pub display_url: String,
+    /// Endpoint-routed or sanitized URL accepted by the server (`/~<alias>/...`,
+    /// hosted `/npm/...`, or query-stripped public URL).
+    pub accepted_routed_url: Option<String>,
+    /// Whether the registry's exact `published` URL is also accepted. Enabled
+    /// for public routes so both `pnpr`'s query-stripped lockfiles and
+    /// pre-existing lockfiles carrying the exact published URL verify, while
+    /// any other query string matches neither.
+    pub accept_published_url: bool,
+}
+
+/// Maps `(registry, package_name, version, lockfile_tarball_url, published_tarball_url)`
+/// to the [`MappedTarballUrl`] expected for that lockfile entry.
+pub type PublishedTarballUrlMapper =
+    Arc<dyn Fn(&str, &str, &str, &str, &str) -> MappedTarballUrl + Send + Sync>;
+
+/// Reverses an authorized server-routed `/~<alias>/...` lockfile tarball URL
+/// `(package_name, lockfile_tarball_url)` back to its upstream URL for
+/// registry prefix selection without mutating the candidate's recorded URL.
+pub type ReverseRoutedTarballUrl = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+
 pub struct VerificationArtifacts {
     /// Optional sink the verifier fills with each verified entry's
     /// `dist` work statistics (see [`ObservedDistStats`]). `None`
@@ -223,7 +300,7 @@ pub struct VerificationArtifacts {
     /// warm/cold partition (see
     /// [`pnpm_resolving_resolver_base::PlannedCanonicalFetches`]).
     /// When supplied, an entry listed there passes the age check on a
-    /// package-level `Last-Modified` HEAD probe alone — the planned
+    /// package-level `Last-Modified` HEAD probe alone, the planned
     /// canonical fetch fail-closes the entry's registry existence, so
     /// no metadata body is needed. `None` (paths that materialize
     /// nothing or run a resolver alongside) keeps the metadata-backed
@@ -232,6 +309,12 @@ pub struct VerificationArtifacts {
     /// Lookups to share with the verifiers of other installs. `None`
     /// gives the verifier lookups of its own.
     pub lookups: Option<crate::VerifierLookups>,
+    /// Optional mapper that translates a registry's published `dist.tarball`
+    /// URL into the routed/sanitized URL expected in the verified lockfile.
+    pub published_tarball_mapper: Option<PublishedTarballUrlMapper>,
+    /// Optional callback reversing server-routed `/~<alias>/...` lockfile URLs
+    /// for registry prefix matching while keeping each candidate's recorded URL.
+    pub reverse_routed_tarball_url: Option<ReverseRoutedTarballUrl>,
 }
 
 /// Verifier returned by [`create_npm_resolution_verifier`]. Stores
@@ -239,7 +322,7 @@ pub struct VerificationArtifacts {
 /// caches, and the pre-built policy snapshot the cache reads via
 /// [`ResolutionVerifier::policy`].
 pub struct NpmResolutionVerifier {
-    now: Option<DateTime<Utc>>,
+    now: Option<Timestamp>,
     policy_snapshot: serde_json::Map<String, JsonValue>,
     lookup_context: Arc<PublishedAtLookupContext>,
     release_age: ReleaseAgeCheck,
@@ -251,7 +334,9 @@ pub struct NpmResolutionVerifier {
 
 struct ReleaseAgeCheck {
     minimum_minutes: Option<u64>,
-    cutoff: Option<DateTime<Utc>>,
+    /// The time the cutoff counts back from, captured once at construction.
+    checked_at: Timestamp,
+    cutoff: Option<Timestamp>,
     exclude: Option<PackageVersionPolicy>,
     /// Saved copy of the trust-exclude patterns so [`TrustCheckOptions`]
     /// can borrow them per-call without reconstructing the policy.
@@ -272,7 +357,6 @@ impl std::fmt::Debug for NpmResolutionVerifier {
             .field("minimum_release_age_minutes", &self.release_age.minimum_minutes)
             .field("cutoff", &self.release_age.cutoff)
             .field("ignore_missing_time_field", &self.metadata.ignore_missing_time_field)
-            .field("registry_supports_time_field", &self.metadata.registry_supports_time_field)
             .field("trust_policy", &self.trust.policy)
             .field("trust_policy_ignore_after", &self.trust.ignore_after)
             .field("offline", &self.metadata.offline)
@@ -281,6 +365,12 @@ impl std::fmt::Debug for NpmResolutionVerifier {
             .field("policy_snapshot", &self.policy_snapshot)
             .finish_non_exhaustive()
     }
+}
+
+/// Whether the time a run checks at changes its verdict: the age check or
+/// the `trustPolicyIgnoreAfter` window counts back from it.
+fn check_time_matters(release_age: &ReleaseAgeCheck, trust: &TrustCheck) -> bool {
+    release_age.age_check_active() || trust.ignore_after.is_some()
 }
 
 /// Builds the [`NpmResolutionVerifier`]. It always requires a tarball
@@ -292,57 +382,34 @@ impl std::fmt::Debug for NpmResolutionVerifier {
 pub fn create_npm_resolution_verifier(
     opts: CreateNpmResolutionVerifierOptions,
 ) -> NpmResolutionVerifier {
-    let cutoff = minimum_release_age_cutoff(&opts.release_age, opts.now);
-
-    let named_registry_prefixes = named_registry_tarball_prefixes(&opts.registries_by_prefix);
-
-    let sorted_min_age_excludes = sorted_unique(&opts.release_age.exclude_patterns);
-    let sorted_trust_excludes = sorted_unique(&opts.trust.exclude_patterns);
-    let named_registries_routing = named_registries_routing_digest(&opts.registries_by_prefix);
-
-    let policy_snapshot = build_policy_snapshot(&BuildPolicySnapshot {
-        minimum_release_age: opts.release_age.minimum_minutes.unwrap_or(0),
-        sorted_min_age_excludes: &sorted_min_age_excludes,
-        ignore_missing_time_field: opts.metadata.ignore_missing_time_field,
-        trust_policy: opts.trust.policy,
-        sorted_trust_excludes: &sorted_trust_excludes,
-        trust_policy_ignore_after: opts.trust.ignore_after,
-        named_registries_routing: &named_registries_routing,
-    });
-
+    let release_age = ReleaseAgeCheck::new(opts.release_age, opts.now);
+    let trust = TrustCheck::new(opts.trust);
+    let routing = VerificationRegistryRoutes::new(
+        opts.registries,
+        opts.registries_by_prefix,
+        opts.registry_options_by_url,
+    );
+    let check_time = opts.now.filter(|_| check_time_matters(&release_age, &trust));
+    let policy_snapshot =
+        build_policy_snapshot(&release_age, &trust, &routing, &opts.metadata, check_time);
     NpmResolutionVerifier {
         now: opts.now,
         policy_snapshot,
         lookup_context: crate::VerifierLookups::context_or_new(opts.artifacts.lookups.as_ref()),
-        release_age: ReleaseAgeCheck {
-            minimum_minutes: opts.release_age.minimum_minutes,
-            cutoff,
-            exclude: opts.release_age.exclude,
-            sorted_excludes: sorted_min_age_excludes,
-        },
-        trust: TrustCheck {
-            policy: opts.trust.policy,
-            exclude: opts.trust.exclude,
-            ignore_after: opts.trust.ignore_after,
-            sorted_excludes: sorted_trust_excludes,
-        },
+        release_age,
+        trust,
         metadata: opts.metadata,
         artifacts: opts.artifacts,
-        routing: VerificationRegistryRoutes {
-            registries: opts.registries,
-            named_registry_prefixes,
-            registries_by_prefix: opts.registries_by_prefix,
-            registry_options_by_url: opts.registry_options_by_url,
-        },
+        routing,
     }
 }
 
 impl ResolutionVerifier for NpmResolutionVerifier {
     fn might_verify(&self, resolution: &LockfileResolution, ctx: VerifyCtx<'_>) -> bool {
         if let LockfileResolution::Variations(variations) = resolution {
-            return variations
-                .resolutions()
-                .any(|resolution| self.might_verify(resolution, ctx));
+            return variations.variants
+                .iter()
+                .any(|variant| self.might_verify(&variant.resolution, ctx));
         }
         let Some(tarball_url) = npm_registry_tarball(resolution) else {
             return false;
@@ -374,14 +441,19 @@ impl ResolutionVerifier for NpmResolutionVerifier {
         }
 
         // Maturity: a previously cached run under a larger cutoff
-        // (stricter window) is trustworthy under a smaller current one
-        // — the set of accepted versions is a subset of today's.
+        // (stricter window) is trustworthy under a smaller current one,
+        // the set of accepted versions is a subset of today's.
         // Tightening the cutoff invalidates the cached run.
         let past_min_age = cached_policy
             .get("minimumReleaseAge")
             .and_then(JsonValue::as_u64)
             .unwrap_or(0);
         if past_min_age < self.release_age.minimum_minutes.unwrap_or(0) {
+            return false;
+        }
+        if check_time_matters(&self.release_age, &self.trust)
+            && !past_check_time_is_not_later(cached_policy, self.now, self.release_age.checked_at)
+        {
             return false;
         }
 
@@ -411,22 +483,32 @@ impl ResolutionVerifier for NpmResolutionVerifier {
         // Missing-time tolerance: a cached run that failed closed on an
         // absent `time` field accepted a subset of what today's tolerant
         // policy accepts, so it stays trustworthy. Turning the tolerance
-        // off invalidates it — entries the past run waved through are the
+        // off invalidates it, entries the past run waved through are the
         // ones today's policy exists to reject. Older records (no field)
         // read as intolerant, which is the safe direction.
         let past_ignore_missing_time = cached_policy
             .get("minimumReleaseAgeIgnoreMissingTime")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
-        if past_ignore_missing_time && !self.metadata.ignore_missing_time_field {
-            return false;
-        }
-
-        true
+        !past_ignore_missing_time || self.metadata.ignore_missing_time_field
     }
 }
 
 impl NpmResolutionVerifier {
+    async fn verify_variations(
+        &self,
+        variations: &pnpm_lockfile::VariationsResolution,
+        ctx: VerifyCtx<'_>,
+    ) -> ResolutionVerification {
+        for variant in &variations.variants {
+            let verification = Box::pin(self.verify_impl(&variant.resolution, ctx)).await;
+            if !matches!(verification, ResolutionVerification::Ok) {
+                return verification;
+            }
+        }
+        ResolutionVerification::Ok
+    }
+
     async fn verify_impl(
         &self,
         resolution: &LockfileResolution,
@@ -443,7 +525,7 @@ impl NpmResolutionVerifier {
         // Network-free structural check, so it runs before the registry
         // metadata shortcuts below. An entry that pins no hash cannot be
         // verified against anything once fetched, whatever its version
-        // shape — a URL-keyed dep is refused here too.
+        // shape, a URL-keyed dep is refused here too.
         if resolution.checkable_integrity().is_none() {
             return ResolutionVerification::Err {
                 code: MISSING_TARBALL_INTEGRITY_VIOLATION_CODE,
@@ -462,13 +544,11 @@ impl NpmResolutionVerifier {
             Ok(named_registry) => named_registry,
             Err(violation) => return violation,
         };
-
         let (age_applies, trust_applies) = self.policies_for(&ctx);
         if tarball_url.is_none() && !age_applies && !trust_applies {
             return ResolutionVerification::Ok;
         }
-        let registry =
-            named_registry.unwrap_or_else(|| self.routing.pick_registry(ctx.name, tarball_url));
+        let registry = self.pick_entry_registry(named_registry, ctx.name, tarball_url);
 
         if let Some(violation) = self.run_artifact_binding(
             &registry,
@@ -485,10 +565,25 @@ impl NpmResolutionVerifier {
         self.run_policy_checks(&registry, &ctx, age_applies, trust_applies).await
     }
 
+    fn pick_entry_registry(
+        &self,
+        named_registry: Option<String>,
+        name: &PkgName,
+        tarball_url: Option<&str>,
+    ) -> String {
+        named_registry.unwrap_or_else(|| {
+            self.routing.pick_registry(
+                name,
+                tarball_url,
+                self.artifacts.reverse_routed_tarball_url.as_ref(),
+            )
+        })
+    }
+
     /// A registry entry that pins an explicit tarball URL must point at the
     /// artifact the registry's own metadata lists. Otherwise a trusted
     /// name@version could front bytes from an attacker-chosen URL (with a
-    /// matching integrity for those bytes). This binding is unconditional —
+    /// matching integrity for those bytes). This binding is unconditional;
     /// it does not depend on the minimum-release-age / trust policies and
     /// isn't narrowed by their exclude lists, since it guards integrity
     /// rather than maturity/trust.
@@ -505,8 +600,7 @@ impl NpmResolutionVerifier {
         if !binds_an_artifact {
             return None;
         }
-        self.run_registry_artifact_check(registry, ctx.name, ctx.version, resolution, tarball_url)
-            .await
+        self.run_registry_artifact_check(registry, ctx, resolution, tarball_url).await
     }
 
     /// Whether the maturity and trust policies apply to this entry.
@@ -575,9 +669,3 @@ fn format_trust_violation(err: TrustViolation) -> String {
 
 #[cfg(test)]
 mod tests;
-
-impl ReleaseAgeCheck {
-    fn age_check_active(&self) -> bool {
-        self.minimum_minutes.is_some_and(|minutes| minutes > 0)
-    }
-}

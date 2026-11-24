@@ -1,12 +1,32 @@
 use super::{
-    Arc, CurrentPkg, HashMap, InvalidRevisionSpecifierError, InvalidTarballIntegrityError,
-    JSR_PACKAGE_BODY, LockfileResolution, MalformedRevisionHistoryError, NoMatchingRevisionError,
-    PACKAGE_BODY, PkgResolutionId, ResolveOptions, TarballRevision, UpdateBehavior,
-    WantedDependency, assert_eq, build_resolver, build_resolver_with_registries, json,
-    reject_versions, revision_history_package_body, revision_package_body,
+    Arc,
+    CurrentPkg,
+    HashMap,
+    InvalidRevisionSpecifierError,
+    InvalidTarballIntegrityError,
+    JSR_PACKAGE_BODY,
+    LockfileResolution,
+    MalformedRevisionHistoryError,
+    NoMatchingRevisionError,
+    PACKAGE_BODY,
+    PkgResolutionId,
+    ResolveOptions,
+    TarballRevision,
+    UpdateBehavior,
+    WantedDependency,
+    assert_eq,
+    build_resolver,
+    build_resolver_with_registries,
+    json,
+    reject_versions,
+    revision_history_package_body,
+    revision_package_body,
     shasum_only_package_body,
 };
-use pnpm_resolving_resolver_base::{Resolver, TrustPolicy};
+use pnpm_resolving_resolver_base::{
+    Resolver,
+    TrustPolicy,
+};
 
 #[tokio::test]
 async fn calculated_specifier_keeps_the_operator_the_previous_specifier_declared() {
@@ -622,7 +642,7 @@ async fn peek_manifest_from_store_bypasses_network_when_package_in_store() {
     assert_eq!(manifest["version"], "1.0.0");
 
     opts.locked_package_policy = pnpm_resolving_resolver_base::LockedPackagePolicy::Trust;
-    opts.policy.published_by = Some(chrono::Utc::now());
+    opts.policy.published_by = Some(jiff::Timestamp::now());
     opts.policy.trust_policy = Some(TrustPolicy::NoDowngrade);
     let trusted = resolver
         .resolve(&wanted, &opts)
@@ -632,8 +652,9 @@ async fn peek_manifest_from_store_bypasses_network_when_package_in_store() {
     assert_eq!(trusted.id.as_str(), "acme@1.0.0");
     assert!(dbg!(&trusted.policy_violation).is_none());
 
-    opts.policy.published_by = Some(chrono::Utc::now() - chrono::Duration::days(1));
-    opts.refresh.current_pkg.as_mut().unwrap().published_at = Some(chrono::Utc::now().to_rfc3339());
+    opts.policy.published_by = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24));
+    opts.refresh.current_pkg.as_mut().unwrap().published_at =
+        Some(pnpm_time::format_rfc3339(jiff::Timestamp::now()));
     let trusted = resolver
         .resolve(&wanted, &opts)
         .await

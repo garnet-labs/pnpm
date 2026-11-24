@@ -51,10 +51,15 @@ impl Colors {
     paint!(green, green);
     paint!(red, red);
     paint!(yellow, yellow);
-    // chalk's `grey`/`gray` — ANSI bright-black.
+    // chalk's `grey`/`gray`, ANSI bright-black.
     paint!(grey, bright_black);
     paint!(magenta, magenta);
     paint!(magenta_bright, bright_magenta);
+
+    // A package name among other words. A basic ANSI color follows the
+    // terminal's theme; bold is not rendered by every terminal.
+    paint!(package_name, magenta);
+    paint!(command, cyan);
 
     /// The `[WARN]` label: yellow-on-yellow brackets around black-on-yellow
     /// `WARN`, matching `formatWarn`.

@@ -1,12 +1,31 @@
 use super::{
-    Config, EnvGuard, EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, HostNoHome, LinkProbe,
-    NodePackageMapMode, NodePackageMapType, OsString, Path, PathBuf, assert_eq, capture_warnings,
-    config_from_workspace_yaml, env, fs, io, load_with_project_and_user, repo_on_branch,
-    safe_host_var, tempdir, write_file,
+    Config,
+    EnvGuard,
+    EnvVar,
+    EnvVarOs,
+    GetCurrentDir,
+    GetHomeDir,
+    HostNoHome,
+    LinkProbe,
+    NodePackageMapMode,
+    NodePackageMapType,
+    OsString,
+    Path,
+    PathBuf,
+    assert_eq,
+    capture_warnings,
+    config_from_workspace_yaml,
+    fs,
+    io,
+    load_with_project_and_user,
+    repo_on_branch,
+    safe_host_var,
+    tempdir,
+    write_file,
 };
 
 /// `pnpm config get` reads the explicit-settings record, which therefore has
-/// to answer both spellings with the value the install will use — whichever
+/// to answer both spellings with the value the install will use, whichever
 /// of the two the file was written in.
 #[test]
 pub fn explicit_settings_report_the_spelling_that_won() {
@@ -35,7 +54,7 @@ pub fn explicit_settings_report_the_spelling_that_won() {
 }
 
 /// `audit.level` supersedes the deprecated `auditLevel` spelling, and
-/// `pnpm config get audit-level` reads the explicit-settings record — so the
+/// `pnpm config get audit-level` reads the explicit-settings record, so the
 /// record has to carry the level under the deprecated name too, whichever
 /// spelling the file was written in.
 #[test]
@@ -61,9 +80,10 @@ pub fn explicit_settings_mirror_audit_level_from_the_audit_section() {
 /// fires even with no `.npmrc` present.
 #[test]
 pub fn proxy_env_fallback_applies_through_current() {
-    // Snapshot every proxy var the cascade might read so peer tests
-    // can't observe our mutations and so the env restores cleanly.
-    let _g = EnvGuard::snapshot([
+    // Every proxy var the cascade might read is cleared, so a host-set
+    // value cannot leak in and skew the assertion, and restored on drop
+    // so peer tests cannot observe the mutation.
+    let guard = EnvGuard::scrubbed([
         "HTTPS_PROXY",
         "https_proxy",
         "HTTP_PROXY",
@@ -78,25 +98,7 @@ pub fn proxy_env_fallback_applies_through_current() {
         "npm_config_workspace_dir",
     ]);
     let tmp = tempdir().unwrap();
-    // SAFETY: EnvGuard above serializes the test against other
-    // env-mutating tests in this process; no other thread reads
-    // these vars concurrently. The other proxy vars are removed so
-    // a host-set value can't leak in and skew the assertion.
-    unsafe {
-        env::remove_var("HTTPS_PROXY");
-        env::remove_var("https_proxy");
-        env::remove_var("HTTP_PROXY");
-        env::remove_var("http_proxy");
-        env::remove_var("PROXY");
-        env::remove_var("proxy");
-        env::remove_var("NO_PROXY");
-        env::remove_var("no_proxy");
-        env::remove_var("PNPM_CONFIG_WORKSPACE_DIR");
-        env::remove_var("pnpm_config_workspace_dir");
-        env::remove_var("NPM_CONFIG_WORKSPACE_DIR");
-        env::remove_var("npm_config_workspace_dir");
-        env::set_var("HTTPS_PROXY", "http://env.example:8080");
-    }
+    guard.set("HTTPS_PROXY", "http://env.example:8080");
     let config =
         Config::new().current::<HostNoHome>(tmp.path()).expect("workspace yaml absent => no error");
     assert_eq!(config.proxy.https_proxy.as_deref(), Some("http://env.example:8080"));
@@ -131,7 +133,8 @@ pub fn global_config_yaml_enables_gvs() {
             if name == "XDG_CONFIG_HOME" {
                 return XDG_CONFIG_HOME_PATH
                     .get()
-                    .map(|path| path.to_string_lossy().into_owned());
+                    .map(|path| path.to_string_lossy())
+                    .map(std::borrow::Cow::into_owned);
             }
             safe_host_var(name)
         }
@@ -383,6 +386,236 @@ pub fn lockfile_dir_env_var_overrides_yaml() {
 }
 
 #[test]
+pub fn lockfile_dir_equal_to_project_dir_keeps_the_default_lockfile_layout() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "lockfileDir: .\n")
+        .expect("write to pnpm-workspace.yaml");
+
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("loads");
+
+    assert_eq!(config.lockfile_dir, None);
+    assert!(config.explicit_settings.contains_key("lockfileDir"));
+    assert!(config.shares_one_lockfile());
+    assert_eq!(config.lockfile_dir_for(tmp.path()), tmp.path());
+}
+
+#[test]
+pub fn lockfile_dir_stays_pinned_when_projects_keep_their_own_lockfiles() {
+    let tmp = tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create project directory");
+    for (lockfile_dir, pinned) in [(".", &workspace), ("packages/app", &project)] {
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            format!(
+                "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\nlockfileDir: {lockfile_dir}\n",
+            ),
+        )
+        .expect("write to pnpm-workspace.yaml");
+        for invoked_from in [&workspace, &project] {
+            let config = Config::new().current::<HostNoHome>(invoked_from).expect("loads");
+
+            assert_eq!(config.lockfile_dir.as_ref(), Some(pinned), "lockfileDir: {lockfile_dir}");
+            assert!(config.shares_one_lockfile(), "lockfileDir: {lockfile_dir}");
+        }
+    }
+}
+
+#[test]
+pub fn default_lockfile_dir_keeps_workspace_relative_path_settings() {
+    let tmp = tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create project directory");
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let settings =
+        "packages:\n  - packages/*\nmodulesDir: custom_modules\nvirtualStoreDir: cache\n";
+    fs::write(&workspace_yaml, settings).expect("write workspace settings");
+    let without_lockfile_dir =
+        Config::new().current::<HostNoHome>(&project).expect("loads without lockfileDir");
+
+    fs::write(&workspace_yaml, format!("{settings}lockfileDir: .\n"))
+        .expect("write default lockfileDir");
+    let with_default_lockfile_dir =
+        Config::new().current::<HostNoHome>(&project).expect("loads default lockfileDir");
+
+    assert_eq!(with_default_lockfile_dir.lockfile_dir, None);
+    assert_eq!(with_default_lockfile_dir.modules_dir, without_lockfile_dir.modules_dir);
+    assert_eq!(
+        with_default_lockfile_dir.virtual_store_dir(),
+        without_lockfile_dir.virtual_store_dir(),
+    );
+    assert_eq!(with_default_lockfile_dir.install_state_dir, without_lockfile_dir.install_state_dir);
+}
+
+#[cfg_attr(not(windows), ignore = "requires Windows path semantics")]
+#[test]
+pub fn case_equivalent_lockfile_dir_keeps_the_default_layout() {
+    let tmp = tempdir().unwrap();
+    let workspace = tmp.path().join("CaseRoot");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create project directory");
+    let lockfile_dir = tmp
+        .path()
+        .join("CASEROOT")
+        .to_string_lossy()
+        .replace('\\', "/");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!("packages:\n  - packages/*\nlockfileDir: {lockfile_dir}\n"),
+    )
+    .expect("write to pnpm-workspace.yaml");
+
+    let config = Config::new().current::<HostNoHome>(&project).expect("loads");
+
+    assert_eq!(config.lockfile_dir, None);
+    assert_eq!(config.modules_dir, workspace.join("node_modules"));
+}
+
+#[test]
+pub fn clearing_a_lockfile_pin_restores_shared_workspace_paths() {
+    let tmp = tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create project directory");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\nlockfileDir: custom\n",
+    )
+    .expect("write to pnpm-workspace.yaml");
+
+    let mut config = Config::new().current::<HostNoHome>(&project).expect("loads");
+    config.pin_lockfile_dir(&workspace, &project);
+
+    assert_eq!(config.lockfile_dir, None);
+    assert_eq!(config.modules_dir, workspace.join("node_modules"));
+    assert_eq!(config.install_state_dir, workspace.join("node_modules/.pnpm"));
+}
+
+#[test]
+pub fn clearing_a_lockfile_pin_reanchors_workspace_virtual_store_settings() {
+    let tmp = tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create project directory");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\nlockfileDir: custom\nvirtualStoreDir: cache\n",
+    )
+    .expect("write to pnpm-workspace.yaml");
+
+    let mut config = Config::new().current::<HostNoHome>(&project).expect("loads");
+    config.pin_lockfile_dir(&workspace, &project);
+
+    assert_eq!(config.lockfile_dir, None);
+    assert_eq!(config.install_state_dir, workspace.join("cache"));
+}
+
+#[test]
+pub fn clearing_a_lockfile_pin_keeps_global_store_separate_from_project_state() {
+    let tmp = tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create project directory");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\nenableGlobalVirtualStore: true\nlockfileDir: custom\nvirtualStoreDir: cache\n",
+    )
+    .expect("write to pnpm-workspace.yaml");
+
+    let mut config = Config::new().current::<HostNoHome>(&project).expect("loads");
+    let global_virtual_store_dir = config.global_virtual_store_dir.clone();
+    config.pin_lockfile_dir(&workspace, &project);
+
+    assert_eq!(config.lockfile_dir, None);
+    assert_eq!(config.install_state_dir, workspace.join("node_modules/.pnpm"));
+    assert_eq!(config.global_virtual_store_dir, global_virtual_store_dir);
+}
+
+#[test]
+pub fn clearing_a_lockfile_pin_preserves_env_virtual_store_anchor() {
+    struct HostWithVirtualStoreEnv;
+    impl EnvVar for HostWithVirtualStoreEnv {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "PNPM_CONFIG_VIRTUAL_STORE_DIR" => Some("cache".to_owned()),
+                _ => safe_host_var(name),
+            }
+        }
+    }
+    impl EnvVarOs for HostWithVirtualStoreEnv {
+        fn var_os(_: &str) -> Option<OsString> {
+            None
+        }
+    }
+    impl GetHomeDir for HostWithVirtualStoreEnv {
+        fn home_dir() -> Option<PathBuf> {
+            None
+        }
+    }
+    inert_link_probe!(HostWithVirtualStoreEnv);
+    host_current_dir!(HostWithVirtualStoreEnv);
+
+    let tmp = tempdir().unwrap();
+    let project = tmp.path().join("app");
+    fs::create_dir_all(&project).expect("create project directory");
+
+    let mut config = Config::new().current::<HostWithVirtualStoreEnv>(&project).expect("loads");
+    config.pin_lockfile_dir(&project.join("custom"), &project);
+    config.pin_lockfile_dir(&project, &project);
+
+    assert_eq!(config.lockfile_dir, None);
+    assert_eq!(config.configured_virtual_store_dir, Some(project.join("cache")));
+    assert_eq!(config.install_state_dir, project.join("cache"));
+}
+
+#[test]
+pub fn lockfile_dir_equal_to_workspace_root_does_not_reanchor_env_paths() {
+    static WORKSPACE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    struct HostWithDefaultLockfileDirEnv;
+    impl EnvVar for HostWithDefaultLockfileDirEnv {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "PNPM_CONFIG_LOCKFILE_DIR" => WORKSPACE_DIR
+                    .get()
+                    .map(|path| path.to_string_lossy())
+                    .map(std::borrow::Cow::into_owned),
+                "PNPM_CONFIG_VIRTUAL_STORE_DIR" => Some("cache".to_owned()),
+                _ => safe_host_var(name),
+            }
+        }
+    }
+    impl EnvVarOs for HostWithDefaultLockfileDirEnv {
+        fn var_os(_: &str) -> Option<OsString> {
+            None
+        }
+    }
+    impl GetHomeDir for HostWithDefaultLockfileDirEnv {
+        fn home_dir() -> Option<PathBuf> {
+            None
+        }
+    }
+    inert_link_probe!(HostWithDefaultLockfileDirEnv);
+    host_current_dir!(HostWithDefaultLockfileDirEnv);
+
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path().join("packages/app");
+    fs::create_dir_all(&project_dir).expect("create project directory");
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write to pnpm-workspace.yaml");
+    WORKSPACE_DIR
+        .set(tmp.path().to_path_buf())
+        .expect("set workspace directory");
+
+    let config =
+        Config::new().current::<HostWithDefaultLockfileDirEnv>(&project_dir).expect("loads");
+
+    assert_eq!(config.lockfile_dir, None);
+    assert_eq!(config.configured_virtual_store_dir, Some(project_dir.join("cache")));
+}
+
+#[test]
 pub fn package_map_settings_load_from_env() {
     struct HostWithPackageMapEnv;
     impl EnvVar for HostWithPackageMapEnv {
@@ -534,7 +767,7 @@ pub fn package_manager_bootstrap_honors_env_registry() {
 }
 
 /// When `PNPM_CONFIG_REGISTRY` is set without a trailing slash, the env
-/// override normalizes it before storing — matching pnpm, which treats
+/// override normalizes it before storing, matching pnpm, which treats
 /// `https://r` and `https://r/` as the same registry. The slash must be
 /// appended consistently to `config.registry`, `config.registries_by_scope`, and
 /// the bootstrap map so downstream lookups (auth-header pinning,
@@ -634,8 +867,8 @@ pub fn global_config_yaml_keys_settable_nowhere_are_reported_with_their_route() 
 }
 
 /// A key that names no setting of any supported pnpm gets the
-/// "not recognized by this version" warning — with the closest real setting
-/// when the key looks like a typo of one — instead of the move-to-workspace
+/// "not recognized by this version" warning (with the closest real setting
+/// when the key looks like a typo of one) instead of the move-to-workspace
 /// advice, which would send the user to a file that ignores it too.
 #[test]
 pub fn global_config_yaml_unrecognized_keys_are_reported_with_a_suggestion() {

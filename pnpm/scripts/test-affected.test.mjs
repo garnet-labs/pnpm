@@ -30,7 +30,7 @@ test('selects the crate that owns each changed file', () => {
 })
 
 test('ignores files outside the workspace', () => {
-  assert.deepEqual(selectPackages(['AGENTS.md', 'pnpm11/pnpm/src/main.ts'], manifests), [])
+  assert.deepEqual(selectPackages(['AGENTS.md', 'pnpm/docs/cli/install.md'], manifests), [])
 })
 
 test('selects every pnpr crate when one of them changes', () => {
@@ -47,10 +47,9 @@ test('prefers the closest crate for a nested manifest', () => {
 test('selects the crates that read a fixture stored outside them', () => {
   assert.deepEqual(selectPackages(['fixtures/gvs-link-hash-parity.json'], manifests), ['pnpm-deps-restorer'])
   assert.deepEqual(selectPackages(['fixtures/pin-decision.json'], manifests), ['pnpm-cli', 'pnpm-config'])
-  assert.deepEqual(selectPackages(['pnpm11/config/reader/src/unknownSettings.ts'], manifests), ['pnpm-config'])
-  assert.deepEqual(
-    selectPackages(['pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0.patch'], manifests),
-    ['pnpm-cli'])
+  for (const oracleInput of ['pnpm/test-oracles/package.json', '.config/pnpm/catalog.yaml', 'pnpm-lock.yaml']) {
+    assert.deepEqual(selectPackages([oracleInput], manifests), ['pnpm-cli', 'pnpm-config', 'pnpm-fs-packlist'])
+  }
 })
 
 test('refuses to scope a change to the mocked registry packages', () => {

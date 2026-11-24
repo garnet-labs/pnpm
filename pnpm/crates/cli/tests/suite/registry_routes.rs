@@ -3,16 +3,26 @@
 //! locked children again from the new registry, so a version the new
 //! registry does not serve is not pinned from the old one.
 
-use crate::_utils::{append_workspace_yaml_key, pacquet_in, read_lockfile};
+use crate::_utils::{
+    append_workspace_yaml_key,
+    pacquet_in,
+    read_lockfile,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_lockfile::Lockfile;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     registry::TestRegistry,
 };
 use pretty_assertions::assert_eq;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+};
 use tempfile::TempDir;
 
 /// `@pnpm.e2e/foobar@100.0.0` declares `@pnpm.e2e/foo: ^100.0.0`, a plain
@@ -113,7 +123,7 @@ fn moving_a_scope_re_resolves_its_plain_keyed_packages_from_the_new_registry() {
 fn a_frozen_install_keeps_the_moved_packages_and_the_recorded_routes() {
     let (root, workspace, anchor) = setup();
     let old = anchor.mock_instance.url().to_string();
-    let new = TestRegistry::start_with_own_storage(root.path());
+    let new = TestRegistry::start_with_public_url(anchor.mock_instance.server_url());
     route_scope(&workspace, &old);
     fs::write(
         workspace.join("package.json"),

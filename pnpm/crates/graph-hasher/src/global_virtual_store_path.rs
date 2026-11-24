@@ -1,16 +1,31 @@
-//! Global-virtual-store directory naming — the GVS hash computation
+//! Global-virtual-store directory naming, the GVS hash computation
 //! and path formatting.
 
 use crate::{
     HashEncoding,
-    dep_state::{DepsGraphNode, DepsStateCache, calc_dep_graph_hash},
-    hash_object, hash_object_without_sorting,
-    object_hasher::{digest_hex, serialize_str},
+    dep_state::{
+        DepsGraphNode,
+        DepsStateCache,
+        calc_dep_graph_hash,
+    },
+    hash_object,
+    hash_object_without_sorting,
+    object_hasher::{
+        digest_hex,
+        serialize_str,
+    },
 };
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
+    path::PathBuf,
 };
 
 /// Compute the hex digest that uniquely identifies one snapshot's
@@ -21,12 +36,12 @@ use std::{
 /// Two snapshots that resolve to the same package contents (identical
 /// `fullPkgId`s and identical recursive children) hash to the same
 /// value and therefore share one directory under
-/// `<store>/links/<name>/<version>/` — which is how pnpm and pacquet
+/// `<store>/links/<name>/<version>/`, which is how pnpm and pacquet
 /// avoid re-extracting the same tarball once per peer-context.
 ///
 /// `engine` is the candidate `ENGINE_NAME`-shaped string
 /// (`<platform>-<arch>-node<major>`). It is included in the hash
-/// payload only when the snapshot transitively requires a build —
+/// payload only when the snapshot transitively requires a build,
 /// pure-JS subgraphs hash with `engine = null` so their GVS
 /// directories survive Node.js upgrades. The gating is driven by:
 ///
@@ -34,52 +49,56 @@ use std::{
 ///   [`crate::build_required_dep_paths`]. `None` disables the gating and
 ///   forces `include_engine = true`.
 ///
+/// With [`BuildRequired::builds_run`], a snapshot in its `dep_paths`
+/// also hashes `built: true`. Its slot holds the built package, which an
+/// install renames into place once the build has finished, so it never
+/// shares a path with the pristine package that an install not running
+/// the build imports. An install under `ignoreScripts` passes `false`.
+///
 /// `project` scopes the slot to one project instead of sharing it
 /// across every project in the store. Callers pass `Some(lockfile_dir)`
 /// for a snapshot resolved from a local directory and `None` for
-/// everything else — see
+/// everything else; see
 /// [`local_directory_scope`](../../../../package-manager/src/virtual_store_layout.rs).
 pub fn calc_graph_node_hash<Key>(
     graph: &HashMap<Key, DepsGraphNode<Key>>,
     cache: &mut DepsStateCache<Key>,
     dep_path: &Key,
     engine: Option<&str>,
-    build_required_dep_paths: Option<&HashSet<Key>>,
+    build_required: BuildRequired<'_, Key>,
     project: Option<&str>,
 ) -> String
 where
     Key: Clone + Eq + std::hash::Hash,
 {
-    let include_engine = build_required_dep_paths.is_none_or(|set| set.contains(dep_path));
-    let engine_value = if include_engine {
-        match engine {
-            Some(s) => Value::String(s.to_owned()),
-            None => Value::Null,
-        }
-    } else {
-        Value::Null
-    };
+    let NodeHashFields { engine: engine_value, built } =
+        node_hash_fields(dep_path, engine, build_required);
     let deps_hash = calc_dep_graph_hash(graph, cache, dep_path);
     // The object-hash serialization of
-    // `{ engine, deps }`, plus `project` when the caller has one, with
+    // `{ engine, deps }`, plus `built` and `project` when they apply, with
     // `sort = false`: keys stay in the order written here, which is the
     // order `hash_object_without_sorting` reads them out of a
     // `preserve_order` `serde_json` map.
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(b"object:");
-    buf.extend_from_slice(if project.is_some() { b"3" } else { b"2" });
+    let field_count = 2 + usize::from(built) + usize::from(project.is_some());
+    buf.extend_from_slice(field_count.to_string().as_bytes());
     buf.push(b':');
     serialize_str(&mut buf, "engine");
     buf.push(b':');
-    match &engine_value {
-        Value::String(engine) => serialize_str(&mut buf, engine),
-        _ => buf.extend_from_slice(b"Null"),
+    match engine_value {
+        Some(engine) => serialize_str(&mut buf, engine),
+        None => buf.extend_from_slice(b"Null"),
     }
     buf.push(b',');
     serialize_str(&mut buf, "deps");
     buf.push(b':');
     serialize_str(&mut buf, &deps_hash);
     buf.push(b',');
+    if built {
+        serialize_str(&mut buf, "built");
+        buf.extend_from_slice(b":bool:true,");
+    }
     if let Some(project) = project {
         serialize_str(&mut buf, "project");
         buf.push(b':');
@@ -89,11 +108,53 @@ where
     digest_hex(&buf)
 }
 
+/// Which snapshots [`calc_graph_node_hash`] treats as built.
+pub struct BuildRequired<'a, Key> {
+    /// When `Some`, the set [`crate::build_required_dep_paths`] returns.
+    /// `None` disables the gating and includes the engine everywhere.
+    pub dep_paths: Option<&'a HashSet<Key>>,
+    /// Whether the install runs the builds. `false` under `ignoreScripts`.
+    pub builds_run: bool,
+}
+
+// Implemented by hand: deriving would require `Key: Copy`.
+impl<Key> Clone for BuildRequired<'_, Key> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Key> Copy for BuildRequired<'_, Key> {}
+
+/// What a snapshot's hash payload holds besides its dependencies.
+struct NodeHashFields<'e> {
+    /// `None` hashes `null`.
+    engine: Option<&'e str>,
+    /// Whether the payload holds `built: true`.
+    built: bool,
+}
+
+fn node_hash_fields<'e, Key>(
+    dep_path: &Key,
+    engine: Option<&'e str>,
+    build_required: BuildRequired<'_, Key>,
+) -> NodeHashFields<'e>
+where
+    Key: Eq + std::hash::Hash,
+{
+    let gated = build_required.dep_paths.is_some_and(|set| set.contains(dep_path));
+    let include_engine = gated || build_required.dep_paths.is_none();
+    NodeHashFields {
+        engine: engine.filter(|_| include_engine),
+        built: gated && build_required.builds_run,
+    }
+}
+
 /// Compute the GVS hash for a config dependency that has no children
 /// at all.
 ///
 /// Unlike [`calc_graph_node_hash`], this doesn't walk a dependency
-/// graph — it hashes a single `{ id: full_pkg_id, deps: {} }` node and
+/// graph; it hashes a single `{ id: full_pkg_id, deps: {} }` node and
 /// wraps it in the `{ engine: null, deps }` payload. The env-installer
 /// uses it for the platform-specific optional subdeps of a config
 /// dependency, which are installed one level deep with no further
@@ -113,7 +174,7 @@ pub fn calc_leaf_global_virtual_store_path(full_pkg_id: &str, name: &str, versio
 /// (`<name>@<version>:<integrity>`). Folding the subdeps into the
 /// parent's hash is what keeps a parent pinned to one version from
 /// colliding on the same leaf directory when a subdep version changes
-/// underneath it — without this, changing a subdep while keeping the
+/// underneath it, without this, changing a subdep while keeping the
 /// parent pinned would silently overwrite the previous sibling
 /// symlinks.
 #[must_use]
@@ -154,7 +215,7 @@ pub fn format_global_virtual_store_path(name: &str, version: &str, hex_digest: &
 /// [`pnpm_fs::push_slash_separated_path`]'s job, whose documentation
 /// covers what a `/` left in a Windows path string costs.
 #[must_use]
-pub fn join_global_virtual_store_path(base: &Path, rel: &str) -> PathBuf {
+pub fn join_global_virtual_store_path(base: PathBuf, rel: &str) -> PathBuf {
     pnpm_fs::join_slash_separated_path(base, rel)
 }
 

@@ -1,9 +1,18 @@
 use crate::_utils::pacquet_in;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_lockfile::{EnvLockfile, PackageKey};
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use std::{fs, path::Path};
+use pnpm_lockfile::{
+    EnvLockfile,
+    PackageKey,
+};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
+use std::{
+    fs,
+    path::Path,
+};
 
 #[test]
 fn filter_log_is_ignored_with_a_warning() {
@@ -121,8 +130,8 @@ module.exports = { hooks: { updateConfig (config) {
 
 const EXTRA_ENV_PNPMFILE: &str = "module.exports = { hooks: { updateConfig (config) { config.extraEnv = { ...config.extraEnv, PNPM_HOOK_MARKER: 'from-hook' }; return config } } }";
 
-/// A script that records `PNPM_HOOK_MARKER` — the variable
-/// [`EXTRA_ENV_PNPMFILE`] exports — in `marker.txt` next to the manifest.
+/// A script that records `PNPM_HOOK_MARKER` (the variable
+/// [`EXTRA_ENV_PNPMFILE`] exports) in `marker.txt` next to the manifest.
 const WRITE_MARKER_SCRIPT: &str =
     r#"node -e "require('fs').writeFileSync('marker.txt', process.env.PNPM_HOOK_MARKER || '')""#;
 
@@ -190,6 +199,45 @@ fn update_config_catalog_applies_to_outdated() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("STDOUT:\n{stdout}\n");
     assert!(stdout.contains(CATALOG_DEP), "outdated should report the catalog dependency");
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn update_config_version_selector_override_applies_to_catalog_dependency() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "catalog-hook-override-project",
+            "version": "1.0.0",
+            "dependencies": { (CATALOG_DEP): "catalog:" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        format!(
+            "module.exports = {{ hooks: {{ updateConfig (config) {{ config.catalogs = {{ default: {{ '{CATALOG_DEP}': '^100.0.0' }} }}; config.overrides = {{ ...config.overrides, '{CATALOG_DEP}@^100.0.0': '100.0.0' }}; return config }} }} }}",
+        ),
+    )
+    .expect("write pnpmfile");
+
+    pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let wanted = pnpm_lockfile::Lockfile::load_wanted_from_dir(&workspace)
+        .expect("load wanted lockfile")
+        .expect("wanted lockfile");
+    let dep_name = CATALOG_DEP.parse().expect("package name");
+    let dependency = &wanted.importers["."].dependencies.as_ref().expect("dependencies")[&dep_name];
+    assert_eq!(dependency.specifier, "100.0.0");
+    assert_eq!(dependency.version.to_string(), "100.0.0");
 
     drop((root, mock_instance));
 }
@@ -712,7 +760,7 @@ fn update_config_catalog_applies_to_import() {
 }
 
 /// `updateConfig` applies to `pnpm run`, not just to the install family:
-/// the settings a hook returns — `extraEnv` here — reach the environment of
+/// the settings a hook returns (`extraEnv` here) reach the environment of
 /// the script it spawns.
 #[test]
 fn update_config_applies_to_run() {
@@ -882,8 +930,8 @@ fn update_config_applies_to_rebuild() {
 /// A hook that changes an install-affecting setting must be applied before
 /// the verify-deps-before-run check compares the live settings with the ones
 /// the last install recorded. Without the hook, `pnpm run` sees the
-/// pre-hook value, reports the setting as changed, and — under
-/// `verifyDepsBeforeRun: error` — refuses to run any script at all.
+/// pre-hook value, reports the setting as changed, and, under
+/// `verifyDepsBeforeRun: error`, refuses to run any script at all.
 #[test]
 fn update_config_applies_before_the_verify_deps_check() {
     let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
@@ -1019,7 +1067,8 @@ fn update_config_omits_the_settings_nothing_set() {
         .as_array()
         .expect("the pnpmfiles seen are an array")
         .iter()
-        .map(|path| path.as_str().expect("a pnpmfile path is a string"))
+        .map(serde_json::Value::as_str)
+        .map(|text| text.expect("a pnpmfile path is a string"))
         .collect();
     assert_eq!(pnpmfiles.len(), 1);
     assert!(pnpmfiles[0].ends_with(".pnpmfile.cjs"));
@@ -1027,7 +1076,8 @@ fn update_config_omits_the_settings_nothing_set() {
     assert!(
         seen["cacheDir"]
             .as_str()
-            .is_some_and(|dir| Path::new(dir).is_absolute()),
+            .map(Path::new)
+            .is_some_and(Path::is_absolute),
     );
 
     drop(root);
@@ -1552,6 +1602,60 @@ fn frozen_install_accepts_an_injected_project_the_root_pnpmfile_rewrites() {
         .with_args(["install", "--frozen-lockfile"])
         .assert()
         .success();
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn update_config_returning_undefined_reports_config_is_undefined() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(workspace.join("package.json"), r#"{"name":"app","version":"1.0.0"}"#)
+        .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (cfg) { cfg.hoist = false; } } };\n",
+    )
+    .expect("write pnpmfile");
+
+    let output = pacquet_in(&workspace)
+        .with_arg("install")
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "STDERR:\n{stderr}");
+    assert!(stderr.contains("ERR_PNPM_CONFIG_IS_UNDEFINED"), "STDERR:\n{stderr}");
+    assert!(stderr.contains("The updateConfig hook returned undefined"), "STDERR:\n{stderr}");
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn after_all_resolved_returning_undefined_reports_bad_after_all_resolved_return() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/pkg-with-1-dep": "100.0.0" } }).to_string(
+        ),
+    )
+    .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { afterAllResolved (lockfile) { delete lockfile.packages; } } };\n",
+    )
+    .expect("write pnpmfile");
+
+    let output = pacquet_in(&workspace)
+        .with_arg("install")
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "STDERR:\n{stderr}");
+    assert!(stderr.contains("ERR_PNPM_BAD_AFTER_ALL_RESOLVED_RETURN"), "STDERR:\n{stderr}");
+    assert!(stderr.contains("The afterAllResolved hook returned undefined"), "STDERR:\n{stderr}");
 
     drop((root, mock_instance));
 }

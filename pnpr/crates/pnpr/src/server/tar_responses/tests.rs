@@ -1,4 +1,10 @@
-use super::{HeaderMap, TarCoding, decode::tar_integrity_within, header, preferred_coding};
+use super::{
+    HeaderMap,
+    TarCoding,
+    decode::tar_integrity_within,
+    header,
+    preferred_coding,
+};
 use std::io::Write;
 
 fn gzip(bytes: &[u8]) -> Vec<u8> {
@@ -54,7 +60,7 @@ async fn decode_and_derive(
         &pnpr_config::HostedStoreConfig::Fs,
         storage_dir.path().join("storage"),
         storage_dir.path().join("cache"),
-        &pnpr_config::MetadataBackend::Sqlite(storage_dir.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(storage_dir.path().join("metadata.sqlite")),
     )
     .unwrap();
     let stale = super::StaleTgz {
@@ -117,7 +123,7 @@ async fn decoded_tar_records_regular_file_statistics_and_forwards_decode_errors(
         &pnpr_config::HostedStoreConfig::Fs,
         temp.path().join("storage"),
         temp.path().join("cache"),
-        &pnpr_config::MetadataBackend::Sqlite(temp.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(temp.path().join("metadata.sqlite")),
     )
     .unwrap();
     let stale = super::StaleTgz {
@@ -207,7 +213,7 @@ async fn a_tar_response_decodes_only_with_a_permit() {
         &pnpr_config::HostedStoreConfig::Fs,
         storage_dir.path().join("storage"),
         storage_dir.path().join("cache"),
-        &pnpr_config::MetadataBackend::Sqlite(storage_dir.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(storage_dir.path().join("metadata.sqlite")),
     )
     .unwrap();
     let stale = super::StaleTgz {

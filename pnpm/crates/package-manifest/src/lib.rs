@@ -1,51 +1,129 @@
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
 pub mod package_manager_spec;
 pub use bins::{
-    MAX_PRECALCULATED_BINS, MAX_PRECALCULATED_BINS_BYTES, PackageBin, ScriptRuntime,
-    declared_bin_entries, extension_program, infer_script_runtime_from_head,
-    infer_script_runtime_from_shebang, is_safe_bin_name, is_within_precalculated_bins_budget,
-    manifest_declares_bins, normalize_bin_path, normalize_package_relative_path, parse_shebang,
-    parse_shebang_from_bytes, resolve_package_bins, resolve_package_bins_from_cas_paths,
-    resolve_package_bins_with, serialize_precalculated_bins, unscoped_bin_name,
+    MAX_PRECALCULATED_BINS,
+    MAX_PRECALCULATED_BINS_BYTES,
+    PackageBin,
+    ScriptRuntime,
+    declared_bin_entries,
+    extension_program,
+    infer_script_runtime_from_head,
+    infer_script_runtime_from_shebang,
+    is_safe_bin_name,
+    is_within_precalculated_bins_budget,
+    manifest_declares_bins,
+    normalize_bin_path,
+    normalize_package_relative_path,
+    parse_shebang,
+    parse_shebang_from_bytes,
+    resolve_package_bins,
+    resolve_package_bins_from_cas_paths,
+    resolve_package_bins_with,
+    serialize_precalculated_bins,
+    unscoped_bin_name,
     verify_package_bins,
 };
 pub use build_triggers::{
-    BINDING_GYP, BuildTriggers, files_build_triggers, files_include_install_scripts,
-    manifest_opts_out_of_gyp_build, manifest_requires_build, pkg_build_triggers,
-    pkg_requires_build, read_package_json_from_cas_paths, requires_build_from_cas_paths,
-    requires_build_from_files, stored_requires_build_needs_manifest_check,
+    BINDING_GYP,
+    BuildTriggers,
+    files_build_triggers,
+    files_include_install_scripts,
+    manifest_opts_out_of_gyp_build,
+    manifest_requires_build,
+    pkg_build_triggers,
+    pkg_requires_build,
+    read_package_json_from_cas_paths,
+    requires_build_from_cas_paths,
+    requires_build_from_files,
+    stored_requires_build_needs_manifest_check,
 };
 pub use bundled_manifest::normalize_bundled_manifest;
 pub use error::PackageManifestError;
-pub use initialization::{InitAuthor, InitOptions};
+pub use initialization::{
+    InitAuthor,
+    InitOptions,
+};
 pub use install_manifest::{
-    ArchiveFacts, INSTALL_MANIFEST_FIELDS, INSTALL_MANIFEST_PROFILE, InstallManifest,
-    ManifestComparison, NODE_GYP_REBUILD,
+    ArchiveFacts,
+    INSTALL_MANIFEST_FIELDS,
+    INSTALL_MANIFEST_PROFILE,
+    InstallManifest,
+    ManifestComparison,
+    NODE_GYP_REBUILD,
 };
-pub use metadata::{extract_author, extract_homepage, extract_license};
+pub use metadata::{
+    extract_author,
+    extract_homepage,
+    extract_license,
+};
 pub use project::{
-    PROJECT_MANIFEST_BASENAMES, find_parent_publish_manifest, project_manifest_path,
-    publishes_from_directory, safe_read_project_manifest_from_dir,
+    PROJECT_MANIFEST_BASENAMES,
+    find_parent_publish_manifest,
+    project_manifest_path,
+    published_name,
+    publishes_from_directory,
+    safe_read_project_manifest_from_dir,
 };
-pub use readme::{ReadmeKind, decode_readme, is_preferred_readme, readme_kind};
+pub use raw::RawPackageManifest;
+pub use readme::{
+    ReadmeKind,
+    decode_readme,
+    is_preferred_readme,
+    readme_kind,
+};
 pub use runtime::{
-    apply_runtime_on_fail_override, convert_dependencies_to_engines_runtime,
-    convert_engines_runtime_to_dependencies, engines_runtime_dependencies, is_runtime_alias,
+    apply_runtime_on_fail_override,
+    convert_dependencies_to_engines_runtime,
+    convert_engines_runtime_to_dependencies,
+    downloaded_node_runtime_from_dependency_field,
+    downloaded_node_specifier_from_engine_field,
+    downloaded_node_version_from_engine_field,
+    downloaded_node_version_from_engines_runtime,
+    engines_runtime_dependencies,
+    is_runtime_alias,
+    node_version_from_engine_field,
     node_version_from_engines_runtime,
 };
-pub use serialization::{parse_manifest, parse_manifest_bytes, safe_read_package_json_from_dir};
+pub use serialization::{
+    parse_manifest,
+    parse_manifest_bytes,
+    safe_read_package_json_from_dir,
+};
 pub use truthiness::is_truthy;
 
 use std::{
-    fmt, fs,
-    io::{self, Write},
-    path::{Path, PathBuf},
+    fmt,
+    fs,
+    io::{
+        self,
+        Write,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use blank_lines::BlankLines;
-use node_semver::{Range, Version};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use serialization::{empty_dependency_fields, normalize_dependency_fields, serialize_with_indent};
+use node_semver::{
+    Range,
+    Version,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
+use serialization::{
+    ManifestFormatting,
+    empty_dependency_fields,
+    normalize_dependency_fields,
+};
 use strum::IntoStaticStr;
 mod bins;
 mod blank_lines;
@@ -57,13 +135,14 @@ mod install_manifest;
 mod json5;
 mod metadata;
 mod project;
+mod raw;
 mod readme;
 mod runtime;
 mod serialization;
 mod truthiness;
 mod validation;
 
-#[derive(Debug, Clone, Copy, PartialEq, IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
 pub enum DependencyGroup {
     #[strum(serialize = "dependencies")]
     Prod,
@@ -92,21 +171,14 @@ const DEFAULT_INDENT: &str = "  ";
 /// Carries the source file's formatting (indentation unit, final-newline
 /// state, blank lines between JSON object members) and its parsed value across the read/save round-trip, so
 /// [`Self::save`] preserves the file's style and skips the write entirely
-/// when nothing changed — the same contract as pnpm's project-manifest
+/// when nothing changed, the same contract as pnpm's project-manifest
 /// reader/writer pair.
 #[derive(Clone)]
 pub struct PackageManifest {
     path: PathBuf,
     value: Value, // TODO: convert this into a proper struct + an array of keys order
-    /// Whether a save ends the file with a newline. New and in-memory
-    /// manifests get one.
-    insert_final_newline: bool,
-    crlf: bool,
-    /// One indentation level. Empty for a single-line source document,
-    /// which then round-trips back to its compact form.
-    indent: String,
-    /// The blank lines of a JSON source file, restored on save.
-    blank_lines: BlankLines,
+    formatting: ManifestFormatting,
+    runtime_policy: Option<Box<runtime::RuntimePolicy>>,
     /// The manifest as the file currently encodes it (`devEngines` folded,
     /// dependency fields normalized), used to skip a save that wouldn't
     /// change the file. `None` when there is no file baseline (in-memory
@@ -154,7 +226,7 @@ impl PackageManifest {
         // that accept untrusted input (the Node API binding) reject a non-object
         // manifest at their boundary for a clear error, but if any value other
         // than an object still reaches here, inserting a dependency via
-        // `self.value[key] = ...` would panic — so coerce it to an empty object
+        // `self.value[key] = ...` would panic, so coerce it to an empty object
         // rather than aborting the host process.
         if !value.is_object() {
             value = json!({});
@@ -164,10 +236,8 @@ impl PackageManifest {
         PackageManifest {
             path,
             value,
-            insert_final_newline: true,
-            crlf: false,
-            indent: DEFAULT_INDENT.to_string(),
-            blank_lines: BlankLines::default(),
+            formatting: ManifestFormatting::in_memory(),
+            runtime_policy: None,
             on_disk: None,
             empty_dependency_fields: Vec::new(),
         }
@@ -188,7 +258,7 @@ impl PackageManifest {
     /// Used by the read-package-hook layer to rewrite a manifest's
     /// dependency maps before downstream consumers see it (the
     /// `readPackage` hook returns a modified manifest). Mutations stay
-    /// in memory — there is no implicit `save`, so the user's on-disk
+    /// in memory; there is no implicit `save`, so the user's on-disk
     /// `package.json` is untouched.
     pub fn value_mut(&mut self) -> &'_ mut Value {
         &mut self.value
@@ -200,6 +270,9 @@ impl PackageManifest {
         let mut value = self.value.clone();
         convert_dependencies_to_engines_runtime(&mut value, "devDependencies", "devEngines")?;
         convert_dependencies_to_engines_runtime(&mut value, "dependencies", "engines")?;
+        if let Some(policy) = &self.runtime_policy {
+            policy.restore(&self.value, &mut value);
+        }
         normalize_dependency_fields(&mut value, &self.empty_dependency_fields);
         Ok(value)
     }
@@ -216,11 +289,7 @@ impl PackageManifest {
         if self.on_disk.as_ref() == Some(&value) {
             return Ok(self.on_disk.as_ref().unwrap());
         }
-        let contents = self.serialize(&value)?;
-        Self::write_atomic(&self.path, &contents)?;
-        if !self.is_yaml() && !self.is_json5() {
-            self.blank_lines = BlankLines::detect(&contents);
-        }
+        self.formatting.write(&self.path, &value)?;
         self.empty_dependency_fields = empty_dependency_fields(&value);
         self.on_disk = Some(value);
         Ok(self.on_disk.as_ref().unwrap())
@@ -235,28 +304,6 @@ impl PackageManifest {
     /// and its modification time untouched.
     pub fn save_and_get_written_value(&mut self) -> Result<Value, PackageManifestError> {
         self.save_internal().cloned()
-    }
-
-    /// The file contents a save writes for `value`, in the source file's
-    /// format and style.
-    fn serialize(&self, value: &Value) -> Result<String, PackageManifestError> {
-        let mut contents = if self.is_yaml() {
-            self.serialize_yaml(value)?
-        } else {
-            let mut contents = if self.is_json5() {
-                self.serialize_json5(value)?
-            } else {
-                self.blank_lines.restore(&serialize_with_indent(value, &self.indent)?)
-            };
-            if self.insert_final_newline {
-                contents.push('\n');
-            }
-            contents
-        };
-        if self.crlf {
-            contents = serialization::normalize_crlf(&contents);
-        }
-        Ok(contents)
     }
 
     pub fn save(&mut self) -> Result<(), PackageManifestError> {
@@ -302,7 +349,7 @@ impl PackageManifest {
         };
         // The bare-specifier parse uses `lastIndexOf('@')` and treats
         // `index < 1` (no `@`, or `@` at position 0 of a scoped name)
-        // as "no version" — the spec is just a package name.
+        // as "no version", the spec is just a package name.
         match rest.rfind('@') {
             Some(idx) if idx >= 1 => (&rest[..idx], &rest[idx + 1..]),
             _ => (rest, "latest"),
@@ -343,7 +390,7 @@ impl PackageManifest {
     /// `optionalDependencies`) drops `name` from the other two: a
     /// dependency has one home there, so saving it as a different type
     /// moves it, matching pnpm's `updateProjectManifestObject`. A
-    /// [`DependencyGroup::Peer`] save is additive — pnpm's `--save-peer`
+    /// [`DependencyGroup::Peer`] save is additive, pnpm's `--save-peer`
     /// writes `peerDependencies` alongside the `devDependencies` entry.
     pub fn add_dependency(
         &mut self,
@@ -371,6 +418,13 @@ impl PackageManifest {
 
     /// A dependency belongs to one install group at a time, so adding it to
     /// one removes it from the other two.
+    #[cfg_attr(
+        dylint_lib = "perfectionist",
+        expect(
+            perfectionist::needless_borrowed_parameters,
+            reason = "the name is copied only for an install group; a peer save returns first"
+        )
+    )]
     fn drop_from_other_install_groups(&mut self, name: &str, added_to: DependencyGroup) {
         const INSTALL_GROUPS: [DependencyGroup; 3] =
             [DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional];

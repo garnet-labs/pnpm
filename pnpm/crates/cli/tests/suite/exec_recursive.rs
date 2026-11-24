@@ -5,17 +5,32 @@
 //! than the POSIX programs Windows has none of.
 
 #[cfg(unix)]
-use crate::_utils::terminal::{Terminal, spawn_without_terminal};
-use crate::_utils::{CHILD_DEADLINE, wait_for_child};
+use crate::_utils::terminal::{
+    Terminal,
+    spawn_without_terminal,
+};
+use crate::_utils::{
+    CHILD_DEADLINE,
+    wait_for_child,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::{bin::CommandTempCwd, command_env::CommandTestExt};
-use serde_json::{Value, json};
+use pnpm_testing_utils::{
+    bin::CommandTempCwd,
+    command_env::CommandTestExt,
+};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
     collections::HashMap,
     fs,
     path::Path,
-    process::{Command, Stdio},
+    process::{
+        Command,
+        Stdio,
+    },
 };
 
 /// Write a `pnpm-workspace.yaml` listing `names` as packages, plus a
@@ -172,6 +187,44 @@ fn recursive_exec_runs_command_in_every_project() {
         );
     }
 
+    drop(root);
+}
+
+#[test]
+fn recursive_exec_checks_node_engines_against_each_projects_runtime() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &["project-1", "project-2"]);
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - project-1\n  - project-2\nengineStrict: true\n",
+    )
+    .expect("write workspace settings");
+    for (name, version) in [("project-1", "22.20.0"), ("project-2", "24.0.0")] {
+        fs::write(
+            workspace.join(name).join("package.json"),
+            json!({
+                "name": name,
+                "version": "1.0.0",
+                "engines": { "node": version },
+                "devEngines": { "runtime": { "name": "node", "version": version, "onFail": "download" } },
+            })
+            .to_string(),
+        )
+        .expect("write project manifest");
+    }
+
+    pacquet
+        .with_args(["exec", "-r"])
+        .with_args([
+            "node".to_owned(),
+            "-e".to_owned(),
+            "require('fs').writeFileSync('runtime.txt', process.version)".to_owned(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_to_string(workspace.join("project-1/runtime.txt")).unwrap(), "v22.20.0");
+    assert_eq!(fs::read_to_string(workspace.join("project-2/runtime.txt")).unwrap(), "v24.0.0");
     drop(root);
 }
 
@@ -412,7 +465,7 @@ fn recursive_exec_no_sort_makes_reverse_and_resume_no_ops() {
 
     // `--no-sort` disregards ordering entirely, so there is no graph for
     // `--reverse` to turn around or for `--resume-from` to skip the
-    // anchor's dependencies in — both are no-ops, exactly as in pnpm.
+    // anchor's dependencies in; both are no-ops, exactly as in pnpm.
     let order = fs::read_to_string(workspace.join("order.log")).expect("read order log");
     assert_eq!(order, "a-last\nm-middle\nz-first\n");
 
@@ -518,8 +571,8 @@ fn recursive_exec_diff_selector_selects_changed_projects() {
     write_workspace(&workspace, &["project-1", "project-2"]);
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&workspace)
+            .with_args(args)
+            .with_current_dir(&workspace)
             .output()
             .expect("spawn git");
         assert!(
@@ -565,7 +618,7 @@ fn recursive_exec_diff_selector_selects_changed_projects() {
 /// A `--filter` that matches no project is a no-op: recursive exec exits
 /// 0, prints pnpm's empty-selection notice, and writes no summary even
 /// with `--report-summary`, matching pnpm's main-dispatch exit-0 for an
-/// empty selection — rather than erroring on `--resume-from` or emitting
+/// empty selection, rather than erroring on `--resume-from` or emitting
 /// an empty summary.
 #[test]
 fn recursive_exec_filter_no_match_is_a_noop() {
@@ -684,9 +737,9 @@ if (name === 'a-slow-1' || name === 'c-slow-2') {
     let mut run = pacquet
         .with_args(["--workspace-concurrency=3", "--no-sort", "--report-summary", "-r", "exec"])
         .with_args(probe)
-        .env("HOLD_MS", hold_ms.to_string())
-        .stdout(Stdio::null())
-        .stderr(fs::File::create(&stderr_path).expect("create the exec output"))
+        .with_env("HOLD_MS", hold_ms.to_string())
+        .with_stdout(Stdio::null())
+        .with_stderr(fs::File::create(&stderr_path).expect("create the exec output").into())
         .spawn()
         .expect("spawn pacquet");
     let status = wait_for_child(&mut run);
@@ -1219,4 +1272,47 @@ fn recursive_exec_resumes_from_exactly_the_projects_that_passed_before_a_failure
     );
 
     drop(root);
+}
+
+/// Under the default `link-workspace-packages: false`, `app`'s `^1.0.0`
+/// range is not a workspace edge on its own; an override pointing it at
+/// the sibling makes `app...` select `lib` too.
+#[test]
+fn dependency_selector_follows_an_override_to_a_workspace_sibling() {
+    for override_key in ["lib", "app>lib"] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        write_workspace(&workspace, &["app", "lib", "other"]);
+        let app_manifest =
+            json!({ "name": "app", "version": "1.0.0", "dependencies": { "lib": "^1.0.0" } });
+        fs::write(workspace.join("app/package.json"), app_manifest.to_string())
+            .expect("write app/package.json");
+        let workspace_yaml = fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
+            .expect("read pnpm-workspace.yaml");
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            format!("{workspace_yaml}overrides:\n  '{override_key}': 'workspace:*'\n"),
+        )
+        .expect("write pnpm-workspace.yaml");
+
+        pacquet
+            .with_arg("--filter")
+            .with_arg("app...")
+            .with_arg("exec")
+            .with_args(marker_args("ran.txt"))
+            .assert()
+            .success();
+
+        for (name, selected) in [("app", true), ("lib", true), ("other", false)] {
+            assert_eq!(
+                workspace
+                    .join(name)
+                    .join("ran.txt")
+                    .exists(),
+                selected,
+                "{name} selected with override key {override_key}",
+            );
+        }
+
+        drop(root);
+    }
 }

@@ -1,14 +1,6 @@
 use super::update_stale_hoist_symlink;
 
 #[test]
-fn distinguishes_non_links_from_ownership_read_failures() {
-    assert!(super::is_non_link_read_error(&std::io::Error::from(std::io::ErrorKind::InvalidInput)));
-    assert!(!super::is_non_link_read_error(&std::io::Error::from(
-        std::io::ErrorKind::PermissionDenied,
-    )));
-}
-
-#[test]
 fn concurrent_hoists_replace_the_same_stale_dependency_link() {
     let root = tempfile::tempdir().unwrap();
     let store = root.path().join("store");
@@ -115,7 +107,7 @@ fn waits_out_a_junction_another_hoist_is_creating() {
     let in_creation = link.clone();
     let mut seen = 0;
     let result = pnpm_fs::test_support::with_retry_observer(
-        &link,
+        link.clone(),
         move |attempt| {
             seen += 1;
             sender

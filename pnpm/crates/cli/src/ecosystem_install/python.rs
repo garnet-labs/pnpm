@@ -1,22 +1,35 @@
 //! Which Python projects an install acts on.
 
-use super::{EcosystemManifest, EcosystemWorkspaceInventory};
+use super::{
+    EcosystemManifest,
+    EcosystemWorkspaceInventory,
+};
 use crate::cli_args::{
     pipelines::WorkspaceScope,
-    recursive::{filter_against, recursive_filter_options},
+    recursive::{
+        filter_graphs,
+        parse_configured_selectors,
+        recursive_filter_options,
+    },
 };
 use miette::Result;
 use pnpm_config::Config;
 use pnpm_python_installer::Discovery;
 use std::{
-    collections::{BTreeSet, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeSet,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Every Python project in the workspace, read once for both the selection
 /// and the install.
 pub(crate) async fn discover(
-    config: &'static Config,
+    config: &Config,
     inventory: &EcosystemWorkspaceInventory,
 ) -> Result<Discovery> {
     let manifests = workspace_manifests(inventory).await?;
@@ -28,14 +41,26 @@ pub(crate) async fn discover(
 /// workspace around it for the members it may take from the repository
 /// and the environment it may share.
 pub(crate) async fn discover_around(
-    config: &'static Config,
+    config: &Config,
     inventory: &EcosystemWorkspaceInventory,
     project: &Path,
 ) -> Result<Discovery> {
+    discover_around_projects(config, inventory, &[project.to_path_buf()]).await
+}
+
+/// [`discover_around`] for a batch of target directories sharing one
+/// workspace inventory.
+pub(crate) async fn discover_around_projects(
+    config: &Config,
+    inventory: &EcosystemWorkspaceInventory,
+    projects: &[PathBuf],
+) -> Result<Discovery> {
     let mut manifests = workspace_manifests(inventory).await?;
-    let manifest = project.join("pyproject.toml");
-    if !manifests.contains(&manifest) {
-        manifests.push(manifest);
+    for project in projects {
+        let manifest = project.join("pyproject.toml");
+        if !manifests.contains(&manifest) {
+            manifests.push(manifest);
+        }
     }
     pnpm_python_installer::discover(config, inventory.workspace_root(), &manifests).await
 }
@@ -102,28 +127,8 @@ fn matching_projects(
             .collect());
     }
     let options = recursive_filter_options(config, prefix);
-    // The generated selector follows the pass a `--filter-prod` selector
-    // routes the run through, as it does for npm.
-    let prod = !config.filter_prod.is_empty();
-    let mut selected: HashSet<PathBuf> = filter_against(
-        &discovery.graph(),
-        &config.filter,
-        root_selector.filter(|_| !prod),
-        false,
-        prefix,
-        &options,
-    )?
-    .into_iter()
-    .collect();
-    if prod {
-        selected.extend(filter_against(
-            &discovery.production_graph(),
-            &config.filter_prod,
-            root_selector.filter(|_| prod),
-            true,
-            prefix,
-            &options,
-        )?);
-    }
-    Ok(selected)
+    let selectors = parse_configured_selectors(config, root_selector, prefix);
+    let prod_graph = (!config.filter_prod.is_empty()).then(|| discovery.production_graph());
+    let filtered = filter_graphs(&discovery.graph(), prod_graph.as_ref(), &selectors, &options)?;
+    Ok(filtered.selected_projects.into_iter().collect())
 }

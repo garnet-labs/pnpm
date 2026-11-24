@@ -4,19 +4,30 @@
 //! A publish computes its packument from the one the store held when it was
 //! staged, and commits it only while the store still holds that one. On a
 //! single replica the package lock makes that hold. Replicas sharing one
-//! metadata database can still race: the publish that commits second finds
+//! database can still race: the publish that commits second finds
 //! another generation and is refused. Rather than answer `409` to a publish
 //! whose bytes are already in place, the commit takes what the publish
 //! changed and applies it to the packument the store now holds, as if the two
 //! publishes had run one after the other.
 
-use super::{RegistryError, StagedPublish};
+use super::{
+    RegistryError,
+    StagedPublish,
+};
 use crate::server::AppState;
 use pnpr_package_name::CanonicalPackageName;
-use pnpr_storage::metadata::{
-    ArtifactMember, BatchDocument, PublicationCommit, PublicationRequest, PublishNotes,
+use pnpr_storage::database::{
+    ArtifactMember,
+    BatchDocument,
+    BlobFence,
+    PublicationCommit,
+    PublicationRequest,
+    PublishNotes,
 };
-use serde_json::{Map, Value};
+use serde_json::{
+    Map,
+    Value,
+};
 
 /// How many times a publish that lost the race for its packages to another
 /// replica is rebased onto what that replica committed and tried again.
@@ -24,12 +35,14 @@ const REBASE_ATTEMPTS: usize = 4;
 
 /// The packument each staged npm publish was computed from, taken out of
 /// `staged`, for a commit that loses the race to rebase off. `None` unless
-/// every document is an npm packument, the one format a rebase understands;
+/// every document is an npm packument without a client revision precondition;
 /// a lost race of any other answers the conflict.
 pub(super) fn rebase_bases(staged: &mut [StagedPublish]) -> Option<Vec<Option<Value>>> {
     if staged
         .iter()
-        .any(|stage| stage.ecosystem != pnpr_registry::Ecosystem::Npm)
+        .any(|stage| {
+            stage.ecosystem != pnpr_registry::Ecosystem::Npm || stage.base.revision_checked
+        })
     {
         return None;
     }
@@ -53,11 +66,11 @@ enum Rebase {
 /// expect that packument's generation.
 async fn rebase_documents(
     state: &AppState,
-    catalog: &str,
+    namespace: &str,
     documents: &mut [BatchDocument],
     rebases: (&[Option<Value>], &[Value]),
 ) -> Result<Rebase, RegistryError> {
-    let storage = state.inner.storage.for_hosted(catalog, pnpr_registry::Ecosystem::Npm);
+    let storage = state.inner.storage.for_hosted(namespace, pnpr_registry::Ecosystem::Npm);
     for ((document, base), ours) in documents
         .iter_mut()
         .zip(rebases.0)
@@ -78,8 +91,16 @@ async fn rebase_documents(
             // left a tombstone the publish was never checked against.
             (None, Some(_)) => return Ok(Rebase::Conflict),
             (None, None) => {
+                let tombstone = storage
+                    .read_tombstone(&name)
+                    .await?
+                    .map(|tombstone| {
+                        pnpr_storage::HostedDocumentVersion::Tombstone(tombstone.maintainers)
+                    });
+                if tombstone != document.expected {
+                    return Ok(Rebase::Conflict);
+                }
                 document.bytes = serde_json::to_vec(ours)?;
-                document.expected = None;
             }
         }
     }
@@ -87,11 +108,13 @@ async fn rebase_documents(
 }
 
 /// What a publish commits beside its documents.
-pub(super) struct Publication<'catalog> {
-    pub(super) catalog: &'catalog str,
+pub(super) struct Publication<'namespace> {
+    pub(super) namespace: &'namespace str,
     pub(super) artifacts: Vec<ArtifactMember>,
     pub(super) notes: PublishNotes,
     pub(super) request: Option<PublicationRequest>,
+    /// The files the commit maps, and the blobs it depends on.
+    pub(super) fence: BlobFence,
 }
 
 /// Commit `documents`, and when another replica committed one of their
@@ -103,18 +126,19 @@ pub(super) async fn commit_rebasing(
     mut documents: Vec<BatchDocument>,
     bases: Option<Vec<Option<Value>>>,
 ) -> Result<PublicationCommit, RegistryError> {
-    let Publication { catalog, artifacts, notes, request } = publication;
-    let database = state.inner.storage.sql_metadata();
+    let namespace = publication.namespace;
+    let database = state.inner.storage.sql_database();
     // What the publish computed, parsed only once a race calls for it.
     let mut ours: Option<Vec<Value>> = None;
     let mut attempts = 0;
     loop {
-        let commit = database.commit_publication(
-            catalog,
+        let commit = database.commit_fenced_publication(
+            namespace,
             documents.clone(),
-            artifacts.clone(),
-            notes.clone(),
-            request.clone(),
+            publication.artifacts.clone(),
+            publication.notes.clone(),
+            publication.request.clone(),
+            publication.fence.clone(),
         );
         let conflict = match (commit.await, &bases) {
             (Err(conflict @ RegistryError::DocumentWriteConflict { .. }), Some(bases))
@@ -134,7 +158,7 @@ pub(super) async fn commit_rebasing(
                     .collect::<Result<_, _>>()?,
             ),
         };
-        match rebase_documents(state, catalog, &mut documents, (conflict.1, ours)).await? {
+        match rebase_documents(state, namespace, &mut documents, (conflict.1, ours)).await? {
             Rebase::Applied => {}
             Rebase::Conflict => return Err(conflict.0),
         }

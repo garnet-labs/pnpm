@@ -1,11 +1,26 @@
 use super::{
-    Config, Deserialize, EngineComponent, RetryOpts, SelfUpdateError, Signature, ThrottledClient,
-    VerifyingKey, classify_signature_failures, encode_package_name, redact_and_sanitize,
+    Config,
+    Deserialize,
+    EngineComponent,
+    RetryOpts,
+    SelfUpdateError,
+    Signature,
+    ThrottledClient,
+    VerifyingKey,
+    classify_signature_failures,
+    encode_package_name,
+    redact_and_sanitize,
     send_with_retry,
 };
 use base64::Engine as _;
-use p256::{ecdsa::signature::Verifier, pkcs8::DecodePublicKey};
-use pnpm_network::normalize_registry_url;
+use p256::{
+    ecdsa::signature::Verifier,
+    pkcs8::DecodePublicKey,
+};
+use pnpm_network::{
+    normalize_registry_url,
+    read_limited_self_delimiting_body,
+};
 
 /// npm's public registry signing keys, generated from
 /// `.config/npm-signing-keys.json` by the meta-updater. `expires` is `None`
@@ -44,7 +59,7 @@ pub(super) enum FailureCategory {
     Unreachable,
     /// The lockfile integrity is not a sha512 hash (e.g. a sha1 pin from a
     /// registry that publishes only `shasum`), so no npm registry signature
-    /// can ever validate over it — verification is impossible by
+    /// can ever validate over it, verification is impossible by
     /// construction, not evidence of tampering.
     Uncovered,
 }
@@ -62,7 +77,7 @@ impl SignatureFailure {
     }
 
     /// Whether the engine may run despite this failure: no signature was
-    /// obtainable (nothing suspicious was observed — as opposed to a
+    /// obtainable (nothing suspicious was observed, as opposed to a
     /// signature that exists but does not validate, or the canonical
     /// registry answering that no signed release exists), and the component
     /// resolves through a registry the user configured themselves.
@@ -73,7 +88,7 @@ impl SignatureFailure {
 }
 
 /// Per-component verification. Returns `None` when a registry signature
-/// validates over the lockfile bytes — from the component's own registry,
+/// validates over the lockfile bytes, from the component's own registry,
 /// or from `fallback_registry` when its own registry cannot provide a
 /// verifiable one. `fallback_registry` is [`CANONICAL_NPM_REGISTRY`] in
 /// production and a mock registry in unit tests. The fallback is attempted
@@ -203,15 +218,17 @@ fn parse_signatures(raw: Option<&serde_json::Value>) -> Option<Vec<PackageSignat
         None => Some(Vec::new()),
         Some(serde_json::Value::Array(elements)) => elements
             .iter()
-            .map(|element| serde_json::from_value::<PackageSignature>(element.clone()).ok())
+            .cloned()
+            .map(serde_json::from_value::<PackageSignature>)
+            .map(Result::ok)
             .collect(),
         Some(_) => None,
     }
 }
 
 /// Whether two registry URLs address the same registry. URL-equivalent
-/// forms must compare equal — hosts are case-insensitive and default ports
-/// are implied — or a canonical registry written as e.g.
+/// forms must compare equal (hosts are case-insensitive and default ports
+/// are implied) or a canonical registry written as e.g.
 /// `https://Registry.NPMJS.org:443/` would be misclassified as a different,
 /// non-canonical one, weakening fail-closed decisions keyed on whether the
 /// registry is the canonical one. Inline `user:pass@` credentials are auth
@@ -228,7 +245,7 @@ fn canonical_registry_url(registry: &str) -> String {
 }
 
 /// `true` as soon as one signature validates against a trusted, unexpired
-/// key over `name@version:integrity` — the trusted [`NPM_SIGNING_KEYS`] in
+/// key over `name@version:integrity`, the trusted [`NPM_SIGNING_KEYS`] in
 /// production, a test key in unit tests.
 pub(super) fn signature_validates_against(
     component: &EngineComponent,
@@ -280,7 +297,7 @@ pub(super) fn verify_one(public_key_base64: &str, message: &str, signature_base6
 }
 
 fn parse_timestamp(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value).ok().map(|datetime| datetime.timestamp_millis())
+    pnpm_time::parse_rfc3339_millis(value).ok()
 }
 
 #[derive(Deserialize)]
@@ -309,7 +326,7 @@ struct Packument {
     versions: std::collections::HashMap<String, PackumentVersion>,
 }
 
-/// Fetch a component's packument from `registry` — its own (trusted)
+/// Fetch a component's packument from `registry`; its own (trusted)
 /// registry, or the canonical fallback. `Ok(None)` for a 404 (package
 /// absent); `Err` for any other failure (treated as `unreachable` by the
 /// caller).
@@ -362,29 +379,23 @@ async fn read_bounded_body(
     display_url: &str,
 ) -> Result<Vec<u8>, String> {
     if let Some(length) = response.content_length()
-        && length > MAX_PACKUMENT_BYTES
+        && length > MAX_PACKUMENT_BYTES as u64
     {
         return Err(format!("{display_url} returned an oversized packument ({length} bytes)"));
     }
-    use futures_util::StreamExt as _;
-    let mut stream = response.bytes_stream();
-    let mut body_bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| {
-            format!("{display_url}: {}", redact_and_sanitize(&source.to_string()))
-        })?;
-        if (body_bytes.len() + chunk.len()) as u64 > MAX_PACKUMENT_BYTES {
-            return Err(format!("{display_url} returned an oversized packument"));
-        }
-        body_bytes.extend_from_slice(&chunk);
+    let body = read_limited_self_delimiting_body(response, MAX_PACKUMENT_BYTES)
+        .await
+        .map_err(|source| format!("{display_url}: {}", redact_and_sanitize(&source.to_string())))?;
+    if body.truncated {
+        return Err(format!("{display_url} returned an oversized packument"));
     }
-    Ok(body_bytes)
+    Ok(body.bytes)
 }
 
 /// Upper bound on a buffered packument response. Generous relative to the
 /// pnpm / `@pnpm/exe` packuments (well under a megabyte) while still
 /// capping a runaway response.
-const MAX_PACKUMENT_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_PACKUMENT_BYTES: usize = 50 * 1024 * 1024;
 
 /// Route a (possibly scoped) engine component to its registry, using the
 /// trusted package-manager bootstrap configuration.

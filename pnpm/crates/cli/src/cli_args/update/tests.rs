@@ -1,4 +1,7 @@
-use super::{UpdateArgs, UpdateDependencyOptions};
+use super::{
+    UpdateArgs,
+    UpdateDependencyOptions,
+};
 use clap::Parser;
 use pnpm_config::Config;
 use pnpm_package_manifest::DependencyGroup;
@@ -16,7 +19,14 @@ fn update_args(args: &[&str]) -> UpdateArgs {
 }
 
 fn options(prod: bool, dev: bool, optional: bool, no_optional: bool) -> UpdateDependencyOptions {
-    UpdateDependencyOptions { prod, dev, optional, no_optional, peer: false }
+    UpdateDependencyOptions {
+        prod,
+        dev,
+        optional,
+        no_optional,
+        peer: false,
+        ecosystem_requests_validated: false,
+    }
 }
 
 #[test]
@@ -137,6 +147,11 @@ fn workspace_option_is_checked_before_anything_is_read() {
         .check_workspace_option(Some(workspace_root))
         .expect_err("--workspace with --latest");
     assert_eq!(with_latest.to_string(), "Cannot use --latest with --workspace simultaneously");
+
+    let with_tag = update_args(&["--workspace", "--tag", "next"])
+        .check_workspace_option(Some(workspace_root))
+        .expect_err("--workspace with --tag");
+    assert_eq!(with_tag.to_string(), "Cannot use --tag with --workspace simultaneously");
 }
 
 #[test]
@@ -184,6 +199,7 @@ fn patches_is_a_selectorless_update_mode() {
     for args in [
         &["--patches", "foo"][..],
         &["--patches", "--latest"][..],
+        &["--patches", "--tag", "next"][..],
         &["--patches", "--interactive"][..],
         &["--patches", "--global"][..],
     ] {
@@ -191,9 +207,22 @@ fn patches_is_a_selectorless_update_mode() {
             update_args(args).check_patches_options().expect_err("--patches combination must fail");
         assert_eq!(
             error.to_string(),
-            "--patches cannot be combined with package selectors, --latest, --interactive, or --global",
+            "--patches cannot be combined with package selectors, --latest, --tag, --interactive, or --global",
         );
     }
+}
+
+#[test]
+fn tag_conflicts_with_latest() {
+    let result = UpdateArgsHarness::try_parse_from(["pacquet-test", "--latest", "--tag", "next"]);
+    assert!(result.is_err(), "--latest and --tag must conflict");
+}
+
+#[test]
+fn tag_parses_as_the_target_dist_tag() {
+    let args = update_args(&["--tag", "next"]);
+    assert_eq!(args.selection.tag.as_deref(), Some("next"));
+    assert!(!args.selection.latest);
 }
 
 #[test]
@@ -215,4 +244,22 @@ fn constrained_patch_refresh_stays_on_the_client() {
         !update_args(&["--patches", "--no-optional"])
             .can_delegate_patch_refresh(false, &all_groups),
     );
+}
+
+#[test]
+fn long_requests_details_only_when_enabled() {
+    for (flags, expected) in
+        [(vec!["--interactive"], false), (vec!["--interactive", "--long"], true)]
+    {
+        let args = update_args(&flags);
+        let options = args.interactive_options(&[], false, &[]);
+        assert_eq!(options.details.shows_urls(), expected);
+    }
+}
+
+#[test]
+fn long_rejects_global_package_group_selection() {
+    let error = UpdateArgsHarness::try_parse_from(["pnpm", "--global", "--interactive", "--long"])
+        .expect_err("global selection has no package URL column");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
 }

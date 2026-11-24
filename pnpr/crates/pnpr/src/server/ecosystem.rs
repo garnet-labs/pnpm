@@ -9,20 +9,46 @@
 //! The documents themselves live in [`super::documents`].
 
 use super::{
-    Action, AppState, MAX_TARBALL_BYTES, RegistrySource, authorize, authorized_upstream,
-    cached_upstream_tarball, default_registry_target, hosted_read_namespace, not_found,
-    private_no_cache, resolves_to_private_source, tarball_response, tarball_stream_error,
+    Action,
+    AppState,
+    RegistrySource,
+    authorize,
+    authorized_upstream,
+    cached_upstream_tarball,
+    default_registry_target,
+    hosted_read_namespace,
+    not_found,
+    private_no_cache,
+    resolves_to_private_source,
+    tarball_response,
+    tarball_stream_error,
     upstream_cache_namespace,
 };
-use axum::response::{IntoResponse, Response};
+use axum::response::{
+    IntoResponse,
+    Response,
+};
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_policy::Identity;
-use pnpr_registry::{Ecosystem, Registry};
+use pnpr_registry::{
+    Ecosystem,
+    Registry,
+};
 use pnpr_storage::streaming;
-use pnpr_upstream::{FetchOutcome, FetchedDocument, Upstream};
-use sha2::{Digest, Sha256};
-use ssri::{Algorithm, Integrity};
+use pnpr_upstream::{
+    FetchOutcome,
+    FetchedDocument,
+    Upstream,
+};
+use sha2::{
+    Digest,
+    Sha256,
+};
+use ssri::{
+    Algorithm,
+    Integrity,
+};
 use std::sync::Arc;
 
 /// The registry a request addressed: the `~<name>` it named, else the
@@ -33,9 +59,11 @@ pub(super) fn addressed_registry(
     ecosystem: Ecosystem,
 ) -> Option<String> {
     match registry {
-        Some(name) => {
-            state.inner.config.routing.registries.addressed(name, ecosystem).map(str::to_string)
-        }
+        Some(name) => state
+            .routing()
+            .registries
+            .addressed(name, ecosystem)
+            .map(str::to_string),
         None => default_registry_target(state, ecosystem),
     }
 }
@@ -43,7 +71,7 @@ pub(super) fn addressed_registry(
 /// The two addresses a surface answers on: the default target, and one named
 /// registry.
 ///
-/// Route templates rather than URLs — `{registry}` is a path parameter the
+/// Route templates rather than URLs, `{registry}` is a path parameter the
 /// [`TargetRegistry`](super::TargetRegistry) extractor reads back.
 pub(super) fn mount_bases(ecosystem: Ecosystem) -> [String; 2] {
     let prefix = ecosystem.base_path();
@@ -67,12 +95,12 @@ pub(super) fn registry_endpoint(
 }
 
 /// The cache headers a response needs so a shared HTTP cache can never replay
-/// an authenticated response to an anonymous caller. A named registry's
-/// responses are always caller-scoped. The default target's are scoped only
-/// when `package` resolves to a source whose effective per-package access
-/// denies anonymous callers, so a URL that answers differently depending on
-/// `Authorization` says so. A publicly-readable resolution stays cacheable:
-/// the path-less base is the hot install path.
+/// an authenticated response to an anonymous caller. A response is scoped
+/// when `package` resolves, through the addressed registry, to a source whose
+/// grants do not let anonymous callers read it, so a URL that
+/// answers differently depending on `Authorization` says so. A
+/// publicly-readable resolution stays cacheable on both the path-less base
+/// (the hot install path) and a named one.
 pub(super) fn caller_scoped(
     state: &AppState,
     ecosystem: Ecosystem,
@@ -80,39 +108,46 @@ pub(super) fn caller_scoped(
     package: Option<&str>,
     response: Response,
 ) -> Response {
-    if registry.is_some() {
-        return private_no_cache(response);
-    }
-    match (default_registry_target(state, ecosystem), package) {
+    let target = registry.map(str::to_string).or_else(|| default_registry_target(state, ecosystem));
+    match (target, package) {
         (Some(target), Some(package))
             if resolves_to_private_source(state, &target, ecosystem, package) =>
         {
             private_no_cache(response)
+        }
+        _ if ecosystem == Ecosystem::Npm
+            && state.inner.config.http.cloudflare_cdn.is_some() =>
+        {
+            super::cdn::public_tarball_response(response)
         }
         _ => response,
     }
 }
 
 /// Whether some read of `ecosystem` through `registry` is closed to anonymous
-/// callers: a hosted source whose default or package rules deny them, or an
-/// upstream source with an `access:` gate. Drives the Cargo `auth-required`
+/// callers: a source that no grant lets them read in full, or an upstream
+/// source that sends a credential or that they may not have fetched. Drives the Cargo `auth-required`
 /// flag, which makes `cargo` send its token on index and download requests too.
 pub(super) fn registry_requires_auth(
     state: &AppState,
     registry: &str,
     ecosystem: Ecosystem,
 ) -> bool {
-    let config = &state.inner.config;
-    config.routing.registries
+    let routing = state.routing();
+    routing.registries
         .sources(registry, ecosystem)
         .into_iter()
-        .any(|source| match config.routing.registries.get(source) {
-            Some(Registry::Hosted { .. }) => config.routing.hosted
+        .any(|source| match routing.registries.get(source) {
+            Some(Registry::Hosted { .. }) => routing.hosted
                 .get(source)
                 .is_some_and(|hosted| !hosted.rules.all_access_admit(&Identity::Anonymous)),
-            Some(Registry::Upstream { .. }) => config.routing.upstreams
+            Some(Registry::Upstream { .. }) => routing.upstreams
                 .get(source)
-                .is_some_and(|upstream| upstream.access.is_some()),
+                .is_some_and(|upstream| {
+                    !upstream.public
+                        || !upstream.rules.all_access_admit(&Identity::Anonymous)
+                        || !upstream.rules.any_admits(Action::Cache, &Identity::Anonymous)
+                }),
             Some(Registry::Router { .. }) | None => false,
         })
 }
@@ -123,7 +158,8 @@ pub(super) fn hosted_sources(
     registry: &str,
     ecosystem: Ecosystem,
 ) -> Vec<String> {
-    let registries = &state.inner.config.routing.registries;
+    let routing = state.routing();
+    let registries = &routing.registries;
     registries
         .sources(registry, ecosystem)
         .into_iter()
@@ -138,7 +174,8 @@ pub(super) fn upstream_sources(
     registry: &str,
     ecosystem: Ecosystem,
 ) -> Vec<String> {
-    let registries = &state.inner.config.routing.registries;
+    let routing = state.routing();
+    let registries = &routing.registries;
     registries
         .sources(registry, ecosystem)
         .into_iter()
@@ -156,9 +193,9 @@ pub(super) async fn serve_hosted_blob(
     key: &CanonicalPackageName,
     filename: &str,
 ) -> Result<Response, RegistryError> {
-    let org = hosted_read_namespace(state, identity, source, key.as_str())?;
+    let namespace = hosted_read_namespace(state, identity, source, key.as_str())?;
     let blob = state.inner.storage
-        .for_hosted(&org, key.ecosystem())
+        .for_hosted(&namespace, key.ecosystem())
         .open_hosted_blob(key, filename)
         .await?;
     Ok(match blob {
@@ -169,16 +206,16 @@ pub(super) async fn serve_hosted_blob(
 
 /// The upstream behind `source`, authorized for `identity` to read `key`,
 /// with its cache namespace.
-pub(super) fn upstream_for<'state>(
-    state: &'state AppState,
+pub(super) fn upstream_for(
+    state: &AppState,
     identity: &Identity,
     source: &RegistrySource,
     key: &CanonicalPackageName,
-) -> Result<(&'state Upstream, String), RegistryError> {
+) -> Result<(Upstream, String), RegistryError> {
     let RegistrySource::Upstream(name) = source else {
         return Err(RegistryError::NotFound);
     };
-    authorize(state, identity, source, key.as_str(), Action::Access)?;
+    authorize(state, identity, source, key.as_str(), Action::Read)?;
     let upstream = authorized_upstream(state, identity, name)?;
     Ok((upstream, upstream_cache_namespace(state, name)))
 }
@@ -194,7 +231,7 @@ pub(super) struct UpstreamDocument<'request> {
 }
 
 /// A fresh cached copy of an upstream document, else the document fetched
-/// and cached — `encode` turns the fetched response into the cached bytes,
+/// and cached, `encode` turns the fetched response into the cached bytes,
 /// so a surface can keep the response URL beside the body. A definitive
 /// upstream 404 purges the cache entry. On an upstream failure a stale
 /// cached copy is served instead, so a transient outage does not break
@@ -207,7 +244,7 @@ pub(super) async fn load_upstream_document(
     encode: impl FnOnce(FetchedDocument) -> Result<Vec<u8>, RegistryError>,
 ) -> Result<Option<Vec<u8>>, RegistryError> {
     let storage = &state.inner.storage;
-    let ttl = upstream.maxage().unwrap_or(state.inner.config.http.packument_ttl);
+    let ttl = upstream.packument_ttl().unwrap_or(state.inner.config.http.packument_ttl);
     if let Some(bytes) = storage.read_upstream_document(namespace, request.name, ttl).await? {
         return Ok(Some(bytes));
     }
@@ -238,6 +275,34 @@ pub(super) async fn load_upstream_document(
     }
 }
 
+/// Sub-caches nested inside an upstream's cache namespace directory so
+/// [`crate::cache_maintenance::active_cache_namespaces`] and orphan pruning
+/// retain and reclaim the upstream's whole tree under `<cache>/<namespace>/`
+/// without colliding with `<cache>/<namespace>/packages/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamCacheSubtree<'key> {
+    /// Cargo `.crate` and Python wheel or sdist blobs keyed by SRI integrity.
+    Artifact(&'key [u8]),
+    /// Python PEP 658 `.metadata` documents keyed by URL and descriptor.
+    Metadata(&'key [u8]),
+    /// OCI upstream manifests keyed by tag or digest reference.
+    OciManifest(&'key [u8]),
+    /// OCI upstream blobs.
+    OciBlobs,
+}
+
+impl UpstreamCacheSubtree<'_> {
+    #[must_use]
+    pub(crate) fn within(self, namespace: &str) -> String {
+        match self {
+            Self::Artifact(key) => format!("{namespace}/artifacts/{}", sha256_hex(key)),
+            Self::Metadata(key) => format!("{namespace}/metadata/{}", sha256_hex(key)),
+            Self::OciManifest(key) => format!("{namespace}/oci-manifests/{}", sha256_hex(key)),
+            Self::OciBlobs => format!("{namespace}/oci-blobs"),
+        }
+    }
+}
+
 /// Serve an upstream artifact: the cached copy when there is one, else the
 /// bytes streamed from `url` into the cache while verified against
 /// `integrity` (see `streaming::stream_verified_to_cache` for what a
@@ -252,7 +317,8 @@ pub(super) async fn serve_upstream_artifact(
     url: &str,
     integrity: &Integrity,
 ) -> Response {
-    let namespace = format!("{namespace}-{}", sha256_hex(integrity.to_string().as_bytes()));
+    let namespace =
+        UpstreamCacheSubtree::Artifact(integrity.to_string().as_bytes()).within(namespace);
     let namespace = namespace.as_str();
     if upstream.caches()
         && let Some(response) = cached_upstream_tarball(state, namespace, name, filename).await
@@ -268,14 +334,10 @@ pub(super) async fn serve_upstream_artifact(
         Ok(write) => write,
         Err(err) => return err.into_response(),
     };
+    let max_bytes = state.max_tarball_bytes();
     if !upstream.caches() {
-        return match streaming::download_verified_to_temp(
-            response,
-            write,
-            integrity,
-            MAX_TARBALL_BYTES,
-        )
-        .await
+        return match streaming::download_verified_to_temp(response, write, integrity, max_bytes)
+            .await
         {
             Ok((file, len, tmp_path)) => {
                 tarball_response(streaming::stream_file_and_remove(file, tmp_path), Some(len))
@@ -283,7 +345,7 @@ pub(super) async fn serve_upstream_artifact(
             Err(err) => tarball_stream_error(err, name, filename).into_response(),
         };
     }
-    match streaming::stream_verified_to_cache(response, write, integrity, MAX_TARBALL_BYTES) {
+    match streaming::stream_verified_to_cache(response, write, integrity, max_bytes) {
         Ok(body) => tarball_response(body, None),
         Err(err) => tarball_stream_error(err, name, filename).into_response(),
     }
@@ -298,18 +360,27 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The redirect guard of an upstream client: the upstream's own origin, the
+/// well-known artifact hosts of its ecosystem, and the registries the current
+/// graph allows.
 pub(super) fn upstream_fetch_guard(
-    config: &pnpr_config::Config,
+    guard_context: &super::registry_graph::UpstreamGuardContext,
     upstream: &pnpr_config::UpstreamConfig,
 ) -> pnpm_network::RedirectGuard {
-    let context = pnpr_route::RouteContext::from_config(config);
+    let guard_context = Arc::clone(guard_context);
     let base = url::Url::parse(&upstream.url).ok();
     Arc::new(move |url| {
         let Some(base) = &base else { return false };
+        let allows_registry = || {
+            guard_context
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .allows_registry(url.as_str())
+        };
         is_fetchable_artifact_url(url)
             && (url.origin() == base.origin()
                 || pnpr_upstream::oci_download_allowed(base, url)
-                || context.allows_registry(url.as_str())
+                || allows_registry()
                 || (base.as_str() == "https://index.crates.io/"
                     && url.origin().ascii_serialization() == "https://static.crates.io")
                 || (base.origin().ascii_serialization() == "https://pypi.org"

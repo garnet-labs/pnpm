@@ -1,5 +1,14 @@
-use super::{CmdShimBatch, ScriptRuntime, generate_cmd_shim};
-use std::{fs, path::Path, process::Command};
+use super::{
+    CmdShimBatch,
+    ScriptRuntime,
+    generate_cmd_shim,
+};
+use command_extra::CommandExtra;
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -9,7 +18,7 @@ fn cmd_shim_switches_encoding_before_unicode_node_path() {
     let node_path = ["/工具/50% off/node_modules".to_string()];
     let body = generate_cmd_shim(target, shim, None, &node_path, CmdShimBatch::Kept);
     let encoding_switch = body
-        .find("@\"%SystemRoot%\\System32\\chcp.com\" 65001 >NUL\r\n")
+        .find("@\"%SystemRoot%\\System32\\mode.com\" con cp select=65001 >NUL\r\n")
         .expect("Unicode literals must be read using UTF-8");
     let node_path_assignment = body
         .find(r#"@SET "NODE_PATH=\工具\50%% off\node_modules""#)
@@ -17,6 +26,21 @@ fn cmd_shim_switches_encoding_before_unicode_node_path() {
     assert!(encoding_switch < node_path_assignment);
     assert!(body.ends_with("@EXIT /B %_PNPM_EXIT_CODE%\r\n"));
     assert!(!body.replace("\r\n", "").contains('\n'));
+}
+
+/// `chcp.com` clears the visible terminal on Windows, so the shim must switch
+/// the code page through `mode.com`, which leaves the screen alone.
+#[test]
+fn cmd_shim_switches_the_codepage_without_chcp() {
+    let target = Path::new("/proj/pkg/cli");
+    let shim = Path::new("/proj/.bin/cli.cmd");
+    let node_path = ["/工具/node_modules".to_string()];
+    let body = generate_cmd_shim(target, shim, None, &node_path, CmdShimBatch::Kept);
+    assert!(!body.contains("chcp.com"), "the shim must not emit chcp.com");
+    assert!(
+        body.contains(r#"@"%SystemRoot%\System32\mode.com" con cp select=65001 >NUL"#),
+        "the code page must switch through mode.com, body:\n{body}",
+    );
 }
 
 #[test]
@@ -50,13 +74,13 @@ fn cmd_shim_runs_unicode_target_and_preserves_codepage_and_exit_status() {
             );
             fs::write(root.path().join("run.cmd"), driver).unwrap();
             let output = cmd_in_own_console()
-                .args(["/d", "/c", "run.cmd"])
-                .current_dir(root.path())
+                .with_args(["/d", "/c", "run.cmd"])
+                .with_current_dir(root.path())
                 .output()
                 .unwrap();
             eprintln!("CP {codepage}, exit {exit_code}: {output:?}");
             assert_eq!(output.status.code(), Some(exit_code));
-            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             eprintln!("STDOUT:\n{stdout}");
             let mut lines = stdout.lines();
             assert_eq!(
@@ -79,9 +103,9 @@ fn cmd_shim_runs_unicode_target_and_preserves_codepage_and_exit_status() {
                 )
                 .unwrap();
                 let shadowed_output = cmd_in_own_console()
-                    .args(["/d", "/c", "exit-only.cmd"])
-                    .env("ERRORLEVEL", "99")
-                    .current_dir(root.path())
+                    .with_args(["/d", "/c", "exit-only.cmd"])
+                    .with_env("ERRORLEVEL", "99")
+                    .with_current_dir(root.path())
                     .output()
                     .unwrap();
                 eprintln!("inherited ERRORLEVEL override: {shadowed_output:?}");
@@ -99,7 +123,7 @@ fn batchless_cmd_shim_restores_the_codepage_before_the_target() {
     let shim = Path::new("/home/bin/pnpm.cmd");
     let body = generate_cmd_shim(target, shim, None, &[], CmdShimBatch::EndedBeforeTarget);
     let encoding_switch = body
-        .find(r#"@"%SystemRoot%\System32\chcp.com" 65001 >NUL"#)
+        .find(r#"@"%SystemRoot%\System32\mode.com" con cp select=65001 >NUL"#)
         .expect("Unicode literals must be read using UTF-8");
     let last_line = body
         .trim_end_matches("\r\n")
@@ -109,7 +133,7 @@ fn batchless_cmd_shim_restores_the_codepage_before_the_target() {
     assert!(encoding_switch < body.find(last_line).unwrap());
     assert!(
         last_line.ends_with(
-            r#"& (IF NOT "%_PNPM_CODEPAGE%"=="" "%SystemRoot%\System32\chcp.com" %_PNPM_CODEPAGE% >NUL) & "%~dp0\..\工具\pnpm.exe"  %*"#,
+            r#"& (IF NOT "%_PNPM_CODEPAGE%"=="" "%SystemRoot%\System32\mode.com" con cp select=%_PNPM_CODEPAGE: =% >NUL) & "%~dp0\..\工具\pnpm.exe"  %*"#,
         ),
         "last line: {last_line}",
     );
@@ -156,8 +180,8 @@ fn batchless_cmd_shim_runs_unicode_target_and_preserves_codepage_and_exit_status
             );
             fs::write(root.path().join("run.cmd"), driver).unwrap();
             let output = cmd_in_own_console()
-                .args(["/d", "/c", "run.cmd"])
-                .current_dir(root.path())
+                .with_args(["/d", "/c", "run.cmd"])
+                .with_current_dir(root.path())
                 .output()
                 .unwrap();
             eprintln!("CP {codepage}, exit {exit_code}: {output:?}");
@@ -186,11 +210,65 @@ fn batchless_cmd_shim_runs_unicode_target_and_preserves_codepage_and_exit_status
     }
 }
 
+/// The code-page switch must run before the shim sets `NODE_PATH`, or cmd.exe
+/// decodes the Unicode path with the caller's code page and Node.js cannot
+/// resolve the module.
+#[test]
+#[cfg_attr(not(windows), ignore = "requires Windows CMD code pages")]
+fn cmd_shim_resolves_a_module_through_a_unicode_node_path() {
+    let root = tempdir().unwrap();
+    let unicode_dir = root.path().join("工具");
+    let node_modules = unicode_dir.join("node_modules");
+    let package = node_modules.join("工具模块");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("package.json"),
+        "{\"name\":\"工具模块\",\"version\":\"1.0.0\",\"main\":\"index.js\"}\n",
+    )
+    .unwrap();
+    fs::write(package.join("index.js"), "module.exports = 'UNICODE_NODE_PATH_OK'\n").unwrap();
+
+    // The target lives outside the tree that holds `node_modules`, so Node.js
+    // finds the package only through `NODE_PATH`, not by walking up from the
+    // script.
+    let target_dir = root.path().join("app");
+    fs::create_dir(&target_dir).unwrap();
+    let target = target_dir.join("cli.js");
+    fs::write(&target, "process.stdout.write(require('工具模块'))\n").unwrap();
+
+    let shim = root.path().join("shim.cmd");
+    let runtime = ScriptRuntime { prog: Some("node".into()), args: String::new() };
+    let node_path_entry = String::from(node_modules.to_string_lossy());
+    let node_path = [node_path_entry];
+    fs::write(
+        &shim,
+        generate_cmd_shim(&target, &shim, Some(&runtime), &node_path, CmdShimBatch::Kept),
+    )
+    .unwrap();
+
+    let driver = "@echo off\r\n\
+                  @for /f \"tokens=2 delims=:\" %%a in ('chcp') do @set \"original_codepage=%%a\"\r\n\
+                  @chcp 936>nul\r\n\
+                  @call shim.cmd\r\n\
+                  @set \"shim_exit=%errorlevel%\"\r\n\
+                  @chcp %original_codepage%>nul\r\n\
+                  @exit /b %shim_exit%\r\n";
+    fs::write(root.path().join("run.cmd"), driver).unwrap();
+
+    let output = cmd_in_own_console()
+        .with_args(["/d", "/c", "run.cmd"])
+        .with_current_dir(root.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "UNICODE_NODE_PATH_OK");
+}
+
 /// The interpreter itself, not whatever launcher answers to `node` on `PATH`:
 /// a version manager's launcher may dispatch on its own file name.
 fn node_executable() -> std::path::PathBuf {
     let output = Command::new("node")
-        .args(["-p", "process.execPath"])
+        .with_args(["-p", "process.execPath"])
         .output()
         .unwrap();
     String::from_utf8(output.stdout)

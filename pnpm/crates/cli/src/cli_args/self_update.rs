@@ -1,4 +1,4 @@
-//! `pacquet self-update` — update pnpm to the latest version (or a given one).
+//! `pacquet self-update`: update pnpm to the latest version (or a given one).
 //!
 //! The target version is resolved from the trusted package-manager
 //! bootstrap registry. When the project pins pnpm via
@@ -13,28 +13,65 @@ pub(crate) mod install_pnpm;
 pub(super) mod project_pin;
 pub(crate) mod verify_engine;
 
-pub(crate) use externally_managed::{ExternalManager, find_external_manager};
+pub(crate) use externally_managed::{
+    ExternalManager,
+    find_external_manager,
+    homebrew_formula,
+};
 
 mod externally_managed;
 mod global_bin;
 mod pinned_project;
 
-use crate::config_deps::{self, EnginePolicyViolation};
+use crate::{
+    cli_args::shadowing_pnpm::find_shadowing_pnpm_on_path,
+    config_deps::{
+        self,
+        EnginePolicyViolation,
+    },
+};
 use clap::Args;
-use derive_more::{Display, Error};
-use global_bin::{link_into_global_bin, link_into_legacy_home_dir};
-use miette::{Context, Diagnostic};
+use derive_more::{
+    Display,
+    Error,
+};
+use global_bin::{
+    link_into_global_bin,
+    link_into_legacy_home_dir,
+};
+use miette::{
+    Context,
+    Diagnostic,
+};
 use pinned_project::ProjectPin;
-use pnpm_config::{Config, Host, PNPM_VERSION, default_pnpm_home_dir};
+use pnpm_config::{
+    Config,
+    Host,
+    PNPM_VERSION,
+    default_pnpm_home_dir,
+};
 use pnpm_lockfile::EnvLockfile;
 use pnpm_package_manifest::PackageManifest;
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
-use pnpm_resolving_npm_resolver::{MINIMUM_RELEASE_AGE_VIOLATION_CODE, infer_range_spec_style};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
+use pnpm_resolving_npm_resolver::{
+    MINIMUM_RELEASE_AGE_VIOLATION_CODE,
+    infer_range_spec_style,
+};
 use project_pin::{
-    NoUpgradeKind, implicit_latest_no_upgrade_message, registry_latest_ignoring_maturity,
+    NoUpgradeKind,
+    implicit_latest_no_upgrade_message,
+    registry_latest_ignoring_maturity,
 };
 use serde_json::Value;
-use std::{io::IsTerminal, path::Path};
+use std::{
+    io::IsTerminal,
+    path::Path,
+};
 
 /// Errors specific to `self-update`. The codes carry the shared
 /// `ERR_PNPM_` prefix, so a code already starting with `PNPM_` becomes
@@ -131,16 +168,16 @@ pub struct SelfUpdateArgs {
 /// A `minimumReleaseAge` cutoff exists so a freshly published pnpm cannot
 /// reach the machine before anyone has had a chance to notice it is
 /// malicious, and pnpm itself is the most valuable thing on the machine to
-/// compromise — so under strict mode an immature pick is refused. An
+/// compromise, so under strict mode an immature pick is refused. An
 /// interactive run may still confirm it: naming a version on the command line
 /// is a deliberate act by the person at the keyboard, unlike a dependency
 /// drifting onto a new release. CI and other non-interactive runs always fail
-/// closed — a CI runner that allocates a pseudo-TTY has no one at the keyboard
-/// either. The cutoff never comes from the project — see
-/// [`WorkspaceSettings::clear_self_update_policy`] — so the only policy to
+/// closed, a CI runner that allocates a pseudo-TTY has no one at the keyboard
+/// either. The cutoff never comes from the project; see
+/// [`WorkspaceSettings::clear_self_update_policy`], so the only policy to
 /// confirm here is the user's own.
 ///
-/// A `trustPolicy` violation is not negotiable — it means the release's trust
+/// A `trustPolicy` violation is not negotiable; it means the release's trust
 /// evidence weakened relative to the installed version.
 ///
 /// [`WorkspaceSettings::clear_self_update_policy`]: pnpm_config::WorkspaceSettings::clear_self_update_policy
@@ -199,7 +236,7 @@ async fn handler<Reporter: self::Reporter + 'static>(
     external_manager: Option<ExternalManager>,
 ) -> miette::Result<Option<String>> {
     let prefix = dir.to_string_lossy().into_owned();
-    info::<Reporter>(&prefix, "Checking for updates...");
+    info::<Reporter>(prefix.clone(), "Checking for updates...".to_owned());
 
     // `self-update` (no args) defaults to the `latest` dist-tag but
     // refuses to downgrade; `self-update latest` (explicit) bypasses the
@@ -212,7 +249,7 @@ async fn handler<Reporter: self::Reporter + 'static>(
     let target_version = Box::pin(resolve_target_version(config, bare_specifier)).await?;
 
     if let Some(hint) = pin.crossed_major_hint(&target_version) {
-        warn::<Reporter>(&prefix, hint);
+        warn::<Reporter>(prefix.clone(), hint.to_owned());
     }
 
     if let Some(refusal) = Box::pin(pin.refusal(config, &target_version, is_implicit_latest)).await?
@@ -311,7 +348,7 @@ async fn verify_target_engine<Reporter: self::Reporter + 'static>(
     if let Some(warning) =
         Box::pin(verify_engine::verify_engine_identity(&env, &engine, config)).await?
     {
-        warn::<Reporter>(prefix, &warning);
+        warn::<Reporter>(prefix.to_owned(), warning);
     }
     Ok(())
 }
@@ -395,42 +432,15 @@ pub(super) fn version_lt(left: &str, right: &str) -> bool {
     }
 }
 
-fn range_satisfies(range: &str, version: &str) -> bool {
-    let (Ok(range), Ok(parsed)) =
-        (node_semver::Range::parse(range), node_semver::Version::parse(version))
-    else {
-        return false;
-    };
-    if range.satisfies(&parsed) {
-        return true;
-    }
-    // node-semver rejects a prerelease (`1.2.3-beta.1`) even when its base
-    // version is in range; retry with the base so prerelease self-update
-    // targets aren't spuriously treated as out of range.
-    if parsed.pre_release.is_empty() {
-        return false;
-    }
-    let base = format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch);
-    matches!(node_semver::Version::parse(&base), Ok(base) if range.satisfies(&base))
-}
-
 #[cfg(test)]
 mod tests;
 
-fn info<Reporter: self::Reporter>(prefix: &str, message: &str) {
-    Reporter::emit(&LogEvent::Pnpm(PnpmLog {
-        level: LogLevel::Info,
-        message: message.to_string(),
-        prefix: prefix.to_string(),
-    }));
+fn info<Reporter: self::Reporter>(prefix: String, message: String) {
+    Reporter::emit(&LogEvent::Pnpm(PnpmLog { level: LogLevel::Info, message, prefix }));
 }
 
-fn warn<Reporter: self::Reporter>(prefix: &str, message: &str) {
-    Reporter::emit(&LogEvent::Pnpm(PnpmLog {
-        level: LogLevel::Warn,
-        message: message.to_string(),
-        prefix: prefix.to_string(),
-    }));
+fn warn<Reporter: self::Reporter>(prefix: String, message: String) {
+    Reporter::emit(&LogEvent::Pnpm(PnpmLog { level: LogLevel::Warn, message, prefix }));
 }
 
 async fn switch_global_pnpm<Reporter: self::Reporter + 'static>(
@@ -440,8 +450,8 @@ async fn switch_global_pnpm<Reporter: self::Reporter + 'static>(
     bare_specifier: &str,
 ) -> miette::Result<Option<String>> {
     info::<Reporter>(
-        prefix,
-        &format!("Switching pnpm from v{PNPM_VERSION} to v{target_version}..."),
+        prefix.to_owned(),
+        format!("Switching pnpm from v{PNPM_VERSION} to v{target_version}..."),
     );
 
     verify_target_engine::<Reporter>(config, target_version, prefix).await?;
@@ -458,8 +468,9 @@ async fn switch_global_pnpm<Reporter: self::Reporter + 'static>(
         && let Some(pnpm_home_dir) = default_pnpm_home_dir::<Host>()
         && link_into_legacy_home_dir(&pnpm_home_dir, &result)?
     {
-        warn::<Reporter>(prefix, global_bin::LEGACY_HOME_DIR_WARNING);
+        warn::<Reporter>(prefix.to_owned(), global_bin::LEGACY_HOME_DIR_WARNING.to_owned());
     }
+    warn_if_shadowed::<Reporter>(config.global_bin.as_deref(), prefix);
 
     if result.already_existed {
         return Ok(Some(format!(
@@ -468,4 +479,12 @@ async fn switch_global_pnpm<Reporter: self::Reporter + 'static>(
         )));
     }
     Ok(Some(format!("Successfully updated pnpm to v{target_version}")))
+}
+
+fn warn_if_shadowed<Reporter: self::Reporter>(global_bin: Option<&Path>, prefix: &str) {
+    if let Some(global_bin) = global_bin
+        && let Some(shadowing) = find_shadowing_pnpm_on_path(global_bin)
+    {
+        shadowing.emit_warning::<Reporter>(global_bin, prefix.to_owned());
+    }
 }

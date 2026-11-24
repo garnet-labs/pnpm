@@ -1,23 +1,44 @@
 use super::{
-    CreateVirtualStoreError, SnapshotWithCacheKey,
-    cache_keys::{SlotReuse, dir_clone_cacheable},
-    cas_paths_key, partition, removed_aliases_for,
+    CreateVirtualStoreError,
+    SnapshotWithCacheKey,
+    cache_keys::{
+        SlotReuse,
+        dir_clone_cacheable,
+    },
+    cas_paths_key,
+    partition,
+    removed_aliases_for,
     slot_linking::{
-        LinkSlotsParallel, SlotLink, emit_warm_snapshot_progress, link_slots_parallel,
+        LinkSlotsParallel,
+        SlotLink,
+        emit_warm_snapshot_progress,
+        link_slots_parallel,
         warm_progress_already_reported,
     },
 };
-use crate::{CasPathsByPkgId, InstallPackageBySnapshotError};
-use pnpm_git_fetcher::{GitFetcherError, resolve_package_build_permission};
-use pnpm_lockfile::{LockfileResolution, PackageKey, PackageMetadata, PkgName};
+use crate::{
+    CasPathsByPkgId,
+    InstallPackageBySnapshotError,
+};
+use pnpm_git_fetcher::{
+    GitFetcherError,
+    resolve_package_build_permission,
+};
+use pnpm_lockfile::{
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+};
 use pnpm_package_manifest::read_package_json_from_cas_paths;
 use pnpm_reporter::Reporter;
-use pnpm_store_dir::git_hosted_store_index_key;
 use pnpm_tarball::PrefetchResult;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
-    path::Path,
+    collections::{
+        HashMap,
+        HashSet,
+    },
     sync::Arc,
 };
 
@@ -44,6 +65,19 @@ pub(super) fn enforce_cached_git_prepare_policy(
     }
     Ok(())
 }
+fn snapshot_metadata<'a>(
+    packages: &'a HashMap<PackageKey, PackageMetadata>,
+    snapshot_key: &PackageKey,
+    metadata_key: &PackageKey,
+) -> Result<&'a PackageMetadata, CreateVirtualStoreError> {
+    packages
+        .get(metadata_key)
+        .ok_or_else(|| CreateVirtualStoreError::MissingPackageMetadata {
+            snapshot_key: snapshot_key.to_string(),
+            metadata_key: metadata_key.to_string(),
+        })
+}
+
 /// Whether the warm slot of one git-hosted snapshot may be reused. `false`
 /// drops the cache key so the snapshot is fetched and prepared afresh.
 pub(super) fn cached_git_prepare_allowed(
@@ -56,21 +90,19 @@ pub(super) fn cached_git_prepare_allowed(
     let Some(key) = cache_key else { return Ok(true) };
     let Some(cas_paths) = prefetch.cas_paths.get(key) else { return Ok(true) };
     let metadata_key = snapshot_key.without_peer();
-    let metadata = packages
-        .get(&metadata_key)
-        .ok_or_else(|| CreateVirtualStoreError::MissingPackageMetadata {
-            snapshot_key: snapshot_key.to_string(),
-            metadata_key: metadata_key.to_string(),
-        })?;
-    let package_id = metadata_key.pkg_id();
-    if !keys_git_hosted_archive(&metadata.resolution, key, &package_id)
-        || prefetch.requires_prepare.get(key) == Some(&false)
+    let metadata = snapshot_metadata(packages, snapshot_key, &metadata_key)?;
+    if !is_git_hosted_resolution(&metadata.resolution)
+        || !prefetch.requires_prepare
+            .get(key)
+            .copied()
+            .unwrap_or(true)
     {
         return Ok(true);
     }
     let Some(manifest) = cached_git_manifest(prefetch, key, cas_paths) else {
         return Ok(false);
     };
+    let package_id = metadata_key.pkg_id();
     let name = manifest
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -104,24 +136,6 @@ pub(super) fn cached_git_manifest<'a>(
     }
     read_package_json_from_cas_paths(cas_paths).map(Cow::Owned)
 }
-/// Whether `key` is the row of a git-hosted archive of `resolution`. A
-/// `variations` resolution is keyed by the archive it selects, which is
-/// git-hosted only when its key takes the git-hosted shape.
-pub(super) fn keys_git_hosted_archive(
-    resolution: &LockfileResolution,
-    key: &str,
-    package_id: &str,
-) -> bool {
-    match resolution {
-        LockfileResolution::Variations(variations) => {
-            variations.resolutions().any(is_git_hosted_resolution)
-                && [true, false]
-                    .into_iter()
-                    .any(|built| key == git_hosted_store_index_key(package_id, built))
-        }
-        resolution => is_git_hosted_resolution(resolution),
-    }
-}
 pub(super) fn is_git_hosted_resolution(resolution: &LockfileResolution) -> bool {
     match resolution {
         LockfileResolution::Git(_) => true,
@@ -132,23 +146,36 @@ pub(super) fn is_git_hosted_resolution(resolution: &LockfileResolution) -> bool 
 pub(super) fn snapshot_needs_build_marker(snapshot_key: &PackageKey, requires_build: bool) -> bool {
     requires_build || crate::snapshot_has_patch(snapshot_key)
 }
-pub(super) fn gvs_slot_needs_rebuild(
-    layout: &crate::VirtualStoreLayout,
-    allow_build_policy: &crate::AllowBuildPolicy,
-    snapshot_key: &PackageKey,
-) -> bool {
-    if !layout.enable_global_virtual_store() {
-        return false;
+/// The builds that place packages into global virtual store slots. A slot
+/// whose package one of them places gets only its dependency links from
+/// the link phase: the build phase builds the package in a private
+/// directory and renames it into the slot.
+#[derive(Clone, Copy)]
+pub(super) struct SlotBuilds<'a> {
+    pub(super) allow_build_policy: &'a crate::AllowBuildPolicy,
+    pub(super) ignore_scripts: bool,
+}
+impl<'a> SlotBuilds<'a> {
+    /// `None` outside a writable global virtual store.
+    pub(super) fn of(
+        config: &pnpm_config::Config,
+        layout: &crate::VirtualStoreLayout,
+        allow_build_policy: &'a crate::AllowBuildPolicy,
+    ) -> Option<Self> {
+        (layout.enable_global_virtual_store() && !config.frozen_store).then_some(Self {
+            allow_build_policy,
+            ignore_scripts: config.ignore_scripts,
+        })
     }
-    let can_build = crate::snapshot_has_patch(snapshot_key)
-        || allow_build_policy.check(&snapshot_key.without_peer().to_string()) == Some(true);
-    can_build
-        && layout
-            .slot_dir(snapshot_key)
-            .join("node_modules")
-            .join(snapshot_key.name.to_string())
-            .join(crate::NEEDS_BUILD_MARKER)
-            .is_file()
+
+    pub(super) fn places(self, snapshot_key: &PackageKey, requires_build: bool) -> bool {
+        crate::snapshot_has_patch(snapshot_key)
+            || (requires_build
+                && !self.ignore_scripts
+                && self.allow_build_policy
+                    .check(&snapshot_key.without_peer().to_string())
+                    .unwrap_or(false))
+    }
 }
 /// The pristine CAS paths of every warm snapshot whose package may publish
 /// shared side effects.
@@ -167,9 +194,12 @@ pub(super) fn warm_shared_base_cas_paths(
 }
 pub(super) fn warm_cas_paths_by_pkg_id(warm: &[partition::WarmEntry<'_>]) -> CasPathsByPkgId {
     let mut map = CasPathsByPkgId::with_capacity(warm.len());
-    for (snapshot_key, _snapshot, cas_paths, _cache_key, _needs_build_marker) in warm {
+    for (snapshot_key, _snapshot, cas_paths, _cache_key, needs_build_marker) in warm {
         map.entry(cas_paths_key(snapshot_key))
-            .or_insert_with(|| Arc::clone(cas_paths).into());
+            .or_insert_with(|| crate::HoistedPackageFiles {
+                needs_build: *needs_build_marker,
+                ..Arc::clone(cas_paths).into()
+            });
     }
     map
 }
@@ -177,12 +207,12 @@ pub(super) fn warm_cas_paths_by_pkg_id(warm: &[partition::WarmEntry<'_>]) -> Cas
 pub(super) struct WarmLinkBatch<'a> {
     pub(super) reuse: SlotReuse<'a>,
     pub(super) is_hoisted: bool,
-    pub(super) needs_build_marker_source: Option<&'a Path>,
+    pub(super) slot_builds: Option<SlotBuilds<'a>>,
     pub(super) removed_aliases_by_key: &'a HashMap<PackageKey, Vec<PkgName>>,
     pub(super) template: &'a LinkSlotsParallel<'a>,
 }
 /// Link every warm slot. Hoisted skips the batch entirely: no virtual-store
-/// slot gets written, so there's no per-snapshot link work to do — the CAS
+/// slot gets written, so there's no per-snapshot link work to do, the CAS
 /// paths captured by the caller are the only output the link phase consumes,
 /// and all link work is routed into the hoisted linker instead. It still wants
 /// the progress reporter to fire so `pnpm:progress imported`-style updates
@@ -204,9 +234,11 @@ pub(super) fn link_warm_batch<Reporter: self::Reporter>(
                     is_mutable: false,
                     source_exists: true,
                     force: force_import,
-                    build_marker: needs_build_marker
-                        .then_some(batch.needs_build_marker_source)
-                        .flatten(),
+                    // Unpatched, a package needs a build only when it
+                    // requires one.
+                    awaits_build: batch.slot_builds.is_some_and(|builds| {
+                        builds.places(snapshot_key, *needs_build_marker)
+                    }),
                     needs_build: *needs_build_marker,
                 },
                 snapshot_key,

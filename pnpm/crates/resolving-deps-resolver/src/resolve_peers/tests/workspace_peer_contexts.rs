@@ -1,8 +1,26 @@
 use super::{
-    Arc, BTreeMap, DepPath, DirectDep, HashMap, HashSet, ImporterPeerInput, NodeId, PeerId,
-    PkgResolutionId, ResolvePeersOptions, ResolvedTree, WorkspacePeerSettings, graph_node,
-    linked_package, package, peer_id_pair, resolve_peers, resolve_peers_workspace, resolve_result,
-    tree_node, walker_for_tests,
+    Arc,
+    BTreeMap,
+    DepPath,
+    DirectDep,
+    HashMap,
+    HashSet,
+    ImporterPeerInput,
+    NodeId,
+    PeerId,
+    PkgResolutionId,
+    ResolvePeersOptions,
+    ResolvedTree,
+    WorkspacePeerSettings,
+    graph_node,
+    linked_package,
+    package,
+    peer_id_pair,
+    resolve_peers,
+    resolve_peers_workspace,
+    resolve_result,
+    tree_node,
+    walker_for_tests,
 };
 
 #[test]
@@ -13,6 +31,8 @@ fn workspace_importers_get_distinct_instances_for_different_peer_versions() {
     let consumer_v2 = NodeId::next();
     let importers = [
         ImporterPeerInput {
+            declared_direct_dependencies: HashSet::default(),
+            explicitly_requested_direct_dependencies: HashSet::default(),
             id: "project-a".to_string(),
             direct: vec![
                 DirectDep {
@@ -28,8 +48,12 @@ fn workspace_importers_get_distinct_instances_for_different_peer_versions() {
             ],
             root_dir: std::path::PathBuf::from("/repo/project-a"),
             modules_dir: None,
+            rejected_optional_peers: HashSet::default(),
+            hoisted_peer_provider_node_ids: HashSet::default(),
         },
         ImporterPeerInput {
+            declared_direct_dependencies: HashSet::default(),
+            explicitly_requested_direct_dependencies: HashSet::default(),
             id: "project-b".to_string(),
             direct: vec![
                 DirectDep {
@@ -45,6 +69,8 @@ fn workspace_importers_get_distinct_instances_for_different_peer_versions() {
             ],
             root_dir: std::path::PathBuf::from("/repo/project-b"),
             modules_dir: None,
+            rejected_optional_peers: HashSet::default(),
+            hoisted_peer_provider_node_ids: HashSet::default(),
         },
     ];
     let mut tree = ResolvedTree {
@@ -85,7 +111,7 @@ fn workspace_importers_get_distinct_instances_for_different_peer_versions() {
 }
 
 #[test]
-fn a_shared_consumer_keeps_the_first_importers_peer_provider_variant() {
+fn a_shared_consumer_keeps_each_importers_peer_provider_variant() {
     let plugin_v1 = NodeId::next();
     let plugin_v2 = NodeId::next();
     let utils_root = NodeId::next();
@@ -96,6 +122,8 @@ fn a_shared_consumer_keeps_the_first_importers_peer_provider_variant() {
 
     let importers = [
         ImporterPeerInput {
+            declared_direct_dependencies: HashSet::default(),
+            explicitly_requested_direct_dependencies: HashSet::default(),
             id: ".".to_string(),
             direct: vec![
                 DirectDep {
@@ -116,8 +144,12 @@ fn a_shared_consumer_keeps_the_first_importers_peer_provider_variant() {
             ],
             root_dir: std::path::PathBuf::from("/repo"),
             modules_dir: None,
+            rejected_optional_peers: HashSet::default(),
+            hoisted_peer_provider_node_ids: HashSet::default(),
         },
         ImporterPeerInput {
+            declared_direct_dependencies: HashSet::default(),
+            explicitly_requested_direct_dependencies: HashSet::default(),
             id: "app".to_string(),
             direct: vec![
                 DirectDep {
@@ -133,6 +165,8 @@ fn a_shared_consumer_keeps_the_first_importers_peer_provider_variant() {
             ],
             root_dir: std::path::PathBuf::from("/repo/app"),
             modules_dir: None,
+            rejected_optional_peers: HashSet::default(),
+            hoisted_peer_provider_node_ids: HashSet::default(),
         },
     ];
 
@@ -189,29 +223,20 @@ fn a_shared_consumer_keeps_the_first_importers_peer_provider_variant() {
         ResolvePeersOptions::default(),
     );
 
-    // Both `utils` occurrences collapse onto one depPath because the
-    // `resolver` peer id collapses on the plugin/resolver peer cycle, so
-    // exactly one of them supplies the graph node's edges.
-    let utils = result.graph
-        .keys()
-        .filter(|dep_path| dep_path.as_str().starts_with("utils@"));
-    assert_eq!(utils.count(), 1, "one utils entry: {:?}", result.graph.keys().collect::<Vec<_>>());
-    let utils_dep_path = result.graph
-        .keys()
-        .find(|dep_path| dep_path.as_str().starts_with("utils@"))
-        .expect("utils entry")
-        .clone();
-    assert_eq!(
-        result.graph[&utils_dep_path].edges.children.get("resolver"),
-        Some(&DepPath::from("resolver@1.0.0(plugin@1.0.0)")),
-    );
+    for importer in [".", "app"] {
+        let direct = &result.direct_dependencies_by_importer[importer];
+        let plugin = &result.graph[&direct["plugin"]];
+        let utils = &result.graph[&plugin.edges.children["utils"]];
+        assert_eq!(utils.edges.children["resolver"], direct["resolver"]);
+    }
     // Trimming a peer segment off the edge would key it to a variant no
-    // importer reaches, leaving an orphan entry in the lockfile —
+    // importer reaches, leaving an orphan entry in the lockfile,
     // <https://github.com/pnpm/pnpm/issues/13320>.
     let mut reachable: HashSet<DepPath> = HashSet::default();
     let mut queue: Vec<DepPath> = result.direct_dependencies_by_importer
         .values()
-        .flat_map(|direct| direct.values().cloned())
+        .map(BTreeMap::values)
+        .flat_map(std::iter::Iterator::cloned)
         .collect();
     while let Some(dep_path) = queue.pop() {
         if !reachable.insert(dep_path.clone()) {
@@ -231,6 +256,8 @@ fn linked_peer_provider_uses_root_relative_snapshot_ref_in_workspace_fallback() 
     let peer = NodeId::leaf("link:packages/peer");
     let consumer = NodeId::next();
     let importer = ImporterPeerInput {
+        declared_direct_dependencies: HashSet::default(),
+        explicitly_requested_direct_dependencies: HashSet::default(),
         id: "apps/nested/app".to_string(),
         direct: vec![
             DirectDep {
@@ -246,6 +273,8 @@ fn linked_peer_provider_uses_root_relative_snapshot_ref_in_workspace_fallback() 
         ],
         root_dir: std::path::PathBuf::from("/repo/apps/nested/app"),
         modules_dir: None,
+        rejected_optional_peers: HashSet::default(),
+        hoisted_peer_provider_node_ids: HashSet::default(),
     };
     let mut tree = ResolvedTree {
         direct: Vec::new(),
@@ -304,6 +333,8 @@ fn workspace_internal_link_peer_keeps_its_node_id_when_exclude_links_on() {
     let peer = NodeId::leaf("link:packages/peer");
     let consumer = NodeId::next();
     let importer = ImporterPeerInput {
+        declared_direct_dependencies: HashSet::default(),
+        explicitly_requested_direct_dependencies: HashSet::default(),
         id: "apps/app".to_string(),
         direct: vec![
             DirectDep {
@@ -319,6 +350,8 @@ fn workspace_internal_link_peer_keeps_its_node_id_when_exclude_links_on() {
         ],
         root_dir: std::path::PathBuf::from("/repo/apps/app"),
         modules_dir: Some(std::path::PathBuf::from("/repo/apps/app/node_modules")),
+        rejected_optional_peers: HashSet::default(),
+        hoisted_peer_provider_node_ids: HashSet::default(),
     };
     let mut tree = ResolvedTree {
         direct: Vec::new(),
@@ -442,7 +475,7 @@ fn pruned_hoisted_providers_with_mutual_peers_resolve() {
 
 /// Mirror of the TS test "an own direct dependency and a pruned hoisted peer
 /// provider that peer-depend on each other are resolved together"
-/// (`deps-resolver/test/resolvePeers.ts`) — the shape behind
+/// (`deps-resolver/test/resolvePeers.ts`), the shape behind
 /// <https://github.com/pnpm/pnpm/issues/12921>, where the peer cycle spans an
 /// own direct dependency and a pruned provider. Both sides of the cycle must
 /// collapse to `name@version` suffixes.
@@ -596,7 +629,7 @@ fn peer_id_pair_leaves_an_ordinary_registry_package_bare() {
 }
 
 /// A parent reached through many occurrences enqueues the identical
-/// `(parent_dep_path, alias, child_node_id)` triple over and over —
+/// `(parent_dep_path, alias, child_node_id)` triple over and over,
 /// millions of times on a cyclic peer graph. Replaying a repeat is a
 /// no-op, because it resolves the same `DepPath` and `or_insert`s a
 /// slot that is already filled, so the buffer keeps only the first.

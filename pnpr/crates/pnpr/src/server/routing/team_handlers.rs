@@ -1,14 +1,33 @@
 use super::{
-    AppState, AuthedCaller, Deserialize, MAX_TEAM_BODY_BYTES, Path, Response, State,
-    TargetRegistry, TeamScope, add_team_member, create_team, destroy_team, get_org_teams,
-    get_team_members, grant_team_access, list_team_packages, private_no_cache, remove_team_member,
-    revoke_team_access, serve_org_packages,
+    AppState,
+    AuthedCaller,
+    Deserialize,
+    MAX_TEAM_BODY_BYTES,
+    Path,
+    Response,
+    State,
+    TargetRegistry,
+    TeamScope,
+    add_team_member,
+    create_team,
+    destroy_team,
+    get_org_teams,
+    get_team_members,
+    grant_team_access,
+    list_team_packages,
+    private_no_cache,
+    remove_team_member,
+    revoke_team_access,
+    serve_org_packages,
 };
 use axum::{
     Router,
     body::Bytes,
     extract::DefaultBodyLimit,
-    routing::{delete, get},
+    routing::{
+        delete,
+        get,
+    },
 };
 
 pub(super) fn team_routes(router: Router<AppState>, base: &str) -> Router<AppState> {
@@ -49,22 +68,31 @@ pub(super) struct TeamPath {
     pub(super) team: String,
 }
 
-// --------------------------------------------------------------------
-// Orgs and teams.
-// --------------------------------------------------------------------
+#[derive(Deserialize)]
+struct ListQuery {
+    #[serde(default)]
+    format: crate::server::organizations::TeamListFormat,
+}
 
-/// `GET {base}/-/org/{scope}/team` — the teams of the registry claiming
+/// `GET {base}/-/org/{scope}/team`: the teams of the registry claiming
 /// `scope`.
 async fn get_teams(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
     Path(path): Path<ScopePath>,
+    axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
-    private_no_cache(get_org_teams(&state, &identity, registry.as_deref(), &path.scope))
+    private_no_cache(get_org_teams(
+        &state,
+        &identity,
+        registry.as_deref(),
+        &path.scope,
+        query.format,
+    ))
 }
 
-/// `GET {base}/-/org/{scope}/package` — the packages of the registry claiming
+/// `GET {base}/-/org/{scope}/package`: the packages of the registry claiming
 /// `scope`.
 async fn get_org_package_list(
     State(state): State<AppState>,
@@ -104,14 +132,18 @@ async fn get_team_users(
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
     Path(path): Path<TeamPath>,
+    axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
-    private_no_cache(get_team_members(
-        &state,
-        &identity,
-        registry.as_deref(),
-        &path.scope,
-        &path.team,
-    ))
+    private_no_cache(
+        get_team_members(
+            &state,
+            &identity,
+            registry.as_deref(),
+            (&path.scope, &path.team),
+            query.format,
+        )
+        .await,
+    )
 }
 
 /// `PUT {base}/-/team/{scope}/{team}/user`.

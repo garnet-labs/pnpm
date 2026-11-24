@@ -2,16 +2,25 @@
 //! $owners policy token, npm owner mutations, and package tombstones.
 
 use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+    },
 };
 use pnpr::Config;
-use pnpr_storage::{
-    TOMBSTONES_NAMESPACE,
-    layout::{namespace_segments, package_segments},
+use serde_json::{
+    Value,
+    json,
 };
-use serde_json::{Value, json};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{
+    Ipv4Addr,
+    SocketAddr,
+    SocketAddrV4,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -43,8 +52,8 @@ fn config_with_packages(packages_block: &str, admins: &[&str]) -> (TempDir, Conf
     };
     let catch_all = if packages_block.contains("'**'") { "" } else { "      '**': {}\n" };
     let yaml = format!(
-        "storage: {}\nauth:\n  htpasswd:\n    maxUsers: 100\n{admin_line}registries:\n  \
-         local:\n    type: hosted\n    org: \"\"\n    access: $all\n    packages:\n{nested}\n{catch_all}  \
+        "storage: {}\nauth:\n  users:\n    maxUsers: 100\n{admin_line}registries:\n  \
+         local:\n    type: hosted\n    namespace: \"\"\n    access: $all\n    packages:\n{nested}\n{catch_all}  \
          main:\n    type: router\n    sources: [local]\n\
          defaultRegistry: main\n",
         storage.display(),
@@ -52,7 +61,7 @@ fn config_with_packages(packages_block: &str, admins: &[&str]) -> (TempDir, Conf
     let path = dir.path().join("config.yaml");
     std::fs::write(&path, yaml).unwrap();
     let config =
-        Config::from_yaml(&path, listen(), Some("http://example.test".to_string())).unwrap();
+        pnpr_fixtures::load_seeded_config(&path, listen(), Some("http://example.test".to_string()));
     (dir, config)
 }
 
@@ -134,11 +143,30 @@ fn authed_get(path: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+async fn maintainer_request(
+    app: &axum::Router,
+    path: &str,
+    token: &str,
+    mut body: Value,
+) -> Request<Body> {
+    let response = app
+        .clone()
+        .oneshot(authed_get(path, token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let packument = body_json(response.into_body()).await;
+    let revision = packument["_rev"].as_str().unwrap();
+    body["_rev"] = json!(revision);
+    authed_put(&format!("{path}/-rev/{revision}"), token, body)
+}
+
 async fn app_router(config: Config, admins: &[&str]) -> axum::Router {
-    let auth = pnpr::AuthState::in_memory_with_max_users(config.identity.auth.htpasswd.max_users);
-    for admin in admins {
-        auth.users.create_user(admin, "secret123").await.unwrap();
-    }
+    let accounts: Vec<_> = admins
+        .iter()
+        .map(|name| (*name, "secret123"))
+        .collect();
+    let auth = crate::tokens::seeded_auth(&config, &accounts);
     pnpr::router_with_auth(config, auth)
 }
 
@@ -149,13 +177,14 @@ async fn get_couchdb_user_endpoint() {
         &["admin_alice", "unprovisioned_admin"],
     );
     let app = app_router(config, &["admin_alice"]).await;
-    let (app, _) = add_user_and_get_token(app, "normal_bob", "secret123").await;
+    let (app, token) = add_user_and_get_token(app, "normal_bob", "secret123").await;
 
     // Check unprovisioned admin user returns NOT_FOUND
     let response = app
         .clone()
         .oneshot(
             Request::get("/-/user/org.couchdb.user:unprovisioned_admin")
+                .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -168,6 +197,7 @@ async fn get_couchdb_user_endpoint() {
         .clone()
         .oneshot(
             Request::get("/-/user/org.couchdb.user:admin_alice")
+                .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -185,6 +215,7 @@ async fn get_couchdb_user_endpoint() {
             .clone()
             .oneshot(
                 Request::get(path)
+                    .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -201,6 +232,7 @@ async fn get_couchdb_user_endpoint() {
         .clone()
         .oneshot(
             Request::get("/-/user/org.couchdb.user:nobody")
+                .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -208,7 +240,8 @@ async fn get_couchdb_user_endpoint() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let err = body_json(response.into_body()).await;
-    assert_eq!(err["error"], "not_found");
+    assert_eq!(err["error"], "User not found");
+    assert_eq!(err["error"], err["reason"]);
 }
 
 #[tokio::test]
@@ -293,6 +326,105 @@ async fn owners_policy_restricts_subsequent_publish() {
 }
 
 #[tokio::test]
+async fn publish_defaults_to_owners_for_an_entry_without_a_publish_list() {
+    let (_dir, config) = config_with_packages("packages:\n  'default-lib': {}\n", &[]);
+    let app = app_router(config, &[]).await;
+    let (app, alice_token) = add_user_and_get_token(app, "alice", "secret123").await;
+    let (app, bob_token) = add_user_and_get_token(app, "bob", "secret123").await;
+
+    let doc = publish_doc("default-lib", "1.0.0", b"tarball-1");
+    let response = app
+        .clone()
+        .oneshot(authed_put("/npm/default-lib", &alice_token, doc))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let doc = publish_doc("default-lib", "1.0.1", b"tarball-2");
+    let response = app
+        .clone()
+        .oneshot(authed_put("/npm/default-lib", &bob_token, doc))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .clone()
+        .oneshot(authed_put(
+            "/npm/-/package/default-lib/dist-tags/next",
+            &bob_token,
+            json!("1.0.0"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let doc = publish_doc("default-lib", "1.0.1", b"tarball-2");
+    let response = app
+        .clone()
+        .oneshot(authed_put("/npm/default-lib", &alice_token, doc))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn organization_listing_reports_write_for_maintainers_under_the_default_rule() {
+    let (_dir, config) = config_with_packages("packages:\n  '@acme/*': {}\n", &[]);
+    let app = app_router(config, &[]).await;
+    let (app, alice_token) = add_user_and_get_token(app, "alice", "secret123").await;
+    let (app, bob_token) = add_user_and_get_token(app, "bob", "secret123").await;
+    for (pkg, token, tarball) in [
+        ("@acme%2flib", &alice_token, &b"tarball-1"[..]),
+        ("@acme%2ftool", &bob_token, &b"tarball-2"[..]),
+    ] {
+        let name = pkg.replace("%2f", "/");
+        let doc = publish_doc(&name, "1.0.0", tarball);
+        let response = app
+            .clone()
+            .oneshot(authed_put(&format!("/npm/{pkg}"), token, doc))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    for (token, expected) in [
+        (&alice_token, json!({ "@acme/lib": "write", "@acme/tool": "read" })),
+        (&bob_token, json!({ "@acme/lib": "read", "@acme/tool": "write" })),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authed_get("/npm/-/org/acme/package", token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response.into_body()).await, expected);
+    }
+
+    let add_bob = json!({
+        "_id": "@acme/lib",
+        "maintainers": [{ "name": "alice" }, { "name": "bob" }],
+    });
+    let response = app
+        .clone()
+        .oneshot(maintainer_request(&app, "/npm/@acme%2flib", &alice_token, add_bob).await)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(authed_get("/npm/-/org/acme/package", &bob_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response.into_body()).await,
+        json!({ "@acme/lib": "write", "@acme/tool": "write" }),
+    );
+}
+
+#[tokio::test]
 async fn npm_owner_maintainer_mutation_flow() {
     let (_dir, config) = config_with_packages(
         "packages:\n  'team-pkg':\n    access: $all\n    publish: $owners\n    unpublish: $owners\n",
@@ -315,12 +447,11 @@ async fn npm_owner_maintainer_mutation_flow() {
     // Non-owner Bob tries to mutate maintainers -> 403
     let mutation = json!({
         "_id": "team-pkg",
-        "_rev": "1-abc",
         "maintainers": [{ "name": "bob" }]
     });
     let res = app
         .clone()
-        .oneshot(authed_put("/npm/team-pkg/-rev/1-abc", &bob_token, mutation))
+        .oneshot(maintainer_request(&app, "/npm/team-pkg", &bob_token, mutation).await)
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -328,12 +459,11 @@ async fn npm_owner_maintainer_mutation_flow() {
     // Owner Alice tries to empty maintainers -> 400 EmptyMaintainers
     let empty_mutation = json!({
         "_id": "team-pkg",
-        "_rev": "1-abc",
         "maintainers": []
     });
     let res = app
         .clone()
-        .oneshot(authed_put("/npm/team-pkg/-rev/1-abc", &alice_token, empty_mutation))
+        .oneshot(maintainer_request(&app, "/npm/team-pkg", &alice_token, empty_mutation).await)
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -341,7 +471,6 @@ async fn npm_owner_maintainer_mutation_flow() {
     // Alice adds Bob as maintainer
     let add_bob_mutation = json!({
         "_id": "team-pkg",
-        "_rev": "1-abc",
         "maintainers": [
             { "name": "alice" },
             { "name": "bob" }
@@ -349,7 +478,7 @@ async fn npm_owner_maintainer_mutation_flow() {
     });
     let res = app
         .clone()
-        .oneshot(authed_put("/npm/team-pkg/-rev/1-abc", &alice_token, add_bob_mutation))
+        .oneshot(maintainer_request(&app, "/npm/team-pkg", &alice_token, add_bob_mutation).await)
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
@@ -366,12 +495,11 @@ async fn npm_owner_maintainer_mutation_flow() {
     // Admin removes Alice, leaving only Bob
     let admin_mutation = json!({
         "_id": "team-pkg",
-        "_rev": "2-def",
         "maintainers": [{ "name": "bob" }]
     });
     let res = app
         .clone()
-        .oneshot(authed_put("/npm/team-pkg/-rev/2-def", &admin_token, admin_mutation))
+        .oneshot(maintainer_request(&app, "/npm/team-pkg", &admin_token, admin_mutation).await)
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
@@ -403,11 +531,12 @@ async fn anonymous_caller_cannot_change_maintainers() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
 
+    let (app, _) = add_user_and_get_token(app, "-", "secret123").await;
     // `-` is the name the audit log gives a caller without a username.
     let dash_maintainer = json!({ "_id": "open-pkg", "maintainers": [{ "name": "-" }] });
     let res = app
         .clone()
-        .oneshot(authed_put("/npm/open-pkg/-rev/1-abc", &alice_token, dash_maintainer))
+        .oneshot(maintainer_request(&app, "/npm/open-pkg", &alice_token, dash_maintainer).await)
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
@@ -456,7 +585,7 @@ async fn package_tombstones_prevent_squatting_and_version_republishing() {
     // Alice unpublishes the entire package
     let res = app
         .clone()
-        .oneshot(authed_delete("/npm/tomb-pkg/-rev/1", &alice_token))
+        .oneshot(authed_delete("/npm/tomb-pkg", &alice_token))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
@@ -546,12 +675,11 @@ async fn scoped_package_ownership_and_unpublish() {
     // Bob cannot update maintainers
     let mutation = json!({
         "_id": "@my-org/core",
-        "_rev": "1-abc",
         "maintainers": [{ "name": "bob" }]
     });
     let res = app
         .clone()
-        .oneshot(authed_put("/npm/@my-org/core/-rev/1-abc", &bob_token, mutation))
+        .oneshot(maintainer_request(&app, "/npm/@my-org/core", &bob_token, mutation).await)
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -559,7 +687,6 @@ async fn scoped_package_ownership_and_unpublish() {
     // Alice adds Bob as maintainer
     let add_bob = json!({
         "_id": "@my-org/core",
-        "_rev": "1-abc",
         "maintainers": [
             { "name": "alice" },
             { "name": "bob" }
@@ -567,15 +694,21 @@ async fn scoped_package_ownership_and_unpublish() {
     });
     let res = app
         .clone()
-        .oneshot(authed_put("/npm/@my-org/core/-rev/1-abc", &alice_token, add_bob))
+        .oneshot(maintainer_request(&app, "/npm/@my-org/core", &alice_token, add_bob).await)
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
 
-    // Bob unpublishes the scoped package
+    let document = app
+        .clone()
+        .oneshot(authed_get("/npm/@my-org/core", &bob_token))
+        .await
+        .unwrap();
+    let document = body_json(document.into_body()).await;
+    let revision = document["_rev"].as_str().unwrap();
     let res = app
         .clone()
-        .oneshot(authed_delete("/npm/@my-org/core/-rev/1", &bob_token))
+        .oneshot(authed_delete(&format!("/npm/@my-org/core/-rev/{revision}"), &bob_token))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
@@ -663,19 +796,30 @@ async fn staged_publish_under_owners_rule_can_be_approved_by_maintainer() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
 
-    // Verify 1.1.0 is published
     let res = app
         .clone()
         .oneshot(authed_get("/npm/staged-owner-pkg", &alice_token))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let packument: Value = serde_json::from_slice(&body_bytes(res.into_body()).await).unwrap();
-    assert!(packument["versions"]["1.1.0"].is_object());
+    let packument = body_json(res.into_body()).await;
+    let publisher = &packument["versions"]["1.1.0"]["_npmUser"];
+    assert_eq!(publisher["name"], "alice");
+    assert!(publisher.get("approver").is_none());
+
+    let mut request = authed_get("/npm/staged-owner-pkg", &alice_token);
+    request
+        .headers_mut()
+        .insert("accept", "application/vnd.pnpr.install-v2+json".parse().unwrap());
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = body_json(response.into_body()).await;
+    assert!(document["versions"]["1.1.0"].is_object());
+    assert!(document["versions"]["1.1.0"].get("trust").is_none());
 }
 
 #[tokio::test]
-async fn a_packument_rewrite_whose_tombstone_fails_leaves_the_packument_unchanged() {
+async fn a_packument_rewrite_whose_removal_record_fails_leaves_the_packument_unchanged() {
     let (dir, config) = config_with_packages(
         "packages:\n  'fail-pkg':\n    access: $all\n    publish: $owners\n    unpublish: $owners\n",
         &[],
@@ -719,15 +863,9 @@ async fn a_packument_rewrite_whose_tombstone_fails_leaves_the_packument_unchange
         dist_tags.insert("latest".to_string(), json!("1.0.0"));
     }
 
-    // Block tombstone recording by creating a directory where the tombstone file belongs
-    let mut tombstone_file = dir.path().join("storage");
-    tombstone_file.extend(namespace_segments("", pnpr_storage::Ecosystem::Npm));
-    tombstone_file.push(TOMBSTONES_NAMESPACE);
-    tombstone_file.push(format!(
-        "{}.json",
-        package_segments(pnpr_storage::Ecosystem::Npm, "fail-pkg").join("/"),
-    ));
-    std::fs::create_dir_all(&tombstone_file).unwrap();
+    let connection =
+        rusqlite::Connection::open(dir.path().join("storage/.metadata/metadata.sqlite")).unwrap();
+    connection.execute_batch("CREATE TRIGGER refuse_removal BEFORE INSERT ON removed_packages BEGIN SELECT RAISE(ABORT, 'injected removal failure'); END;").unwrap();
 
     // Alice attempts to rewrite the packument to remove 1.1.0
     let res = app
@@ -741,8 +879,7 @@ async fn a_packument_rewrite_whose_tombstone_fails_leaves_the_packument_unchange
         res.status(),
     );
 
-    // The tombstone is written first, so the rewrite never ran and 1.1.0 is
-    // still present
+    // The transaction rolled back the package rewrite.
     let res = app
         .clone()
         .oneshot(authed_get("/npm/fail-pkg", &alice_token))
@@ -752,4 +889,306 @@ async fn a_packument_rewrite_whose_tombstone_fails_leaves_the_packument_unchange
     let restored: Value = serde_json::from_slice(&body_bytes(res.into_body()).await).unwrap();
     assert!(restored["versions"]["1.1.0"].is_object());
     assert!(restored["versions"]["1.0.0"].is_object());
+}
+
+#[tokio::test]
+async fn staged_publish_approval_rejects_malformed_body_without_claiming_stage() {
+    let (_dir, config) = config_with_packages(
+        "packages:\n  'staged-bad-body':\n    access: $all\n    publish: $authenticated\n",
+        &[],
+    );
+    let app = app_router(config, &[]).await;
+    let (app, alice_token) = add_user_and_get_token(app, "alice", "secret123").await;
+
+    let doc = publish_doc("staged-bad-body", "1.0.0", b"v1");
+    let res = app
+        .clone()
+        .oneshot(authed_post("/npm/-/stage/package/staged-bad-body", &alice_token, doc))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let stage_id = body_json(res.into_body()).await["stageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let approve_path = format!("/npm/-/stage/{stage_id}/approve");
+
+    for bad_body in ["{not-json", "[]"] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(&approve_path)
+            .header("Authorization", format!("Bearer {alice_token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(bad_body))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{bad_body}");
+        let err = body_json(res.into_body()).await;
+        let message = err["error"].as_str().unwrap();
+        assert!(message.starts_with("Bad request: invalid request body:"), "{message}");
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(&approve_path)
+        .header("Authorization", format!("Bearer {alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn mutations_reauthorize_after_concurrent_package_update() {
+    let primary_dir = TempDir::new().unwrap();
+    let (primary, address, _server) =
+        pnpr_libsql::testing::serve_primary(primary_dir.path().join("primary.db")).await;
+    let (_dir, mut config) = config_with_packages(
+        "packages:\n  'race-pkg':\n    access: $all\n    publish: $owners\n    unpublish: $owners\n",
+        &[],
+    );
+    config.has_configured_secret = true;
+    config.storage.database = pnpr_config::DatabaseBackend::Libsql(pnpr_config::LibsqlSettings {
+        url: format!("http://{address}"),
+        auth_token: None,
+        replica_path: None,
+        sync_interval_secs: None,
+        max_connections: None,
+    });
+    // The libSQL database holds no graph: serve the one seeded into SQLite.
+    config.graph_source = pnpr_config::GraphSource::Supplied;
+    let app = app_router(config, &[]).await;
+    let (app, alice_token) = add_user_and_get_token(app, "alice", "secret123").await;
+    let (app, bob_token) = add_user_and_get_token(app, "bob", "secret123").await;
+
+    for (version, tarball) in [("1.0.0", b"v1".as_slice()), ("1.1.0", b"v2".as_slice())] {
+        let doc = publish_doc("race-pkg", version, tarball);
+        let res = app
+            .clone()
+            .oneshot(authed_put("/npm/race-pkg", &alice_token, doc))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    let restore_both_owners = || {
+        let app = app.clone();
+        let bob_token = bob_token.clone();
+        async move {
+            let body = json!({
+                "_id": "race-pkg",
+                "maintainers": [{ "name": "alice" }, { "name": "bob" }],
+            });
+            let res = app
+                .clone()
+                .oneshot(maintainer_request(&app, "/npm/race-pkg", &bob_token, body).await)
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED);
+        }
+    };
+    let set_initial = json!({
+        "_id": "race-pkg",
+        "maintainers": [{ "name": "alice" }, { "name": "bob" }],
+    });
+    assert_eq!(
+        app.clone()
+            .oneshot(maintainer_request(&app, "/npm/race-pkg", &alice_token, set_initial).await)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED,
+    );
+
+    let packument = body_json(
+        app.clone()
+            .oneshot(authed_get("/npm/race-pkg", &alice_token))
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    let both_maintainers = packument["maintainers"].clone();
+    let bob_only = json!([both_maintainers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "bob")
+        .unwrap()
+        .clone()]);
+
+    // When a concurrent commit advances the package generation without
+    // removing Alice, her dist-tag update retries and succeeds.
+    let status = run_with_concurrent_state_commit(
+        &primary,
+        &both_maintainers,
+        app.clone(),
+        authed_put("/npm/-/package/race-pkg/dist-tags/next", &alice_token, json!("1.0.0")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    restore_both_owners().await;
+    let mut trimmed_packument = body_json(
+        app.clone()
+            .oneshot(authed_get("/npm/race-pkg", &alice_token))
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    let rev = trimmed_packument["_rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    trimmed_packument["versions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("1.1.0");
+    trimmed_packument["dist-tags"]["latest"] = json!("1.0.0");
+    let requests = [
+        authed_put(&format!("/npm/race-pkg/-rev/{rev}"), &alice_token, trimmed_packument),
+        authed_put("/npm/-/package/race-pkg/dist-tags/canary", &alice_token, json!("1.1.0")),
+        authed_delete("/npm/-/package/race-pkg/dist-tags/next", &alice_token),
+        authed_delete("/npm/race-pkg/-/race-pkg-1.1.0.tgz/-rev/1", &alice_token),
+        authed_delete("/npm/race-pkg", &alice_token),
+        authed_delete("/npm/-/package/race-pkg/owners/bob", &alice_token),
+    ];
+    for request in requests {
+        let uri = request.uri().to_string();
+        let method = request.method().clone();
+        let status =
+            run_with_concurrent_state_commit(&primary, &bob_only, app.clone(), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        restore_both_owners().await;
+    }
+
+    let final_doc = body_json(
+        app.clone()
+            .oneshot(authed_get("/npm/race-pkg", &bob_token))
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert!(final_doc["versions"]["1.0.0"].is_object());
+    assert!(final_doc["versions"]["1.1.0"].is_object());
+    assert_eq!(final_doc["dist-tags"]["next"], "1.0.0");
+    assert!(final_doc["dist-tags"].get("canary").is_none());
+    assert_eq!(final_doc["maintainers"], both_maintainers);
+
+    // When a concurrent replica removes the package before `remove_package_if_current`
+    // commits, `PackageRemoval::NotFound` re-authorizes against the tombstone and
+    // completes without exhausting the conflict retry loop.
+    primary.round_trips.pause_next_write();
+    let unpublish_task = tokio::spawn({
+        let app = app.clone();
+        let request = authed_delete("/npm/race-pkg", &alice_token);
+        async move {
+            app.oneshot(request).await
+                .unwrap()
+                .status()
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        primary.round_trips.write_paused.notified(),
+    )
+    .await
+    .expect("unpublish reaches its write transaction after pre-commit read");
+    let maintainer_user_ids = serde_json::to_string(
+        &both_maintainers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["userId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    primary
+        .conn
+        .execute(
+            "INSERT INTO removed_packages (namespace, ecosystem, name, maintainers, unpublished_at, unpublished_by)
+             VALUES ('', 'npm', 'race-pkg', ?1, 1000, 'bob')",
+            [maintainer_user_ids],
+        )
+        .await
+        .unwrap();
+    primary.conn
+        .execute(
+            "DELETE FROM packages WHERE namespace = '' AND ecosystem = 'npm' AND name = 'race-pkg'",
+            (),
+        )
+        .await
+        .unwrap();
+    primary.round_trips.write_resume.notify_one();
+    assert_eq!(unpublish_task.await.unwrap(), StatusCode::CREATED);
+}
+
+async fn run_with_concurrent_state_commit(
+    primary: &pnpr_libsql::testing::Primary,
+    maintainers: &Value,
+    app: axum::Router,
+    request: Request<Body>,
+) -> StatusCode {
+    primary.round_trips.take();
+    primary.round_trips.pause_next_write();
+    let task = tokio::spawn(async move {
+        app.oneshot(request).await
+            .unwrap()
+            .status()
+    });
+    // Wait until the handler has read and authorized the pre-commit document
+    // and paused at its conditional write (`BEGIN IMMEDIATE`), then commit the
+    // competing update before releasing the write so it conflicts and retries.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        primary.round_trips.write_paused.notified(),
+    )
+    .await
+    .expect("handler reaches its write transaction after pre-commit read");
+    let mut rows = primary
+        .conn
+        .query(
+            "SELECT state FROM packages WHERE namespace = '' AND ecosystem = 'npm' AND name = 'race-pkg'",
+            (),
+        )
+        .await
+        .unwrap();
+    let state: Vec<u8> = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    drop(rows);
+    let mut parsed: Value = serde_json::from_slice(&state).unwrap();
+    parsed["maintainers"] = maintainers.clone();
+    let updated_state = serde_json::to_vec(&parsed).unwrap();
+    primary.conn
+        .execute("UPDATE namespaces SET generation = generation + 1 WHERE namespace = ''", ())
+        .await
+        .unwrap();
+    primary.conn
+        .execute(
+            "UPDATE packages
+             SET generation = (SELECT generation FROM namespaces WHERE namespace = ''),
+                 state = ?1
+             WHERE namespace = '' AND ecosystem = 'npm' AND name = 'race-pkg'",
+            [updated_state],
+        )
+        .await
+        .unwrap();
+    primary.round_trips.write_resume.notify_one();
+
+    let status = task.await.unwrap();
+    let reads = primary.round_trips
+        .take()
+        .iter()
+        .flatten()
+        .filter(|sql| sql.starts_with("SELECT generation, state_version, state FROM packages"))
+        .count();
+    assert!(reads >= 2, "expected initial read and retry read, got {reads}");
+    status
 }

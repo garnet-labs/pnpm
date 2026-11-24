@@ -8,15 +8,33 @@ use super::{
     build,
     environment::PythonPrepare,
     host,
-    manifest::{Manifest, Source},
+    manifest::{
+        Manifest,
+        Source,
+    },
     registry::Registry,
 };
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use pep440_rs::Version;
-use pep508_rs::{PackageName, Requirement, VersionOrUrl};
-use pnpm_python_resolver::{Candidate, LockedVcs};
+use pep508_rs::{
+    PackageName,
+    Requirement,
+    VersionOrUrl,
+};
+use pnpm_python_resolver::{
+    Candidate,
+    LockedVcs,
+};
 use pnpm_reporter::Reporter;
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+};
 
 pub(super) struct Sources<'a> {
     pub(super) prepare: &'a PythonPrepare<'a>,
@@ -38,7 +56,7 @@ pub(super) fn declaration_url(source: &Source) -> Result<Option<String>> {
     if count > 1 {
         bail!("a Python source must declare exactly one of git, url, path or workspace");
     }
-    if (source.git.is_some() || source.url.is_some()) && source.editable == Some(true) {
+    if (source.git.is_some() || source.url.is_some()) && source.editable.unwrap_or(false) {
         bail!("Python git and URL sources cannot be installed editable");
     }
     let Some(git) = &source.git else { return Ok(source.url.clone()) };
@@ -106,7 +124,8 @@ impl Registry<'_> {
         if self.resolution.packages.candidates
             .get(name)
             .and_then(|versions| versions.get(version))
-            .is_some_and(|candidate| candidate.sdist().is_some())
+            .map(Candidate::sdist)
+            .is_some_and(|sdist| sdist.is_some())
         {
             return self.build_sdist::<Reporter>(name, version).await;
         }
@@ -223,7 +242,7 @@ impl Registry<'_> {
             if !self.has_wheel(&name, &version) {
                 bail!("the Python git source built a different version of {name}=={version}");
             }
-            self.record_sources(&[])?;
+            self.record_sources(Vec::new())?;
         }
         Ok(())
     }
@@ -242,8 +261,8 @@ impl Registry<'_> {
         wanted
     }
 
-    pub(super) fn record_sources(&mut self, requirements: &[Requirement]) -> Result<()> {
-        let mut declared = requirements.to_vec();
+    pub(super) fn record_sources(&mut self, requirements: Vec<Requirement>) -> Result<()> {
+        let mut declared = requirements;
         for ((name, version), metadata) in &self.resolution.packages.metadata {
             if !self.resolution.packages.candidates
                 .get(name)

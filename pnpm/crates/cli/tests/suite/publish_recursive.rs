@@ -8,8 +8,14 @@ use command_extra::CommandExtra;
 use mockito::Matcher;
 use pipe_trait::Pipe;
 use pnpm_testing_utils::bin::CommandTempCwd;
-use serde_json::{Value, json};
-use std::{fs, path::Path};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    fs,
+    path::Path,
+};
 
 /// Write a `pnpm-workspace.yaml` listing `names` as packages, plus a
 /// `package.json` per name under its own subdirectory of `workspace`.
@@ -42,18 +48,26 @@ fn write_registry_npmrc(workspace: &Path, registry: &str) {
 }
 
 /// Clear the CI / OIDC environment so the spawned publish never attempts an
-/// id-token exchange and stays offline against the mocked registry.
-fn clear_ci<Command: CommandExtra>(command: Command) -> Command {
+/// id-token exchange and stays offline against the mocked registry, and pin
+/// the config layers below `pnpm-workspace.yaml` to nothing.
+///
+/// The global `config.yaml` matters here even for the tests that set no publish
+/// setting: these projects are unscoped, so a developer's own
+/// `access: restricted` would fail them with `ERR_PNPM_UNSCOPED_RESTRICTED`,
+/// and a `provenance: true` would send them into the sigstore path.
+/// `CommandTempCwd` already strips the `PNPM_CONFIG_*` overlay.
+fn clear_ci<Command: CommandExtra>(command: Command, workspace: &Path) -> Command {
     command
         .without_env("GITHUB_ACTIONS")
         .without_env("GITLAB_CI")
         .without_env("NPM_ID_TOKEN")
         .without_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         .without_env("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .with_env("XDG_CONFIG_HOME", workspace)
 }
 
 /// A `--filter` that matches no project narrows the workspace to nothing, so
-/// recursive publish exits 0 without publishing or writing a summary — an
+/// recursive publish exits 0 without publishing or writing a summary, an
 /// empty selection is a no-op.
 #[test]
 fn recursive_publish_filter_no_match_is_a_noop() {
@@ -117,7 +131,7 @@ fn recursive_publish_all_private_writes_empty_summary() {
 }
 
 /// `publish -r --json` prints the per-package summaries as a JSON array on
-/// stdout — an empty array when nothing is published. Exercised on the
+/// stdout, an empty array when nothing is published. Exercised on the
 /// all-private no-op path so no registry request is made.
 #[test]
 fn recursive_publish_json_prints_empty_array_when_nothing_published() {
@@ -164,8 +178,8 @@ fn recursive_publish_batches_selected_packages() {
         .mock("PUT", "/-/pnpr/v0/publish")
         .match_body(Matcher::PartialJson(serde_json::json!({
             "packages": [
-                { "name": "project-1" },
-                { "name": "project-2" },
+                { "name": "project-1", "dist-tags": { "next": "1.0.0" } },
+                { "name": "project-2", "dist-tags": { "next": "1.0.0" } },
             ],
         })))
         .with_status(201)
@@ -177,10 +191,11 @@ fn recursive_publish_batches_selected_packages() {
         .expect(0)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--batch")
+        .with_arg("--config.tag=next")
         .with_arg("--force")
         .with_arg("--no-git-checks")
         .assert()
@@ -245,7 +260,7 @@ fn recursive_batch_publish_runs_completed_group_postpublish_scripts_before_a_lat
         .expect(1)
         .create();
 
-    let assert = clear_ci(pacquet)
+    let assert = clear_ci(pacquet, &workspace)
         .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
         .assert()
         .failure();
@@ -304,14 +319,12 @@ fn recursive_batch_publish_to_pnpr_stages_archives_before_the_commit() {
     )
     .expect("declare the registry pnpr");
     let lookups = server
-        .mock("HEAD", "/-/pnpr/v0/artifacts/blob")
-        .match_query(Matcher::Regex("^integrity=sha512-".to_string()))
+        .mock("HEAD", Matcher::Regex("^/-/pnpr/v0/publish/archives/sha512-".to_string()))
         .with_status(404)
         .expect(2)
         .create();
     let uploads = server
-        .mock("PUT", "/-/pnpr/v0/artifacts/blob")
-        .match_query(Matcher::Regex("^integrity=sha512-".to_string()))
+        .mock("PUT", Matcher::Regex("^/-/pnpr/v0/publish/archives/sha512-".to_string()))
         .match_header("content-type", "application/octet-stream")
         .with_status(201)
         .expect(2)
@@ -331,7 +344,7 @@ fn recursive_batch_publish_to_pnpr_stages_archives_before_the_commit() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
         .assert()
         .success();
@@ -352,8 +365,7 @@ fn recursive_batch_publish_to_another_registry_carries_archives_inline() {
     write_registry_npmrc(&workspace, &format!("{}/", server.url()));
     let staging = ["HEAD", "PUT"].map(|method| {
         server
-            .mock(method, "/-/pnpr/v0/artifacts/blob")
-            .match_query(Matcher::Any)
+            .mock(method, Matcher::Regex("^/-/pnpr/v0/publish/archives/sha512-".to_string()))
             .expect(0)
             .create()
     });
@@ -369,7 +381,7 @@ fn recursive_batch_publish_to_another_registry_carries_archives_inline() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
         .assert()
         .success();
@@ -403,7 +415,7 @@ fn recursive_batch_publish_rejects_mixed_credentials_for_one_registry() {
         .expect(0)
         .create();
 
-    let assert = clear_ci(pacquet)
+    let assert = clear_ci(pacquet, &workspace)
         .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
         .assert()
         .failure();
@@ -440,7 +452,7 @@ fn recursive_batch_publish_accepts_one_scope_credential_for_every_package() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
         .assert()
         .success();
@@ -461,7 +473,7 @@ fn recursive_batch_publish_reports_an_unsupported_registry() {
         .expect(1)
         .create();
 
-    let assert = clear_ci(pacquet)
+    let assert = clear_ci(pacquet, &workspace)
         .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
         .assert()
         .failure();
@@ -472,7 +484,7 @@ fn recursive_batch_publish_reports_an_unsupported_registry() {
     drop(root);
 }
 
-/// A bare `--filter` (no `-r`) puts `publish` into recursive mode — the shape
+/// A bare `--filter` (no `-r`) puts `publish` into recursive mode, the shape
 /// `release.yml` drives
 /// publishing with (`pn publish --filter=<pkg>`). A filter that matches no
 /// project is then a recursive no-op (exit 0); without the promotion this
@@ -501,7 +513,7 @@ fn filter_without_recursive_flag_enters_recursive_publish() {
     drop(root);
 }
 
-/// The exact shape `release.yml` publishes the monorepo with — an exclusion
+/// The exact shape `release.yml` publishes the monorepo with, an exclusion
 /// selector and no `-r` (`pn publish --filter=!<pkg> ...`). The promotion
 /// enters recursive mode, the exclusion narrows the set, and because every
 /// remaining package is private the run is a successful no-op that records an
@@ -540,7 +552,7 @@ fn filter_exclusion_without_recursive_flag_publishes_nothing() {
 }
 
 /// The global `-r` short flag works *after* the `publish` subcommand, not only
-/// before it — `pnpm publish -r` is the canonical recursive-publish ordering.
+/// before it, `pnpm publish -r` is the canonical recursive-publish ordering.
 /// (`publish` must not declare its own `--recursive` arg, which would strip the
 /// global `-r` short from the subcommand.)
 #[test]
@@ -562,7 +574,7 @@ fn recursive_publish_short_flag_after_subcommand() {
 }
 
 /// A workspace that enumerates no project is a recursive no-op that writes no
-/// summary — publishing returns before the handler when there are no
+/// summary, publishing returns before the handler when there are no
 /// projects, so no empty `pnpm-publish-summary.json` is emitted.
 #[test]
 fn recursive_publish_empty_workspace_writes_no_summary() {
@@ -619,7 +631,7 @@ fn recursive_publish_pushes_each_eligible_package() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--no-git-checks")
@@ -628,6 +640,53 @@ fn recursive_publish_pushes_each_eligible_package() {
 
     probe_1.assert();
     probe_2.assert();
+    put_1.assert();
+    put_2.assert();
+    drop(root);
+}
+
+/// The recursive path builds its publish options from the same resolver as the
+/// single-package one, so a configured `tag` has to reach every package's
+/// `PUT`. Upstream re-derives `opts.tag ?? 'latest'` separately here.
+#[test]
+fn recursive_publish_applies_the_configured_dist_tag() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let mut server = mockito::Server::new();
+    write_workspace(
+        &workspace,
+        &[("project-1", public_pkg("project-1")), ("project-2", public_pkg("project-2"))],
+    );
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let existing = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml, format!("{existing}tag: next\n")).expect("append the tag setting");
+    write_registry_npmrc(&workspace, &format!("{}/", server.url()));
+
+    server
+        .mock("GET", Matcher::Any)
+        .with_status(404)
+        .create();
+    let put_1 = server
+        .mock("PUT", "/project-1")
+        .match_body(Matcher::PartialJsonString(r#"{"dist-tags":{"next":"1.0.0"}}"#.to_owned()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+    let put_2 = server
+        .mock("PUT", "/project-2")
+        .match_body(Matcher::PartialJsonString(r#"{"dist-tags":{"next":"1.0.0"}}"#.to_owned()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    clear_ci(pacquet, &workspace)
+        .with_arg("-r")
+        .with_arg("publish")
+        .with_arg("--no-git-checks")
+        .assert()
+        .success();
+
     put_1.assert();
     put_2.assert();
     drop(root);
@@ -681,7 +740,7 @@ fn recursive_publish_skips_already_published_packages() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--no-git-checks")
@@ -694,7 +753,7 @@ fn recursive_publish_skips_already_published_packages() {
 }
 
 /// The already-published probe addresses the registry, so a project renamed by
-/// `publishConfig.name` is probed — and published — under the name the registry
+/// `publishConfig.name` is probed (and published) under the name the registry
 /// knows. Probing the workspace name would 404 and republish a version already
 /// out.
 #[test]
@@ -742,7 +801,7 @@ fn recursive_publish_probes_a_renamed_project_under_its_published_name() {
         .expect(0)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--no-git-checks")
@@ -775,7 +834,7 @@ fn recursive_publish_force_republishes_without_probing() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--force")
@@ -810,7 +869,7 @@ fn recursive_publish_report_summary_lists_the_published_packages() {
         .with_body("{}")
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--report-summary")
@@ -857,7 +916,7 @@ fn recursive_publish_json_prints_the_published_array() {
         .with_body("{}")
         .create();
 
-    let assert = clear_ci(pacquet)
+    let assert = clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--json")
@@ -897,7 +956,7 @@ fn recursive_publish_filter_uses_workspace_root_npmrc_registry() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("--filter=project-1")
         .with_arg("publish")
         .with_arg("--no-git-checks")
@@ -951,7 +1010,7 @@ fn recursive_publish_uses_the_publish_config_scoped_registry() {
         .expect(1)
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--no-git-checks")
@@ -1007,7 +1066,7 @@ fn recursive_publish_resolves_workspace_protocol_without_node_modules() {
         .with_body("{}")
         .create();
 
-    clear_ci(pacquet)
+    clear_ci(pacquet, &workspace)
         .with_arg("-r")
         .with_arg("publish")
         .with_arg("--no-git-checks")
@@ -1019,4 +1078,6 @@ fn recursive_publish_resolves_workspace_protocol_without_node_modules() {
     drop(root);
 }
 
+mod eligibility;
+mod new_version;
 mod wait;

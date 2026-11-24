@@ -1,4 +1,7 @@
-use super::{Path, lexical_normalize};
+use super::{
+    Path,
+    lexical_normalize,
+};
 
 pub(super) fn is_ancestor_path(parent: &Path, child: &Path) -> bool {
     is_child_path(child, parent)
@@ -59,6 +62,13 @@ fn comparison_component(component: &str) -> String {
     component.to_lowercase()
 }
 
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "The Windows twin lowercases from a borrow, and both twins share one signature."
+    )
+)]
 #[cfg(not(windows))]
 fn comparison_component(component: &str) -> String {
     component.to_string()

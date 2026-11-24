@@ -14,6 +14,10 @@
 //! instead, per the DI pattern from
 //! [pnpm/pacquet#339](https://github.com/pnpm/pacquet/issues/339).
 
+pub use sentinel::SentinelPlaceholders;
+
+mod sentinel;
+
 /// Capability: read a process environment variable as a UTF-8 string.
 pub trait EnvVar {
     /// Return the value of the named environment variable, or `None`
@@ -105,7 +109,7 @@ pub fn env_replace_lossy<Sys: EnvVar>(text: &str) -> (String, Vec<String>) {
 ///
 /// A caller that resolves placeholders itself, rather than taking the whole
 /// substituted string, reads them from here so it agrees with
-/// [`env_replace_lossy`] about what a placeholder is — an unfinished `${`
+/// [`env_replace_lossy`] about what a placeholder is, an unfinished `${`
 /// among them, which is text rather than the opening of one.
 #[must_use]
 pub fn placeholder_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
@@ -182,7 +186,9 @@ fn expand_placeholder<Sys: EnvVar>(
 fn optional_var_name(inside: &str) -> Option<&str> {
     inside
         .strip_suffix('?')
-        .filter(|name| !name.is_empty() && !name.contains('?') && !name.ends_with('-'))
+        .filter(|name| !name.is_empty())
+        .filter(|name| !name.contains('?'))
+        .filter(|name| !name.ends_with('-'))
 }
 
 /// Return the index of the closing `}` for a `${...}` starting at `start`.

@@ -1,12 +1,27 @@
-use super::{CargoCache, prepend_path};
-use std::{collections::BTreeMap, env, fs, path::PathBuf, process::Command};
+use super::{
+    CargoCache,
+    prepend_path,
+    restore::invalidate_fingerprints,
+};
+use Fingerprint::{
+    Invalidated,
+    Kept,
+};
+use command_extra::CommandExtra;
+use std::{
+    collections::BTreeMap,
+    env,
+    fs,
+    path::PathBuf,
+    process::Command,
+};
 
 fn project() -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
     assert!(
         Command::new("git")
-            .arg("init")
-            .arg(project.path())
+            .with_arg("init")
+            .with_arg(project.path())
             .output()
             .unwrap()
             .status
@@ -83,6 +98,8 @@ fn existing_target_is_never_replaced_and_changed_inputs_invalidate_freshness() {
     fs::create_dir_all(cache.target.join("debug/incremental")).unwrap();
     fs::write(cache.target.join("debug/.fingerprint/stale"), "stale").unwrap();
     fs::write(cache.target.join("debug/incremental/state"), "keep").unwrap();
+    fs::create_dir_all(cache.target.join("debug/build/probe/1/fingerprint")).unwrap();
+    fs::create_dir_all(cache.target.join("debug/build/probe/1/out/.fingerprint/nested-2")).unwrap();
     assert!(
         !cache
             .restore(&root.path().join("missing"), "inputs")
@@ -90,7 +107,84 @@ fn existing_target_is_never_replaced_and_changed_inputs_invalidate_freshness() {
     );
     cache.prepare("changed").unwrap();
     assert!(!cache.target.join("debug/.fingerprint").exists());
+    assert!(!cache.target.join("debug/build/probe/1/fingerprint").exists());
+    assert!(cache.target.join("debug/build/probe/1/out").exists());
+    assert!(!cache.target.join("debug/build/probe/1/out/.fingerprint").exists());
     assert_eq!(fs::read_to_string(cache.target.join("debug/incremental/state")).unwrap(), "keep");
+}
+
+#[test]
+fn restore_invalidates_local_units_and_build_script_runs_in_both_layouts() {
+    let first_worktree = project();
+    let second_worktree = project();
+    let cache = tempfile::tempdir().unwrap();
+    let entry = cache.path().join("entry");
+    let publisher = CargoCache::open(first_worktree.path(), "target").unwrap();
+    let units = [
+        Unit { file: "debug/.fingerprint/my-probe-1/bin-probe", after_restore: Invalidated },
+        Unit {
+            file: "debug/.fingerprint/dep-2/run-build-script-build",
+            after_restore: Invalidated,
+        },
+        Unit { file: "debug/.fingerprint/dep-3/lib-dep", after_restore: Kept },
+        Unit { file: "debug/build/my-probe/4/fingerprint/bin-probe", after_restore: Invalidated },
+        Unit {
+            file: "debug/build/dep/5/fingerprint/run-build-script-build",
+            after_restore: Invalidated,
+        },
+        Unit { file: "debug/build/dep/6/fingerprint/lib-dep", after_restore: Kept },
+        Unit { file: "debug/build/my-probe/7/out/fingerprint/data", after_restore: Kept },
+        Unit {
+            file: "debug/build/dep-8/out/fingerprint/run-build-script-data",
+            after_restore: Kept,
+        },
+        Unit {
+            file: "debug/build/dep/9/out/build/nested/a/fingerprint/run-build-script-build",
+            after_restore: Kept,
+        },
+        Unit {
+            file: "debug/build/dep-b/out/.fingerprint/nested-c/run-build-script-build",
+            after_restore: Kept,
+        },
+    ];
+    for unit in &units {
+        let path = publisher.target.join(unit.file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    publisher
+        .publish(&entry, "inputs", &["my-probe".to_string()])
+        .unwrap();
+    let consumer = CargoCache::open(second_worktree.path(), "target").unwrap();
+    assert!(consumer.restore(&entry, "inputs").unwrap());
+    for unit in &units {
+        let file = consumer.target.join(unit.file);
+        match unit.after_restore {
+            Invalidated => assert!(!file.parent().unwrap().exists(), "{}", unit.file),
+            Kept => assert!(file.is_file(), "{}", unit.file),
+        }
+    }
+}
+
+#[test]
+fn the_names_above_the_build_directory_do_not_classify_it() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("build/cache-abc");
+    let fingerprint = root.join("out/.fingerprint/dep-1");
+    fs::create_dir_all(&fingerprint).unwrap();
+    fs::write(fingerprint.join("lib-dep"), "").unwrap();
+    invalidate_fingerprints(&root, Some(&["dep".to_string()])).unwrap();
+    assert!(!fingerprint.exists());
+}
+
+struct Unit {
+    file: &'static str,
+    after_restore: Fingerprint,
+}
+
+enum Fingerprint {
+    Invalidated,
+    Kept,
 }
 
 #[test]
@@ -131,8 +225,8 @@ fn source_configuration_and_environment_changes_select_different_snapshots() {
     .unwrap();
     assert!(
         Command::new("cargo")
-            .current_dir(root.path())
-            .args(["generate-lockfile", "--offline"])
+            .with_current_dir(root.path())
+            .with_args(["generate-lockfile", "--offline"])
             .output()
             .unwrap()
             .status
@@ -140,7 +234,9 @@ fn source_configuration_and_environment_changes_select_different_snapshots() {
     );
     let cache = tempfile::tempdir().unwrap();
     let environment = std::collections::BTreeMap::new();
-    let key = || super::snapshot_entry(cache.path(), root.path(), "task", &environment).unwrap().1;
+    let key = || {
+        super::snapshot_entry(cache.path(), root.path(), "task".to_owned(), &environment).unwrap().1
+    };
     let original = key();
     fs::write(root.path().join("src/lib.rs"), "pub fn value() -> u8 { 2 }").unwrap();
     let changed_source = key();
@@ -158,7 +254,8 @@ fn source_configuration_and_environment_changes_select_different_snapshots() {
         "--cfg another_build".to_string(),
     )]);
     let changed_environment =
-        super::snapshot_entry(cache.path(), root.path(), "task", &environment).unwrap().1;
+        super::snapshot_entry(cache.path(), root.path(), "task".to_owned(), &environment).unwrap()
+            .1;
     assert_ne!(changed_config, changed_environment);
 }
 
@@ -239,8 +336,8 @@ fn restoration_falls_back_to_copy_on_tmpfs() {
     let second_worktree = tempfile::tempdir_in("/dev/shm").unwrap();
     assert!(
         Command::new("git")
-            .arg("init")
-            .arg(second_worktree.path())
+            .with_arg("init")
+            .with_arg(second_worktree.path())
             .output()
             .unwrap()
             .status

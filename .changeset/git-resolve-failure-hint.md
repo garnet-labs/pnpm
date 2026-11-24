@@ -1,6 +1,4 @@
 ---
-"@pnpm/resolving.git-resolver": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

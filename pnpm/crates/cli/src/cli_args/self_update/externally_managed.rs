@@ -74,7 +74,8 @@ pub(super) fn refuse_without_pin(
     };
     let pins_pnpm = manifest
         .and_then(Option::as_ref)
-        .and_then(|manifest| wanted_package_manager(manifest.value()))
+        .map(PackageManifest::value)
+        .and_then(wanted_package_manager)
         .is_some_and(|pm| pm.name == "pnpm");
     if pins_pnpm {
         return Ok(Some(manager));
@@ -85,7 +86,7 @@ pub(super) fn refuse_without_pin(
 /// The Homebrew formula (`pnpm`, `pnpm@11`, ...) whose keg holds `exe`, a
 /// canonical path. A keg is `<cellar>/<formula>/<version>/`, and Homebrew
 /// writes `INSTALL_RECEIPT.json` into every keg it installs.
-pub(super) fn homebrew_formula(exe: &Path) -> Option<String> {
+pub(crate) fn homebrew_formula(exe: &Path) -> Option<String> {
     exe.ancestors()
         .find_map(|keg| {
             let formula_dir = keg.parent()?;

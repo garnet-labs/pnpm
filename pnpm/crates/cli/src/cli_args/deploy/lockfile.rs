@@ -1,13 +1,52 @@
+mod relocate;
+mod snapshots;
+
+use snapshots::{
+    DeploySnapshots,
+    convert_deploy_snapshots,
+};
+
 use super::{
-    Config, Context, DependencyGroup, DeployError, DeployWorkspaceSettings, DirectoryResolution,
-    HashMap, HashSet, LinkedWorkspaceProject, Lockfile, LockfileResolution, Map, PackageKey,
-    PackageManifest, PackageMetadata, Path, PkgName, PkgNameVerPeer, Project, ProjectInfo,
-    ProjectPathKey, ProjectSnapshot, ResolveBases, ResolvedDependencyMap, ResolvedDependencySpec,
-    SelectedProject, SnapshotEntry, State, Value, bind_singleton_peers, convert_package_key,
-    convert_package_metadata, convert_resolved_dependency_spec, convert_snapshot,
-    create_file_url_key, deploy_peer_edges, deploy_workspace_settings, is_ancestor_path,
-    lexical_normalize, omit_peers_of_excluded_dependencies, project_snapshot_to_snapshot_entry,
-    prune_deploy_lockfile_graph, relative_path, same_path,
+    Config,
+    Context,
+    DependencyGroup,
+    DeployError,
+    DeployWorkspaceSettings,
+    DirectoryResolution,
+    HashMap,
+    HashSet,
+    Lockfile,
+    LockfileResolution,
+    Map,
+    PackageKey,
+    PackageManifest,
+    PackageMetadata,
+    Path,
+    PathBuf,
+    PkgName,
+    Project,
+    ProjectInfo,
+    ProjectPathKey,
+    ProjectSnapshot,
+    ResolveBases,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SelectedProject,
+    State,
+    Value,
+    bind_singleton_peers,
+    convert_package_key,
+    convert_package_metadata,
+    convert_resolved_dependency_spec,
+    create_file_url_key,
+    deploy_peer_edges,
+    deploy_workspace_settings,
+    is_ancestor_path,
+    lexical_normalize,
+    omit_peers_of_excluded_dependencies,
+    prune_deploy_lockfile_graph,
+    relative_path,
+    same_path,
 };
 use pnpm_tool_protocol::is_tool_specifier;
 
@@ -23,19 +62,13 @@ pub(super) struct ConvertCtx<'a> {
     pub(super) deploy_dir: &'a Path,
     pub(super) lockfile_dir: &'a Path,
     pub(super) deployed_project_root: &'a Path,
+    pub(super) references: ReferenceLocation,
 }
 
-pub(super) fn manifest_dependency_names(
-    manifest: &PackageManifest,
-    groups: &[&str],
-) -> Vec<PkgName> {
-    groups
-        .iter()
-        .filter_map(|group| manifest.value().get(group))
-        .filter_map(Value::as_object)
-        .flat_map(|dependencies| dependencies.keys())
-        .filter_map(|name| name.parse().ok())
-        .collect()
+#[derive(Clone, Copy)]
+pub(super) enum ReferenceLocation {
+    Workspace,
+    Deploy,
 }
 
 pub(super) fn create_deploy_files(
@@ -47,16 +80,18 @@ pub(super) fn create_deploy_files(
     config: &Config,
     dependency_groups: &[DependencyGroup],
 ) -> miette::Result<DeployFiles> {
-    let input_snapshot = lockfile.importers
-        .get(project_id)
-        .ok_or_else(|| DeployError::MissingImporter { project_id: project_id.to_string() })?;
     let deployed_project_root = lexical_normalize(&lockfile_dir.join(project_id));
-    let ctx = ConvertCtx {
+    let mut ctx = ConvertCtx {
         projects_by_path: &selected.projects_by_path,
         deploy_dir,
         lockfile_dir,
         deployed_project_root: &deployed_project_root,
+        references: ReferenceLocation::Workspace,
     };
+    let lockfile = &*relocate::prepare_source_lockfile(lockfile, &mut ctx)?;
+    let input_snapshot = lockfile.importers
+        .get(project_id)
+        .ok_or_else(|| DeployError::MissingImporter { project_id: project_id.to_string() })?;
     let (declared_dependencies, peer_only_dependencies) =
         dependency_name_sets(&selected.project.manifest);
     let target_snapshot = deploy_snapshot(&DeployedDependencies {
@@ -92,11 +127,13 @@ fn dependency_name_sets(manifest: &PackageManifest) -> (HashSet<String>, HashSet
         .available_dependency_names(None)
         .into_iter()
         .collect::<HashSet<_>>();
-    let peer_only_dependencies = manifest
-        .dependencies([DependencyGroup::Peer])
-        .map(|(name, _)| name.to_string())
-        .filter(|name| !declared_dependencies.contains(name))
-        .collect::<HashSet<_>>();
+    let peer_only_dependencies =
+        pnpm_resolving_deps_resolver::PeerSet::from_manifest(manifest.value(), |_| false)
+            .taken()
+            .keys()
+            .filter(|name| !declared_dependencies.contains(*name))
+            .cloned()
+            .collect();
     (declared_dependencies, peer_only_dependencies)
 }
 
@@ -192,7 +229,7 @@ fn converted_deploy_lockfile(
 /// The deployed lockfile's `packages` map: every source package with its
 /// paths rewritten, plus a directory entry for each other workspace
 /// importer the deploy links.
-fn convert_deploy_packages(
+pub(super) fn convert_deploy_packages(
     lockfile: &Lockfile,
     project_id: &str,
     lockfile_dir: &Path,
@@ -205,86 +242,91 @@ fn convert_deploy_packages(
         let output_key = convert_package_key(key, ctx)?;
         packages.insert(output_key, convert_package_metadata(metadata, ctx)?);
     }
-    for importer_path in lockfile.importers.keys() {
-        if importer_path == project_id {
-            continue;
-        }
-        let project_root = lexical_normalize(&lockfile_dir.join(importer_path));
-        let package_key = create_file_url_key(&project_root, "", &selected.projects_by_path, None)?;
-        let (peer_dependencies, peer_dependencies_meta) = selected
-            .project_info(&project_root)
-            .map(|project| project.peer_blocks.clone())
-            .unwrap_or_default();
-        packages.insert(
-            package_key,
-            PackageMetadata {
-                resolution: LockfileResolution::Directory(DirectoryResolution {
-                    directory: relative_path(deploy_dir, &project_root),
-                }),
-                version: None,
-                engines: None,
-                cpu: None,
-                os: None,
-                libc: None,
-                deprecated: None,
-                has_bin: selected.has_bin(&project_root),
-                prepare: None,
-                bundled_dependencies: None,
-                peer_dependencies,
-                peer_dependencies_meta,
-            },
-        );
-    }
-    Ok(packages)
-}
-
-/// The deployed lockfile's `snapshots` map, and the linked workspace
-/// packages whose peers [`bind_singleton_peers`] still has to resolve.
-struct DeploySnapshots {
-    snapshots: HashMap<PkgNameVerPeer, SnapshotEntry>,
-    linked_workspace_projects: HashMap<PkgNameVerPeer, LinkedWorkspaceProject>,
-}
-
-fn convert_deploy_snapshots(
-    lockfile: &Lockfile,
-    project_id: &str,
-    lockfile_dir: &Path,
-    selected: &SelectedProject,
-    ctx: &ConvertCtx<'_>,
-) -> miette::Result<DeploySnapshots> {
-    let mut snapshots = HashMap::new();
-    for (key, snapshot) in lockfile.snapshots.iter().flatten() {
-        let output_key = convert_package_key(key, ctx)?;
-        snapshots.insert(output_key, convert_snapshot(snapshot, ctx, lockfile_dir)?);
-    }
-    let mut linked_workspace_projects = HashMap::new();
     for (importer_path, project_snapshot) in &lockfile.importers {
         if importer_path == project_id {
             continue;
         }
         let project_root = lexical_normalize(&lockfile_dir.join(importer_path));
-        let bases = ResolveBases { file_base: lockfile_dir, link_base: &project_root };
-        let package_key = create_file_url_key(&project_root, "", &selected.projects_by_path, None)?;
-        if let Some(project) = selected.project_info(&project_root)
-            && !project.peer_dependencies.is_empty()
+        for package_dir in
+            importer_package_dirs(&project_root, project_snapshot, &selected.projects_by_path)
         {
-            linked_workspace_projects.insert(
-                package_key.clone(),
-                LinkedWorkspaceProject::new(
-                    project.clone(),
-                    lockfile,
-                    project_snapshot,
-                    ctx,
-                    &bases,
-                ),
-            );
+            packages
+                .entry(create_file_url_key(&package_dir, "", &selected.projects_by_path, None)?)
+                .or_insert_with(|| {
+                    workspace_project_package_metadata(
+                        selected,
+                        &project_root,
+                        &package_dir,
+                        deploy_dir,
+                    )
+                });
         }
-        snapshots.insert(
-            package_key,
-            project_snapshot_to_snapshot_entry(project_snapshot, ctx, &bases)?,
-        );
     }
-    Ok(DeploySnapshots { snapshots, linked_workspace_projects })
+    Ok(packages)
+}
+
+/// The `packages:` entry of the workspace project at `project_root`,
+/// installed from `package_dir`.
+fn workspace_project_package_metadata(
+    selected: &SelectedProject,
+    project_root: &Path,
+    package_dir: &Path,
+    deploy_dir: &Path,
+) -> PackageMetadata {
+    let (peer_dependencies, peer_dependencies_meta) = selected
+        .project_info(project_root)
+        .map(|project| {
+            pnpm_resolving_deps_resolver::lockfile_peer_blocks(project.peer_set.declared())
+        })
+        .unwrap_or_default();
+    PackageMetadata {
+        specifiers: None,
+        resolution: LockfileResolution::Directory(DirectoryResolution {
+            directory: relative_path(deploy_dir, package_dir),
+        }),
+        version: None,
+        engines: None,
+        cpu: None,
+        os: None,
+        libc: None,
+        deprecated: None,
+        // Unknown for a publish directory, whose own manifest declares its
+        // bins.
+        has_bin: selected.has_bin(package_dir),
+        prepare: None,
+        bundled_dependencies: None,
+        peer_dependencies,
+        peer_dependencies_meta,
+    }
+}
+
+/// The directories the deploy installs the project at `project_root` from:
+/// its root, and the publish directory the other importers link it from,
+/// when both the project manifest and the lockfile record one that workspace
+/// links use.
+pub(super) fn importer_package_dirs(
+    project_root: &Path,
+    project_snapshot: &ProjectSnapshot,
+    projects_by_path: &HashMap<ProjectPathKey, ProjectInfo>,
+) -> impl Iterator<Item = PathBuf> {
+    std::iter::once(project_root.to_path_buf())
+        .chain(importer_linked_publish_dir(project_root, project_snapshot, projects_by_path))
+}
+
+fn importer_linked_publish_dir(
+    project_root: &Path,
+    project_snapshot: &ProjectSnapshot,
+    projects_by_path: &HashMap<ProjectPathKey, ProjectInfo>,
+) -> Option<PathBuf> {
+    let publish_directory = project_snapshot.publish_directory.as_deref()?;
+    if !project_snapshot.link_directory.unwrap_or(true) {
+        return None;
+    }
+    let publish_dir = lexical_normalize(&project_root.join(publish_directory));
+    let project = projects_by_path
+        .get(&ProjectPathKey::new(project_root))
+        .filter(|project| project.root_dir == project_root)?;
+    (project.linked_publish_dir.as_deref() == Some(&*publish_dir)).then_some(publish_dir)
 }
 
 /// A lockfile importer records a dependency group only when it has entries.
@@ -403,13 +445,11 @@ fn finish_deploy_files(
     manifest: Value,
     mut deploy_lockfile: Lockfile,
 ) -> miette::Result<DeployFiles> {
-    let (workspace_manifest, workspace_config) = deploy_workspace_settings(
-        lockfile,
-        config,
-        ctx.lockfile_dir,
-        ctx.deploy_dir,
-        &mut deploy_lockfile,
-    )?;
+    let (workspace_manifest, workspace_config) =
+        deploy_workspace_settings(lockfile, config, ctx, &mut deploy_lockfile)?;
+    if deploy_lockfile.is_next_format() {
+        deploy_lockfile.normalize_peer_keys_for_next_format()?;
+    }
 
     Ok(DeployFiles {
         manifest,

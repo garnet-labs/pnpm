@@ -3,12 +3,24 @@
 //! failed. A bail stopping the tasks still running is the second place pnpm
 //! differs on purpose.
 
-use super::{Leftover, launcher_args, surviving, write_fixture};
+use super::{
+    Leftover,
+    launcher_args,
+    surviving,
+    write_fixture,
+};
 use crate::_utils::wait_for_child;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::CommandTempCwd;
-use serde_json::{Value, json};
-use std::{fs, path::Path, process::Stdio};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    fs,
+    path::Path,
+    process::Stdio,
+};
 
 const LEFTOVERS: [Leftover; 2] = [Leftover::Detached, Leftover::Attached];
 
@@ -49,8 +61,8 @@ fn leftovers_of_a_finished_script_survive_a_recursive_run() {
 
     let mut run = pacquet
         .with_args(["--workspace-concurrency=1", "--no-sort", "-r", "run", "build"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .with_stdout(Stdio::null())
+        .with_stderr(Stdio::null())
         .spawn()
         .expect("spawn pacquet");
     let status = wait_for_child(&mut run);
@@ -81,8 +93,8 @@ fn leftovers_of_the_script_a_bail_follows_survive_it() {
 
     let mut run = pacquet
         .with_args(["--workspace-concurrency=2", "--no-sort", "-r", "run", "build"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .with_stdout(Stdio::null())
+        .with_stderr(Stdio::null())
         .spawn()
         .expect("spawn pacquet");
     let status = wait_for_child(&mut run);
@@ -105,22 +117,38 @@ fn recursive_run_bail_stops_running_scripts_gracefully_then_kills_them() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
     let graceful = r#"node -e "const fs = require('fs'); process.on('SIGTERM', () => { fs.writeFileSync('terminated.txt', ''); process.exit(0) }); fs.writeFileSync('ran.txt', ''); setInterval(() => {}, 1000)""#;
     let stubborn = r#"node -e "const fs = require('fs'); process.on('SIGTERM', () => fs.writeFileSync('terminated.txt', '')); fs.writeFileSync('ran.txt', String(process.pid)); setTimeout(() => process.exit(0), 60000)""#;
-    let fails = r#"node -e "const fs = require('fs'); const wait = () => fs.existsSync('../a-graceful/ran.txt') && fs.existsSync('../c-stubborn/ran.txt') ? process.exit(1) : setTimeout(wait, 10); wait()""#;
+    let fails = r#"node -e "const fs = require('fs'); fs.writeFileSync('ran.txt', ''); const wait = () => fs.existsSync('../a-graceful/ran.txt') && fs.existsSync('../c-stubborn/ran.txt') ? process.exit(1) : setTimeout(wait, 10); wait()""#;
     write_workspace(
         &workspace,
         &[("a-graceful", graceful), ("b-fails", fails), ("c-stubborn", stubborn)],
     );
 
+    // The tracker's trace says what pnpm signalled, which is what a failure
+    // here needs explained.
+    let log_path = root.path().join("pnpm.log");
+    let log = fs::File::create(&log_path).expect("create the pnpm log");
     let mut run = pacquet
+        .with_env("TRACE", "pacquet::process_tracker=debug")
         .with_args(["--workspace-concurrency=3", "--no-sort", "-r", "run", "build"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .with_stdout(
+            log.try_clone()
+                .expect("share the pnpm log")
+                .into(),
+        )
+        .with_stderr(log.into())
         .spawn()
         .expect("spawn pacquet");
+    let report = || bail_report(&workspace, &log_path);
     let stubborn_dir = workspace.join("c-stubborn");
     let asked_to_stop = stubborn_dir.join("terminated.txt");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !asked_to_stop.exists() && std::time::Instant::now() < deadline {
+    while !asked_to_stop.exists() {
+        if std::time::Instant::now() >= deadline {
+            let report = report();
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!("the stubborn script was not asked to stop within 30s\n{report}");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let stubborn: libc::pid_t = fs::read_to_string(stubborn_dir.join("ran.txt"))
@@ -130,31 +158,91 @@ fn recursive_run_bail_stops_running_scripts_gracefully_then_kills_them() {
     // Well inside the grace: the script that ignored `SIGTERM` is still
     // running, and pnpm still waits for it.
     std::thread::sleep(std::time::Duration::from_secs(1));
-    let running_in_grace = is_running(stubborn)
+    let running_in_grace = pnpm_testing_utils::process_liveness::is_running(stubborn)
         && run
             .try_wait()
             .expect("poll pnpm")
             .is_none();
-    let status = wait_for_child(&mut run);
-    assert!(!status.success(), "the failing project should fail the run");
+    let status = wait_for_child_reporting(&mut run, &report);
+    assert!(!status.success(), "the failing project should fail the run\n{}", report());
     for name in ["a-graceful", "c-stubborn"] {
         assert!(
             workspace
                 .join(name)
                 .join("terminated.txt")
                 .exists(),
-            "{name} should have been asked to stop with SIGTERM before pnpm exited",
+            "{name} should have been asked to stop with SIGTERM before pnpm exited\n{}",
+            report(),
         );
     }
-    assert!(running_in_grace, "the script that ignored SIGTERM gets its grace before the kill");
+    assert!(
+        running_in_grace,
+        "the script that ignored SIGTERM gets its grace before the kill\n{}",
+        report(),
+    );
     // The fixture gives up on its own well after this, so a failure leaves
     // nothing running for long and no recorded pid has to be signalled.
     assert!(
         ends_within(stubborn, std::time::Duration::from_secs(5)),
-        "the script that ignored SIGTERM should have been killed after the grace",
+        "the script that ignored SIGTERM should have been killed after the grace\n{}",
+        report(),
     );
 
     drop(root);
+}
+
+/// Like [`wait_for_child`], with `report` in the panic should `child` outlive
+/// the deadline. The report is taken before the child is stopped.
+#[cfg(unix)]
+fn wait_for_child_reporting(
+    child: &mut std::process::Child,
+    report: &dyn Fn() -> String,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + crate::_utils::CHILD_DEADLINE;
+    loop {
+        if let Some(status) = child.try_wait().expect("read child status") {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let report = report();
+            child.kill().expect("stop stalled child");
+            child.wait().expect("reap stalled child");
+            panic!("child did not finish before the deadline\n{report}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The state a failed bail test leaves: which projects' scripts ran and were
+/// asked to stop, pnpm's output with the tracker's trace, and the processes
+/// still running the fixture.
+#[cfg(unix)]
+fn bail_report(workspace: &Path, log_path: &Path) -> String {
+    let markers: Vec<String> = ["a-graceful", "b-fails", "c-stubborn"]
+        .iter()
+        .map(|name| {
+            let dir = workspace.join(name);
+            let ran = fs::read_to_string(dir.join("ran.txt")).ok();
+            let terminated = dir.join("terminated.txt").exists();
+            format!("{name}: ran.txt={ran:?} terminated.txt={terminated}")
+        })
+        .collect();
+    let log = fs::read_to_string(log_path).unwrap_or_else(|error| format!("<{error}>"));
+    let processes = std::process::Command::new("ps")
+        .with_args(["-A", "-o", "pid,ppid,pgid,stat,command"])
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.contains("node -e") || line.contains("PPID"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|error| format!("<{error}>"));
+    format!(
+        "--- markers ---\n{}\n--- pnpm output ---\n{log}\n--- processes ---\n{processes}",
+        markers.join("\n"),
+    )
 }
 
 /// A bail ends everything a running script started, even a detached process
@@ -200,8 +288,8 @@ fn recursive_run_bail_ends_a_detached_grandchild_of_a_running_script() {
 
     let mut run = pacquet
         .with_args(["--workspace-concurrency=2", "--no-sort", "-r", "run", "build"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .with_stdout(Stdio::null())
+        .with_stderr(Stdio::null())
         .spawn()
         .expect("spawn pacquet");
     let connection = super::killed::accept_detached_connection(&listener, &mut run);
@@ -212,25 +300,11 @@ fn recursive_run_bail_ends_a_detached_grandchild_of_a_running_script() {
     drop(root);
 }
 
-/// Whether `pid` still runs. A process that has exited but that its new
-/// parent has not reaped yet has stopped running.
-#[cfg(unix)]
-fn is_running(pid: libc::pid_t) -> bool {
-    // SAFETY: signal 0 only probes the process the fixture recorded.
-    let alive = unsafe { libc::kill(pid, 0) == 0 };
-    let zombie = fs::read_to_string(format!("/proc/{pid}/stat"))
-        .is_ok_and(|stat| {
-            stat.rsplit_once(") ")
-                .is_some_and(|(_, rest)| rest.starts_with('Z'))
-        });
-    alive && !zombie
-}
-
 /// Whether `pid` stops running within `deadline`.
 #[cfg(unix)]
 fn ends_within(pid: libc::pid_t, deadline: std::time::Duration) -> bool {
     let until = std::time::Instant::now() + deadline;
-    while is_running(pid) {
+    while pnpm_testing_utils::process_liveness::is_running(pid) {
         if std::time::Instant::now() >= until {
             return false;
         }

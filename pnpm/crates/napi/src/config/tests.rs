@@ -1,12 +1,23 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
     path::Path,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc,
+        Barrier,
+    },
     thread,
 };
 
 use super::{
-    ConfigOverlay, build_config, cache_key, config_cache, intern_config, overlay_default_registry,
+    ConfigOverlay,
+    build_config,
+    cache_key,
+    config_cache,
+    intern_config,
+    overlay_default_registry,
     pin_unkeyed_header,
 };
 
@@ -151,7 +162,7 @@ fn unkeyed_header_falls_back_to_npmjs_when_the_overlay_declares_no_registry() {
 }
 
 /// A default registry that is not a parseable URL leaves the unkeyed header
-/// nowhere safe to go, so it is dropped rather than keyed at `""` — where it
+/// nowhere safe to go, so it is dropped rather than keyed at `""`, where it
 /// would match every lookup.
 #[test]
 fn unkeyed_header_is_dropped_when_the_default_registry_is_unparsable() {
@@ -199,4 +210,17 @@ fn a_header_the_host_keyed_explicitly_wins_over_the_unkeyed_one() {
     let by_uri = pin_unkeyed_header(&headers, &overlay_default_registry(&overlay));
 
     assert_eq!(by_uri.get("//trusted.example.com/").map(String::as_str), Some("Bearer explicit"));
+}
+
+#[test]
+fn an_overlay_sets_project_scoped_optional_peers() {
+    let root = tempfile::tempdir().unwrap();
+    let overlay =
+        ConfigOverlay { project_scoped_optional_peers: Some(true), ..ConfigOverlay::default() };
+
+    assert!(build_config(root.path(), &overlay).unwrap().project_scoped_optional_peers);
+    assert!(
+        !build_config(root.path(), &ConfigOverlay::default()).unwrap()
+            .project_scoped_optional_peers,
+    );
 }

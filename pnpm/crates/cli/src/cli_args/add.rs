@@ -1,6 +1,23 @@
-pub use arguments::{AddIncludeArgs, AddInstallArgs, AddRequest, AddSaveArgs, AddTargetArgs};
+pub(crate) mod allow_build;
 
-pub(crate) use execution::{AddGroups, add_package, add_packages};
+pub use arguments::{
+    AddIncludeArgs,
+    AddInstallArgs,
+    AddRequest,
+    AddSaveArgs,
+    AddTargetArgs,
+};
+
+pub(crate) use allow_build::{
+    AllowBuildSelector,
+    apply_allow_build,
+    parse_allow_build_selectors,
+};
+pub(crate) use execution::{
+    AddGroups,
+    add_package,
+    add_packages,
+};
 
 mod arguments;
 
@@ -8,7 +25,10 @@ use crate::{
     State,
     cargo_manifest::CargoDependencyKind,
     cli_args::{
-        install::{included_dependency_groups, resolve_bool_override},
+        install::{
+            included_dependency_groups,
+            resolve_bool_override,
+        },
         lockfile_dir::LockfileDirArg,
         pipelines::InstallFamilySelection,
         recursive,
@@ -19,26 +39,49 @@ use crate::{
     engine_pm::{
         error::EngineError,
         pin::{
-            declared_package_manager, describe_pin, record_package_manager_pin, resolve_project_pin,
+            declared_package_manager,
+            describe_pin,
+            record_package_manager_pin,
+            resolve_project_pin,
         },
         selector::tool_install_selector,
     },
 };
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 
-use miette::{Context, Diagnostic, IntoDiagnostic};
+use miette::{
+    Context,
+    Diagnostic,
+    IntoDiagnostic,
+};
 use pnpm_config::Config;
-use pnpm_package_manager::{Add, build_workspace_packages_map, parse_allow_build_selector};
-use pnpm_package_manifest::DependencyGroup;
+use pnpm_package_manager::{
+    Add,
+    build_workspace_packages_map,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PROJECT_MANIFEST_BASENAMES,
+};
 use pnpm_registry::RangeSpecStyle;
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 use pnpm_resolving_resolver_base::WorkspacePackages;
-use pnpm_workspace_manifest_writer::set_allow_builds;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[derive(Debug, Clone, Args)]
@@ -213,7 +256,14 @@ pub struct AddArgs {
 }
 
 impl AddArgs {
-    pub(crate) fn check_workspace_root(&self, config: &Config, dir: &Path) -> miette::Result<()> {
+    /// `cli_dir` is the directory `pnpm add` was invoked from, which differs
+    /// from `dir` when that directory has no manifest of its own.
+    pub(crate) fn check_workspace_root(
+        &self,
+        config: &Config,
+        dir: &Path,
+        cli_dir: &Path,
+    ) -> miette::Result<()> {
         if config.recursive
             || config.workspace_root
             || resolve_bool_override(
@@ -228,6 +278,9 @@ impl AddArgs {
         let patterns = pnpm_workspace::read_workspace_manifest(dir)
             .into_diagnostic()?
             .map(|manifest| pnpm_workspace::workspace_package_patterns(&manifest));
+        if is_uninitialized_workspace_project_dir(config, dir, cli_dir, patterns.as_deref())? {
+            return Err(AddError::AddingToRootFromUninitializedProject.into());
+        }
         if patterns
             .as_ref()
             .is_some_and(|patterns| patterns.len() > 1)
@@ -258,6 +311,7 @@ impl AddArgs {
         }
         config.optional =
             resolve_bool_override(self.install.optional, self.install.no_optional, config.optional);
+        config.cli.included_dependency_groups = Some(self.included_groups(config));
         if self.install.force {
             config.cli_settings.insert("force".to_string());
         }
@@ -362,46 +416,31 @@ fn workspace_selectors(
         .collect()
 }
 
-/// Honor `--allow-build`: reject any package the root project explicitly
-/// disallows (`allowBuilds: false`), persist the allowed names to
-/// `settings_dir`'s `pnpm-workspace.yaml`, and enable them for this
-/// install. `settings_dir` is the workspace root, or the project
-/// directory outside a workspace. Mirrors pnpm's `add` handler.
-pub(crate) fn apply_allow_build(
-    config: &mut Config,
-    allow_build: &[String],
-    settings_dir: &Path,
-) -> miette::Result<()> {
-    if allow_build.is_empty() {
-        return Ok(());
+/// `pnpm add` run from a directory that the workspace patterns select but
+/// that has no manifest yet falls back to the workspace root. Such a
+/// directory is most likely a package that was not initialized.
+fn is_uninitialized_workspace_project_dir(
+    config: &Config,
+    workspace_dir: &Path,
+    cli_dir: &Path,
+    patterns: Option<&[String]>,
+) -> miette::Result<bool> {
+    if cli_dir == workspace_dir
+        || PROJECT_MANIFEST_BASENAMES
+            .iter()
+            .any(|basename| cli_dir.join(basename).exists())
+    {
+        return Ok(false);
     }
-    let mut allow_build_map: Vec<(&str, bool)> = Vec::with_capacity(allow_build.len());
-    let mut allowed_only: Vec<&str> = Vec::new();
-    for pkg in allow_build {
-        let (name, allowed) = parse_allow_build_selector(pkg);
-        if name.is_empty() {
-            return Err(AllowBuildError::MissingPackage.into());
-        }
-        allow_build_map.push((name, allowed));
-        if allowed {
-            allowed_only.push(name);
-        }
-    }
-    let overlap: Vec<&str> = allowed_only
-        .into_iter()
-        .filter(|pkg| config.allow_builds.get(*pkg) == Some(&false))
-        .collect();
-    if !overlap.is_empty() {
-        return Err(AllowBuildError::OverridingIgnoredBuiltDependencies {
-            dependencies: overlap.join(", "),
-        }
-        .into());
-    }
-    set_allow_builds(settings_dir, allow_build_map.iter().copied()).into_diagnostic()?;
-    for (name, is_allow) in allow_build_map {
-        config.allow_builds.insert(name.to_string(), is_allow);
-    }
-    Ok(())
+    let opts = pnpm_workspace::FindWorkspaceProjectsOpts {
+        patterns: Some(
+            patterns
+                .map(<[String]>::to_vec)
+                .unwrap_or_else(|| vec![".".to_string()]),
+        ),
+        ignored_directories: config.managed_directories(),
+    };
+    pnpm_workspace::is_workspace_project_dir(workspace_dir, cli_dir, &opts).into_diagnostic()
 }
 
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -412,6 +451,12 @@ pub enum AddError {
     )]
     #[diagnostic(code(ERR_PNPM_ADDING_TO_ROOT))]
     AddingToRoot,
+
+    #[display(
+        r#"Running this command in a workspace package directory without a package manifest will add the dependency to the workspace root, which might not be what you want. If this directory is meant to be a package, create a package manifest first, for example by running "pnpm init" to generate a package.json. If you really meant it, make it explicit by running this command again with the -w flag (or --workspace-root). If you don't want to see this warning anymore, you may set the ignore-workspace-root-check setting to true."#
+    )]
+    #[diagnostic(code(ERR_PNPM_ADDING_TO_ROOT))]
+    AddingToRootFromUninitializedProject,
 
     #[display(
         "Cannot declare {request} as the package manager of a filtered selection of projects"
@@ -444,27 +489,6 @@ pub enum AddError {
         #[error(not(source))]
         selector: String,
     },
-}
-
-#[derive(Debug, Display, Error, Diagnostic)]
-#[non_exhaustive]
-pub enum AllowBuildError {
-    #[display(
-        "The following dependencies are ignored by the root project, but are allowed to be built by the current command: {dependencies}"
-    )]
-    #[diagnostic(
-        code(ERR_PNPM_OVERRIDING_IGNORED_BUILT_DEPENDENCIES),
-        help(
-            "If you are sure you want to allow those dependencies to run installation scripts, remove them from the allowBuilds list (or change their value to true)."
-        )
-    )]
-    OverridingIgnoredBuiltDependencies { dependencies: String },
-
-    #[display(
-        "The --allow-build flag is missing a package name. Please specify the package name(s) that are allowed to run installation scripts."
-    )]
-    #[diagnostic(code(ERR_PNPM_ALLOW_BUILD_MISSING_PACKAGE))]
-    MissingPackage,
 }
 
 #[cfg(test)]

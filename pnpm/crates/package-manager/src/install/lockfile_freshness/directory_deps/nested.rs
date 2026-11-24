@@ -4,16 +4,32 @@
 //! it never reaches them.
 
 use super::{
-    FreshnessCheckError, ImporterSatisfactionCheck, LocalDepContext, is_deploy_file_url,
+    FreshnessCheckError,
+    ImporterSatisfactionCheck,
+    LocalDepContext,
+    is_deploy_file_url,
     package::check_single_directory_dep_freshness,
-    scope::{AliasScope, Visited, importer_aliases, snapshot_aliases},
+    scope::{
+        AliasScope,
+        Visited,
+        importer_aliases,
+        snapshot_aliases,
+    },
     spec_dirs,
 };
 use pnpm_lockfile::{
-    Lockfile, LockfileResolution, PackageKey, PkgName, SnapshotDepRef, SnapshotEntry,
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+    PkgName,
+    SnapshotDepRef,
+    SnapshotEntry,
 };
 use pnpm_package_manifest::DependencyGroup;
-use std::collections::{HashMap, HashSet};
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 
 /// A directory package beneath a package that is not one.
 pub(crate) struct NestedDirectoryPackage {
@@ -134,9 +150,7 @@ impl<'n> NestedByImporter<'n> {
     }
 
     pub(crate) fn of(&self, importer_id: &str) -> &[&'n NestedDirectoryPackage] {
-        self.0
-            .get(importer_id)
-            .map_or(&[], Vec::as_slice)
+        self.0.get(importer_id).map_or_default(Vec::as_slice)
     }
 }
 
@@ -197,13 +211,6 @@ impl<'a> DirectoryPackages<'a> {
     }
 }
 
-/// Checks `nested` as the importer walk checks a directory package. The
-/// `file:` and `workspace:` declarations can read different manifests (see
-/// [`super::unhooked_manifest`]), and the lockfile does not record which one
-/// the parent used, so the snapshot must match both. Where they differ, a
-/// lockfile the resolver just wrote fails the check: the price of never
-/// accepting a stale one until the lockfile records the declaration
-/// (pnpm/tasks#228).
 pub(crate) fn check_nested_directory_package(
     check: &ImporterSatisfactionCheck<'_>,
     nested: &NestedDirectoryPackage,
@@ -217,7 +224,29 @@ pub(crate) fn check_nested_directory_package(
     let snapshot = check.lockfile.snapshots
         .as_ref()
         .and_then(|snapshots| snapshots.get(&nested.key));
-    let dir = check.lockfile_dir.join(&nested.directory);
+    let dir =
+        pnpm_resolving_deps_resolver::directory_package_dir(check.lockfile_dir, &nested.directory);
+    let scope = nested_scope(check, nested);
+    let dep = LocalDepContext {
+        name: &nested.alias,
+        rel_path: &nested.directory,
+        dir: &dir,
+        dirs: spec_dirs(check),
+        catalogs: check.workspace.catalogs,
+    };
+    check_single_directory_dep_freshness(
+        check,
+        &scope,
+        &dep,
+        (&nested.key, snapshot, pkg_meta),
+        &mut Visited::new(check.lockfile),
+    )
+}
+
+fn nested_scope(
+    check: &ImporterSatisfactionCheck<'_>,
+    nested: &NestedDirectoryPackage,
+) -> AliasScope {
     let mut scope = nested.ancestor_aliases.clone();
     scope.extend(
         check.lockfile.importers
@@ -225,27 +254,7 @@ pub(crate) fn check_nested_directory_package(
             .into_iter()
             .flat_map(importer_aliases),
     );
-    let visited = Visited::new(check.lockfile);
-    let check_declared = |declared_as_file| {
-        let dep = LocalDepContext {
-            name: &nested.alias,
-            declared_as_file,
-            rel_path: &nested.directory,
-            dir: &dir,
-            dirs: spec_dirs(check),
-            catalogs: check.workspace.catalogs,
-        };
-        check_single_directory_dep_freshness(
-            check,
-            &scope,
-            &dep,
-            (&nested.key, snapshot, pkg_meta),
-            &mut visited.clone(),
-        )
-    };
-    let declared_as_workspace = false;
-    let declared_as_file = true;
-    check_declared(declared_as_workspace).and_then(|()| check_declared(declared_as_file))
+    scope
 }
 
 fn snapshot_dependencies(

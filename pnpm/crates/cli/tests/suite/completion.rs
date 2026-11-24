@@ -1,4 +1,5 @@
 use assert_cmd::prelude::*;
+use command_extra::CommandExtra;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -17,6 +18,22 @@ fn stderr(output: std::process::Output) -> String {
 }
 
 #[test]
+fn completion_server_uses_the_line_prefix_without_words() {
+    let project = project_with_scripts(&["build🚀test", "build🚦test"]);
+    for (shell, cursor) in [("bash", "15"), ("pwsh", "16")] {
+        let output = pacquet()
+            .with_current_dir(project.path())
+            .with_arg("completion-server")
+            .with_env("SHELL", shell)
+            .with_env("COMP_LINE", "pnpm run build🚀 trailing")
+            .with_env("COMP_POINT", cursor)
+            .output()
+            .unwrap();
+        assert_eq!(stdout(output), "build🚀test\n");
+    }
+}
+
+#[test]
 fn completion_scripts_are_lightweight_shims_for_pnpm_supported_shells() {
     let cases = [
         ("bash", "_pnpm_completion"),
@@ -27,7 +44,7 @@ fn completion_scripts_are_lightweight_shims_for_pnpm_supported_shells() {
 
     for (shell, marker) in cases {
         let output = pacquet()
-            .args(["completion", shell])
+            .with_args(["completion", shell])
             .output()
             .expect("run pacquet completion");
         let script = stdout(output);
@@ -50,7 +67,7 @@ fn completion_scripts_do_not_expose_redundant_parameter_plumbing() {
 
     for (shell, leaked_marker) in cases {
         let output = pacquet()
-            .args(["completion", shell])
+            .with_args(["completion", shell])
             .output()
             .expect("run pacquet completion");
         let script = stdout(output);
@@ -65,7 +82,7 @@ fn completion_scripts_do_not_expose_redundant_parameter_plumbing() {
 fn completion_scripts_preserve_current_token_for_fish_and_pwsh() {
     let fish = stdout(
         pacquet()
-            .args(["completion", "fish"])
+            .with_args(["completion", "fish"])
             .output()
             .expect("run pacquet completion"),
     );
@@ -73,7 +90,7 @@ fn completion_scripts_preserve_current_token_for_fish_and_pwsh() {
 
     let pwsh = stdout(
         pacquet()
-            .args(["completion", "pwsh"])
+            .with_args(["completion", "pwsh"])
             .output()
             .expect("run pacquet completion"),
     );
@@ -83,7 +100,7 @@ fn completion_scripts_preserve_current_token_for_fish_and_pwsh() {
 #[test]
 fn completion_server_lists_top_level_commands() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", ""])
+        .with_args(["completion-server", "--", "pnpm", ""])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -107,7 +124,7 @@ fn completion_server_lists_top_level_commands() {
 fn completion_server_answers_the_pn_alias_like_pnpm() {
     let reply = |binary: &str| {
         let output = pacquet()
-            .args(["completion-server", "--", binary, ""])
+            .with_args(["completion-server", "--", binary, ""])
             .output()
             .expect("run pnpm completion-server");
         stdout(output)
@@ -121,7 +138,7 @@ fn completion_server_answers_the_pn_alias_like_pnpm() {
 #[test]
 fn completion_server_lists_options_for_current_command() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "install", "--"])
+        .with_args(["completion-server", "--", "pnpm", "install", "--"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -149,7 +166,7 @@ fn completion_server_lists_options_for_current_command() {
 #[test]
 fn completion_server_lists_option_values() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "--reporter", ""])
+        .with_args(["completion-server", "--", "pnpm", "--reporter", ""])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -183,7 +200,7 @@ fn completion_server_lists_option_values() {
 #[test]
 fn completion_server_lists_option_values_only_after_option_name() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "--reporter", "default", ""])
+        .with_args(["completion-server", "--", "pnpm", "--reporter", "default", ""])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -205,7 +222,7 @@ fn completion_server_lists_option_values_only_after_option_name() {
 #[test]
 fn completion_server_does_not_treat_option_values_as_commands() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "--filter", "install", ""])
+        .with_args(["completion-server", "--", "pnpm", "--filter", "install", ""])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -222,7 +239,7 @@ fn completion_server_does_not_treat_option_values_as_commands() {
 #[test]
 fn completion_server_stops_after_double_dash_separator() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "--", "--rep"])
+        .with_args(["completion-server", "--", "pnpm", "--", "--rep"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -233,7 +250,7 @@ fn completion_server_stops_after_double_dash_separator() {
 #[test]
 fn completion_server_lists_nested_subcommands() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "store", ""])
+        .with_args(["completion-server", "--", "pnpm", "store", ""])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -250,7 +267,7 @@ fn completion_server_lists_nested_subcommands() {
 #[test]
 fn completion_server_lists_ci_command() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "ci", "--"])
+        .with_args(["completion-server", "--", "pnpm", "ci", "--"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -271,8 +288,10 @@ fn completion_server_lists_ci_command() {
 
 #[test]
 fn completion_server_completes_ci_aliases() {
+    let project = TempDir::new().unwrap();
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "ci"])
+        .with_current_dir(project.path())
+        .with_args(["completion-server", "--", "pnpm", "ci"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -283,7 +302,7 @@ fn completion_server_completes_ci_aliases() {
 #[test]
 fn completion_server_completes_clean_install_alias() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "clean-install"])
+        .with_args(["completion-server", "--", "pnpm", "clean-install"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -294,7 +313,7 @@ fn completion_server_completes_clean_install_alias() {
 #[test]
 fn completion_server_completes_ic_alias() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "ic"])
+        .with_args(["completion-server", "--", "pnpm", "ic"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -305,7 +324,7 @@ fn completion_server_completes_ic_alias() {
 #[test]
 fn completion_server_completes_install_clean_alias() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "install-clean"])
+        .with_args(["completion-server", "--", "pnpm", "install-clean"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -316,7 +335,7 @@ fn completion_server_completes_install_clean_alias() {
 #[test]
 fn completion_server_filters_command_prefixes() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "inst"])
+        .with_args(["completion-server", "--", "pnpm", "inst"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -330,8 +349,8 @@ fn completion_server_filters_option_prefixes() {
         [vec!["pnpm", "--rep"], vec!["pnpm", "--filter", "--rep"], vec!["pnpm", "-F", "--rep"]]
     {
         let output = pacquet()
-            .args(["completion-server", "--"])
-            .args(&words)
+            .with_args(["completion-server", "--"])
+            .with_args(&words)
             .output()
             .expect("run pnpm completion-server");
         let reply = stdout(output);
@@ -342,7 +361,7 @@ fn completion_server_filters_option_prefixes() {
 #[test]
 fn completion_server_filters_option_value_prefixes() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "--reporter", "a"])
+        .with_args(["completion-server", "--", "pnpm", "--reporter", "a"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -353,7 +372,7 @@ fn completion_server_filters_option_value_prefixes() {
 #[test]
 fn completion_server_completes_equals_option_values() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "--reporter=de"])
+        .with_args(["completion-server", "--", "pnpm", "--reporter=de"])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -364,7 +383,7 @@ fn completion_server_completes_equals_option_values() {
 #[test]
 fn completion_server_lists_completion_shells() {
     let output = pacquet()
-        .args(["completion-server", "--", "pnpm", "completion", ""])
+        .with_args(["completion-server", "--", "pnpm", "completion", ""])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -377,9 +396,9 @@ fn completion_server_does_not_require_a_project_or_existing_dir_argument() {
     let root = TempDir::new().expect("temp dir");
     let missing_dir = root.path().join("missing");
     let output = pacquet()
-        .args(["--dir"])
-        .arg(&missing_dir)
-        .args(["completion-server", "--", "pnpm", "completion", ""])
+        .with_args(["--dir"])
+        .with_arg(&missing_dir)
+        .with_args(["completion-server", "--", "pnpm", "completion", ""])
         .output()
         .expect("run pnpm completion-server");
     let reply = stdout(output);
@@ -390,7 +409,7 @@ fn completion_server_does_not_require_a_project_or_existing_dir_argument() {
 #[test]
 fn completion_missing_shell_errors_like_pnpm() {
     let output = pacquet()
-        .arg("completion")
+        .with_arg("completion")
         .output()
         .expect("run pacquet completion");
     let err = stderr(output);
@@ -400,7 +419,7 @@ fn completion_missing_shell_errors_like_pnpm() {
 #[test]
 fn completion_unsupported_shell_errors_like_pnpm() {
     let output = pacquet()
-        .args(["completion", "elvish"])
+        .with_args(["completion", "elvish"])
         .output()
         .expect("run pacquet completion");
     let err = stderr(output);
@@ -411,7 +430,7 @@ fn completion_unsupported_shell_errors_like_pnpm() {
 #[test]
 fn completion_redundant_parameters_error_like_pnpm() {
     let output = pacquet()
-        .args(["completion", "bash", "fish", "pwsh"])
+        .with_args(["completion", "bash", "fish", "pwsh"])
         .output()
         .expect("run pacquet completion");
     let err = stderr(output);
@@ -423,9 +442,9 @@ fn completion_does_not_require_a_project_or_existing_dir_argument() {
     let root = TempDir::new().expect("temp dir");
     let missing_dir = root.path().join("missing");
     let output = pacquet()
-        .args(["--dir"])
-        .arg(&missing_dir)
-        .args(["completion", "zsh"])
+        .with_args(["--dir"])
+        .with_arg(&missing_dir)
+        .with_args(["completion", "zsh"])
         .output()
         .expect("run pacquet completion");
     let script = stdout(output);
@@ -437,12 +456,17 @@ fn completion_server_completes_project_scripts() {
     let project = TempDir::new().unwrap();
     std::fs::write(
         project.path().join("package.json"),
-        r#"{"scripts":{"hello":"echo hi","build":"echo b","build:watch":"echo w"}}"#,
+        r#"{"scripts":{".hidden":"echo h","adduser":"echo a","hello":"echo hi","build":"echo b","build:watch":"echo w"}}"#,
     )
     .unwrap();
     for shell in ["bash", "fish", "pwsh", "zsh"] {
         for (words, expected) in [
-            (vec!["pnpm", "run", ""], "build\nbuild:watch\nhello\n"),
+            (vec!["pn", "he"], "help\nhello\n"),
+            (vec!["pnpm", "build:"], "build:watch\n"),
+            (vec!["pnpm", "add"], "add\nadduser\n"),
+            (vec!["pnpm", ".hid"], ""),
+            (vec!["pnpm", "hello", "he"], "help\n"),
+            (vec!["pnpm", "run", ""], ".hidden\nadduser\nbuild\nbuild:watch\nhello\n"),
             (vec!["pnpm", "run", "bu"], "build\nbuild:watch\n"),
             (vec!["pnpm", "run", "build:"], "build:watch\n"),
             (vec!["pnpm", "--color", "run", "he"], "hello\n"),
@@ -453,10 +477,10 @@ fn completion_server_completes_project_scripts() {
             (vec!["pnpm", "run", "--", ""], ""),
         ] {
             let output = pacquet()
-                .current_dir(project.path())
-                .env("SHELL", shell)
-                .args(["completion-server", "--"])
-                .args(&words)
+                .with_current_dir(project.path())
+                .with_env("SHELL", shell)
+                .with_args(["completion-server", "--"])
+                .with_args(&words)
                 .output()
                 .unwrap();
             let expected =
@@ -473,12 +497,15 @@ fn completion_server_finds_scripts_from_project_subdirectories() {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(project.path().join("package.json"), r#"{"scripts":{"hello":"echo hi"}}"#)
         .unwrap();
-    let output = pacquet()
-        .current_dir(nested)
-        .args(["completion-server", "--", "pnpm", "run", ""])
-        .output()
-        .unwrap();
-    assert_eq!(stdout(output), "hello\n");
+    for words in [&["pnpm", "run", ""][..], &["pnpm", "hell"]] {
+        let output = pacquet()
+            .with_current_dir(&nested)
+            .with_args(["completion-server", "--"])
+            .with_args(words)
+            .output()
+            .unwrap();
+        assert_eq!(stdout(output), "hello\n");
+    }
 }
 
 #[test]
@@ -489,8 +516,8 @@ fn completion_server_handles_projects_without_scripts() {
             std::fs::write(project.path().join("package.json"), manifest).unwrap();
         }
         let output = pacquet()
-            .current_dir(project.path())
-            .args(["completion-server", "--", "pnpm", "run", ""])
+            .with_current_dir(project.path())
+            .with_args(["completion-server", "--", "pnpm", "run", ""])
             .output()
             .unwrap();
         assert_eq!(stdout(output), "");
@@ -515,16 +542,22 @@ fn completion_server_respects_project_directory_options() {
         vec!["pnpm", "--prefix=target-project", "run", ""],
     ] {
         let output = pacquet()
-            .current_dir(project.path())
-            .args(["completion-server", "--"])
-            .args(&words)
+            .with_current_dir(project.path())
+            .with_args(["completion-server", "--"])
+            .with_args(&words)
             .output()
             .unwrap();
         assert_eq!(stdout(output), "hello\n", "{words:?}");
     }
     let output = pacquet()
-        .current_dir(project.path())
-        .args(["completion-server", "--", "pnpm", "run", "--dir", ""])
+        .with_current_dir(project.path())
+        .with_args(["completion-server", "--", "pnpm", "run", "--dir", ""])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(output), "target-project/\n");
+    let output = pacquet()
+        .with_current_dir(project.path())
+        .with_args(["completion-server", "--", "pnpm", "run", "--registry", ""])
         .output()
         .unwrap();
     assert_eq!(stdout(output), "");
@@ -535,8 +568,8 @@ fn completion_server_reports_invalid_script_manifests() {
     let project = TempDir::new().unwrap();
     std::fs::write(project.path().join("package.json"), "{").unwrap();
     let output = pacquet()
-        .current_dir(project.path())
-        .args(["completion-server", "--", "pnpm", "run", ""])
+        .with_current_dir(project.path())
+        .with_args(["completion-server", "--", "pnpm", "run", ""])
         .output()
         .unwrap();
     let error = stderr(output);
@@ -553,8 +586,8 @@ fn completion_server_uses_the_nearest_project_manifest() {
         .unwrap();
     std::fs::write(child.join("package.yaml"), "scripts:\n  child: echo child\n").unwrap();
     let output = pacquet()
-        .current_dir(nested)
-        .args(["completion-server", "--", "pnpm", "run", ""])
+        .with_current_dir(nested)
+        .with_args(["completion-server", "--", "pnpm", "run", ""])
         .output()
         .unwrap();
     assert_eq!(stdout(output), "child\n");
@@ -567,8 +600,8 @@ fn completion_server_does_not_search_above_explicit_directories() {
     std::fs::write(project.path().join("package.json"), r#"{"scripts":{"parent":"echo parent"}}"#)
         .unwrap();
     let output = pacquet()
-        .current_dir(project.path())
-        .args(["completion-server", "--", "pnpm", "--dir", "subdir", "run", ""])
+        .with_current_dir(project.path())
+        .with_args(["completion-server", "--", "pnpm", "--dir", "subdir", "run", ""])
         .output()
         .unwrap();
     assert_eq!(stdout(output), "");
@@ -592,16 +625,15 @@ fn completion_server_respects_workspace_root_selection() {
         &["-C", "--workspace-root"],
     ] {
         for after_command in [false, true] {
-            let mut command = pacquet();
-            command
-                .current_dir(&child)
-                .args(["completion-server", "--", "pnpm"]);
+            let mut command = pacquet()
+                .with_current_dir(&child)
+                .with_args(["completion-server", "--", "pnpm"]);
             if after_command {
-                command.arg("run").args(flags);
+                command = command.with_arg("run").with_args(flags);
             } else {
-                command.args(flags).arg("run");
+                command = command.with_args(flags).with_arg("run");
             }
-            let output = command.arg("").output().unwrap();
+            let output = command.with_arg("").output().unwrap();
             assert_eq!(stdout(output), "root\n", "{flags:?}, after_command={after_command}");
         }
     }
@@ -622,15 +654,15 @@ fn completion_powershell_preserves_literal_script_names() {
     let project = project_with_scripts(&names);
     let mut script = stdout(
         pacquet()
-            .args(["completion", "pwsh"])
+            .with_args(["completion", "pwsh"])
             .output()
             .unwrap(),
     );
     script.push_str(include_str!("completion/powershell_safety.ps1"));
     let output = Command::new("pwsh")
-        .current_dir(project.path())
-        .env("PATH", prepend_binary_dir_to_path())
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .with_current_dir(project.path())
+        .with_env("PATH", prepend_binary_dir_to_path())
+        .with_args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .unwrap();
     let reply = stdout(output);
@@ -667,7 +699,7 @@ fn completion_bash_preserves_literal_script_names() {
     std::fs::write(project.path().join("expanded-literal"), "").unwrap();
     let mut script = stdout(
         pacquet()
-            .args(["completion", "bash"])
+            .with_args(["completion", "bash"])
             .output()
             .unwrap(),
     );
@@ -683,9 +715,9 @@ printf '%s\n' "$@"
 "#,
     );
     let output = Command::new("bash")
-        .current_dir(project.path())
-        .env("PATH", prepend_binary_dir_to_path())
-        .args(["--noprofile", "--norc", "-c", &script])
+        .with_current_dir(project.path())
+        .with_env("PATH", prepend_binary_dir_to_path())
+        .with_args(["--noprofile", "--norc", "-c", &script])
         .output()
         .unwrap();
     let reply = stdout(output);
@@ -701,30 +733,34 @@ fn completion_bash_completes_words_split_at_word_breaks() {
     let project = project_with_scripts(&["build", "test:e2e", "test:unit"]);
     let completion_script = stdout(
         pacquet()
-            .args(["completion", "bash"])
+            .with_args(["completion", "bash"])
             .output()
             .unwrap(),
     );
-    let cases: [(&str, &str, &[&str]); 3] = [
-        ("(pnpm run test : u)", "pnpm run test:u", &["unit"]),
-        ("(pnpm run test :)", "pnpm run test:", &["e2e", "unit"]),
-        ("(pnpm install --reporter = app)", "pnpm install --reporter=app", &["append-only"]),
+    let cases: [(&str, &str, usize, &[&str]); 4] = [
+        ("(pnpm run test : u)", "pnpm run test:u|", 4, &["unit"]),
+        ("(pnpm run test :)", "pnpm run test:|", 3, &["e2e", "unit"]),
+        ("(pnpm install --reporter = app)", "pnpm install --reporter=app|", 4, &["append-only"]),
+        ("(pnpm completion fishy trailing)", "pnpm completion fish|y trailing", 2, &["fish"]),
     ];
-    for (words, line, expected) in cases {
+    for (words, marked_line, current_word, expected) in cases {
+        let (prefix, suffix) = marked_line.split_once('|').unwrap();
+        let line = format!("{prefix}{suffix}");
+        let point = prefix.chars().count();
         let bash_script = format!(
             r#"{completion_script}
 COMP_WORDS={words}
-COMP_CWORD=$((${{#COMP_WORDS[@]}} - 1))
+COMP_CWORD={current_word}
 COMP_LINE='{line}'
-COMP_POINT=${{#COMP_LINE}}
+COMP_POINT={point}
 _pnpm_completion
 printf '%s\n' "${{COMPREPLY[@]}}"
 "#,
         );
         let output = Command::new("bash")
-            .current_dir(project.path())
-            .env("PATH", prepend_binary_dir_to_path())
-            .args(["--noprofile", "--norc", "-c", &bash_script])
+            .with_current_dir(project.path())
+            .with_env("PATH", prepend_binary_dir_to_path())
+            .with_args(["--noprofile", "--norc", "-c", &bash_script])
             .output()
             .unwrap();
         let reply = stdout(output);
@@ -740,8 +776,8 @@ fn completion_server_accepts_attached_hyphen_prefixed_directories() {
     std::fs::write(target.join("package.json"), r#"{"scripts":{"hello":"echo hi"}}"#).unwrap();
     for option in ["--dir=-target", "--prefix=-target", "-C-target", "-rC-target"] {
         let output = pacquet()
-            .current_dir(project.path())
-            .args(["completion-server", "--", "pnpm", "run", option, ""])
+            .with_current_dir(project.path())
+            .with_args(["completion-server", "--", "pnpm", "run", option, ""])
             .output()
             .unwrap();
         assert_eq!(stdout(output), "hello\n", "{option}");
@@ -762,144 +798,4 @@ fn project_with_scripts(names: &[&str]) -> TempDir {
     project
 }
 
-#[test]
-fn completion_server_completes_workspace_filter_values() {
-    let workspace = TempDir::new().unwrap();
-    std::fs::write(workspace.path().join("package.json"), r#"{"name":"root"}"#).unwrap();
-    std::fs::write(
-        workspace.path().join("pnpm-workspace.yaml"),
-        "packages:\n  - packages/*\n  - '!packages/excluded'\n",
-    )
-    .unwrap();
-    for (directory, manifest) in [
-        ("foo", r#"{"name":"pkg-foo"}"#),
-        ("bar", r#"{"name":"@scope/bar"}"#),
-        ("unnamed", "{}"),
-        ("excluded", r#"{"name":"excluded"}"#),
-    ] {
-        let directory = workspace
-            .path()
-            .join("packages")
-            .join(directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("package.json"), manifest).unwrap();
-    }
-    for words in [
-        vec!["pnpm", "--filter", ""],
-        vec!["pnpm", "-F", ""],
-        vec!["pnpm", "run", "--filter", ""],
-        vec!["pnpm", "--filter", "pkg-foo", "-F", ""],
-    ] {
-        let output = pacquet()
-            .current_dir(workspace.path())
-            .args(["completion-server", "--"])
-            .args(&words)
-            .output()
-            .unwrap();
-        assert_eq!(stdout(output), "@scope/bar\npkg-foo\nroot\n", "{words:?}");
-    }
-    for (prefix, expected) in [("pkg", "pkg-foo\n"), ("@scope/", "@scope/bar\n"), ("missing", "")] {
-        let output = pacquet()
-            .current_dir(workspace.path().join("packages/foo"))
-            .args(["completion-server", "--", "pnpm", "-F", prefix])
-            .output()
-            .unwrap();
-        assert_eq!(stdout(output), expected, "{prefix}");
-    }
-    for directory_option in
-        [vec!["--dir", "packages/foo"], vec!["-Cpackages/foo"], vec!["--prefix=packages/foo"]]
-    {
-        let output = pacquet()
-            .current_dir(workspace.path())
-            .args(["completion-server", "--", "pnpm"])
-            .args(&directory_option)
-            .args(["--filter", "pkg"])
-            .output()
-            .unwrap();
-        assert_eq!(stdout(output), "pkg-foo\n", "{directory_option:?}");
-    }
-}
-
-#[test]
-fn completion_server_filter_values_without_workspace() {
-    for (manifest, expected) in
-        [(None, ""), (Some("{}"), ""), (Some(r#"{"name":"standalone"}"#), "standalone\n")]
-    {
-        let project = TempDir::new().unwrap();
-        if let Some(manifest) = manifest {
-            std::fs::write(project.path().join("package.json"), manifest).unwrap();
-        }
-        let output = pacquet()
-            .current_dir(project.path())
-            .args(["completion-server", "--", "pnpm", "--filter", ""])
-            .output()
-            .unwrap();
-        assert_eq!(stdout(output), expected);
-    }
-}
-
-#[test]
-fn completion_server_filter_respects_root_only_workspaces() {
-    for config in ["packages: []\n", "linkWorkspacePackages: true\n"] {
-        let workspace = TempDir::new().unwrap();
-        let child = workspace.path().join("child");
-        std::fs::create_dir(&child).unwrap();
-        std::fs::write(workspace.path().join("package.json"), r#"{"name":"root"}"#).unwrap();
-        std::fs::write(child.join("package.json"), r#"{"name":"child"}"#).unwrap();
-        std::fs::write(workspace.path().join("pnpm-workspace.yaml"), config).unwrap();
-        let output = pacquet()
-            .current_dir(workspace.path())
-            .args(["completion-server", "--", "pnpm", "--filter", ""])
-            .output()
-            .unwrap();
-        assert_eq!(stdout(output), "root\n", "{config}");
-    }
-}
-
-#[test]
-fn completion_server_omits_unsafe_package_and_script_names() {
-    let workspace = TempDir::new().unwrap();
-    let unsafe_names = [
-        "bad\nname",
-        "bad\rname",
-        "bad\tname",
-        "bad\u{1b}[31mname",
-        "bad\u{7f}name",
-        "bad\u{85}name",
-        "bad\u{202e}name",
-        "bad\u{2028}name",
-    ];
-    let scripts: serde_json::Map<_, _> = std::iter::once("safe")
-        .chain(unsafe_names)
-        .map(|name| (name.to_string(), serde_json::json!("echo unused")))
-        .collect();
-    std::fs::write(
-        workspace.path().join("package.json"),
-        serde_json::to_vec(&serde_json::json!({"name": "safe", "scripts": scripts})).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(workspace.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
-        .unwrap();
-    for (index, name) in unsafe_names.iter().enumerate() {
-        let directory = workspace
-            .path()
-            .join(format!("packages/pkg-{index}"));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("package.json"),
-            serde_json::to_vec(&serde_json::json!({"name": name})).unwrap(),
-        )
-        .unwrap();
-    }
-    for shell in ["bash", "fish", "pwsh", "zsh"] {
-        for option in ["--filter", "-F", "run"] {
-            let output = pacquet()
-                .current_dir(workspace.path())
-                .env("SHELL", shell)
-                .args(["completion-server", "--", "pnpm", option, ""])
-                .output()
-                .unwrap();
-            assert_eq!(stdout(output), "safe\n", "{shell}: {option}");
-        }
-    }
-}
+mod option_values;

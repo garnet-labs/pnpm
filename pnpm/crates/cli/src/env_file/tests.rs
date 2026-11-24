@@ -1,5 +1,12 @@
-use super::{load, scan, strip_flags};
-use std::{ffi::OsString, path::PathBuf};
+use super::{
+    load,
+    scan,
+    strip_flags,
+};
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+};
 
 /// Build an argv (with a leading program name) from string slices.
 fn argv(tokens: &[&str]) -> Vec<OsString> {
@@ -11,7 +18,8 @@ fn argv(tokens: &[&str]) -> Vec<OsString> {
 
 fn strings(argv: &[OsString]) -> Vec<String> {
     argv.iter()
-        .map(|token| token.to_string_lossy().into_owned())
+        .map(|token| token.to_string_lossy())
+        .map(std::borrow::Cow::into_owned)
         .collect()
 }
 
@@ -48,6 +56,7 @@ fn leaves_script_arguments_alone() {
     for tokens in [
         vec!["run", "build", "--env-file", ".env"],
         vec!["exec", "cmd", "--env-file=.env"],
+        vec!["create", "vite", "my-app", "--env-file", ".env"],
         vec!["install", "--", "--env-file", ".env"],
     ] {
         let argv = argv(&tokens);
@@ -87,6 +96,40 @@ fn strips_the_flag_after_the_pm_prefix() {
     let (paths, remaining) = scan(&argv(&["pm", "install", "--env-file", ".env"]));
     assert_eq!(paths, vec![PathBuf::from(".env")]);
     assert_eq!(strings(&remaining), vec!["pnpm", "pm", "install"]);
+
+    let (paths, remaining) =
+        scan(&argv(&["--dir", "sub", "--env-file", "a.env", "pm", "install", "--env-file=b.env"]));
+    assert_eq!(paths, vec![PathBuf::from("a.env"), PathBuf::from("b.env")]);
+    assert_eq!(strings(&remaining), vec!["pnpm", "--dir", "sub", "pm", "install"]);
+}
+
+#[test]
+fn claims_env_file_before_create_starter_and_forwards_after_it() {
+    let (paths, remaining) = scan(&argv(&[
+        "--env-file",
+        "pnpm.env",
+        "create",
+        "--allow-build",
+        "esbuild",
+        "vite",
+        "my-app",
+        "--env-file",
+        "starter.env",
+    ]));
+    assert_eq!(paths, vec![PathBuf::from("pnpm.env")]);
+    assert_eq!(
+        strings(&remaining),
+        vec![
+            "pnpm",
+            "create",
+            "--allow-build",
+            "esbuild",
+            "vite",
+            "my-app",
+            "--env-file",
+            "starter.env"
+        ],
+    );
 }
 
 #[test]
@@ -170,7 +213,8 @@ fn strip_flags_keeps_everything_else() {
 #[test]
 fn load_fails_loudly_on_a_missing_file() {
     let missing = PathBuf::from("pacquet-env-file-test-does-not-exist.env");
-    let error = load(std::slice::from_ref(&missing)).expect_err("missing file must fail");
+    let error =
+        load(std::slice::from_ref(&missing), |_, _| ()).expect_err("missing file must fail");
     let message = format!("{error:?}");
     assert!(
         message.contains("pacquet-env-file-test-does-not-exist.env"),

@@ -55,7 +55,7 @@ Python requirement, marker, and lockfile semantics are kept separate from npm's 
 
 Added in: v12.5.0
 
-pnpm installs the project's own package editable when it declares `[build-system]`, making its imports and `[project.scripts]` commands available immediately. Source edits take effect without reinstalling. `[tool.uv].package` overrides whether the project is packaged. Dynamic metadata is read from the declared build backend. A project with only `requirements.txt` can also receive an environment and `pylock.toml`.
+pnpm installs the project's own package editable when it declares `[build-system]`, making its imports and `[project.scripts]` commands available immediately. Source edits take effect without reinstalling. `[tool.uv].package` overrides whether the project is packaged. Dynamic metadata is read from the declared build backend. A project with only `requirements.txt` can also receive an environment and `pylock.toml`. If its directory already has a `.venv` that pnpm did not create, `pnpm install` leaves that project alone and prints a warning. Remove the `.venv` to let pnpm install the requirements.
 
 Declare workspace and local dependencies in `pyproject.toml`:
 
@@ -101,7 +101,7 @@ Every platform is paired with every Python version. The lockfile pins wheels and
 
 ## Filtering projects
 
-Project discovery honors `[tool.uv.workspace]` members. Outside an explicitly declared uv workspace, conventional example, demo, documentation, template, test, and fixture directories are skipped.
+Project discovery honors `[tool.uv.workspace]` members. A `pyproject.toml` that declares a workspace without a `[project]` table is not a project, so pnpm ignores a `requirements.txt` beside it. Outside an explicitly declared uv workspace, conventional example, demo, documentation, template, test, and fixture directories are skipped.
 
 Since v12.5.0, `pnpm install --filter <selector>` selects Python projects by name, path, or dependencies declared in `[tool.uv.sources]`. A Python project colocated with an npm workspace project is selected with that project. `--fail-if-no-match` accepts Python-only matches, and `pnpm add --filter <selector> pypi:<package>` writes to every selected project. Selecting a member of a shared environment installs the whole environment.
 
@@ -121,7 +121,9 @@ groups = ["test"]
 
 The lists override their workspace defaults independently. Omitting a list keeps its workspace default. An empty list disables that default for the project.
 
-Explicit project selections must exist in that project. Selected groups' `include-group` references must exist and cannot form cycles. Extra names follow Python's normalization rules, so `dev_tools` and `dev-tools` select the same extra. These rules also apply to extras obtained from dynamic build-backend metadata.
+Explicit project selections must exist in that project. Selected groups' `include-group` references must exist and cannot form cycles. Extra and dependency group names follow Python's normalization rules, so `dev_tools` and `dev-tools` match. This also applies to extras obtained from dynamic build-backend metadata.
+
+To use `pnpm add -D pypi:<name>`, select the `dev` group directly or include it from a selected group.
 
 Selections participate in locking. `--prod` and `--dev` choose which dependencies to install without changing the complete lockfile. A requirement on another project's extra, such as `library[cli]`, selects that distribution extra independently of `library`'s own installation settings.
 
@@ -143,7 +145,7 @@ shared-environment = true
 
 Two members that require versions of one distribution no release satisfies at once are refused, with an error naming the distribution and both members. Two members whose own `[project]` tables name the same distribution are refused too, because one environment holds one distribution of a name. Members may require the same dependencies freely; the environment holds each once.
 
-Selecting any member with [`--filter`](./filtering.md) installs the whole shared environment. `pnpm add` in a member writes that member's `pyproject.toml` and the shared `pylock.toml`. [`pnpm run`](./cli/run.md) and [`pnpm exec`](./cli/exec.md) in a member, or in any directory under one, use the `.venv` at the workspace root.
+Selecting any member with [`--filter`](./filtering.md) installs the whole shared environment. `pnpm add` in a member writes that member's `pyproject.toml` and the shared `pylock.toml`. `pnpm update` at the workspace root updates matching member manifests and the shared `pylock.toml`. [`pnpm run`](./cli/run.md) and [`pnpm exec`](./cli/exec.md) in a member, or in any directory under one, use the `.venv` at the workspace root.
 
 Sharing is decided per workspace, so a repository can share an environment where its projects agree and keep independent ones where they do not.
 
@@ -153,7 +155,7 @@ pnpm reads what each release requires from the metadata file the index publishes
 
 ### Faster resolution through pnpr
 
-With [`pnprServer`](/pnpr/install-acceleration) set, the server resolves the Python graph, so pnpm does not read the index to find out what each release requires. A server that does not answer for Python makes pnpm fall back to resolving locally.
+With [`pnprServer`](/pnpr/install-acceleration) set, the server resolves the Python graph, so pnpm does not read the index to find out what each release requires. pnpm resolves locally if the server does not answer for Python, or if it refuses a setting or lockfile format the request uses. pnpm also resolves locally if the graph needs a package that only this machine can resolve, such as one from an explicit source or one whose metadata comes only from building its source distribution. Other server errors stop the install.
 
 Python graphs configured with multiple indexes, overrides, constraints, or explicit target environments resolve locally. pnpr cannot represent these resolution settings.
 

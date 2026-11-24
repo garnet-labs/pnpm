@@ -1,6 +1,6 @@
-//! `pacquet pack` — create a tarball from a package.
+//! `pacquet pack`: create a tarball from a package.
 //!
-//! The single-project work lives in [`pnpm_pack::pack_archives`]; this module
+//! The single-project work lives in [`pnpm_pack::api`]; this module
 //! maps the resolved [`Config`] and CLI flags onto
 //! [`pnpm_pack::PackOptions`], and drives the recursive (`-r`) sweep
 //! over the workspace the same way the other recursive commands do.
@@ -12,31 +12,58 @@ use crate::cli_args::{
     catalogs::configured_catalogs,
     install::resolve_bool_override,
     recursive::{
-        AutoExcludeRoot, discover_workspace_projects, filtered_projects_dependencies,
+        AutoExcludeRoot,
+        discover_workspace_projects,
+        filtered_projects_dependencies,
         select_recursive_projects,
     },
 };
-use clap::Args;
+use clap::{
+    Args,
+    ValueHint,
+};
 use miette::Context;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_hooks::PnpmfileHooks;
 use pnpm_pack::{
-    Host, PackError, PackOptions, PackOutputLocks, PackResultJson, PackedArchive,
-    WorkspacePackageManifest, archive_result_json, format_pack_output, pack_archives,
-    pack_output_path,
+    Host,
+    PackError,
+    PackOptions,
+    PackOutputLocks,
+    PackResultJson,
+    WorkspacePackageManifest,
+    api,
+    canonicalize_pack_dir,
+    format_pack_output,
+    pack_output_parts,
+    to_pack_result_json,
 };
-use pnpm_reporter::{LifecycleMessage, LifecycleStdio, LogEvent, Reporter};
+use pnpm_reporter::{
+    LifecycleMessage,
+    LifecycleStdio,
+    LogEvent,
+    Reporter,
+};
 use pnpm_workspace_task_scheduler::{
-    ScheduleGraphAsyncOptions, TaskCompletion, graph_sequencer, schedule_graph_async,
+    ScheduleGraphAsyncOptions,
+    TaskCompletion,
+    graph_sequencer,
+    schedule_graph_async,
 };
 use recursive::RecursivePack;
 use std::{
     collections::HashMap,
     io,
     io::Write,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 
 /// The `wrap_err` framing `pack` and `publish` attach to a failed pack.
@@ -84,7 +111,7 @@ pub struct PackArgs {
 
     /// Directory in which to save the tarball. Defaults to the current
     /// working directory.
-    #[clap(long = "pack-destination")]
+    #[clap(long = "pack-destination", value_hint = ValueHint::DirPath)]
     pub pack_destination: Option<String>,
 
     /// Print the packed tarball and its contents in JSON.
@@ -93,16 +120,10 @@ pub struct PackArgs {
 
     /// Customize the output path. `%s` expands to the package name and
     /// `%v` to the version, e.g. `%s.tgz` or `some-dir/%s-%v.tgz`.
-    #[clap(long)]
+    #[clap(long, value_hint = ValueHint::FilePath)]
     pub out: Option<String>,
 
-    /// Pack only the archive of the `publishConfig.variants` entry this
-    /// target names, such as `linux-x64-musl`, or `any` for the archive of
-    /// every other host. Can be repeated.
-    #[clap(long = "variant", value_name = "TARGET")]
-    pub variant: Vec<String>,
-
-    /// gzip compression level (`0`–`9`) for the tarball.
+    /// gzip compression level (`0`-`9`) for the tarball.
     #[clap(long = "pack-gzip-level", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub pack_gzip_level: Option<u32>,
 
@@ -121,6 +142,7 @@ pub struct PackArgs {
 
 struct PackSharedContext {
     catalogs: Catalogs,
+    output_base_dir: Option<PathBuf>,
     out: Option<String>,
     pack_destination: Option<String>,
     before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
@@ -137,18 +159,12 @@ impl PackArgs {
         recursive: bool,
         before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     ) -> miette::Result<String> {
-        if recursive && !self.variant.is_empty() {
-            return Err(miette::miette!(
-                code = "ERR_PNPM_PACK_VARIANT_ALONE",
-                help = "Run it in the directory of each package whose archive you want.",
-                "--variant packs archives of one package's publishConfig.variants, so it does not take --recursive",
-            ));
-        }
         if recursive {
             self.run_recursive::<Reporter>(dir, config, before_packing_hooks).await
         } else {
             let shared = PackSharedContext {
                 catalogs: configured_catalogs(config)?,
+                output_base_dir: None,
                 out: self.out.clone(),
                 pack_destination: self.pack_destination.clone(),
                 before_packing_hooks,
@@ -156,15 +172,10 @@ impl PackArgs {
             };
             let mut options = self.pack_options(dir.to_path_buf(), config, shared);
             set_injected_changelog(&mut options, config, dir).await?;
-            let archives = pack_archives::<Reporter, Host>(&options, &self.variant)
-                .await
+            let result = api::<Reporter, Host>(&options).await
                 .map_err(miette::Report::new)
                 .wrap_err(PACK_ERROR_CONTEXT)?;
-            let results: Vec<PackResultJson> = archives.archives
-                .iter()
-                .map(archive_result_json)
-                .collect();
-            Ok(format_pack_output(&results, self.json, false))
+            Ok(format_pack_output(&[to_pack_result_json(&result)], self.json, false))
         }
     }
 
@@ -173,10 +184,9 @@ impl PackArgs {
         config: &Config,
         project: &pnpm_workspace::Project,
         mut options: PackOptions,
-    ) -> miette::Result<Vec<PackedArchive>> {
+    ) -> miette::Result<pnpm_pack::PackResult> {
         set_injected_changelog(&mut options, config, &project.root_dir).await?;
-        pack_archives::<Reporter, Host>(&options, &self.variant).await
-            .map(|packed| packed.archives)
+        api::<Reporter, Host>(&options).await
             .map_err(miette::Report::new)
             .wrap_err_with(|| {
                 if self.json {
@@ -249,10 +259,12 @@ impl PackArgs {
                 ),
                 before_packing_hooks: shared.before_packing_hooks,
                 workspace_packages,
+                bumped_workspace_packages: None,
             },
             output: pnpm_pack::PackOutputOptions {
                 gzip_level: self.pack_gzip_level,
                 dry_run: self.dry_run,
+                base_dir: shared.output_base_dir,
                 out: shared.out,
                 destination: shared.pack_destination,
                 injected_files: Vec::new(),
@@ -289,6 +301,7 @@ impl RecursivePack<'_, '_> {
         let project = self.graph[&root].package.project;
         let shared = PackSharedContext {
             catalogs: self.catalogs.clone(),
+            output_base_dir: Some(self.output.base_dir.clone()),
             out: self.output.out.clone(),
             pack_destination: self.output.destination.clone(),
             before_packing_hooks: self.before_packing_hooks.clone(),
@@ -299,16 +312,11 @@ impl RecursivePack<'_, '_> {
         };
         options.output.locks = Some(Arc::clone(&self.output.locks));
         match args.pack_one::<Reporter>(self.config, project, options).await {
-            Ok(archives) => {
-                let index = self.results.order_index[&root];
+            Ok(result) => {
                 self.results.packed
                     .lock()
                     .expect("packed results lock is not poisoned")
-                    .extend(
-                        archives
-                            .iter()
-                            .map(|archive| (index, archive_result_json(archive))),
-                    );
+                    .push((self.results.order_index[&root], to_pack_result_json(&result)));
                 TaskCompletion::Passed
             }
             Err(error) => {
@@ -330,8 +338,7 @@ impl RecursivePack<'_, '_> {
         }
         let mut packed =
             self.results.packed.into_inner().expect("packed results lock is not poisoned");
-        // Stable, so a package's archives keep their declaration order.
-        packed.sort_by_key(|(index, _)| *index);
+        packed.sort_unstable_by_key(|(index, _)| *index);
         Ok(packed
             .into_iter()
             .map(|(_, result)| result)
@@ -353,13 +360,6 @@ pub(crate) async fn set_injected_changelog(
         options.output.injected_files = vec![("package/CHANGELOG.md".to_string(), changelog)];
     }
     Ok(())
-}
-
-/// Resolve `path` against `base` when it is relative, mirroring node's
-/// `path.resolve(base, path)`.
-fn absolute_against(base: &Path, path: &str) -> String {
-    let path = if Path::new(path).is_absolute() { PathBuf::from(path) } else { base.join(path) };
-    pnpm_fs::lexical_normalize(&path).to_string_lossy().into_owned()
 }
 
 mod recursive;

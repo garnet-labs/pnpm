@@ -1,10 +1,20 @@
-use super::{InstallArgs, InstallDependencyOptions, NodeLinkerArg, PnprBenchmarkRegistryOverride};
+use super::{
+    InstallArgs,
+    InstallDependencyOptions,
+    NodeLinkerArg,
+    PnprBenchmarkRegistryOverride,
+};
 use crate::cli_args::install::pnpr_request::{
-    BenchmarkRegistryRewrite, check_pnpr_applied_settings, rewrite_resolution_registry,
+    BenchmarkRegistryRewrite,
+    check_pnpr_applied_settings,
+    rewrite_resolution_registry,
 };
 use clap::Parser;
 use pnpm_config::NodeLinker;
-use pnpm_lockfile::{LockfileResolution, TarballResolution};
+use pnpm_lockfile::{
+    LockfileResolution,
+    TarballResolution,
+};
 use pnpm_package_manifest::DependencyGroup;
 use pretty_assertions::assert_eq;
 
@@ -12,7 +22,11 @@ use pretty_assertions::assert_eq;
 /// resolution in `config/reader/src/index.ts`.
 #[test]
 fn dependency_options_to_dependency_groups() {
-    use DependencyGroup::{Dev, Optional, Prod};
+    use DependencyGroup::{
+        Dev,
+        Optional,
+        Prod,
+    };
     let create_list =
         |opts: InstallDependencyOptions| opts.dependency_groups(true).collect::<Vec<_>>();
 
@@ -198,11 +212,11 @@ fn fix_lockfile_flag_parses() {
 #[test]
 fn frozen_store_flag_parses() {
     let parsed = InstallArgsHarness::try_parse_from(["pacquet-test"]).expect("parses");
-    assert!(!parsed.args.materialization.frozen_store, "flag absent → false");
+    assert!(!parsed.args.materialization.store.frozen_store, "flag absent → false");
 
     let parsed = InstallArgsHarness::try_parse_from(["pacquet-test", "--frozen-store"])
         .expect("parses --frozen-store");
-    assert!(parsed.args.materialization.frozen_store, "flag present → true");
+    assert!(parsed.args.materialization.store.frozen_store, "flag present → true");
 }
 
 #[test]
@@ -222,7 +236,7 @@ fn slow_fetch_warning_flags_parse() {
 
 /// `NodeLinkerArg::into_config` maps every variant 1:1 to the
 /// canonical `pnpm_config::NodeLinker` enum. Tied to the
-/// `ValueEnum` derive's kebab-case rename — if a future variant
+/// `ValueEnum` derive's kebab-case rename, if a future variant
 /// is added, this test starts failing at compile time as a
 /// reminder to update the mapping.
 #[test]
@@ -338,6 +352,23 @@ fn pnpr_lockfile_resolved_without_add_missing_peer_types_is_rejected() {
     );
     assert!(check_pnpr_applied_settings(&enabled, Some(&applied)).is_ok());
     assert!(check_pnpr_applied_settings(&pnpm_config::Config::default(), None).is_ok());
+}
+
+#[test]
+fn pnpr_lockfile_resolved_without_project_scoped_optional_peers_is_rejected() {
+    let enabled = pnpm_config::Config {
+        project_scoped_optional_peers: true,
+        ..pnpm_config::Config::default()
+    };
+    let applied = pnpm_lockfile::LockfileSettings {
+        project_scoped_optional_peers: Some(true),
+        ..pnpm_lockfile::LockfileSettings::default()
+    };
+    let without_dedupe = pnpm_config::Config { dedupe_peer_dependents: false, ..enabled.clone() };
+
+    assert!(check_pnpr_applied_settings(&enabled, None).is_err());
+    assert!(check_pnpr_applied_settings(&enabled, Some(&applied)).is_ok());
+    assert!(check_pnpr_applied_settings(&without_dedupe, None).is_ok());
 }
 
 #[test]

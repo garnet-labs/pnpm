@@ -1,12 +1,26 @@
 use crate::cli_args::sanitize::sanitize;
 use clap::Args;
-use derive_more::{Display, Error};
-use miette::{Context, Diagnostic, IntoDiagnostic};
-use owo_colors::{OwoColorize, Rgb, Stream};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Context,
+    Diagnostic,
+    IntoDiagnostic,
+};
+use owo_colors::{
+    OwoColorize,
+    Rgb,
+    Stream,
+};
 use pnpm_config::Config;
 use pnpm_store_dir::{
     decode_package_files_index,
-    store_index::{StoreIndex, StoreIndexError},
+    store_index::{
+        StoreIndex,
+        StoreIndexError,
+    },
     transcode_to_plain_msgpack,
 };
 use serde::Deserialize;
@@ -100,6 +114,9 @@ impl FindHashArgs {
 fn open_store_index(config: &Config) -> miette::Result<StoreIndex> {
     let store_dir = &config.store_dir;
 
+    if !StoreIndex::exists(store_dir.root()) {
+        return Err(FindHashError::InvalidFileHash.into());
+    }
     if config.frozen_store {
         StoreIndex::open_immutable(store_dir.root())
             .into_diagnostic()
@@ -169,7 +186,10 @@ fn parse_sri_hash(hash: &str) -> miette::Result<String> {
 fn decode_base64_padded_or_not(base64_part: &str) -> miette::Result<Vec<u8>> {
     use base64::{
         Engine as _,
-        engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD},
+        engine::general_purpose::{
+            STANDARD as BASE64,
+            STANDARD_NO_PAD as BASE64_NO_PAD,
+        },
     };
 
     BASE64

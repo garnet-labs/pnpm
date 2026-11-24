@@ -1,30 +1,52 @@
 use super::{
-    BENCHMARK_DIAGNOSTICS_JSON, BENCHMARK_DIAGNOSTICS_MD, BENCHMARK_OUTPUT_LOG,
-    BenchmarkDiagnostics, BenchmarkTargetDiagnostics, HyperfineCommand,
-    PNPR_DIRECT_ABS_SLACK_SECONDS, PNPR_DIRECT_RATIO_MAX, WorkEnv, check_peer_heavy_speedup,
-    collect_pnpr_direct_ratios, dir_contains_file, non_trivial_cold_batch,
-    read_benchmark_diagnostics, read_hyperfine_report, read_phase_events,
-    render_diagnostics_markdown, requires_fresh_pnpr_cold_batch_metrics, summarize_phase_events,
+    BENCHMARK_DIAGNOSTICS_JSON,
+    BENCHMARK_DIAGNOSTICS_MD,
+    BENCHMARK_OUTPUT_LOG,
+    BenchmarkDiagnostics,
+    BenchmarkTargetDiagnostics,
+    HyperfineCommand,
+    PNPR_DIRECT_ABS_SLACK_SECONDS,
+    PNPR_DIRECT_RATIO_MAX,
+    WorkEnv,
+    check_peer_heavy_speedup,
+    collect_pnpr_direct_ratios,
+    non_trivial_cold_batch,
+    pnpr_cache_dir,
+    read_benchmark_diagnostics,
+    read_hyperfine_report,
+    read_phase_events,
+    render_diagnostics_markdown,
+    requires_fresh_pnpr_cold_batch_metrics,
+    summarize_phase_events,
 };
-use crate::cli_args::{BenchmarkScenario, TargetKind};
-use std::{collections::HashMap, fs};
+use crate::cli_args::{
+    BenchmarkScenario,
+    TargetKind,
+};
+use std::{
+    collections::HashMap,
+    fs,
+};
 
 impl WorkEnv {
     /// Fail the run if a `pnpr@<rev>` target never actually went through its
-    /// pnpr server. A resolve populates the server's on-disk store/cache
-    /// under `pnpr-storage`, so an empty `pnpr-storage` after the
-    /// benchmark means the client resolved *directly* instead — the silent
-    /// failure mode where a misnamed `PNPM_CONFIG_PNPR_SERVER` made every
-    /// `pnpr@<rev>` row a duplicate of its `pacquet@<rev>` row. Better to
-    /// abort than to publish meaningless pnpr-vs-direct numbers.
+    /// pnpr server. pnpr creates `resolver-cache` in its cache directory on
+    /// the first resolve request and writes nothing else there before one,
+    /// so a missing `resolver-cache` after the benchmark means the client
+    /// resolved *directly* instead, the silent failure mode where a misnamed
+    /// `PNPM_CONFIG_PNPR_SERVER` made every `pnpr@<rev>` row a duplicate of
+    /// its `pacquet@<rev>` row. The rest of `pnpr-storage` (the layout file
+    /// and the database) is written at startup, so it proves nothing. Better
+    /// to abort than to publish meaningless pnpr-vs-direct numbers.
     pub(super) fn verify_pnpr_targets_were_routed(&self) {
         for id in self.target_ids().filter(|id| id.is_pnpr()) {
-            let storage = self.bench_dir(id).join("pnpr-storage");
+            let resolver_cache =
+                pnpr_cache_dir(&self.bench_dir(id).join("pnpr-storage")).join("resolver-cache");
             assert!(
-                dir_contains_file(&storage),
-                "pnpr server storage at {storage:?} is empty after the benchmark — `{id}` never \
-                 routed through pnpr (it resolved directly), so its rows would silently duplicate \
-                 the `pacquet@<rev>` install. Check that `.pnpr-env` exports \
+                resolver_cache.is_dir(),
+                "pnpr server has no resolver cache at {resolver_cache:?} after the benchmark, \
+                 `{id}` never routed through pnpr (it resolved directly), so its rows would \
+                 silently duplicate the `pacquet@<rev>` install. Check that `.pnpr-env` exports \
                  `PNPM_CONFIG_PNPR_SERVER` and that the client reads it.",
             );
         }

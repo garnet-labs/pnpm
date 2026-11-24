@@ -1,15 +1,25 @@
 use pnpm_lockfile::RegistryContext;
+use pnpm_resolving_resolver_base::is_valid_semver_range;
 
 use super::{
-    Arc, CurrentPkg, LockfileResolution, PkgNameVerPeer, PreferredVersionsOverlay,
-    ResolveDependencyTreeError, ResolvedPackage, TarballRevision, TreeCtx, WantedDependency,
-    overlay_lookup_names, update_unpins_edge,
+    Arc,
+    CurrentPkg,
+    LockfileResolution,
+    PkgNameVerPeer,
+    PreferredVersionsOverlay,
+    ResolveDependencyTreeError,
+    ResolvedPackage,
+    TarballRevision,
+    TreeCtx,
+    WantedDependency,
+    overlay_lookup_names,
+    update_unpins_edge,
 };
 
 /// The overlay's view for one edge, as it joins the resolve cache key: the
 /// same range can legitimately pick different versions under levels that
 /// resolved different siblings. Each candidate name (alias, `npm:` inner
-/// target, folded `jsr:` name) keeps its own versions — the picker consults
+/// target, folded `jsr:` name) keeps its own versions, the picker consults
 /// the overlay per name, so a flat union of versions could collide two
 /// overlays that distribute the same versions across different names. Empty
 /// for almost every edge, so the dedup keeps working where it matters.
@@ -81,7 +91,7 @@ pub(super) fn pin_patched_revision(
 ///
 /// `parent_dir` is the directory of the manifest that declares this
 /// edge, when that manifest is a package resolved from a local
-/// directory — see [`declaring_manifest_dir`](crate::resolve_dependency_tree::tree_ctx::declaring_manifest_dir).
+/// directory; see [`declaring_manifest_dir`](crate::resolve_dependency_tree::tree_ctx::declaring_manifest_dir).
 ///
 /// `parent_pkg_aliases` is the scope this edge's level resolves in; it
 /// decides which of the resolved package's `dependencies` its own
@@ -110,10 +120,18 @@ pub(super) fn pin_locked_version(
         && let Some(version) = key.suffix.registry_version()
         && wanted.bare_specifier
             .as_deref()
-            .is_some_and(|spec| spec.parse::<node_semver::Range>().is_ok())
+            .filter(|spec| !spec.trim().is_empty())
+            .is_some_and(is_valid_semver_range)
     {
         wanted.bare_specifier = Some(version.to_string());
     }
+}
+
+/// Whether a reopened edge returns its locked runtime as it is. See
+/// [`crate::LockedRuntimeReuse`].
+pub(super) fn keeps_locked_runtime(ctx: &TreeCtx, current_pkg: &CurrentPkg) -> bool {
+    ctx.workspace.reuse.runtimes == crate::LockedRuntimeReuse::Keep
+        && matches!(current_pkg.resolution, LockfileResolution::Variations(_))
 }
 
 /// Whether an edge stays on the version the lockfile recorded
@@ -143,7 +161,7 @@ pub(super) fn exact_registry_specifier_for_revision_refresh(
     if has_registry_revision_specifier(specifier) {
         return specifier.to_string();
     }
-    if specifier.parse::<node_semver::Range>().is_ok() {
+    if !specifier.trim().is_empty() && is_valid_semver_range(specifier) {
         return version.to_string();
     }
     let Some((protocol, body)) = specifier.split_once(':') else {
@@ -156,7 +174,7 @@ pub(super) fn exact_registry_specifier_for_revision_refresh(
     if protocol != "npm" && protocol != "jsr" && !names_locked_registry {
         return specifier.to_string();
     }
-    if body.parse::<node_semver::Range>().is_ok() {
+    if !body.trim().is_empty() && is_valid_semver_range(body) {
         return format!("{protocol}:{version}");
     }
     let Some(delimiter) = body
@@ -233,4 +251,29 @@ pub(super) fn ensure_same_registry_revision(
         });
     }
     Ok(())
+}
+
+impl super::edge_resolution::ResolvedEdge {
+    pub(super) fn locked_resolution(
+        &self,
+        ctx: &TreeCtx,
+        wanted: &WantedDependency,
+        edge: &super::ChildEdge<'_>,
+    ) -> Option<Box<crate::resolved_tree::LockedResolution>> {
+        self.prior_key
+            .as_ref()
+            .filter(|key| {
+                !super::update_unpins_edge(
+                    ctx.update_scope(),
+                    wanted,
+                    key.suffix.version_semver(),
+                    edge.depth,
+                ) && super::landed_on_prior_entry(
+                    key,
+                    &self.id,
+                    &ctx.workspace.cache.registry_context,
+                )
+            })
+            .and_then(|key| super::super::locked_resolution::from_prior(ctx, key))
+    }
 }

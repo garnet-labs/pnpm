@@ -1,11 +1,10 @@
-#[cfg(target_family = "wasm")]
-pub(crate) use pnpm_process as process;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) use std::process;
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
 
 pub mod build_graph;
 pub mod build_modules;
 pub mod cas;
+pub mod claimed_commands;
 pub mod create_symlink_layout;
 pub mod create_virtual_dir_by_snapshot;
 pub mod create_virtual_store;
@@ -16,6 +15,7 @@ pub mod hoist;
 pub mod hoisted_dep_graph;
 pub mod hoisting_limits;
 pub mod import_indexed_dir;
+pub mod importer_modules_dirs;
 pub mod install_context;
 pub mod install_frozen_lockfile;
 pub mod install_package_by_snapshot;
@@ -41,32 +41,61 @@ pub mod symlink_package;
 pub mod validate_lockfile_paths;
 pub mod version_policy;
 pub mod virtual_store_layout;
+
+pub(crate) use pnpm_process as process;
+
 pub use build_graph::*;
 pub use build_modules::*;
 pub use build_options::{
-    BuildCacheContext, BuildGraphInputs, BuildLayout, BuildProgress, BuildScriptOptions,
-    BuildSnapshotInputs, CachedSideEffects, PatchedEngineCheck, ScriptPath,
+    BuildCacheContext,
+    BuildCacheStore,
+    BuildGraphInputs,
+    BuildLayout,
+    BuildProgress,
+    BuildScriptOptions,
+    BuildSnapshotInputs,
+    BuiltSideEffects,
+    CachedSideEffects,
+    CapturedBuildSideEffects,
+    PatchedEngineCheck,
+    ScriptPath,
 };
+pub use claimed_commands::ClaimedCommands;
 pub use create_symlink_layout::*;
 pub use create_virtual_dir_by_snapshot::*;
 pub use create_virtual_store::*;
 pub use current_lockfile::*;
-pub use custom_fetcher::{CustomFetcherSession, ResolvedTarballMetadata};
+pub use custom_fetcher::{
+    CustomFetcherSession,
+    ResolvedTarballMetadata,
+};
 pub use deps_graph::*;
 pub use dir_clone_cache::*;
 pub use frozen_install_options::{
-    FrozenInstallDrivers, FrozenInstallSeed, FrozenLockfileInputs, FrozenPlatformOptions,
-    FrozenProjectInputs, PriorMaterialization, SharedFetchCaches,
+    FrozenInstallDrivers,
+    FrozenInstallSeed,
+    FrozenLockfileInputs,
+    FrozenPlatformOptions,
+    FrozenProjectInputs,
+    FrozenVerificationPolicies,
+    PriorMaterialization,
+    SharedFetchCaches,
 };
 pub use hoist::*;
 pub use hoisted_dep_graph::*;
 pub use hoisting_limits::*;
 pub use import_indexed_dir::*;
+pub use importer_modules_dirs::ImporterModulesDirs;
 pub use install_context::*;
 pub use install_frozen_lockfile::*;
 pub use install_options::{
-    DirectLinkPolicy, ImporterDependencyGraph, ImporterLinkContext, SkipSetClosure,
-    SnapshotSelection, VirtualStoreFetchInputs,
+    DirectLinkPolicy,
+    ImporterDependencyGraph,
+    ImporterLinkContext,
+    LatestVersions,
+    SkipSetClosure,
+    SnapshotSelection,
+    VirtualStoreFetchInputs,
 };
 pub use install_package_by_snapshot::*;
 pub use install_package_from_registry::*;
@@ -77,20 +106,44 @@ pub use link_file::*;
 pub use link_hoisted_modules::*;
 pub use link_root_component_members::*;
 pub use materialization_options::{
-    ModuleLinkerContext, PackageImportOptions, RegistryFetchContext, SlotImportSource,
-    SnapshotDependencyLinks, SnapshotFetchContext, VirtualStoreLinkOptions,
+    ModuleLinkerContext,
+    PackageImportOptions,
+    RegistryFetchContext,
+    SlotImportSource,
+    SnapshotDependencyLinks,
+    SnapshotFetchContext,
+    VirtualStoreLinkOptions,
 };
 pub use modules_swap_lock::ModulesSwapLock;
 pub use package_map::*;
 pub use phase_options::{
-    BuildPhaseCache, BuildPhaseDirectories, BuildPhaseGraph, BuildPhasePolicy, HoistedLinkGraph,
-    HoistedProjects, LinkLockfiles, LinkPackageData, LinkProjects, PriorHoistedState,
-    PriorLinkState, PruneTreeOptions,
+    BuildPhaseCache,
+    BuildPhaseDirectories,
+    BuildPhaseGraph,
+    BuildPhasePolicy,
+    HoistedLinkGraph,
+    HoistedProjects,
+    LinkLockfiles,
+    LinkPackageData,
+    LinkProjects,
+    PriorHoistedState,
+    PriorLinkState,
+    PruneTreeOptions,
 };
 pub use pnp::*;
-pub use pnpm_workspace_task_scheduler::{GraphSequencerResult, PathNode, graph_sequencer};
+pub use pnpm_workspace_task_scheduler::{
+    GraphSequencerResult,
+    PathNode,
+    graph_sequencer,
+};
 pub use prune_direct_deps::*;
 pub use prune_stale_modules::*;
+pub use remote_cache_options::{
+    ArtifactSignerSettings,
+    ArtifactStoreOptions,
+    artifact_signer_settings,
+    artifact_store_options,
+};
 pub use safe_join_modules_dir::*;
 pub use symlink_direct_dependencies::*;
 pub use symlink_package::*;
@@ -99,12 +152,15 @@ pub use version_policy::*;
 pub use virtual_store_layout::*;
 
 mod custom_fetcher;
-mod gvs_slot_lock;
 mod installed_hoisted_state;
 mod link_pool;
 mod prune_extraneous_deps;
+mod remote_cache_options;
 mod shared_side_effects;
 
+/// The file older pnpm versions put in a global virtual store package
+/// directory that awaited its build. Imports leave it out when they compare
+/// a directory with the files it should hold.
 pub const NEEDS_BUILD_MARKER: &str = ".pnpm-needs-build";
 
 /// Cargo's checksum manifest of a vendored package directory. The Cargo

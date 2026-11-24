@@ -12,10 +12,19 @@
 use crate::error::DirectoryFetcherError;
 use pnpm_package_manifest::safe_read_package_json_from_dir;
 use std::{
-    collections::{HashMap, HashSet},
-    fs::{self, Metadata},
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    fs::{
+        self,
+        Metadata,
+    },
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Output of [`walk_all_files`] / [`walk_package_files`]: the
@@ -143,7 +152,9 @@ fn walk_all_inner(
 fn walked_relative_path(entry: &fs::DirEntry, rel_prefix: &str) -> Option<String> {
     let file_name = entry.file_name();
     let file_name = file_name.to_str()?;
-    if file_name == "node_modules" {
+    if file_name == "node_modules"
+        || (rel_prefix.is_empty() && pnpm_fs_packlist::is_lockfile_staging_file(file_name))
+    {
         return None;
     }
     if rel_prefix.is_empty() {

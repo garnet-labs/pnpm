@@ -1,31 +1,55 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use node_semver::Version;
-use pnpm_registry::{DerivedPackuments, Package, PackageDistribution, PackageVersion};
+use pnpm_registry::{
+    DerivedPackuments,
+    Package,
+    PackageDistribution,
+    PackageVersion,
+};
 use pnpm_resolving_resolver_base::{
-    DIRECT_DEP_SELECTOR_WEIGHT, EXISTING_VERSION_SELECTOR_WEIGHT, RESOLVED_VERSION_SELECTOR_WEIGHT,
-    VersionSelectorEntry, VersionSelectorType, VersionSelectorWithWeight, VersionSelectors,
+    DIRECT_DEP_SELECTOR_WEIGHT,
+    EXISTING_VERSION_SELECTOR_WEIGHT,
+    RESOLVED_VERSION_SELECTOR_WEIGHT,
+    VersionSelectorEntry,
+    VersionSelectorType,
+    VersionSelectorWithWeight,
+    VersionSelectors,
 };
 use pnpm_version_policy::create_package_version_policy;
 use pretty_assertions::assert_eq;
 
 use super::{
-    PickPackageFromMetaError, PickPackageFromMetaOptions, PickVersionByVersionRangeOptions,
-    RegistryPackageSpec, RegistryPackageSpecType, filter_pkg_metadata_by_publish_date,
-    filter_pkg_metadata_versions, pick_lowest_version_by_version_range, pick_package_from_meta,
-    pick_stable_cached_range_version, pick_version_by_version_range,
+    PickPackageFromMetaError,
+    PickPackageFromMetaOptions,
+    PickVersionByVersionRangeOptions,
+    RegistryPackageSpec,
+    RegistryPackageSpecType,
+    filter_pkg_metadata_by_publish_date,
+    filter_pkg_metadata_versions,
+    pick_lowest_version_by_version_range,
+    pick_package_from_meta,
+    pick_stable_cached_range_version,
+    pick_version_by_version_range,
 };
 
 mod stable_cached_range;
 
-fn parse_iso(input: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(input).expect("rfc3339").with_timezone(&Utc)
+fn parse_iso(input: &str) -> Timestamp {
+    pnpm_time::parse_rfc3339(input).expect("rfc3339")
 }
 
 #[test]
 fn range_scans_keep_the_first_raw_version_when_precedence_ties() {
-    use super::semver_range::{max_satisfying, max_version, min_satisfying};
+    use super::semver_range::{
+        max_satisfying,
+        max_version,
+        min_satisfying,
+    };
 
     for versions in [["v1.2.3", "1.2.3"], ["1.2.3", "v1.2.3"]] {
         let expected = Some(versions[0].to_string());
@@ -37,7 +61,11 @@ fn range_scans_keep_the_first_raw_version_when_precedence_ties() {
 
 #[test]
 fn range_scans_keep_prerelease_and_build_spelling() {
-    use super::semver_range::{max_satisfying, max_version, min_satisfying};
+    use super::semver_range::{
+        max_satisfying,
+        max_version,
+        min_satisfying,
+    };
 
     let versions = ["invalid", "1.2.3-beta.1+build.7", "1.2.3-beta.2+build.9"];
     assert_eq!(max_version(&versions).as_deref(), Some("1.2.3-beta.2+build.9"));
@@ -1026,7 +1054,7 @@ fn filter_is_memoized_per_packument_and_stays_bounded() {
     // Distinct cutoffs past the cap evict the oldest entry, so the
     // original policy is derived again instead of growing the memo.
     for minutes in 1..=4 {
-        let other = cutoff + chrono::Duration::minutes(minutes);
+        let other = cutoff + jiff::SignedDuration::from_mins(minutes);
         let _ = filter_pkg_metadata_by_publish_date(&pkg, other, None);
     }
     let after_eviction = filter_pkg_metadata_by_publish_date(&pkg, cutoff, None);
@@ -1158,7 +1186,7 @@ fn filter_tag_rewrite_prefers_non_deprecated_candidate() {
 /// tie-break that hydrates to check `deprecated` sees every candidate
 /// as undecodable (= not deprecated) and picks the higher deprecated
 /// version instead. Guards the no-hydration deprecation probe the
-/// publish-date filter relies on — also matching pnpm, which reads
+/// publish-date filter relies on, also matching pnpm, which reads
 /// `versions[candidate].deprecated` off plain parsed JSON without
 /// validating the rest of the entry.
 #[test]

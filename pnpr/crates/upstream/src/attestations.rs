@@ -1,10 +1,18 @@
 use reqwest::{
     StatusCode,
-    header::{self, HeaderValue},
+    header::{
+        self,
+        HeaderValue,
+    },
 };
 
 use super::{
-    FetchOutcome, RegistryError, Result, UNPRIORITIZED, UPSTREAM_DISCOVERY_BODY_LIMIT, Upstream,
+    FetchOutcome,
+    RegistryError,
+    Result,
+    UNPRIORITIZED,
+    UPSTREAM_DISCOVERY_BODY_LIMIT,
+    Upstream,
     read_limited_body,
 };
 
@@ -45,7 +53,7 @@ impl Upstream {
         let limited = read_limited_body(response, UPSTREAM_DISCOVERY_BODY_LIMIT)
             .await
             .map_err(|err| {
-                self.breaker.record_failure();
+                self.record_body_failure(&err);
                 RegistryError::UpstreamResponse { url: url.clone(), reason: err.to_string() }
             })?;
         if limited.truncated {

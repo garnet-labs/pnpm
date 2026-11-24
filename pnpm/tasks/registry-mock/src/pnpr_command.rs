@@ -1,12 +1,32 @@
-use crate::{port_to_url::port_to_url, seed_storage::seed_runtime_storage, workspace_root};
-use std::{
-    env, fs,
-    hash::{DefaultHasher, Hash, Hasher},
-    io,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+use crate::{
+    port_to_url::port_to_url,
+    seed_storage::seed_runtime_storage,
+    workspace_root,
 };
+use command_extra::CommandExtra;
+use std::{
+    env,
+    fs,
+    hash::{
+        DefaultHasher,
+        Hash,
+        Hasher,
+    },
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::Command,
+    sync::atomic::{
+        AtomicU64,
+        Ordering,
+    },
+};
+
+// The tests stand in for `pnpr` with a shell script.
+#[cfg(all(test, unix))]
+mod tests;
 
 /// Locate the `pnpr` binary built into the cargo workspace's
 /// `target/<profile>/` dir.
@@ -20,12 +40,12 @@ use std::{
 /// var is unset and `cargo_bin` aborts. We resolve the path
 /// ourselves:
 ///
-/// 1. Honor `CARGO_BIN_EXE_pnpr` if set — this is the case
+/// 1. Honor `CARGO_BIN_EXE_pnpr` if set; this is the case
 ///    inside pnpr's own integration tests.
 /// 2. Prefer the release binary if one exists at
 ///    `$CARGO_TARGET_DIR/release/pnpr`. Critical for the
 ///    integrated benchmark: comparing a debug-Rust mock to a
-///    JIT-optimized verdaccio is apples to oranges — the install
+///    JIT-optimized verdaccio is apples to oranges, the install
 ///    measures 20%+ slower purely from unoptimized JSON parse +
 ///    serialize on every request. Tests don't need the release
 ///    binary, but having a release build override the debug one is
@@ -37,7 +57,8 @@ fn pnpr_binary() -> PathBuf {
         return PathBuf::from(path);
     }
     let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace_root().join("target"), PathBuf::from);
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"));
     let exe = format!("pnpr{}", env::consts::EXE_SUFFIX);
     let release = target_dir.join("release").join(&exe);
     if release.is_file() {
@@ -58,7 +79,7 @@ fn pnpr_binary() -> PathBuf {
 /// packuments authoritative across a test run: their on-disk
 /// mtime is whenever the npm tarball was built, which is far older
 /// than any sane TTL, so a short TTL would mark them stale and try
-/// to refetch from npm — where the fixtures don't exist — and 404.
+/// to refetch from npm (where the fixtures don't exist) and 404.
 ///
 /// `pnpr` is a workspace crate; run
 /// `cargo build -p pnpr` once before invoking the mock if
@@ -76,13 +97,45 @@ pub fn pnpr_command(port: u16, public_url: Option<&str>) -> Command {
 /// Like [`pnpr_command`] but runs an explicit `pnpr` binary instead of the
 /// one resolved from the workspace `target/` dir, so the integrated benchmark
 /// can front each compared revision with a mock built from its own `pnpr`.
-/// All revisions share the one runtime storage — serving a warm cache is
+/// All revisions share the one runtime storage, serving a warm cache is
 /// read-only, so concurrent mocks don't contend.
 #[must_use]
 pub fn pnpr_command_with_binary(bin: &Path, port: u16, public_url: Option<&str>) -> Command {
+    pnpr_command_with_home(bin, port, public_url, None)
+}
+
+/// Configuration and storage for a mock built from an explicit revision.
+#[derive(Debug, Clone, Copy)]
+pub struct PnprMockConfig<'a> {
+    pub home: &'a Path,
+    /// Complete configuration in the revision's format, including its database URL.
+    pub yaml: &'a str,
+    /// The registries document to store in the home's database, for
+    /// a `pnpr` that reads its registries only from there. `None` for one
+    /// whose `yaml` declares them.
+    pub registries: Option<&'a Path>,
+}
+
+/// Like [`pnpr_command_with_binary`], keeping the hosted store and its
+/// database in `home` instead of the fixture build's when one is
+/// given. The fixture build's store and database carry this checkout's
+/// layout and metadata schema, which a `pnpr` built from another revision
+/// may refuse; given a home of its own, that `pnpr` creates its own there
+/// and serves everything it proxies, sharing only the proxy cache.
+///
+/// # Panics
+///
+/// Storing [`PnprMockConfig::registries`] fails.
+#[must_use]
+pub fn pnpr_command_with_home(
+    bin: &Path,
+    port: u16,
+    public_url: Option<&str>,
+    config: Option<PnprMockConfig<'_>>,
+) -> Command {
     assert!(
         bin.is_file(),
-        "pnpr binary not found at {bin:?} — \
+        "pnpr binary not found at {bin:?}, \
          run `cargo build -p pnpr` before invoking the mock",
     );
     let seeded = seed_runtime_storage()
@@ -90,56 +143,117 @@ pub fn pnpr_command_with_binary(bin: &Path, port: u16, public_url: Option<&str>)
     if seeded > 0 {
         eprintln!("info: seeded {seeded} fixture file(s) into runtime storage");
     }
-    let default_public_url;
-    let public_url = if let Some(public_url) = public_url {
-        public_url.trim_end_matches('/')
-    } else {
-        default_public_url = port_to_url(port);
-        default_public_url.trim_end_matches('/')
-    };
-    let mut cmd = Command::new(bin);
-    // pnpr binds each of its options to the `PNPR_*` variable named after
-    // it, so an ambient one — a developer's `PNPR_CONFIG`, a stray
-    // `PNPR_DISABLE_REGISTRY` — would quietly reconfigure the mock. The
-    // arguments below are the only thing allowed to.
-    for (name, _) in env::vars_os() {
-        let key = name.to_string_lossy().to_ascii_uppercase();
-        if key.starts_with("PNPR_") {
-            cmd.env_remove(&name);
-        }
-    }
+    let public_url = public_url.map(str::to_string).unwrap_or_else(|| port_to_url(port));
     // Front pnpr with the registry-mock config from `pnpr/.fixtures/config.yaml`
     // (the fixture namespace served from local hosted storage, everything else
     // proxied through the pattern-less npmjs upstream). We pin the runtime bits
     // the config file can't know about via CLI arguments.
-    let config = runtime_mock_config()
+    let (storage, database) = match &config {
+        Some(config) => (config.home.join("storage"), None),
+        None => (crate::runtime_hosted_storage(), Some(crate::runtime_metadata_path())),
+    };
+    let yaml = config.as_ref().map_or(pnpr_fixtures::MOCK_CONFIG_YAML, |config| config.yaml);
+    let registries = config.and_then(|config| config.registries);
+    let config = runtime_mock_config(database.as_deref(), yaml)
         .unwrap_or_else(|err| panic!("write the registry-mock config into runtime storage: {err}"));
-    cmd.arg("--config")
-        .arg(config)
-        .arg("--storage")
-        .arg(crate::runtime_hosted_storage())
-        .arg("--cache")
-        .arg(crate::runtime_cache())
-        .arg("--packument-ttl")
-        .arg("31536000")
-        .arg("--listen")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--public-url")
-        .arg(public_url);
+    let cmd = command_without_pnpr_env(bin)
+        .with_arg("--config")
+        .with_arg(config)
+        .with_arg("--storage")
+        .with_arg(storage)
+        .with_arg("--cache")
+        .with_arg(crate::runtime_cache())
+        .with_arg("--packument-ttl")
+        .with_arg("31536000")
+        .with_arg("--listen")
+        .with_arg(format!("127.0.0.1:{port}"))
+        .with_arg("--public-url")
+        .with_arg(public_url.trim_end_matches('/'));
+    if let Some(registries) = registries {
+        import_registries(&cmd, registries);
+    }
     cmd
 }
 
-/// The registry-mock config with the fixture build's metadata database
-/// named outright, written beside the build's hosted store. A `pnpr` from another
-/// revision, such as the one the integrated benchmark compares against, may
-/// not move its default database along with `--storage`, and every revision
-/// reads a named one. The config is named after the fixture build and its
-/// own contents, so no mock reads a config another checkout wrote for
-/// another build or another fixture config.
-fn runtime_mock_config() -> io::Result<PathBuf> {
-    let database = std::path::absolute(crate::runtime_metadata_path())?;
-    let url = format!("sqlite:{}", database.display()).replace('\'', "''");
-    let yaml = format!("{}\nmetadata:\n  url: '{url}'\n", pnpr_fixtures::MOCK_CONFIG_YAML);
+/// Store the registries `document` declares in the database of the
+/// `pnpr` that `serve` starts, as its next revision, by running
+/// `pnpr registries import` with `serve`'s program, arguments, and
+/// environment. A server started on a database with no stored registries
+/// stores the bundled default ones, so this runs before `serve` does.
+///
+/// A `grants.yaml` beside `document` is stored with `pnpr grants import`
+/// afterwards. A revision whose registries declare their own access rules
+/// has no such file.
+///
+/// # Panics
+///
+/// An import cannot be spawned or exits unsuccessfully.
+pub fn import_registries(serve: &Command, document: &Path) {
+    import(serve, "registries", document);
+    let grants = document.with_file_name("grants.yaml");
+    if grants.is_file() {
+        import(serve, "grants", &grants);
+    }
+}
+
+/// Run `pnpr <kind> import <file>` the way `serve` runs `pnpr`.
+fn import(serve: &Command, kind: &str, file: &Path) {
+    let import = serve
+        .get_envs()
+        .fold(Command::new(serve.get_program()), |import, (name, value)| match value {
+            Some(value) => import.with_env(name, value),
+            None => import.without_env(name),
+        });
+    let import = match serve.get_current_dir() {
+        Some(dir) => import.with_current_dir(dir),
+        None => import,
+    };
+    let output = import
+        .with_args(serve.get_args())
+        .with_arg(kind)
+        .with_arg("import")
+        .with_arg(file)
+        .output()
+        .unwrap_or_else(|err| panic!("spawn `pnpr {kind} import` for {file:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "`pnpr {kind} import` of {file:?} failed with {}:\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// A [`Command`] of `bin` without the ambient `PNPR_*` variables. pnpr binds
+/// each of its options to the variable named after it, so an ambient one (a
+/// developer's `PNPR_CONFIG`, a stray `PNPR_DISABLE_REGISTRY`) would quietly
+/// reconfigure the mock. The arguments the caller adds are the only thing
+/// allowed to.
+fn command_without_pnpr_env(bin: &Path) -> Command {
+    env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            name.to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("PNPR_")
+        })
+        .fold(Command::new(bin), CommandExtra::without_env)
+}
+
+/// Pin the database beside the fixture build's hosted store.
+/// The path includes the config's hash so concurrent configurations stay separate.
+fn runtime_mock_config(database: Option<&Path>, config: &str) -> io::Result<PathBuf> {
+    let yaml = match database {
+        Some(database) => {
+            let database = std::path::absolute(database)?;
+            let mut yaml: serde_json::Value =
+                serde_saphyr::from_str(config).map_err(io::Error::other)?;
+            yaml["storage"]["database"] =
+                serde_json::json!({"url": format!("sqlite:{}", database.display())});
+            serde_saphyr::to_string(&yaml).map_err(io::Error::other)?
+        }
+        None => config.to_string(),
+    };
     let mut hasher = DefaultHasher::new();
     yaml.hash(&mut hasher);
     let mut path = std::path::absolute(crate::runtime_hosted_storage())?.into_os_string();

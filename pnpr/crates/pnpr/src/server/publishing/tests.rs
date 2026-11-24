@@ -1,17 +1,32 @@
 use super::{
-    attachments::{AttachmentKind, PreparedAttachment, TarballStorage, write_attachment_slot},
+    attachments::{
+        AttachmentKind,
+        PreparedAttachment,
+        TarballStorage,
+        write_attachment_slots,
+    },
     manifest::record_publisher,
 };
 use base64::Engine;
 use pnpr_config::HostedStoreConfig;
-use pnpr_package_name::{CanonicalPackageName, Ecosystem};
+use pnpr_package_name::{
+    CanonicalPackageName,
+    Ecosystem,
+};
 use pnpr_policy::Identity;
 use pnpr_storage::{
     Storage,
-    publish::{AttachmentPayload, PendingAttachment},
+    publish::{
+        AttachmentPayload,
+        PendingAttachment,
+    },
 };
 use serde_json::json;
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{
+    io::Write,
+    sync::Arc,
+    time::Duration,
+};
 
 #[test]
 fn publisher_attribution_comes_only_from_an_authenticated_identity() {
@@ -35,7 +50,7 @@ async fn a_published_tarball_hashes_its_tar_under_a_decode_permit() {
         &HostedStoreConfig::Fs,
         temp.path().join("store"),
         temp.path().join("cache"),
-        &pnpr_config::MetadataBackend::Sqlite(temp.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(temp.path().join("metadata.sqlite")),
     )
     .unwrap();
     let name = CanonicalPackageName::parse("pkg", Ecosystem::Npm).unwrap();
@@ -56,18 +71,22 @@ async fn a_published_tarball_hashes_its_tar_under_a_decode_permit() {
         version: "1.0.0".to_string(),
         dist: json!({ "integrity": sha512(&tgz).to_string() }),
         kind: AttachmentKind::Tarball,
-        variant_tag: None,
     };
     let decodes = Arc::new(tokio::sync::Semaphore::new(0));
-    let write =
-        write_attachment_slot((&storage, None), &name, prepared, TarballStorage::Tgz, &decodes);
+    let write = write_attachment_slots(
+        (&storage, None),
+        &name,
+        vec![prepared],
+        TarballStorage::Tgz,
+        &decodes,
+    );
     tokio::pin!(write);
 
     let waited = tokio::time::timeout(Duration::from_millis(200), &mut write).await;
     assert!(waited.is_err(), "the write must wait for a decode permit");
     decodes.add_permits(1);
-    let (_slot, published) = write.await.unwrap();
-    assert!(published.is_some());
+    let written = write.await.unwrap();
+    assert_eq!(written.tars.len(), 1);
     let integrities = storage.read_tar_integrities(&name).await.unwrap();
     assert_eq!(
         integrities
@@ -109,32 +128,6 @@ fn a_request_digest_hashes_the_canonical_json() {
     assert_eq!(targeted, ssri::Integrity::from(canonical).to_string());
 }
 
-#[tokio::test]
-async fn archives_compare_a_bounded_chunk_at_a_time() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let staged = tmp.path().join("staged");
-    // Longer than one comparison chunk, so the comparison spans several.
-    let bytes: Vec<u8> = (0..200_000u32)
-        .map(|index| (index % 251) as u8)
-        .collect();
-    std::fs::write(&staged, &bytes).unwrap();
-    let mut changed = bytes.clone();
-    changed[150_000] ^= 1;
-    let cases = [
-        (bytes.clone(), Some(bytes.len() as u64), true),
-        (bytes.clone(), None, true),
-        (changed, None, false),
-        (bytes[..100].to_vec(), None, false),
-        ([bytes.as_slice(), b"more"].concat(), None, false),
-        (bytes.clone(), Some(1), false),
-    ];
-    for (index, (existing, length, same)) in cases.into_iter().enumerate() {
-        let body = axum::body::Body::from(existing);
-        let compared = super::atomic::same_bytes(body, length, &staged).await.unwrap();
-        assert_eq!(compared, same, "case {index}");
-    }
-}
-
 #[test]
 fn a_python_version_note_is_keyed_by_the_normalized_version() {
     let mut entry = json!({ "name": "demo", "version": "01.0", "notes": "- first\n" });
@@ -156,7 +149,8 @@ fn a_response_carries_a_bounded_size_of_notices() {
         .headers()
         .get_all("npm-notice")
         .iter()
-        .map(|value| value.to_str().unwrap())
+        .map(reqwest::header::HeaderValue::to_str)
+        .map(Result::unwrap)
         .collect();
     // Nine 200-byte notices fit beside the summary, which counts the rest.
     assert_eq!(sent.len(), 10);
@@ -172,15 +166,38 @@ fn a_response_carries_a_bounded_size_of_notices() {
 }
 
 #[test]
-fn a_tilde_in_the_package_name_does_not_make_a_variant_attachment() {
-    let name = CanonicalPackageName::parse("a~b", Ecosystem::Npm).unwrap();
-    assert!(super::variants::parse_variant_attachment(&name, "a~b-1.0.0.tgz").is_none());
-    let (blob, version, label) =
-        super::variants::parse_variant_attachment(&name, "a~b-1.0.0~musl.tgz")
-            .expect("a variant attachment")
-            .expect("a valid label");
-    assert_eq!(
-        (blob.as_str(), version.as_str(), label.as_str()),
-        ("a~b-1.0.0~musl.tgz", "1.0.0", "musl"),
-    );
+fn semver_validation_is_strict() {
+    for valid in [
+        "1.0.0",
+        "1.0.0-alpha.1",
+        "1.0.0+001",
+        "1.0.0-alpha+001",
+        "1.0.0+build.01",
+        "1.0.0-18446744073709551616",
+    ] {
+        assert!(super::is_valid_semver(valid), "{valid:?} should be valid");
+    }
+    for invalid in [
+        "01.0.0",
+        "v1.0.0",
+        "=1.0.0",
+        "1.0.0-01",
+        "1.0.0-0000000000000000000018446744073709551616",
+        "1.0.0-Ł",
+        " 1.0.0",
+        "1.0",
+        "1.0.0+",
+        "1.0.0+a+b",
+        "9007199254740992.0.0",
+    ] {
+        assert!(!super::is_valid_semver(invalid), "{invalid:?} should be invalid");
+    }
 }
+
+mod claims;
+
+mod fence;
+
+mod names;
+
+mod owners;

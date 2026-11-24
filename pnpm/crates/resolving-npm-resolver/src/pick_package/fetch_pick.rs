@@ -3,12 +3,17 @@
 use std::sync::Arc;
 
 use pnpm_network::MetadataCacheScope;
-use pnpm_registry::{Package, PackageVersion};
+use pnpm_registry::{
+    Package,
+    PackageVersion,
+};
 
 use crate::{
-    FetchFullMetadataCachedOptions, FetchMetadataError,
+    FetchFullMetadataCachedOptions,
+    FetchMetadataError,
     fetch_full_metadata_cached::{
-        fetch_full_metadata_bypassing_cache, fetch_full_metadata_cached_lazily,
+        fetch_full_metadata_bypassing_cache,
+        fetch_full_metadata_cached_lazily,
     },
     metadata_cache_policy::DocumentKind,
     mirror::load_meta_async,
@@ -16,8 +21,14 @@ use crate::{
 };
 
 use super::{
-    PackageMetaCache, PickPackageContext, PickPackageError, PickPackageOptions, PickPackageResult,
-    PickState, pick_from_meta, route::fetch_failure_falls_back,
+    PackageMetaCache,
+    PickPackageContext,
+    PickPackageError,
+    PickPackageOptions,
+    PickPackageResult,
+    PickState,
+    pick_from_meta,
+    route::fetch_failure_falls_back,
 };
 
 impl PickState<'_> {
@@ -86,7 +97,10 @@ impl PickState<'_> {
         }?;
         let meta = Arc::new(document.meta);
         if document.requested == Some(DocumentKind::FullInAbbreviatedMirror) {
-            ctx.metadata.fetch_locker.mark_release_age_upgrade_checked(&self.cache_key, &meta);
+            ctx.metadata.fetch_locker.mark_release_age_upgrade_checked(
+                self.cache_key.clone(),
+                &meta,
+            );
         }
         Ok(meta)
     }

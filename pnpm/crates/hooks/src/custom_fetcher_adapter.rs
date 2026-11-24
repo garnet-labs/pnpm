@@ -2,14 +2,17 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::{CustomFetcher, HookError};
+use crate::{
+    CustomFetcher,
+    HookError,
+};
 
 /// Adapts a slice of [`CustomFetcher`] instances to a single "pick fetcher"
 /// call: iterate the custom fetchers in declared order, return the first
 /// one that claims the package via `can_fetch`.
 ///
 /// This mirrors the TypeScript `pickFetcher` logic in
-/// `pnpm11/fetching/pick-fetcher/src/index.ts`, where custom fetchers are
+/// [`pnpm11/fetching/pick-fetcher/src/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/fetching/pick-fetcher/src/index.ts), where custom fetchers are
 /// tried before built-in fetchers.
 pub struct CustomFetcherPicker {
     fetchers: Vec<Arc<dyn CustomFetcher>>,

@@ -1,9 +1,24 @@
 use super::{
-    FrozenScope, HashSet, InstallError, InstallFrozenLockfile, Lockfile, LockfileEntries,
-    MaterializationInputs, MaterializationOutput, MaterializationWorkspace, Materialized, Reporter,
-    allow_builds_changed_since, anchored_project_manifests, announce_headless_install,
-    frozen_project_anchor_ids, initial_materialization_ids, map_frozen_lockfile_error,
-    previously_skipped, prior_unbuilt_builds, settle_frozen_verification,
+    FrozenScope,
+    HashSet,
+    InstallError,
+    InstallFrozenLockfile,
+    Lockfile,
+    LockfileEntries,
+    MaterializationInputs,
+    MaterializationOutput,
+    MaterializationWorkspace,
+    Materialized,
+    Reporter,
+    allow_builds_changed_since,
+    anchored_project_manifests,
+    announce_headless_install,
+    frozen_project_anchor_ids,
+    initial_materialization_ids,
+    map_frozen_lockfile_error,
+    previously_skipped,
+    prior_unbuilt_builds,
+    settle_frozen_verification,
 };
 
 impl<'a> MaterializationInputs<'a, '_> {
@@ -23,13 +38,16 @@ impl<'a> MaterializationInputs<'a, '_> {
         pnpm_deps_restorer::FrozenLockfileInputs {
             wanted: scope.lockfile(),
             verified: lockfile,
-            path: self.lockfiles.verification.derived_lockfile_path.as_deref(),
+            source: self.lockfiles.verification.cache_source(),
             current: self.lockfiles.current,
             current_entries: LockfileEntries::of_previous_install(self.lockfiles.current),
-            resolution_verifiers: self.workspace.requested_importer_ids.map_or(
-                self.lockfiles.verification.resolution_verifiers.as_slice(),
-                |_| &[][..],
-            ),
+            resolution_verifiers: self.workspace.requested_importer_ids
+                .map(|_| &[][..])
+                .unwrap_or(self.lockfiles.verification.resolution_verifiers.as_slice()),
+            policies: pnpm_deps_restorer::FrozenVerificationPolicies {
+                exotic_subdeps: &self.lockfiles.verification.exotic_subdeps,
+                local_policy: Some(&self.lockfiles.verification.local_policy),
+            },
             planned_canonical_fetches: Some(&self.lockfiles.verification.planned_canonical_fetches),
         }
     }
@@ -69,6 +87,7 @@ impl<'a> MaterializationInputs<'a, '_> {
             lockfiles: self.frozen_lockfiles(scope, lockfile),
             platform: pnpm_deps_restorer::FrozenPlatformOptions {
                 supported_architectures: self.execution.supported_architectures,
+                runtime_provisioning: cfg!(feature = "runtime-provisioning"),
                 skip_runtimes: self.install.execution.skip_runtimes,
                 node_linker: self.install.execution.node_linker,
             },
@@ -116,16 +135,16 @@ impl<'a> MaterializationInputs<'a, '_> {
             self.groups(lockfile),
             self.install.lockfile_policy.ignore_manifest_check,
         );
-        let supported_lockfile_major = matches!(scope.lockfile().lockfile_version.major, 9 | 12);
-        debug_assert!(supported_lockfile_major);
+        assert_supported_lockfile_major(scope.lockfile());
 
+        let verification = &self.lockfiles.verification;
         let frozen_verification_override = settle_frozen_verification::<Reporter>(
             self.workspace.requested_importer_ids,
             self.lockfiles.verification_override.take(),
             lockfile,
-            &self.lockfiles.verification.resolution_verifiers,
-            self.lockfiles.verification.derived_lockfile_path.as_deref(),
-            &self.install.context.config.cache_dir,
+            &verification.resolution_verifiers,
+            (verification.exotic_subdeps.clone(), verification.local_policy.clone()),
+            (verification.cache_source(), &self.install.context.config.cache_dir),
         )
         .await?;
         let prior_unbuilt = prior_unbuilt_builds(self.modules.modules_manifest);
@@ -142,11 +161,17 @@ impl<'a> MaterializationInputs<'a, '_> {
             .await
             // Surface a verification failure as the same top-level
             // `LockfileVerification` variant the eager paths use, rather
-            // than nesting it under `FrozenLockfile` — the concurrent gate
+            // than nesting it under `FrozenLockfile`, the concurrent gate
             // is the same gate, run alongside the fetch.
             .map_err(map_frozen_lockfile_error)?;
         Ok(MaterializationOutput::from_frozen(frozen_result, scope.groups))
     }
+}
+
+fn assert_supported_lockfile_major(lockfile: &Lockfile) {
+    let major = lockfile.lockfile_version.major;
+    let supported = matches!(major, 9 | 12 | 13);
+    debug_assert!(supported);
 }
 
 impl<'a> MaterializationWorkspace<'a> {
@@ -163,13 +188,14 @@ impl<'a> MaterializationWorkspace<'a> {
                 lockfile,
                 self.workspace_root,
                 selected,
+                Some(self.real_importer_ids),
                 hoisted_prior,
                 &groups,
                 &skipped,
             )
         } else {
             let ids = (!ignore_manifest_check).then_some(self.real_importer_ids);
-            let initial = initial_materialization_ids(lockfile, ids, None);
+            let initial = initial_materialization_ids(lockfile, ids, None, None);
             crate::materialization_closure(
                 lockfile,
                 self.workspace_root,

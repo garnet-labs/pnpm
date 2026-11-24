@@ -1,7 +1,19 @@
 use super::{
-    AsyncWriteExt, AtomicU64, ErrorKind, Ordering, Path, PathBuf, Result, fs, read_dir_if_present,
+    AsyncWriteExt,
+    AtomicU64,
+    ErrorKind,
+    Ordering,
+    Path,
+    PathBuf,
+    Result,
+    fs,
+    read_dir_if_present,
 };
-use crate::tmp_suffix::{RANDOM_HEX_DIGITS, TMP_MARKER, tmp_suffix};
+use crate::tmp_suffix::{
+    RANDOM_HEX_DIGITS,
+    TMP_MARKER,
+    tmp_suffix,
+};
 
 /// Per-process counter feeding [`unique_tmp_path`] so two concurrent
 /// writes to the same path don't collide on the same temp filename.
@@ -98,10 +110,114 @@ pub async fn remove_atomic_write_temps(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether `name` is a file name [`unique_tmp_path`] produced.
-pub(crate) fn is_atomic_write_temp_name(name: &str) -> bool {
-    name.match_indices(TMP_MARKER)
-        .any(|(at, marker)| is_atomic_write_temp_suffix(&name.as_bytes()[at + marker.len()..]))
+/// Files and bytes matched by a stale-temporary scan.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TempSweep {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StaleTempAction {
+    Remove,
+    CountOnly,
+}
+
+/// Remove the temporary siblings of `base` (see [`unique_tmp_path`]) last
+/// modified at least `max_age` ago: files a process wrote and never moved
+/// into place because it stopped.
+pub async fn sweep_stale_temps(base: &Path, max_age: std::time::Duration) -> Result<TempSweep> {
+    scan_stale_temps(base, max_age, StaleTempAction::Remove).await
+}
+
+/// Count the temporary siblings of `base` (see [`unique_tmp_path`]) last
+/// modified at least `max_age` ago without removing them.
+pub async fn count_stale_temps(base: &Path, max_age: std::time::Duration) -> Result<TempSweep> {
+    scan_stale_temps(base, max_age, StaleTempAction::CountOnly).await
+}
+
+/// Remove the temporary siblings of `base` (see [`unique_tmp_path`]) last
+/// modified at least `max_age` ago: files a process wrote and never moved
+/// into place because it stopped. Returns how many went.
+pub async fn remove_stale_temps(base: &Path, max_age: std::time::Duration) -> Result<usize> {
+    Ok(sweep_stale_temps(base, max_age).await?.files)
+}
+
+async fn scan_stale_temps(
+    base: &Path,
+    max_age: std::time::Duration,
+    action: StaleTempAction,
+) -> Result<TempSweep> {
+    let (Some(parent), Some(file_name)) = (base.parent(), base.file_name()) else {
+        return Ok(TempSweep::default());
+    };
+    let mut prefix = file_name.to_os_string();
+    prefix.push(TMP_MARKER);
+    let Some(mut entries) = read_dir_if_present(parent).await? else {
+        return Ok(TempSweep::default());
+    };
+    let mut sweep = TempSweep::default();
+    while let Some(entry) = entries.next_entry().await? {
+        if let Some(size) = inspect_stale_temp(&entry, prefix.as_encoded_bytes(), max_age).await
+            && apply_stale_temp_action(action, &entry.path()).await
+        {
+            sweep.files += 1;
+            sweep.bytes += size;
+        }
+    }
+    Ok(sweep)
+}
+
+async fn inspect_stale_temp(
+    entry: &fs::DirEntry,
+    prefix: &[u8],
+    max_age: std::time::Duration,
+) -> Option<u64> {
+    let name = entry.file_name();
+    let suffix = name.as_encoded_bytes().strip_prefix(prefix)?;
+    if !is_atomic_write_temp_suffix(suffix) || crate::blob_write::is_active_temp(&entry.path()) {
+        return None;
+    }
+    let metadata = entry.metadata().await.ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?;
+    let age =
+        std::time::SystemTime::now().duration_since(modified).unwrap_or(std::time::Duration::ZERO);
+    (age >= max_age).then_some(metadata.len())
+}
+
+async fn apply_stale_temp_action(action: StaleTempAction, path: &Path) -> bool {
+    match action {
+        StaleTempAction::Remove => remove_if_present(path).await,
+        StaleTempAction::CountOnly => true,
+    }
+}
+
+async fn remove_if_present(path: &Path) -> bool {
+    match fs::remove_file(path).await {
+        Ok(()) => true,
+        Err(err) if err.kind() == ErrorKind::NotFound => false,
+        Err(err) => {
+            tracing::warn!(?err, path = %path.display(), "stale temporary file cleanup failed");
+            false
+        }
+    }
+}
+
+/// Whether `path`'s filename ends with a [`unique_tmp_path`] suffix.
+#[must_use]
+pub fn is_atomic_write_temp_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().map(std::ffi::OsStr::as_encoded_bytes) else {
+        return false;
+    };
+    let marker = TMP_MARKER.as_bytes();
+    name.windows(marker.len())
+        .enumerate()
+        .any(|(idx, window)| {
+            idx > 0 && window == marker && is_atomic_write_temp_suffix(&name[idx + marker.len()..])
+        })
 }
 
 pub(super) fn is_atomic_write_temp_suffix(suffix: &[u8]) -> bool {

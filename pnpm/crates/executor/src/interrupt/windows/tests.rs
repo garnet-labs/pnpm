@@ -7,16 +7,38 @@
 //! no real console is needed and the children other tests register are
 //! never touched: a `cmd` reading an answer from a pipe pnpm never writes
 //! to stands in for the one at that prompt.
-use super::{STATUS_CONTROL_C_EXIT, WINDOWS_INTERRUPT_GRACE, interrupt_child};
-use crate::interrupt::{SignalRelay, relay_to_child};
+use super::{
+    STATUS_CONTROL_C_EXIT,
+    WINDOWS_INTERRUPT_GRACE,
+    interrupt_child,
+};
+use crate::interrupt::{
+    SignalRelay,
+    spawning_child,
+};
+use command_extra::CommandExtra;
 use pretty_assertions::assert_eq;
 use std::{
     os::windows::process::CommandExt,
-    path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::{OnceLock, atomic::Ordering},
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::{
+        Child,
+        Command,
+        ExitStatus,
+        Stdio,
+    },
+    sync::{
+        OnceLock,
+        atomic::Ordering,
+    },
     thread::sleep,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 /// The node binary itself. The `node` on `PATH` can be a shim that runs
@@ -26,8 +48,8 @@ fn node_binary() -> &'static Path {
     static NODE: OnceLock<PathBuf> = OnceLock::new();
     NODE.get_or_init(|| {
         let output = Command::new("node")
-            .args(["-p", "process.execPath"])
-            .stderr(Stdio::inherit())
+            .with_args(["-p", "process.execPath"])
+            .with_stderr(Stdio::inherit())
             .output()
             .expect("run node");
         assert!(output.status.success(), "node reports its path");
@@ -37,10 +59,10 @@ fn node_binary() -> &'static Path {
 
 fn spawn_node(script: &str) -> Child {
     Command::new(node_binary())
-        .args(["-e", script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .with_args(["-e", script])
+        .with_stdin(Stdio::null())
+        .with_stdout(Stdio::null())
+        .with_stderr(Stdio::null())
         .spawn()
         .expect("spawn node")
 }
@@ -62,10 +84,10 @@ fn spawn_cmd_running_node(script: &str) -> Child {
 /// unanswered, for as long as the returned child is held.
 fn spawn_stuck_cmd() -> Child {
     Command::new("cmd")
-        .args(["/d", "/c", "set /p answer="])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .with_args(["/d", "/c", "set /p answer="])
+        .with_stdin(Stdio::piped())
+        .with_stdout(Stdio::null())
+        .with_stderr(Stdio::null())
         .spawn()
         .expect("spawn cmd")
 }
@@ -93,7 +115,7 @@ fn wait_for_exit(child: &mut Child, deadline: Duration) -> ExitStatus {
 #[test]
 fn a_stuck_cmd_is_terminated_once_the_grace_passes() {
     let mut child = spawn_stuck_cmd();
-    let relay = relay_to_child(child.id(), false);
+    let relay = spawning_child().relay_to_child(child.id(), false);
 
     press_ctrl_c(&relay);
     let status = wait_for_exit(&mut child, WINDOWS_INTERRUPT_GRACE + Duration::from_secs(30));
@@ -108,7 +130,7 @@ fn a_stuck_cmd_is_terminated_once_the_grace_passes() {
 #[test]
 fn a_cmd_that_exits_during_the_grace_keeps_its_own_exit_code() {
     let mut child = spawn_cmd_running_node("setTimeout(() => process.exit(42), 200)");
-    let relay = relay_to_child(child.id(), false);
+    let relay = spawning_child().relay_to_child(child.id(), false);
 
     press_ctrl_c(&relay);
     let status = wait_for_exit(&mut child, Duration::from_secs(30));
@@ -125,7 +147,7 @@ fn a_cmd_whose_script_is_still_shutting_down_is_waited_for() {
     let shutdown_ms = (WINDOWS_INTERRUPT_GRACE * 3).as_millis();
     let mut child =
         spawn_cmd_running_node(&format!("setTimeout(() => process.exit(42), {shutdown_ms})"));
-    let relay = relay_to_child(child.id(), false);
+    let relay = spawning_child().relay_to_child(child.id(), false);
 
     press_ctrl_c(&relay);
     let status = wait_for_exit(&mut child, Duration::from_secs(30));
@@ -143,7 +165,7 @@ fn a_child_that_is_not_cmd_is_waited_for_without_child_processes() {
     // nothing under it, and has no batch-termination prompt to get stuck on.
     let shutdown_ms = (WINDOWS_INTERRUPT_GRACE * 3).as_millis();
     let mut child = spawn_node(&format!("setTimeout(() => process.exit(42), {shutdown_ms})"));
-    let relay = relay_to_child(child.id(), false);
+    let relay = spawning_child().relay_to_child(child.id(), false);
 
     press_ctrl_c(&relay);
     let status = wait_for_exit(&mut child, Duration::from_secs(30));
@@ -154,7 +176,7 @@ fn a_child_that_is_not_cmd_is_waited_for_without_child_processes() {
 #[test]
 fn a_second_interrupt_terminates_without_waiting_for_the_grace() {
     let mut child = spawn_stuck_cmd();
-    let relay = relay_to_child(child.id(), false);
+    let relay = spawning_child().relay_to_child(child.id(), false);
 
     press_ctrl_c(&relay);
     press_ctrl_c(&relay);
@@ -167,7 +189,7 @@ fn a_second_interrupt_terminates_without_waiting_for_the_grace() {
 #[test]
 fn an_interrupt_for_a_released_entry_is_not_counted() {
     let mut child = spawn_node("setInterval(() => {}, 1000)");
-    let relay = relay_to_child(child.id(), false);
+    let relay = spawning_child().relay_to_child(child.id(), false);
     let entry = relay.entry.expect("the child is registered");
     let target = entry.target.load(Ordering::Acquire);
     let relays = entry.relays.load(Ordering::Relaxed);
@@ -190,8 +212,6 @@ fn an_interrupt_for_a_released_entry_is_not_counted() {
 /// which nextest gives it alone, so no other test's child is registered.
 #[test]
 fn an_interrupt_while_no_command_runs_releases_the_process_tree_cleanup() {
-    use windows_sys::Win32::System::Console::CTRL_C_EVENT;
-
     let armed = || {
         crate::job_control::ARMED_JOB
             .lock()
@@ -201,10 +221,12 @@ fn an_interrupt_while_no_command_runs_releases_the_process_tree_cleanup() {
     crate::job_control::arm_process_tree_cleanup();
     assert!(armed(), "the cleanup is armed before the interrupt");
 
-    // SAFETY: the handler reads only atomics and the relay list, and with
-    // no child registered it ends nothing.
-    let handled = unsafe { super::relay_console_event(CTRL_C_EVENT) };
+    let handled = super::relay_console_event(pnpm_ffi_signal::Interrupt::Interrupt);
 
-    assert_eq!(handled, 0, "pnpm ends, as nothing waits on the interrupt");
+    assert_eq!(
+        handled,
+        pnpm_ffi_signal::Handled::No,
+        "pnpm ends, as nothing waits on the interrupt",
+    );
     assert!(!armed(), "the cleanup is released before pnpm ends");
 }

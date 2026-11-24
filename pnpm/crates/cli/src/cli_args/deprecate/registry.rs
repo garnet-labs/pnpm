@@ -1,13 +1,27 @@
 use super::{
-    BTreeMap, DEPRECATION_ERROR_BODY_LIMIT, DeprecateContext, DeprecateError, Deserialize,
-    LimitedBody, Response, Serialize, StatusCode, read_limited_body, redact_url_credentials,
-    retry_async, sanitize, send_with_retry,
+    BTreeMap,
+    DEPRECATION_ERROR_BODY_LIMIT,
+    DeprecateContext,
+    DeprecateError,
+    Deserialize,
+    LimitedBody,
+    Response,
+    Serialize,
+    StatusCode,
+    read_limited_body,
+    redact_url_credentials,
+    retry_async,
+    sanitize,
+    send_with_retry,
 };
 use crate::cli_args::{
     package_spec::PackageSpec,
     registry_client::{
-        PACKAGE_DOCUMENT_BODY_LIMIT, apply_auth_and_otp, auth_header_for_package,
-        package_endpoint_url, resolve_target_registry_for_package,
+        PACKAGE_DOCUMENT_BODY_LIMIT,
+        apply_auth_and_otp,
+        auth_header_for_package,
+        package_endpoint_url,
+        resolve_target_registry_for_package,
     },
 };
 
@@ -63,8 +77,8 @@ async fn fetch_package_meta_once<Meta: serde::de::DeserializeOwned>(
 ) -> Result<Meta, FetchError> {
     let (_guard, response) =
         send_with_retry(&context.http_client, url, context.retry_opts, |client| {
-            // Need full metadata for put update.
-            apply_auth_and_otp(client.get(url), auth_header, None)
+            // Read the current revision before mutating the package document.
+            apply_auth_and_otp(client.get(format!("{url}?write=true")), auth_header, None)
         })
         .await
         .map_err(FetchError::Request)?;
@@ -123,12 +137,14 @@ pub(super) async fn put_package_meta(
     otp: Option<&str>,
     is_deprecate: bool,
 ) -> miette::Result<()> {
+    let command = if is_deprecate { "deprecate" } else { "undeprecate" };
     let body = serde_json::to_string(package_meta).expect("a struct serializes");
     let (_guard, response) =
         send_with_retry(&context.http_client, url, context.retry_opts, |client| {
             let builder = client
                 .put(url)
                 .header("content-type", "application/json")
+                .header("npm-command", command)
                 .body(body.clone());
             apply_auth_and_otp(builder, auth_header, otp)
         })
@@ -140,7 +156,7 @@ pub(super) async fn put_package_meta(
         return Ok(());
     }
 
-    let action = if is_deprecate { "deprecate" } else { "undeprecate" }.to_string();
+    let action = command.to_string();
     Err(registry_write_error(response, action).await.into())
 }
 

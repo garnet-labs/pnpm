@@ -9,10 +9,24 @@ use crate::{
     ConfigDepError,
     manifest_lockfile::package_metadata,
     options::ConfigDepsInstallOptions,
-    resolve_and_install_config_deps::{assert_no_policy_violation, resolve_options},
+    resolve_and_install_config_deps::{
+        assert_no_policy_violation,
+        resolve_options,
+    },
 };
-use pnpm_lockfile::{EnvLockfile, PackageKey, PkgName, PkgVerPeer, SnapshotDepRef, SnapshotEntry};
-use pnpm_resolving_resolver_base::{ResolveResult, Resolver, WantedDependency};
+use pnpm_lockfile::{
+    EnvLockfile,
+    PackageKey,
+    PkgName,
+    PkgVerPeer,
+    SnapshotDepRef,
+    SnapshotEntry,
+};
+use pnpm_resolving_resolver_base::{
+    ResolveResult,
+    Resolver,
+    WantedDependency,
+};
 use std::collections::HashMap;
 
 /// Resolve `parent_manifest.optionalDependencies` and record each into
@@ -75,7 +89,6 @@ fn record_optional_subdep(
     subdep_version: &str,
     result: &ResolveResult,
 ) -> Result<(), ConfigDepError> {
-    let registry = opts.verification.pick_registry(subdep_name);
     let pkg_key: PackageKey = format!("{subdep_name}@{subdep_version}")
         .parse()
         .map_err(|_| ConfigDepError::BadConfigDep {
@@ -86,8 +99,14 @@ fn record_optional_subdep(
 
     env_lockfile.packages.insert(
         pkg_key.clone(),
-        package_metadata(subdep_name, subdep_version, result, registry, false)
-            .map_err(ConfigDepError::LockfileForm)?,
+        package_metadata(
+            subdep_name,
+            subdep_version,
+            result,
+            opts.verification.tarball_url_options(subdep_name),
+            false,
+        )
+        .map_err(ConfigDepError::LockfileForm)?,
     );
     env_lockfile.snapshots
         .entry(pkg_key)

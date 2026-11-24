@@ -1,5 +1,8 @@
 use super::{
-    default_rules::{DEFAULT_PATTERNS, may_match_default_rules},
+    default_rules::{
+        DEFAULT_PATTERNS,
+        may_match_default_rules,
+    },
     rule::IgnoreRule,
 };
 
@@ -283,6 +286,13 @@ fn default_rule_gate_is_a_superset_of_the_default_rules() {
     }
 }
 
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::numeric_escape_for_visible_character,
+        reason = "the Kelvin sign reads as `K`, and clippy rejects it written out"
+    )
+)]
 #[test]
 fn default_rule_gate_rejects_ordinary_paths() {
     for path in [
@@ -335,3 +345,30 @@ fn unc_roots_follow_minimatch_platform_semantics() {
     assert!(IgnoreRule::parse("/**").matches("/foo", false));
     assert!(IgnoreRule::parse("///**").matches("/foo", false));
 }
+
+#[test]
+fn lockfile_staging_entries_are_pruned_before_visiting_even_with_a_files_allowlist() {
+    let root = tempfile::tempdir().unwrap();
+    for name in [
+        "index.js",
+        ".pnpm-lock.yaml.123.0.tmp",
+        ".pnpm-lock.yaml.123.5f0e2c1a-7a3b-4c8d-9e0f-1a2b3c4d5e6f.tmp",
+        ".pnpm-lock.yaml.backup",
+    ] {
+        std::fs::write(root.path().join(name), "contents").unwrap();
+    }
+    let temporary = root.path().join(".pnpm-lock.yaml.123.1.tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::write(temporary.join("nested.js"), "contents").unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    std::fs::write(root.path().join("nested/.pnpm-lock.yaml.123.0.tmp"), "contents").unwrap();
+    for manifest in [serde_json::json!({}), serde_json::json!({"files": ["*"]})] {
+        let selected = crate::packlist(root.path(), &manifest).unwrap();
+        assert_eq!(
+            selected,
+            vec![".pnpm-lock.yaml.backup", "index.js", "nested/.pnpm-lock.yaml.123.0.tmp"],
+        );
+    }
+}
+
+mod vanished_entries;

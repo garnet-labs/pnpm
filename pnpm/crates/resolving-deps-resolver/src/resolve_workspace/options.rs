@@ -1,10 +1,18 @@
 //! The options [`fn@super::resolve_workspace`] takes, and the split that
 //! hands most of them to the shared tree context.
 
-use crate::resolve_dependency_tree::{UpdateDepth, UpdateReuseScope, WorkspaceTreeCtx};
+use crate::resolve_dependency_tree::{
+    UpdateDepth,
+    UpdateReuseScope,
+    WorkspaceTreeCtx,
+};
 use pnpm_lockfile::RegistryContext;
 use pnpm_package_manifest::PackageManifest;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+};
 
 /// One importer's input to [`fn@super::resolve_workspace`].
 pub struct WorkspaceImporter<'a> {
@@ -20,7 +28,7 @@ pub struct WorkspaceResolveOptions {
     /// and the importer-relative `link:` is rendered from that canonical
     /// result afterwards. Must stay `false` whenever the resolver chain can
     /// make a resolution depend on the consuming importer beyond that
-    /// rendering — a pnpmfile custom resolver above all.
+    /// rendering, a pnpmfile custom resolver above all.
     pub share_workspace_resolutions: bool,
     /// Package-name → semver-range map from the
     /// `pnpm.allowedDeprecatedVersions` setting. When a newly-resolved
@@ -37,6 +45,9 @@ pub struct WorkspaceResolveOptions {
     pub hooks: WorkspaceResolveHooks,
     pub reuse: WorkspaceLockfileReuse,
     pub version: WorkspaceVersionResolution,
+    /// Parsed `overrides`, used to attribute `ERR_PNPM_NO_MATCHING_VERSION`
+    /// to the override entry that forced the missing version.
+    pub parsed_overrides: Option<Arc<[crate::OverrideEntry]>>,
 }
 
 #[derive(Default)]
@@ -47,7 +58,7 @@ pub struct WorkspacePeerResolutionOptions {
     /// Threaded into [`crate::WorkspacePeerSettings::dedupe_peer_dependents`],
     /// and overrides every per-importer
     /// [`crate::ImporterPeerOptions::dedupe_peer_dependents`].
-    pub dedupe_peer_dependents: bool,
+    pub dedupe_peer_dependents: crate::PeerDependentsDedupe,
     /// Threaded into
     /// [`crate::WorkspacePeerSettings::resolve_peers_from_workspace_root`].
     pub resolve_peers_from_workspace_root: bool,
@@ -62,7 +73,7 @@ pub struct WorkspacePeerResolutionOptions {
     /// shared [`WorkspaceTreeCtx`] so the tree walk drops
     /// peer-shadowed `dependencies` entries. Also overrides every
     /// per-importer
-    /// [`crate::ImporterPeerOptions::auto_install_peers`] — the
+    /// [`crate::ImporterPeerOptions::auto_install_peers`], the
     /// setting is workspace-wide.
     pub auto_install_peers: bool,
 }
@@ -88,7 +99,14 @@ pub struct WorkspaceResolveHooks {
     /// `pnpm:deprecation` debug log). `None` keeps the deprecation
     /// check but drops the notification.
     pub deprecation_log: Option<crate::DeprecationLogFn>,
+    /// Sink told about each package the walk adds to the graph, before its
+    /// dependencies resolve. A package that several walks resolve, such as
+    /// the rounds of an automatic dedupe, is reported by each. `None`
+    /// drops the notification.
+    pub resolved_package: Option<crate::ResolvedPackageFn>,
     pub manifests: crate::ManifestTransformHooks,
+    pub max_snapshots: Option<usize>,
+    pub cancel: crate::ResolutionCancel,
 }
 
 #[derive(smart_default::SmartDefault)]
@@ -103,7 +121,7 @@ pub struct WorkspaceLockfileReuse {
     /// [`Self::lockfile`]. `false` keeps the lockfile as a
     /// per-edge version-pin source only: every node re-resolves against
     /// its (hook-rewritten) manifest range, and an edge whose recorded
-    /// version still satisfies that range stays on it — mirroring the
+    /// version still satisfies that range stays on it, mirroring the
     /// TypeScript resolver's forced full resolution, which forces the
     /// walk without unpinning still-satisfied edges. The config drift
     /// that denied subtree reuse stays effective: hooks rewrite the
@@ -124,6 +142,7 @@ pub struct WorkspaceLockfileReuse {
     /// Reconsider these packages using the existing-version preferences,
     /// without treating them as explicit update targets.
     pub dedupe: crate::UpdateTargets,
+    pub runtimes: crate::LockedRuntimeReuse,
 }
 
 #[derive(Default)]
@@ -145,12 +164,14 @@ pub struct WorkspaceVersionResolution {
 /// taken the hooks, logs and lockfile.
 pub(super) struct PassSettings {
     /// The lockfile's recorded publish dates, taken only for the
-    /// `time-based` pre-pass that reads them — a lockfile is untrusted
+    /// `time-based` pre-pass that reads them, a lockfile is untrusted
     /// input, so an install that will not consult the dates must not
     /// copy them.
     pub(super) recorded_time: Option<BTreeMap<String, String>>,
     pub(super) peers: WorkspacePeerResolutionOptions,
     pub(super) version: WorkspaceVersionResolution,
+    pub(super) max_snapshots: Option<usize>,
+    pub(super) cancel: crate::ResolutionCancel,
 }
 
 impl WorkspaceResolveOptions {
@@ -160,14 +181,23 @@ impl WorkspaceResolveOptions {
                 self.reuse.lockfile.as_ref().and_then(|lockfile| lockfile.time.clone())
             })
             .flatten();
-        let settings = PassSettings { recorded_time, peers: self.peers, version: self.version };
+        let max_snapshots = self.hooks.max_snapshots;
+        let cancel = self.hooks.cancel.clone();
+        let settings = PassSettings {
+            recorded_time,
+            peers: self.peers,
+            version: self.version,
+            max_snapshots,
+            cancel,
+        };
         let workspace = WorkspaceTreeCtx::default()
             .with_shared_workspace_resolutions(self.share_workspace_resolutions)
             .with_hooks(self.hooks)
             .with_lockfile_reuse(self.reuse)
             .with_allowed_deprecated_versions(self.allowed_deprecated_versions)
             .with_auto_install_peers(settings.peers.auto_install_peers)
-            .with_registry_context(self.registry_context);
+            .with_registry_context(self.registry_context)
+            .with_parsed_overrides(self.parsed_overrides);
         (Arc::new(workspace), settings)
     }
 }

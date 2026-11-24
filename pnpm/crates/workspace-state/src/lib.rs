@@ -10,16 +10,34 @@
 //! pnpm read state written by pacquet, which is what lets
 //! `verify-deps-before-run` stay enabled.
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use indexmap::IndexMap;
-use pnpm_diagnostics::miette::{self, Diagnostic};
-use serde::{Deserialize, Serialize};
+use pnpm_diagnostics::miette::{
+    self,
+    Diagnostic,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Write},
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    io::{
+        self,
+        Write,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 /// Basename of the workspace-state file, written inside `node_modules/`.
@@ -49,7 +67,7 @@ pub struct ProjectEntry {
     pub has_modules_dir: bool,
 }
 
-/// A single `configDependencies` value — either a `VersionWithIntegrity`
+/// A single `configDependencies` value; either a `VersionWithIntegrity`
 /// string or a `{ tarball?, integrity }` object. Untagged so it
 /// round-trips both shapes verbatim; pnpm compares the recorded value
 /// against the live config with a deep, order-independent equality
@@ -71,8 +89,8 @@ pub struct ConfigDependencyDetail {
 
 /// Typed view of `.pnpm-workspace-state-v1.json`.
 ///
-/// `lastValidatedTimestamp` is JS `Date.now()` — milliseconds since the
-/// Unix epoch — so pnpm's freshness checks (`mtime > lastValidated`)
+/// `lastValidatedTimestamp` is JS `Date.now()` (milliseconds since the
+/// Unix epoch) so pnpm's freshness checks (`mtime > lastValidated`)
 /// stay consistent across the two implementations.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +171,11 @@ pub struct ManifestFile {
     /// without them, which cannot stand in for the manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Which list of fields `fields` holds. A record of another revision
+    /// may lack a field the check reads, so it cannot stand in for the
+    /// manifest. `0` in a record written before revisions were recorded.
+    #[serde(default)]
+    pub fields_revision: u32,
 }
 
 /// The local dependencies one lockfile resolves, as absolute paths.
@@ -221,7 +244,7 @@ pub struct FileSignature {
 /// track yet. pnpm iterates its full set of workspace-state setting
 /// keys and reads an omitted key as `undefined`, so a key pacquet omits
 /// stays compatible only while pnpm's resolved value for it is also
-/// `undefined`. Match what the install actually used — if pacquet's
+/// `undefined`. Match what the install actually used, if pacquet's
 /// resolved value differs from pnpm's, pnpm correctly reinstalls.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -242,6 +265,8 @@ pub struct WorkspaceStateSettings {
     pub allow_skills: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_install_peers: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_exotic_subdeps: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogs: Option<serde_json::Value>,
     /// `dangerouslyAllowAllBuilds`. An unset value reads as `false`. Turned
@@ -268,7 +293,7 @@ pub struct WorkspaceStateSettings {
     pub auto_dedupe: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<bool>,
-    /// `None` and `Some(false)` both mean "global virtual store off" —
+    /// `None` and `Some(false)` both mean "global virtual store off",
     /// pnpm omits the key for its `undefined` default and only writes a
     /// concrete value when `--global` (always `true`) or CI (`false`)
     /// forces one. The freshness check coerces the two off-forms before
@@ -296,11 +321,20 @@ pub struct WorkspaceStateSettings {
     /// such setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub add_missing_peer_types: Option<bool>,
+    /// `projectScopedOptionalPeers`, recorded only while it is on. pnpm v11
+    /// has no such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_scoped_optional_peers: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_workspace_packages: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_workspace_packages: Option<serde_json::Value>,
-    /// `lockfile.includeResolutionSettings`, recorded only while it is on.
+    /// The selected wanted lockfile format, recorded for a non-default format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockfile_format: Option<String>,
+    /// Whether the lockfile records the resolution settings, which
+    /// `lockfile.includeResolutionSettings` or `lockfile.format: v13` turns
+    /// on. Recorded only while it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lockfile_include_resolution_settings: Option<bool>,
     /// `lockfile.integrityTarget`, recorded only while it is not the
@@ -325,6 +359,12 @@ pub struct WorkspaceStateSettings {
     /// the recorded value is that resolved form, not the raw setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_release_age_strict: Option<bool>,
+    /// `referenceTime`, the fixed time lockfile verification checks
+    /// at. pnpm v11 has no such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_download_mirrors: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_linker: Option<NodeLinker>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,9 +411,16 @@ pub struct WorkspaceStateSettings {
     /// `runtime`, recorded only while it is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<bool>,
+    /// `runtimeOnFail`, recorded only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_on_fail: Option<RuntimeOnFail>,
     /// `skills.dirs`, recorded only when set. pnpm v11 has no such setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_dirs: Option<Vec<String>>,
+    /// Configured `tools.<name>.mirror` / `channels` runtime mirrors, recorded
+    /// only when set. pnpm v11 has no such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mirrors: Option<BTreeMap<String, String>>,
     /// The store directory a configured `storeDir` resolves to, recorded
     /// only when set. The modules directory is linked from the store it was
     /// installed with, so a change must reach the install that recreates it.
@@ -426,6 +473,33 @@ pub enum TrustPolicy {
     NoDowngrade,
 }
 
+/// What to do when a runtime declared through `devEngines.runtime` or
+/// `engines.runtime` does not match the current process.
+///
+/// The `runtimeOnFail` setting overrides the manifest-level `onFail` value.
+/// `download` reifies the runtime as a dependency; the other modes leave it
+/// as an engine constraint only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeOnFail {
+    Download,
+    Error,
+    Warn,
+    Ignore,
+}
+
+impl RuntimeOnFail {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Ignore => "ignore",
+        }
+    }
+}
+
 /// pnpm's `nodeLinker: 'hoisted' | 'isolated' | 'pnp'`. Same wire
 /// format as `pnpm_modules_yaml::NodeLinker`; duplicated here rather
 /// than depending on `pnpm-modules-yaml` so `workspace-state` stays
@@ -459,7 +533,7 @@ pub enum UpdateWorkspaceStateError {
 /// Write `state` to `<workspace_dir>/node_modules/.pnpm-workspace-state-v1.json`.
 ///
 /// Writes to a temporary file in the same directory, then atomically
-/// renames it into place, so a concurrent reader — pnpm or pacquet —
+/// renames it into place, so a concurrent reader (pnpm or pacquet)
 /// never observes a half-written file
 /// ([#12020](https://github.com/pnpm/pnpm/issues/12020)). Two pnpm
 /// processes installing one workspace at once both write it, so the

@@ -1,20 +1,49 @@
 use super::{
-    super::{DependenciesGraphToLockfileError, GraphToLockfileOptions, ImporterLockfileInput},
-    EMPTY_CATALOGS, EMPTY_NAMED_REGISTRIES, EMPTY_REGISTRY_OPTIONS, GIT_TARBALL_URL,
-    NPM_REGISTRIES, dependencies_graph_to_lockfile, error_from_single_node_graph, git_hosted_node,
-    injected_link_fixture, make_link_node, make_node, make_node_with_optional,
-    single_importer_opts, write_manifest,
+    super::{
+        DependenciesGraphToLockfileError,
+        GraphToLockfileOptions,
+        ImporterLockfileInput,
+    },
+    EMPTY_CATALOGS,
+    EMPTY_NAMED_REGISTRIES,
+    EMPTY_REGISTRY_OPTIONS,
+    GIT_TARBALL_URL,
+    NPM_REGISTRIES,
+    dependencies_graph_to_lockfile,
+    error_from_single_node_graph,
+    git_hosted_node,
+    injected_link_fixture,
+    make_link_node,
+    make_node,
+    make_node_with_optional,
+    single_importer_opts,
+    write_manifest,
 };
 use pnpm_deps_path::DepPath;
 use pnpm_lockfile::{
-    GitResolution, ImporterDepVersion, LockfileResolution, PackageKey, PkgName, SnapshotDepRef,
+    GitResolution,
+    ImporterDepVersion,
+    LockfileResolution,
+    PackageKey,
+    PkgName,
+    SnapshotDepRef,
     VariationsResolution,
 };
-use pnpm_resolving_deps_resolver::{DependenciesGraph, DependenciesGraphNode, PeerDep};
-use pnpm_resolving_resolver_base::{PkgResolutionId, ResolveResult};
+use pnpm_resolving_deps_resolver::{
+    DependenciesGraph,
+    DependenciesGraphNode,
+    PeerDep,
+};
+use pnpm_resolving_resolver_base::{
+    PkgResolutionId,
+    ResolveResult,
+};
 use rustc_hash::FxHashSet as HashSet;
 use serde_json::json;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 #[test]
 fn fresh_install_records_importer_manifest_metadata() {
@@ -103,10 +132,7 @@ fn runtime_dependency_strips_importer_prefix_and_records_package_version() {
     let dep_path = DepPath::from("node@runtime:26.3.0".to_string());
     let resolve_result = ResolveResult {
         id: PkgResolutionId::from("node@runtime:26.3.0"),
-        resolution: LockfileResolution::Variations(VariationsResolution {
-            variants: vec![],
-            revision: None,
-        }),
+        resolution: LockfileResolution::Variations(VariationsResolution { variants: vec![] }),
         resolved_via: "node-runtime".to_string(),
         normalized_bare_specifier: None,
         alias: Some("node".to_string()),
@@ -124,6 +150,7 @@ fn runtime_dependency_strips_importer_prefix_and_records_package_version() {
         },
     };
     let node = DependenciesGraphNode {
+        recorded_peer_bindings: None,
         dep_path: dep_path.clone(),
         resolved_package_id: "node@runtime:26.3.0".to_string(),
         resolve_result: std::sync::Arc::new(resolve_result),
@@ -192,7 +219,7 @@ fn git_hosted_dependency_records_bare_tarball_url_in_importer() {
         .expect("git dependency");
     assert_eq!(entry.specifier, "github:kevva/is-negative#1.0.0");
     // The alias matches the package name, so the `is-negative@` prefix
-    // is stripped — same shape upstream's `depPathToRef` writes.
+    // is stripped, same shape upstream's `depPathToRef` writes.
     match &entry.version {
         ImporterDepVersion::Regular(version) => assert_eq!(version.to_string(), GIT_TARBALL_URL),
         other => panic!("expected Regular({GIT_TARBALL_URL}), got {other:?}"),
@@ -260,7 +287,7 @@ fn aliased_git_hosted_dependency_keeps_package_name_in_importer_ref() {
 /// `type: git` snapshot whose id *is* its depPath, and whose name lives
 /// only in the fetched manifest. When the manifest alias matches that
 /// name, the importer entry drops the `<name>@` prefix and records the
-/// bare `git+<repo>#<commit>` ref — the shape pnpm v11 writes, verified
+/// bare `git+<repo>#<commit>` ref, the shape pnpm v11 writes, verified
 /// byte-for-byte against pnpm 11.13.1.
 #[test]
 fn non_host_git_dependency_records_bare_git_url_in_importer() {
@@ -274,7 +301,7 @@ fn non_host_git_dependency_records_bare_git_url_in_importer() {
 
     // The install pipeline keys a git dep's depPath by `<name>@<ref>`
     // once the name is read from the fetched manifest, so the `<name>@`
-    // prefix is present here — the exact shape `real_name` has to strip
+    // prefix is present here, the exact shape `real_name` has to strip
     // back off for the importer entry.
     let dep_path = DepPath::from(format!("is-negative@{GIT_REF}"));
     let resolve_result = ResolveResult {
@@ -298,6 +325,7 @@ fn non_host_git_dependency_records_bare_git_url_in_importer() {
         },
     };
     let node = DependenciesGraphNode {
+        recorded_peer_bindings: None,
         dep_path: dep_path.clone(),
         resolved_package_id: dep_path.to_string(),
         resolve_result: Arc::new(resolve_result),
@@ -532,12 +560,14 @@ fn multi_importer_pruner_marks_shared_dep_non_optional_when_any_importer_reaches
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,
@@ -621,12 +651,14 @@ fn workspace_sibling_link_renders_per_importer_with_link_ref() {
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,

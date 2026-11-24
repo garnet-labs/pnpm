@@ -2,24 +2,49 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{
+            AtomicU32,
+            Ordering,
+        },
     },
     time::Duration,
 };
 
 use reqwest::{
     StatusCode,
-    dns::{Addrs, Name, Resolve, Resolving},
+    dns::{
+        Addrs,
+        Name,
+        Resolve,
+        Resolving,
+    },
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{
+        AsyncReadExt,
+        AsyncWriteExt,
+    },
     net::TcpStream,
 };
 
-use super::{RetryOpts, SecureAttemptError, get_secure_bytes, retry_async, should_retry_status};
+use super::{
+    RetryOpts,
+    SecureAttemptError,
+    get_secure_bytes,
+    retry_async,
+    should_retry_status,
+};
 use crate::{
-    AuthHeaders, GuardedDnsResolver, PerRegistryTls, ProxyConfig, SecureAuthResponse,
-    ThrottledClient, TlsConfig, is_permanent_error, is_public_address, nerf_dart,
+    AuthHeaders,
+    GuardedDnsResolver,
+    PerRegistryTls,
+    ProxyConfig,
+    SecureAuthResponse,
+    ThrottledClient,
+    TlsConfig,
+    is_permanent_error,
+    is_public_address,
+    nerf_dart,
     walk_reqwest_chain,
 };
 use pnpm_testing_utils::untrusted_tls_server::UntrustedTlsServer;
@@ -33,6 +58,48 @@ fn instant_retry_opts(retries: u32) -> RetryOpts {
         min_timeout: Duration::from_millis(1),
         max_timeout: Duration::from_millis(1),
     }
+}
+
+#[tokio::test]
+async fn transient_local_metadata_response_is_retried() {
+    struct LocalMetadata(String);
+    impl crate::UpstreamRouteHook for LocalMetadata {
+        fn authorize(&self, _: &str, _: Option<&str>) -> Option<String> {
+            None
+        }
+
+        fn fetch_local(
+            &self,
+            _: &str,
+            _: reqwest::header::HeaderMap,
+        ) -> Option<crate::LocalResponse> {
+            let url = self.0.clone();
+            Some(Box::pin(async move { reqwest::get(url).await.unwrap() }))
+        }
+    }
+
+    let mut server = mockito::Server::new_async().await;
+    let unavailable = server
+        .mock("GET", "/")
+        .with_status(503)
+        .expect(1)
+        .create_async()
+        .await;
+    let available = server
+        .mock("GET", "/")
+        .with_body("ok")
+        .expect(1)
+        .create_async()
+        .await;
+    let auth = AuthHeaders::default().with_route_hook(Arc::new(LocalMetadata(server.url())));
+    let client = ThrottledClient::new_for_installs_with_redirect_guard(|_| false);
+    let response =
+        get_secure_bytes(&client, "https://index.invalid/", &auth, None, instant_retry_opts(1), 16)
+            .await
+            .unwrap();
+    assert_eq!(response.body, b"ok");
+    unavailable.assert_async().await;
+    available.assert_async().await;
 }
 
 #[tokio::test]
@@ -293,7 +360,10 @@ fn metadata_retry_diagnostics_do_not_include_response_body_or_url() {
 
 #[tokio::test]
 async fn metadata_retry_recovers_an_interrupted_response_body() {
-    use tokio::{io::AsyncWriteExt, net::TcpListener};
+    use tokio::{
+        io::AsyncWriteExt,
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/metadata", listener.local_addr().unwrap());
@@ -531,6 +601,20 @@ async fn a_timeout_while_another_request_is_in_flight_downscales_concurrency() {
     };
     assert!(left_error.is_timeout(), "{left_error:?}");
     assert!(right_error.is_timeout(), "{right_error:?}");
+    assert!(client.is_origin_downscaled(&url));
+}
+
+#[tokio::test]
+async fn a_head_deadline_timeout_while_another_request_is_in_flight_downscales_concurrency() {
+    let addr = spawn_stalling_server(b"").await;
+    let client = ThrottledClient::default();
+    let url = format!("http://{addr}/pkg.tgz");
+    let head_timeout = Duration::from_millis(200);
+    let first = client.get_response_head_within(&url, head_timeout, |request, _| request);
+    let second = client.get_response_head_within(&url, head_timeout, |request, _| request);
+    let (left, right) = tokio::join!(first, second);
+    assert!(matches!(left, Err(crate::HeadError::TimedOut)), "{:?}", left.err());
+    assert!(matches!(right, Err(crate::HeadError::TimedOut)), "{:?}", right.err());
     assert!(client.is_origin_downscaled(&url));
 }
 

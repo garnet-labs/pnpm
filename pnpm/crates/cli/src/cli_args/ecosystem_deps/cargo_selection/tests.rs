@@ -1,24 +1,32 @@
 use super::{
-    SelectedCargoDep, SelectedCargoTarget, is_held_as_downgrade, is_held_by_patch,
+    SelectedCargoDep,
+    SelectedCargoTarget,
+    is_held_as_downgrade,
+    is_held_by_patch,
     target_requirement,
 };
 use crate::cli_args::ecosystem_deps::{
-    cargo_manifest_ops::DeclaredCargoDep, cargo_workspace_scope::tests::scope_with,
+    cargo_manifest_ops::DeclaredCargoDep,
+    cargo_workspace_scope::tests::scope_with,
 };
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_reporter::SilentReporter;
-use semver::{Version, VersionReq};
+use semver::{
+    Version,
+    VersionReq,
+};
 use std::path::PathBuf;
 
 fn tower_0_4() -> DeclaredCargoDep {
     DeclaredCargoDep {
-        alias: "tower-0-4".to_string(),
+        aliases: vec!["tower-0-4".to_string()],
+        manifest_key: "tower-0-4".to_string(),
         package_name: "tower".to_string(),
         raw_spec: "0.4.0".to_string(),
         version_req: VersionReq::parse("0.4.0").unwrap(),
         group: DependencyGroup::Prod,
         manifest_path: PathBuf::from("Cargo.toml"),
-        table: "workspace.dependencies",
+        table: ["workspace", "dependencies"].map(String::from).to_vec(),
     }
 }
 

@@ -17,7 +17,7 @@ use regex::Regex;
 /// first matching include, or `None` when nothing matches.
 ///
 /// The match position is an `Option<usize>` rather than an `i32` /
-/// `-1`-sentinel — the same information, idiomatic for Rust.
+/// `-1`-sentinel, the same information, idiomatic for Rust.
 #[must_use]
 pub fn create_matcher_with_index(patterns: &[String]) -> MatcherWithIndex {
     match patterns.len() {
@@ -34,7 +34,27 @@ pub fn create_matcher(patterns: &[String]) -> Matcher {
     Matcher(create_matcher_with_index(patterns))
 }
 
-/// Boolean matcher — opaque wrapper around [`MatcherWithIndex`].
+/// Returns `true` when at least one pattern in `patterns` is an include rule
+/// (does not start with `'!'`).
+#[must_use]
+pub fn has_include_pattern(patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| !pattern.starts_with('!'))
+}
+
+/// Drops ignore-only rules from `filtered` when `original` included at least
+/// one positive pattern, preventing a domain projection from turning leftover
+/// `'!'` exclusions into a match-everything-except-exclusions list.
+#[must_use]
+pub fn prune_orphan_ignores(mut filtered: Vec<String>, original: &[String]) -> Vec<String> {
+    if has_include_pattern(original) && !has_include_pattern(&filtered) {
+        filtered.clear();
+    }
+    filtered
+}
+
+/// Boolean matcher, opaque wrapper around [`MatcherWithIndex`].
 #[derive(Clone)]
 pub struct Matcher(MatcherWithIndex);
 
@@ -46,8 +66,15 @@ impl Matcher {
         self.0.matches(input).is_some()
     }
 
+    /// Evaluates the ordered include and ignore rules across all `inputs`
+    /// representing one item (such as a package name and its manifest aliases).
+    #[must_use]
+    pub fn matches_any(&self, inputs: &[&str]) -> bool {
+        !inputs.is_empty() && self.0.0.matches_any(inputs)
+    }
+
     /// `true` iff this matcher is statically guaranteed to never
-    /// match any input — i.e. compiled from an empty pattern list.
+    /// match any input, i.e. compiled from an empty pattern list.
     /// Lets callers short-circuit before they walk a graph and call
     /// [`Self::matches`] for every alias.
     #[must_use]
@@ -91,6 +118,33 @@ impl MatcherImpl {
             MatcherImpl::Mixed(patterns) => last_verdict(patterns, input),
         }
     }
+
+    fn matches_any(&self, inputs: &[&str]) -> bool {
+        match self {
+            MatcherImpl::Never => false,
+            MatcherImpl::Single(single) => single.matches_any(inputs),
+            MatcherImpl::AllInclude(patterns) => inputs
+                .iter()
+                .any(|input| first_include(patterns, input).is_some()),
+            MatcherImpl::AllIgnore(patterns) => !inputs
+                .iter()
+                .any(|input| none_ignores(patterns, input).is_none()),
+            MatcherImpl::Mixed(patterns) => mixed_verdict_any(patterns, inputs),
+        }
+    }
+}
+
+fn mixed_verdict_any(patterns: &[CompiledPattern], inputs: &[&str]) -> bool {
+    let mut included = false;
+    for pattern in patterns {
+        if inputs
+            .iter()
+            .any(|input| pattern.matches(input))
+        {
+            included = !pattern.is_ignore;
+        }
+    }
+    included
 }
 
 /// The first include pattern that matches, by position.
@@ -143,6 +197,13 @@ impl SingleMatcher {
         let raw = self.glob.matches(input);
         let matched = if self.is_ignore { !raw } else { raw };
         matched.then_some(0)
+    }
+
+    fn matches_any(&self, inputs: &[&str]) -> bool {
+        let any_hit = inputs
+            .iter()
+            .any(|input| self.glob.matches(input));
+        if self.is_ignore { !any_hit } else { any_hit }
     }
 }
 
@@ -197,7 +258,7 @@ fn compile_many(patterns: &[String]) -> MatcherImpl {
 
 /// A compiled glob pattern. `*` matches any sequence including empty,
 /// `?` matches one character, and every other character is literal. The
-/// match is anchored — pattern must consume the whole input.
+/// match is anchored, pattern must consume the whole input.
 
 #[derive(Clone)]
 pub struct WildcardMatcher {

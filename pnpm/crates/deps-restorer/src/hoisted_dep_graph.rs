@@ -9,7 +9,7 @@
 //!
 //! Unlike the depPath-keyed [`crate::deps_graph`] module (which is
 //! a hashing-side adapter for the build cache), the graph defined
-//! here is keyed by *absolute directory path* — that's the
+//! here is keyed by *absolute directory path*; that's the
 //! identity hoisted-linker nodes have, because the same package
 //! can occupy several directories when a name conflict forces it
 //! to nest. Hoisting decisions are made at directory granularity,
@@ -17,24 +17,57 @@
 
 mod presence;
 use presence::{
-    installability_skip, lookup_package_metadata, package_present_at,
-    path_relative_to_lockfile_dir, resolution_changed_at,
+    installability_skip,
+    lookup_package_metadata,
+    package_present_at,
+    path_relative_to_lockfile_dir,
+    resolution_changed_at,
 };
 
 mod walk;
-use walk::{PackageLocations, WalkState, walk_deps};
+use walk::{
+    PackageLocations,
+    WalkState,
+    walk_deps,
+};
 
-use crate::{HoistedLocations, safe_join_modules_dir::InvalidDependencyAliasError};
-use derive_more::{Display, Error, From};
+use crate::{
+    HoistedLocations,
+    ImporterModulesDirs,
+    safe_join_modules_dir::InvalidDependencyAliasError,
+};
+use derive_more::{
+    Display,
+    Error,
+    From,
+};
 use miette::Diagnostic;
-use pnpm_lockfile::{Lockfile, LockfileResolution, ParsePkgNameVerPeerError, PkgIdWithPatchHash};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileResolution,
+    ParsePkgNameVerPeerError,
+    PkgIdWithPatchHash,
+};
 use pnpm_modules_yaml::DepPath;
-use pnpm_package_is_installable::{InstallabilityError, SupportedArchitectures};
+use pnpm_package_is_installable::{
+    InstallabilityError,
+    SupportedArchitectures,
+};
 use pnpm_patching::PatchInfo;
-use pnpm_real_hoist::{HoistError, HoistOpts, hoist};
+use pnpm_real_hoist::{
+    HoistError,
+    HoistOpts,
+    hoist,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// One node in a hoisted-linker dependency graph. Keyed in the
@@ -47,7 +80,7 @@ use std::{
 pub struct DependenciesGraphNode {
     pub package: HoistedPackageMetadata,
     /// The alias this node was placed under in its parent's
-    /// `node_modules`. Optional — only populated when the node is
+    /// `node_modules`. Optional, only populated when the node is
     /// reached via the hoist walk.
     pub alias: Option<String>,
     /// Absolute path of the package's directory on disk. The
@@ -74,7 +107,7 @@ pub struct DependenciesGraphNode {
     /// Alias → child `dir` of this node's listed dependencies, as
     /// computed from the lockfile snapshot's `dependencies` and
     /// (when included) `optionalDependencies`. The walker resolves
-    /// each child to the directory the alias was hoisted to —
+    /// each child to the directory the alias was hoisted to,
     /// which may be the root, a sibling, or this node's own
     /// `node_modules`, depending on the hoister's decision.
     pub children: BTreeMap<String, PathBuf>,
@@ -135,7 +168,7 @@ pub struct LockfileToDepGraphResult {
     /// by the post-install re-mirror step. The keys are typed as raw
     /// `String`, not `DepPath`, to keep the on-disk shape identical.
     pub injection_targets_by_dep_path: BTreeMap<String, Vec<PathBuf>>,
-    /// Packages the walker decided to skip — the input
+    /// Packages the walker decided to skip, the input
     /// `opts.skipped` extended with any depPaths whose
     /// installability check failed (optional + unsupported
     /// platform/engine). pacquet returns the augmented set on the
@@ -149,15 +182,10 @@ pub struct LockfileToDepGraphResult {
 pub struct LockfileToHoistedDepGraphOptions<'a> {
     pub installability: HoistedInstallability,
     pub placement: HoistedPlacementOptions,
-    /// Project / workspace root. Used as the base for relativizing
-    /// `hoisted_locations` entries and for placing the root's modules
-    /// directory.
-    pub lockfile_dir: PathBuf,
-    /// The root's modules directory, the configured `modulesDir`,
-    /// resolved against [`lockfile_dir`](Self::lockfile_dir) when
-    /// relative. Workspace projects and package directories keep
-    /// `node_modules`, as pnpm's `lockfileToHoistedDepGraph` does.
-    pub root_modules_dir: PathBuf,
+    /// Where each importer's dependencies go. Its lockfile directory is
+    /// also the base for relativizing `hoisted_locations` entries. A
+    /// package's own dependencies always go in its `node_modules`.
+    pub modules_dirs: ImporterModulesDirs,
     /// Packages the previous install decided not to fetch
     /// (installability check failed; the package was added here).
     /// The walker skips any depPath in this set without consulting
@@ -171,7 +199,7 @@ pub struct LockfileToHoistedDepGraphOptions<'a> {
     /// dep into the graph regardless of cpu / os / libc / engines.
     /// Set for `--force` under `forceIgnoresPlatform`, and by the
     /// `prev_graph` walk where the previous lockfile is replayed
-    /// wholesale to compute orphans — that walk starts from an empty
+    /// wholesale to compute orphans, that walk starts from an empty
     /// skip set so the diff catches packages that previously
     /// installed but would now be filtered.
     pub include_incompatible_packages: bool,
@@ -202,8 +230,7 @@ impl Default for LockfileToHoistedDepGraphOptions<'_> {
                 hoisting_limits: pnpm_real_hoist::HoistingLimits::new(),
                 external_dependencies: BTreeSet::new(),
             },
-            lockfile_dir: PathBuf::new(),
-            root_modules_dir: PathBuf::from("node_modules"),
+            modules_dirs: ImporterModulesDirs::node_modules(Path::new("")),
 
             skipped: BTreeSet::new(),
             force: false,
@@ -230,8 +257,8 @@ pub enum HoistedDepGraphError {
     /// A `HoisterResult` node carried a reference string that
     /// doesn't parse as a `name@version[(peers)]` package key.
     /// Should never happen for hoister output produced from a
-    /// valid lockfile — the hoister only emits references it
-    /// already validated — but the conversion is fallible at the
+    /// valid lockfile (the hoister only emits references it
+    /// already validated) but the conversion is fallible at the
     /// type level, so a typed error is the honest surface.
     #[display("Unparsable snapshot reference {reference:?} on hoisted node")]
     #[diagnostic(code(ERR_PNPM_HOISTED_GRAPH_BAD_REFERENCE))]
@@ -274,7 +301,7 @@ pub fn lockfile_to_hoisted_dep_graph(
     // Prev-graph walk: forced (every snapshot in the current
     // lockfile must surface so the diff catches packages that
     // would now fail installability) and unskipped (the previous
-    // install's `skipped` is irrelevant — we want the full
+    // install's `skipped` is irrelevant; we want the full
     // previous layout to compute orphans against).
     let prev_graph = match current_lockfile {
         // Require a non-empty `packages` map. For an empty `packages:
@@ -321,11 +348,9 @@ fn build_dep_graph<'a>(
     };
     let hoister_result = hoist(lockfile, &hoist_opts)?;
 
-    let modules_dir = opts.lockfile_dir.join(&opts.root_modules_dir);
     let mut state = WalkState {
         result: LockfileToDepGraphResult { skipped: opts.skipped.clone(), ..Default::default() },
         lockfile,
-        lockfile_dir: &opts.lockfile_dir,
         opts,
         prev_graph,
 
@@ -335,7 +360,7 @@ fn build_dep_graph<'a>(
         per_importer_direct_deps: BTreeMap::new(),
     };
     let root_deps = hoister_result.dependencies.borrow();
-    let root_hierarchy = walk_deps(&mut state, &modules_dir, &root_deps)?;
+    let root_hierarchy = walk_deps(&mut state, opts.modules_dirs.root(), &root_deps)?;
     drop(root_deps);
     state.into_result(root_hierarchy)
 }
@@ -350,7 +375,7 @@ pub struct HoistedPackageMetadata {
     pub dep_path: DepPath,
     /// `pkgIdWithPatchHash`: the patch-aware ident key
     /// the side-effects cache uses. Modelled by
-    /// [`pnpm_lockfile::PkgIdWithPatchHash`] — a non-validating
+    /// [`pnpm_lockfile::PkgIdWithPatchHash`], a non-validating
     /// branded newtype around `String`.
     pub pkg_id_with_patch_hash: PkgIdWithPatchHash,
     pub name: String,
@@ -394,7 +419,7 @@ pub struct HoistedPlacementOptions {
     /// When `true` (the default), every non-root workspace importer
     /// becomes a `Workspace`-kind child of the virtual `.` root in
     /// the hoist tree, and the walker emits per-importer subtrees
-    /// under `<lockfile_dir>/<importer_id>/node_modules`. When
+    /// under each project's modules directory. When
     /// `false`, only the root importer's subtree is emitted (the
     /// hoister also skips adding the workspace children to its
     /// shared tree). Pacquet's `Config::hoist_workspace_packages`

@@ -7,51 +7,93 @@
 //! lockfile. Plugin-hook loading (the `updateConfig` half) is wired in
 //! separately.
 
-pub use declarations::{add_config_dependencies, update_config_dependencies};
+pub use declarations::{
+    add_config_dependencies,
+    update_config_dependencies,
+};
 pub use engine_policy::mature_pnpm_version_for_range;
 pub use hooks::{
-    apply_config_dependency_settings, load_before_packing_hooks, may_update_config, prepare_config,
+    apply_config_dependency_settings,
+    load_before_packing_hooks,
+    may_update_config,
+    prepare_config,
     run_update_config_hooks,
+    update_config_hook_catalogs,
 };
 
 pub(crate) use declarations::declared_specifier;
 
 mod declarations;
+mod env_installer_context;
 mod network;
 mod store;
 
 use crate::{
-    cli_args::config_warnings::emit_config_warning, config_overrides::apply_store_dir_override,
+    cli_args::config_warnings::emit_config_warning,
+    config_overrides::apply_store_dir_override,
 };
 use engine_policy::engine_resolve_options;
-use network::EnvironmentNetwork;
+use env_installer_context::EnvInstallerContext;
 
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+};
 use pnpm_catalogs_config::get_catalogs_from_workspace_manifest;
 use pnpm_config::{
-    Config, Host, PNPM_VERSION, TrustedSettings, WorkspaceSettings, default_state_dir,
-    known_settings::is_known_setting_key, resolve_configured_state_dir,
+    Config,
+    Host,
+    PNPM_VERSION,
+    TrustedSettings,
+    WorkspaceSettings,
+    default_state_dir,
+    known_settings::is_known_setting_key,
+    resolve_configured_state_dir,
 };
 use pnpm_env_installer::{
-    ConfigDepUpdates, ConfigDependencyVerification, ConfigDepsInstallMode,
-    ConfigDepsInstallOptions, pnpm_engine_packages, read_config_dependency_lockfile,
-    resolve_and_install_config_deps_updating, resolve_package_manager_integrities,
+    ConfigDepUpdates,
+    ConfigDepsInstallMode,
+    pnpm_engine_packages,
+    read_config_dependency_lockfile,
+    resolve_and_install_config_deps_updating,
+    resolve_package_manager_integrities,
     running_version_unpublished,
 };
-use pnpm_graph_hasher::{detect_node_version, host_arch, host_libc, host_platform};
-use pnpm_hooks::{HookContext, LogFn, PnpmfileHooks, finder};
-use pnpm_lockfile::EnvLockfile;
-use pnpm_network::ThrottledClient;
-use pnpm_reporter::{HookLog, LogEvent, LogLevel, PnpmLog, Reporter};
-use pnpm_resolving_npm_resolver::{InMemoryPackageMetaCache, NpmResolver};
+use pnpm_hooks::{
+    HookContext,
+    LogFn,
+    PnpmfileHooks,
+    finder,
+};
+use pnpm_lockfile::{
+    EnvDocumentFormat,
+    EnvLockfile,
+};
+use pnpm_reporter::{
+    HookLog,
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
 use pnpm_resolving_resolver_base::{
-    ResolutionPolicyOptions, ResolveOptions, Resolver, WantedDependency,
+    ResolutionPolicyOptions,
+    ResolveOptions,
+    Resolver,
+    WantedDependency,
 };
 use pnpm_workspace_state::ConfigDependency;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -81,7 +123,7 @@ pub async fn install_config_deps<Reporter: self::Reporter>(
 }
 
 /// Install the project's `configDependencies` and run their `updateConfig`
-/// hooks — the pair every install-family pipeline opens with.
+/// hooks, the pair every install-family pipeline opens with.
 ///
 /// Both happen before the pipeline builds its state: the env lockfile must
 /// land at the top of `pnpm-lock.yaml` before the wanted lockfile is read,
@@ -123,7 +165,8 @@ pub async fn record_running_package_manager_pin(
     let boot_config = config.for_boot();
     let config = &*boot_config;
     let context = EnvInstallerContext::for_package_manager(config)?;
-    let options = context.options(root_dir, frozen_lockfile);
+    let options =
+        context.options(root_dir, frozen_lockfile, EnvDocumentFormat::for_pnpm(pnpm_version));
     let resolved = resolve_package_manager_integrities(
         pnpm_engine_packages(pnpm_version),
         wanted_specifier,
@@ -186,7 +229,7 @@ pub async fn sync_engine_dependencies(
     force_resync: bool,
 ) -> Result<EnvLockfile> {
     let context = EnvInstallerContext::for_package_manager(config)?;
-    let options = context.options(root_dir, frozen_lockfile);
+    let options = context.options(root_dir, frozen_lockfile, EnvDocumentFormat::for_pnpm(version));
     resolve_package_manager_integrities(
         packages,
         wanted_specifier,
@@ -232,7 +275,7 @@ pub struct EnginePolicyViolation {
 /// The metadata mode follows [`Config::requires_full_metadata_for_resolution`]
 /// (via [`EnvInstallerContext`]), so under `trustPolicy=no-downgrade` or
 /// `resolutionMode=time-based` the probe fetches the full packument the
-/// trust and maturity checks need — the same resolver behaviour as a
+/// trust and maturity checks need, the same resolver behaviour as a
 /// regular install.
 pub async fn resolve_engine_version(
     config: &Config,
@@ -327,7 +370,15 @@ async fn resolve_and_install<Reporter: self::Reporter>(
 
     let context = EnvInstallerContext::new(config)?;
     context.network.http_client.set_warning_handler(pnpm_reporter::emit_global_warning::<Reporter>);
-    let mut options = context.options(root_dir, frozen_lockfile);
+    // The pinned pnpm's version picks the format; a project that pins none
+    // gets the running pnpm's.
+    let mut options = context.options(
+        root_dir,
+        frozen_lockfile,
+        EnvDocumentFormat::for_pnpm(
+            env_lockfile.pinned_package_manager_version().unwrap_or(PNPM_VERSION),
+        ),
+    );
     options.mode = mode;
     // Sampled before the verifiers so the resolution cutoff is never later
     // than the verification cutoff.
@@ -359,143 +410,6 @@ fn release_age_policy(config: &Config) -> Result<ResolutionPolicyOptions> {
         published_by_exclude: policy.published_by_exclude,
         ..ResolutionPolicyOptions::default()
     })
-}
-
-struct EnvInstallerContext {
-    node_version: String,
-    resolver: NpmResolver<InMemoryPackageMetaCache>,
-    network: EnvironmentNetwork,
-    store: pnpm_env_installer::ConfigDependencyStore,
-    symlinked_lockfile_target_dirs: Vec<std::path::PathBuf>,
-}
-
-impl EnvInstallerContext {
-    fn resolution_verifiers(
-        &self,
-        config: &Config,
-    ) -> Result<Vec<Arc<dyn pnpm_resolving_resolver_base::ResolutionVerifier>>> {
-        pnpm_package_manager::build_resolution_verifiers(
-            config,
-            Arc::clone(&self.network.http_client),
-            None,
-            Some(Arc::clone(&self.network.auth_headers)),
-            None,
-            None,
-            None,
-        )
-        .into_diagnostic()
-    }
-
-    /// Context for resolving the project's `configDependencies`, using the
-    /// project's configured registries and network settings.
-    fn new(config: &Config) -> Result<Self> {
-        Self::build(
-            config,
-            &config.proxy,
-            &config.tls,
-            &config.tls_by_uri,
-            config.resolved_registries(),
-            Arc::clone(&config.auth_headers),
-        )
-    }
-
-    /// Context for resolving the package manager pnpm auto-switches to
-    /// (`pnpm` / `@pnpm/exe`), routed through the trusted
-    /// [`PackageManagerBootstrap`](pnpm_config::PackageManagerBootstrap)
-    /// config instead of the repository-controlled project registries.
-    fn for_package_manager(config: &Config) -> Result<Self> {
-        let bootstrap = &config.package_manager_bootstrap;
-        Self::build(
-            config,
-            &bootstrap.proxy,
-            &bootstrap.tls,
-            &bootstrap.tls_by_uri,
-            bootstrap.resolved_registries(),
-            Arc::clone(&bootstrap.auth_headers),
-        )
-    }
-
-    fn build(
-        config: &Config,
-        proxy: &pnpm_network::ProxyConfig,
-        tls: &pnpm_network::TlsConfig,
-        tls_by_uri: &pnpm_network::PerRegistryTls,
-        registries: std::collections::BTreeMap<String, String>,
-        auth_headers: Arc<pnpm_network::AuthHeaders>,
-    ) -> Result<Self> {
-        let http_client = Arc::new(
-            ThrottledClient::for_installs(proxy, tls, tls_by_uri, &config.network_settings())
-                .into_diagnostic()
-                .wrap_err("create the network client for env-installer dependencies")?
-                .with_max_sockets_per_host(config.max_sockets),
-        );
-
-        let registries: HashMap<String, String> = registries.into_iter().collect();
-        let retry_opts = config.retry_opts();
-        let network = EnvironmentNetwork {
-            http_client,
-            auth_headers,
-            registries,
-            retry_opts,
-            offline: config.offline,
-            tar_limits: config.tar_limits(),
-        };
-        let resolver = network.resolver(config);
-
-        Ok(Self {
-            node_version: detect_node_version().unwrap_or_else(|| "0.0.0".to_string()),
-            resolver,
-            network,
-            store: pnpm_env_installer::ConfigDependencyStore {
-                dir: Box::leak(Box::new(config.store_dir.clone())),
-                verify_integrity: config.verify_store_integrity,
-                strict_pkg_content_check: config.strict_store_pkg_content_check,
-                package_import_method: config.package_import_method,
-            },
-            symlinked_lockfile_target_dirs: config
-                .symlinked_lockfile_target_dirs
-                .clone(),
-        })
-    }
-
-    fn options<'a>(
-        &'a self,
-        root_dir: &'a Path,
-        frozen_lockfile: bool,
-    ) -> ConfigDepsInstallOptions<'a> {
-        ConfigDepsInstallOptions {
-            mode: ConfigDepsInstallMode::Reconcile,
-            verification: ConfigDependencyVerification {
-                registries: &self.network.registries,
-                resolution_verifiers: Vec::new(),
-                resolution_policy: ResolutionPolicyOptions::default(),
-            },
-            fetching: pnpm_tarball::ArchiveFetchOptions {
-                http_client: &self.network.http_client,
-                auth_headers: &self.network.auth_headers,
-                retry_opts: self.network.retry_opts,
-                offline: self.network.offline,
-                tar_limits: self.network.tar_limits,
-            },
-            platform: pnpm_package_is_installable::InstallabilityOptions {
-                supported_architectures: None,
-                current_node_version: &self.node_version,
-                current_os: host_platform(),
-                current_cpu: host_arch(),
-                current_libc: host_libc(),
-                ..Default::default()
-            },
-            store: self.store,
-            store_index: pnpm_env_installer::ConfigDependencyStoreIndex::default(),
-            root_dir,
-            lockfile: pnpm_env_installer::EnvLockfileOptions {
-                frozen: frozen_lockfile,
-                symlinked: pnpm_lockfile::SymlinkedLockfile::allowing(
-                    &self.symlinked_lockfile_target_dirs,
-                ),
-            },
-        }
-    }
 }
 
 #[cfg(test)]

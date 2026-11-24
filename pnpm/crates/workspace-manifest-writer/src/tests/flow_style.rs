@@ -1,7 +1,18 @@
 use super::{
-    TempDir, UpdateWorkspaceManifestOptions, WORKSPACE_MANIFEST_FILENAME, catalogs, fs, run,
-    run_age_excludes, run_allow_builds, run_config_dep, run_ignore_ghsas, run_patched_deps,
-    run_remove_overrides, run_scaffold_allow_builds, update_workspace_manifest,
+    TempDir,
+    UpdateWorkspaceManifestOptions,
+    WORKSPACE_MANIFEST_FILENAME,
+    catalogs,
+    fs,
+    run,
+    run_age_excludes,
+    run_allow_builds,
+    run_config_dep,
+    run_ignore_ghsas,
+    run_patched_deps,
+    run_remove_overrides,
+    run_scaffold_allow_builds,
+    update_workspace_manifest,
 };
 
 #[test]
@@ -200,7 +211,7 @@ fn a_whole_document_flow_mapping_is_refused_rather_than_corrupted() {
     let dir = TempDir::new().expect("temp dir");
     let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
     // The keys of a document written as one flow mapping are not
-    // top-level lines, so no splice — nor a new top-level block — can
+    // top-level lines, so no splice (nor a new top-level block) can
     // address them.
     let original = "{ overrides: { foo: 1.0.0 } }\n";
     fs::write(&path, original).expect("seed manifest");
@@ -230,4 +241,25 @@ fn an_aliased_block_is_refused_rather_than_corrupted() {
 
     assert!(matches!(err, crate::UpdateWorkspaceManifestError::UnsupportedInlineBlock { .. }));
     assert_eq!(fs::read_to_string(&path).expect("read manifest"), original);
+}
+
+#[test]
+fn a_field_holding_a_line_separator_stays_editable() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    fs::write(&path, "packages:\n  - '*'\n").expect("seed manifest");
+    let overrides = serde_json::json!({ "foo": "link:../foo\u{2028}bar" });
+
+    crate::update_manifest_field(&path, "overrides", &overrides)
+        .expect("update_manifest_field succeeds");
+    crate::set_overrides(dir.path(), [("baz", "2.0.0")]).expect("set_overrides succeeds");
+
+    let text = fs::read_to_string(&path).expect("read manifest");
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        serde_saphyr::from_str(&text).unwrap_or_else(|error| panic!("{error}:\n{text}"));
+    assert_eq!(
+        parsed["overrides"],
+        serde_json::json!({ "baz": "2.0.0", "foo": "link:../foo\u{2028}bar" }),
+        "manifest:\n{text}",
+    );
 }

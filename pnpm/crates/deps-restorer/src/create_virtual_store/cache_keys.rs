@@ -1,12 +1,21 @@
 use super::CreateVirtualStoreError;
 use crate::{
-    install_package_by_snapshot::{runtime_platform_selector, unverified_fetch_is_allowed},
+    install_package_by_snapshot::{
+        binary_store_index_key,
+        runtime_platform_selector,
+        unverified_fetch_is_allowed,
+    },
     store_index_key_for_resolution,
 };
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    LockfileEntries, LockfileResolution, PackageKey, PackageMetadata, PlatformSelector,
+    LockfileEntries,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PlatformSelector,
     SnapshotEntry,
+    select_platform_variant,
 };
 use pnpm_store_dir::store_index_key;
 use std::collections::HashMap;
@@ -28,8 +37,9 @@ pub(super) fn derive_cache_keys(
                 snapshot_cache_key(snapshot_key, packages, config.ignore_scripts, &selector)
                     .map(|mut key| {
                         if key.is_git_hosted
-                            && allow_build_policy.check(&snapshot_key.without_peer().to_string())
-                                == Some(false)
+                            && !allow_build_policy
+                                .check(&snapshot_key.without_peer().to_string())
+                                .unwrap_or(true)
                         {
                             key.value = Some(pnpm_store_dir::git_hosted_store_index_key(
                                 &snapshot_key.without_peer().pkg_id(),
@@ -44,14 +54,15 @@ pub(super) fn derive_cache_keys(
 }
 /// Sorted + deduplicated so `prefetch_cas_paths` doesn't redo identical
 /// SELECT + integrity-check work for peer variants of one package.
-/// Derived leniently over the whole lockfile — the superset over what
+/// Derived leniently over the whole lockfile, the superset over what
 /// the plan pass will keep merely prefetches a few rows nothing reads.
 pub(super) fn prefetch_keys(
     cache_keys: &HashMap<PackageKey, Result<SnapshotCacheKey, CreateVirtualStoreError>>,
 ) -> Vec<String> {
     let mut refs: Vec<&str> = cache_keys
         .values()
-        .filter_map(|cache_key| cache_key.as_ref().ok())
+        .map(Result::as_ref)
+        .filter_map(Result::ok)
         .filter_map(|cache_key| cache_key.value.as_deref())
         .collect();
     refs.sort_unstable();
@@ -62,8 +73,8 @@ pub(super) fn prefetch_keys(
 }
 /// Build the store-index cache key for a snapshot.
 ///
-/// Returns `Err` for missing metadata — a condition the install would
-/// fail on anyway — so the orchestrator can short-circuit *before* the
+/// Returns `Err` for missing metadata (a condition the install would
+/// fail on anyway) so the orchestrator can short-circuit *before* the
 /// warm rayon batch runs; otherwise a malformed lockfile does up to
 /// ~6 s of warm-batch linking before the actual error fires.
 ///
@@ -99,7 +110,7 @@ pub(super) fn snapshot_cache_key(
             // bypass the CAFS entirely (the directory-fetcher returns
             // source-path entries; no `write_cas_file` happens, no
             // `PackageFilesIndex` row is written). There is therefore
-            // no warm-cache key to recover the install from — every
+            // no warm-cache key to recover the install from; every
             // install re-walks the source dir (the source may have
             // changed since the last install). Returning `Ok(None)`
             // routes the snapshot
@@ -112,7 +123,7 @@ pub(super) fn snapshot_cache_key(
             // row under the same `gitHostedStoreIndexKey` shape as
             // the git-hosted tarball path. Returning the key here
             // lets the warm prefetch reuse a previous install's
-            // clone + checkout + prepare + packlist work — without
+            // clone + checkout + prepare + packlist work, without
             // this, every git install cold-paths regardless of
             // whether the snapshot is already in `index.db`. `built`
             // tracks `!ignore_scripts`; `derive_cache_keys` also applies
@@ -126,30 +137,11 @@ pub(super) fn snapshot_cache_key(
                 is_git_hosted: true,
             })
         }
-        // Runtime artifacts (Node.js / Bun / Deno): the per-archive
-        // integrity is the warm-cache key, same shape as the
-        // registry / tarball arms above. Mirrors the per-snapshot
-        // dispatch in [`InstallPackageBySnapshot::run`]; the cold
-        // path's variant selector + binary fetcher writes the row
-        // under this key when it succeeds, so a re-install hits
-        // here instead of cold-fetching the runtime archive again.
-        LockfileResolution::Binary(binary) => Ok(SnapshotCacheKey {
-            value: Some(store_index_key(&binary.integrity.to_string(), &pkg_id)),
-            is_git_hosted: false,
-        }),
-        // `Variations` is a meta-shape: its integrity lives on the
-        // *picked* variant, not the wrapper. Run the same host-
-        // matching selector the cold path runs so the warm key
-        // resolves to the variant that would actually be installed.
-        // No variant matched → return `Ok(None)` and let the cold
-        // path surface the typed `NoMatchingPlatformVariant` error
-        // (a warm-key miss is the right shape; the warm prefetch
-        // is best-effort and the cold path is where errors are
-        // raised).
+        LockfileResolution::Binary(binary) => binary_cache_key(&metadata_key, binary),
         LockfileResolution::Variations(variations) => {
-            variant_cache_key(variations, runtime_platform_selector, &pkg_id, !ignore_scripts)
+            variant_cache_key(variations, runtime_platform_selector, &metadata_key)
         }
-        // Custom resolutions have no built-in warm-cache key — the
+        // Custom resolutions have no built-in warm-cache key, the
         // cold path consults the pnpmfile custom fetchers, and the
         // delegated resolution (unknowable here) determines the row
         // that gets written.
@@ -202,12 +194,12 @@ pub(super) fn integrity_equal(
 /// everything that identifies the slot's contents must be inside its
 /// graph-hash path. That rules out:
 ///
-/// - slots that need a build or patch marker — the canonical copy must
+/// - slots that need a build or patch marker, the canonical copy must
 ///   stay plain pre-build CAS content;
 /// - mutable local sources, which reuse one slot for changing contents;
 /// - forced re-imports, whose existing slot is known stale;
 /// - any resolution without a checkable integrity, and any whose
-///   integrity does not identify the bytes the slot holds — see
+///   integrity does not identify the bytes the slot holds; see
 ///   [`integrity_identifies_content`].
 pub(crate) fn dir_clone_cacheable(
     packages: &HashMap<PackageKey, PackageMetadata>,
@@ -226,7 +218,7 @@ pub(crate) fn dir_clone_cacheable(
             .is_some()
 }
 /// Whether a resolution's recorded `integrity` pins the bytes the
-/// canonical slot would hold — the slot path hashes that integrity and
+/// canonical slot would hold, the slot path hashes that integrity and
 /// nothing else, so anything it fails to pin can be served stale.
 ///
 /// A `file:` tarball's bytes change under the project's control while
@@ -256,6 +248,7 @@ pub(crate) fn package_content_changed(
 /// fields mean the same thing at the two phases.
 #[derive(Clone, Copy)]
 pub(super) struct SlotReuse<'a> {
+    pub(super) runtime_archives: &'a super::RuntimeArchives,
     pub(super) packages: &'a HashMap<PackageKey, PackageMetadata>,
     pub(super) current_packages: Option<&'a HashMap<PackageKey, PackageMetadata>>,
     /// Replace the slot even when its recorded metadata is unchanged.
@@ -267,48 +260,36 @@ impl SlotReuse<'_> {
     /// this install wants, so its completion marker must not be taken
     /// as proof that the slot is already correct.
     pub(super) fn must_replace(&self, snapshot_key: &PackageKey) -> bool {
-        self.force || package_content_changed(self.current_packages, self.packages, snapshot_key)
+        self.force
+            || self.runtime_archives.must_replace(snapshot_key)
+            || package_content_changed(self.current_packages, self.packages, snapshot_key)
     }
+}
+fn binary_cache_key(
+    key: &PackageKey,
+    binary: &pnpm_lockfile::BinaryResolution,
+) -> Result<SnapshotCacheKey, CreateVirtualStoreError> {
+    let value = binary_store_index_key(key, binary)
+        .map_err(CreateVirtualStoreError::InstallPackageBySnapshot)?;
+    Ok(SnapshotCacheKey { value: Some(value), is_git_hosted: false })
 }
 pub(super) fn variant_cache_key(
     variations: &pnpm_lockfile::VariationsResolution,
     runtime_platform_selector: &PlatformSelector,
-    pkg_id: &str,
-    built: bool,
+    package_key: &PackageKey,
 ) -> Result<SnapshotCacheKey, CreateVirtualStoreError> {
-    let platform = crate::install_package_by_snapshot::variations_platform(
-        variations,
-        runtime_platform_selector,
-    );
-    let no_key = SnapshotCacheKey { value: None, is_git_hosted: false };
-    let Some(selected) = variations
-        .select(&platform)
-        .ok()
-        .flatten()
+    let Some(variant) = select_platform_variant(&variations.variants, runtime_platform_selector)
     else {
-        return Ok(no_key);
+        return Ok(SnapshotCacheKey { value: None, is_git_hosted: false });
     };
-    match &selected.resolution {
-        LockfileResolution::Binary(binary) => Ok(SnapshotCacheKey {
-            value: Some(store_index_key(&binary.integrity.to_string(), pkg_id)),
-            is_git_hosted: false,
-        }),
-        // A tarball is keyed as a lone tarball resolution is: a git-hosted
-        // one under its built or not-built key, which `derive_cache_keys`
-        // narrows on an explicit build denial, and one the downloader
-        // refuses under no key.
-        resolution @ LockfileResolution::Tarball(tarball) => {
-            tarball_cache_key(tarball, resolution, pkg_id, !built)
-        }
-        // Any archive of a registry package's variants, keyed by its own
-        // digest like any registry archive.
-        resolution @ LockfileResolution::Registry(_) => Ok(SnapshotCacheKey {
-            value: store_index_key_for_resolution(resolution, pkg_id, built),
-            is_git_hosted: false,
-        }),
-        // The cold path raises the typed `UnsupportedVariantResolution`
-        // error; we just skip the warm key.
-        _ => Ok(no_key),
+    match &variant.resolution {
+        LockfileResolution::Binary(binary) => binary_cache_key(package_key, binary),
+        // Non-`Binary` variant (corrupt lockfile, or a
+        // future shape pacquet doesn't recognise). The
+        // cold path raises the typed
+        // `VariantHasNonBinaryResolution` error; we just
+        // skip the warm key.
+        _ => Ok(SnapshotCacheKey { value: None, is_git_hosted: false }),
     }
 }
 /// Rejects warm reuse when the downloader would refuse missing integrity.

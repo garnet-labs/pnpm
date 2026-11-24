@@ -1,16 +1,26 @@
 use super::{
-    ApproveArgs, Capabilities,
-    decisions::{PackageDecisions, confirmation},
+    ApproveArgs,
+    Capabilities,
+    PromptAvailability,
+    decisions::PackageDecisions,
     render_permissions,
 };
+use crate::cli_args::approve_builds::ApproveBuildsError;
 use pnpm_config::{
     Config,
-    PermissionCapability::{Build, Skills},
+    PermissionCapability::{
+        Build,
+        Skills,
+    },
     SkillsPermission,
 };
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+};
 use tempfile::TempDir;
 
 fn pending(
@@ -95,11 +105,156 @@ fn all_approves_every_pending_capability() {
 }
 
 #[test]
+fn an_explicit_git_repository_selector_decides_pending_commits() {
+    let repo = "example@git+https://example.org/project.git";
+    let first = format!("{repo}#1111111");
+    let second = format!("{repo}#2222222");
+    let other = "example@git+https://example.org/other.git#1111111";
+    let pending = pending(&[(&first, &[Build]), (&second, &[Build]), (other, &[Build, Skills])]);
+    let approval = args(&[repo], false)
+        .decide::<SilentReporter>(&pending, decide_config(), Path::new("/workspace"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(approval.decisions, BTreeMap::from([(repo.to_string(), decided(Some(true), None))]));
+    assert_eq!(
+        super::decisions::pending_builds_approved(&approval.decisions, &pending),
+        vec![first, second],
+    );
+}
+
+#[test]
+fn approving_a_registry_package_keeps_the_same_name_git_request_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = "example@git+https://example.org/project.git#1111111";
+    let config = config_awaiting(&dir, &["example@1.0.0", git]);
+    let requests = super::pending_permissions(&config).unwrap();
+    let approval = args(&["example"], false)
+        .decide::<SilentReporter>(&requests.by_package, decide_config(), dir.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        approval.decisions,
+        BTreeMap::from([("example".into(), decided(None, Some(SkillsPermission::All(true))))]),
+    );
+    super::decisions::clear_decided(requests.scan, &approval.decisions).unwrap();
+    assert_eq!(
+        super::pending_permissions(&config).unwrap().by_package,
+        pending(&[(git, &[Skills])]),
+    );
+}
+
+#[test]
+fn an_unmatched_git_selector_lists_the_repository_and_each_pending_commit_once() {
+    let repo = "sample@git+https://example.org/project.git";
+    let first = format!("{repo}#1111111");
+    let second = format!("{repo}#2222222");
+    let requests = pending(&[(&first, &[Build]), (&second, &[Skills])]);
+    for invalid in ["sample", &format!("{repo}#3333333")] {
+        let error = args(&[invalid], false)
+            .decide::<SilentReporter>(&requests, decide_config(), Path::new("/workspace"))
+            .unwrap_err();
+        let Some(ApproveBuildsError::ExactSelectorRequired(selectors)) = error.downcast_ref()
+        else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(selectors.as_slice(), [repo, first.as_str(), second.as_str()]);
+    }
+}
+
+#[test]
+fn a_git_repository_decision_clears_only_its_pending_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = "example@git+https://example.org/other.git#1111111";
+    let repo = "example@git+https://example.org/project.git";
+    let config = config_awaiting(&dir, &[&format!("{repo}#1111111"), other]);
+    let pending = super::pending_permissions(&config).unwrap();
+    let approval = args(&[repo], false)
+        .decide::<SilentReporter>(&pending.by_package, decide_config(), dir.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        approval.decisions,
+        BTreeMap::from([(repo.to_string(), decided(None, Some(SkillsPermission::All(true))))]),
+    );
+    super::decisions::clear_decided(pending.scan, &approval.decisions).unwrap();
+    assert_eq!(
+        super::pending_permissions(&config).unwrap().by_package,
+        self::pending(&[(other, &[Skills])]),
+    );
+}
+
+#[test]
+fn repository_scope_combines_all_pending_commits_before_review() {
+    let repo = "demo@git+https://example.org/demo.git";
+    let first = format!("{repo}#abcdef1");
+    let second = format!("{repo}#abcdef2");
+    let other = "demo@git+https://example.org/other.git#abcdef1";
+    let requests = pending(&[(&first, &[Build]), (&second, &[Skills]), (other, &[Skills])]);
+    let selected = [repo.to_string()].into();
+    let grouped = super::repository_scope::group_requests(requests, &selected);
+    assert_eq!(grouped, pending(&[(repo, &[Build, Skills]), (other, &[Skills])]));
+    let skills = BTreeMap::from([(first, vec!["one"]), (second, vec!["two", "one"])]);
+    assert_eq!(
+        super::repository_scope::group_requests(skills, &selected),
+        BTreeMap::from([(repo.to_string(), ["one", "two"].into())]),
+    );
+}
+
+#[test]
+fn approving_all_git_packages_keeps_the_resolved_commit() {
+    let commit = "example@git+https://example.org/project.git#1111111";
+    let approval = args(&[], true)
+        .decide::<SilentReporter>(
+            &pending(&[(commit, &[Skills])]),
+            decide_config(),
+            Path::new("/workspace"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        approval.decisions,
+        BTreeMap::from([(commit.to_string(), decided(None, Some(SkillsPermission::All(true))))]),
+    );
+}
+
+#[test]
 fn rejects_contradictory_arguments() {
     let error = args(&["foo", "!foo"], false)
         .decide::<SilentReporter>(&BTreeMap::new(), decide_config(), Path::new("/workspace"))
         .expect_err("contradiction");
     assert!(error.to_string().contains("both approved and denied"));
+}
+
+#[test]
+fn rejects_interactive_approval_when_prompting_is_unavailable() {
+    let pending = pending(&[("esbuild", &[Build])]);
+    let error = args(&[], false)
+        .decide_with_prompt::<SilentReporter>(
+            &pending,
+            decide_config(),
+            Path::new("/workspace"),
+            PromptAvailability::Unavailable,
+        )
+        .expect_err("interactive approval without a prompt is rejected");
+    assert_eq!(
+        error
+            .code()
+            .map(|code| code.to_string())
+            .as_deref(),
+        Some("ERR_PNPM_APPROVE_NON_INTERACTIVE"),
+    );
+
+    assert!(
+        args(&[], false)
+            .decide_with_prompt::<SilentReporter>(
+                &BTreeMap::new(),
+                decide_config(),
+                Path::new("/workspace"),
+                PromptAvailability::Unavailable,
+            )
+            .expect("no pending permissions needs no prompt")
+            .is_none(),
+    );
 }
 
 #[test]
@@ -139,17 +294,6 @@ fn lists_chosen_skills_next_to_the_package() {
     assert_eq!(
         render_permissions(&config).unwrap(),
         "Granted:\n  drizzle-kit  skills (guide)\n\nDenied:\n  esbuild  skills\n",
-    );
-}
-
-#[test]
-fn the_confirmation_names_packages_without_their_dep_path() {
-    let pending =
-        pending(&[("@pnpm/marked-skills", &[Skills]), ("@pnpm/git-skills", &[Build, Skills])]);
-
-    assert_eq!(
-        confirmation(&pending.keys().cloned().collect(), &pending),
-        "Approve @pnpm/git-skills (build, skills), @pnpm/marked-skills (skills)?",
     );
 }
 
@@ -376,4 +520,68 @@ fn clear_decided_removes_decided_entries_from_modules_manifest() {
         .unwrap();
     assert!(updated.ignored_builds.is_none());
     assert!(updated.pending_skills.is_none());
+}
+
+#[test]
+fn pending_permissions_and_clear_decided_key_local_directory_skills_by_package_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_awaiting(
+        &dir,
+        &[
+            "@example/my-skills@link:packages/my-skills",
+            "@example/file-skills@file:../file-skills",
+            "tar-skills@file:./tar-skills.tgz",
+        ],
+    );
+
+    let actual = super::pending_permissions(&config).unwrap();
+    assert_eq!(
+        actual.by_package,
+        pending(&[
+            ("@example/file-skills", &[Skills]),
+            ("@example/my-skills", &[Skills]),
+            ("tar-skills@file:./tar-skills.tgz", &[Skills]),
+        ]),
+    );
+
+    let mut decisions = BTreeMap::new();
+    decisions.insert(
+        "@example/my-skills".to_string(),
+        decided(None, Some(SkillsPermission::All(true))),
+    );
+    decisions.insert(
+        "@example/file-skills".to_string(),
+        decided(None, Some(SkillsPermission::All(false))),
+    );
+    super::decisions::clear_decided(actual.scan, &decisions).unwrap();
+
+    let updated = pnpm_modules_yaml::read_modules_manifest::<pnpm_modules_yaml::Host>(
+        &dir.path().join("node_modules"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        updated.pending_skills,
+        Some(indexmap::IndexSet::from([pnpm_modules_yaml::DepPath::from(
+            "tar-skills@file:./tar-skills.tgz".to_string(),
+        )])),
+    );
+}
+
+/// A run that names no packages leaves a recorded build denial alone, even
+/// when the stale `.modules.yaml` still lists the build as ignored.
+#[test]
+fn a_denied_build_is_not_awaiting_approval_for_an_unnamed_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_awaiting(&dir, &["drizzle-kit@1.0.0"]);
+    config.allow_builds.insert("drizzle-kit".to_string(), false);
+    config.allow_builds.insert("esbuild".to_string(), false);
+    let mut pending = super::PendingPermissions {
+        by_package: pending(&[("drizzle-kit", &[Build, Skills]), ("esbuild", &[Build])]),
+        scan: crate::cli_args::ignored_builds::get_automatically_ignored_builds(&config).unwrap(),
+    };
+
+    pending.exclude_denied_builds(&config).unwrap();
+
+    assert_eq!(pending.by_package, self::pending(&[("drizzle-kit", &[Skills])]));
 }

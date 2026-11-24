@@ -1,5 +1,8 @@
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::{
+        IpAddr,
+        Ipv4Addr,
+    },
     time::Duration,
 };
 
@@ -203,4 +206,126 @@ fn web_login_rejects_new_sessions_when_capacity_reached() {
             .is_ok(),
         "already-admitted IP should still be allowed under attempt limit",
     );
+}
+
+#[test]
+fn rate_limiter_caps_account_attempts_across_client_ips() {
+    let limiter = LoginRateLimiter::new(Duration::from_mins(1), 5, 20, 3);
+    for suffix in 1..=3 {
+        let client_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, suffix));
+        assert!(
+            limiter
+                .check(Some(client_ip), "alice")
+                .is_ok(),
+        );
+        limiter.record_failure(Some(client_ip), "alice");
+    }
+    let fresh_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4));
+    assert!(
+        limiter
+            .check(Some(fresh_ip), "alice")
+            .is_err(),
+    );
+    assert!(limiter.check(None, "alice").is_err());
+    assert!(
+        limiter
+            .check(Some(fresh_ip), "bob")
+            .is_ok(),
+    );
+    limiter.record_success(Some(fresh_ip), "alice");
+    assert!(
+        limiter
+            .check(Some(fresh_ip), "alice")
+            .is_ok(),
+    );
+}
+
+#[test]
+fn one_client_ip_cannot_exhaust_the_default_account_limit() {
+    let limiter = LoginRateLimiter::default();
+    let attacker = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    for _ in 0..5 {
+        assert!(
+            limiter
+                .check(Some(attacker), "alice")
+                .is_ok(),
+        );
+        limiter.record_failure(Some(attacker), "alice");
+    }
+    assert!(
+        limiter
+            .check(Some(attacker), "alice")
+            .is_err(),
+    );
+    let owner = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+    assert!(
+        limiter
+            .check(Some(owner), "alice")
+            .is_ok(),
+    );
+}
+
+#[test]
+fn distributed_failures_exhaust_the_default_account_limit() {
+    let limiter = LoginRateLimiter::default();
+    for suffix in 1..=10 {
+        let client = IpAddr::V4(Ipv4Addr::new(192, 0, 2, suffix));
+        for _ in 0..5 {
+            assert!(
+                limiter
+                    .check(Some(client), "alice")
+                    .is_ok(),
+            );
+            limiter.record_failure(Some(client), "alice");
+        }
+    }
+    let next = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+    assert!(
+        limiter
+            .check(Some(next), "alice")
+            .is_err(),
+    );
+    assert!(limiter.check(Some(next), "bob").is_ok());
+}
+
+#[test]
+fn refunded_code_submissions_do_not_use_up_the_limit() {
+    let limiter = LoginRateLimiter::new(Duration::from_mins(1), 5, 3, 5);
+    let ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    for _ in 0..10 {
+        assert!(limiter.reserve_web_login_code(ip, None).is_ok());
+        limiter.refund_web_login_code(ip, None);
+    }
+    for _ in 0..3 {
+        assert!(limiter.reserve_web_login_code(ip, None).is_ok());
+    }
+    assert!(limiter.reserve_web_login_code(ip, None).is_err());
+    assert!(limiter.check_and_record_web_login(ip, None).is_ok(), "the start limit is separate");
+}
+
+#[test]
+fn wrong_codes_cannot_use_up_the_records_that_login_starts_need() {
+    let limiter = LoginRateLimiter::new(Duration::from_mins(1), 5, 2, 5);
+    for index in 0..1024u32 {
+        let ip = IpAddr::V4(Ipv4Addr::from(index + 1));
+        assert!(
+            limiter
+                .reserve_web_login_code(Some(ip), None)
+                .is_ok(),
+            "IP #{index}",
+        );
+    }
+    let over_capacity_ip = Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)));
+    assert!(limiter.reserve_web_login_code(over_capacity_ip, None).is_err());
+    assert!(limiter.check_and_record_web_login(over_capacity_ip, None).is_ok());
+}
+
+#[test]
+fn refunded_code_records_free_their_slot() {
+    let limiter = LoginRateLimiter::new(Duration::from_mins(1), 5, 2, 5);
+    for index in 0..2048u32 {
+        let ip = Some(IpAddr::V4(Ipv4Addr::from(index + 1)));
+        assert!(limiter.reserve_web_login_code(ip, None).is_ok(), "IP #{index}");
+        limiter.refund_web_login_code(ip, None);
+    }
 }

@@ -1,8 +1,19 @@
 use super::{
-    TWO_IMPORTERS, WITH_A_NEW_PROJECT, WITH_ONLY_A_PEER_VARIANT, WITH_SHARED_OPTIONAL_CHILD,
-    WITH_TWO_IMPORTERS, WITH_TWO_LOCKED_VERSIONS, a_new_project_lockfile_projects, manifest,
-    manifest_from, parsed_lockfile, projects_of_a_new_project_lockfile, snapshot_optional,
-    try_fast_update_importers, try_prune_stale_importers, with_a_direct_foo_at,
+    TWO_IMPORTERS,
+    WITH_A_NEW_PROJECT,
+    WITH_ONLY_A_PEER_VARIANT,
+    WITH_SHARED_OPTIONAL_CHILD,
+    WITH_TWO_IMPORTERS,
+    WITH_TWO_LOCKED_VERSIONS,
+    a_new_project_lockfile_projects,
+    manifest,
+    manifest_from,
+    parsed_lockfile,
+    projects_of_a_new_project_lockfile,
+    snapshot_optional,
+    try_fast_update_importers,
+    try_prune_stale_importers,
+    with_a_direct_foo_at,
 };
 use pnpm_config::ResolutionMode::LowestDirect as LOWEST_DIRECT;
 use pnpm_lockfile::PkgName;
@@ -62,6 +73,26 @@ fn writes_a_new_project_importer_from_the_highest_locked_versions() {
     assert!(
         snapshot_optional(&updated, "child@3.0.0"),
         "the version the new project did not take keeps the flag its only path gives it",
+    );
+    assert!(snapshot_optional(&updated, "opt@5.0.0"), "nothing else changed about the old path");
+}
+#[test]
+fn writes_an_empty_importer_for_a_new_project_without_dependencies() {
+    let added = manifest_from(json!({ "name": "pkg-b" }));
+    let [existing, locks_the_higher_child] = a_new_project_lockfile_projects(&added);
+
+    let updated = try_fast_update_importers(
+        &parsed_lockfile(WITH_A_NEW_PROJECT),
+        &projects_of_a_new_project_lockfile(&existing, &locks_the_higher_child, &added),
+    )
+    .expect("a project without dependencies needs nothing resolved");
+
+    let importer = &updated.importers["pkg-b"];
+    assert!(
+        importer.dependencies.is_none()
+            && importer.dev_dependencies.is_none()
+            && importer.optional_dependencies.is_none(),
+        "the new importer records no dependency groups",
     );
     assert!(snapshot_optional(&updated, "opt@5.0.0"), "nothing else changed about the old path");
 }

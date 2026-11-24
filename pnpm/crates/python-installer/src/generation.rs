@@ -2,14 +2,34 @@
 //! lockfile pins and the projects in this repository built from source.
 
 use super::{
-    Lockfile, Registry, Reporter, build,
-    environment::{EnvironmentStore, Generation, PythonPrepare},
-    host, projects, resolver, workspace,
+    Lockfile,
+    Registry,
+    Reporter,
+    build,
+    environment::{
+        EnvironmentStore,
+        Generation,
+        PythonPrepare,
+    },
+    host,
+    projects,
+    resolver,
+    workspace,
 };
-use miette::{Result, bail};
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel};
+use miette::{
+    Result,
+    bail,
+};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     path::Path,
 };
 
@@ -50,7 +70,7 @@ impl PythonPrepare<'_> {
         registry.resolution.packages.candidates.clear();
         lock.seed(&mut registry.resolution.packages, &self.interpreter.target)?;
         workspace::offer_locked(&mut registry.resolution.packages, project.local, lock);
-        registry.record_sources(selected)?;
+        registry.record_sources(selected.to_vec())?;
         registry.fetch_wheels::<Reporter>(selected).await?;
         let solution = resolver::selected_solution(&mut registry.resolution, selected)?;
         let installed = self.installable::<Reporter>(registry, solution, project).await?;

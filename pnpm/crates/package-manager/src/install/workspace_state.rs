@@ -1,20 +1,42 @@
 pub(super) use projects::{
-    ProjectScriptsInputs, build_root_importer_project_manifests_list,
-    build_selected_project_manifests_list, mutated_project_dirs, projects_running_own_scripts,
+    ProjectScriptsInputs,
+    build_root_importer_project_manifests_list,
+    build_selected_project_manifests_list,
+    mutated_project_dirs,
+    projects_running_own_scripts,
     selected_manifest_freshness_inputs,
 };
-pub(crate) use projects::{build_project_manifests_list, replace_project_manifest};
-pub(crate) use write::{CarriedSettings, StateProjects, StateWrite, recorded_workspace_state};
+pub(crate) use projects::{
+    build_project_manifests_list,
+    replace_project_manifest,
+};
+pub(crate) use write::{
+    CarriedSettings,
+    StateProjects,
+    StateWrite,
+    recorded_workspace_state,
+};
 
 mod projects;
 
 mod write;
 
 use super::{
-    BTreeMap, Catalogs, Clock, Config, IncludedDependencies, NodeLinker, PackageManifest, Path,
-    PathBuf, ProjectEntry, WorkspaceState, manifest_string_field,
+    BTreeMap,
+    Catalogs,
+    Clock,
+    Config,
+    IncludedDependencies,
+    NodeLinker,
+    PackageManifest,
+    Path,
+    PathBuf,
+    ProjectEntry,
+    WorkspaceState,
+    manifest_string_field,
 };
 use crate::install_state::last_validated_timestamp;
+use pnpm_deps_restorer::ImporterModulesDirs;
 use pnpm_reporter::Reporter;
 use pnpm_workspace_state::update_workspace_state_in_modules;
 
@@ -102,7 +124,7 @@ pub(crate) fn lockfile_root_for(
     if !config.shared_workspace_lockfile {
         return manifest_dir.to_path_buf();
     }
-    workspace_dir.map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf)
+    workspace_dir.map(Path::to_path_buf).unwrap_or_else(|| manifest_dir.to_path_buf())
 }
 
 /// Build the `name → version → WorkspacePackage` lookup the npm
@@ -167,6 +189,13 @@ pub(crate) fn workspace_packages_for_freshness(
     .then(|| build_workspace_packages_map_from_manifests(projects, dependency_manifests))
 }
 
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the root dir is copied only for a manifest with a name and a string version, and callers borrow it from the project list"
+    )
+)]
 fn insert_workspace_package(
     map: &mut pnpm_resolving_resolver_base::WorkspacePackages,
     root_dir: &Path,
@@ -198,7 +227,7 @@ fn insert_workspace_package(
 /// assembled.
 ///
 /// Pure in-memory: no file I/O, no read-failure warnings, no lockfile
-/// or importer traversal. Every project — root and siblings alike —
+/// or importer traversal. Every project (root and siblings alike)
 /// reuses the [`PackageManifest`] reference already loaded for the
 /// install dispatch.
 pub(super) fn build_projects_map(
@@ -277,7 +306,11 @@ pub(crate) fn build_workspace_state<Sys: Clock>(
     state.settings.default_registry = None;
     state.settings.registry_routes = None;
     if node_linker == NodeLinker::Hoisted {
-        record_hoisted_modules_dirs(&mut state.projects, project_manifests);
+        record_hoisted_modules_dirs(
+            &mut state.projects,
+            project_manifests,
+            &ImporterModulesDirs::from_config(config, workspace_root),
+        );
     }
     state
 }
@@ -296,13 +329,13 @@ pub(crate) fn registry_keys_current(
 
 /// The `autoDedupe` an install records in the workspace state.
 ///
-/// With `lockfile.includeResolutionSettings`, the lockfile records
+/// When [`Config::lockfile_records_resolution_settings`], the lockfile records
 /// `autoDedupe` and its freshness check holds that value to the config, so
 /// every install that kept the lockfile records the config's value.
 /// Otherwise only a resolving install establishes the dedupe baseline, and
 /// `established` is what this write knows of it.
 pub(crate) fn recorded_auto_dedupe(config: &Config, established: Option<bool>) -> Option<bool> {
-    if config.lockfile && config.lockfile_include_resolution_settings {
+    if config.lockfile && config.lockfile_records_resolution_settings() {
         return config.auto_dedupe.then_some(true);
     }
     established
@@ -313,11 +346,11 @@ pub(crate) fn recorded_auto_dedupe(config: &Config, established: Option<bool>) -
 fn record_hoisted_modules_dirs(
     projects: &mut BTreeMap<String, ProjectEntry>,
     project_manifests: &[(PathBuf, &PackageManifest)],
+    modules_dirs: &ImporterModulesDirs,
 ) {
     for (root_dir, _) in project_manifests {
         if let Some(entry) = projects.get_mut(&*root_dir.to_string_lossy()) {
-            entry.has_modules_dir =
-                crate::install_state::hoisted_project_modules_dir(root_dir).is_dir();
+            entry.has_modules_dir = modules_dirs.of(root_dir).is_dir();
         }
     }
 }

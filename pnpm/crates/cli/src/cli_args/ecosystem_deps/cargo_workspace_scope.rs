@@ -1,14 +1,28 @@
 #[cfg(test)]
 pub(super) mod tests;
 
-use super::cargo_manifest_ops::{DeclaredCargoDep, declared_cargo_deps, same_declared_dep};
+use super::cargo_manifest_ops::{
+    DeclaredCargoDep,
+    declared_cargo_deps,
+    same_declared_dep,
+};
 use crate::cargo_deps::CargoWorkspaceDependency;
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+};
 use semver::VersionReq;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{
+        BTreeSet,
+        HashMap,
+    },
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// A declaration's version requirement and the features it enables.
@@ -29,25 +43,33 @@ impl CargoWorkspaceScope {
     /// that resolves through it: the declaration itself, the members
     /// inheriting it, and their target-specific tables.
     pub(crate) fn enabled_features(&self, dep: &DeclaredCargoDep) -> Vec<String> {
-        let Some(declarations) =
-            self.declarations.get(&(dep.package_name.clone(), dep.alias.clone()))
-        else {
-            return Vec::new();
-        };
-        let features: BTreeSet<&String> = declarations
+        let mut features = BTreeSet::new();
+        for alias in dep.aliases
             .iter()
-            .filter(|(req, _)| *req == dep.version_req)
-            .flat_map(|(_, features)| features)
-            .collect();
-        features.into_iter().cloned().collect()
+            .map(String::as_str)
+            .chain(std::iter::once(dep.manifest_key.as_str()))
+        {
+            if let Some(declarations) =
+                self.declarations.get(&(dep.package_name.clone(), alias.to_string()))
+            {
+                features.extend(
+                    declarations
+                        .iter()
+                        .filter(|(req, _)| *req == dep.version_req)
+                        .flat_map(|(_, features)| features.iter().cloned()),
+                );
+            }
+        }
+        features.into_iter().collect()
     }
 
     /// Whether the workspace also declares `dep`'s package under another
     /// name, so `dep` is a renamed alias kept on a line of its own.
     pub(crate) fn has_sibling_alias(&self, dep: &DeclaredCargoDep) -> bool {
-        let is_sibling =
-            |(name, alias): &(String, String)| *name == dep.package_name && *alias != dep.alias;
-        dep.alias != dep.package_name
+        let is_sibling = |(name, alias): &(String, String)| {
+            *name == dep.package_name && !dep.has_alias(alias) && alias != &dep.manifest_key
+        };
+        dep.primary_alias() != dep.package_name
             && (self.declarations.keys().any(is_sibling)
                 || self.root_manifest.workspace_aliases.iter().any(is_sibling))
     }
@@ -176,11 +198,16 @@ fn extend_unique_declared(
     cargo_root: &Path,
 ) {
     for dep in deps {
-        if dep.manifest_path.starts_with(cargo_root)
-            && !all_declared
-                .iter()
-                .any(|existing| existing.group == dep.group && same_declared_dep(existing, &dep))
+        if !dep.manifest_path.starts_with(cargo_root) {
+            continue;
+        }
+        if let Some(existing) = all_declared
+            .iter_mut()
+            .filter(|existing| existing.group == dep.group)
+            .find(|existing| same_declared_dep(existing, &dep))
         {
+            existing.merge_aliases_from(&dep);
+        } else {
             all_declared.push(dep);
         }
     }

@@ -3,15 +3,25 @@
 
 use crate::{
     check_engine::{
-        Engine, InvalidNodeVersionError, UnsupportedEngineError, WantedEngine, check_engine,
+        Engine,
+        InvalidNodeVersionError,
+        UnsupportedEngineError,
+        WantedEngine,
+        check_engine,
     },
     check_platform::{
-        UnsupportedPlatformError, WantedPlatformRef, check_platform, platform_is_supported,
+        UnsupportedPlatformError,
+        WantedPlatformRef,
+        check_platform,
+        platform_is_supported,
     },
     infer_platform_from_package_name::inferred_platform,
     supported_architectures::SupportedArchitectures,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use serde::Serialize;
 
@@ -82,8 +92,7 @@ impl InstallabilityError {
 ///   the install set.
 /// - [`InstallabilityVerdict::ProceedWithWarning`]: the package is
 ///   incompatible, not optional, and `engineStrict` is off; caller
-///   emits `pnpm:install-check` warn (or a tracing-level warning) and
-///   proceeds.
+///   emits `pnpm:install-check` warn and proceeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallabilityVerdict {
     Installable,
@@ -166,8 +175,8 @@ pub fn check_package(
 /// Produces the tri-state installability verdict.
 ///
 /// Side effects (the `pnpm:install-check` warn and
-/// `pnpm:skipped-optional-dependency` emit) are *not* performed here
-/// — the caller composes them so log payloads can carry pacquet-
+/// `pnpm:skipped-optional-dependency` emit) are *not* performed here,
+/// the caller composes them so log payloads can carry pacquet-
 /// specific context (`prefix`, `requester`, etc.).
 ///
 /// [`InstallabilityError`] is large (200+ bytes) because it carries the
@@ -228,7 +237,7 @@ pub fn package_is_installable(
 /// [`inferred_platform`]).
 ///
 /// This is the check for a package described by a lockfile row rather than by
-/// a manifest — no engines are recorded per snapshot, so only the platform is
+/// a manifest, no engines are recorded per snapshot, so only the platform is
 /// evaluated. The `optional` gate stays at the call site: pnpm leaves out only
 /// an optional dependency it cannot install.
 ///

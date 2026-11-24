@@ -1,3 +1,5 @@
+mod streaming;
+
 mod wire_protocol;
 
 mod request_validation;
@@ -6,34 +8,104 @@ mod authorization;
 
 mod behavior;
 
+mod bounds;
+
+mod bounds_review;
+
+mod bounds_review_round2;
+
+mod bounds_review_round3;
+
+mod refresh_bounds;
+
 mod configuration_cache;
 
+mod graph_swap;
+
+mod resolution_shape;
+
 use axum::http::StatusCode;
-use pnpm_config::{Config as PacquetConfig, RegistryDeclaration, ResolutionMode};
+use pnpm_config::{
+    Config as PacquetConfig,
+    RegistryDeclaration,
+    ResolutionMode,
+};
 use pnpm_lockfile::Lockfile;
 use pnpm_resolving_resolver_base::{
-    PackageVersionGuard, PackageVersionGuardDecision, PackageVersionGuardFuture,
+    PackageVersionGuard,
+    PackageVersionGuardDecision,
+    PackageVersionGuardFuture,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
     time::Duration,
 };
 
 use pnpr_fixtures::MockConfigPresets;
 
 use super::{
-    cache::{MAX_RESOLUTION_CACHE_CANDIDATES_PER_KEY, cached_resolution},
-    protocol::{ResolveRequest, ResolveRequestProject},
-    reject_inline_url_auth, reject_invalid_patch_hashes, reject_off_allowlist_fetches,
-    reject_unsafe_publish_directories, reject_unusable_resolve, resolution_cache_key,
-    store_resolution,
+    cache::{
+        MAX_RESOLUTION_CACHE_CANDIDATES_PER_KEY,
+        cached_resolution,
+    },
+    dispatch::reject_unusable_resolve,
+    protocol::{
+        ResolveRequest,
+        ResolveRequestProject,
+    },
+    reject_inline_url_auth,
+    reject_off_allowlist_fetches,
+    request_validation::{
+        reject_invalid_patch_hashes,
+        reject_unsafe_publish_directories,
+    },
+    resolution_cache_key,
 };
-use pnpr_config::{Config as RegistryConfig, PublicRoute, UpstreamConfig};
-use pnpr_policy::{AccessList, Identity, PackageRule, PackageRules};
-use pnpr_route::{Footprint, PrivateAccessDescriptor, RouteContext};
+use pnpr_config::{
+    Config as RegistryConfig,
+    PublicRoute,
+    UpstreamConfig,
+};
+use pnpr_policy::{
+    AccessList,
+    Identity,
+    PackageRule,
+    PackageRules,
+};
+use pnpr_route::{
+    Footprint,
+    PrivateAccessDescriptor,
+    RouteContext,
+};
+
+fn store_resolution(
+    cache: &Mutex<HashMap<String, Vec<super::cache::CachedResolution>>>,
+    ttl: Duration,
+    key: String,
+    footprint: Footprint,
+    secret: &[u8],
+    lockfile: &Lockfile,
+) -> bool {
+    super::cache::store_resolution_with_allowed_picks(
+        cache,
+        ttl,
+        key,
+        footprint,
+        secret,
+        lockfile,
+        Vec::new(),
+    )
+}
 
 fn config_for_registry(registry: &str) -> PacquetConfig {
     let mut config = PacquetConfig::new();
@@ -105,7 +177,7 @@ fn upstream_with_token(registry: &str, access: &str, token: &'static str) -> Ups
         reqwest::header::HeaderValue::from_static(token),
     );
     let mut upstream = UpstreamConfig::with_defaults(registry.to_string(), headers);
-    upstream.access = Some(AccessList::from_tokens([access]));
+    upstream.set_access(AccessList::from_tokens([access]));
     upstream
 }
 
@@ -113,10 +185,17 @@ fn private_alias_footprint(alias: &str) -> Footprint {
     let mut footprint = Footprint::default();
     footprint.add(PrivateAccessDescriptor::Alias {
         alias: alias.to_string(),
-        credential_digest: pnpr_route::credential_digest(ALIAS_TOKEN),
+        credential_digest: alias_credential(),
         package: None,
     });
     footprint
+}
+
+fn alias_credential() -> String {
+    pnpr_route::headers_credential_digest(&reqwest::header::HeaderMap::from_iter([(
+        reqwest::header::AUTHORIZATION,
+        ALIAS_TOKEN.parse().unwrap(),
+    )]))
 }
 
 fn private_hosted_footprint(registry: &str, package: &str) -> Footprint {
@@ -130,7 +209,10 @@ fn private_hosted_footprint(registry: &str, package: &str) -> Footprint {
 /// whose `access` is `access`, so a test can rotate who may read a hosted
 /// package.
 fn set_local_hosted_rules(config: &mut RegistryConfig, pattern: &str, access: &str) {
-    use pnpr_registry::{Ecosystem, PackagePattern};
+    use pnpr_registry::{
+        Ecosystem,
+        PackagePattern,
+    };
     let rules = PackageRules::new(
         vec![PackageRule {
             pattern: PackagePattern::parse(pattern, Ecosystem::Npm).expect("test pattern parses"),
@@ -204,4 +286,9 @@ fn lockfile_with_tarball(tarball: &str) -> Lockfile {
         },
     }))
     .expect("lockfile parses")
+}
+
+fn cargo_done_frame(lockfile: &str) -> Vec<u8> {
+    super::wire::cargo_done_frame_until(lockfile, &|| false)
+        .expect("unconditional frame serialization cannot cancel")
 }

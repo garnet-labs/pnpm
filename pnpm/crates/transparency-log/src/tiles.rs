@@ -2,8 +2,14 @@
 //! at `tile/<L>/<N>[.p/<W>]` and entry bundles at
 //! `tile/entries/<N>[.p/<W>]`, relative to the log's URL prefix.
 
-use derive_more::{Display, Error};
-use std::{fmt, str::FromStr};
+use derive_more::{
+    Display,
+    Error,
+};
+use std::{
+    fmt,
+    str::FromStr,
+};
 use tlog_tiles::Tile;
 
 /// The height of every tile: a full tile holds 2⁸ hashes or entries.
@@ -77,6 +83,13 @@ impl TilePath {
         match self {
             TilePath::Hashes { width, .. } | TilePath::Entries { width, .. } => width == TILE_WIDTH,
         }
+    }
+
+    /// The path prefix under which partial entry bundles of `index` are
+    /// stored (`tile/entries/<N>.p`), without a trailing `/`.
+    #[must_use]
+    pub fn partial_entries_prefix(index: u64) -> String {
+        format!("tile/entries/{}.p", encode_index(index))
     }
 }
 

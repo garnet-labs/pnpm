@@ -1,9 +1,17 @@
 use super::{
-    install_v2, install_v2_body, leave_out_unlikely_picks, likely_picks, record_address,
-    release_records::release_record, without_pnpr_facts_in,
+    install_v2,
+    install_v2_body,
+    leave_out_unlikely_picks,
+    likely_picks,
+    record_address,
+    release_records::release_record,
+    without_pnpr_facts_in,
 };
 use pnpr_config::PackageDocumentsConfig;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::time::Duration;
 
 fn version(integrity: &str) -> Value {
@@ -62,6 +70,17 @@ fn likely_picks_are_the_tag_targets_and_the_highest_of_each_line() {
 }
 
 #[test]
+fn a_split_document_keeps_versions_whose_record_urls_are_occupied() {
+    let mut source = packument();
+    source["versions"]["1.0.0+r0"] = version("sha512-i");
+    source["dist-tags"]["0.1.0+r0"] = json!("2.1.0");
+    let split = document(&source, true);
+    for base in ["1.0.0", "0.1.0"] {
+        assert!(split["versions"][base]["manifest"].is_object());
+    }
+}
+
+#[test]
 fn a_small_document_keeps_every_manifest() {
     let doc = document(&packument(), false);
     assert_eq!(doc["name"], json!("acme"));
@@ -71,7 +90,8 @@ fn a_small_document_keeps_every_manifest() {
     assert!(
         versions
             .values()
-            .all(|entry| entry.get("manifest").is_some()),
+            .map(|entry| entry.get("manifest"))
+            .all(|value| value.is_some()),
     );
 }
 
@@ -112,10 +132,7 @@ fn busy_month() -> Value {
     for day in 1..=20 {
         let version = format!("1.0.{day}");
         time.insert(version.clone(), json!(format!("2025-01-{day:02}T00:00:00.000Z")));
-        versions.insert(
-            version.clone(),
-            json!({ "dist": { "integrity": format!("sha512-{day}") } }),
-        );
+        versions.insert(version, json!({ "dist": { "integrity": format!("sha512-{day}") } }));
     }
     json!({ "name": "acme", "dist-tags": { "latest": "1.0.20" }, "time": time, "versions": versions })
 }
@@ -126,7 +143,8 @@ fn is_split(body: &[u8]) -> bool {
         .as_object()
         .expect("versions")
         .values()
-        .any(|entry| entry.get("manifest").is_none())
+        .map(|entry| entry.get("manifest"))
+        .any(|value| value.is_none())
 }
 
 #[test]
@@ -227,12 +245,24 @@ fn a_release_record_leaves_out_what_may_change() {
 #[test]
 fn npm_documents_carry_no_pnpr_facts() {
     let mut doc = packument();
+    doc["formatVersion"] = json!(1);
+    doc["access"] = Value::Null;
     doc["versions"]["1.0.0"]["dist"]["revision"] = json!(1);
     doc["versions"]["1.0.0"]["dist"]["revisions"] = json!([]);
     without_pnpr_facts_in(&mut doc);
+    assert!(doc.get("formatVersion").is_none());
+    assert!(doc.get("access").is_none());
     let dist = &doc["versions"]["1.0.0"]["dist"];
     for omitted in ["pnpr", "revision", "revisions"] {
         assert!(dist.get(omitted).is_none(), "{omitted}");
     }
     assert_eq!(dist["integrity"], json!("sha512-d"));
+}
+
+#[test]
+fn npm_documents_preserve_explicit_access() {
+    let mut doc = packument();
+    doc["access"] = json!("public");
+    without_pnpr_facts_in(&mut doc);
+    assert_eq!(doc["access"], json!("public"));
 }

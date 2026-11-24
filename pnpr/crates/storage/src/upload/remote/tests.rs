@@ -1,11 +1,33 @@
-use super::{MAX_CHUNKS, RemoteUploadStore, UploadRecord, VersionedRecord, same_object_version};
+use super::{
+    MAX_CHUNKS,
+    RemoteUploadStore,
+    UploadPrincipal,
+    UploadRecord,
+    VersionedRecord,
+    same_object_version,
+};
 use futures_util::stream::BoxStream;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion,
-    memory::InMemory, path::Path,
+    CopyOptions,
+    GetOptions,
+    GetResult,
+    ListResult,
+    MultipartUpload,
+    ObjectMeta,
+    ObjectStore,
+    PutMode,
+    PutMultipartOptions,
+    PutOptions,
+    PutPayload,
+    PutResult,
+    UpdateVersion,
+    memory::InMemory,
+    path::Path,
 };
-use pnpr_package_name::{CanonicalPackageName, Ecosystem};
+use pnpr_package_name::{
+    CanonicalPackageName,
+    Ecosystem,
+};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -15,6 +37,7 @@ async fn a_full_chunk_list_still_accepts_an_empty_completion_request() {
     let id = "a".repeat(32);
     let record = UploadRecord {
         repository: "app".into(),
+        principal: UploadPrincipal::User("alice".into()),
         chunks: vec!["b".repeat(32); MAX_CHUNKS],
         size: 0,
         completion: None,
@@ -50,6 +73,7 @@ async fn expiry_removes_unrecorded_chunks_even_when_they_are_listed_first() {
     let id = "a".repeat(32);
     let record = UploadRecord {
         repository: "app".into(),
+        principal: UploadPrincipal::User("alice".into()),
         chunks: Vec::new(),
         size: 0,
         completion: None,
@@ -88,6 +112,7 @@ async fn unreadable_sessions_do_not_prevent_other_uploads_from_expiring() {
         .unwrap();
     let record = UploadRecord {
         repository: "app".into(),
+        principal: UploadPrincipal::User("alice".into()),
         chunks: Vec::new(),
         size: 0,
         completion: None,
@@ -195,7 +220,10 @@ async fn an_empty_chunk_is_accepted_when_reads_omit_the_version_id() {
         disk.path().into(),
     );
     let repository = CanonicalPackageName::parse("app", Ecosystem::Oci).unwrap();
-    let upload = backend.begin(&repository).await.unwrap();
+    let upload = backend
+        .begin(&repository, Some("alice"))
+        .await
+        .unwrap();
     assert_eq!(
         upload
             .append()
@@ -235,4 +263,109 @@ fn version_ids_decide_when_both_observations_carry_one() {
 fn etags_decide_when_either_observation_lacks_a_version_id() {
     assert!(same_object_version(&observed(Some("a"), Some("1")), &observed(Some("a"), None)));
     assert!(!same_object_version(&observed(Some("a"), Some("1")), &observed(Some("b"), None)));
+}
+
+#[tokio::test]
+async fn completing_or_aborting_an_upload_removes_the_session_record() {
+    use futures_util::TryStreamExt;
+    let disk = tempfile::TempDir::new().unwrap();
+    let backend = RemoteUploadStore::new(Arc::new(InMemory::new()), "", disk.path().into());
+    let repository = CanonicalPackageName::parse("app", Ecosystem::Oci).unwrap();
+    let upload = backend
+        .begin(&repository, Some("alice"))
+        .await
+        .unwrap();
+    let mut writer = upload.append().await.unwrap();
+    writer.write_all(b"layer").await.unwrap();
+    writer.finish().await.unwrap();
+    upload.remote
+        .as_ref()
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+    assert!(
+        backend
+            .read(upload.id())
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    let upload = backend
+        .begin(&repository, Some("alice"))
+        .await
+        .unwrap();
+    assert!(backend.abort(upload.id()).await.unwrap());
+    assert!(
+        backend.store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty(),
+    );
+}
+
+#[tokio::test]
+async fn remote_upload_record_round_trips_and_binds_principal() {
+    let disk = tempfile::TempDir::new().unwrap();
+    let backend = RemoteUploadStore::new(Arc::new(InMemory::new()), "", disk.path().into());
+    let repository = CanonicalPackageName::parse("acme/app", Ecosystem::Oci).unwrap();
+    let alice_upload = backend
+        .begin(&repository, Some("u-alice"))
+        .await
+        .unwrap();
+    let stored = backend
+        .read(alice_upload.id())
+        .await
+        .unwrap()
+        .unwrap();
+    let encoded = serde_json::to_vec(&stored.record).unwrap();
+    let decoded: UploadRecord = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded.repository, "acme/app");
+    assert_eq!(decoded.principal, UploadPrincipal::User("u-alice".into()));
+
+    assert!(
+        serde_json::from_slice::<UploadRecord>(
+            br#"{"repository":"acme/app","chunks":[],"size":0,"closed":false}"#,
+        )
+        .is_err(),
+    );
+    assert!(
+        backend
+            .open(&repository, Some("u-bob"), alice_upload.id())
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert!(
+        backend
+            .open(&repository, None, alice_upload.id())
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert!(
+        backend
+            .open(&repository, Some("u-alice"), alice_upload.id())
+            .await
+            .unwrap()
+            .is_some(),
+    );
+
+    let anon_upload = backend.begin(&repository, None).await.unwrap();
+    assert!(
+        backend
+            .open(&repository, Some("u-alice"), anon_upload.id())
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert!(
+        backend
+            .open(&repository, None, anon_upload.id())
+            .await
+            .unwrap()
+            .is_some(),
+    );
 }

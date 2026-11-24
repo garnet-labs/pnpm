@@ -1,17 +1,31 @@
 use crate::_utils;
 
 use _utils::{
-    append_workspace_yaml_key, bravo_dep_mature_up_to_1_0_1_minimum_release_age,
-    read_current_lockfile, set_minimum_release_age,
+    append_workspace_yaml_key,
+    bravo_dep_mature_up_to_1_0_1_minimum_release_age,
+    read_current_lockfile,
+    set_minimum_release_age,
 };
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pipe_trait::Pipe;
-use pnpm_lockfile::{Lockfile, PkgName};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_lockfile::{
+    Lockfile,
+    PkgName,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
-    fs::{get_all_folders, get_filenames_in_folder},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
+    fs::{
+        get_all_folders,
+        get_filenames_in_folder,
+    },
     registry::TestRegistry,
 };
 use pretty_assertions::assert_eq;
@@ -19,7 +33,10 @@ use pretty_assertions::assert_eq;
 use std::fs;
 use std::{
     ffi::OsStr,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 use tempfile::TempDir;
@@ -122,6 +139,55 @@ fn add_accepts_dir_allow_build_and_registry_after_the_subcommand() {
     assert!(
         yaml.contains("@pnpm.e2e/pre-and-postinstall-scripts-example"),
         "allowBuilds entry should be persisted, got:\n{yaml}",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn add_allow_build_accepts_a_comma_separated_list() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let registry = mock_instance.url();
+
+    pacquet
+        .with_args([
+            "add",
+            "@pnpm.e2e/pre-and-postinstall-scripts-example@1.0.0",
+            "@pnpm.e2e/install-script-example",
+            "--allow-build=@pnpm.e2e/pre-and-postinstall-scripts-example,!@pnpm.e2e/install-script-example",
+        ])
+        .with_arg(format!("--registry={registry}"))
+        .assert()
+        .success();
+
+    let pkg_dir = workspace.join(
+        "node_modules/.pnpm/@pnpm.e2e+pre-and-postinstall-scripts-example@1.0.0\
+         /node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example",
+    );
+    assert!(
+        pkg_dir.join("generated-by-postinstall.js").exists(),
+        "the first package in the list should have run its postinstall",
+    );
+    assert!(
+        !workspace
+            .join("node_modules/@pnpm.e2e/install-script-example/generated-by-install.js")
+            .exists(),
+        "the denied package in the list must not run its install script",
+    );
+
+    let yaml = std::fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
+        .expect("pnpm-workspace.yaml present");
+    assert!(
+        yaml.contains("'@pnpm.e2e/pre-and-postinstall-scripts-example': true")
+            && yaml.contains("'@pnpm.e2e/install-script-example': false"),
+        "both decisions should be persisted, got:\n{yaml}",
     );
 
     drop((root, mock_instance));
@@ -406,7 +472,7 @@ fn add_can_disable_progress_output() {
             ..
         } = CommandTempCwd::init().add_mocked_registry();
         if let Some((key, value)) = env {
-            pacquet.env(key, value);
+            pacquet = pacquet.with_env(key, value);
         }
         if workspace_config {
             append_workspace_yaml_key(&workspace, "progress", false);
@@ -471,7 +537,7 @@ fn prod_spec(dir: &std::path::Path, name: &str) -> String {
 /// explicit save target moves the entry into that group and drops it from
 /// the others, carrying the first-found specifier in pnpm's `findSpec`
 /// order (`optionalDependencies`, `dependencies`, `devDependencies`,
-/// `peerDependencies`) — so `--save-dev` here adopts the `dependencies`
+/// `peerDependencies`), so `--save-dev` here adopts the `dependencies`
 /// spec, matching pnpm's `updateProjectManifestObject`.
 #[test]
 fn add_existing_dependency_moves_it_to_the_target_group() {
@@ -544,7 +610,7 @@ fn add_existing_dependency_ignores_pin_from_peer_range() {
 }
 
 /// Naming a package manager records which one the project uses instead of
-/// installing it — but an alias only borrows the name, so it is an
+/// installing it, but an alias only borrows the name, so it is an
 /// ordinary dependency and must still be installed.
 #[test]
 fn add_aliasing_a_package_manager_name_installs_the_aliased_package() {
@@ -561,7 +627,7 @@ fn add_aliasing_a_package_manager_name_installs_the_aliased_package() {
 }
 
 /// A registry-host tarball URL parses as a registry `Version` spec, but it
-/// must be written verbatim — resolving it would rewrite an explicit URL
+/// must be written verbatim, resolving it would rewrite an explicit URL
 /// dependency into a semver range.
 #[test]
 fn add_registry_tarball_url_is_kept_verbatim() {
@@ -974,7 +1040,7 @@ fn saved_spec(dir: &Path, name: &str) -> Option<String> {
 ///
 /// `CommandTempCwd::add_mocked_registry` writes these for tests that
 /// need a registry. The workspace-protocol tests resolve only local
-/// packages, so they skip the registry — but they still have to pin the
+/// packages, so they skip the registry, but they still have to pin the
 /// directories, or they race every other test over the developer's real
 /// store.
 const HERMETIC_STORE_YAML: &str =
@@ -984,8 +1050,8 @@ fn write_json(path: &Path, value: &serde_json::Value) {
     std::fs::write(path, value.to_string()).expect("write manifest");
 }
 
-/// An alias-less selector — the whole argument is the specifier, with no
-/// `<name>@` in front — names a package whose name lives only in its own
+/// An alias-less selector (the whole argument is the specifier, with no
+/// `<name>@` in front) names a package whose name lives only in its own
 /// manifest, so `add` reads it from the directory, the archive, or the
 /// checkout rather than from the selector.
 ///

@@ -13,18 +13,33 @@
 //! rather than fatal.
 
 pub use npm::collect_npm_lockfile_versions;
-pub use yarn::{YarnSyntaxError, collect_yarn_lockfile_versions};
-
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+pub use yarn::{
+    YarnSyntaxError,
+    collect_yarn_lockfile_versions,
 };
 
-use derive_more::{Display, Error};
+use std::{
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
+};
+
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_resolving_resolver_base::{
-    PreferredVersions, REQUESTED_VERSION_SELECTOR_WEIGHT, VersionSelectorEntry,
-    VersionSelectorType, VersionSelectorWithWeight,
+    PreferredVersions,
+    REQUESTED_VERSION_SELECTOR_WEIGHT,
+    VersionSelectorEntry,
+    VersionSelectorType,
+    VersionSelectorWithWeight,
 };
 
 mod npm;
@@ -171,6 +186,14 @@ fn add_version(versions: &mut VersionsByPackageName, name: &str, version: &str) 
         .entry(name.to_string())
         .or_default()
         .insert(version.to_string());
+}
+
+/// Split `<name>@<spec>` at the first `@` after the leading character, keeping
+/// a scoped package name's leading `@` intact.
+pub(crate) fn split_descriptor(descriptor: &str) -> Option<(&str, &str)> {
+    let first_len = descriptor.chars().next()?.len_utf8();
+    let index = descriptor[first_len..].find('@')? + first_len;
+    Some((&descriptor[..index], &descriptor[index + 1..]))
 }
 
 #[cfg(test)]

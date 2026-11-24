@@ -1,11 +1,21 @@
 #[cfg(unix)]
 use super::{
-    super::BuildModules, TEST_LOGGED_METHODS, create_failing_postinstall_fixture,
-    create_postinstall_modifies_source_fixture, key, policy_from_specs, root_importers, sha512_hex,
+    super::BuildModules,
+    TEST_LOGGED_METHODS,
+    create_failing_postinstall_fixture,
+    create_postinstall_modifies_source_fixture,
+    key,
+    policy_from_specs,
+    root_importers,
+    sha512_hex,
 };
 use crate::store_index_key_for_resolution;
 #[cfg(unix)]
-use crate::{RequiresBuildBySnapshot, SkippedSnapshots, VirtualStoreLayout};
+use crate::{
+    RequiresBuildBySnapshot,
+    SkippedSnapshots,
+    VirtualStoreLayout,
+};
 #[cfg(unix)]
 use pnpm_config::PackageImportMethod;
 #[cfg(unix)]
@@ -14,7 +24,10 @@ use pnpm_lockfile::SnapshotEntry;
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
 #[cfg(unix)]
-use std::{collections::HashMap, fs};
+use std::{
+    collections::HashMap,
+    fs,
+};
 #[cfg(unix)]
 use tempfile::tempdir;
 
@@ -64,6 +77,7 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
         HashMap::from([(
             pkg_key.without_peer(),
             pnpm_lockfile::PackageMetadata {
+                specifiers: None,
                 resolution: pnpm_lockfile::LockfileResolution::Registry(
                     pnpm_lockfile::RegistryResolution {
                         integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -92,7 +106,7 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
     let modules_dir = tempdir().expect("create temp dir");
     let lockfile_dir = tempdir().expect("create temp dir");
 
-    // A slot directory that exists but has lost its manifest — the state a
+    // A slot directory that exists but has lost its manifest, the state a
     // stage-and-swap failure would leave behind.
     let (pkg_dir, _mode) =
         create_postinstall_modifies_source_fixture(virtual_store_dir.path(), &pkg_key);
@@ -131,6 +145,7 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
 
     let result = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects {
                 overlays: Some(&side_effects_maps),
                 rows: None,
@@ -139,8 +154,7 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
             read: true,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -164,6 +178,7 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -195,7 +210,7 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
     );
 }
 /// Negative pair: with `side_effects_cache = false`, even a
-/// matching cache entry is ignored — the build runs.
+/// matching cache entry is ignored, the build runs.
 #[cfg(unix)]
 #[test]
 fn side_effects_cache_disabled_bypasses_the_gate() {
@@ -222,6 +237,7 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
 
     let err = BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects {
                 overlays: Some(&side_effects_maps),
                 rows: None,
@@ -230,8 +246,7 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
             read: false,
             write: false,
             publisher: None,
-            store_dir: None,
-            store_index_writer: None,
+            store: None,
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -255,6 +270,7 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
@@ -289,7 +305,7 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
 /// built directory, diffs against the pristine `PackageFilesIndex.files`
 /// row pre-seeded in the store, and queues a mutation so the row's
 /// `side_effects[cache_key]` carries the post-build files that
-/// differ from the base. The base CAS blob is left untouched — the
+/// differ from the base. The base CAS blob is left untouched, the
 /// digest the store-index row holds for `index.js` matches the
 /// pristine content, not the post-build content.
 ///
@@ -300,7 +316,12 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
 #[tokio::test(flavor = "current_thread")]
 async fn write_path_populates_side_effects_row() {
     use pnpm_store_dir::{
-        CafsFileInfo, HASH_ALGORITHM, PackageFilesIndex, StoreDir, StoreIndex, StoreIndexWriter,
+        CafsFileInfo,
+        HASH_ALGORITHM,
+        PackageFilesIndex,
+        StoreDir,
+        StoreIndex,
+        StoreIndexWriter,
         store_index_key,
     };
 
@@ -311,6 +332,7 @@ async fn write_path_populates_side_effects_row() {
         HashMap::from([(
             pkg_key.without_peer(),
             pnpm_lockfile::PackageMetadata {
+                specifiers: None,
                 resolution: pnpm_lockfile::LockfileResolution::Registry(
                     pnpm_lockfile::RegistryResolution {
                         integrity: integrity_str.parse().expect("parse integrity"),
@@ -352,7 +374,7 @@ async fn write_path_populates_side_effects_row() {
         "index.js".to_string(),
         CafsFileInfo {
             // The pristine content's actual digest is irrelevant
-            // for this test — the WRITE path doesn't compare it
+            // for this test, the WRITE path doesn't compare it
             // against on-disk CAS, just against the post-build
             // hashes from `add_files_from_dir`. So long as it
             // matches what `add_files_from_dir` will compute for
@@ -401,13 +423,13 @@ async fn write_path_populates_side_effects_row() {
 
     BuildModules {
         cache: crate::BuildCacheContext {
+            captured: None,
             side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: Some(engine),
             read: true,
             write: true,
             publisher: None,
-            store_dir: Some(&store_dir),
-            store_index_writer: Some(&writer),
+            store: Some(crate::BuildCacheStore { directory: &store_dir, writer: &writer }),
             frozen_store: false,
         },
         directories: crate::BuildLayout {
@@ -431,6 +453,7 @@ async fn write_path_populates_side_effects_row() {
             importers: &importers,
             dependency_groups: None,
             build_scope: None,
+            variations_platform: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),

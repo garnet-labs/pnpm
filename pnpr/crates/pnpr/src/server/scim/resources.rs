@@ -1,7 +1,14 @@
 //! SCIM 2.0 (RFC 7643, RFC 7644) message shapes for the `User` resource.
 
-use super::{super::RegistryError, directory::ScimUser};
-use serde_json::{Map, Value, json};
+use super::{
+    super::RegistryError,
+    directory::ScimUser,
+};
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
 
 pub(super) const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 const LIST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
@@ -19,7 +26,7 @@ pub(super) fn user_resource(username: &str, user: &ScimUser, location: &str) -> 
     let mut resource = user.attributes.clone();
     resource.insert("schemas".to_string(), json!([USER_SCHEMA]));
     resource.insert("id".to_string(), json!(username));
-    resource.insert("userName".to_string(), json!(username));
+    resource.insert("userName".to_string(), json!(user.username));
     resource.insert("active".to_string(), json!(user.active));
     resource.insert("meta".to_string(), json!({ "resourceType": "User", "location": location }));
     Value::Object(resource)
@@ -38,28 +45,29 @@ pub(super) fn list_response(resources: &[Value], total: usize, start_index: usiz
 /// The `userName` and the user a `POST` or `PUT` body describes. `active`
 /// defaults to `true`.
 pub(super) fn parse_user(body: &Value) -> Result<(String, ScimUser), RegistryError> {
-    let object = body.as_object().ok_or_else(|| invalid("the body must be a JSON object"))?;
+    let object =
+        body.as_object().ok_or_else(|| invalid("the body must be a JSON object".to_owned()))?;
     let username = object
         .get("userName")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| invalid("userName is required"))?;
+        .ok_or_else(|| invalid("userName is required".to_owned()))?;
     let active = object
         .get("active")
         .map(parse_active)
         .unwrap_or(Ok(true))?;
-    let attributes = object
+    let mut attributes = object
         .iter()
         .filter(|(key, _)| !MANAGED_ATTRIBUTES.contains(&key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    Ok((username.to_string(), ScimUser { active, attributes, ..ScimUser::default() }))
+    normalize_external_id(&mut attributes)?;
+    Ok((username.to_string(), ScimUser { username: username.to_string(), active, attributes }))
 }
 
 /// Apply a `PatchOp` body to `user`. `active` and top-level or `name.*`
 /// attributes change. Operations on a filtered path such as
-/// `emails[type eq "work"].value` are accepted and ignored, because pnpr
-/// reads no attribute but `active`.
+/// `emails[type eq "work"].value` are accepted and ignored.
 pub(super) fn apply_patch(user: &mut ScimUser, body: &Value) -> Result<(), RegistryError> {
     let schemas = body.get("schemas").and_then(Value::as_array);
     if !schemas.is_some_and(|schemas| {
@@ -67,16 +75,16 @@ pub(super) fn apply_patch(user: &mut ScimUser, body: &Value) -> Result<(), Regis
             .iter()
             .any(|schema| schema == PATCH_SCHEMA)
     }) {
-        return Err(invalid("a PATCH body must use the PatchOp schema"));
+        return Err(invalid("a PATCH body must use the PatchOp schema".to_owned()));
     }
     let operations = body
         .get("Operations")
         .and_then(Value::as_array)
-        .ok_or_else(|| invalid("Operations is required"))?;
+        .ok_or_else(|| invalid("Operations is required".to_owned()))?;
     for operation in operations {
         apply_operation(user, operation)?;
     }
-    Ok(())
+    normalize_external_id(&mut user.attributes)
 }
 
 fn apply_operation(user: &mut ScimUser, operation: &Value) -> Result<(), RegistryError> {
@@ -84,32 +92,42 @@ fn apply_operation(user: &mut ScimUser, operation: &Value) -> Result<(), Registr
         .get("op")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase)
-        .ok_or_else(|| invalid("every operation needs an op"))?;
+        .ok_or_else(|| invalid("every operation needs an op".to_owned()))?;
     let value = operation.get("value");
     match (op.as_str(), operation.get("path").and_then(Value::as_str)) {
         ("add" | "replace", None) => {
             let values = value
                 .and_then(Value::as_object)
-                .ok_or_else(|| invalid("an operation without a path needs an object value"))?;
+                .ok_or_else(|| {
+                    invalid("an operation without a path needs an object value".to_owned())
+                })?;
+            let _ = external_id_key(values)?;
             values
                 .iter()
                 .try_for_each(|(path, value)| set(user, path, Some(value)))
         }
-        ("add" | "replace", Some(path)) => {
-            set(user, path, Some(value.ok_or_else(|| invalid("add and replace need a value"))?))
-        }
+        ("add" | "replace", Some(path)) => set(
+            user,
+            path,
+            Some(value.ok_or_else(|| invalid("add and replace need a value".to_owned()))?),
+        ),
         ("remove", Some(path)) => set(user, path, None),
-        _ => Err(invalid(&format!("unsupported PATCH operation {op:?}"))),
+        _ => Err(invalid(format!("unsupported PATCH operation {op:?}"))),
     }
 }
 
 /// Set or, with `None`, remove the attribute at `path`.
 fn set(user: &mut ScimUser, path: &str, value: Option<&Value>) -> Result<(), RegistryError> {
-    let path = path
-        .strip_prefix(USER_SCHEMA)
-        .map(|rest| rest.trim_start_matches(':'))
-        .unwrap_or(path);
+    let path = user_attribute_path(path);
     if path.contains('[') {
+        return Ok(());
+    }
+    if path.eq_ignore_ascii_case("userName") {
+        let name = value
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid("userName must be a nonempty string".to_owned()))?;
+        user.username = name.to_string();
         return Ok(());
     }
     if path.eq_ignore_ascii_case("active") {
@@ -126,6 +144,7 @@ fn set(user: &mut ScimUser, path: &str, value: Option<&Value>) -> Result<(), Reg
             reason: format!("{path} cannot be changed through PATCH"),
         });
     }
+    let path = if path.eq_ignore_ascii_case("externalId") { "externalId" } else { path };
     let keys = attribute_keys(path);
     if keys.len() > MAX_PATH_DEPTH {
         return Err(RegistryError::BadRequest {
@@ -180,7 +199,7 @@ fn parse_active(value: &Value) -> Result<bool, RegistryError> {
         Value::Bool(active) => Ok(*active),
         Value::String(text) if text.eq_ignore_ascii_case("true") => Ok(true),
         Value::String(text) if text.eq_ignore_ascii_case("false") => Ok(false),
-        _ => Err(invalid("active must be a boolean")),
+        _ => Err(invalid("active must be a boolean".to_owned())),
     }
 }
 
@@ -207,6 +226,34 @@ pub(super) fn parse_filter(filter: &str) -> Result<String, RegistryError> {
     }
 }
 
-fn invalid(reason: &str) -> RegistryError {
-    RegistryError::BadRequest { reason: reason.to_string() }
+fn invalid(reason: String) -> RegistryError {
+    RegistryError::BadRequest { reason }
+}
+
+fn user_attribute_path(path: &str) -> &str {
+    path.strip_prefix(USER_SCHEMA)
+        .map(|rest| rest.trim_start_matches(':'))
+        .unwrap_or(path)
+}
+
+fn external_id_key(attributes: &Map<String, Value>) -> Result<Option<String>, RegistryError> {
+    let mut entries = attributes
+        .iter()
+        .filter(|(key, _)| user_attribute_path(key).eq_ignore_ascii_case("externalId"));
+    let Some((key, value)) = entries.next() else { return Ok(None) };
+    if entries.next().is_some() {
+        return Err(invalid("externalId must appear only once".to_owned()));
+    }
+    if value.as_str().is_none_or(str::is_empty) {
+        return Err(invalid("externalId must be a nonempty string".to_owned()));
+    }
+    Ok(Some(key.clone()))
+}
+
+fn normalize_external_id(attributes: &mut Map<String, Value>) -> Result<(), RegistryError> {
+    if let Some(key) = external_id_key(attributes)? {
+        let value = attributes.remove(&key).expect("attribute exists");
+        attributes.insert("externalId".to_string(), value);
+    }
+    Ok(())
 }

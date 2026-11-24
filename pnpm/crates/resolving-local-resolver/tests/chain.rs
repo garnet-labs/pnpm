@@ -2,10 +2,23 @@
 //! [`pnpm_resolving_default_resolver::DefaultResolver`] chain.
 
 use pnpm_lockfile::LockfileResolution;
-use pnpm_resolving_default_resolver::{DefaultResolver, SpecNotSupportedByAnyResolverError};
-use pnpm_resolving_local_resolver::{LocalResolver, LocalResolverContext};
-use pnpm_resolving_resolver_base::{ResolveOptions, UnsupportedProtocolError, WantedDependency};
-use std::{fs, path::PathBuf};
+use pnpm_resolving_default_resolver::{
+    DefaultResolver,
+    SpecNotSupportedByAnyResolverError,
+};
+use pnpm_resolving_local_resolver::{
+    LocalResolver,
+    LocalResolverContext,
+};
+use pnpm_resolving_resolver_base::{
+    ResolveOptions,
+    UnsupportedProtocolError,
+    WantedDependency,
+};
+use std::{
+    fs,
+    path::PathBuf,
+};
 use tempfile::TempDir;
 
 fn setup_project() -> (TempDir, PathBuf) {
@@ -115,6 +128,7 @@ async fn resolve_latest_claims_local_scheme_specifiers() {
             ..WantedDependency::default()
         },
         compatible: false,
+        current_version: None,
     };
     let info = resolver.resolve_latest(&query, &opts).await.expect("resolve_latest");
     assert!(info.is_some(), "local resolver should claim link: specs in resolve_latest");

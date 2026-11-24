@@ -24,9 +24,15 @@
 //! walker's caches across importers and applies `dedupeInjectedDeps`.
 
 pub(crate) use missing_peers::intersect_ranges;
+pub(crate) use optional_peer_candidates::OptionalPeerCandidates;
 pub use options::{
-    ImporterPeerOptions, ImporterResolutionInputs, ManifestTransformHooks, PeerLinkOptions,
-    ResolveImporterError, ResolveImporterOptions, ResolveImporterResult,
+    ImporterPeerOptions,
+    ImporterResolutionInputs,
+    ManifestTransformHooks,
+    PeerLinkOptions,
+    ResolveImporterError,
+    ResolveImporterOptions,
+    ResolveImporterResult,
 };
 
 mod direct_seeds;
@@ -35,11 +41,15 @@ mod hoist_state;
 mod local_targets;
 mod locked_peers;
 mod missing_peers;
+mod optional_peer_candidates;
 mod options;
 
 use direct_seeds::DirectSeeds;
 use hoist_state::{
-    ImporterHoistDependencies, ImporterHoistPolicy, ImporterHoistProgress, ImporterHoistSelection,
+    ImporterHoistDependencies,
+    ImporterHoistPolicy,
+    ImporterHoistProgress,
+    ImporterHoistSelection,
 };
 use local_targets::build_workspace_root_deps;
 use locked_peers::LockedPeers;
@@ -51,25 +61,55 @@ use crate::{
     dependencies_graph::MissingPeer,
     parent_pkg_aliases::ParentPkgAliases,
     peer_provider::{
-        DependencyOverrider, HoistPeersOptions, MissingPeerInfo, WorkspaceRootDep,
-        get_hoistable_optional_peers_with_preferred_versions, hoist_peers,
+        DependencyOverrider,
+        HoistPeersOptions,
+        MissingPeerInfo,
+        WorkspaceRootDep,
+        get_hoistable_optional_peers_with_preferred_versions,
+        hoist_peers,
     },
     resolve_dependency_tree::{
-        DependencySpec, TreeCtx, WorkspaceTreeCtx, extend_tree, record_changed_direct_deps,
-        unwrap_package_name,
+        DependencySpec,
+        TreeCtx,
+        WorkspaceTreeCtx,
+        extend_tree,
+        record_changed_direct_deps,
+        resolve_direct_dependency_detached,
     },
     resolve_peers::{
-        CandidatePeerRanges, HoistMissingScope, PeerDiscoveryResult, PeerHoistDiscovery,
-        ResolvePeersOptions, apply_hoist_missing_scope, index_missing_names,
-        peers_accept_provided_versions, resolve_peers, resolved_name_and_version,
+        CandidatePeer,
+        CandidatePeers,
+        HoistMissingScope,
+        PeerDiscoveryResult,
+        PeerHoistDiscovery,
+        ResolvePeersOptions,
+        accepts_optional_peer_candidate,
+        apply_hoist_missing_scope,
+        index_missing_names,
+        resolve_peers,
+        resolved_name_and_version,
     },
     resolved_tree::ResolvedTree,
+    unwrap_package_name::unwrap_package_name,
 };
-use pnpm_package_manifest::{DependencyGroup, PackageManifest, safe_read_package_json_from_dir};
-use pnpm_resolving_resolver_base::{PreferredVersions, Resolver};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+    safe_read_package_json_from_dir,
+};
+use pnpm_resolving_resolver_base::{
+    PreferredVersions,
+    Resolver,
+};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     io,
     path::Path,
     sync::Arc,
@@ -89,7 +129,7 @@ where
 {
     // Both `manifest_hook` and `pnpmfile_hook` live on the workspace ctx
     // (they're workspace-wide, not per-importer). Apply them before
-    // sharing the `Arc` — `resolve_importer_with_workspace` reads through
+    // sharing the `Arc`, `resolve_importer_with_workspace` reads through
     // the shared ctx and can't mutate it after the fact.
     let workspace = Arc::new(
         WorkspaceTreeCtx::default()
@@ -143,7 +183,9 @@ where
     let mut peer_discovery = PeerHoistDiscovery::new();
     loop {
         state.run_required_round(resolver, &mut peer_discovery).await?;
-        if !state.hoist_optional_round(resolver).await? {
+        if !state.hoist_optional_round(resolver, OptionalPeerCandidates::Resolved).await?
+            && !state.hoist_optional_round(resolver, OptionalPeerCandidates::Preferred).await?
+        {
             break;
         }
     }
@@ -156,7 +198,7 @@ where
 /// running any hoist round, forming a barrier: every importer's
 /// initial wave completes first, then per-round required-peer loops
 /// and one optional-peer hoist per round repeat across all importers
-/// until no importer hoists — so an optional-peer pick sees every
+/// until no importer hoists, so an optional-peer pick sees every
 /// importer's resolved versions, not just the importers processed so
 /// far.
 pub(crate) struct ImporterHoistState {
@@ -168,6 +210,16 @@ pub(crate) struct ImporterHoistState {
     progress: ImporterHoistProgress,
     dependencies: ImporterHoistDependencies,
     selection: ImporterHoistSelection,
+}
+
+/// An importer's share of the workspace peer pass.
+pub(crate) struct ImporterDirect {
+    pub(crate) declared_direct_dependencies: HashSet<String>,
+    pub(crate) explicitly_requested_direct_dependencies: HashSet<String>,
+    pub(crate) direct: Vec<DirectDep>,
+    pub(crate) hoisted_peer_provider_node_ids: HashSet<crate::NodeId>,
+    /// See [`crate::ImporterPeerInput::rejected_optional_peers`].
+    pub(crate) rejected_optional_peers: HashSet<String>,
 }
 
 pub(crate) struct RequiredRound {
@@ -186,7 +238,7 @@ pub(crate) struct SeededImporter {
     importer_id: String,
     ctx: TreeCtx,
     seeds: DirectSeeds,
-    locked: LockedPeers,
+    retained: HashSet<pnpm_lockfile::PkgName>,
     settings: HoistSettings,
 }
 
@@ -203,10 +255,20 @@ impl SeededImporter {
         DependencyGroupList: IntoIterator<Item = DependencyGroup>,
     {
         let seeds = DirectSeeds::of(manifest, dependency_groups, &opts)?;
-        let (ctx, settings) = opts.into_tree_ctx(importer_id, importer_order, workspace);
-        let locked = LockedPeers::of(&ctx, importer_id);
+        let (ctx, settings) = opts.into_tree_ctx(importer_id.to_owned(), importer_order, workspace);
+        let retained = ctx
+            .workspace()
+            .wanted_lockfile()
+            .map(|lockfile| {
+                locked_peers::retained_dependency_names(
+                    lockfile,
+                    importer_id,
+                    &seeds.initial_wanted,
+                )
+            })
+            .unwrap_or_default();
         record_changed_direct_deps(&ctx, importer_id, &seeds.initial_wanted);
-        Ok(Self { importer_id: importer_id.to_string(), ctx, seeds, locked, settings })
+        Ok(Self { importer_id: importer_id.to_string(), ctx, seeds, retained, settings })
     }
 
     pub(crate) async fn seed_changed_direct<Chain>(
@@ -245,18 +307,19 @@ impl SeededImporter {
             &self.ctx,
             resolver,
             std::mem::take(&mut self.seeds.initial_wanted),
-            &self.importer_id,
+            Some(&self.importer_id),
             &ParentPkgAliases::root(self.seeds.parent_pkg_aliases.clone()),
         )
         .await?;
         self.seeds.parent_pkg_aliases.extend(direct.iter().map(|dep| dep.alias.clone()));
         self.ctx.resolve_new_direct_deps_as_subdeps();
+        let locked = LockedPeers::for_importer(&self.ctx, &self.importer_id, &self.retained);
         Ok(ImporterHoistState::assemble(
-            &self.importer_id,
+            self.importer_id,
             self.ctx,
             direct,
             self.seeds,
-            self.locked,
+            locked,
             self.settings,
         ))
     }
@@ -359,6 +422,12 @@ impl ImporterHoistState {
             },
             scope: crate::PeerResolutionScope {
                 hoist_missing_scope: None,
+                declared_direct_dependencies: self.dependencies
+                    .wanted_specifier_by_alias
+                    .keys()
+                    .cloned()
+                    .collect(),
+                explicitly_requested_direct_dependencies: self.requested_direct_dependencies(),
                 hoisted_peer_provider_node_ids: self.dependencies
                     .hoisted_peer_provider_node_ids
                     .clone(),
@@ -372,16 +441,45 @@ impl ImporterHoistState {
     /// pass would be discarded), together with the `NodeIds` of the peer
     /// providers among them (see
     /// [`crate::PeerResolutionScope::hoisted_peer_provider_node_ids`]).
-    pub(crate) fn into_direct(self) -> (Vec<DirectDep>, HashSet<crate::NodeId>) {
-        (self.dependencies.direct, self.dependencies.hoisted_peer_provider_node_ids)
+    pub(crate) fn into_direct(self) -> ImporterDirect {
+        ImporterDirect {
+            declared_direct_dependencies: self.dependencies
+                .wanted_specifier_by_alias
+                .keys()
+                .cloned()
+                .collect(),
+            explicitly_requested_direct_dependencies: self.requested_direct_dependencies(),
+            direct: self.dependencies.direct,
+            hoisted_peer_provider_node_ids: self.dependencies.hoisted_peer_provider_node_ids,
+            rejected_optional_peers: self.dependencies.rejected_optional_peers,
+        }
     }
 
     /// Run the final per-importer peer pass and emit the result. Used
     /// by the single-importer entry points.
     fn into_result(self) -> ResolveImporterResult {
-        let peers_opts = self.peers_opts();
+        let mut peers_opts = self.peers_opts();
+        let lockfile = self.ctx
+            .workspace()
+            .wanted_lockfile()
+            .cloned();
         let mut resolved_tree = self.ctx.into_resolved_tree(self.dependencies.direct);
-        let peers_result = resolve_peers(&mut resolved_tree, peers_opts);
+        let has_locked = crate::resolve_peers::locked::has_contexts(&resolved_tree);
+        peers_opts.scope.collect_paths_by_node_id = has_locked;
+        let mut peers_result = resolve_peers(&mut resolved_tree, peers_opts.clone());
+        if has_locked
+            && crate::resolve_peers::locked::has_pinnable_context(
+                &resolved_tree,
+                &peers_result.paths_by_node_id,
+            )
+        {
+            crate::resolve_peers::locked::mark_changed_children(
+                &mut resolved_tree,
+                lockfile.as_deref(),
+            );
+            peers_opts.scope.resolved_peer_provider_paths = Some(peers_result.paths_by_node_id);
+            peers_result = resolve_peers(&mut resolved_tree, peers_opts);
+        }
         ResolveImporterResult { resolved_tree, peers_result }
     }
 }

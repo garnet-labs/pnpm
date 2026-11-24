@@ -2,7 +2,7 @@
 //! its build runs with.
 //!
 //! The dependency's install and prepublish scripts invoke `yarn`, `npm` or
-//! `bun` by name — its own scripts do too — so the package manager has to
+//! `bun` by name (its own scripts do too) so the package manager has to
 //! be reachable as a command, not just as a path pnpm knows. Each shim
 //! forwards to `pnpm dlx --package <pm>@<spec> <command>`, which resolves,
 //! verifies and installs that package manager once, reuses it afterwards,
@@ -11,8 +11,12 @@
 
 use pnpm_fs::write_atomic;
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use crate::preferred_pm::WantedPm;
@@ -20,7 +24,7 @@ use crate::preferred_pm::WantedPm;
 /// The commands a package manager answers to, all of which a dependency's
 /// scripts may reach for, and how each one is run.
 ///
-/// A command is usually a bin of the engine itself — the alias of the same
+/// A command is usually a bin of the engine itself, the alias of the same
 /// executable (`yarnpkg`), or the separate command it publishes beside
 /// itself (`npx`). Bun ships one executable and answers to `bunx` as
 /// `bun x`, so that command carries the subcommand instead.
@@ -118,6 +122,13 @@ fn running_pnpm_shim_file(pnpm_execpath: &Path) -> (String, String) {
 }
 
 #[cfg(any(unix, target_os = "wasi"))]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "shares its signature with the Windows twin, which formats `name` into `<name>.cmd`"
+    )
+)]
 fn shim_files(
     name: &str,
     run_as: &[&str],
@@ -160,7 +171,7 @@ fn shim_files(
 }
 
 /// `version_spec` if every character of it can appear in a semver range,
-/// and `None` otherwise — the version is then left to the channel default.
+/// and `None` otherwise, the version is then left to the channel default.
 ///
 /// `cmd.exe` has no way to escape a quote inside a quoted argument, so the
 /// Windows shim cannot make an arbitrary specifier safe by quoting it. The
@@ -185,7 +196,7 @@ fn command_line_safe(version_spec: &str) -> Option<&str> {
 fn write_executable(path: &Path, contents: &str) -> io::Result<()> {
     write_atomic(path, contents.as_bytes())?;
     #[cfg(target_os = "wasi")]
-    pnpm_fs::file_mode::set_path_permissions(path, 0o755)?;
+    pnpm_fs::file_mode::set_path_permissions(path, pnpm_fs::FileMode::from_mode(0o755))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

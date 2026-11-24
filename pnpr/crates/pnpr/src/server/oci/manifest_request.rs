@@ -1,10 +1,39 @@
 use super::{
-    Action, Body, CanonicalPackageName, DOCUMENT_WRITE_RETRIES, Digest, DocumentUpdate, ErrorCode,
-    ImageDocument, Method, OciPublication, Refusal, RegistryError, RegistrySource, Request,
-    Response, ResponseBody, StatusCode, authorize, collect_body, created, error, header,
-    hosted_manifest_response, insert_header, method_not_allowed, no_content, read_hosted_document,
-    read_manifest_bytes, registry_error, unknown_repository,
+    Action,
+    Body,
+    CanonicalPackageName,
+    DOCUMENT_WRITE_RETRIES,
+    Digest,
+    DocumentUpdate,
+    ErrorCode,
+    HostedRepo,
+    ImageDocument,
+    Method,
+    OciPublication,
+    Ownership,
+    Refusal,
+    RegistryError,
+    RegistrySource,
+    Request,
+    Response,
+    ResponseBody,
+    StatusCode,
+    authorize_with_ownership,
+    collect_body,
+    created,
+    error,
+    header,
+    hosted_manifest_response,
+    insert_header,
+    lookup_in_hosted_document,
+    method_not_allowed,
+    no_content,
+    read_manifest_bytes,
+    registry_error,
+    unknown_repository,
 };
+use pnpr_oci::ManifestRemoval;
+use pnpr_storage::database::HostedLookup;
 
 impl Request {
     /// `HEAD`/`GET`/`PUT`/`DELETE /v2/<name>/manifests/<reference>`.
@@ -25,20 +54,22 @@ impl Request {
             Ok(repo) => repo,
             Err(refusal) => return refusal.respond(),
         };
-        let document = match read_hosted_document::<ImageDocument>(
+        let requested = reference.to_string();
+        let entry = match lookup_in_hosted_document::<ImageDocument, _>(
             &self.state,
             &self.identity,
             &repo.source,
             &repo.key,
+            move |document| document.resolve(&requested).cloned(),
         )
         .await
         {
-            Ok(Some(document)) => document,
-            Ok(None) => return unknown_repository(name).respond(),
+            Ok(HostedLookup::Found(entry)) => entry,
+            Ok(HostedLookup::Absent) => return unknown_repository(name).respond(),
+            Ok(HostedLookup::Missing) => {
+                return error(ErrorCode::ManifestUnknown, "no such manifest or tag");
+            }
             Err(err) => return registry_error(err),
-        };
-        let Some(entry) = document.resolve(reference).cloned() else {
-            return error(ErrorCode::ManifestUnknown, "no such manifest or tag");
         };
         // A manifest is small enough to answer from memory, and the response
         // carries its digest and media type either way.
@@ -90,39 +121,64 @@ impl Request {
             Ok(repo) => repo,
             Err(refusal) => return refusal.respond(),
         };
-        if let Err(err) = authorize(
-            &self.state,
-            &self.identity,
-            &RegistrySource::Hosted(repo.source.clone()),
-            repo.key.as_str(),
-            Action::Unpublish,
-        ) {
-            return registry_error(err);
-        }
         let _guard = self.state.inner.locks.packages.lock(repo.key.as_str()).await;
-        let outcome = repo.storage.update_hosted_document_with_retry(
-            &repo.key,
-            DOCUMENT_WRITE_RETRIES,
-            None,
-            |existing| remove_manifest_or_tag(existing, &repo.key, reference),
-        )
-        .await;
+        let mut referenced_child = None;
+        let outcome = self.update_manifest_deletion(&repo, reference, &mut referenced_child).await;
         match outcome {
             Ok(DocumentUpdate::Written) => {
                 self.log_oci_manifest_deleted(repo.key.as_str(), reference);
                 no_content(StatusCode::ACCEPTED)
             }
-            Ok(_) => error(ErrorCode::ManifestUnknown, "no such manifest or tag"),
+            Ok(DocumentUpdate::NotFound) => match referenced_child {
+                Some(digest) => {
+                    error(ErrorCode::Denied, format!("{digest} is referenced by a retained index"))
+                }
+                None => error(ErrorCode::ManifestUnknown, "no such manifest or tag"),
+            },
             Err(err) => registry_error(err),
         }
     }
 
+    async fn update_manifest_deletion(
+        &self,
+        repo: &HostedRepo,
+        reference: &str,
+        referenced_child: &mut Option<Digest>,
+    ) -> Result<DocumentUpdate, RegistryError> {
+        let source = RegistrySource::Hosted(repo.source.clone());
+        let mut authorized = false;
+        let outcome = repo.storage.update_hosted_document_with_retry(
+            &repo.key,
+            DOCUMENT_WRITE_RETRIES,
+            self.identity.user_id(),
+            |existing| {
+                *referenced_child = None;
+                let Some(bytes) = existing else { return Ok(None) };
+                let document = ImageDocument::parse(bytes).map_err(RegistryError::Json)?;
+                let ownership = Ownership::Owners(&document.owners);
+                authorize_with_ownership(
+                    &self.state,
+                    &self.identity,
+                    &source,
+                    (repo.key.as_str(), &ownership),
+                    Action::Delete,
+                )?;
+                authorized = true;
+                remove_manifest_or_tag(document, &repo.key, reference, referenced_child)
+            },
+        )
+        .await?;
+        if !authorized {
+            self.authorize_unpublish(repo).await?;
+        }
+        Ok(outcome)
+    }
+
     fn log_oci_manifest_deleted(&self, repository: &str, reference: &str) {
-        let actor = self.identity.username().unwrap_or("-");
-        tracing::info!(
-            target: "pnpr::audit",
-            action = "oci.delete_manifest",
-            actor = %actor,
+        let actor = crate::audit::Actor::of(&self.identity);
+        crate::audit!(
+            actor,
+            "oci.delete_manifest",
             repository = %repository,
             reference = %reference,
             "oci manifest deleted",
@@ -135,13 +191,14 @@ impl Request {
         reference: &str,
         body: Body,
     ) -> Result<OciPublication, Refusal> {
-        let (key, org) = self.publish_target(name)?;
+        let target = self.publish_target(name).await?;
         let content_type = self.headers
             .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
+            .map(reqwest::header::HeaderValue::to_str)
+            .and_then(Result::ok);
         let bytes = collect_body(body, self.state.inner.config.http.oci.max_manifest_bytes).await?;
         OciPublication::new(
-            (key, org),
+            target,
             reference.to_string(),
             bytes,
             content_type,
@@ -151,12 +208,11 @@ impl Request {
 }
 
 fn remove_manifest_or_tag(
-    bytes: Option<&[u8]>,
+    mut document: ImageDocument,
     key: &CanonicalPackageName,
     reference: &str,
+    referenced_child: &mut Option<Digest>,
 ) -> Result<Option<Vec<u8>>, RegistryError> {
-    let Some(bytes) = bytes else { return Ok(None) };
-    let mut document = ImageDocument::parse(bytes).map_err(RegistryError::Json)?;
     if document.format_version > pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION {
         return Err(RegistryError::DocumentFormatTooNew {
             document: key.as_str().to_string(),
@@ -164,9 +220,23 @@ fn remove_manifest_or_tag(
             supported_version: pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION,
         });
     }
-    let removed = match Digest::parse(reference) {
-        Ok(digest) => document.remove_manifest(&digest),
-        Err(_) => document.remove_tag(reference),
-    };
-    Ok(removed.then(|| document.to_bytes()))
+    match Digest::parse(reference) {
+        Ok(digest) => match document.remove_manifest(&digest) {
+            ManifestRemoval::Removed => {}
+            ManifestRemoval::NotFound => return Ok(None),
+            ManifestRemoval::ReferencedByIndex => {
+                *referenced_child = Some(digest);
+                return Ok(None);
+            }
+        },
+        Err(_) => {
+            if !document.remove_tag(reference) {
+                return Ok(None);
+            }
+        }
+    }
+    if document.manifests().is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(document.to_bytes()))
 }

@@ -2,13 +2,24 @@ use super::resolve;
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
 use pnpm_lockfile_preferred_versions::add_weight_to_version_selector;
-use pnpm_resolving_deps_resolver::{ResolveWorkspaceResult, UpdateTargets};
+use pnpm_resolving_deps_resolver::{
+    ResolveWorkspaceResult,
+    UpdateTargets,
+};
 use pnpm_resolving_resolver_base::{
-    EXISTING_VERSION_SELECTOR_WEIGHT, PreferredVersions, VersionSelectorEntry, VersionSelectorType,
-    VersionSelectorWithWeight, pinned_by_lockfile,
+    EXISTING_VERSION_SELECTOR_WEIGHT,
+    PreferredVersions,
+    VersionSelectorEntry,
+    VersionSelectorType,
+    VersionSelectorWithWeight,
+    pinned_by_lockfile,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
     sync::Arc,
 };
 
@@ -135,6 +146,7 @@ impl<Reporter: pnpm_reporter::Reporter + 'static> super::ResolutionContext<'_, R
                     &preferred_versions_seeds_by_importer,
                     own_manifest_specifiers.as_ref(),
                 ),
+                deprecation_log: self.deprecations.sink(),
             })
             .await?;
             if !self.install.drivers.config.auto_dedupe

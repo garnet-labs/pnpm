@@ -1,13 +1,20 @@
-use super::{TokenBackend, sha256_hex, unix_seconds};
+use super::{
+    TokenBackend,
+    sha256_hex,
+    unix_millis,
+};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 use tokio::sync::Semaphore;
 
-/// The interval that limits last-used writes, in seconds. A token in steady
+/// The interval that limits last-used writes, in milliseconds. A token in steady
 /// use costs one write per interval, not one per request.
-pub const LAST_USED_GRANULARITY_SECS: u64 = 60;
+pub const LAST_USED_GRANULARITY_MILLIS: u64 = 60_000;
 
 /// How many writes may run at once. They share the token store's connection
 /// pool with the lookups that authenticate requests, so a burst of distinct
@@ -19,7 +26,7 @@ const MAX_WRITES_IN_FLIGHT: usize = 4;
 const MIN_CLAIMS_BEFORE_PRUNE: usize = 1024;
 
 /// Records when tokens are used. The write to the token store happens off
-/// the request path, at most once per [`LAST_USED_GRANULARITY_SECS`] per
+/// the request path, at most once per [`LAST_USED_GRANULARITY_MILLIS`] per
 /// token. A request never waits for it or learns that it failed: a failed
 /// write keeps its claim, so the token's next write is due an interval
 /// later.
@@ -67,7 +74,7 @@ impl LastUsedWriter {
 
     /// Whether a write was started.
     fn record_with(&self, last_used_at: u64, key: impl FnOnce() -> String) -> bool {
-        let now = unix_seconds();
+        let now = unix_millis();
         if within_interval(last_used_at, now) {
             return false;
         }
@@ -97,7 +104,7 @@ impl LastUsedWriter {
         if claims.written_at.get(key).is_some_and(|&written_at| within_interval(written_at, now)) {
             return false;
         }
-        claims.insert(key, now);
+        claims.insert(key.to_owned(), now);
         true
     }
 
@@ -111,17 +118,17 @@ impl LastUsedWriter {
 }
 
 impl Claims {
-    fn insert(&mut self, key: &str, now: u64) {
+    fn insert(&mut self, key: String, now: u64) {
         if self.written_at.len() >= self.prune_at {
             self.written_at.retain(|_, &mut written_at| within_interval(written_at, now));
             self.prune_at = (self.written_at.len() * 2).max(MIN_CLAIMS_BEFORE_PRUNE);
         }
-        self.written_at.insert(key.to_owned(), now);
+        self.written_at.insert(key, now);
     }
 }
 
 fn within_interval(written_at: u64, now: u64) -> bool {
-    now < written_at.saturating_add(LAST_USED_GRANULARITY_SECS)
+    now < written_at.saturating_add(LAST_USED_GRANULARITY_MILLIS)
 }
 
 #[cfg(test)]

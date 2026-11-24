@@ -5,8 +5,8 @@
 //! only an install has: the pnpmfile's custom resolvers, the resolution
 //! caches shared across the walk, the tarball fetch context that lets a
 //! tarball resolver read a fetched `package.json`. A caller that wants a
-//! single answer for a single specifier — `pnpm store add`, the NAPI
-//! `resolveDependency` — has none of that, and would otherwise each grow
+//! single answer for a single specifier (`pnpm store add`, the NAPI
+//! `resolveDependency`) has none of that, and would otherwise each grow
 //! its own copy of the resolver chain.
 //!
 //! Deliberate deviations from the install chain follow from having no
@@ -14,28 +14,57 @@
 //!
 //! - The tarball resolver runs without a fetch context, so an `http(s)`
 //!   tarball is claimed with its normalized URL but no bundled manifest or
-//!   integrity — both live inside the archive, and only the install pass
+//!   integrity; both live inside the archive, and only the install pass
 //!   extracts it.
 //! - Custom (pnpmfile) resolvers are omitted: loading a pnpmfile is an
 //!   install-time concern.
 
+pub use pnpm_resolving_local_resolver::LocalTarballResolution;
+
 use crate::DefaultResolver;
-use pnpm_config::{Config, Tool};
+use pnpm_config::Config;
+#[cfg(feature = "runtime-provisioning")]
+use pnpm_config::Tool;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_pm_yarn_resolver::YarnResolver;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_runtime_bun_resolver::BunResolver;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_runtime_deno_resolver::DenoResolver;
+#[cfg(feature = "runtime-provisioning")]
 use pnpm_engine_runtime_node_resolver::NodeResolver;
-use pnpm_network::{RetryOpts, ThrottledClient};
-use pnpm_resolving_git_resolver::{GitResolver, RealGitProbe, RealGitRunner};
-use pnpm_resolving_local_resolver::{LocalPathResolver, LocalResolverContext, LocalSchemeResolver};
+use pnpm_network::{
+    RetryOpts,
+    ThrottledClient,
+};
+use pnpm_resolving_git_resolver::{
+    GitResolver,
+    RealGitProbe,
+    RealGitRunner,
+};
+use pnpm_resolving_local_resolver::{
+    LocalFilesystemPolicy,
+    LocalPathResolver,
+    LocalResolverContext,
+    LocalSchemeResolver,
+};
 use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, MergeNamedRegistriesError, NamedRegistryResolver, NpmResolver,
-    OfflineStoreView, merge_named_registries, shared_in_memory_cache,
-    shared_packument_fetch_locker, shared_picked_manifest_cache,
+    InMemoryPackageMetaCache,
+    MergeNamedRegistriesError,
+    NamedRegistryResolver,
+    NpmResolver,
+    OfflineStoreView,
+    merge_named_registries,
+    shared_in_memory_cache,
+    shared_packument_fetch_locker,
+    shared_picked_manifest_cache,
 };
 use pnpm_resolving_resolver_base::Resolver;
 use pnpm_resolving_tarball_resolver::TarballResolver;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+};
 
 /// Inputs of [`build_standalone_chain`].
 pub struct StandaloneChainOptions<'a> {
@@ -50,6 +79,9 @@ pub struct StandaloneChainOptions<'a> {
     /// [`Self::full_metadata`], and wrong for a caller that asked for the
     /// full document because it wants those fields.
     pub filter_metadata: bool,
+    /// Whether `file:` tarball resolution reads the archive on disk or defers
+    /// reading to the caller's fetcher.
+    pub local_tarball_resolution: LocalTarballResolution,
 }
 
 /// Build the chain a single resolve dispatches through.
@@ -69,11 +101,15 @@ pub fn build_standalone_chain(
     // slot below all point at the same instance and its metadata cache.
     let npm_resolver: Arc<dyn Resolver> = Arc::new(build_npm_resolver(opts, retry_opts));
     // `preserveAbsolutePaths` isn't exposed by pacquet's `Config` yet, so
-    // the local-resolver context defaults to `false` here — same as the
+    // the local-resolver context defaults to `false` here, same as the
     // install path.
-    let local_ctx = LocalResolverContext { preserve_absolute_paths: false, ..Default::default() };
+    let local_ctx = LocalResolverContext {
+        preserve_absolute_paths: false,
+        filesystem_policy: LocalFilesystemPolicy::HostFilesystem(opts.local_tarball_resolution),
+        ..Default::default()
+    };
 
-    Ok(DefaultResolver::new(vec![
+    let mut chain: Vec<Box<dyn Resolver>> = vec![
         Box::new(Arc::clone(&npm_resolver)),
         Box::new(GitResolver::new(
             Arc::new(RealGitProbe::new(Arc::clone(http_client))),
@@ -81,16 +117,25 @@ pub fn build_standalone_chain(
         )),
         Box::new(TarballResolver { http_client: Arc::clone(http_client), fetch_context: None }),
         Box::new(LocalSchemeResolver::new(local_ctx)),
-        Box::new(build_node_resolver(config, http_client)),
-        Box::new(DenoResolver::new(Arc::clone(http_client), Arc::clone(&npm_resolver))),
-        Box::new(
+    ];
+    #[cfg(feature = "runtime-provisioning")]
+    {
+        chain.push(Box::new(build_node_resolver(config, http_client)));
+        chain.push(Box::new(DenoResolver::new(Arc::clone(http_client), Arc::clone(&npm_resolver))));
+        chain.push(Box::new(
             BunResolver::new(Arc::clone(http_client), Arc::clone(&npm_resolver))
                 .with_mirror(config.tool_mirror(Tool::Bun)),
-        ),
-        Box::new(YarnResolver::new(Arc::clone(http_client), config.tls.strict_ssl.unwrap_or(true))),
-        Box::new(build_named_registry_resolver(opts, retry_opts)?),
-        Box::new(LocalPathResolver::new(local_ctx)),
-    ]))
+        ));
+        chain.push(Box::new(YarnResolver::new(
+            Arc::clone(http_client),
+            config.tls.strict_ssl.unwrap_or(true),
+        )));
+    }
+    #[cfg(not(feature = "runtime-provisioning"))]
+    chain.push(Box::new(crate::UnavailableToolResolver));
+    chain.push(Box::new(build_named_registry_resolver(opts, retry_opts)?));
+    chain.push(Box::new(LocalPathResolver::new(local_ctx)));
+    Ok(DefaultResolver::new(chain))
 }
 
 fn build_npm_resolver(
@@ -134,7 +179,7 @@ fn metadata_format(
         needs_full_metadata_for: None,
         filter_metadata: opts.filter_metadata,
         registry_options_by_url: Arc::new(config.registry_options_by_url.clone()),
-        minimum_release_age: config.resolved_minimum_release_age(),
+        minimum_release_age: config.release_age_window_from_now(),
     }
 }
 
@@ -142,6 +187,7 @@ fn offline_store_view(config: &Config) -> Option<OfflineStoreView> {
     OfflineStoreView::open_for_offline(config.offline, &config.store_dir, config.frozen_store)
 }
 
+#[cfg(feature = "runtime-provisioning")]
 fn build_node_resolver(config: &Config, http_client: &Arc<ThrottledClient>) -> NodeResolver {
     let mut node_resolver =
         NodeResolver::new_with_auth(Arc::clone(http_client), Arc::clone(&config.auth_headers));

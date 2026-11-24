@@ -1,8 +1,17 @@
-pub use paths::{normalize_bin_path, normalize_package_relative_path};
+pub use paths::{
+    normalize_bin_path,
+    normalize_package_relative_path,
+};
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use serde_json::Value;
 
 mod paths;
@@ -92,13 +101,17 @@ fn is_valid_args_byte(byte: u8) -> bool {
 /// shebang.
 #[must_use]
 pub fn extension_program(extension: &str) -> Option<&'static str> {
-    match extension {
-        "js" | "cjs" | "mjs" => Some("node"),
-        "cmd" | "bat" => Some("cmd"),
-        "ps1" => Some("pwsh"),
-        "sh" => Some("sh"),
-        _ => None,
-    }
+    [
+        ("js", "node"),
+        ("cjs", "node"),
+        ("mjs", "node"),
+        ("cmd", "cmd"),
+        ("bat", "cmd"),
+        ("ps1", "pwsh"),
+        ("sh", "sh"),
+    ]
+    .into_iter()
+    .find_map(|(suffix, program)| extension.eq_ignore_ascii_case(suffix).then_some(program))
 }
 
 /// Combine an already-parsed shebang runtime with the extension fallback for
@@ -156,7 +169,7 @@ pub fn parse_shebang_from_bytes(bytes: &[u8]) -> Option<ScriptRuntime> {
 /// `^#!\s*(?:/usr/bin/env(?:\s+-S\s*)?)?\s*([^ \t]+)(.*)$`.
 ///
 /// `args` is captured **including the leading whitespace** that
-/// separates it from `prog` — everything from after `prog`'s end of
+/// separates it from `prog`; everything from after `prog`'s end of
 /// match to end of line. Preserving the leading whitespace is what
 /// produces byte-identical shim text (e.g. the double space between
 /// `$basedir/sh` and `-e` in the rendered exec line).
@@ -458,11 +471,15 @@ fn resolve_paths_from_directories_bin<'files>(
 }
 
 fn bin_dir_entry_name<'path>(file_path: &'path str, bin_dir: &str) -> Option<&'path str> {
-    let in_bin_dir = bin_dir.is_empty()
-        || file_path
-            .strip_prefix(bin_dir)
-            .is_some_and(|rest| rest.starts_with('/'));
-    if !in_bin_dir {
+    let relative = if bin_dir.is_empty() {
+        file_path
+    } else {
+        file_path.strip_prefix(bin_dir)?.strip_prefix('/')?
+    };
+    if relative
+        .split('/')
+        .any(|part| part.starts_with('.'))
+    {
         return None;
     }
     let file_name = file_path

@@ -1,10 +1,21 @@
 //! The pre-run dependency-status check behind `verifyDepsBeforeRun`.
 
 use super::{
-    Config, LockfileConflictCheckFailure, NodeLinker, OptimisticRepeatInstallCheck, Path, Scope,
+    Config,
+    LockfileConflictCheckFailure,
+    NodeLinker,
+    OptimisticRepeatInstallCheck,
+    Path,
+    Scope,
     WorkspaceState,
     freshness::{
-        Gate, GatePolicy, MissingWantedLockfile, NewerPatch, RecordedGroups, Stale, check_freshness,
+        Gate,
+        GatePolicy,
+        MissingWantedLockfile,
+        NewerPatch,
+        RecordedGroups,
+        Stale,
+        check_freshness,
     },
     relocation::relocated_state,
     wanted_lockfile_file_has_content,
@@ -14,15 +25,17 @@ use super::{
 /// run with the default dependency groups, and with the runtime the last
 /// install linked or skipped. A script runs the same from
 /// whichever store and virtual store `node_modules` was linked from, and
-/// whatever keys the lockfile records. Only an install has to act on a store
-/// location change or re-key the lockfile.
+/// whatever keys the lockfile records. Only an install acts on store location
+/// changes, re-keys the lockfile, or applies a change to lockfile verification.
 const RUN_IGNORED_SETTINGS: &[&str] = &[
     "dev",
     "optional",
     "production",
     "registryPrefixes",
     "runtime",
+    "runtimeOnFail",
     "storeDir",
+    "trustLockfile",
     "virtualStoreDir",
     "virtualStoreDirMaxLength",
     "globalVirtualStoreDir",
@@ -49,7 +62,7 @@ pub enum RunDepsStatus {
 
 /// The verify-deps-before-run twin of
 /// [`crate::optimistic_repeat_install::check_optimistic_repeat_install`]: the same freshness checks, with
-/// the differences pnpm's run gate carries over its install fast path —
+/// the differences pnpm's run gate carries over its install fast path;
 /// it runs regardless of `optimisticRepeatInstall`, never treats local
 /// file dependencies as outdated, ignores `dev`/`optional`/`production`
 /// drift (scripts always run with the default groups), and reports drift

@@ -3,18 +3,45 @@
 
 pub(crate) mod add;
 
-use super::workspace_directory::{ensure_workspace_directory, force_workspace_symlink};
-use miette::{IntoDiagnostic, Result, WrapErr};
-use pnpm_config::{Config, RuntimeOnFail};
+use super::workspace_directory::{
+    ensure_workspace_directory,
+    force_workspace_symlink,
+};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+};
+use pnpm_config::{
+    Config,
+    RuntimeOnFail,
+};
 use pnpm_network::ThrottledClient;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
 use pnpm_rust_toolchain::{
-    InstalledToolchain, RustToolchainError, TOOLCHAIN_LINK, ToolchainRequest, Unmanaged,
-    find_toolchain_file, install_toolchain, read_toolchain_file,
+    InstalledToolchain,
+    RustToolchainError,
+    TOOLCHAIN_LINK,
+    ToolchainRequest,
+    Unmanaged,
+    find_toolchain_file,
+    install_toolchain,
+    read_toolchain_file,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Mutex,
 };
 
@@ -33,6 +60,28 @@ pub(crate) async fn provision<Reporter: self::Reporter>(
     http_client: &ThrottledClient,
     manifests: &[PathBuf],
     checkout: Option<&Path>,
+) -> Result<()> {
+    provision_for_command::<Reporter>(
+        config,
+        http_client,
+        manifests,
+        checkout,
+        ToolchainLink::Publish,
+    )
+    .await
+}
+
+pub(crate) enum ToolchainLink {
+    Publish,
+    Preserve,
+}
+
+pub(crate) async fn provision_for_command<Reporter: self::Reporter>(
+    config: &Config,
+    http_client: &ThrottledClient,
+    manifests: &[PathBuf],
+    checkout: Option<&Path>,
+    link_in_project: ToolchainLink,
 ) -> Result<()> {
     let Some(checkout) = checkout else { return Ok(()) };
     if !installs_toolchains(config) {
@@ -59,8 +108,13 @@ pub(crate) async fn provision<Reporter: self::Reporter>(
             }
             Err(error) => return Err(error.into()),
         };
-        let dir = file.parent().expect("a toolchain file has a parent directory");
-        link(dir, &toolchain.dir)?;
+        match link_in_project {
+            ToolchainLink::Publish => {
+                let dir = file.parent().expect("a toolchain file has a parent directory");
+                link(dir, &toolchain.dir)?;
+            }
+            ToolchainLink::Preserve => {}
+        }
         PROVISIONED
             .lock()
             .expect("the provisioned toolchains are not poisoned")

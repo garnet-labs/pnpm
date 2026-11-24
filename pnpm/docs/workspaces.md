@@ -243,7 +243,7 @@ Even if this setting is enabled, pnpm will prefer to deduplicate injected depend
 
 :::
 
-Relative `workspace:` dependencies and auto-installed peers of an injected package resolve from the directory containing that package's `package.json`.
+Relative `workspace:` and `file:` dependencies and auto-installed peers of an injected package resolve from the directory containing that package's `package.json`.
 
 ### dedupeInjectedDeps
 
@@ -260,6 +260,8 @@ When this setting is enabled, [dependencies that are injected](package_json.md#d
 Injected workspace dependencies are collections of hardlinks, which don't add or remove the files when their sources change. This causes problems in packages that need to be built (such as in TypeScript projects).
 
 This setting is a list of script names. When any of these scripts are executed in a workspace package, the injected dependencies inside `node_modules` will also be synchronized. While a listed script runs, pnpm also refreshes the injected copies as separate files, so a watcher on the injected package sees each write. This makes the setting useful with watch-mode builds.
+
+After the script succeeds, pnpm refreshes command links for injected packages that declare `bin` or `directories.bin`.
 
 ### preferWorkspacePackages
 

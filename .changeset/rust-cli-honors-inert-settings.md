@@ -1,8 +1,4 @@
 ---
-"@pnpm/config.reader": patch
-"@pnpm/workspace.commands": patch
-"@pnpm/workspace.projects-filter": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

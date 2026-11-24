@@ -1,10 +1,29 @@
 use super::{
-    Config, EntryPoint, EnvLockfile, Invocation, LogEvent, PACKAGE_MANAGER_SWITCH_ENV_VARS,
-    PackageManager, PackageManagerToSync, PathBuf, PinRoots, PmOnFail, PreCommandError,
-    SwitchProcessState, SwitchSource, SwitchTarget, Value, WantedPackageManager,
-    env_lockfile_sync_from_loaded, global_warn, locked_package_manager_version,
-    locked_switch_source, sanitize_inline, should_persist_package_manager_lockfile,
-    switch_env_root, version_satisfies,
+    Config,
+    EntryPoint,
+    EnvLockfile,
+    Invocation,
+    LogEvent,
+    PACKAGE_MANAGER_SWITCH_ENV_VARS,
+    PackageManager,
+    PackageManagerToSync,
+    PathBuf,
+    PinRoots,
+    PmOnFail,
+    PreCommandError,
+    SwitchProcessState,
+    SwitchSource,
+    SwitchTarget,
+    Value,
+    WantedPackageManager,
+    env_lockfile_sync_from_loaded,
+    global_warn,
+    locked_package_manager_version,
+    locked_switch_source,
+    sanitize_inline,
+    should_persist_package_manager_lockfile,
+    switch_env_root,
+    version_satisfies,
 };
 
 /// What [`decide`] chooses for an invocation.
@@ -102,7 +121,9 @@ fn decide_enforced_pin(
     if can_switch_for_entry_point(invocation.entry_point, switch_wanted, pin.process_state) {
         return decide_switch_or_record(pin, settings, invocation, root_manifest, on_fail);
     }
-    if invocation.entry_point == EntryPoint::UnknownFlag {
+    if invocation.entry_point == EntryPoint::UnknownFlag
+        || (invocation.entry_point == EntryPoint::Version && pm.name != "pnpm")
+    {
         return Ok(PinDecision::Nothing);
     }
     check_package_manager(
@@ -180,7 +201,6 @@ fn decide_record(
         match env_lockfile_sync_from_loaded(
             settings,
             root_manifest,
-            pin.roots,
             on_fail,
             pin.locked_env.as_ref(),
             pin.running_version,
@@ -217,7 +237,7 @@ fn check_package_manager(
     emit: fn(&LogEvent),
 ) -> miette::Result<()> {
     // `download` reaches this function only when the switch it asks for
-    // cannot happen, which leaves the mismatch unresolved — as strict a
+    // cannot happen, which leaves the mismatch unresolved, as strict a
     // failure as `error`.
     let should_error = matches!(on_fail, PmOnFail::Error | PmOnFail::Download);
     if pm.name.is_empty() {
@@ -328,6 +348,7 @@ pub(super) fn package_manager_switch_disabled() -> bool {
 
 fn env_var_is_false(name: &str) -> bool {
     std::env::var_os(name)
-        .and_then(|value| value.into_string().ok())
+        .map(std::ffi::OsString::into_string)
+        .and_then(Result::ok)
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "false" | "0"))
 }

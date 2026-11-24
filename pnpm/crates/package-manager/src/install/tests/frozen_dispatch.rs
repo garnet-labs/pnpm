@@ -1,16 +1,47 @@
 use super::{
-    super::{Install, InstallError, ProjectMutation, workspace_state::build_workspace_state},
-    InstallDirs, PARTIAL_INSTALL_LOCKFILE, seed_placeholder_virtual_store_slot,
+    super::{
+        Install,
+        InstallError,
+        ProjectMutation,
+        workspace_state::build_workspace_state,
+    },
+    InstallDirs,
+    PARTIAL_INSTALL_LOCKFILE,
+    seed_placeholder_virtual_store_slot,
 };
 use crate::PolicyExcludes;
 use pnpm_config::Config;
-use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
-use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, write_modules_manifest};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::{LogEvent, Reporter, SilentReporter, Stage};
+use pnpm_lockfile::{
+    Lockfile,
+    MaybeLazyLockfile,
+};
+use pnpm_modules_yaml::{
+    Host,
+    LayoutVersion,
+    Modules,
+    NodeLinker,
+    write_modules_manifest,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_reporter::{
+    LogEvent,
+    Reporter,
+    SilentReporter,
+    Stage,
+};
 use pnpm_testing_utils::registry::TestRegistry;
-use pnpm_workspace_state::{load_workspace_state, update_workspace_state};
-use std::{fs, sync::Mutex, time::Duration};
+use pnpm_workspace_state::{
+    load_workspace_state,
+    update_workspace_state,
+};
+use std::{
+    fs,
+    sync::Mutex,
+    time::Duration,
+};
 use text_block_macros::text_block;
 
 /// Frozen-lockfile install with a `VariationsResolution` whose
@@ -19,11 +50,40 @@ use text_block_macros::text_block;
 /// [`crate::InstallPackageBySnapshotError::NoMatchingPlatformVariant`]
 /// from the cold-batch dispatcher. Variant selection happens
 /// before any network fetch, so the bogus URL on the variant is
-/// never read — the test stays hermetic.
+/// never read, the test stays hermetic.
+#[cfg_attr(not(feature = "runtime-provisioning"), ignore = "requires runtime provisioning")]
 #[tokio::test]
 async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
     let dirs = InstallDirs::new();
+    let err = install_unmatchable_runtime_variant(&dirs).await;
 
+    let rendered = format!("{err:?}");
+    eprintln!("ERROR DEBUG:\n{rendered}");
+    assert!(
+        rendered.contains("NoMatchingPlatformVariant"),
+        "expected NoMatchingPlatformVariant in the error chain, got: {rendered}",
+    );
+    let displayed = err.to_string();
+    assert!(!displayed.is_empty(), "Display impl should produce a non-empty user-facing message");
+
+    drop(dirs.dir);
+}
+
+#[cfg(not(feature = "runtime-provisioning"))]
+#[tokio::test]
+async fn frozen_lockfile_install_reports_unavailable_runtime_provisioning() {
+    let dirs = InstallDirs::new();
+    let err = install_unmatchable_runtime_variant(&dirs).await;
+
+    assert!(
+        matches!(&err, InstallError::RuntimeProvisioningUnavailable { alias } if alias == "node"),
+        "expected RuntimeProvisioningUnavailable, got: {err:?}",
+    );
+
+    drop(dirs.dir);
+}
+
+async fn install_unmatchable_runtime_variant(dirs: &InstallDirs) -> InstallError {
     let manifest_path = dirs.path().join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
     manifest.add_dependency("node", "runtime:22.0.0", DependencyGroup::Prod).unwrap();
@@ -67,11 +127,12 @@ async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
     })
     .expect("parse variant-mismatch fixture lockfile");
 
-    let err = Install {
+    Install {
         lockfile_policy: crate::InstallLockfilePolicy {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -87,6 +148,7 @@ async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -118,25 +180,14 @@ async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
     }
     .run::<SilentReporter>()
     .await
-    .expect_err("variant-mismatch lockfile must surface a typed error");
-
-    let rendered = format!("{err:?}");
-    eprintln!("ERROR DEBUG:\n{rendered}");
-    assert!(
-        rendered.contains("NoMatchingPlatformVariant"),
-        "expected NoMatchingPlatformVariant in the error chain, got: {rendered}",
-    );
-    let displayed = err.to_string();
-    assert!(!displayed.is_empty(), "Display impl should produce a non-empty user-facing message");
-
-    drop(dirs.dir);
+    .expect_err("variant-mismatch lockfile must surface a typed error")
 }
 /// Same lockfile + manifest shape as
 /// [`frozen_lockfile_install_errors_when_no_variant_matches_host`],
 /// but with `skip_runtimes: true`. The `--no-runtime` filter
 /// iterates importer-direct deps, builds `node@runtime:22.0.0`
 /// from `(alias, version)`, sees the `@runtime:` substring, and
-/// adds the snapshot to the skip set — so variant selection
+/// adds the snapshot to the skip set, so variant selection
 /// never runs and the unmatchable-platform variant doesn't fail
 /// the install.
 #[tokio::test]
@@ -187,6 +238,7 @@ lockfile_policy: crate::InstallLockfilePolicy {
 frozen: true,
 prefer_frozen: None,
 ignore_manifest_check: false,
+ignore_settings_check: false,
 trust: false,
 update_checksums: false,
 excludes: PolicyExcludes::Persist,
@@ -202,6 +254,7 @@ dry_run: false
 },
 resolution: crate::ResolutionInputs {
 update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+local_filesystem_policy: Default::default(),
 preferred_versions_override: None,
 auth_override: None,
 observer: None,
@@ -235,7 +288,7 @@ discovered_workspace: None
     .await
     .expect("--no-runtime should skip the unmatchable runtime entry and let the rest of the install succeed");
 
-    // The runtime slot must NOT exist under the virtual store —
+    // The runtime slot must NOT exist under the virtual store,
     // the snapshot was filtered out by the skip set.
     //
     // Use `symlink_metadata` rather than `Path::exists()` so a
@@ -268,7 +321,7 @@ discovered_workspace: None
 /// Asserts:
 ///
 /// 1. `Install::run` returns `Err(InstallError::LockfileVerification(...))`
-///    with the inner `VerifyError::MinimumReleaseAgeViolation` —
+///    with the inner `VerifyError::MinimumReleaseAgeViolation`,
 ///    i.e. the verifier code path actually ran and returned a
 ///    violation, the wiring is correct, and the dispatch maps the
 ///    inner code to the per-policy variant rather than collapsing
@@ -301,7 +354,7 @@ async fn frozen_lockfile_gate_rejects_under_huge_minimum_release_age() {
     config.minimum_release_age = Some(60 * 24 * 365 * 100);
     let config = config.leak();
 
-    // The integrity hash here is placeholder text — the gate fails
+    // The integrity hash here is placeholder text, the gate fails
     // before the tarball is fetched, so checksum verification never
     // runs and the value doesn't have to match the mock's actual
     // payload. The lockfile only needs to deserialize.
@@ -326,6 +379,7 @@ async fn frozen_lockfile_gate_rejects_under_huge_minimum_release_age() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -341,6 +395,7 @@ async fn frozen_lockfile_gate_rejects_under_huge_minimum_release_age() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -386,7 +441,7 @@ async fn frozen_lockfile_gate_rejects_under_huge_minimum_release_age() {
     );
 
     // The gate must short-circuit before any virtual-store
-    // materialization — no slot, no project-side symlink.
+    // materialization, no slot, no project-side symlink.
     let slot = dirs.project_root.join("node_modules/.pacquet/@pnpm.e2e+hello-world-js-bin@1.0.0");
     assert!(!slot.exists(), "the gate must fail before any virtual-store materialization");
     assert!(
@@ -422,6 +477,7 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -437,6 +493,7 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -485,6 +542,7 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
             frozen: false,
             prefer_frozen: Some(true),
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -500,6 +558,7 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -564,7 +623,7 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
     manifest.save().unwrap();
 
     let mut config = Config::new();
-    // Same legacy-layout opt-out as the sibling skip test — the seed
+    // Same legacy-layout opt-out as the sibling skip test, the seed
     // helper writes the flat-name slot shape.
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
@@ -588,6 +647,7 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: true,
             // fixture pins a tripwire tarball URL; skip resolution verification so the tarball-URL check doesn't flag it before the path under test
             update_checksums: false,
@@ -604,6 +664,7 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -683,7 +744,7 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
     let lockfile: Lockfile = serde_saphyr::from_str(PARTIAL_INSTALL_LOCKFILE)
         .expect("parse partial-install fixture lockfile");
 
-    // Seed exactly as the auto-frozen test does — if dispatch did go
+    // Seed exactly as the auto-frozen test does, if dispatch did go
     // frozen, the skip cache would carry the install to success.
     std::fs::create_dir_all(&dirs.virtual_store_dir).unwrap();
     lockfile
@@ -698,6 +759,7 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
             // CLI flag would land here).
             prefer_frozen: Some(false),
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -713,6 +775,7 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -783,7 +846,7 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
     let manifest_path = dirs.project_root.join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
     // A sibling `link:` dependency keeps the lockfile non-empty without
-    // requiring registry fetches — the gate fires on the eligibility
+    // requiring registry fetches, the gate fires on the eligibility
     // checks alone, materialization is never reached so the
     // (non-existent) link target doesn't matter.
     manifest.add_dependency("sibling", "link:../sibling", DependencyGroup::Prod).unwrap();
@@ -868,6 +931,7 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: true,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -883,6 +947,7 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,

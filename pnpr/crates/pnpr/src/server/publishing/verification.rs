@@ -3,15 +3,29 @@
 //! stored and served for the version is derived from the archive.
 
 use pnpm_package_manifest::{
-    ArchiveFacts, INSTALL_MANIFEST_PROFILE, InstallManifest, ManifestComparison, NODE_GYP_REBUILD,
+    ArchiveFacts,
+    INSTALL_MANIFEST_PROFILE,
+    InstallManifest,
+    ManifestComparison,
+    NODE_GYP_REBUILD,
     parse_manifest_bytes,
 };
-use pnpm_tarball::{PublicationArchive, read_publication_archive};
+use pnpm_tarball::{
+    PublicationArchive,
+    read_publication_archive,
+};
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
-use pnpr_storage::metadata::ARCHIVE_MANIFEST_FIELD;
-use serde_json::{Map, Value, json};
-use std::{io::Read, path::Path};
+use pnpr_storage::database::ARCHIVE_MANIFEST_FIELD;
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
+use std::{
+    io::Read,
+    path::Path,
+};
 
 use super::attachments::PublishedTar;
 
@@ -142,33 +156,6 @@ fn check_slot(
             comparison.mismatched.push(field.to_string());
         }
     }
-}
-
-/// Describe `version`, published without an `any` archive, by the archive
-/// pnpr generated for npm's documents: its install-critical fields are the
-/// generated archive's, and `dist` names that archive, at `tarball`.
-pub(super) fn describe_generated_archive(
-    version: &mut Map<String, Value>,
-    archive: &PublicationArchive,
-    mut dist: Value,
-    tarball: &str,
-) {
-    let manifest = parse_manifest_bytes(&archive.manifest).unwrap_or_default();
-    let facts = ArchiveFacts {
-        binding_gyp: archive.binding_gyp,
-        has_shrinkwrap: archive.shrinkwrap_integrity.is_some(),
-        files: &archive.files,
-    };
-    InstallManifest::derive(&manifest, facts).write_to_version(version);
-    version.insert(ARCHIVE_MANIFEST_FIELD.to_string(), archive_manifest_record(archive));
-    dist["tarball"] = Value::String(tarball.to_string());
-    if let Some(attestations) = version
-        .get("dist")
-        .and_then(|old| old.get("attestations"))
-    {
-        dist["attestations"] = attestations.clone();
-    }
-    version.insert("dist".to_string(), dist);
 }
 
 fn archive_manifest_record(archive: &PublicationArchive) -> Value {

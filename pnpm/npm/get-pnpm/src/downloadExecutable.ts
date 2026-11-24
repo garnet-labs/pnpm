@@ -4,7 +4,7 @@ import path from 'node:path'
 
 import { extractTarballMember } from './extractTarballMember.js'
 import { isMusl, platformPackageName } from './platformPackageName.js'
-import { downloadTarball, fetchSignatures, fetchVersionMeta, normalizeRegistry, type ProxyEnv, type RequestHeaders, useCertificateAuthorities, useProxyFromEnv } from './registry.js'
+import { DEFAULT_REGISTRY, downloadTarball, fetchSignatures, fetchVersionMeta, normalizeRegistry, type ProxyEnv, type RequestHeaders, useCertificateAuthorities, useProxyFromEnv } from './registry.js'
 import { majorVersion } from './resolveVersion.js'
 import { sameFileContents } from './sameFileContents.js'
 import { type SigningKey, verifyRegistrySignature } from './verifySignature.js'
@@ -24,6 +24,8 @@ export interface DownloadExecutableOptions {
   destPath: string
   /** Credentials for `registry`, withheld from any other origin. */
   headers?: RequestHeaders
+  /** The path `headers` are scoped to, such as `/org-a/npm/`: they are withheld from any other path too. */
+  authPath?: string
   /** PEM certificates of CAs to trust besides Node.js's own; see {@link useCertificateAuthorities}. */
   ca?: readonly string[]
   /** The proxy to download through; `process.env` names it when unset. See {@link useProxyFromEnv}. */
@@ -33,7 +35,7 @@ export interface DownloadExecutableOptions {
   /**
    * Whether the registry's signature over the checksum has to check out;
    * `true` unless set. Waiving it is for a registry that carries no npm
-   * signatures — one that re-published the package — and accepts that the
+   * signatures (one that re-published the package) and accepts that the
    * checksum then comes from the same host as the bytes it vouches for.
    */
   verifySignature?: boolean
@@ -45,7 +47,7 @@ export interface DownloadExecutableOptions {
  * The narrow half of {@link downloadPnpm}, for a caller that already knows the
  * exact version and already has whatever else it needs: no dist-tag lookup (so
  * no packument download), no `dist/` tree, no directory to assemble. Corepack
- * is the case it exists for — it unpacks the `pnpm` package itself but installs
+ * is the case it exists for. It unpacks the `pnpm` package itself but installs
  * none of its dependencies, so the executable has to arrive separately.
  *
  * The download is checked against the checksum the registry published for it,
@@ -59,6 +61,17 @@ export interface DownloadExecutableOptions {
  * @returns the package the executable came from.
  */
 export async function downloadPnpmExecutable (opts: DownloadExecutableOptions): Promise<{ packageName: string }> {
+  return downloadPnpmExecutableWithNpmRegistry({ ...opts, npmRegistry: DEFAULT_REGISTRY })
+}
+
+/**
+ * {@link downloadPnpmExecutable} with `npmRegistry` as the place npm's
+ * signatures are looked up when `registry` serves none. The package does not
+ * export it; tests use it to keep that lookup off the network.
+ */
+export async function downloadPnpmExecutableWithNpmRegistry (
+  opts: DownloadExecutableOptions & { npmRegistry: string }
+): Promise<{ packageName: string }> {
   const registry = normalizeRegistry(opts.registry)
   const packageName = platformPackageName({
     major: majorVersion(opts.version),
@@ -81,10 +94,10 @@ export async function downloadPnpmExecutable (opts: DownloadExecutableOptions): 
 }
 
 async function fetchExecutable (
-  opts: DownloadExecutableOptions & { packageName: string }
+  opts: DownloadExecutableOptions & { npmRegistry: string, packageName: string }
 ): Promise<{ packageName: string }> {
   const { version, destPath, registry, packageName } = opts
-  const meta = await fetchVersionMeta(registry, packageName, version, opts.headers)
+  const meta = await fetchVersionMeta(registry, packageName, version, opts.headers, opts.authPath)
   if (!meta.dist.integrity) {
     throw new Error(`The npm registry published no checksum for ${packageName}@${version}, so it cannot be verified.`)
   }
@@ -93,7 +106,7 @@ async function fetchExecutable (
       name: packageName,
       version,
       integrity: meta.dist.integrity,
-      signatures: await fetchSignatures(meta, { registry, pkgName: packageName, version, headers: opts.headers }),
+      signatures: await fetchSignatures(meta, { registry, pkgName: packageName, version, headers: opts.headers, headersPath: opts.authPath, npmRegistry: opts.npmRegistry }),
       keys: opts.keys,
     })
   }
@@ -103,7 +116,7 @@ async function fetchExecutable (
   const staged = `${scratch}.tmp`
   fs.mkdirSync(path.dirname(destPath), { recursive: true })
   try {
-    await downloadTarball(meta, tarball, { registry, headers: opts.headers })
+    await downloadTarball(meta, tarball, { registry, headers: opts.headers, headersPath: opts.authPath })
     const member = `package/${executableName()}`
     if (!await extractTarballMember(tarball, member, staged, 0o755)) {
       throw new Error(`The ${packageName}@${version} tarball contains no ${member}.`)
@@ -117,7 +130,7 @@ async function fetchExecutable (
 }
 
 /**
- * The codes Windows fails a rename with when the destination is held open —
+ * The codes Windows fails a rename with when the destination is held open,
  * which is what a concurrent call executing the copy it just placed looks like.
  * POSIX replaces the destination instead, so a failure there is a real one.
  */
@@ -129,8 +142,8 @@ const DESTINATION_IN_USE = new Set(['EPERM', 'EACCES', 'EBUSY'])
  *
  * A lost race is not assumed from the failure alone: the copy already there has
  * to hold the same bytes as the one just verified, or this call has no idea
- * what it would be reporting success for. Anything else — no permission on the
- * directory, a directory or an unrelated file at `destPath` — is a failure.
+ * what it would be reporting success for. Anything else (no permission on the
+ * directory, a directory or an unrelated file at `destPath`) is a failure.
  */
 function place (staged: string, destPath: string): void {
   try {

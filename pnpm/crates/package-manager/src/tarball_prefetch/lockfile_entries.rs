@@ -2,16 +2,33 @@
 //! staging one can fail on.
 
 use crate::install_package_by_snapshot::tarball_url_and_integrity;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
 use pnpm_deps_restorer::InstallPackageBySnapshotError;
-use pnpm_lockfile::{Lockfile, LockfileResolution, PackageKey, PackageMetadata};
-use pnpm_package_is_installable::{
-    SupportedArchitectures, WantedPlatformRef, platform_is_supported,
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
 };
-use pnpm_store_dir::{SharedReadonlyStoreIndex, store_index_key};
-use pnpm_tarball::{PrefetchIntegrityCheck, TarballError, prefetch_cas_paths};
+use pnpm_package_is_installable::{
+    SupportedArchitectures,
+    WantedPlatformRef,
+    platform_is_supported,
+};
+use pnpm_store_dir::{
+    SharedReadonlyStoreIndex,
+    store_index_key,
+};
+use pnpm_tarball::{
+    PrefetchIntegrityCheck,
+    TarballError,
+    prefetch_cas_paths,
+};
 use std::collections::HashSet;
 
 /// One registry lockfile entry [`super::TarballPrefetcher::prefetch_lockfile`]
@@ -78,7 +95,7 @@ pub(super) async fn without_verified_store_hits(
         .collect();
     let verified = prefetch_cas_paths(
         store.index.clone(),
-        store.dir,
+        &store.dir,
         keys,
         PrefetchIntegrityCheck::eager_if(verify_store_integrity),
         std::sync::Arc::clone(&store.verified_files_cache),

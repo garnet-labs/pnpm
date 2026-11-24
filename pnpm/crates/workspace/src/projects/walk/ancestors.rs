@@ -1,4 +1,7 @@
-use super::{Path, PathBuf};
+use super::{
+    Path,
+    PathBuf,
+};
 
 struct AncestorEntry {
     path: PathBuf,
@@ -12,8 +15,8 @@ pub(super) struct AncestorStack {
 }
 
 impl AncestorStack {
-    pub(super) fn new(walk_root: &Path) -> Self {
-        Self { entries: vec![AncestorEntry { path: walk_root.to_path_buf(), handle: None }] }
+    pub(super) fn new(walk_root: PathBuf) -> Self {
+        Self { entries: vec![AncestorEntry { path: walk_root, handle: None }] }
     }
 
     pub(super) fn push_literal(&mut self, path: PathBuf) {

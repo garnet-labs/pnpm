@@ -1,10 +1,18 @@
 use std::path::Path;
 
 use super::{
-    CatalogAnchor, CatalogResolution, CatalogResolutionError, CatalogResolutionFound,
-    CatalogResolutionResult, WantedDependency, resolve_from_catalog,
+    CatalogAnchor,
+    CatalogResolution,
+    CatalogResolutionError,
+    CatalogResolutionFound,
+    CatalogResolutionResult,
+    WantedDependency,
+    resolve_from_catalog,
 };
-use pnpm_catalogs_types::{Catalog, Catalogs};
+use pnpm_catalogs_types::{
+    Catalog,
+    Catalogs,
+};
 
 fn catalogs_from(entries: &[(&str, &[(&str, &str)])]) -> Catalogs {
     entries
@@ -169,6 +177,19 @@ fn reanchors_a_file_entry_on_the_consuming_project() {
 #[test]
 fn reanchors_a_link_entry_on_the_consuming_project() {
     assert_eq!(reanchored("link:libs/bar", Some("packages/foo")), "link:../../libs/bar");
+}
+
+#[test]
+fn reanchors_a_workspace_path_entry_on_the_consuming_project() {
+    assert_eq!(
+        reanchored("workspace:./packages/bar", Some("apps/deep/foo")),
+        "workspace:../../../packages/bar",
+    );
+}
+
+#[test]
+fn keeps_a_workspace_path_entry_relative_for_a_consumer_outside_the_workspace() {
+    assert_eq!(reanchored("workspace:./packages/bar", None), "workspace:./packages/bar");
 }
 
 #[test]

@@ -1,9 +1,15 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 fn write_manifest(workspace: &Path, manifest: &serde_json::Value) {
@@ -14,7 +20,7 @@ fn write_manifest(workspace: &Path, manifest: &serde_json::Value) {
 /// (`packages/first`, `packages/second`) that both depend on `pkg`, plus a
 /// `link:` override redirecting `pkg` to a local directory. Returns the two
 /// project dirs. Callers run `unlink` *before* any install, so the link is
-/// stripped and never materialized — the reinstall re-resolves `pkg` from the
+/// stripped and never materialized, the reinstall re-resolves `pkg` from the
 /// registry.
 fn scaffold_dedicated_link_workspace(workspace: &Path, pkg: &str) -> (PathBuf, PathBuf) {
     let local_target = workspace.join("local-dep");
@@ -261,7 +267,7 @@ fn dislink_alias_works() {
 /// End-to-end: a `link:` override redirects a registry dependency to a local
 /// directory, so installing produces a symlink in `node_modules` and a
 /// `link:` resolution in the lockfile. After `unlink`, the override is gone
-/// and the reinstall re-resolves the dependency from the registry — the
+/// and the reinstall re-resolves the dependency from the registry, the
 /// lockfile records the registry version instead of the link.
 #[test]
 fn unlink_restores_registry_package_in_lockfile() {
@@ -302,12 +308,15 @@ fn unlink_restores_registry_package_in_lockfile() {
         .success();
     let installed = workspace.join("node_modules").join(PKG);
     assert!(
-        fs::symlink_metadata(&installed).is_ok_and(|meta| meta.file_type().is_symlink()),
+        fs::symlink_metadata(&installed)
+            .map(|meta| meta.file_type())
+            .is_ok_and(|file_type| file_type.is_symlink()),
         "the link override should make node_modules/{PKG} a symlink before unlink",
     );
 
-    let mut unlink = std::process::Command::cargo_bin("pnpm").expect("locate pacquet binary");
-    unlink.current_dir(&workspace);
+    let unlink = std::process::Command::cargo_bin("pnpm")
+        .expect("locate pacquet binary")
+        .with_current_dir(&workspace);
     unlink
         .with_args(["unlink", PKG])
         .assert()
@@ -347,8 +356,9 @@ fn recursive_unlink_with_dedicated_lockfiles_reinstalls_each_project() {
     const PKG: &str = "@pnpm.e2e/dep-of-pkg-with-1-dep";
     let (first, second) = scaffold_dedicated_link_workspace(&workspace, PKG);
 
-    let mut unlink = std::process::Command::cargo_bin("pnpm").expect("locate pacquet binary");
-    unlink.current_dir(&workspace);
+    let unlink = std::process::Command::cargo_bin("pnpm")
+        .expect("locate pacquet binary")
+        .with_current_dir(&workspace);
     unlink
         .with_args(["-r", "unlink", PKG])
         .assert()
@@ -382,7 +392,7 @@ fn recursive_unlink_with_dedicated_lockfiles_reinstalls_each_project() {
 }
 
 /// `pnpm --filter <project> unlink` strips the override and reinstalls only the
-/// selected project — the unselected project's dedicated lockfile is never
+/// selected project, the unselected project's dedicated lockfile is never
 /// created.
 #[test]
 fn filtered_unlink_with_dedicated_lockfiles_reinstalls_only_selected_project() {
@@ -393,8 +403,9 @@ fn filtered_unlink_with_dedicated_lockfiles_reinstalls_only_selected_project() {
     const PKG: &str = "@pnpm.e2e/dep-of-pkg-with-1-dep";
     let (first, second) = scaffold_dedicated_link_workspace(&workspace, PKG);
 
-    let mut unlink = std::process::Command::cargo_bin("pnpm").expect("locate pacquet binary");
-    unlink.current_dir(&workspace);
+    let unlink = std::process::Command::cargo_bin("pnpm")
+        .expect("locate pacquet binary")
+        .with_current_dir(&workspace);
     unlink
         .with_args(["--filter", "first", "unlink", PKG])
         .assert()
@@ -430,8 +441,9 @@ fn write_local_package(workspace: &Path, dir: &str, name: &str) {
 }
 
 fn run_pnpm(workspace: &Path, args: &[&str]) {
-    let mut command = std::process::Command::cargo_bin("pnpm").expect("locate pacquet binary");
-    command.current_dir(workspace);
+    let command = std::process::Command::cargo_bin("pnpm")
+        .expect("locate pacquet binary")
+        .with_current_dir(workspace);
     command
         .with_args(args)
         .assert()
@@ -570,8 +582,9 @@ fn failed_selection_keeps_link_override() {
     fs::create_dir_all(&member).expect("create member dir");
     write_manifest(&member, &serde_json::json!({ "name": "app", "version": "1.0.0" }));
 
-    let mut unlink = std::process::Command::cargo_bin("pnpm").expect("locate pacquet binary");
-    unlink.current_dir(&workspace);
+    let unlink = std::process::Command::cargo_bin("pnpm")
+        .expect("locate pacquet binary")
+        .with_current_dir(&workspace);
     unlink
         .with_args(["--filter", "missing", "--fail-if-no-match", "unlink"])
         .assert()
@@ -618,6 +631,170 @@ fn filtered_unlink_keeps_link_dependency_of_unselected_project() {
 
     assert_eq!(read_manifest(&workspace), root_manifest);
     assert_eq!(read_manifest(&member), serde_json::json!({ "name": "app", "version": "1.0.0" }));
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn unlink_reverts_a_hard_link() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_manifest(&workspace, &serde_json::json!({ "name": "test-project", "version": "1.0.0" }));
+    write_local_package(&workspace, "linked-foo", "linked-foo");
+
+    run_pnpm(&workspace, &["link", "--hard", "./linked-foo"]);
+    assert!(workspace.join("node_modules/linked-foo").exists(), "link must install linked-foo");
+
+    run_pnpm(&workspace, &["unlink", "linked-foo"]);
+
+    assert_eq!(
+        read_manifest(&workspace),
+        serde_json::json!({ "name": "test-project", "version": "1.0.0" }),
+    );
+    let workspace_yaml = read_workspace_yaml(&workspace);
+    assert!(!workspace_yaml.contains("linked-foo"), "override must be removed: {workspace_yaml}");
+    assert!(
+        fs::symlink_metadata(workspace.join("node_modules/linked-foo")).is_err(),
+        "linked-foo must be removed from node_modules",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// The directory a hard link pointed at may be gone by the time the user
+/// unlinks it. The override is still removed.
+#[test]
+fn unlink_removes_file_override_to_a_missing_directory() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_manifest(&workspace, &serde_json::json!({ "name": "test-project", "version": "1.0.0" }));
+    add_overrides(&workspace, "overrides:\n  foo: file:../missing-foo\n  baz: 1.0.0\n");
+
+    pacquet
+        .with_args(["unlink", "foo"])
+        .assert()
+        .success();
+
+    let workspace_yaml = read_workspace_yaml(&workspace);
+    assert!(!workspace_yaml.contains("foo"), "foo override must be removed: {workspace_yaml}");
+    assert!(
+        workspace_yaml.contains("baz: 1.0.0"),
+        "non-link override must remain: {workspace_yaml}",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn unlink_keeps_file_tarball_overrides() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_manifest(&workspace, &serde_json::json!({ "name": "test-project", "version": "1.0.0" }));
+    add_overrides(
+        &workspace,
+        "overrides:\n  foo: link:../foo\n  bar: file:../bar.tgz\n  qux: file:../qux.tar.gz\n",
+    );
+
+    pacquet
+        .with_arg("unlink")
+        .assert()
+        .success();
+
+    let workspace_yaml = read_workspace_yaml(&workspace);
+    assert!(!workspace_yaml.contains("foo"), "foo override must be removed: {workspace_yaml}");
+    assert!(
+        workspace_yaml.contains("bar: file:../bar.tgz"),
+        "tarball override must remain: {workspace_yaml}",
+    );
+    assert!(
+        workspace_yaml.contains("qux: file:../qux.tar.gz"),
+        "tarball override must remain: {workspace_yaml}",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// `pnpm link` without `--hard` keeps a dependency that is already declared
+/// and only adds a `link:` override. Unlinking must keep that `file:`
+/// dependency, although it points at the same directory.
+#[test]
+fn unlink_keeps_file_dependency_replaced_by_a_link_override() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_local_package(&workspace, "linked-foo", "linked-foo");
+    let manifest = serde_json::json!({
+        "name": "test-project",
+        "version": "1.0.0",
+        "dependencies": { "linked-foo": "file:linked-foo" },
+    });
+    write_manifest(&workspace, &manifest);
+
+    run_pnpm(&workspace, &["link", "./linked-foo"]);
+    assert!(
+        read_workspace_yaml(&workspace).contains("linked-foo: link:linked-foo"),
+        "link must add a link: override",
+    );
+
+    run_pnpm(&workspace, &["unlink", "linked-foo"]);
+
+    assert_eq!(read_manifest(&workspace), manifest);
+    assert!(!read_workspace_yaml(&workspace).contains("link:"), "override must be removed");
+
+    drop((root, mock_instance));
+}
+
+/// The override and the dependency name the same directory in different
+/// forms, one through `~/`. `unlink` resolves both the way the installer does
+/// and drops the dependency.
+#[test]
+#[cfg_attr(not(unix), ignore = "sets HOME, which the home directory lookup reads only on Unix")]
+fn unlink_matches_equivalent_file_specifiers() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_local_package(&workspace, "linked-foo", "linked-foo");
+    let absolute = workspace.join("linked-foo");
+    write_manifest(
+        &workspace,
+        &serde_json::json!({
+            "name": "test-project",
+            "version": "1.0.0",
+            "dependencies": { "linked-foo": format!("file:{}", absolute.display()) },
+        }),
+    );
+    add_overrides(&workspace, "overrides:\n  linked-foo: file:~/linked-foo\n");
+
+    std::process::Command::cargo_bin("pnpm")
+        .expect("locate pacquet binary")
+        .with_current_dir(&workspace)
+        .with_env("HOME", &workspace)
+        .with_args(["unlink", "linked-foo"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_manifest(&workspace),
+        serde_json::json!({ "name": "test-project", "version": "1.0.0" }),
+    );
 
     drop((root, mock_instance));
 }

@@ -1,7 +1,7 @@
 //! The Cargo registry surface.
 //!
-//! Two URL families make up a Cargo registry. The **sparse index** —
-//! `index/config.json` and one `index/<prefix>/<crate>` file per crate — is
+//! Two URL families make up a Cargo registry. The **sparse index**
+//! (`index/config.json` and one `index/<prefix>/<crate>` file per crate) is
 //! what `cargo` resolves from; a hosted crate's file is rendered from its
 //! stored [`CrateDocument`], an upstream's is proxied through the cache
 //! unchanged (index files carry no URLs; the `config.json` pnpr serves points
@@ -13,48 +13,136 @@
 //!
 //! In a multi-ecosystem registry, both families answer under `/cargo/` (the
 //! default target) and `/cargo/~<name>/` (a named registry). A Cargo-only
-//! registry omits `/cargo`. Crate names are case-insensitive:
-//! the index path `cargo` requests is lowercase, so hosted documents and cache
-//! entries are keyed by the lowercase name while archives keep the name as
-//! published.
+//! registry omits `/cargo`. Crate keys fold ASCII case and map `_` to `-`;
+//! archives and index entries keep the published name.
 
-pub(super) use publication::{CratePublication, authorize_crate_publish, verify_crate_archive};
+pub(super) use publication::{
+    CratePublication,
+    authorize_crate_publish,
+    verify_crate_archive,
+};
 
+mod owners;
 mod publication;
-use publication::{delete_yank, put_publish, put_unyank};
+use owners::{
+    delete_owners,
+    get_owners,
+    put_owners,
+};
+use publication::{
+    delete_yank,
+    put_publish,
+    put_unyank,
+};
 
 use super::{
-    Action, AppState, AuthedCaller, DiscoverySource, RegistrySource, SearchPage, TargetRegistry,
-    authorize, discovery_sources,
-    documents::{read_hosted_document, stage_hosted_artifact, store_hosted_artifact},
-    ecosystem::{
-        UpstreamDocument, addressed_registry, caller_scoped, is_fetchable_artifact_url,
-        load_upstream_document, mount_bases, registry_endpoint, registry_requires_auth,
-        serve_hosted_blob, serve_upstream_artifact, sha256_hex, sha256_integrity, upstream_for,
+    Action,
+    AppState,
+    AuthedCaller,
+    DiscoverySource,
+    Ownership,
+    RegistrySource,
+    SearchPage,
+    TargetRegistry,
+    authorize_package,
+    authorize_with_ownership,
+    conditional_requests::is_not_modified,
+    discovery_sources,
+    documents::{
+        lookup_in_hosted_document,
+        read_hosted_document,
+        stage_hosted_artifact,
+        store_hosted_artifact,
     },
-    hosted_search_names, json_response, not_found, private_no_cache,
-    publishing::{PublishTarget, StagedPublish, resolve_publish_target_for},
-    resolve_ecosystem_source, resolve_write_target_for,
+    ecosystem::{
+        UpstreamDocument,
+        addressed_registry,
+        caller_scoped,
+        is_fetchable_artifact_url,
+        load_upstream_document,
+        mount_bases,
+        registry_endpoint,
+        registry_requires_auth,
+        serve_hosted_blob,
+        serve_upstream_artifact,
+        sha256_hex,
+        sha256_integrity,
+        upstream_for,
+    },
+    hosted_search_names,
+    json_response,
+    not_found,
+    package_owners::MAX_OWNER_BODY_BYTES,
+    private_no_cache,
+    publishing::{
+        PublishTarget,
+        StagedPublish,
+        resolve_publish_target_for,
+    },
+    resolve_ecosystem_source,
+    resolve_write_target_for,
 };
 use axum::{
     Router,
-    body::{Body, Bytes},
-    extract::{Path, RawQuery, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::{delete, get, put},
+    body::{
+        Body,
+        Bytes,
+    },
+    extract::{
+        DefaultBodyLimit,
+        Path,
+        RawQuery,
+        State,
+    },
+    http::{
+        HeaderMap,
+        StatusCode,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
+    routing::{
+        delete,
+        get,
+        put,
+    },
 };
 use pnpr_cargo::{
-    CrateDocument, IndexConfig, IndexEntry, PublishMetadata, SearchCrate, SearchMeta,
-    SearchResponse, bounded_description, crate_filename, download_url, errors_json, ok_json,
-    parse_index, parse_publish_body, publish_ok_json, sparse_index_path, validate_crate_archive,
+    CrateDocument,
+    IndexConfig,
+    IndexEntry,
+    PublishMetadata,
+    SearchCrate,
+    SearchMeta,
+    SearchResponse,
+    bounded_description,
+    crate_filename,
+    download_url,
+    errors_json,
+    ok_json,
+    parse_index,
+    parse_publish_body,
+    publish_ok_json,
+    sparse_index_path,
+    validate_crate_archive,
 };
 use pnpr_error::RegistryError;
-use pnpr_package_name::{CanonicalPackageName, is_safe_path_segment};
+use pnpr_package_name::{
+    CanonicalPackageName,
+    is_safe_path_segment,
+};
 use pnpr_policy::Identity;
 use pnpr_registry::Ecosystem;
-use pnpr_storage::{DOCUMENT_WRITE_RETRIES, DocumentUpdate};
-use std::{collections::HashMap, fmt::Display};
+use pnpr_storage::{
+    DOCUMENT_WRITE_RETRIES,
+    DocumentUpdate,
+};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+};
 
 const ECOSYSTEM: Ecosystem = Ecosystem::Cargo;
 /// The largest sparse-index file accepted from an upstream.
@@ -64,15 +152,30 @@ const INDEX_CONFIG_LIMIT: usize = 64 * 1024;
 /// `.`, so it can never collide with a crate's own entry.
 const INDEX_CONFIG_KEY: &str = "config.json";
 
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn resolver_routes() -> Router<AppState> {
     let mut router = Router::new();
     for base in mount_bases(ECOSYSTEM) {
         router = router
-            .route(&format!("{base}/index/config.json"), get(get_index_config))
             .route(&format!("{base}/index/{{a}}/{{b}}"), get(get_index_file))
-            .route(&format!("{base}/index/{{a}}/{{b}}/{{c}}"), get(get_index_file))
+            .route(&format!("{base}/index/{{a}}/{{b}}/{{c}}"), get(get_index_file));
+    }
+    router
+}
+
+pub(super) fn routes() -> Router<AppState> {
+    let mut router = resolver_routes();
+    for base in mount_bases(ECOSYSTEM) {
+        router = router
+            .route(&format!("{base}/index/config.json"), get(get_index_config))
             .route(&format!("{base}/api/v1/crates"), get(get_search))
             .route(&format!("{base}/api/v1/crates/new"), put(put_publish))
+            .route(
+                &format!("{base}/api/v1/crates/{{name}}/owners"),
+                get(get_owners)
+                    .put(put_owners)
+                    .delete(delete_owners)
+                    .layer(DefaultBodyLimit::max(MAX_OWNER_BODY_BYTES)),
+            )
             .route(
                 &format!("{base}/api/v1/crates/{{name}}/{{version}}/download"),
                 get(get_download),
@@ -87,7 +190,7 @@ pub(super) fn routes() -> Router<AppState> {
 /// when a request names none.
 const DEFAULT_SEARCH_PAGE: usize = 10;
 
-/// `GET api/v1/crates?q=<query>&per_page=<n>&page=<n>` — `cargo search`.
+/// `GET api/v1/crates?q=<query>&per_page=<n>&page=<n>`: `cargo search`.
 ///
 /// Hosted sources only. An upstream contributes nothing, the way an npm
 /// upstream does until its `search` is turned on, and searching one needs
@@ -106,7 +209,9 @@ async fn get_search(
                 .expect("search response serializes"),
         )
     };
-    let Some(text) = pnpr_search::parse_query(&query_string).map(pnpr_search::SearchText::Package)
+    let Some(text) = pnpr_search::parse_query(&query_string)
+        .map(|query| query.replace('_', "-"))
+        .map(pnpr_search::SearchText::Package)
     else {
         return respond(Vec::new(), 0);
     };
@@ -117,7 +222,8 @@ async fn get_search(
         .map_or(DEFAULT_SEARCH_PAGE, |size| size.clamp(1, pnpr_search::MAX_PAGE_SIZE));
     // crates.io numbers pages from one; anything lower starts at the first.
     let from = pnpr_search::parse_usize_param(&query_string, "page")
-        .map_or(0, |page| page.saturating_sub(1).saturating_mul(size));
+        .map(|page| page.saturating_sub(1))
+        .map_or(0, |saturating_sub| saturating_sub.saturating_mul(size));
 
     let mut page = SearchPage::new(from, size);
     if let Err(err) = collect_hosted_crates(&state, &identity, &target, &text, &mut page).await {
@@ -159,9 +265,10 @@ async fn add_crates_to_page(
     names: Vec<String>,
 ) {
     for name in names {
-        let Ok(key) = CanonicalPackageName::parse(&name, ECOSYSTEM) else {
+        if !is_safe_path_segment(&name) {
             continue;
-        };
+        }
+        let key = CanonicalPackageName::from_stored(&name, ECOSYSTEM);
         if page.push_name(&name) {
             page.objects.push(search_crate(storage, &key).await);
         }
@@ -191,8 +298,12 @@ async fn search_crate(storage: &pnpr_storage::Storage, key: &CanonicalPackageNam
 /// detail instead of a bare status.
 fn error_response(err: RegistryError) -> Response {
     let detail = err.public_message();
-    let status = err.into_response().status();
-    json_response(status, &errors_json(&detail))
+    let original = err.into_response();
+    let mut response = json_response(original.status(), &errors_json(&detail));
+    if let Some(retry_after) = original.headers().get(header::RETRY_AFTER) {
+        response.headers_mut().insert(header::RETRY_AFTER, retry_after.clone());
+    }
+    response
 }
 
 fn bad_request(reason: impl Display) -> Response {
@@ -218,11 +329,18 @@ async fn get_index_config(
     caller_scoped(&state, ECOSYSTEM, registry.as_deref(), None, response)
 }
 
-fn index_response(text: String) -> Response {
+fn index_response(text: String, headers: &HeaderMap) -> Response {
+    let etag = format!(r#""{}""#, sha256_hex(text.as_bytes()));
+    let (status, body) = if is_not_modified(headers, &etag, None) {
+        (StatusCode::NOT_MODIFIED, Body::empty())
+    } else {
+        (StatusCode::OK, Body::from(text))
+    };
     Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
+        .header(header::ETAG, etag)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(text))
+        .body(body)
         .expect("static-shape response always builds")
 }
 
@@ -233,6 +351,7 @@ async fn get_index_file(
     AuthedCaller(identity): AuthedCaller,
     TargetRegistry(registry): TargetRegistry,
     Path(params): Path<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
     let segments: Vec<&str> = ["a", "b", "c"]
         .iter()
@@ -259,7 +378,7 @@ async fn get_index_file(
         RegistrySource::Unclaimed | RegistrySource::NotFound => Ok(None),
     };
     let response = match index {
-        Ok(Some(text)) => index_response(text),
+        Ok(Some(text)) => index_response(text, &headers),
         Ok(None) => not_found(),
         Err(err) => error_response(err),
     };
@@ -274,9 +393,16 @@ async fn load_upstream_index(
     path: &str,
 ) -> Result<Option<String>, RegistryError> {
     let (upstream, namespace) = upstream_for(state, identity, source, key)?;
-    let request =
-        UpstreamDocument { name: key, relative_path: path, accept: None, limit: INDEX_FILE_LIMIT };
-    let bytes = load_upstream_document(state, upstream, &namespace, request, |document| {
+    // Sparse-index paths distinguish separator aliases even when claims share a key.
+    let index_name = path.rsplit('/').next().unwrap_or(path);
+    let cache_key = CanonicalPackageName::from_stored(index_name, ECOSYSTEM);
+    let request = UpstreamDocument {
+        name: &cache_key,
+        relative_path: path,
+        accept: None,
+        limit: INDEX_FILE_LIMIT,
+    };
+    let bytes = load_upstream_document(state, &upstream, &namespace, request, |document| {
         decode_index_text(document.bytes, path).map(String::into_bytes)
     })
     .await?;
@@ -329,11 +455,14 @@ async fn download_hosted_crate(
     key: &CanonicalPackageName,
     version: &str,
 ) -> Result<Response, RegistryError> {
-    let document = read_hosted_document::<CrateDocument>(state, identity, source, key)
+    let requested = version.to_string();
+    let filename =
+        lookup_in_hosted_document(state, identity, source, key, move |document: &CrateDocument| {
+            document.version(&requested).map(|entry| crate_filename(&entry.name, &entry.vers))
+        })
         .await?
+        .found()
         .ok_or(RegistryError::NotFound)?;
-    let entry = document.version(version).ok_or(RegistryError::NotFound)?;
-    let filename = crate_filename(&entry.name, &entry.vers);
     serve_hosted_blob(state, identity, source, key, &filename).await
 }
 
@@ -364,7 +493,8 @@ async fn download_via_upstream(
     };
     let Some(entry) = entries
         .iter()
-        .find(|entry| entry.vers == version && entry.name.eq_ignore_ascii_case(name))
+        .filter(|entry| entry.vers == version)
+        .find(|entry| entry.name.eq_ignore_ascii_case(name))
     else {
         return not_found();
     };
@@ -374,7 +504,7 @@ async fn download_via_upstream(
             reason: format!("index entry {name}@{version} has no SHA-256 checksum"),
         });
     };
-    let config = match upstream_index_config(state, upstream, &namespace).await {
+    let config = match upstream_index_config(state, &upstream, &namespace).await {
         Ok(config) => config,
         Err(err) => return error_response(err),
     };
@@ -386,7 +516,7 @@ async fn download_via_upstream(
         });
     }
     let filename = crate_filename(&entry.name, &entry.vers);
-    serve_upstream_artifact(state, upstream, &namespace, key, &filename, &url, &integrity).await
+    serve_upstream_artifact(state, &upstream, &namespace, key, &filename, &url, &integrity).await
 }
 
 /// The upstream sparse index's `config.json`, through the cache.
@@ -426,3 +556,6 @@ fn parse_upstream_index(index: &str, name: &str) -> Result<Vec<IndexEntry>, Regi
             reason: err.to_string(),
         })
 }
+
+#[cfg(test)]
+mod tests;

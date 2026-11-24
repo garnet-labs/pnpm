@@ -5,14 +5,20 @@
 //! Catalog protocol: when the override value uses the `catalog:` form
 //! it is resolved against the workspace's named catalogs before being
 //! stored on the parsed entry. Pass an empty
-//! [`Catalogs`] map when the caller has no catalogs configured — any
+//! [`Catalogs`] map when the caller has no catalogs configured, any
 //! `catalog:` value will then fall through to the missing-entry branch.
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use node_semver::Version;
 use pnpm_catalogs_resolver::{
-    CatalogAnchor, CatalogResolutionResult, WantedDependency, resolve_from_catalog,
+    CatalogAnchor,
+    CatalogResolutionResult,
+    WantedDependency,
+    resolve_from_catalog,
 };
 use pnpm_catalogs_types::Catalogs;
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
@@ -119,7 +125,7 @@ pub enum ParseOverridesError {
 ///
 /// Iteration follows the input map's iterator order. `HashMap` is
 /// unordered, so the returned `Vec` is *not* guaranteed to match
-/// the input's insertion order — for that, use
+/// the input's insertion order, for that, use
 /// [`parse_overrides_iter`] with an ordered map (e.g. `IndexMap`)
 /// or pre-sort by key.
 pub fn parse_overrides(
@@ -146,7 +152,7 @@ where
         let trimmed_selector = selector.trim();
         let (parent_pkg, target_pkg) = parse_pkg_and_parent_selector(trimmed_selector)?;
         let resolved_specifier =
-            resolve_catalog_in_value(catalogs, &target_pkg.name, new_bare_specifier)?;
+            resolve_catalog_in_value(catalogs, target_pkg.name.clone(), new_bare_specifier)?;
         let converge = check_converge(
             trimmed_selector,
             parent_pkg.as_ref(),
@@ -185,13 +191,20 @@ pub fn parse_pkg_and_parent_selector(
     selector: &str,
 ) -> Result<(Option<PackageSelector>, PackageSelector), ParseOverridesError> {
     let trimmed_selector = selector.trim();
-    if let Some(delimiter_idx) = find_parent_delimiter(trimmed_selector) {
-        let parent_selector = &trimmed_selector[..delimiter_idx];
-        let child_selector = &trimmed_selector[delimiter_idx + 1..];
+    if let Some((parent_selector, child_selector)) = split_parent_selector(trimmed_selector) {
         Ok((Some(parse_parent_selector(parent_selector)?), parse_target_selector(child_selector)?))
     } else {
         Ok((None, parse_target_selector(trimmed_selector)?))
     }
+}
+
+/// Split a `parent>child` selector at its delimiter, so a `>` inside the
+/// parent's range, as in `parent@>=1.0.0>child`, stays part of the parent.
+/// Returns `None` for a selector without a parent.
+#[must_use]
+pub fn split_parent_selector(selector: &str) -> Option<(&str, &str)> {
+    let delimiter_idx = find_parent_delimiter(selector)?;
+    Some((&selector[..delimiter_idx], &selector[delimiter_idx + 1..]))
 }
 
 /// Position of the `>` byte that separates parent from child, when
@@ -298,13 +311,11 @@ fn strip_dep_type(selector: &str) -> (&str, Option<OverrideDependencyType>) {
 /// re-anchoring here would move the path twice.
 fn resolve_catalog_in_value(
     catalogs: &Catalogs,
-    target_name: &str,
+    target_name: String,
     new_bare_specifier: &str,
 ) -> Result<String, ParseOverridesError> {
-    let wanted = WantedDependency {
-        alias: target_name.to_string(),
-        bare_specifier: new_bare_specifier.to_string(),
-    };
+    let wanted =
+        WantedDependency { alias: target_name, bare_specifier: new_bare_specifier.to_string() };
     match resolve_from_catalog(catalogs, &wanted, CatalogAnchor::AsWritten) {
         CatalogResolutionResult::Found(found) => Ok(found.resolution.specifier),
         CatalogResolutionResult::Unused => Ok(new_bare_specifier.to_string()),

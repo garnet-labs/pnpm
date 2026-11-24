@@ -9,28 +9,56 @@
 
 use super::{
     super::reporter::EventFilter,
-    GlobalInstallTarget, check_bin_dir, global_dirs,
-    selectors::{is_pnpm_cli_dependency, resolve_local_param},
+    GlobalInstallTarget,
+    check_bin_dir,
+    global_dirs,
+    selectors::{
+        is_pnpm_cli_dependency,
+        resolve_local_param,
+    },
     warn_global,
 };
-use miette::{Context, IntoDiagnostic};
-use pnpm_config::{Config, Host, default_pnpm_home_dir};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
+use pnpm_config::{
+    Config,
+    Host,
+    default_pnpm_home_dir,
+};
 use pnpm_fs::{
-    is_subdir, lexical_normalize, realpath_missing, remove_dir_all_with_retry,
+    is_subdir,
+    lexical_normalize,
+    realpath_missing,
+    remove_dir_all_with_retry,
     remove_file_with_retry,
 };
 use pnpm_global::{
-    GlobalPackageInfo, clean_orphaned_install_dirs, get_global_package_details, get_installed_bins,
-    read_direct_dependencies, scan_global_packages,
+    GlobalPackageInfo,
+    clean_orphaned_install_dirs,
+    get_global_package_details,
+    get_installed_bins,
+    read_direct_dependencies,
+    scan_global_packages,
 };
 use pnpm_package_is_installable::SupportedArchitectures;
 use pnpm_package_manifest::safe_read_package_json_from_dir;
 use pnpm_registry::RangeSpecStyle;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
 use std::{
     collections::BTreeSet,
-    fs, io,
-    path::{Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 const LEGACY_GLOBAL_LAYOUT: &str = "5";
@@ -77,7 +105,9 @@ impl CurrentGroups {
             .collect();
         let materialized = groups
             .iter()
-            .flat_map(|pkg| get_global_package_details(pkg).into_iter().map(|pkg| pkg.alias))
+            .map(get_global_package_details)
+            .map(std::iter::IntoIterator::into_iter)
+            .flat_map(|global_package_details| global_package_details.map(|pkg| pkg.alias))
             .collect();
         Ok(Self { declared, materialized })
     }
@@ -142,7 +172,7 @@ impl LegacyGlobalLayout {
     fn remove<Reporter: self::Reporter>(self) -> miette::Result<()> {
         if !self.remove_home_bins::<Reporter>() {
             let dir = self.dir.display();
-            warn_global::<Reporter>(&format!(
+            warn_global::<Reporter>(format!(
                 "Kept {dir} because a bin pnpm 10 linked into the pnpm home could not be removed. \
                  The next \"pnpm update -g\" retries.",
             ));
@@ -151,7 +181,7 @@ impl LegacyGlobalLayout {
         remove_dir_all_with_retry(&self.dir)
             .into_diagnostic()
             .wrap_err_with(|| format!("remove {}", self.dir.display()))?;
-        info_global::<Reporter>(&format!("Removed {}", self.dir.display()));
+        info_global::<Reporter>(format!("Removed {}", self.dir.display()));
         Ok(())
     }
 
@@ -167,7 +197,7 @@ impl LegacyGlobalLayout {
             Ok(files) => files,
             Err(error) => {
                 let dir = self.dir.display();
-                warn_global::<Reporter>(&format!(
+                warn_global::<Reporter>(format!(
                     "Failed to read the bins linked from {dir}: {error}",
                 ));
                 return false;
@@ -178,7 +208,7 @@ impl LegacyGlobalLayout {
             if let Err(error) = remove_file_with_retry(&file) {
                 every_bin_removed = false;
                 let file = file.display();
-                warn_global::<Reporter>(&format!("Failed to remove {file}: {error}"));
+                warn_global::<Reporter>(format!("Failed to remove {file}: {error}"));
             }
         }
         every_bin_removed
@@ -346,13 +376,13 @@ fn warn_legacy_kept<Reporter: self::Reporter>(
 ) {
     let dir = legacy_dir.display();
     if !every_package_migrated {
-        warn_global::<Reporter>(&format!(
+        warn_global::<Reporter>(format!(
             "Kept {dir} for the packages that failed to migrate. \
              The next \"pnpm update -g\" retries them; delete the directory to skip them.",
         ));
         return;
     }
-    warn_global::<Reporter>(&format!(
+    warn_global::<Reporter>(format!(
         "Kept {dir} until {} are installed again: a current global package declares them \
          without their files. \"pnpm update -g\" restores a global package that lost all of \
          its files; otherwise remove it with \"pnpm remove -g\". The next \"pnpm update -g\" \
@@ -380,7 +410,7 @@ impl GlobalInstallTarget<'_> {
             .iter()
             .map(|to_migrate| to_migrate.alias.as_str())
             .collect();
-        info_global::<Reporter>(&format!(
+        info_global::<Reporter>(format!(
             "Migrating global packages from {dir}: {}",
             aliases.join(", "),
         ));
@@ -415,14 +445,11 @@ fn warn_migration_failure<Reporter: self::Reporter>(
         .collect::<Vec<_>>()
         .join(": ");
     let dir = legacy_dir.display();
-    warn_global::<Reporter>(&format!("Failed to migrate {alias} from {dir}: {cause}"));
+    warn_global::<Reporter>(format!("Failed to migrate {alias} from {dir}: {cause}"));
 }
 
-fn info_global<Reporter: self::Reporter>(message: &str) {
-    Reporter::emit(&LogEvent::Global(GlobalLog {
-        level: LogLevel::Info,
-        message: message.to_string(),
-    }));
+fn info_global<Reporter: self::Reporter>(message: String) {
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Info, message }));
 }
 
 #[cfg(test)]

@@ -1,25 +1,48 @@
 use crate::{
     base_project::GraphProject,
-    graph::{ProjectGraph, ProjectGraphNode},
+    dependency_rewriter::DependencyRewriter,
+    graph::{
+        ProjectGraph,
+        ProjectGraphNode,
+    },
 };
 use indexmap::IndexMap;
-use node_semver::{Range, Version};
+use node_semver::Version;
 use pnpm_catalogs_protocol_parser::parse_catalog_protocol;
 use pnpm_catalogs_resolver::{
-    CatalogAnchor, CatalogResolutionResult, WantedDependency, resolve_from_catalog,
+    CatalogAnchor,
+    CatalogResolutionResult,
+    WantedDependency,
+    resolve_from_catalog,
 };
 use pnpm_catalogs_types::Catalogs;
 use pnpm_fs::lexical_normalize;
-use pnpm_workspace_range_resolver::resolve_workspace_range;
+use pnpm_semver_include_prerelease::is_valid_semver_range;
+use pnpm_workspace_range_resolver::{
+    matches_any_workspace_version,
+    resolve_workspace_range,
+};
 use pnpm_workspace_spec::WorkspaceSpec;
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    fmt,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
+/// The workspace's catalogs, and the directory their relative paths are
+/// measured from.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceCatalogs<'a> {
+    pub catalogs: &'a Catalogs,
+    pub workspace_dir: &'a Path,
+}
+
 /// Options for [`create_projects_graph()`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct CreateProjectsGraphOptions<'a> {
     /// Exclude `devDependencies` from edge computation. Set when building
     /// the `--filter-prod` graph so dependency walks follow production
@@ -31,14 +54,22 @@ pub struct CreateProjectsGraphOptions<'a> {
     /// The catalogs a `catalog:` specifier resolves through. Without
     /// them, a `catalog:` dependency adds no edge.
     pub catalogs: Option<WorkspaceCatalogs<'a>>,
+    /// Applied to every project's dependencies before they are matched
+    /// against the siblings, so the edges follow what the install
+    /// resolves rather than what the manifests declare. See
+    /// [`DependencyRewriter`].
+    pub dependency_rewriter: Option<&'a dyn DependencyRewriter>,
 }
 
-/// The workspace's catalogs, and the directory their relative paths are
-/// measured from.
-#[derive(Debug, Clone, Copy)]
-pub struct WorkspaceCatalogs<'a> {
-    pub catalogs: &'a Catalogs,
-    pub workspace_dir: &'a Path,
+impl fmt::Debug for CreateProjectsGraphOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateProjectsGraphOptions")
+            .field("ignore_dev_deps", &self.ignore_dev_deps)
+            .field("link_workspace_packages", &self.link_workspace_packages)
+            .field("catalogs", &self.catalogs)
+            .field("dependency_rewriter", &self.dependency_rewriter.map(|_| ".."))
+            .finish()
+    }
 }
 
 /// A dependency that named a workspace sibling but whose version range
@@ -79,7 +110,7 @@ where
     Pkg: GraphProject,
 {
     let count = projects.len();
-    let fields = snapshot_project_fields(&projects, opts.ignore_dev_deps);
+    let fields = snapshot_project_fields(&projects, opts);
     let by_name = index_by_name(&fields.names);
     let by_dir = index_by_dir(&fields.node_keys);
     let lookups = Lookups {
@@ -114,28 +145,54 @@ struct ProjectFields {
     dependency_lists: Vec<Vec<(String, String)>>,
 }
 
-fn snapshot_project_fields<Pkg>(projects: &[Pkg], ignore_dev_deps: bool) -> ProjectFields
+fn snapshot_project_fields<Pkg>(
+    projects: &[Pkg],
+    opts: &CreateProjectsGraphOptions<'_>,
+) -> ProjectFields
 where
     Pkg: GraphProject,
 {
     ProjectFields {
         node_keys: projects
             .iter()
-            .map(|project| project.root_dir().to_path_buf())
+            .map(super::base_project::BaseProject::root_dir)
+            .map(Path::to_path_buf)
             .collect(),
         names: projects
             .iter()
-            .map(|project| project.manifest_name().map(str::to_string))
+            .map(|project| project.manifest_name())
+            .map(|manifest_name| manifest_name.map(str::to_string))
             .collect(),
         versions: projects
             .iter()
-            .map(|project| project.manifest_version().map(str::to_string))
+            .map(|project| project.manifest_version())
+            .map(|manifest_version| manifest_version.map(str::to_string))
             .collect(),
         dependency_lists: projects
             .iter()
-            .map(|project| project.merged_dependencies(ignore_dev_deps))
+            .map(|project| project_dependencies(project, opts))
             .collect(),
     }
+}
+
+/// The `(name, raw_specifier)` pairs edge resolution reads for one project.
+///
+/// A [`DependencyRewriter`] sees the groups before the merge, so a rule
+/// scoped to one field or one declaration's range leaves that
+/// declaration's namesake in another group alone, exactly as resolution does.
+fn project_dependencies<Pkg>(
+    project: &Pkg,
+    opts: &CreateProjectsGraphOptions<'_>,
+) -> Vec<(String, String)>
+where
+    Pkg: GraphProject,
+{
+    let Some(rewriter) = opts.dependency_rewriter else {
+        return project.merged_dependencies(opts.ignore_dev_deps);
+    };
+    let mut groups = project.dependency_groups(opts.ignore_dev_deps);
+    rewriter.rewrite_dependencies(project, &mut groups);
+    groups.merge()
 }
 
 /// Each importer's edges resolve against the immutable lookup tables only,
@@ -220,7 +277,7 @@ enum SpecKind<'a> {
     Directory(&'a str),
     /// A semver version or range, matched by name + version.
     VersionOrRange,
-    /// Neither (tag, git URL, `npm:` alias, ...) — no edge.
+    /// Neither (tag, git URL, `npm:` alias, ...), no edge.
     Skip,
 }
 
@@ -239,7 +296,9 @@ fn resolve_edge(
         if let SpecKind::Directory(path) = classify(&spec.version) {
             return resolve_directory(importer, path, lookups);
         }
-        return resolve_by_name_version(name, &spec.version, true, lookups, unmatched);
+        let range =
+            if matches_any_workspace_version(&spec.version) { "*" } else { spec.version.as_str() };
+        return resolve_by_name_version(name, range, true, lookups, unmatched);
     }
 
     if let Some((name, selector)) = npm_alias_target(dep_name, raw_spec) {
@@ -270,14 +329,27 @@ fn resolve_edge(
 /// so a caller must not read a path-shaped selector as a directory.
 fn npm_alias_target<'a>(dep_name: &'a str, raw_spec: &'a str) -> Option<(&'a str, &'a str)> {
     let aliased = raw_spec.strip_prefix("npm:")?;
+    if !aliased.is_empty() && is_valid_semver_range(aliased) {
+        return Some((dep_name, aliased));
+    }
     Some(match aliased.rfind('@') {
-        Some(index) if index >= 1 => (&aliased[..index], &aliased[index + 1..]),
-        _ => (dep_name, aliased),
+        Some(index) if index >= 1 && index + 1 < aliased.len() => {
+            (&aliased[..index], &aliased[index + 1..])
+        }
+        Some(index) if index >= 1 => (&aliased[..index], "latest"),
+        _ => (aliased, "latest"),
     })
 }
 
 /// The catalog entry a `catalog:` specifier names, with a local path
 /// re-anchored from the workspace directory to the importer's.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`dep_name` is copied only for a `catalog:` specifier when catalogs exist, after the early returns, so an owned parameter would allocate for every dependency."
+    )
+)]
 fn resolve_catalog_spec(
     importer: usize,
     dep_name: &str,
@@ -317,7 +389,7 @@ fn resolve_by_name_version(
 ) -> Option<PathBuf> {
     let candidates = lookups.by_name.get(dep_name)?;
 
-    if lookups.link_workspace_packages == Some(false) && !is_workspace_spec {
+    if !lookups.link_workspace_packages.unwrap_or(true) && !is_workspace_spec {
         unmatched.push(Unmatched { pkg_name: dep_name.to_string(), range: raw_spec.to_string() });
         return None;
     }
@@ -376,7 +448,7 @@ fn classify(spec: &str) -> SpecKind<'_> {
     if is_path_like(spec) {
         return SpecKind::Directory(spec);
     }
-    if Version::parse(spec).is_ok() || Range::parse(spec).is_ok() {
+    if Version::parse(spec).is_ok() || is_valid_semver_range(spec) {
         return SpecKind::VersionOrRange;
     }
     SpecKind::Skip

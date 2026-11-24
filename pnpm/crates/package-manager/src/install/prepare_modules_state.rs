@@ -1,20 +1,38 @@
 mod up_to_date;
 use up_to_date::{
-    CarriedWorkspaceState, FrozenTreeUpToDate, UpToDateInstall, frozen_tree_up_to_date,
+    CarriedWorkspaceState,
+    FrozenTreeUpToDate,
+    UpToDateInstall,
+    frozen_tree_up_to_date,
     report_up_to_date,
 };
 
 mod purge;
 use purge::{
-    ExcludedGroupPrune, InconsistentModulesDir, prune_excluded_direct_deps,
+    ExcludedGroupPrune,
+    InconsistentModulesDir,
+    prune_excluded_direct_deps,
     purge_inconsistent_modules_dir,
 };
 
 use super::{
-    Config, Host, InstallError, Lockfile, Modules, NodeLinker, PackageManifest, PathBuf, Reporter,
-    WorkspaceState, modules_layout_consistent_with, tree_may_move,
+    Config,
+    Host,
+    InstallError,
+    Lockfile,
+    Modules,
+    NodeLinker,
+    PackageManifest,
+    PathBuf,
+    Reporter,
+    WorkspaceState,
+    modules_layout_consistent_with,
+    tree_may_move,
 };
-use crate::{install::state_options::RecordedWorkspace, install_state::recorded_elsewhere};
+use crate::{
+    install::state_options::RecordedWorkspace,
+    install_state::recorded_elsewhere,
+};
 use pnpm_workspace_state::load_workspace_state_in_modules;
 
 pub(super) struct PrepareModulesStateInputs<'a, 'install> {
@@ -64,7 +82,7 @@ pub(super) async fn prepare_modules_state<'install, Reporter: self::Reporter + '
         inputs.tree.config,
     )?;
     let drifted = modules_layout_drifted(modules_manifest, &inputs);
-    let is_inconsistent = prepare_modules_layout(&inputs, modules_manifest, drifted)?;
+    let is_inconsistent = prepare_modules_layout::<Reporter>(&inputs, modules_manifest, drifted)?;
 
     let recorded_state = load_recorded_workspace_state(&inputs);
     let recorded = recorded_workspace(
@@ -119,13 +137,13 @@ fn recorded_workspace<'a>(
 }
 
 /// Returns `is_inconsistent` as [`purge_inconsistent_modules_dir`] leaves it.
-fn prepare_modules_layout(
+fn prepare_modules_layout<Reporter: self::Reporter>(
     inputs: &PrepareModulesStateInputs<'_, '_>,
     modules_manifest: Option<&pnpm_modules_yaml::ModulesLayout>,
     is_inconsistent: bool,
 ) -> Result<bool, InstallError> {
     let is_inconsistent = if !inputs.resolve_only && is_inconsistent {
-        purge_inconsistent_modules_dir(&InconsistentModulesDir {
+        purge_inconsistent_modules_dir::<Reporter>(&InconsistentModulesDir {
             config: inputs.tree.config,
             workspace_root: inputs.tree.workspace_root,
             modules_manifest,
@@ -144,16 +162,18 @@ fn prepare_modules_layout(
             filtered_install: inputs.repeat.filtered,
         },
 
-        config: inputs.tree.config,
-        workspace_root: inputs.tree.workspace_root,
-        included: inputs.tree.included,
+        tree: inputs.tree,
         modules_manifest,
         current_lockfile: inputs.lockfiles.current,
         requested_importer_ids: inputs.lockfiles.importer_ids,
         manifest_links: purge::ManifestLinkProjects {
             manifests: inputs.projects.manifests,
-            workspace_links: inputs.projects.workspace_packages.map(|packages| {
-                crate::WorkspaceLinks { packages, catalogs: inputs.projects.catalogs }
+            workspace_links: Some(crate::WorkspaceLinks {
+                packages: inputs.projects.workspace_packages,
+                catalogs: inputs.projects.catalogs,
+                workspace_dir: inputs.tree.config.workspace_dir
+                    .as_deref()
+                    .unwrap_or(inputs.tree.workspace_root),
             }),
         },
     })?;
@@ -176,7 +196,7 @@ fn resync_agent_skills_when_up_to_date<Reporter: self::Reporter>(
     {
         return Ok(());
     }
-    let pending = crate::agent_skills::resync_agent_skills_at(
+    let pending = crate::agent_skills::resync_agent_skills_dep_paths_at(
         config,
         inputs.tree.workspace_root,
         inputs.lockfiles.current,
@@ -210,8 +230,11 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
         },
         verification: crate::install::state_options::LockfileVerificationInputs {
             verifiers: inputs.verification.verifiers,
-            path: inputs.verification.path,
+            source: inputs.verification.source,
+            local_policy: inputs.verification.local_policy,
             override_check: inputs.verification.override_check,
+            trust_lockfile: inputs.verification.trust_lockfile,
+            exotic_subdeps: inputs.verification.exotic_subdeps,
         },
         write: crate::install::state_options::LockfileWritePolicy {
             synthesized_from_current: inputs.write.synthesized_from_current,
@@ -266,8 +289,8 @@ mod tests;
 /// treat the materialized tree as stale.
 ///
 /// An unreadable state file fails the install rather than reading as layout
-/// drift: the drift path purges `node_modules` — the entries the user keeps
-/// there included — and relinks the whole tree, and it would do so on every
+/// drift: the drift path purges `node_modules` (the entries the user keeps
+/// there included) and relinks the whole tree, and it would do so on every
 /// run, because the manifest it rewrites is no more readable than the one it
 /// replaced. The TypeScript CLI's `readModulesManifest` rethrows everything
 /// but `ENOENT` for the same reason.

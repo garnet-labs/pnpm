@@ -1,8 +1,9 @@
 name: Release
 
 # The unified release workflow for every product in this repository: the
-# TypeScript pnpm CLI (v11), the Rust pnpm CLI + NAPI addon (v12), the
-# pnpr registry server, and the get-pnpm installer package. Versions are committed (bumped by `pnpm bump` via the
+# Rust pnpm CLI + NAPI addon, the pnpr registry server, and the get-pnpm
+# installer package. pnpm v11 releases from the release/11 branch, whose own
+# copy of this workflow a v11 tag runs. Versions are committed (bumped by `pnpm bump` via the
 # release PR that create-release-pr.yml opens); pushing a version tag runs the
 # `plan` job, which releases exactly the product whose committed version the
 # tag names, so tags pushed together release their products in parallel runs.
@@ -12,23 +13,16 @@ name: Release
 on:
   push:
     tags:
-      # pnpm (TypeScript, v11.x) and pacquet (v12.x) share the `v<version>`
-      # namespace that get.pnpm.io's install scripts fetch by. pnpr gets its own
+      # Every pnpm major shares the `v<version>` namespace that get.pnpm.io's
+      # install scripts fetch by. pnpr gets its own
       # Changesets-style `pnpr@<version>` namespace: pnpm's tag history includes
       # v0.x/v1.x that pnpr's low version numbers would otherwise collide with.
       - "v*.*.*"
       - "pnpr@*.*.*"
       # get-pnpm is versioned apart from pnpm, from 0.0.x.
       - "get-pnpm@*.*.*"
-  # Manual trigger for rerunning a tag release or verifying TypeScript release
-  # artifacts from a branch without publishing.
+  # Manual trigger for rerunning a tag release.
   workflow_dispatch:
-    inputs:
-      verify_ts_release:
-        description: Verify TypeScript release artifacts without publishing
-        required: false
-        type: boolean
-        default: false
 
 # A release PR that bumps several products is tagged per product by hand, with
 # a signed annotated tag pushed from a maintainer's machine (see RELEASING.md),
@@ -55,10 +49,7 @@ jobs:
             refs/tags/pnpr@*.*.*) ;;
             refs/tags/get-pnpm@*.*.*) ;;
             *)
-              if [ "${{ inputs.verify_ts_release }}" = "true" ]; then
-                exit 0
-              fi
-              echo "::error::The release workflow must run from a version tag like v11.9.0, pnpr@0.2.0, or get-pnpm@0.1.0. Current ref: ${GITHUB_REF}"
+              echo "::error::The release workflow must run from a version tag like v12.9.0, pnpr@0.2.0, or get-pnpm@0.1.0. Current ref: ${GITHUB_REF}"
               exit 1
               ;;
           esac
@@ -94,19 +85,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The verify_ts_release dispatch runs from a branch to inspect
-          # artifacts and never publishes, so there is no tag to verify. This is
-          # a step-level exit rather than a job-level `if` on purpose: a skipped
-          # job skips everything that `needs` it, which would take `plan` and
-          # the whole dispatch path down with it.
-          case "${GITHUB_REF}" in
-            refs/tags/*) ;;
-            *)
-              echo "$GITHUB_REF is not a tag; nothing to verify and nothing will publish."
-              exit 0
-              ;;
-          esac
-
           # An isolated keyring, so verification can only ever succeed against a
           # key committed to this repository — never one that happens to be on
           # the runner.
@@ -141,8 +119,6 @@ jobs:
     permissions:
       contents: read
     outputs:
-      ts: ${{ steps.decide.outputs.ts }}
-      ts_version: ${{ steps.decide.outputs.ts_version }}
       rust: ${{ steps.decide.outputs.rust }}
       rust_version: ${{ steps.decide.outputs.rust_version }}
       rust_tag: ${{ steps.decide.outputs.rust_tag }}
@@ -166,7 +142,7 @@ jobs:
         # treats only E404 as "not published"; any other npm failure aborts
         # the plan so a registry outage can't be misread as a pending release.
         # The gate packages are the ones each publish job publishes last
-        # (`pnpm` for both CLIs, `@pnpm/pnpr` for pnpr, `get-pnpm` for itself), so a rerun after a
+        # (`pnpm` for the CLI, `@pnpm/pnpr` for pnpr, `get-pnpm` for itself), so a rerun after a
         # partial failure resumes instead of skipping.
         run: |
           set -eu
@@ -180,21 +156,19 @@ jobs:
             esac
           }
 
-          TS_VERSION=$(jq -r .version pnpm11/pnpm/package.json)
           RUST_VERSION=$(jq -r .version pnpm/npm/pnpm/package.json)
           NAPI_VERSION=$(jq -r .version pnpm/npm/napi/package.json)
           PNPR_VERSION=$(jq -r .version pnpr/npm/pnpr/package.json)
           GET_PNPM_VERSION=$(jq -r .version pnpm/npm/get-pnpm/package.json)
 
-          # pacquet and @pnpm/napi are a versioning.fixed group; a drift means
+          # pnpm and @pnpm/napi are a versioning.fixed group; a drift means
           # the versions were edited by hand inconsistently.
           if [ "$RUST_VERSION" != "$NAPI_VERSION" ]; then
             echo "::error::pnpm/npm/pnpm ($RUST_VERSION) and pnpm/npm/napi ($NAPI_VERSION) versions differ"
             exit 1
           fi
 
-          # A v12 prerelease must never move the production dist-tags; derive
-          # next-<major> the way the TypeScript packages' publishConfig does.
+          # A prerelease must never move the production dist-tags.
           RUST_TAG="next-${RUST_VERSION%%.*}"
 
           # A pnpr prerelease must not move the mutable `latest` dist-tag,
@@ -209,7 +183,6 @@ jobs:
           # the non-zero exit is the subshell's, discarded by echo, so a
           # registry outage would otherwise be written out as an empty (falsy)
           # value and silently skip the release.
-          TS_NEEDS=false
           RUST_NEEDS=false
           PNPR_NEEDS=false
           GET_PNPM_NEEDS=false
@@ -232,25 +205,15 @@ jobs:
               ;;
             refs/tags/v*)
               TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-              if [ "$TAG_VERSION" = "$TS_VERSION" ]; then
-                TS_NEEDS=$(needs_release "pnpm@$TS_VERSION")
-              elif [ "$TAG_VERSION" = "$RUST_VERSION" ]; then
-                RUST_NEEDS=$(needs_release "pnpm@$RUST_VERSION")
-              else
-                echo "::error::Tag v${TAG_VERSION} matches no product: the committed TypeScript pnpm version is ${TS_VERSION} and the committed Rust pnpm version is ${RUST_VERSION}"
+              if [ "$TAG_VERSION" != "$RUST_VERSION" ]; then
+                echo "::error::Tag v${TAG_VERSION} matches no product: the committed pnpm version is ${RUST_VERSION}"
                 exit 1
               fi
-              ;;
-            *)
-              # Only reachable via the verify_ts_release dispatch —
-              # validate-release-ref rejects every other non-tag ref. Nothing
-              # is released.
+              RUST_NEEDS=$(needs_release "pnpm@$RUST_VERSION")
               ;;
           esac
 
           {
-            echo "ts=$TS_NEEDS"
-            echo "ts_version=$TS_VERSION"
             echo "rust=$RUST_NEEDS"
             echo "rust_version=$RUST_VERSION"
             echo "rust_tag=$RUST_TAG"
@@ -261,292 +224,11 @@ jobs:
             echo "get_pnpm_version=$GET_PNPM_VERSION"
           } | tee -a "$GITHUB_OUTPUT"
 
-  verify-ts-release:
-    name: Verify TypeScript pnpm release artifacts
-    needs:
-      - validate-release-ref
-      - plan
-    if: needs.plan.outputs.ts == 'true' || inputs.verify_ts_release
-    permissions:
-      contents: read
-    # Runs on macOS so the darwin artifacts can be ad-hoc signed with native
-    # `codesign` (no need to build/install `ldid` on the runner) and so
-    # `verify-binary.mjs` can smoke-test the darwin-arm64 SEA in place — a
-    # macos-latest runner is Apple Silicon and can execute the arm64 binary.
-    # Note: this does NOT fix the darwin-x64 crash (nodejs/node#62893) — that's
-    # an upstream Node.js SEA bug independent of signing; see pack-app docs.
-    # npm trusted publishing still requires this publish job to run on GitHub-hosted macOS.
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-      - name: Initialize Rust before dependency installation
-        uses: $/.github/actions/rustup
-        with:
-          restore-cache: false
-      - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
-        with:
-          runtime: node@26.13.0
-      - name: Build TypeScript executable artifacts
-        run: pn --filter=@pnpm/exe run build-artifacts
-
-      - name: Verify TypeScript npm packages
-        # Inspect the same tarballs that publish will upload before the first
-        # immutable npm publish, including the generated platform packages.
-        # zizmor: ignore[adhoc-packages] -- This smoke test intentionally
-        # installs locally built release tarballs before publication.
-        run: |
-          set -euo pipefail
-          release_tarballs=$(mktemp -d)
-          for package in pnpm11/pnpm/artifacts/{darwin-arm64,exe,linux-arm64,linux-x64,linux-x64-musl,win32-arm64,win32-x64} pnpm11/pnpm; do
-            package_tarballs="$release_tarballs/${package//\//_}"
-            mkdir "$package_tarballs"
-            (
-              cd "$package"
-              pn pack --pack-destination "$package_tarballs"
-            )
-
-            tarball=$(find "$package_tarballs" -type f -name '*.tgz' -print -quit)
-            test -n "$tarball"
-            contents="$package_tarballs/contents"
-            mkdir "$contents"
-            tar -xzf "$tarball" -C "$contents"
-            node -e '
-              const fs = require("node:fs")
-              const path = require("node:path")
-              const manifestPath = path.resolve(process.argv[1])
-              const manifest = require(manifestPath)
-              const packageDir = path.dirname(manifestPath)
-              const excluded = (manifest.files ?? []).filter((file) => file.startsWith("!")).map((file) => globToRegExp(file.slice(1)))
-              const files = new Set()
-              for (const file of manifest.files ?? []) {
-                if (!file.startsWith("!") && !/[?*[]/.test(file)) add(file)
-              }
-              for (const file of manifest.publishConfig?.executableFiles ?? []) add(file)
-              for (const file of Object.values(typeof manifest.bin === "string" ? { default: manifest.bin } : manifest.bin ?? {})) add(file)
-              if (files.size === 0) throw new Error("No literal payload files declared by " + manifest.name)
-              console.log([...files].join("\n"))
-
-              function add(file) {
-                const relative = file.replace(/^\.\//, "")
-                if (excluded.some((pattern) => pattern.test(relative))) return
-                const source = path.join(packageDir, relative)
-                if (path.relative(packageDir, source).split(path.sep)[0] === "..") throw new Error("Payload file outside the package: " + file)
-                const stat = fs.statSync(source, { throwIfNoEntry: false })
-                if (stat?.isFile()) {
-                  files.add(relative)
-                  return
-                }
-                if (!stat?.isDirectory()) throw new Error("Missing payload file " + source)
-                for (const entry of fs.readdirSync(source, { withFileTypes: true })) add(path.join(relative, entry.name))
-              }
-
-              function globToRegExp(pattern) {
-                return new RegExp("^" + pattern.replace(/[.+^{}()|[\]\\]/g, "\\$&").replace(/\*\*\//g, "\x00").replace(/\*\*/g, "\x01").replace(/\*/g, "[^/]*").replace(/\x00/g, "(?:.*/)?").replace(/\x01/g, ".*") + String.fromCharCode(36))
-              }
-            ' "$package/package.json" | while IFS= read -r file; do
-              test -f "$package/$file"
-              cmp "$contents/package/$file" "$package/$file"
-            done
-          done
-
-          pnpm_tarball=$(find "$release_tarballs/pnpm11_pnpm" -type f -name '*.tgz' -print -quit)
-          test -n "$pnpm_tarball"
-
-          # dist/node_modules carries every runtime dependency, so the published
-          # manifest must declare no dependency field of any kind: a surviving
-          # `dependencies` or `optionalDependencies` is resolved and installed a
-          # second time, and `devDependencies` names workspace packages that are
-          # never published at all. .meta-updater/src/index.ts additionally
-          # forbids `optionalDependencies` and `peerDependencies` on this
-          # package outright.
-          #
-          # Assert on the packed tarball rather than on any of the strippers,
-          # because an npm publish cannot be taken back and only two of these
-          # fields are stripped at pack time: the .pnpmfile.cjs beforePacking
-          # hook deliberately leaves `optionalDependencies` alone (the v12 Rust
-          # wrapper needs them for its natives), which leaves meta-updater — a
-          # source normalizer, not a release gate — as the only thing between
-          # that field and the registry.
-          tar -xOf "$pnpm_tarball" package/package.json | node -e '
-            const manifest = JSON.parse(require("node:fs").readFileSync(0, "utf8"))
-            const fields = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]
-            const declared = fields.filter((field) => manifest[field] != null)
-            if (declared.length > 0) {
-              throw new Error("The published pnpm manifest must not declare " + declared.join(" or ") + " - every runtime dependency is bundled into dist/node_modules")
-            }
-          '
-
-          smoke_dir=$(mktemp -d)
-          tar -xzf "$pnpm_tarball" -C "$smoke_dir"
-          command -v node
-          node --version
-          set +e
-          node "$smoke_dir/package/bin/pnpm.mjs" --version >"$smoke_dir/pnpm.stdout" 2>"$smoke_dir/pnpm.stderr"
-          pnpm_exit=$?
-          set -e
-          cat "$smoke_dir/pnpm.stdout"
-          cat "$smoke_dir/pnpm.stderr" >&2
-          test "$pnpm_exit" -eq 0
-
-          exe_tarball=$(find "$release_tarballs/pnpm11_pnpm_artifacts_exe" -type f -name '*.tgz' -print -quit)
-          native_tarball=$(find "$release_tarballs/pnpm11_pnpm_artifacts_darwin-arm64" -type f -name '*.tgz' -print -quit)
-          test -n "$exe_tarball"
-          test -n "$native_tarball"
-          (
-            cd "$smoke_dir"
-            command -v npm
-            npm --version
-            npm config get ignore-scripts
-            npm config get strict-allow-scripts
-            npm install --foreground-scripts --ignore-scripts=false --loglevel verbose "$exe_tarball" "$native_tarball"
-          )
-          ls -l "$smoke_dir/node_modules/@pnpm/exe/pnpm"
-          file "$smoke_dir/node_modules/@pnpm/exe/pnpm"
-          "$smoke_dir/node_modules/@pnpm/exe/pnpm" --version
-
-  release:
-    name: Release the TypeScript pnpm CLI
-    needs:
-      - validate-release-ref
-      - plan
-      - verify-ts-release
-    if: needs.plan.outputs.ts == 'true' && !inputs.verify_ts_release
-    permissions:
-      id-token: write  # Required for OIDC
-      contents: write  # for softprops/action-gh-release to create GitHub release
-      attestations: write  # for actions/attest-build-provenance
-    runs-on: macos-latest
-    environment: release
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Assert the version tag points at this commit
-        # The plan job dispatches on the tag's version string, which cannot
-        # prove the tag points at this commit — a retagged release, or another
-        # commit carrying the same committed version, would still dispatch.
-        # The artifacts built below and the GitHub release that lands on
-        # v<ts_version> must both come from the commit that tag names.
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.plan.outputs.ts_version }}
-        run: |
-          tag_commit=$(gh api "repos/${GITHUB_REPOSITORY}/commits/v${VERSION}" --jq .sha)
-          if [ "$tag_commit" != "$GITHUB_SHA" ]; then
-            echo "::error::Tag v${VERSION} points at ${tag_commit}, but this run would release commit ${GITHUB_SHA}. Rerun the release workflow from the v${VERSION} tag."
-            exit 1
-          fi
-      - uses: garnet-org/action@673a06d87748bec49e4d8df22d371b2a3420aba4 # v2.5.2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-      - name: Initialize Rust before dependency installation
-        uses: $/.github/actions/rustup
-        with:
-          restore-cache: false
-      - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
-        with:
-          runtime: node@26.13.0
-      # Internal workspace packages still publish with the static token. `@pnpm/exe`
-      # and `pnpm` use stage-only OIDC. CI stages both packages but cannot approve
-      # or publish them; a maintainer does that later with interactive 2FA. Keeping
-      # each stage operation in a token-free step also prevents an accidental
-      # fallback to token authentication.
-      - name: Build TypeScript executable artifacts
-        run: pn --filter=@pnpm/exe run build-artifacts
-      - name: Publish internal workspace packages (static token)
-        # The other workspace packages don't have trusted publishing configured on npm,
-        # so we still need a static token here. The token is removed from pnpm's config
-        # at the end of the step so it can't leak into the trusted-publishing step that
-        # follows (where its presence would silently downgrade `pnpm` to token publishing).
-        # The Rust products' wrapper packages are private workspace packages, so the
-        # recursive publish skips them; they are published by their own jobs below.
-        env:
-          # Setting the "npm_config_//registry.npmjs.org/:_authToken" env variable directly
-          # doesn't work — pnpm doesn't appear to pass auth tokens to child processes.
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          trap 'pn config delete "//registry.npmjs.org/:_authToken" || true' EXIT
-          pn config set "//registry.npmjs.org/:_authToken" "${NPM_TOKEN}"
-          pn publish --filter=!pnpm --filter=!@pnpm/exe --access=public --provenance
-      - name: Stage @pnpm/exe (OIDC)
-        run: >-
-          .github/scripts/npm-staged-publication.sh stage
-          'TypeScript @pnpm/exe wrapper' next-11
-          pnpm11/pnpm/artifacts/exe
-      - name: Stage pnpm CLI (OIDC)
-        run: >-
-          .github/scripts/npm-staged-publication.sh stage
-          'TypeScript pnpm CLI' next-11
-          pnpm11/pnpm
-      - name: Copy Artifacts
-        run: pn copy-artifacts
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: 'dist/*'
-      - name: Generate release description
-        env:
-          TS_VERSION: ${{ needs.plan.outputs.ts_version }}
-        run: |
-          rm -f RELEASE.md
-          if pn make-release-description && test -s RELEASE.md; then
-            exit 0
-          fi
-          echo "::warning::Release notes could not be generated; publishing the release with a diagnostic description"
-          cat > RELEASE.md <<EOF
-          ## Release notes unavailable
-
-          pnpm ${TS_VERSION} was published successfully, but its release notes could not be generated from the pending changelog. The release artifacts are still available below.
-
-          See the [release workflow run](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) for the generation error.
-          EOF
-      - name: Release
-        id: github-release
-        # `gh release create` could replace this, but the release pipeline is
-        # sensitive and softprops/action-gh-release is widely battle-tested.
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3 # zizmor: ignore[superfluous-actions]
-        with:
-          # Draft so a maintainer publishes it deliberately, like the Rust and
-          # pnpr releases: the repository uses immutable releases, so a
-          # published release cannot be corrected, only deleted — and deleting
-          # it burns its tag for releases forever.
-          draft: true
-          # Explicit so the release's identity comes from the plan job like
-          # every other step here, never from the github.ref fallback.
-          tag_name: v${{ needs.plan.outputs.ts_version }}
-          name: pnpm ${{ needs.plan.outputs.ts_version }}
-          files: dist/*
-          body_path: RELEASE.md
-      - name: Verify draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ steps.github-release.outputs.id }}
-        run: |
-          test -n "$RELEASE_ID"
-          release_json=$(mktemp)
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$release_json"
-          RELEASE_JSON="$release_json" node <<'NODE'
-          const fs = require('node:fs')
-          const normalizeNewlines = (text) => text?.replace(/\r\n?/g, '\n')
-          const actual = normalizeNewlines(JSON.parse(fs.readFileSync(process.env.RELEASE_JSON, 'utf8')).body)
-          const expected = normalizeNewlines(fs.readFileSync('RELEASE.md', 'utf8'))
-          if (actual !== expected) throw new Error('GitHub draft release body does not match RELEASE.md')
-          NODE
-
   build-wasm-payload:
     name: Bundle WebContainer runtime
     runs-on: blacksmith-8vcpu-ubuntu-2404
     needs: plan
-    if: needs.plan.outputs.rust == 'true' && !inputs.verify_ts_release
+    if: needs.plan.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -555,7 +237,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false
@@ -589,7 +271,7 @@ jobs:
     name: Bundle node-gyp
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: plan
-    if: needs.plan.outputs.rust == 'true' && !inputs.verify_ts_release
+    if: needs.plan.outputs.rust == 'true'
     permissions:
       contents: read
     # Every channel ships the same node-gyp, so it is resolved once here rather
@@ -608,12 +290,12 @@ jobs:
           restore-cache: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
 
       - name: Bundle node-gyp
-        run: pnpm --filter=pacquet run bundle-node-gyp
+        run: pnpm --filter=pnpm run bundle-node-gyp
 
       - name: Archive payload
         # Archived rather than uploaded as a directory, for the same reason the
@@ -640,7 +322,7 @@ jobs:
     needs:
       - plan
       - build-node-gyp-payload
-    if: needs.plan.outputs.rust == 'true' && !inputs.verify_ts_release
+    if: needs.plan.outputs.rust == 'true'
     permissions:
       contents: read
       id-token: write # needed for actions/attest-build-provenance
@@ -685,8 +367,18 @@ jobs:
             code-target: linux-s390x
 
           - os: blacksmith-8vcpu-ubuntu-2404
+            target: loongarch64-unknown-linux-gnu
+            code-target: linux-loong64
+
+          - os: blacksmith-8vcpu-ubuntu-2404
             target: x86_64-unknown-freebsd
             code-target: freebsd-x64
+
+          # Built natively in a NetBSD VM, which needs KVM: see the VM build step.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-netbsd
+            code-target: netbsd-x64
+            vm: netbsd
 
           - os: blacksmith-8vcpu-ubuntu-2404
             target: aarch64-linux-android
@@ -723,6 +415,7 @@ jobs:
           container-build: 'true'
 
       - name: Build with cross
+        if: matrix.vm != 'netbsd'
         # windows-msvc links VCRUNTIME140.dll dynamically by default, and a
         # clean Windows install does not ship it, so pnpm.exe would exit
         # 0xC0000135 before main. Only the CLI links the CRT statically: the
@@ -745,6 +438,24 @@ jobs:
             export "CARGO_TARGET_${target_var}_RUSTFLAGS=-C force-unwind-tables=no"
           fi
           .github/scripts/cross-build.sh --locked -p pnpm-cli --bin pnpm --release --target="$TARGET"
+
+      - name: Start the NetBSD VM
+        if: matrix.vm == 'netbsd'
+        uses: $/.github/actions/netbsd-vm
+
+      - name: Build and smoke-test in the NetBSD VM
+        if: matrix.vm == 'netbsd'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.plan.outputs.rust_version }}
+        # Run outside the checkout: the repository's packageManager pin would
+        # otherwise make the new binary hand off to the pinned pnpm.
+        run: |
+          .github/scripts/netbsd-vm/vm.sh build --locked -p pnpm-cli --bin pnpm --release --target="$TARGET"
+          actual=$(.github/scripts/netbsd-vm/vm.sh run "cd /tmp && /build/target/$TARGET/release/pnpm --version")
+          echo "$actual"
+          test "$actual" = "$VERSION"
 
       - name: Smoke-test Linux ppc64le startup
         if: matrix.target == 'powerpc64le-unknown-linux-gnu'
@@ -819,16 +530,17 @@ jobs:
     # Deliberately not waiting on build-node-gyp-payload: the addon ships no
     # node-gyp, so these legs start as soon as the release is planned.
     needs: plan
-    if: needs.plan.outputs.rust == 'true' && !inputs.verify_ts_release
+    if: needs.plan.outputs.rust == 'true'
     permissions:
       contents: read
       id-token: write # needed for actions/attest-build-provenance
       attestations: write
     strategy:
       matrix:
-        # Every target build-rust above packages a CLI binary for also needs
-        # an addon — `pnpm/npm/napi/scripts/generate-packages.mjs` fails on a
-        # missing one — so keep the two matrices in sync.
+        # Every target in the TARGETS list of
+        # `pnpm/npm/napi/scripts/generate-packages.mjs` needs an entry here:
+        # the generator fails on a missing addon. build-rust also packages
+        # CLI-only targets (netbsd-x64, linux-loong64) that have no addon.
         include:
           - os: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
@@ -967,7 +679,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false
@@ -1008,6 +720,17 @@ jobs:
           fi
           node .github/scripts/assert-windows-crt-static.mjs "${exes[@]}"
 
+      - name: Reject a symbol table in ELF and Mach-O binaries
+        # An extracted CLI binary is the only `pnpm-*` file without an
+        # extension. The Windows binaries keep their symbols in a separate PDB.
+        run: |
+          mapfile -t binaries < <(find . -maxdepth 1 -type f \( -name 'pnpm-*' ! -name '*.*' -o -name 'pnpm-napi.*.node' \) ! -name '*win32*' | sort)
+          if [ ${#binaries[@]} -eq 0 ]; then
+            echo "::error::no ELF or Mach-O pnpm binaries to check"
+            exit 1
+          fi
+          node .github/scripts/assert-stripped.mjs "${binaries[@]}"
+
       - name: Restore node-gyp payload
         # The dist/ payload both wrappers ship, so install scripts that shell
         # out to node-gyp build out of the box. Taken from the artifact rather
@@ -1032,8 +755,8 @@ jobs:
         run: tar xzf wasm-payload/wasm-payload.tar.gz -C pnpm/npm
 
       - name: Generate npm packages
-        # Rewrites the committed private `pacquet` wrapper into the publishable
-        # `pnpm` manifest and generates the per-platform packages.
+        # Rewrites the committed private `pnpm` wrapper into the publishable
+        # manifest and generates the per-platform packages.
         run: |
           node pnpm/npm/pnpm/scripts/generate-packages.mjs
           node pnpm/npm/napi/scripts/generate-packages.mjs
@@ -1110,6 +833,19 @@ jobs:
             -C "$smoke_dir/node_modules/@pnpm/exe.linux-x64" --strip-components=1
           tar -xzf "$wrapper_tarball" \
             -C "$smoke_dir/node_modules/pnpm" --strip-components=1
+          # Exercise the fallback launcher before install.js replaces it.
+          (
+            cd "$smoke_dir"
+            printf '%s\n' '{"scripts":{"probe":"sh probe.sh"}}' > package.json
+            cat > probe.sh <<'SH'
+          set -eu
+          dist="$PWD/node_modules/pnpm/dist"
+          test "$(command -v node-gyp)" = "$dist/node-gyp-bin/node-gyp"
+          test "$npm_config_node_gyp" = "$dist/node_modules/node-gyp/bin/node-gyp.js"
+          node-gyp --version
+          SH
+            "$smoke_dir/node_modules/pnpm/pnpm" run probe
+          )
           node "$smoke_dir/node_modules/pnpm/install.js"
           wrapper_bin=$(node -p 'require(process.argv[1]).bin.pnpm' "$smoke_dir/node_modules/pnpm/package.json")
           "$smoke_dir/node_modules/pnpm/$wrapper_bin" --version
@@ -1117,6 +853,205 @@ jobs:
           # install.js, so its only job here is to prove it was published and
           # can reach the binary.
           node "$smoke_dir/node_modules/pnpm/bin/pnpm.mjs" --version
+
+  verify-rust-executables:
+    name: Verify pnpm (Rust) executable (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    needs:
+      - plan
+      - build-rust
+    if: needs.plan.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+            type: native
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            type: native
+          - os: ubuntu-24.04
+            target: linux-x64-musl
+            type: alpine
+          - os: ubuntu-24.04-arm
+            target: linux-arm64-musl
+            type: alpine
+          - os: windows-latest
+            target: win32-x64
+            type: native
+          - os: windows-11-arm
+            target: win32-arm64
+            type: native
+          - os: macos-15-intel
+            target: darwin-x64
+            type: native
+          - os: macos-latest
+            target: darwin-arm64
+            type: native
+          - os: ubuntu-24.04
+            target: linux-ppc64
+            type: qemu-ppc64
+          - os: ubuntu-24.04
+            target: linux-riscv64
+            type: qemu-riscv64
+          - os: ubuntu-24.04
+            target: linux-s390x
+            type: qemu-s390x
+          # Note: freebsd-x64, android-arm64, and android-x64 are cross-compiled
+          # but omitted from execution smoke tests due to lack of FreeBSD/Android
+          # kernel environments on standard GitHub Actions runners.
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries-rust-${{ matrix.target }}
+
+      - name: Extract archive (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pnpm-smoke"
+          7z x pnpm-${{ matrix.target }}.zip -o"$RUNNER_TEMP/pnpm-smoke"
+
+      - name: Extract archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pnpm-smoke"
+          tar xzf pnpm-${{ matrix.target }}.tar.gz -C "$RUNNER_TEMP/pnpm-smoke"
+
+      - name: Smoke-test native binary
+        if: matrix.type == 'native'
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.rust_version }}
+        run: |
+          cd "$RUNNER_TEMP/pnpm-smoke"
+          if [ -f pnpm.exe ]; then
+            BIN="$PWD/pnpm.exe"
+          else
+            BIN="$PWD/pnpm"
+            chmod +x "$BIN"
+          fi
+          actual=$("$BIN" --version)
+          echo "pnpm --version: $actual"
+          test "$actual" = "$VERSION"
+          mkdir -p "$RUNNER_TEMP/pnpm-smoke-install"
+          cd "$RUNNER_TEMP/pnpm-smoke-install"
+          cat > package.json << 'EOF'
+          {
+            "name": "smoke-test",
+            "version": "1.0.0",
+            "dependencies": {
+              "is-positive": "1.0.0"
+            }
+          }
+          EOF
+          "$BIN" install --no-frozen-lockfile
+          test -d node_modules/is-positive
+
+      - name: Smoke-test Alpine musl binary
+        if: matrix.type == 'alpine'
+        env:
+          VERSION: ${{ needs.plan.outputs.rust_version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pnpm-smoke/test-project"
+          cat > "$RUNNER_TEMP/pnpm-smoke/test-project/package.json" << 'EOF'
+          {
+            "name": "smoke-test",
+            "version": "1.0.0",
+            "dependencies": {
+              "is-positive": "1.0.0"
+            }
+          }
+          EOF
+          docker run --rm -v "$RUNNER_TEMP/pnpm-smoke:/smoke" -w /smoke alpine:latest sh -c '
+            set -eu
+            chmod +x ./pnpm
+            actual=$(./pnpm --version)
+            echo "pnpm --version: $actual"
+            test "$actual" = "'"$VERSION"'"
+            cd /smoke/test-project
+            /smoke/pnpm install --no-frozen-lockfile
+            test -d node_modules/is-positive
+          '
+
+      - name: Smoke-test Linux ppc64le (QEMU)
+        if: matrix.type == 'qemu-ppc64'
+        env:
+          VERSION: ${{ needs.plan.outputs.rust_version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user libc6-ppc64el-cross libgcc-s1-ppc64el-cross
+          cd "$RUNNER_TEMP/pnpm-smoke"
+          chmod +x ./pnpm
+          actual=$(qemu-ppc64le -L /usr/powerpc64le-linux-gnu ./pnpm --version)
+          echo "pnpm --version (ppc64le): $actual"
+          test "$actual" = "$VERSION"
+          mkdir -p test-project && cd test-project
+          cat > package.json << 'EOF'
+          {
+            "name": "smoke-test",
+            "version": "1.0.0",
+            "dependencies": {
+              "is-positive": "1.0.0"
+            }
+          }
+          EOF
+          qemu-ppc64le -L /usr/powerpc64le-linux-gnu ../pnpm install --no-frozen-lockfile
+          test -d node_modules/is-positive
+
+      - name: Smoke-test Linux riscv64 (QEMU)
+        if: matrix.type == 'qemu-riscv64'
+        env:
+          VERSION: ${{ needs.plan.outputs.rust_version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user libc6-riscv64-cross libgcc-s1-riscv64-cross
+          cd "$RUNNER_TEMP/pnpm-smoke"
+          chmod +x ./pnpm
+          actual=$(qemu-riscv64 -L /usr/riscv64-linux-gnu ./pnpm --version)
+          echo "pnpm --version (riscv64): $actual"
+          test "$actual" = "$VERSION"
+          mkdir -p test-project && cd test-project
+          cat > package.json << 'EOF'
+          {
+            "name": "smoke-test",
+            "version": "1.0.0",
+            "dependencies": {
+              "is-positive": "1.0.0"
+            }
+          }
+          EOF
+          qemu-riscv64 -L /usr/riscv64-linux-gnu ../pnpm install --no-frozen-lockfile
+          test -d node_modules/is-positive
+
+      - name: Smoke-test Linux s390x (QEMU)
+        if: matrix.type == 'qemu-s390x'
+        env:
+          VERSION: ${{ needs.plan.outputs.rust_version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user libc6-s390x-cross libgcc-s1-s390x-cross
+          cd "$RUNNER_TEMP/pnpm-smoke"
+          chmod +x ./pnpm
+          actual=$(qemu-s390x -L /usr/s390x-linux-gnu ./pnpm --version)
+          echo "pnpm --version (s390x): $actual"
+          test "$actual" = "$VERSION"
+          mkdir -p test-project && cd test-project
+          cat > package.json << 'EOF'
+          {
+            "name": "smoke-test",
+            "version": "1.0.0",
+            "dependencies": {
+              "is-positive": "1.0.0"
+            }
+          }
+          EOF
+          qemu-s390x -L /usr/s390x-linux-gnu ../pnpm install --no-frozen-lockfile
+          test -d node_modules/is-positive
 
   publish-rust:
     name: Publish pnpm (Rust) and @pnpm/napi to npm
@@ -1133,13 +1068,14 @@ jobs:
       - build-rust-napi
       - build-wasm-payload
       - verify-rust-artifacts
+      - verify-rust-executables
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false
@@ -1224,6 +1160,7 @@ jobs:
       - build-rust
       - build-rust-napi
       - publish-rust
+      - verify-rust-executables
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1231,8 +1168,7 @@ jobs:
           persist-credentials: false
 
       - name: Assert the version tag points at this commit
-        # Same tag↔commit invariant as the TypeScript release job's guard: the
-        # binaries below were built from this run's commit, and this assert is
+        # The binaries below were built from this run's commit, and this assert is
         # the only thing pinning the release to it. A `target_commitish` input
         # cannot: GitHub ignores it whenever the tag already exists, and with
         # immutable releases enabled its mere presence makes release creation
@@ -1269,7 +1205,7 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.rust_version }}
         run: |
-          changelog=".changeset/changelogs/pacquet@${VERSION}.md"
+          changelog=".changeset/changelogs/pnpm@${VERSION}.md"
           if [ -f "$changelog" ]; then
             tail -n +2 "$changelog" | sed '/./,$!d' > RELEASE.md
           else
@@ -1289,10 +1225,9 @@ jobs:
         # binary at the root of `pnpm-<target>.tar.gz` / `.zip`), so they're
         # uploaded byte-for-byte as attested there — get.pnpm.io's install
         # scripts fetch them by these exact names. Draft so a maintainer
-        # publishes it deliberately. `make_latest: false` keeps a published v12
-        # prerelease from stealing the "Latest" badge from the stable v11
-        # line.
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3 # zizmor: ignore[superfluous-actions]
+        # publishes it deliberately. The Tag workflow (update-latest.yml) moves
+        # the "Latest" badge along with the npm `latest` dist-tag.
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4 # zizmor: ignore[superfluous-actions]
         with:
           draft: true
           prerelease: ${{ contains(needs.plan.outputs.rust_version, '-') }}
@@ -1306,7 +1241,7 @@ jobs:
 
   build-pnpr:
     needs: plan
-    if: needs.plan.outputs.pnpr == 'true' && !inputs.verify_ts_release
+    if: needs.plan.outputs.pnpr == 'true'
     permissions:
       contents: read
       id-token: write # needed for actions/attest-build-provenance
@@ -1354,7 +1289,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cross
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cross
 
@@ -1421,7 +1356,27 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: .github/scripts/cross-build.sh --locked -p pnpr --bin pnpr --release --target="$TARGET"
+        run: >-
+          .github/scripts/cross-build.sh --locked -p pnpr --bin pnpr --release
+          --features backend-libsql,backend-postgres,backend-mysql
+          --target="$TARGET"
+
+      - name: Verify storage.database.url schemes on native target
+        if: >-
+          matrix.target == 'x86_64-pc-windows-msvc'
+          || matrix.target == 'x86_64-unknown-linux-gnu'
+          || matrix.target == 'x86_64-unknown-linux-musl'
+          || matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          bin="target/$TARGET/release/pnpr"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin="${bin}.exe"
+          fi
+          .github/scripts/pnpr-check-database-drivers.sh "$bin"
 
       # The binary is zipped to fix permission loss https://github.com/actions/upload-artifact#permission-loss
       # Rename the binary to include the target triple so the archive
@@ -1465,7 +1420,7 @@ jobs:
   build-pnpr-ui:
     name: Build the pnpr web UI
     needs: plan
-    if: needs.plan.outputs.pnpr == 'true' && !inputs.verify_ts_release
+    if: needs.plan.outputs.pnpr == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1475,7 +1430,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false
@@ -1510,7 +1465,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false
@@ -1537,6 +1492,17 @@ jobs:
           for archive in ./*.gz; do
             tar xf "$archive"
           done
+
+      - name: Reject a symbol table in ELF and Mach-O binaries
+        # Every other `pnpr-*` file here has an extension: the archives, the
+        # checksums, and the Windows binaries, whose symbols are in a PDB.
+        run: |
+          mapfile -t binaries < <(find . -maxdepth 1 -type f -name 'pnpr-*' ! -name '*.*' | sort)
+          if [ ${#binaries[@]} -eq 0 ]; then
+            echo "::error::no ELF or Mach-O pnpr binaries to check"
+            exit 1
+          fi
+          node .github/scripts/assert-stripped.mjs "${binaries[@]}"
 
       - name: Generate npm packages
         run: |
@@ -1614,6 +1580,13 @@ jobs:
           node "$smoke_dir/node_modules/@pnpm/pnpr/install.js"
           "$smoke_dir/node_modules/@pnpm/pnpr/bin/pnpr" --version
 
+          # The packaged Linux x64 binary and the static musl binary staged
+          # into ghcr.io/pnpm/pnpr must accept every documented storage.database.url
+          # scheme.
+          chmod +x ./pnpr-linux-x64-musl
+          .github/scripts/pnpr-check-database-drivers.sh \
+            "$smoke_dir/node_modules/@pnpm/pnpr/bin/pnpr" ./pnpr-linux-x64-musl
+
           # pnpr finds the web UI installed next to it and serves it.
           ui_tarball=$(find "$release_tarballs/pnpr_npm_pnpr-ui" -type f -name '*.tgz' -print -quit)
           test -n "$ui_tarball"
@@ -1648,7 +1621,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false
@@ -1784,7 +1757,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1820,7 +1793,7 @@ jobs:
           persist-credentials: false
 
       - name: Assert the version tag points at this commit
-        # Same tag↔commit invariant as the TypeScript release job's guard.
+        # Same tag↔commit invariant as the Rust release's guard.
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.plan.outputs.pnpr_version }}
@@ -1857,7 +1830,7 @@ jobs:
         # byte-for-byte as attested there. Draft so a maintainer publishes it
         # deliberately; `make_latest: false` keeps a pnpr release off the
         # repository's "Latest" badge, which tracks the stable pnpm CLI.
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3 # zizmor: ignore[superfluous-actions]
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4 # zizmor: ignore[superfluous-actions]
         with:
           draft: true
           prerelease: ${{ contains(needs.plan.outputs.pnpr_version, '-') }}
@@ -1890,7 +1863,7 @@ jobs:
           restore-cache: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false
@@ -1901,8 +1874,8 @@ jobs:
       - name: Test
         run: pnpm --filter=get-pnpm test
 
-      # The package is private in the workspace so the TypeScript release's
-      # recursive publish skips it. The packed manifest drops the flag.
+      # The package is private in the workspace so no recursive publish ships
+      # it. The packed manifest drops the flag.
       - name: Pack
         working-directory: pnpm/npm/get-pnpm
         env:
@@ -1937,7 +1910,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@22
           install: false

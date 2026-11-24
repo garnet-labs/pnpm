@@ -11,11 +11,19 @@ mod slot_identity;
 use super::VirtualStoreLayout;
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    LockfileResolution, PackageKey, PackageMetadata, PkgName, RegistryResolution, SnapshotDepRef,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    RegistryResolution,
+    SnapshotDepRef,
     SnapshotEntry,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+};
 
 /// Build a `Config` test-double with the GVS-relevant fields
 /// wired explicitly. `gvs_dir` populates `global_virtual_store_dir`
@@ -32,6 +40,7 @@ fn make_config(gvs: bool, virtual_store_dir: PathBuf, gvs_dir: PathBuf) -> Confi
 /// [`PackageMetadata`] carrying only the fields the layout reads.
 fn package_metadata(resolution: LockfileResolution, version: Option<&str>) -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution,
         version: version.map(str::to_string),
         engines: None,
@@ -92,7 +101,7 @@ fn cyclic_slot_suffixes() -> Vec<(String, String)> {
     );
     let (snapshots, packages) = cyclic_snapshots();
     // An empty policy allows no builds, which makes every snapshot hash
-    // engine-agnostically — the digests below then hold on any host.
+    // engine-agnostically, the digests below then hold on any host.
     let policy = crate::AllowBuildPolicy::default();
     let layout = VirtualStoreLayout::new(
         &config,
@@ -189,6 +198,7 @@ fn depends_on(name: &str) -> SnapshotEntry {
 fn registry_metadata(lead: &str) -> PackageMetadata {
     let integrity = format!("sha512-{lead}{}", "A".repeat(91));
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Registry(RegistryResolution {
             integrity: integrity.parse().expect("parse integrity"),
             revision: None,

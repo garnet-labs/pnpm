@@ -89,7 +89,7 @@ pnx --package=yo --package=generator-webapp yo webapp --skip-install
 
 ### --allow-build
 
-A list of package names that are allowed to run build scripts during installation.
+A list of package names that are allowed to run build scripts during installation. Repeat the option or, since v12.23.0, separate names with commas.
 
 Example:
 
@@ -98,6 +98,12 @@ pnx --allow-build=esbuild my-bundler bundle
 ```
 
 The actual packages executed by `pnx` are allowed to run build scripts by default. So if in the above example `my-bundler` has to be built before execution, it will be built.
+
+Prefixing a name with `!` denies its build scripts, including for the executed package itself:
+
+```sh
+pnx --allow-build=!my-bundler my-bundler bundle
+```
 
 When a dependency's build scripts are skipped, `pnx` prompts you to approve them in an interactive terminal. This also applies when reusing a cached install that still has builds awaiting approval. Approved scripts run before the requested command.
 
@@ -114,6 +120,12 @@ Example:
 ```sh
 pnx --package cowsay --package lolcatjs -c 'echo "hi pnpm" | cowsay | lolcatjs'
 ```
+
+### --minimum-release-age &lt;minutes\>, --minimum-release-age-exclude &lt;package-spec\>
+
+Added in: v12.23.0
+
+Set [`minimumReleaseAge`](../settings/dependency-resolution.md#minimumreleaseage) and [`minimumReleaseAgeExclude`](../settings/dependency-resolution.md#minimumreleaseageexclude) for this run, as they do for [`pnpm install`](./install.md).
 
 ### --cpu, --os, --libc
 
@@ -135,3 +147,5 @@ Only the output of the executed command is printed.
 * [`trustPolicy`](../settings/dependency-resolution.md#trustpolicy), [`trustPolicyExclude`](../settings/dependency-resolution.md#trustpolicyexclude), [`trustPolicyIgnoreAfter`](../settings/dependency-resolution.md#trustpolicyignoreafter)
 
 This means `pnx` will refuse to execute freshly published or insufficiently trusted packages the same way a regular `pnpm install` would.
+
+`pnx` ignores other project-local execution, hook, and directory settings in the current directory (`pnpmfile`, `globalPnpmfile`, `configDependencies`, `scriptShell`, `cacheDir`, `storeDir`, `ignoreScripts`, `overrides`, `packageExtensions`, and `patchedDependencies`), while keeping user-level global configuration active.

@@ -1,24 +1,20 @@
 use super::{
-    add_esm_node_path_loader_option, esm_node_path_loader_import_flag,
+    add_esm_node_path_loader_option,
+    esm_node_path_loader_import_flag,
     keep_esm_node_path_loader_option,
 };
+use command_extra::CommandExtra;
 use pretty_assertions::assert_eq;
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::Command,
+};
 
-/// The TypeScript CLI asserts its derived flag against the same file
-/// (`pnpm11/exec/esm-node-path-loader/test/index.ts`), so the two stacks
-/// cannot drift apart without one of the tests failing.
+/// `import-flag.txt` is a copy of the golden file pnpm v11 asserts its
+/// derived flag against, so both CLIs inject the same `NODE_OPTIONS` value.
 #[test]
-fn flag_matches_the_golden_copy_shared_with_the_typescript_cli() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../pnpm11/exec/esm-node-path-loader/test/import-flag.txt",
-    );
-    let golden = std::fs::read_to_string(path)
-        .unwrap_or_else(|err| {
-            panic!("the golden flag file must be readable at {path}: {err}");
-        });
-    assert_eq!(esm_node_path_loader_import_flag(), golden);
+fn flag_matches_the_golden_copy_of_the_typescript_cli() {
+    assert_eq!(esm_node_path_loader_import_flag(), include_str!("import-flag.txt"));
 }
 
 #[test]
@@ -58,8 +54,52 @@ fn keep_reapplies_the_flag_only_when_the_previous_value_carried_it() {
     );
 }
 
+/// Mirrors the TypeScript test `require() from a module compiled from a
+/// string loads ...` in [`pnpm11/exec/esm-node-path-loader/test/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/exec/esm-node-path-loader/test/index.ts).
+/// A module created with `new Module()` has no filename, so its `require()`
+/// calls reach the resolve hook without a parent URL, like the entry point
+/// does, and resolve relative specifiers from the working directory
+/// (pnpm/pnpm#18261).
+#[test]
+fn require_from_a_module_compiled_from_a_string_keeps_require_extensions() {
+    let ts_hook = r#"require.extensions['.ts'] = (module, filename) => module._compile('module.exports = "ts-hook"', filename)"#;
+    for (file, contents, hook, expected) in [
+        ("lib.ts", "not JavaScript", ts_hook, "ts-hook"),
+        ("data.json", r#""json-loaded""#, "", "json-loaded"),
+    ] {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        fs::write(
+            root.join("runner.js"),
+            format!(
+                r#"const Module = require('node:module')
+const path = require('node:path')
+{hook}
+const filename = path.join(__dirname, 'compiled.js')
+const compiled = new Module(filename, module)
+compiled.paths = Module._nodeModulePaths(__dirname)
+compiled._compile('module.exports = require("./{file}")', filename)
+console.log(compiled.exports)
+"#,
+            ),
+        )
+        .expect("write runner.js");
+        fs::write(root.join(file), contents).expect("write the required file");
+
+        let output = Command::new("node")
+            .with_arg("runner.js")
+            .with_current_dir(root)
+            .with_env("NODE_OPTIONS", esm_node_path_loader_import_flag())
+            .output()
+            .expect("run node");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "requiring {file}");
+        assert!(output.status.success(), "requiring {file}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+}
+
 /// Mirrors the TypeScript test of the same name in
-/// `pnpm11/exec/esm-node-path-loader/test/index.ts`. The alias hook stands in
+/// [`pnpm11/exec/esm-node-path-loader/test/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/exec/esm-node-path-loader/test/index.ts). The alias hook stands in
 /// for the tsconfig paths hook in pnpm/pnpm#16979. `NODE_OPTIONS` imports
 /// register before command-line ones, so it runs first and reads
 /// `context.parentURL` after the fallback fails.
@@ -120,10 +160,10 @@ export async function resolve (specifier, context, nextResolve) {
     .expect("write alias-resolve.mjs");
 
     let output = Command::new("node")
-        .args(["--import", "./alias-hook.mjs", "main.mjs"])
-        .current_dir(root)
-        .env("NODE_PATH", &node_path)
-        .env("NODE_OPTIONS", esm_node_path_loader_import_flag())
+        .with_args(["--import", "./alias-hook.mjs", "main.mjs"])
+        .with_current_dir(root)
+        .with_env("NODE_PATH", &node_path)
+        .with_env("NODE_OPTIONS", esm_node_path_loader_import_flag())
         .output()
         .expect("run node");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");

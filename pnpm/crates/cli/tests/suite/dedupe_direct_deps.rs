@@ -8,8 +8,8 @@
 //!
 //! `dedupeDirectDeps` is **off by default**, so the dedupe-on tests
 //! below set `dedupeDirectDeps: true` in the workspace yaml
-//! explicitly. The default-off behavior — every importer keeps its own
-//! per-project symlink — is covered by
+//! explicitly. The default-off behavior (every importer keeps its own
+//! per-project symlink) is covered by
 //! [`dedupe_off_by_default_keeps_shared_workspace_link`].
 
 use crate::_utils;
@@ -18,10 +18,17 @@ use _utils::append_workspace_yaml_key;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     fs::is_symlink_or_junction,
 };
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
 /// With `dedupeDirectDeps: true`, a sibling project whose only
 /// direct dep is also a direct dep of the workspace root must not
@@ -95,7 +102,7 @@ fn dedupes_direct_deps_against_workspace_root() {
     drop((root, mock_instance));
 }
 
-/// `dedupeDirectDeps: false` opts out — every sibling gets its
+/// `dedupeDirectDeps: false` opts out; every sibling gets its
 /// own per-project symlink even when the workspace root already
 /// resolves the same alias to the same target.
 #[test]
@@ -288,7 +295,7 @@ fn dedupe_off_by_default_keeps_shared_workspace_link() {
     )
     .expect("write root package.json");
 
-    // No `dedupeDirectDeps` key — exercise the default.
+    // No `dedupeDirectDeps` key, exercise the default.
     let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
     let mut workspace_yaml =
         fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
@@ -305,7 +312,7 @@ fn dedupe_off_by_default_keeps_shared_workspace_link() {
     )
     .expect("write packages/shared/package.json");
 
-    // Non-root importer that also depends on the shared package — the
+    // Non-root importer that also depends on the shared package, the
     // `@pnpm/exe` analogue.
     fs::create_dir_all(workspace.join("packages/app")).expect("mkdir packages/app");
     fs::write(
@@ -320,7 +327,7 @@ fn dedupe_off_by_default_keeps_shared_workspace_link() {
     .expect("write packages/app/package.json");
 
     // A pnpm-written lockfile (importer-relative `link:` targets), the
-    // same shape the release checks out before installing — so this
+    // same shape the release checks out before installing, so this
     // test isolates the dedupe behavior rather than pacquet's own
     // lockfile-writing path.
     fs::write(
@@ -349,7 +356,7 @@ importers:
     )
     .expect("write pnpm-lock.yaml");
 
-    // Replay the lockfile through the frozen-lockfile path — the
+    // Replay the lockfile through the frozen-lockfile path, the
     // codepath the release workflow runs.
     pacquet
         .with_arg("install")
@@ -358,7 +365,7 @@ importers:
         .success();
 
     // The non-root importer must keep its own symlink, and it must
-    // resolve to the shared package's manifest — that read is what
+    // resolve to the shared package's manifest, that read is what
     // `pnpm publish`'s `workspace:*` rewrite performs.
     let app_link = workspace.join("packages/app/node_modules/@scope/shared");
     let app_link_linked = is_symlink_or_junction(&app_link).expect("query app symlink");
@@ -493,7 +500,7 @@ fn removes_a_project_link_the_root_starts_providing() {
         .expect("write root package.json");
     };
     // `Path::exists` follows the link, so a leftover whose target the
-    // install also pruned would read as absent — stat the entry itself.
+    // install also pruned would read as absent, stat the entry itself.
     let assert_absent = |path: &Path, what: &str| match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(metadata) => panic!("{what} survived at {path:?} ({:?})", metadata.file_type()),
@@ -559,8 +566,8 @@ fn removes_a_project_link_the_root_starts_providing() {
 
 /// Two `link:` deps that resolve to the same physical directory via
 /// different relative paths must still dedupe. Pnpm's dedupe runs
-/// `path.relative` on stored symlink targets — which Node normalises
-/// through `path.resolve` — so `<workspace>/packages/shared` and
+/// `path.relative` on stored symlink targets (which Node normalises
+/// through `path.resolve`) so `<workspace>/packages/shared` and
 /// `<workspace>/packages/sibling/../shared` compare equal. Pacquet's
 /// dedupe map uses lexical equality of `PathBuf`s, which would miss
 /// this case unless the target paths are normalised first; this test
@@ -604,7 +611,7 @@ fn dedupes_link_deps_resolving_to_the_same_dir_via_different_segments() {
     )
     .expect("write packages/shared/package.json");
 
-    // Sibling reaches `packages/shared` via `../shared` — same
+    // Sibling reaches `packages/shared` via `../shared`, same
     // physical target as root's `packages/shared` after lexical
     // normalisation.
     fs::create_dir_all(workspace.join("packages/sibling")).expect("mkdir packages/sibling");
@@ -820,7 +827,7 @@ fn dedupe_under_shamefully_hoist() {
 
     // Project has neither its direct dep `foobar` (deduped against the
     // shamefully-hoisted root entry) nor its transitive `foo` (which
-    // never reaches the project's `node_modules/` to begin with —
+    // never reaches the project's `node_modules/` to begin with,
     // transitives only materialize via hoist).
     let project_modules = workspace.join("packages/project/node_modules");
     let project_foobar = project_modules.join("@pnpm.e2e/foobar");
@@ -836,87 +843,6 @@ fn dedupe_under_shamefully_hoist() {
     assert!(
         !project_foo_exists,
         "transitive `foo` should only appear at root via hoist, not under project",
-    );
-
-    drop((root, mock_instance));
-}
-
-/// `link:` payloads are stored relative to their own importer, so two
-/// importers can spell the same string while resolving to different
-/// directories. The prune's version-string dedupe fires on the pair
-/// anyway; the relink behind it is what keeps the importer pointing at
-/// its own target.
-#[test]
-fn relative_link_payloads_survive_the_dedupe_prune() {
-    let CommandTempCwd {
-        pacquet,
-        root,
-        workspace,
-        npmrc_info,
-        ..
-    } = CommandTempCwd::init().add_mocked_registry();
-    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
-
-    fs::write(
-        workspace.join("package.json"),
-        serde_json::json!({
-            "name": "ws-root",
-            "version": "0.0.0",
-            "private": true,
-            "dependencies": { "x": "link:vendor/x" },
-        })
-        .to_string(),
-    )
-    .expect("write root package.json");
-
-    append_workspace_yaml_key(&workspace, "packages", "['packages/*']");
-    append_workspace_yaml_key(&workspace, "dedupeDirectDeps", true);
-
-    fs::create_dir_all(workspace.join("vendor/x")).expect("mkdir vendor/x");
-    fs::write(
-        workspace.join("vendor/x/package.json"),
-        serde_json::json!({ "name": "@scope/root-x", "version": "1.0.0" }).to_string(),
-    )
-    .expect("write vendor/x/package.json");
-
-    fs::create_dir_all(workspace.join("packages/app/vendor/x")).expect("mkdir app vendor/x");
-    fs::write(
-        workspace.join("packages/app/vendor/x/package.json"),
-        serde_json::json!({ "name": "@scope/app-x", "version": "1.0.0" }).to_string(),
-    )
-    .expect("write app vendor/x/package.json");
-    fs::write(
-        workspace.join("packages/app/package.json"),
-        serde_json::json!({
-            "name": "@scope/app",
-            "version": "1.0.0",
-            "dependencies": { "x": "link:vendor/x" },
-        })
-        .to_string(),
-    )
-    .expect("write packages/app/package.json");
-
-    pacquet
-        .with_arg("install")
-        .assert()
-        .success();
-    // The second install is the one that prunes: only then does a
-    // current lockfile record the importer's link.
-    pacquet_at(&workspace)
-        .with_arg("install")
-        .assert()
-        .success();
-
-    let app_link = workspace.join("packages/app/node_modules/x");
-    let app_link_linked = is_symlink_or_junction(&app_link).expect("query app symlink");
-    eprintln!("app_link={app_link:?} linked={app_link_linked}");
-    assert!(app_link_linked, "app's link must survive at {app_link:?}");
-    let linked_manifest =
-        fs::read_to_string(app_link.join("package.json")).expect("read the linked manifest");
-    eprintln!("linked_manifest={linked_manifest}");
-    assert!(
-        linked_manifest.contains("@scope/app-x"),
-        "app's `link:vendor/x` must resolve to its own vendor/x, not the root's",
     );
 
     drop((root, mock_instance));

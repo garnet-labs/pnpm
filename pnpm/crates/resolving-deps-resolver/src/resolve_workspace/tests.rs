@@ -3,9 +3,15 @@
 
 mod lockfile_fixtures;
 use lockfile_fixtures::{
-    graph_versions_of, importer_scoped_update_lockfile, lockfile_recording_time,
-    lockfile_with_package, recorded_time, resolve_importer_scoped_update_direct,
-    resolve_pinned_versus_fresh, reuse_graph_lockfile, reuse_steal_lockfile,
+    graph_versions_of,
+    importer_scoped_update_lockfile,
+    lockfile_recording_time,
+    lockfile_with_package,
+    recorded_time,
+    resolve_importer_scoped_update_direct,
+    resolve_pinned_versus_fresh,
+    reuse_graph_lockfile,
+    reuse_steal_lockfile,
 };
 
 mod optional_dependencies;
@@ -23,34 +29,68 @@ mod workspace_links;
 
 mod resolution_order;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+mod snapshot_budget;
+
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::{
     collections::BTreeMap,
     str::FromStr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc,
+        Mutex,
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
     },
 };
 
-use chrono::{DateTime, Utc};
-use pnpm_lockfile::{DirectoryResolution, LockfileResolution, RegistryContext};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use jiff::Timestamp;
+use pnpm_lockfile::{
+    DirectoryResolution,
+    LockfileResolution,
+    RegistryContext,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_resolving_resolver_base::{
-    LatestQuery, LinkWorkspacePackages, NoMatchingVersionError, PkgResolutionId, PreferredVersions,
-    RegistryResponseError, RegistryResponseErrorOptions, ResolveError, ResolveFuture,
-    ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver, WantedDependency,
+    LatestQuery,
+    LinkWorkspacePackages,
+    NoMatchingVersionError,
+    PkgResolutionId,
+    PreferredVersions,
+    RegistryResponseError,
+    RegistryResponseErrorOptions,
+    ResolveError,
+    ResolveFuture,
+    ResolveLatestFuture,
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
+    WantedDependency,
 };
 use pretty_assertions::assert_eq;
 
-use super::{WorkspaceImporter, WorkspaceResolveOptions, resolve_workspace};
+use super::{
+    WorkspaceImporter,
+    WorkspaceResolveOptions,
+    resolve_workspace,
+};
 use crate::{
     resolve_importer::ResolveImporterOptions,
-    tests::{RecordedReadPackageCalls, RecordingHooks},
+    tests::{
+        RecordedReadPackageCalls,
+        RecordingHooks,
+    },
 };
 
 /// The `(pick_lowest_version, published_by)` pair recorded per alias.
-type RecordedOpts = (bool, Option<DateTime<Utc>>);
+type RecordedOpts = (bool, Option<Timestamp>);
 
 /// Resolver fed from a `(alias, range)` → `ResolveResult` table that
 /// records the [`RecordedOpts`] each alias was last resolved with.
@@ -185,7 +225,12 @@ fn fake_result(
     published_at: Option<&str>,
     manifest: serde_json::Value,
 ) -> ResolveResult {
-    use pnpm_lockfile::{LockfileResolution, PkgName, PkgNameVer, TarballResolution};
+    use pnpm_lockfile::{
+        LockfileResolution,
+        PkgName,
+        PkgNameVer,
+        TarballResolution,
+    };
     let name_ver = PkgNameVer::new(
         PkgName::parse(name).unwrap(),
         node_semver::Version::from_str(version).unwrap(),
@@ -228,7 +273,7 @@ fn fake_manifest(deps: serde_json::Value) -> (tempfile::TempDir, PackageManifest
 
 fn importer_opts(
     project_dir: std::path::PathBuf,
-    published_by: Option<DateTime<Utc>>,
+    published_by: Option<Timestamp>,
 ) -> ResolveImporterOptions {
     ResolveImporterOptions {
         base_opts: ResolveOptions {
@@ -244,11 +289,12 @@ fn importer_opts(
         },
         peers_suffix_max_length: 1000,
         peers: crate::ImporterPeerOptions {
+            explicitly_requested_direct_dependencies: HashSet::default(),
             auto_install_peers: false,
             auto_install_peers_from_highest_match: false,
             resolve_peers_from_workspace_root: false,
             dedupe_peers: false,
-            dedupe_peer_dependents: true,
+            dedupe_peer_dependents: crate::PeerDependentsDedupe::On,
         },
         links: crate::PeerLinkOptions {
             exclude_links_from_lockfile: false,
@@ -281,24 +327,14 @@ fn workspace_opts(pick_lowest_direct: bool, time_based: bool) -> WorkspaceResolv
         peers: crate::WorkspacePeerResolutionOptions {
             dedupe_peers: false,
             dedupe_injected_deps: false,
-            dedupe_peer_dependents: false,
+            dedupe_peer_dependents: crate::PeerDependentsDedupe::Off,
             resolve_peers_from_workspace_root: false,
             exclude_links_from_lockfile: false,
             lockfile_dir: std::path::PathBuf::from("/lockfile-dir"),
             peers_suffix_max_length: 1000,
             auto_install_peers: false,
         },
-        hooks: crate::WorkspaceResolveHooks {
-            read_package_log: None,
-            skipped_optional_log: None,
-            finalized_package: None,
-            deprecation_log: None,
-            manifests: crate::ManifestTransformHooks {
-                manifest_hook: None,
-                overrides_hook: None,
-                pnpmfile_hook: None,
-            },
-        },
+        hooks: crate::WorkspaceResolveHooks::default(),
         reuse: crate::WorkspaceLockfileReuse {
             lockfile: None,
             subtrees: true,
@@ -306,8 +342,10 @@ fn workspace_opts(pick_lowest_direct: bool, time_based: bool) -> WorkspaceResolv
             scope: crate::UpdateReuseScope::All,
             scopes_by_importer: BTreeMap::new(),
             depth: crate::UpdateDepth::UNLIMITED,
+            runtimes: crate::LockedRuntimeReuse::Repick,
         },
         version: crate::WorkspaceVersionResolution { pick_lowest_direct, time_based },
+        parsed_overrides: None,
     }
 }
 
@@ -444,6 +482,7 @@ impl FailureShape {
                 dep: format!("{alias}@{range}"),
                 registry: "https://registry.example/".to_string(),
                 published_versions: format!(r#"The latest release of {alias} is "2.0.0"."#),
+                versions: Vec::new(),
             }),
             FailureShape::RegistryResponse => {
                 Box::new(RegistryResponseError::new(RegistryResponseErrorOptions {
@@ -814,7 +853,7 @@ impl Resolver for WarmupProbeResolver {
             .cloned();
         let (held, release) = self.gate
             .as_ref()
-            .map_or((false, false), |(held, release)| (*held == alias, *release == alias));
+            .map_or_default(|(held, release)| (*held == alias, *release == alias));
         if release {
             self.released.store(true, std::sync::atomic::Ordering::Release);
         }

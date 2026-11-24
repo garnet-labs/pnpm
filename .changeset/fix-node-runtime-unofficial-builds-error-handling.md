@@ -1,7 +1,4 @@
 ---
-"@pnpm/engine.runtime.node-resolver": patch
-"@pnpm/crypto.shasums-file": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

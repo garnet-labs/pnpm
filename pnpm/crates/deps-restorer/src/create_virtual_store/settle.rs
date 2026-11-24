@@ -3,11 +3,17 @@
 //! imports, and the cached git-prepare policy.
 
 use super::{
-    CreateVirtualStore, CreateVirtualStoreError, PrefetchTask, snapshot_plan,
+    CreateVirtualStore,
+    CreateVirtualStoreError,
+    PrefetchTask,
+    snapshot_plan,
     warm::enforce_cached_git_prepare_policy,
 };
-use pnpm_lockfile::{PackageKey, PackageMetadata};
-use pnpm_store_dir::{SharedVerifiedFilesCache, StoreDir};
+use pnpm_lockfile::{
+    PackageKey,
+    PackageMetadata,
+};
+use pnpm_store_dir::SharedVerifiedFilesCache;
 use pnpm_tarball::PrefetchResult;
 use std::collections::HashMap;
 
@@ -63,13 +69,13 @@ impl CreateVirtualStore<'_> {
             return prefetched;
         }
         let imported_keys = imported_cache_keys(plan, &prefetched);
-        let store_dir: &'static StoreDir = &self.ctx.config.store_dir;
+        let store_dir = self.ctx.config.store_dir.clone();
         let verified_files_cache = SharedVerifiedFilesCache::clone(verified_files_cache);
         tokio::task::spawn_blocking(move || {
             let verify_start = std::time::Instant::now();
             let failed = prefetched.verify_rows(
                 imported_keys.iter().map(String::as_str),
-                store_dir,
+                &store_dir,
                 &verified_files_cache,
             );
             tracing::debug!(

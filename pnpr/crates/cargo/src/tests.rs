@@ -1,12 +1,30 @@
 use super::{
-    CrateArchiveError, CrateDocument, CrateNameError, DependencyKind, IndexConfig, IndexEntry,
-    MAX_DESCRIPTION_LEN, PublishBodyError, PublishMetadata, SearchCrate, bounded_description,
-    crate_filename, download_url, parse_index, parse_publish_body,
-    publishing::validate_crate_archive_with_limit, render_index, sparse_index_path,
-    validate_crate_archive, validate_crate_name,
+    CrateArchiveError,
+    CrateDocument,
+    CrateNameError,
+    DependencyKind,
+    IndexConfig,
+    IndexEntry,
+    MAX_DESCRIPTION_LEN,
+    PublishBodyError,
+    PublishMetadata,
+    SearchCrate,
+    bounded_description,
+    crate_filename,
+    download_url,
+    parse_index,
+    parse_publish_body,
+    publishing::validate_crate_archive_with_limit,
+    render_index,
+    sparse_index_path,
+    validate_crate_archive,
+    validate_crate_name,
 };
 use serde_json::json;
-use std::{collections::BTreeMap, io::Write as _};
+use std::{
+    collections::BTreeMap,
+    io::Write as _,
+};
 
 pub(crate) fn crate_archive(root: &str, files: &[(&str, &str)]) -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -234,7 +252,7 @@ fn index_files_round_trip_through_the_document() {
     let entries = parse_index(text).unwrap();
     assert_eq!(entries.len(), 2);
     assert!(entries[1].yanked);
-    let mut document = CrateDocument::new("demo");
+    let mut document = CrateDocument::new("demo".to_owned());
     document.versions.clone_from(&entries);
     let reparsed = CrateDocument::parse(&document.to_bytes()).unwrap();
     assert_eq!(reparsed, document);
@@ -274,6 +292,22 @@ fn crate_archive_must_hold_the_crate_it_claims() {
     ));
 
     assert_eq!(crate_filename("demo", "0.1.0"), "demo-0.1.0.crate");
+}
+
+#[test]
+fn crate_archive_paths_are_unique_without_regard_to_ascii_case() {
+    let archive = crate_archive(
+        "sample-1.0.0",
+        &[
+            ("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"1.0.0\""),
+            ("Readme", ""),
+            ("README", ""),
+        ],
+    );
+    assert!(matches!(
+        validate_crate_archive(&archive, "sample", "1.0.0"),
+        Err(CrateArchiveError::InvalidPath { .. })
+    ));
 }
 
 #[test]
@@ -321,7 +355,7 @@ fn crate_archive_rejects_traversal_and_links() {
         assert!(
             matches!(
                 validate_crate_archive(&archive, "demo", "0.1.0"),
-                Err(CrateArchiveError::EntryOutsideRoot { .. }
+                Err(CrateArchiveError::InvalidPath { .. }
                     | CrateArchiveError::UnsupportedEntry { .. })
             ),
             "{path}",
@@ -409,7 +443,7 @@ fn entry(vers: &str, yanked: bool) -> IndexEntry {
 
 #[test]
 fn max_version_prefers_the_newest_release_that_is_not_yanked() {
-    let mut document = CrateDocument::new("demo");
+    let mut document = CrateDocument::new("demo".to_owned());
     document.versions = vec![entry("0.9.0", false), entry("1.10.0", false), entry("1.9.0", false)];
 
     // Semver ordering, not lexicographic: 1.10.0 is newer than 1.9.0.
@@ -426,12 +460,12 @@ fn max_version_prefers_the_newest_release_that_is_not_yanked() {
 
 #[test]
 fn a_document_with_no_release_has_no_max_version() {
-    assert_eq!(CrateDocument::new("demo").max_version(), None);
+    assert_eq!(CrateDocument::new("demo".to_owned()).max_version(), None);
 }
 
 #[test]
 fn a_search_row_carries_the_name_as_published() {
-    let mut document = CrateDocument::new("Inflector");
+    let mut document = CrateDocument::new("Inflector".to_owned());
     document.versions = vec![entry("0.11.4", false)];
     document.description = Some("A crate".to_string());
 

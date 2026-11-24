@@ -1,11 +1,26 @@
-use crate::{remove_dirent, test_support::with_retry_observer};
+use crate::{
+    remove_dirent,
+    test_support::with_retry_observer,
+};
+use command_extra::CommandExtra;
 use std::{
-    env, fs, io,
+    env,
+    fs,
+    io,
     os::windows::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::{
+        Command,
+        Stdio,
+    },
     sync::mpsc,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 use tempfile::tempdir;
 
@@ -23,7 +38,7 @@ fn assert_removal_recovers(
     let mut first_failure = None;
     let (sender, receiver) = mpsc::channel();
     let result = with_retry_observer(
-        target,
+        target.to_path_buf(),
         move |attempt| {
             sender
                 .send(
@@ -117,10 +132,10 @@ fn directory_removal_waits_out_a_running_executable() {
     // The copy of cmd.exe reads commands from its stdin and runs until it is
     // killed or its stdin closes.
     let mut program = Command::new(&executable)
-        .args(["/d", "/q"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .with_args(["/d", "/q"])
+        .with_stdin(Stdio::piped())
+        .with_stdout(Stdio::null())
+        .with_stderr(Stdio::null())
         .spawn()
         .unwrap();
     const ERROR_ACCESS_DENIED: i32 = 5;

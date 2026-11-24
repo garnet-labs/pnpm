@@ -3,7 +3,7 @@
 ## Table of contents
 
 - [Setting Up the Environment](#setting-up-the-environment)
-  - [JavaScript and TypeScript CLI](#javascript-and-typescript-cli)
+  - [pnpm and Node.js tooling](#pnpm-and-nodejs-tooling)
   - [Rust toolchain and git hooks](#rust-toolchain-and-git-hooks)
 - [Working with Git Worktrees](#working-with-git-worktrees)
 - [Running Tests](#running-tests)
@@ -22,28 +22,17 @@
 
 ## Setting Up the Environment
 
-The repository holds two implementations of the same package manager: the TypeScript pnpm CLI and the Rust `pacquet` port (plus the Rust `pnpr` registry server). Most contributions touch Rust, but the two stacks share one workspace, so set up both.
+The repository holds the Rust pnpm CLI (`pacquet`), the Rust `pnpr` registry server, and a few TypeScript and JavaScript packages and scripts, such as the `get-pnpm` installer.
 
-### JavaScript and TypeScript CLI
+### pnpm and Node.js tooling
 
-1. Install pnpm using one of the [official installation methods](https://pnpm.io/installation). **Do not use Corepack.** The scripts in this repository invoke pnpm through the `pn` and `pnx` aliases, which the official installation methods create. Corepack only provides the `pnpm` and `pnpx` commands, so with a Corepack-managed pnpm the build fails with errors like `pn: Permission denied` ([pnpm/pnpm#12448](https://github.com/pnpm/pnpm/issues/12448)).
+1. Install pnpm using one of the [official installation methods](https://pnpm.io/installation). **Do not use Corepack.** The scripts in this repository invoke pnpm through the `pn` and `pnx` aliases, which the official installation methods create. Corepack only provides the `pnpm` and `pnpx` commands, so with a Corepack-managed pnpm the scripts fail with errors like `pn: Permission denied` ([pnpm/pnpm#12448](https://github.com/pnpm/pnpm/issues/12448)).
 1. Set up the Rust tools first, as described under [Rust toolchain and git hooks](#rust-toolchain-and-git-hooks).
 1. Run `pnpm install` in the root of the repository to install all dependencies.
-1. Run `pnpm add ./pnpm11/pnpm/dev -g` to make pnpm from the repository available in the command line via the `pd` command.
-1. Run `pnpm run compile` to create an initial build of pnpm from the source in the repository.
-1. Now you can change any source code file and run `pd [command] [flags]` to run `pnpm` directly from the source code by compiling all the files without typechecking in memory.
-1. Alternatively, for recompiling all the projects with typechecking after your changes, again run `pnpm run compile` in the root of the repository.
-1. Run the tests for what you changed rather than the whole repository, which takes a long time: `pnpm test` inside a project's directory, `pnpm --filter <project name> test` from the root, or `pnpm --filter <project name> test <file path>` for a single file. `pnpm run test-all` runs the whole TypeScript suite on the rare occasion you need it; the Rust and `pnpr` suites are separate, and are covered in [`pnpm/CONTRIBUTING.md`](./pnpm/CONTRIBUTING.md).
-
-Some of the e2e tests run node-gyp, so you might need to install some build-essentials on your system for those tests to pass. On Fedora, install these:
-
-```shell
-sudo dnf install make automake gcc gcc-c++ kernel-devel
-```
 
 ### Rust toolchain and git hooks
 
-Rust is now the primary language in this repository, so most contributions need a working Rust toolchain and the Rust developer tools. The Rust workspace (`Cargo.toml`, `rust-toolchain.toml`, `justfile`) lives at the repository root; run `cargo` and `just` from there.
+Most contributions need a working Rust toolchain and the Rust developer tools. The Rust workspace (`Cargo.toml`, `rust-toolchain.toml`, `justfile`) lives at the repository root; run `cargo` and `just` from there.
 
 1. Install [`rustup`](https://rustup.rs). `pnpm install` installs the toolchain `rust-toolchain.toml` pins, and the root `package.json` scripts run it. rustup provides the `cargo` you run outside those scripts, such as through `just`, and the dated nightlies that the [pinned formatter](#rust-formatting) and the dylint check build with.
 
@@ -73,7 +62,7 @@ Every crate reaches the build this way, in CI as well as locally. Cargo resolves
 
 The block is a function of `Cargo.lock`, so an install regenerates it byte for byte and leaves `git status` clean. It changes only when a git-sourced dependency moves to a new revision, and that change belongs in the same commit as the lockfile. Rust CI fails if the two drift apart.
 
-Make sure `~/.cargo/bin` is on your `PATH`, ahead of any system-wide Rust in `/usr/bin`. `rustup`'s installer adds this entry through `~/.cargo/env`; ensure your shell sources it. This matters for the git hooks. The `pnpm install` step above wires up husky. Its `pre-commit` hook formats the Rust files being committed, as described under [Rust formatting](#rust-formatting), and its `pre-push` hook runs the Rust checks in `pnpm/scripts/pre-push-rust.sh` (format, doc, dylint, typos) alongside the TypeScript compile and lint. That script locates `cargo`, `rustup`, `taplo`, `typos`, and `cargo-dylint` through `PATH`, and it **skips** a check when the tool is not found rather than failing. A push that appears to pass locally with the tools off `PATH` has silently skipped the format, doc, and dylint checks, so those problems surface only in CI.
+Make sure `~/.cargo/bin` is on your `PATH`, ahead of any system-wide Rust in `/usr/bin`. `rustup`'s installer adds this entry through `~/.cargo/env`; ensure your shell sources it. This matters for the git hooks. The `pnpm install` step above points git at the hooks in `.config/githooks/`. The `pre-commit` hook formats the Rust files being committed, as described under [Rust formatting](#rust-formatting), and the `pre-push` hook runs the Rust checks in `pnpm/scripts/pre-push-rust.sh` (format, doc, dylint, typos) alongside the TypeScript checks. That script locates `cargo`, `rustup`, `taplo`, `typos`, and `cargo-dylint` through `PATH`, and it **skips** a check when the tool is not found rather than failing. A push that appears to pass locally with the tools off `PATH` has silently skipped the format, doc, and dylint checks, so those problems surface only in CI.
 
 For the full Rust development workflow (checks, tests, benchmarks, and the code style guide), see [`pnpm/CONTRIBUTING.md`](./pnpm/CONTRIBUTING.md).
 
@@ -156,11 +145,13 @@ One-time setup:
    cd ~/src/pnpm/pnpm
    ```
 
-2. Point Husky at a path that exists inside every worktree (not inside the bare repo's gitdir),
-   so commit and push hooks run when you commit from any worktree:
+2. Point git at the tracked `.config/githooks` directory so the git hooks run when you
+   commit from any worktree. The path is relative, so git resolves it inside whichever
+   worktree you commit from. (`pnpm install` does this for you in the next step; run it
+   yourself if you want the hooks active before the first install.)
 
    ```shell
-   git config core.hooksPath .husky/_
+   git config core.hooksPath .config/githooks
    ```
 
 3. Create the first worktree for `main` and install dependencies:
@@ -235,11 +226,12 @@ Passing a number is interpreted as a PR number. The PR is fetched via
 for both same-repo branches and forks.
 
 For PR worktrees, `git wt <pr-number>` will additionally launch an agent review of the PR via
-the tracked hook at `.git-wt/pr-hook`. The hook defaults to
+the tracked hook at `.config/git-wt/pr-hook`. The hook defaults to
 [Claude Code](https://www.anthropic.com/claude-code), but you can pass another agent CLI name
 after the PR number, for example `git wt 10000 codex`. The hook silently no-ops if the
 requested CLI isn't on your `PATH`, so contributors who don't use an agent aren't affected.
-Requires a version of `@zkochan/git-wt` with per-repo hook lookup.
+Requires `@zkochan/git-wt` 0.0.13 or later, and a shell that has re-run `git-wt init` since
+upgrading.
 
 If you only need the worktree path (e.g. to open it in an editor) without switching directories,
 invoke `git-wt` directly — it's also exposed as a native git subcommand:
@@ -251,22 +243,10 @@ git wt 10000
 
 ## Running Tests
 
-You can run the tests of the project that you modified by going to the project's directory and running:
+Run the tests for what you changed rather than the whole repository. For the Rust workspace, see [`pnpm/CONTRIBUTING.md`](./pnpm/CONTRIBUTING.md#automated-checks). For a TypeScript package, filter by its name:
 
 ```shell
-pnpm test
-```
-
-Alternatively, you can run it from anywhere by specifying the name of the project using the `--filter` option:
-
-```shell
-pnpm --filter core test
-```
-
-If you want to pass options to Jest, use the `pnpm run test` command and append any needed options. For instance, if you want to run a single test in a single file, run:
-
-```shell
-pnpm --filter core run test test/lockfile.ts -t "lockfile has dev deps even when installing for prod only"
+pnpm --filter get-pnpm test
 ```
 
 ## Submitting a Pull Request (PR)
@@ -279,6 +259,8 @@ Before you submit your Pull Request (PR) consider the following guidelines:
   issue, contribute by reviewing or improving that PR instead of opening a
   competing one — duplicate PRs are closed in favor of the first viable one, and
   the effort spent on them (yours and the reviewers') is wasted.
+- Do not submit packaging for a system package manager or app store, such as
+  deb, RPM, or Snap. See [Distribution](PHILOSOPHY.md#distribution).
 - Make your changes in a new git branch:
 
   ```shell

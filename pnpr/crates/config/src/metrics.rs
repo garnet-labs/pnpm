@@ -1,6 +1,9 @@
 use pnpr_error::RegistryError;
 use serde::Deserialize;
-use std::{fmt, net::SocketAddr};
+use std::{
+    fmt,
+    net::SocketAddr,
+};
 
 /// The YAML `metrics:` block. pnpr serves Prometheus metrics only when it is
 /// present, and only to a scraper that holds `token` or reaches `listen`.
@@ -9,7 +12,7 @@ use std::{fmt, net::SocketAddr};
 pub struct MetricsConfig {
     /// The bearer secret a scraper sends.
     #[serde(default)]
-    pub token: Option<String>,
+    pub token: Option<crate::Secret>,
     /// The address of a listener that serves only metrics. When set, the main
     /// listener does not serve them.
     #[serde(default)]

@@ -1,5 +1,10 @@
 use super::{
-    Arc, ResolveDependencyTreeError, ResolveOptions, TreeCtx, link_file_deps_inside_package,
+    Arc,
+    ResolveDependencyTreeError,
+    ResolveOptions,
+    TreeCtx,
+    link_file_deps_inside_package,
+    validate_and_record_non_local_manifest,
 };
 
 pub(super) async fn original_manifest_opts<'a>(
@@ -26,7 +31,7 @@ pub(super) async fn original_manifest_opts<'a>(
 /// before anything downstream sees it. `readPackageHook` (today:
 /// `packageExtensions`) clones the inner `Value` only when it modifies it, so
 /// unrelated manifests keep sharing the resolver's cached `Arc`. Overrides run
-/// last so a pnpmfile hook that replaced the manifest cannot erase them — see
+/// last so a pnpmfile hook that replaced the manifest cannot erase them; see
 /// `WorkspaceTreeCtx::overrides_hook`.
 pub(super) async fn apply_manifest_hooks(
     ctx: &TreeCtx,
@@ -43,7 +48,7 @@ pub(super) async fn apply_manifest_hooks(
     };
     // Directory resolutions carry their directory so the hook can tell a
     // workspace project's dependency instance apart from a registry
-    // manifest — see `HookContext::dir`.
+    // manifest; see `HookContext::dir`.
     let hook_ctx = || pnpm_hooks::HookContext {
         log: ctx.workspace.hooks.read_package_log
             .clone()
@@ -55,10 +60,12 @@ pub(super) async fn apply_manifest_hooks(
             _ => None,
         },
     };
+    let pre_hook = Arc::clone(&manifest);
     let hooked = ctx.workspace.hooks.manifests
         .apply(manifest, hook_ctx)
         .await
         .map_err(ResolveDependencyTreeError::from)?;
+    validate_and_record_non_local_manifest(ctx, result, &pre_hook, &hooked)?;
     result.package.manifest = Some(hooked);
     Ok(())
 }

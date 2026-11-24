@@ -1,14 +1,27 @@
 use super::{
-    super::VirtualStoreLayout, LinkHashParityFixture, make_config, package_metadata,
+    super::VirtualStoreLayout,
+    LinkHashParityFixture,
+    make_config,
+    package_metadata,
     snapshot_with_link,
 };
 use pnpm_lockfile::{
-    LockfileResolution, PackageKey, PackageMetadata, RegistryResolution, SnapshotEntry,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    RegistryResolution,
+    SnapshotEntry,
 };
-use pretty_assertions::{assert_eq, assert_ne};
+use pretty_assertions::{
+    assert_eq,
+    assert_ne,
+};
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[test]
@@ -23,6 +36,7 @@ fn slot_dir_engine_agnostic_with_empty_allow_build_policy() {
     packages.insert(
         key.clone(),
         PackageMetadata {
+            specifiers: None,
             resolution: LockfileResolution::Registry(RegistryResolution {
                 integrity: "sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                     .parse()
@@ -77,6 +91,7 @@ fn full_pkg_id_keeps_patch_hash_when_present() {
     packages.insert(
         metadata_key,
         PackageMetadata {
+            specifiers: None,
             resolution: LockfileResolution::Registry(RegistryResolution {
                 integrity: "sha512-PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"
                     .parse()

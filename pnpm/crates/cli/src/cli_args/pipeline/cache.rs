@@ -2,32 +2,60 @@
 //! cache directory. A proof-of-concept tier of the workspace task cache
 //! RFC (pnpm/rfcs#22): keys cover the script text, the declared env
 //! values, the project's tracked files, the upstream task keys, the
-//! lockfile, and the runtime — with the lockfile hashed whole as a
+//! lockfile, and the runtime, with the lockfile hashed whole as a
 //! deliberate `PoC` stand-in for the per-importer dependency-graph hash the
 //! RFC specifies.
 
+pub(super) use output_globs::OutputGlobs;
+
 use super::{
     capture::CapturedScript,
-    paths::{check_ancestors, check_input_directories, validate_relative_path},
+    paths::{
+        check_ancestors,
+        check_input_directories,
+        validate_relative_path,
+    },
 };
 use crate::process::Command;
-use inputs::{HashedFile, compile_globs};
+use fs_ops::{
+    remove_output_file,
+    replace_output_file,
+};
+use inputs::HashedFile;
 use miette::IntoDiagnostic;
 use pnpm_config::TaskSettings;
 use pnpm_crypto_hash::{
-    create_hex_hash, create_hex_hash_bytes, create_hex_hash_from_file, create_short_hash,
+    create_hex_hash,
+    create_hex_hash_bytes,
+    create_hex_hash_from_file,
+    create_short_hash,
+};
+use pnpm_lockfile::{
+    Lockfile,
+    WantedLockfileSelection,
 };
 use pnpm_workspace_task_scheduler::TaskNode;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::{
     collections::HashMap,
-    env, fs, io,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    env,
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
-use wax::{
-    Glob,
-    walk::{Entry, FileIterator},
+use wax::walk::{
+    Entry,
+    FileIterator,
 };
 
 /// How a task met the cache, for the run report.
@@ -59,17 +87,18 @@ pub struct TaskCache {
     tasks_dir: PathBuf,
     state_dir: PathBuf,
     workspace_root: PathBuf,
-    lockfile_hash: String,
+    lockfile_hashes: Mutex<HashMap<(PathBuf, WantedLockfileSelection), String>>,
     runtime_fingerprint: String,
-    /// Per-project tracked-file hashes, shared by every task of the
-    /// project: enumeration and hashing run once, per-task input specs
-    /// filter the shared list.
+    /// Per-project tracked-file paths from `git ls-files`, shared by every
+    /// task of the project; per-file content hashes live in `file_hashes` so
+    /// excluded or unselected files are never read.
     project_files: Mutex<HashMap<PathBuf, ProjectFiles>>,
+    file_hashes: Mutex<HashMap<PathBuf, Option<String>>>,
 }
 
-/// A project's file set, or why it has none.
+/// A project's tracked-file path list, or why it has none.
 enum ProjectFiles {
-    Hashed(Arc<Vec<HashedFile>>),
+    Tracked(Arc<Vec<String>>),
     Unavailable(InputsUnavailable),
 }
 
@@ -84,23 +113,14 @@ pub enum InputsUnavailable {
     /// Git cannot enumerate the project's files: the project is outside a
     /// work tree, or `git` is not installed. The input contract makes the
     /// default input set the project's Git-tracked and untracked, unignored
-    /// files, so there is no set to hash and the tasks bypass the cache — the
+    /// files, so there is no set to hash and the tasks bypass the cache, the
     /// same bypass a submodule input gets. Unlike the submodule case, this one
     /// is reported: a project Git does not cover is usually an accident the
     /// user can fix.
     NoGit,
 }
 
-impl ProjectFiles {
-    fn hashes(&self) -> ProjectInputHashes {
-        match self {
-            Self::Hashed(files) => Some(Arc::clone(files)),
-            Self::Unavailable(_) => None,
-        }
-    }
-}
-
-/// The project's tracked-file hashes, or `None` when it has no file set.
+/// Selected input-file hashes, or `None` when the project has no file set.
 type ProjectInputHashes = Option<Arc<Vec<HashedFile>>>;
 
 /// One entry of a task's last-outputs record: a file the previous run or
@@ -114,11 +134,21 @@ struct RecordedFile {
 pub struct TaskKeyInputs<'a> {
     pub node: &'a TaskNode,
     pub settings: Option<&'a TaskSettings>,
+    /// The lockfile directory and wanted-lockfile selection governing this project.
+    pub lockfile_dir: &'a Path,
+    pub lockfile_selection: &'a WantedLockfileSelection,
     /// The cache keys of the tasks this task depends on, sorted.
     pub dependency_keys: &'a [&'a str],
+    pub sibling_outputs: &'a [OutputGlobs<'a>],
+    pub environment: TaskKeyEnvironment<'a>,
     /// `(stage, body)` of every script the task runs, in run order.
-    pub environment: &'a HashMap<String, String>,
     pub script_bodies: &'a [(String, String)],
+}
+
+pub struct TaskKeyEnvironment<'a> {
+    pub variables: &'a HashMap<String, String>,
+    pub shell_emulator: bool,
+    pub script_shell: Option<&'a str>,
 }
 
 impl TaskCache {
@@ -128,8 +158,6 @@ impl TaskCache {
         fs::create_dir_all(&tasks_dir)
             .and_then(|()| fs::create_dir_all(&state_dir))
             .map_err(|error| miette::miette!("creating the pipeline cache directories: {error}"))?;
-        let lockfile_hash = create_hex_hash_from_file(&workspace_root.join("pnpm-lock.yaml"))
-            .unwrap_or_else(|_| "no-lockfile".to_string());
         // Resolved from the workspace, not the invoking process: with
         // context-aware toolchains (pnpm's own shims included) the
         // runtime is a function of the directory, and a `--dir`
@@ -148,9 +176,10 @@ impl TaskCache {
             tasks_dir,
             state_dir,
             workspace_root: workspace_root.to_path_buf(),
-            lockfile_hash,
+            lockfile_hashes: Mutex::new(HashMap::new()),
             runtime_fingerprint,
             project_files: Mutex::new(HashMap::new()),
+            file_hashes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -167,13 +196,13 @@ impl TaskCache {
     }
 
     /// Restore a stored task into the working tree. `Err` carries the
-    /// human-readable reason the restore refused — the caller runs the
+    /// human-readable reason the restore refused, the caller runs the
     /// task normally.
     ///
     /// A file is only ever overwritten or deleted when its current
     /// content matches what the previous run or restore left there
     /// (or what the artifact would write anyway). The record therefore
-    /// carries content hashes, not just paths — a path set cannot tell
+    /// carries content hashes, not just paths, a path set cannot tell
     /// "we produced it" apart from "we produced it and the user has
     /// edited it since".
     pub fn restore(
@@ -380,7 +409,7 @@ fn remove_stale_outputs(
     }
     for recorded in stale {
         validate_output_path(project_dir, &recorded.path)?;
-        fs::remove_file(project_dir.join(&recorded.path)).map_err(|error| error.to_string())?;
+        remove_output_file(&project_dir.join(&recorded.path)).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -396,28 +425,25 @@ fn copy_cached_outputs(
         let source = stored.entry_dir.join("outputs").join(rel_path);
         let target = project_dir.join(rel_path);
         validate_output_path(project_dir, rel_path)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        if let Err(error) = fs::copy(&source, &target) {
-            return Err(format!("copying {rel_path}: {error}"));
-        }
-        record.push(RecordedFile {
-            path: rel_path.clone(),
-            hash: create_hex_hash_from_file(&source).unwrap_or_default(),
-        });
+        replace_output_file(&source, &target)
+            .map_err(|error| format!("copying {rel_path}: {error}"))?;
+        let hash = stored.hashes
+            .get(rel_path)
+            .cloned()
+            .unwrap_or_else(|| create_hex_hash_from_file(&source).unwrap_or_default());
+        record.push(RecordedFile { path: rel_path.clone(), hash });
     }
     Ok(record)
 }
 
 fn collect_output_files(project_dir: &Path, outputs: &[String]) -> io::Result<Vec<String>> {
-    let globs = compile_globs(outputs)
+    let globs = OutputGlobs::new(outputs)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    if globs.is_empty() {
+    if globs.include.is_empty() {
         return Ok(Vec::new());
     }
     let mut files = Vec::new();
-    for glob in globs {
+    for glob in &globs.include {
         for entry in glob
             .walk(project_dir)
             .not(wax::any(["**/node_modules/**", "**/.git/**"]))
@@ -433,6 +459,9 @@ fn collect_output_files(project_dir: &Path, outputs: &[String]) -> io::Result<Ve
                 .map_err(|_| io::Error::other("output glob must stay inside the project"))?
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/");
+            if !globs.is_match(&relative) {
+                continue;
+            }
             validate_relative_path(Path::new(&relative))?;
             check_ancestors(project_dir, Path::new(&relative))?;
             files.push(relative);
@@ -468,4 +497,6 @@ fn stage_output_files(
     Ok(record)
 }
 
+mod fs_ops;
 mod inputs;
+mod output_globs;

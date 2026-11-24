@@ -1,19 +1,42 @@
 use super::{
-    super::listing::split_regex_literal, BuildTaskGraphOptions, Config, ExecutionStatus, GraphPkg,
-    HashMap, HashSet, IndexMap, IntoDiagnostic, LogEvent, LogLevel, Path, PathBuf, PnpmLog,
-    ProcessTracker, ProjectGraph, RecursiveRunError, RunArgs, ScriptSelector, TaskGraph, TaskKey,
-    TaskRunExecutionSettings, TaskRunStateContext, TaskSettings, build_task_graph, count_failures,
-    env, filtered_projects_dependencies, find_resume_root, render_project_commands,
-    render_task_graph_dry_run, resume_task_graph_from, reverse_task_graph, task_graph_to_json,
-    task_run_execution_settings, throw_or_filter_hidden_scripts, write_recursive_summary,
+    BuildTaskGraphOptions,
+    Config,
+    ExecutionStatus,
+    GraphPkg,
+    HashMap,
+    HashSet,
+    IndexMap,
+    IntoDiagnostic,
+    LogEvent,
+    LogLevel,
+    Path,
+    PathBuf,
+    PnpmLog,
+    ProcessTracker,
+    ProjectGraph,
+    RecursiveRunError,
+    RunArgs,
+    ScriptSelector,
+    TaskGraph,
+    TaskKey,
+    TaskRunExecutionSettings,
+    TaskRunStateContext,
+    TaskSettings,
+    build_task_graph,
+    count_failures,
+    env,
+    filtered_projects_dependencies,
+    find_resume_root,
+    render_project_commands,
+    render_task_graph_dry_run,
+    resume_task_graph_from,
+    reverse_task_graph,
+    task_graph_to_json,
+    task_run_execution_settings,
+    throw_or_filter_hidden_scripts,
+    write_recursive_summary,
 };
 use pnpm_workspace_projects_graph::BaseProject;
-
-/// Whether a task name addresses scripts by `RegExp` literal rather than by
-/// name.
-fn is_selector_task(task_name: &str) -> bool {
-    split_regex_literal(task_name).is_some()
-}
 
 /// Before anything is dispatched: when no selected project has the
 /// script, the run is a user error, and the tasks `dependsOn` pulled in
@@ -29,7 +52,7 @@ pub(super) fn check_a_project_has_the_script(
     if script_name == "test" || args.if_present || a_project_has_the_script(task_graph) {
         return Ok(());
     }
-    Err(no_requested_script_error(script_name, all_packages_selected).into())
+    Err(no_requested_script_error(script_name.to_owned(), all_packages_selected).into())
 }
 
 /// A script listed in `requiredScripts` must exist in every requested
@@ -48,7 +71,8 @@ pub(super) fn check_required_script(
     }
     let missing: Vec<String> = task_graph
         .values()
-        .filter(|node| node.requested && node.scripts.is_empty())
+        .filter(|node| node.requested)
+        .filter(|node| node.scripts.is_empty())
         .map(|node| project_display_name(graph, &node.project))
         .collect();
     if missing.is_empty() {
@@ -63,7 +87,8 @@ pub(super) fn check_required_script(
 fn project_display_name(graph: &ProjectGraph<GraphPkg<'_>>, project: &Path) -> String {
     graph[project].package
         .manifest_name()
-        .map_or_else(|| project.display().to_string(), str::to_string)
+        .map(str::to_string)
+        .unwrap_or_else(|| project.display().to_string())
 }
 
 pub(super) fn a_project_has_the_script(task_graph: &TaskGraph) -> bool {
@@ -110,9 +135,16 @@ pub(super) fn run_state_settings(
     settings
 }
 
-/// The task graph this run actually schedules: the full graph, or —
-/// under `--resume-from` — the part of it that follows the named project,
+/// The task graph this run actually schedules: the full graph, or
+/// (under `--resume-from`) the part of it that follows the named project,
 /// minus what the previous run already completed.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`script_name` is copied only under `--resume-from`, after the early return, so an owned parameter would allocate on every recursive run."
+    )
+)]
 pub(super) fn resume_task_graph(
     task_run_state_context: &TaskRunStateContext,
     args: &RunArgs,
@@ -128,7 +160,7 @@ pub(super) fn resume_task_graph(
     Ok(resume_task_graph_from(
         full_task_graph.clone(),
         &anchor,
-        script_name,
+        script_name.to_owned(),
         completed_tasks.as_ref(),
     ))
 }
@@ -270,13 +302,7 @@ pub(super) fn run_tasks<'a>(
 /// one at a time, and the default follows the workspace concurrency
 /// setting.
 pub(super) fn run_concurrency(args: &RunArgs, config: &Config, task_count: usize) -> usize {
-    if args.workspace.parallel {
-        return task_count;
-    }
-    if args.sequential {
-        return 1;
-    }
-    usize::try_from(config.workspace_concurrency).unwrap_or(usize::MAX).max(1)
+    super::script_concurrency(config, task_count, args.workspace.parallel, args.sequential)
 }
 
 /// What the run reports once every task has settled.
@@ -318,7 +344,11 @@ pub(super) fn report_run_outcome(
     let failures = count_failures(result);
     if script_name != "test" && !reporting.ran_a_command && failures == 0 && !args.if_present {
         task_run_state.finish()?;
-        return Err(no_requested_script_error(script_name, reporting.all_packages_selected).into());
+        return Err(no_requested_script_error(
+            script_name.to_owned(),
+            reporting.all_packages_selected,
+        )
+        .into());
     }
 
     if args.workspace.report_summary {
@@ -330,8 +360,10 @@ pub(super) fn report_run_outcome(
     task_run_state.finish()
 }
 
-fn no_requested_script_error(script_name: &str, all_packages_selected: bool) -> RecursiveRunError {
-    let script_name = script_name.to_string();
+fn no_requested_script_error(
+    script_name: String,
+    all_packages_selected: bool,
+) -> RecursiveRunError {
     if all_packages_selected {
         RecursiveRunError::NoScript { script_name }
     } else {
@@ -386,8 +418,9 @@ pub(super) fn build_run_task_graph(
         project_dependencies: &project_dependencies,
         select_scripts,
         task_name: script_name,
+        requested_projects: None,
         tasks: run_tasks(args, config),
-        is_selector_task,
+        is_selector_task: ScriptSelector::is_selector,
     });
     if args.workspace.reverse {
         task_graph = reverse_task_graph(&task_graph);

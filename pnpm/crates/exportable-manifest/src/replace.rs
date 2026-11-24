@@ -2,24 +2,36 @@
 //!
 //! Two free functions:
 //!
-//! - [`replace_workspace_protocol`] — the regular-dependency form.
+//! - [`replace_workspace_protocol`], the regular-dependency form.
 //!   Resolves `workspace:` specs against the dependency's already-
 //!   installed `package.json` in `node_modules`.
-//! - [`replace_workspace_protocol_peer_dependency`] — the
+//! - [`replace_workspace_protocol_peer_dependency`], the
 //!   peer-dependency form. Accepts the broader `>=`/`<=`/`>`/`<`
 //!   comparators allowed in peer specs and rewrites every
 //!   `workspace:` segment in place so a compound `a || workspace:>=`
 //!   round-trips correctly.
 
 use std::{
-    collections::HashMap,
+    collections::{
+        HashMap,
+        HashSet,
+    },
     fmt,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
-use pnpm_package_manifest::{PackageManifestError, safe_read_package_json_from_dir};
+use pnpm_package_manifest::{
+    PackageManifestError,
+    safe_read_project_manifest_from_dir,
+};
 use pnpm_workspace_spec::WorkspaceSpec;
 use serde_json::Value;
 
@@ -91,7 +103,7 @@ pub fn replace_workspace_protocol(
     dep_spec: &str,
     dir: &Path,
     modules_dir: Option<&Path>,
-    workspace_packages: Option<&HashMap<String, WorkspacePackageManifest>>,
+    lookup: WorkspacePackageLookup<'_>,
 ) -> Result<String, ReplaceWorkspaceProtocolError> {
     let Some(rest) = dep_spec.strip_prefix("workspace:") else {
         return Ok(dep_spec.to_string());
@@ -99,13 +111,8 @@ pub fn replace_workspace_protocol(
 
     if let Some(parsed) = parse_version_alias_spec(rest) {
         let installed = installed_modules_dir(dir, modules_dir);
-        let target_pkg_name = parsed.alias.unwrap_or(dep_name);
-        let manifest = read_and_check_manifest(
-            dep_name,
-            target_pkg_name,
-            &installed.join(dep_name),
-            workspace_packages,
-        )?;
+        let manifest =
+            read_and_check_manifest(dep_name, parsed.alias, &installed.join(dep_name), lookup)?;
         let token = match parsed.sentinel {
             Some('^') => "^",
             Some('~') => "~",
@@ -115,11 +122,29 @@ pub fn replace_workspace_protocol(
     }
 
     if let Some(relative) = strip_workspace_relative_prefix(dep_spec) {
-        let manifest =
-            read_and_check_manifest(dep_name, dep_name, &dir.join(relative), workspace_packages)?;
+        // A relative spec names its target by path, so the manifest at that
+        // path is authoritative; the name-keyed workspace lookup stays a
+        // fallback only, since `dep_name` may belong to another package.
+        let manifest = read_and_check_manifest(
+            dep_name,
+            None,
+            &dir.join(relative),
+            WorkspacePackageLookup { prefer_workspace_for: None, ..lookup },
+        )?;
         return Ok(published_spec(dep_name, &manifest, ""));
     }
 
+    if let Some(spec) = WorkspaceSpec::parse(dep_spec) {
+        let target = spec.alias.as_deref().unwrap_or(dep_name);
+        if let Some(renamed) = lookup.renamed_range(
+            dep_name,
+            target,
+            &spec.version,
+            &installed_modules_dir(dir, modules_dir),
+        )? {
+            return Ok(renamed);
+        }
+    }
     if rest.contains('@') {
         return Ok(format!("npm:{rest}"));
     }
@@ -137,24 +162,34 @@ pub fn replace_workspace_protocol_peer_dependency(
     dep_spec: &str,
     dir: &Path,
     modules_dir: Option<&Path>,
-    workspace_packages: Option<&HashMap<String, WorkspacePackageManifest>>,
+    lookup: WorkspacePackageLookup<'_>,
 ) -> Result<String, ReplaceWorkspaceProtocolError> {
     if !dep_spec.contains("workspace:") {
         return Ok(dep_spec.to_string());
     }
-    match parsed_peer_spec(dep_spec) {
-        Some(ParsedPeer::Alias(alias)) => return Ok(alias),
-        Some(ParsedPeer::Relative) => {
-            return replace_workspace_protocol(
-                dep_name,
-                dep_spec,
-                dir,
-                modules_dir,
-                workspace_packages,
-            );
-        }
-        None => {}
+    if let Some(spec) = WorkspaceSpec::parse(dep_spec)
+        && let Some(alias) = spec.alias.as_deref()
+    {
+        let range = match spec.version.as_str() {
+            "^" | "~" | "" => "*",
+            range => range,
+        };
+        return Ok(lookup
+            .renamed_range(dep_name, alias, range, &installed_modules_dir(dir, modules_dir))?
+            .unwrap_or_else(|| format!("npm:{alias}@{range}")));
     }
+    if strip_workspace_relative_prefix(dep_spec).is_some() {
+        return replace_workspace_protocol(dep_name, dep_spec, dir, modules_dir, lookup);
+    }
+    resolve_peer_range(dep_name, dep_spec, &installed_modules_dir(dir, modules_dir), lookup)
+}
+
+fn resolve_peer_range(
+    dep_name: &str,
+    dep_spec: &str,
+    installed: &Path,
+    lookup: WorkspacePackageLookup<'_>,
+) -> Result<String, ReplaceWorkspaceProtocolError> {
     // Only the first `workspace:` occurrence is stripped. Rust's
     // `str::replace` is all-occurrence; use `replacen(_, _, 1)` so
     // compound peer specs like `^1.0.0 || workspace:>=1 || workspace:>=2`
@@ -164,12 +199,11 @@ pub fn replace_workspace_protocol_peer_dependency(
     };
 
     if !matched.version.is_empty() {
-        return Ok(dep_spec.replacen("workspace:", "", 1));
+        let range = dep_spec.replacen("workspace:", "", 1);
+        return Ok(lookup.renamed_range(dep_name, dep_name, &range, installed)?.unwrap_or(range));
     }
 
-    let installed = installed_modules_dir(dir, modules_dir);
-    let manifest =
-        read_and_check_manifest(dep_name, dep_name, &installed.join(dep_name), workspace_packages)?;
+    let manifest = read_and_check_manifest(dep_name, None, &installed.join(dep_name), lookup)?;
     let token = if matched.range_group == "*" { "" } else { matched.range_group };
 
     let mut rewritten = String::with_capacity(dep_spec.len());
@@ -177,103 +211,88 @@ pub fn replace_workspace_protocol_peer_dependency(
     rewritten.push_str(token);
     rewritten.push_str(&manifest.version);
     rewritten.push_str(&dep_spec[matched.end..]);
-    Ok(rewritten)
+    Ok(match &manifest.publish_name {
+        Some(name) => registry_spec(dep_name, name, &rewritten),
+        None => rewritten,
+    })
 }
 
-/// What a `workspace:` peer specifier parses as, when it parses as one whole.
-enum ParsedPeer {
-    /// An `npm:` alias the published manifest records verbatim.
-    Alias(String),
-    /// A relative path, which the ordinary rewrite resolves.
-    Relative,
-}
-
-fn parsed_peer_spec(dep_spec: &str) -> Option<ParsedPeer> {
-    let workspace_spec = WorkspaceSpec::parse(dep_spec)?;
-    if let Some(alias) = workspace_spec.alias.as_deref() {
-        return Some(ParsedPeer::Alias(aliased_peer_spec(alias, &workspace_spec.version)));
-    }
-    let relative =
-        workspace_spec.version.starts_with("./") || workspace_spec.version.starts_with("../");
-    relative.then_some(ParsedPeer::Relative)
+/// The manifest a `workspace:` specifier resolves to, read with the same
+/// precedence and fallbacks as [`replace_workspace_protocol`]. A target the
+/// rewrite cannot use, because its manifest lacks a `name` or `version`, is
+/// still returned as found. `None` when `dep_spec` is not a `workspace:`
+/// specifier or names no package at all.
+pub(crate) fn workspace_target_manifest(
+    dep_name: &str,
+    dep_spec: &str,
+    dir: &Path,
+    modules_dir: Option<&Path>,
+    lookup: WorkspacePackageLookup<'_>,
+) -> Result<Option<WorkspacePackageManifest>, ReplaceWorkspaceProtocolError> {
+    let Some(workspace_spec) = WorkspaceSpec::parse(dep_spec) else {
+        return Ok(None);
+    };
+    let (alias, target_dir, lookup) = match strip_workspace_relative_prefix(dep_spec) {
+        Some(relative) => (
+            None,
+            dir.join(relative),
+            WorkspacePackageLookup { prefer_workspace_for: None, ..lookup },
+        ),
+        None => (
+            workspace_spec.alias.as_deref(),
+            installed_modules_dir(dir, modules_dir).join(dep_name),
+            lookup,
+        ),
+    };
+    lookup.resolve_manifest(dep_name, alias, &target_dir)
 }
 
 /// The directory a workspace dependency is installed under: the caller's, or
 /// the project's own `node_modules`.
 fn installed_modules_dir(dir: &Path, modules_dir: Option<&Path>) -> PathBuf {
-    modules_dir.map_or_else(|| dir.join("node_modules"), Path::to_path_buf)
+    modules_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dir.join("node_modules"))
 }
 
 /// The specifier a published manifest records for a workspace dependency: the
 /// resolved version, or an `npm:` alias when the package is published under
 /// another name.
 fn published_spec(dep_name: &str, manifest: &WorkspacePackageManifest, token: &str) -> String {
-    if manifest.name == dep_name {
-        return format!("{token}{version}", version = manifest.version);
+    let name = manifest.publish_name.as_deref().unwrap_or(&manifest.name);
+    registry_spec(dep_name, name, &format!("{token}{}", manifest.version))
+}
+
+fn registry_spec(dep_name: &str, published_name: &str, range: &str) -> String {
+    if published_name == dep_name {
+        range.to_string()
+    } else {
+        format!("npm:{published_name}@{range}")
     }
-    format!("npm:{name}@{token}{version}", name = manifest.name, version = manifest.version)
 }
 
-/// An aliased peer keeps its alias; a range sentinel with no version behind it
-/// widens to `*`, which is what a peer range without a resolved version means.
-fn aliased_peer_spec(alias: &str, version: &str) -> String {
-    let version =
-        if version == "^" || version == "~" || version.is_empty() { "*" } else { version };
-    format!("npm:{alias}@{version}")
-}
-
-/// Read `<dependency_dir>/package.json` and verify the `name` / `version`
-/// fields are present, falling back to the workspace package named
-/// `target_pkg_name`. Surfaces the
-/// `ERR_PNPM_CANNOT_RESOLVE_WORKSPACE_PROTOCOL` error when the
-/// dependency hasn't been installed yet or its manifest is incomplete.
+/// Require a name and version for a dependency whose range needs the workspace version.
 fn read_and_check_manifest(
     dep_name: &str,
-    target_pkg_name: &str,
+    alias: Option<&str>,
     dependency_dir: &Path,
-    workspace_packages: Option<&HashMap<String, WorkspacePackageManifest>>,
+    lookup: WorkspacePackageLookup<'_>,
 ) -> Result<WorkspacePackageManifest, ReplaceWorkspaceProtocolError> {
-    let manifest_from_dir = read_manifest_fields(dependency_dir)?;
-    if let Some(manifest) = &manifest_from_dir
-        && manifest.is_complete()
-    {
-        return Ok(manifest.clone());
-    }
-
-    let workspace_manifest = workspace_packages.and_then(|pkgs| pkgs.get(target_pkg_name));
-    if let Some(manifest) = workspace_manifest
-        && manifest.is_complete()
-    {
-        return Ok(manifest.clone());
-    }
-
-    let found = match manifest_from_dir {
-        Some(manifest) if !manifest.name.is_empty() || !manifest.version.is_empty() => {
-            Some(manifest)
+    match lookup.resolve_manifest(dep_name, alias, dependency_dir)? {
+        Some(manifest) if manifest.is_complete() => Ok(manifest),
+        found => {
+            Err(ReplaceWorkspaceProtocolError::CannotResolve(cannot_resolve_error(dep_name, found)))
         }
-        manifest_from_dir => workspace_manifest.cloned().or(manifest_from_dir),
-    };
-    Err(ReplaceWorkspaceProtocolError::CannotResolve(cannot_resolve_error(dep_name, found)))
+    }
 }
 
-/// The `name` / `version` fields of `<dir>/package.json`, each empty when
-/// absent, or `None` when the file doesn't exist.
+/// Read the dependency at `dir` in project-manifest precedence order.
 fn read_manifest_fields(
     dir: &Path,
 ) -> Result<Option<WorkspacePackageManifest>, ReplaceWorkspaceProtocolError> {
-    let value =
-        safe_read_package_json_from_dir(dir).map_err(ReplaceWorkspaceProtocolError::ReadManifest)?;
-    let field = |value: &Value, key: &str| {
-        value
-            .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    Ok(value.map(|value| WorkspacePackageManifest {
-        name: field(&value, "name"),
-        version: field(&value, "version"),
-    }))
+    let value = safe_read_project_manifest_from_dir(dir)
+        .map_err(ReplaceWorkspaceProtocolError::ReadManifest)?;
+    Ok(value.as_ref().map(WorkspacePackageManifest::from_manifest))
 }
 
 /// Classify an unresolvable dependency by the incomplete manifest that was
@@ -292,17 +311,124 @@ fn cannot_resolve_error(
     CannotResolveWorkspaceProtocolError { dep_name: dep_name.to_string(), package_name, reason }
 }
 
-/// The two fields the rewriters consult on the dependency's manifest.
+/// The fields used to publish a workspace dependency.
 /// `version` is empty when a workspace package was found but its
 /// `package.json` has no `version` field, so the caller can report that
 /// instead of claiming the dependency is not installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePackageManifest {
     pub name: String,
+    pub publish_name: Option<String>,
     pub version: String,
+    /// The package's `"private": true`.
+    pub private: bool,
+}
+
+/// How a workspace dependency's manifest is resolved at publish time: the
+/// packages discovered in the workspace, and which of them take precedence
+/// over the copies installed in `node_modules`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WorkspacePackageLookup<'a> {
+    /// Workspace packages by manifest name, consulted when the dependency
+    /// is not installed, or first, when [`Self::prefer_workspace_for`]
+    /// names it.
+    pub packages: Option<&'a HashMap<String, WorkspacePackageManifest>>,
+    /// Resolve from the workspace manifests before the installed copies,
+    /// but only for the packages named here. `publish --new-version` sets
+    /// this to the packages whose version it rewrote: those manifests carry
+    /// the new version while `node_modules` can still hold the pre-bump
+    /// copies, and every other dependency keeps the installed-copy-first
+    /// resolution a plain publish uses. Applies only to specs resolved by
+    /// name; a relative-path spec always reads the manifest at its target
+    /// path first.
+    pub prefer_workspace_for: Option<&'a HashSet<String>>,
+}
+
+impl WorkspacePackageLookup<'_> {
+    fn resolve_manifest(
+        self,
+        dep_name: &str,
+        alias: Option<&str>,
+        dependency_dir: &Path,
+    ) -> Result<Option<WorkspacePackageManifest>, ReplaceWorkspaceProtocolError> {
+        let target_pkg_name = alias.unwrap_or(dep_name);
+        let workspace_manifest = self.packages.and_then(|pkgs| pkgs.get(target_pkg_name));
+        if let Some(preferred) = self.prefer_workspace_for
+            && preferred.contains(target_pkg_name)
+            && let Some(manifest) = workspace_manifest
+            && manifest.is_complete()
+        {
+            return Ok(Some(manifest.clone()));
+        }
+
+        let manifest_from_dir = read_manifest_fields(dependency_dir)?
+            .filter(|manifest| {
+                alias.is_none_or(|target| manifest.name.is_empty() || manifest.name == target)
+            });
+        if let Some(manifest) = &manifest_from_dir
+            && manifest.is_complete()
+        {
+            return Ok(Some(manifest.clone()));
+        }
+
+        if let Some(manifest) = workspace_manifest
+            && manifest.is_complete()
+        {
+            return Ok(Some(manifest.clone()));
+        }
+
+        Ok(match manifest_from_dir {
+            Some(manifest) if !manifest.name.is_empty() || !manifest.version.is_empty() => {
+                Some(manifest)
+            }
+            manifest_from_dir => workspace_manifest.cloned().or(manifest_from_dir),
+        })
+    }
+
+    fn renamed_range(
+        self,
+        dep_name: &str,
+        target: &str,
+        range: &str,
+        modules_dir: &Path,
+    ) -> Result<Option<String>, ReplaceWorkspaceProtocolError> {
+        let manifest = self.resolve_manifest(dep_name, Some(target), &modules_dir.join(dep_name))?;
+        Ok(manifest
+            .filter(|manifest| manifest.name == target)
+            .and_then(|manifest| manifest.publish_name)
+            .map(|name| registry_spec(dep_name, &name, range)))
+    }
+}
+
+impl<'a> From<Option<&'a HashMap<String, WorkspacePackageManifest>>>
+    for WorkspacePackageLookup<'a>
+{
+    fn from(packages: Option<&'a HashMap<String, WorkspacePackageManifest>>) -> Self {
+        WorkspacePackageLookup { packages, prefer_workspace_for: None }
+    }
 }
 
 impl WorkspacePackageManifest {
+    #[must_use]
+    pub fn from_manifest(manifest: &Value) -> Self {
+        let name = manifest
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Self {
+            name: name.to_string(),
+            publish_name: pnpm_package_manifest::published_name(manifest)
+                .filter(|renamed| *renamed != name)
+                .map(str::to_owned),
+            version: manifest
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            private: manifest.get("private") == Some(&Value::Bool(true)),
+        }
+    }
+
     fn is_complete(&self) -> bool {
         !self.name.is_empty() && !self.version.is_empty()
     }
@@ -399,7 +525,7 @@ fn parse_peer_range_comparator(bytes: &[u8], pos: usize) -> usize {
 }
 
 /// Consume `(\d+|[xX*])(\.(\d+|[xX*])){0,2}` starting at `pos`. Returns
-/// the byte offset one past the consumed region — or `pos` when the
+/// the byte offset one past the consumed region, or `pos` when the
 /// first character isn't a valid part.
 fn parse_peer_version(bytes: &[u8], pos: usize) -> usize {
     let Some(end) = parse_peer_version_part(bytes, pos) else {

@@ -1,7 +1,20 @@
 use super::{
-    CATALOG_FOO, DEP, HELLO, ManifestDeps, NO_DEPS, PARENT, WorkspaceFixture, assert_eq, fs,
-    has_link, has_snapshot, importer_version, importing_started_count, reports_up_to_date,
-    set_dependency, set_version,
+    CATALOG_FOO,
+    DEP,
+    HELLO,
+    ManifestDeps,
+    NO_DEPS,
+    PARENT,
+    WorkspaceFixture,
+    assert_eq,
+    fs,
+    has_link,
+    has_snapshot,
+    importer_version,
+    importing_started_count,
+    reports_up_to_date,
+    set_dependency,
+    set_version,
 };
 
 #[test]
@@ -249,7 +262,9 @@ fn filtered_hoisted_no_optional_install_preserves_unselected_optional_dependenci
 fn filtered_install_succeeds_under_sparse_checkout_when_unselected_catalog_importer_is_missing_from_disk()
  {
     let fixture = WorkspaceFixture::new();
-    fixture.append_workspace_yaml(&format!("catalog:\n  '{CATALOG_FOO}': 1.0.0\n"));
+    fixture.append_workspace_yaml(&format!(
+        "catalog:\n  '{CATALOG_FOO}': 1.0.0\n  '{HELLO}': 1.0.0\n",
+    ));
     let selected = fixture.project(
         "selected",
         "selected",
@@ -260,9 +275,15 @@ fn filtered_install_succeeds_under_sparse_checkout_when_unselected_catalog_impor
         "missing",
         ManifestDeps { prod: &[(CATALOG_FOO, "catalog:")], ..Default::default() },
     );
+    let local = missing.join("local");
+    fs::create_dir(&local).unwrap();
+    fs::write(local.join("package.json"), serde_json::json!({"name": "local", "version": "1.0.0", "peerDependencies": {HELLO: "catalog:"}}).to_string()).unwrap();
+    set_dependency(&missing, "dependencies", "local", "file:./local");
+    set_dependency(&missing, "dependencies", HELLO, "1.0.0");
     fixture.run(["install", "--lockfile-only"]);
 
     fs::remove_dir_all(&missing).expect("simulate sparse checkout omitting packages/missing");
+    set_dependency(&selected, "dependencies", NO_DEPS, "1.0.0");
     fixture.run(["--filter", "selected", "install"]);
 
     assert!(has_link(&selected, HELLO), "selected project must be materialized");
@@ -272,13 +293,119 @@ fn filtered_install_succeeds_under_sparse_checkout_when_unselected_catalog_impor
         "1.0.0",
         "sparse-checkout missing project must remain preserved in wanted lockfile",
     );
-    assert!(
-        wanted.catalogs
-            .as_ref()
-            .and_then(|catalogs| catalogs.get("default"))
-            .is_some_and(|entries| entries.contains_key(CATALOG_FOO)),
-        "catalog entry referenced by sparse-checkout missing project must be preserved",
-    );
+    let catalog = &wanted.catalogs.expect("catalog snapshots")["default"];
+    for alias in [CATALOG_FOO, HELLO] {
+        assert_eq!(catalog[alias].specifier, "1.0.0", "catalog entry for {alias}");
+    }
+}
+
+#[test]
+fn filtered_hoisted_install_drops_projects_missing_from_disk() {
+    for frozen in [false, true] {
+        let fixture = WorkspaceFixture::new();
+        fixture.append_workspace_yaml("nodeLinker: hoisted\n");
+        let project_1 = fixture.project(
+            "project-1",
+            "project-1",
+            ManifestDeps { prod: &[(DEP, "100.0.0")], ..Default::default() },
+        );
+        fixture.project(
+            "project-2",
+            "project-2",
+            ManifestDeps { prod: &[(HELLO, "1.0.0")], ..Default::default() },
+        );
+        let project_3 = fixture.project(
+            "project-3",
+            "project-3",
+            ManifestDeps {
+                prod: &[
+                    (DEP, "100.1.0"),
+                    (PARENT, "100.0.0"),
+                    ("local-pkg", "file:../../local-pkg"),
+                    ("project-2", "workspace:*"),
+                ],
+                ..Default::default()
+            },
+        );
+        let local_pkg = fixture.workspace.join("local-pkg");
+        fs::create_dir(&local_pkg).expect("create local-pkg");
+        fs::write(
+            local_pkg.join("package.json"),
+            serde_json::json!({
+                "name": "local-pkg",
+                "version": "1.0.0",
+                "dependencies": { NO_DEPS: "1.0.0" },
+            })
+            .to_string(),
+        )
+        .expect("write local-pkg/package.json");
+
+        fixture.run(["install"]);
+        assert!(project_3.join("node_modules").exists());
+        assert!(
+            fixture.workspace
+                .join("node_modules")
+                .join(PARENT)
+                .is_dir(),
+        );
+        assert!(fixture.workspace.join("node_modules/local-pkg").is_dir());
+        assert!(
+            fixture.workspace
+                .join("node_modules")
+                .join(NO_DEPS)
+                .is_dir(),
+        );
+
+        fs::remove_dir_all(&project_3).expect("take project-3 off disk");
+        if frozen {
+            fixture.run([
+                "--filter",
+                "project-1",
+                "--filter",
+                "project-2",
+                "install",
+                "--frozen-lockfile",
+            ]);
+        } else {
+            set_dependency(&project_1, "dependencies", CATALOG_FOO, "1.0.0");
+            fixture.run(["--filter", "project-1", "--filter", "project-2", "install"]);
+        }
+
+        assert!(
+            !project_3.exists(),
+            "filtered hoisted install (frozen={frozen}) must not recreate missing project directory",
+        );
+        for removed in [PARENT, "local-pkg", NO_DEPS] {
+            assert!(
+                !fixture.workspace
+                    .join("node_modules")
+                    .join(removed)
+                    .exists(),
+                "exclusive package {removed} of missing project must be pruned from root node_modules (frozen={frozen})",
+            );
+        }
+        assert!(
+            fixture.workspace
+                .join("node_modules")
+                .join(HELLO)
+                .is_dir(),
+            "selected project dependency must remain hoisted (frozen={frozen})",
+        );
+        let current = fixture.current();
+        assert!(
+            !current.importers.contains_key("packages/project-3"),
+            "current lockfile must drop missing importer (frozen={frozen})",
+        );
+        assert!(!has_snapshot(&current, PARENT, "100.0.0"));
+        assert!(!has_snapshot(&current, NO_DEPS, "1.0.0"));
+        let wanted = fixture.wanted();
+        assert!(
+            wanted.importers.contains_key("packages/project-3"),
+            "wanted lockfile must preserve missing importer (frozen={frozen})",
+        );
+        assert!(has_snapshot(&wanted, PARENT, "100.0.0"));
+        assert!(has_snapshot(&wanted, NO_DEPS, "1.0.0"));
+    }
 }
 
 #[test]

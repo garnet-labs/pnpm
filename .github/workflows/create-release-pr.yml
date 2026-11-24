@@ -4,21 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: Branch to release (the PR base; e.g. main or release/11.1).
+        description: Branch to release (the PR base). Run the workflow from the same branch.
         default: main
         required: true
       # Each product is a separate checkbox, so a release can cover any
       # combination. Only the checked products' pending changesets are consumed;
-      # the rest stay in the ledger for a later release. This lets a rapid v12
-      # (Rust) cadence release without dragging the TypeScript CLI (v11) along —
-      # and with it the near-daily "Update available!" notification. Checking
-      # every box releases everything pending.
-      pnpm11:
-        description: Release pnpm v11 (the TypeScript CLI) and the rest of the default lane.
-        type: boolean
-        default: true
+      # the rest stay in the ledger for a later release. Checking every box
+      # releases everything pending.
       pnpm:
-        description: Release pnpm (the Rust CLI, v12 alpha prerelease) and its @pnpm/napi addon.
+        description: Release pnpm (the Rust CLI) and its @pnpm/napi addon.
         type: boolean
         default: true
       pnpr:
@@ -33,8 +27,7 @@ on:
         default: false
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 # Serialize per target so two dispatches for the same branch can't race on the
 # force-pushed release-pr/<target> branch.
@@ -46,36 +39,30 @@ jobs:
   create-release-pr:
     if: github.repository == 'pnpm/pnpm' # Only run on the main repository, not forks
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    env:
-      # The husky hooks are a developer safety net; CI has its own gates. Without
-      # this, `pnpm install` wires the hooks and the pre-push hook runs the full
-      # TS compile/lint plus the Rust clippy/doc sweep during "Commit and push"
-      # (the shallow clone and URL remote make its change detection always
-      # conclude that Rust sources changed).
-      HUSKY: 0
     steps:
+    # Each release branch carries its own copy of this workflow, which knows
+    # that branch's products. release/11 releases pnpm v11 with its copy.
+    - name: Require the workflow from the target branch
+      env:
+        TARGET: ${{ github.event.inputs.target }}
+      run: |
+        if [ "$TARGET" != "$GITHUB_REF_NAME" ]; then
+          echo "::error::Run this workflow from the $TARGET branch to release $TARGET."
+          exit 1
+        fi
     - name: Checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        # Don't persist the write-scoped token in .git/config; the install below
+        # Don't persist the token in .git/config; the install below
         # runs third-party lifecycle scripts. Pushing is done with an explicit,
         # single-use remote URL in the "Commit and push" step.
         persist-credentials: false
 
-    - name: Initialize Rust before dependency installation
-      uses: $/.github/actions/rustup
-      with:
-        restore-cache: false
-
-    - name: Install pnpm and Node
-      uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
-      with:
-        runtime: node@26.3.0
-
     # Base the release on the tip of the target branch, fetched explicitly so the
     # run is correct even when dispatched from another ref. A force-push to
     # release-pr/<target> reuses an already-open release PR for the same target
-    # rather than opening a second.
+    # rather than opening a second. Setup must use the target branch's toolchain
+    # and manifests, and run after checkout before it can modify tracked files.
     - name: Prepare release branch
       env:
         TARGET: ${{ github.event.inputs.target }}
@@ -85,8 +72,18 @@ jobs:
         git fetch origin "$TARGET"
         git checkout -B "release-pr/$TARGET" FETCH_HEAD
 
-    # Refresh .config/npm-signing-keys.json from what npm advertises. pnpm v11,
-    # pnpm v12, and get-pnpm verify package-manager binaries against these keys,
+    - name: Initialize Rust before dependency installation
+      uses: $/.github/actions/rustup
+      with:
+        restore-cache: false
+
+    - name: Install pnpm and Node
+      uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
+      with:
+        runtime: node@26.3.0
+
+    # Refresh .config/npm-signing-keys.json from what npm advertises. pnpm and
+    # get-pnpm verify package-manager binaries against these keys,
     # so a stale set could break verification after a key rotation. The bump
     # step's update-manifests renders the file into each product's copy, and any
     # drift is committed below along with the version bumps, so the new trust
@@ -99,8 +96,8 @@ jobs:
     # nodejs/release-keys list, so a new release signer cannot break Node.js
     # runtime verification. Reviewed in the release PR diff like the npm keys.
     - name: Update embedded Node.js release keys
-      if: github.event.inputs.pnpm11 == 'true'
-      run: node pnpm11/crypto/shasums-file/scripts/update-node-release-keys.mjs --update
+      if: github.event.inputs.pnpm == 'true'
+      run: node .github/scripts/update-node-release-keys.mjs --update
 
     # A refreshed trust root must show up in the changelogs, so synthesize a
     # changeset for whichever key sets drifted before `pnpm bump` consumes the
@@ -116,20 +113,17 @@ jobs:
           drifted="npm registry signing keys"
           cat > .changeset/release-refresh-npm-signing-keys.md <<'EOF'
         ---
-        "@pnpm/deps.security.signatures": patch
         "pnpm": patch
-        "pacquet": patch
         "get-pnpm": patch
         ---
 
         Updated the embedded npm registry signing keys to the set currently advertised by npm.
         EOF
         fi
-        if ! git diff --quiet -- pnpm11/crypto/shasums-file/src/nodeReleaseKeys.ts; then
+        if ! git diff --quiet -- pnpm/crates/crypto-shasums-file/src; then
           drifted="${drifted:+$drifted and }Node.js release keys"
           cat > .changeset/release-refresh-node-release-keys.md <<'EOF'
         ---
-        "@pnpm/crypto.shasums-file": patch
         "pnpm": patch
         ---
 
@@ -144,13 +138,11 @@ jobs:
     # pending in scope) leaves the tree clean and the steps below skip.
     - name: Bump versions
       env:
-        RELEASE_PNPM11: ${{ github.event.inputs.pnpm11 }}
         RELEASE_PNPM: ${{ github.event.inputs.pnpm }}
         RELEASE_PNPR: ${{ github.event.inputs.pnpr }}
         RELEASE_GET_PNPM: ${{ github.event.inputs.get_pnpm }}
       run: |
         args=()
-        [ "$RELEASE_PNPM11" = "true" ] && args+=(--release pnpm11)
         [ "$RELEASE_PNPM" = "true" ] && args+=(--release pnpm)
         [ "$RELEASE_PNPR" = "true" ] && args+=(--release pnpr)
         [ "$RELEASE_GET_PNPM" = "true" ] && args+=(--release get-pnpm)
@@ -171,10 +163,9 @@ jobs:
 
     # One release PR covers every product; the commit subject lists the ones
     # whose version actually changed against the target branch, e.g.
-    # "chore(release): 11.13.0, pacquet 12.0.0-alpha.9, pnpr 0.2.0". When only
-    # the TypeScript CLI bumped, the subject stays the historical bare version.
+    # "chore(release): pnpm 12.3.0, pnpr 0.2.0".
     # `@pnpm/napi` is not listed separately: it is a versioning.fixed group with
-    # pacquet, so it always carries pacquet's version.
+    # pnpm, so it always carries pnpm's version.
     - name: Compose release summary
       id: version
       if: steps.changes.outputs.changed == 'true'
@@ -188,14 +179,13 @@ jobs:
             summary="${summary:+$summary, }${label:+$label }$new"
           fi
         }
-        add "" pnpm11/pnpm/package.json
-        add "pacquet" pnpm/npm/pnpm/package.json
+        add "pnpm" pnpm/npm/pnpm/package.json
         add "pnpr" pnpr/npm/pnpr/package.json
         add "get-pnpm" pnpm/npm/get-pnpm/package.json
         # Changes without a version bump (e.g. refreshed trust-root changesets
         # consumed into changelogs only) still need a commit subject.
         if [ -z "$summary" ]; then
-          summary=$(jq -r .version pnpm11/pnpm/package.json)
+          summary="pnpm $(jq -r .version pnpm/npm/pnpm/package.json)"
         fi
         echo "version=$summary" >> "$GITHUB_OUTPUT"
 

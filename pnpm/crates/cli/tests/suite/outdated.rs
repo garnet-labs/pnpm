@@ -1,18 +1,27 @@
 use crate::_utils::{
-    append_workspace_yaml_key, bravo_dep_mature_up_to_1_0_1_minimum_release_age,
-    set_ignore_dependencies, set_minimum_release_age,
+    append_workspace_yaml_key,
+    bravo_dep_mature_up_to_1_0_1_minimum_release_age,
+    set_ignore_dependencies,
+    set_minimum_release_age,
 };
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     command_env::CommandTestExt,
 };
 use std::{
     ffi::OsStr,
-    fs, io,
+    fs,
+    io,
     path::Path,
-    process::{Command, Stdio},
+    process::{
+        Command,
+        Stdio,
+    },
 };
 use tempfile::TempDir;
 
@@ -20,10 +29,17 @@ const DEP: &str = "@pnpm.e2e/dep-of-pkg-with-1-dep";
 const FOO: &str = "@pnpm.e2e/foo";
 const DEPRECATED: &str = "@pnpm.e2e/deprecated";
 const BRAVO_DEP: &str = "@pnpm.e2e/bravo-dep";
+const HAS_PRERELEASE: &str = "@pnpm.e2e/has-prerelease";
 
 fn setup() -> (TempDir, std::path::PathBuf, AddMockedRegistry) {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
+    (root, workspace, npmrc_info)
+}
+
+fn setup_with_own_registry_storage() -> (TempDir, std::path::PathBuf, AddMockedRegistry) {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
     (root, workspace, npmrc_info)
 }
 
@@ -167,6 +183,29 @@ fn outdated_json_format() {
     drop((root, anchor));
 }
 
+#[test]
+fn outdated_follows_the_dist_tag_on_the_installed_prerelease_channel() {
+    let (root, workspace, anchor) = setup_with_own_registry_storage();
+
+    write_manifest(&workspace, &format!(r#"{{ "{HAS_PRERELEASE}": "3.0.0-rc.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    anchor.set_dist_tag(HAS_PRERELEASE, "2.0.0", "latest");
+    anchor.set_dist_tag(HAS_PRERELEASE, "3.0.0-rc.1", "next");
+
+    let output = pacquet(&workspace, ["outdated", "--format", "json"])
+        .output()
+        .expect("run pacquet outdated");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("outdated --format json should emit valid JSON");
+    let entry = &value[HAS_PRERELEASE];
+    assert_eq!(entry["current"], "3.0.0-rc.0");
+    assert_eq!(entry["latest"], "3.0.0-rc.1");
+
+    drop((root, anchor));
+}
+
 /// A dependency pinned to its `latest` tag is not outdated; the report is
 /// empty and the exit code is zero.
 #[test]
@@ -246,24 +285,161 @@ fn outdated_reports_deprecated_package() {
     drop((root, anchor));
 }
 
-/// Without a lockfile, `outdated` fails with
-/// `ERR_PNPM_OUTDATED_NO_LOCKFILE` rather than silently reporting nothing.
 #[test]
-fn outdated_without_lockfile_errors() {
+fn outdated_reports_newer_version_without_lockfile() {
     let (root, workspace, anchor) = setup();
 
     write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
 
     let output = pacquet(&workspace, ["outdated"]).output().expect("run pacquet outdated");
-    assert!(!output.status.success(), "outdated without a lockfile should fail");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("No lockfile in directory"), "stderr should explain why: {stderr}");
+    assert_eq!(output.status.code(), Some(1), "outdated deps present should exit 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(DEP), "report should mention the package: {stdout}");
+    assert!(stdout.contains("100.0.0"), "report should show the declared range minimum: {stdout}");
+    assert!(stdout.contains("101.0.0"), "report should show the latest version: {stdout}");
 
     drop((root, anchor));
 }
 
 #[test]
-fn recursive_outdated_reports_the_shared_lockfile_directory() {
+fn outdated_reports_installed_version_when_lockfile_is_disabled() {
+    let (root, workspace, anchor) = setup();
+    append_workspace_yaml_key(&workspace, "lockfile", "false");
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    assert!(!workspace.join("pnpm-lock.yaml").exists());
+
+    let output = pacquet(&workspace, ["outdated"]).output().expect("run pacquet outdated");
+    assert_eq!(output.status.code(), Some(1), "outdated deps present should exit 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("100.1.0"), "report should show the installed version: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_reports_dependency_added_after_install_when_lockfile_is_disabled() {
+    let (root, workspace, anchor) = setup();
+    append_workspace_yaml_key(&workspace, "lockfile", "false");
+    write_manifest(&workspace, &format!(r#"{{ "{FOO}": "^1.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    write_manifest(&workspace, &format!(r#"{{ "{FOO}": "^1.0.0", "{DEP}": "^100.0.0" }}"#));
+
+    let output = pacquet(&workspace, ["outdated"]).output().expect("run pacquet outdated");
+    assert_eq!(output.status.code(), Some(1), "outdated deps present should exit 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(DEP), "report should include the added dependency: {stdout}");
+    assert!(stdout.contains("100.0.0"), "report should show the declared range minimum: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_ignores_unresolvable_package_config_overrides_in_a_shared_lockfile() {
+    let (root, workspace, anchor) = setup();
+    append_workspace_yaml_key(
+        &workspace,
+        "packageConfigs",
+        format!("{{ test-outdated: {{ overrides: {{ foo: $missing, '{DEP}': '-' }} }} }}"),
+    );
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+
+    let output = pacquet(&workspace, ["outdated"]).output().expect("run pacquet outdated");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "outdated deps present should exit 1: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(DEP), "report should list the dependency: {stdout}\n{stderr}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn recursive_outdated_reports_installed_versions_when_lockfile_is_disabled() {
+    for shared_workspace_lockfile in [true, false] {
+        let (root, workspace, anchor) = setup();
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            format!(
+                "packages:\n  - packages/*\nlockfile: false\nsharedWorkspaceLockfile: {shared_workspace_lockfile}\n",
+            ),
+        )
+        .expect("write workspace manifest");
+        write_manifest(&workspace, "{}");
+        let project = workspace.join("packages/app");
+        fs::create_dir_all(&project).expect("create workspace project");
+        fs::write(
+            project.join("package.json"),
+            format!(
+                r#"{{ "name": "app", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }} }}"#,
+            ),
+        )
+        .expect("write project manifest");
+        pacquet(&workspace, ["install"]).assert().success();
+
+        let output = pacquet(&workspace, ["outdated", "--recursive"])
+            .output()
+            .expect("run recursive outdated");
+        assert_eq!(output.status.code(), Some(1), "outdated deps present should exit 1");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("100.1.0"),
+            "sharedWorkspaceLockfile: {shared_workspace_lockfile} should show the installed version: {stdout}",
+        );
+
+        drop((root, anchor));
+    }
+}
+
+#[test]
+fn outdated_reports_npm_alias_without_lockfile() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "positive": "npm:{FOO}@^1.0.0" }}"#));
+
+    let output = pacquet(&workspace, ["outdated"]).output().expect("run outdated without lockfile");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(FOO), "report should use the real package name: {stdout}");
+    assert!(stdout.contains("1.0.0"), "report should show the declared range minimum: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_reports_catalog_dependency_without_lockfile() {
+    let (root, workspace, anchor) = setup();
+
+    append_workspace_yaml_key(&workspace, "catalog", format!("{{ '{DEP}': '^100.0.0' }}"));
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "catalog:" }}"#));
+
+    let output = pacquet(&workspace, ["outdated"]).output().expect("run outdated without lockfile");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(DEP), "report should mention the catalog package: {stdout}");
+    assert!(stdout.contains("100.0.0"), "report should show the catalog range minimum: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_catalog_entry_missing_without_lockfile_is_a_catalog_error() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "catalog:" }}"#));
+
+    let output = pacquet(&workspace, ["outdated"]).output().expect("run outdated without lockfile");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "the run should fail: {stderr}");
+    assert!(
+        stderr.contains("ERR_PNPM_CATALOG_ENTRY_NOT_FOUND_FOR_SPEC"),
+        "missing catalog entry should be reported as such: {stderr}",
+    );
+
+    drop((root, anchor));
+}
+
+#[test]
+fn recursive_outdated_reports_newer_versions_without_a_shared_lockfile() {
     let (root, workspace, anchor) = setup();
     fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
         .expect("write workspace manifest");
@@ -282,16 +458,58 @@ fn recursive_outdated_reports_the_shared_lockfile_directory() {
         .output()
         .expect("run recursive outdated without a shared lockfile");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(r#"workspace""#),
-        "error should point to the shared lockfile directory: {stderr}",
-    );
-    assert!(
-        !stderr.contains(r#"app""#),
-        "error should not point to a project-specific lockfile: {stderr}",
-    );
+    assert_eq!(output.status.code(), Some(1), "outdated deps present should exit 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(DEP), "report should mention the package: {stdout}");
+    assert!(stdout.contains("app"), "report should name the dependent: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn recursive_outdated_checks_packages_with_only_excluded_action_selectors() {
+    let (root, workspace, anchor) = setup();
+    fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write workspace manifest");
+    write_manifest(&workspace, "{}");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create workspace project");
+    fs::write(
+        project.join("package.json"),
+        format!(
+            r#"{{ "name": "app", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }} }}"#,
+        ),
+    )
+    .expect("write project manifest");
+
+    let output = pacquet(&workspace, ["outdated", "--recursive", "!actions/checkout"])
+        .output()
+        .expect("run recursive outdated with excluded action selector");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(DEP), "package checks should still run: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_skips_workspace_dependencies_without_a_lockfile() {
+    let (root, workspace, anchor) = setup();
+    fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write workspace manifest");
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "workspace:^100.0.0 || ^101.0.0" }}"#));
+    let dependency = workspace.join("packages/dep");
+    fs::create_dir_all(&dependency).expect("create workspace dependency");
+    fs::write(
+        dependency.join("package.json"),
+        format!(r#"{{ "name": "{DEP}", "version": "101.0.0" }}"#),
+    )
+    .expect("write workspace dependency manifest");
+
+    let output = pacquet(&workspace, ["outdated"])
+        .output()
+        .expect("run outdated with workspace dependency and no lockfile");
+    assert_eq!(output.status.code(), Some(0), "workspace dependencies are not registry updates");
 
     drop((root, anchor));
 }
@@ -329,14 +547,16 @@ fn outdated_recursive_aggregates_workspace_dependents() {
     assert!(
         dependents[0]["location"]
             .as_str()
-            .is_some_and(|path| Path::new(path).ends_with(Path::new("packages").join("app-a"))),
+            .map(Path::new)
+            .is_some_and(|value| value.ends_with(Path::new("packages").join("app-a"))),
         "unexpected app-a location: {}",
         dependents[0]["location"],
     );
     assert!(
         dependents[1]["location"]
             .as_str()
-            .is_some_and(|path| Path::new(path).ends_with(Path::new("packages").join("app-b"))),
+            .map(Path::new)
+            .is_some_and(|value| value.ends_with(Path::new("packages").join("app-b"))),
         "unexpected app-b location: {}",
         dependents[1]["location"],
     );
@@ -445,7 +665,7 @@ fn outdated_recursive_reads_dedicated_project_lockfiles() {
 }
 
 /// A dependency-free manifest is reported as up to date (exit 0) even
-/// when there is no lockfile — the no-lockfile error only fires for a
+/// when there is no lockfile, the no-lockfile error only fires for a
 /// manifest that actually declares dependencies. Ports pnpm's "should
 /// return empty when there is no lockfile and no dependencies".
 #[test]
@@ -559,6 +779,24 @@ fn outdated_npm_alias_override_checks_the_alias_target() {
     drop((root, anchor));
 }
 
+#[test]
+fn outdated_override_checks_the_alias_target_without_lockfile() {
+    let (root, workspace, anchor) = setup();
+
+    append_workspace_yaml_key(
+        &workspace,
+        "overrides",
+        format!("{{ '{DEP}': 'npm:{FOO}@100.1.0' }}"),
+    );
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+
+    let output = pacquet(&workspace, ["outdated"]).output().expect("run outdated without lockfile");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "the alias target is at its latest: {stdout}");
+
+    drop((root, anchor));
+}
+
 /// A project's own overrides, set through `packageConfigs`, apply to it
 /// when it has a lockfile of its own.
 #[test]
@@ -588,6 +826,106 @@ fn outdated_recursive_applies_project_overrides() {
         .expect("run recursive outdated with dedicated lockfiles");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "the alias target is at its latest: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_recursive_applies_project_overrides_without_lockfile() {
+    let (root, workspace, anchor) = setup();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\noverrides:\n  '{DEP}': 'npm:{FOO}@100.1.0'\npackageConfigs:\n  app:\n    overrides: {{}}\n",
+        ),
+    )
+    .expect("write workspace manifest");
+    write_manifest(&workspace, "{}");
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create workspace project");
+    fs::write(
+        project.join("package.json"),
+        format!(
+            r#"{{ "name": "app", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }} }}"#,
+        ),
+    )
+    .expect("write project manifest");
+
+    let output = pacquet(&workspace, ["outdated", "--recursive"])
+        .output()
+        .expect("run recursive outdated without project lockfiles");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(DEP), "the project override should clear the root override: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_recursive_resolves_project_override_references_without_lockfile() {
+    let (root, workspace, anchor) = setup();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\noverrides:\n  '{DEP}': 'npm:{FOO}@100.1.0'\npackageConfigs:\n  app:\n    overrides:\n      '{DEP}': '${DEP}'\n",
+        ),
+    )
+    .expect("write workspace manifest");
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create workspace project");
+    fs::write(
+        project.join("package.json"),
+        format!(
+            r#"{{ "name": "app", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }} }}"#,
+        ),
+    )
+    .expect("write project manifest");
+
+    let output = pacquet(&workspace, ["outdated", "--recursive"])
+        .output()
+        .expect("run recursive outdated without project lockfiles");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(DEP),
+        "the project override reference should resolve: stdout={stdout}, stderr={stderr}",
+    );
+    assert!(stdout.contains("101.0.0"), "the resolved range should be checked: {stdout}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn outdated_resolves_project_override_references_enabled_by_env() {
+    let (root, workspace, anchor) = setup();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "packages:\n  - packages/*\noverrides:\n  '{DEP}': 'npm:{FOO}@100.1.0'\npackageConfigs:\n  app:\n    overrides:\n      '{DEP}': '${DEP}'\n",
+        ),
+    )
+    .expect("write workspace manifest");
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+    let project = workspace.join("packages/app");
+    fs::create_dir_all(&project).expect("create workspace project");
+    fs::write(
+        project.join("package.json"),
+        format!(
+            r#"{{ "name": "app", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }} }}"#,
+        ),
+    )
+    .expect("write project manifest");
+
+    let output = pacquet(&workspace, ["outdated", "--recursive"])
+        .with_env("PNPM_CONFIG_SHARED_WORKSPACE_LOCKFILE", "false")
+        .output()
+        .expect("run recursive outdated with dedicated lockfiles from the environment");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stdout={stdout}, stderr={stderr}");
+    assert!(stdout.contains("101.0.0"), "the resolved range should be checked: {stdout}");
 
     drop((root, anchor));
 }
@@ -1098,6 +1436,38 @@ fn outdated_reports_cargo_and_python_dependencies() {
     assert_eq!(all_report["requests"]["current"], "1.0");
     assert_eq!(all_report["requests"]["latest"], "2.0");
     assert_eq!(all_report["requests"]["wanted"], "1.5");
+
+    let cargo_output =
+        pacquet(&workspace, ["-r", "outdated", "pkg:cargo/foo", "--offline", "--format", "json"])
+            .output()
+            .expect("run recursive outdated for a Cargo purl");
+    assert_eq!(cargo_output.status.code(), Some(1));
+    let cargo_report: serde_json::Value =
+        serde_json::from_slice(&cargo_output.stdout).expect("parse Cargo purl outdated JSON");
+    assert_eq!(cargo_report["foo"]["current"], "1.0.0");
+    assert_eq!(cargo_report["foo"]["latest"], "2.0.0");
+
+    let excluded_cargo_output = pacquet(
+        &workspace,
+        [
+            "-r",
+            "outdated",
+            "pkg:cargo/foo",
+            "pypi:requests",
+            "!pkg:cargo/foo",
+            "--offline",
+            "--format",
+            "json",
+        ],
+    )
+    .output()
+    .expect("run recursive outdated with an excluded Cargo purl");
+    assert_eq!(excluded_cargo_output.status.code(), Some(1));
+    let excluded_cargo_report: serde_json::Value =
+        serde_json::from_slice(&excluded_cargo_output.stdout)
+            .expect("parse excluded Cargo purl outdated JSON");
+    assert!(excluded_cargo_report.get("foo").is_none());
+    assert_eq!(excluded_cargo_report["requests"]["current"], "1.0");
 
     let compat_output =
         pacquet(&workspace, ["outdated", "--compatible", "--offline", "--format", "json"])

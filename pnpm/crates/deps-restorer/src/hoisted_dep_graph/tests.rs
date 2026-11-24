@@ -13,8 +13,10 @@ mod runtimes;
 mod installation;
 
 use super::LockfileToHoistedDepGraphOptions;
-use pnpm_lockfile::{DirectoryResolution, LockfileResolution};
-use std::path::PathBuf;
+use pnpm_lockfile::{
+    DirectoryResolution,
+    LockfileResolution,
+};
 
 fn sample_resolution() -> LockfileResolution {
     DirectoryResolution { directory: "../local-pkg".to_string() }.into()
@@ -29,8 +31,18 @@ const ACCEPTS_DEP_PATH: &str = "accepts@1.3.7";
 // --- Walker tests ----------------------------------------------------
 
 use pnpm_lockfile::{
-    ComVer, Lockfile, LockfileSettings, LockfileVersion, PackageKey, PackageMetadata, PkgName,
-    PkgNameVerPeer, PkgVerPeer, ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec,
+    ComVer,
+    Lockfile,
+    LockfileSettings,
+    LockfileVersion,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    PkgNameVerPeer,
+    PkgVerPeer,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
     SnapshotEntry,
 };
 use std::collections::HashMap;
@@ -60,10 +72,11 @@ fn directory_resolution(directory: &str) -> LockfileResolution {
 }
 
 /// Uses a synthetic `directory:` resolution: walker tests don't exercise
-/// resolution semantics — they only need *some* resolution so the graph node
+/// resolution semantics; they only need *some* resolution so the graph node
 /// has a non-default value to inspect.
 fn metadata_stub() -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: directory_resolution("/dev/null/stub"),
         version: None,
         engines: None,
@@ -111,7 +124,7 @@ fn lockfile_with(
 fn host_aware_opts() -> LockfileToHoistedDepGraphOptions<'static> {
     // Concrete platform values so the installability check has
     // something to compare against. The specific host doesn't
-    // matter — tests assert relative behavior (compatible vs
+    // matter, tests assert relative behavior (compatible vs
     // incompatible) by setting metadata that targets *this*
     // value or its opposite.
     LockfileToHoistedDepGraphOptions {
@@ -122,7 +135,7 @@ fn host_aware_opts() -> LockfileToHoistedDepGraphOptions<'static> {
             current_libc: "glibc".to_string(),
             ..LockfileToHoistedDepGraphOptions::default().installability
         },
-        lockfile_dir: PathBuf::from("/repo"),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(std::path::Path::new("/repo")),
 
         ..LockfileToHoistedDepGraphOptions::default()
     }

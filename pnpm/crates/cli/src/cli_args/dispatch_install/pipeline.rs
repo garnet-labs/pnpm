@@ -1,7 +1,19 @@
 use super::{
-    super::install_test, CommandFuture, Config, InstallArgs, PipelineArgs, PipelineInvocation,
-    ReporterType, RunCtx, UpdateCheckPolicy, WatchInvocation, install_with_config,
-    install_with_update_check, reporter_emit, run_pipeline, run_watch,
+    super::install_test,
+    CommandFuture,
+    Config,
+    InstallArgs,
+    PipelineArgs,
+    PipelineInvocation,
+    ReporterType,
+    RunCtx,
+    UpdateCheckPolicy,
+    WatchInvocation,
+    install_with_config,
+    install_with_update_check,
+    reporter_emit,
+    run_pipeline,
+    run_watch,
 };
 use crate::cli_args::reporter::selected_reporter;
 
@@ -11,7 +23,7 @@ pub(in super::super) fn install_test<'a>(
 ) -> miette::Result<CommandFuture<'a>> {
     let install_args = args.install_args;
     let mut run_args = super::super::run::RunArgs {
-        script: super::super::run::RunArgs::script("test", args.args),
+        script: super::super::run::RunArgs::script("test".to_owned(), args.args),
         if_present: ctx.workspace.if_present,
         sequential: false,
         dry_run: false,
@@ -127,7 +139,7 @@ fn pipeline_invocation(args: PipelineArgs) -> (PipelineInvocation, InstallArgs) 
 }
 
 /// Publish the run to the configured pnpr server. A run that could not be
-/// reported still ran — the submission failure is a warning, not the
+/// reported still ran, the submission failure is a warning, not the
 /// run's exit code.
 async fn report_pipeline_run(
     cfg: &Config,
@@ -159,16 +171,20 @@ async fn report_pipeline_run(
         summary: upload.summary,
         events: upload.events,
     };
+    let display_server = pnpm_network::redact_url_for_display(server);
     match client.publish_pipeline_run(&request, authorization.as_deref()).await {
         Ok(()) => emit(&pnpm_reporter::LogEvent::Pnpm(pnpm_reporter::PnpmLog {
             level: pnpm_reporter::LogLevel::Info,
             message: format!(
-                "Run recorded on {server} as {}/{}/{}",
+                "Run recorded on {display_server} as {}/{}/{}",
                 request.org, request.workspace, request.run_id,
             ),
             prefix: String::new(),
         })),
-        Err(error) => warn(format!("failed to publish the pipeline run to {server}: {error}")),
+        Err(error) => {
+            let reason = pnpm_network::redact_and_sanitize(&error.to_string());
+            warn(format!("failed to publish the pipeline run to {display_server}: {reason}"));
+        }
     }
 }
 

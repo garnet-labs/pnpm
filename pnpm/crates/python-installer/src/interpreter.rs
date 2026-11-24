@@ -18,17 +18,43 @@ mod mismatch;
 mod request;
 mod search;
 
-use super::{host, manifest::Manifest, targets};
-use command::{InterpreterCommand, path_outside, scan_for_interpreters};
+use super::{
+    host,
+    manifest::Manifest,
+    targets,
+};
+use command::{
+    InterpreterCommand,
+    path_outside,
+    scan_for_interpreters,
+};
 use host::Interpreter;
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use mismatch::check_requires_python;
 use pnpm_config::Config;
 use pnpm_network::ThrottledClient;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
 use request::VersionRequest;
-use search::{Fallbacks, Search};
-use std::{ffi::OsString, fmt::Write as _, path::Path, sync::Arc};
+use search::{
+    Fallbacks,
+    Search,
+};
+use std::{
+    ffi::OsString,
+    fmt::Write as _,
+    path::Path,
+    sync::Arc,
+};
 
 const WRITE_TO_STRING: &str = "writing to a String cannot fail";
 
@@ -157,7 +183,9 @@ impl<'a> Interpreters<'a> {
                 return Ok(interpreter);
             }
             Search::Unaccepted(interpreter) => interpreter,
-            Search::None => bail!("{}", self.no_interpreter(root, requires_python, request)),
+            Search::None => {
+                bail!("{}", self.no_interpreter(root, requires_python, request));
+            }
         };
         let accepted = mismatch::accepted::<Reporter>(
             root,
@@ -168,7 +196,7 @@ impl<'a> Interpreters<'a> {
         if accepted {
             return Ok(interpreter);
         }
-        bail!("{}", self.no_interpreter(root, requires_python, request))
+        bail!("{}", self.no_interpreter(root, requires_python, request));
     }
 
     /// Install an interpreter the project accepts, when this machine has
@@ -209,7 +237,9 @@ impl<'a> Interpreters<'a> {
         let command = build.install(self.config, self.client).await?;
         match self.probe(&command).await {
             Probe::Usable(interpreter) => Ok(Some(Arc::clone(interpreter))),
-            Probe::Unusable(reason) => bail!("{reason}"),
+            Probe::Unusable(reason) => {
+                bail!("{reason}");
+            }
         }
     }
 
@@ -225,7 +255,9 @@ impl<'a> Interpreters<'a> {
         let command = InterpreterCommand::program(executable);
         let interpreter = match self.probe(&command).await {
             Probe::Usable(interpreter) => Arc::clone(interpreter),
-            Probe::Unusable(reason) => bail!("{reason}"),
+            Probe::Unusable(reason) => {
+                bail!("{reason}");
+            }
         };
         check_requires_python::<Reporter>(
             root,

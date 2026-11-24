@@ -1,8 +1,18 @@
 use super::{
-    Catalogs, Config, IncludedDependencies, MaybeLazyLockfile, OptimisticRepeatInstallCheck,
-    PackageManifest, Path, PathBuf, build_project_manifests_list,
-    configured_or_discovered_workspace_dir, get_catalogs_from_workspace_manifest,
-    lazy_wanted_lockfile, lockfile_root_for, nothing_to_install::projects_have_nothing_to_install,
+    Catalogs,
+    Config,
+    IncludedDependencies,
+    MaybeLazyLockfile,
+    OptimisticRepeatInstallCheck,
+    PackageManifest,
+    Path,
+    PathBuf,
+    build_project_manifests_list,
+    configured_or_discovered_workspace_dir,
+    get_catalogs_from_workspace_manifest,
+    lazy_wanted_lockfile,
+    lockfile_root_for,
+    nothing_to_install::projects_have_nothing_to_install,
     stand_ins,
 };
 use std::borrow::Cow;
@@ -51,7 +61,10 @@ pub fn check_deps_status_before_run_at(
         workspace_dir_opt.is_some(),
         config.shares_one_lockfile(),
     ) {
-        GateManifest::Found(manifest) => manifest,
+        GateManifest::Found(mut manifest) => {
+            crate::apply_runtime_on_fail(config, &mut manifest);
+            manifest
+        }
         GateManifest::NoManifest => return None,
         GateManifest::Unreadable => return cannot_check_deps(),
     };
@@ -120,7 +133,8 @@ impl GateWorkspace {
             .get_or_init(|| {
                 let manifest = pnpm_workspace::read_workspace_manifest(&self.root).ok()??;
                 let opts = crate::install::checked_projects_opts(config, &manifest);
-                let projects = pnpm_workspace::find_workspace_projects(&self.root, &opts).ok()?;
+                let mut projects = pnpm_workspace::find_workspace_projects(&self.root, &opts).ok()?;
+                crate::apply_runtime_on_fail_to_projects(config, &mut projects);
                 let key = opts.discovery_key(&self.root);
                 Some(DiscoveredProjects { manifest, key, projects })
             })
@@ -144,7 +158,7 @@ pub(super) struct GateInputs<'a> {
 }
 
 /// pnpm reports "cannot check" straight from the missing workspace state,
-/// before any project discovery — a fresh project (the common out-of-sync
+/// before any project discovery, a fresh project (the common out-of-sync
 /// case) must not pay for the workspace-projects walk only to reach the
 /// same verdict inside the check. Projects are walked only when the
 /// manifest itself gives an install nothing to do.
@@ -355,7 +369,7 @@ fn run_gate(
                 supported_architectures: gate.config.supported_architectures.as_ref(),
                 // The gate ignores dependency-group drift, so the groups only
                 // shape the settings snapshot written back after a passing
-                // content check — where the recorded values win anyway.
+                // content check, where the recorded values win anyway.
                 included: IncludedDependencies {
                     dependencies: true,
                     dev_dependencies: true,
@@ -389,14 +403,11 @@ fn load_gated_workspace(
     if !needed {
         return Ok(None);
     }
-    match listed {
-        Some(listed) => pnpm_workspace::read_workspace_projects(listed).map(Some),
-        None => crate::install::load_checked_workspace_projects(
-            config,
-            workspace_root,
-            workspace_manifest,
-        ),
-    }
+    crate::install::read_checked_workspace_projects(
+        config,
+        (workspace_root, workspace_manifest),
+        listed,
+    )
 }
 
 /// The projects the gate compares, and the ones whose commands they link per

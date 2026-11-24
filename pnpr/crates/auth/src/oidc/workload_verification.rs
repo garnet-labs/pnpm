@@ -1,11 +1,19 @@
 use super::{
-    MetadataFreshness, OidcState, OidcWorkload, Provider, Result, Value, match_workload_binding,
-    rejected, token_payload, verify_workload,
+    MetadataFreshness,
+    OidcState,
+    OidcWorkload,
+    Provider,
+    Result,
+    Value,
+    match_workload_binding,
+    rejected,
+    token_payload,
+    verify_workload,
 };
 
 impl OidcState {
     /// Verifies workload credentials against configured issuers only. The returned restrictions
-    /// must be enforced before treating the mapped username as an authenticated caller.
+    /// must be enforced before treating the mapped account ID as an authenticated caller.
     pub async fn workload(&self, raw: &str) -> Result<Option<OidcWorkload>> {
         if !self.providers
             .values()

@@ -1,35 +1,42 @@
-use super::TeamDirectory;
 use std::sync::Arc;
 
 /// A single token in an access list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessToken {
-    /// `$all` — anyone, authenticated or not.
+    /// `$all`: anyone, authenticated or not.
     All,
-    /// `$authenticated` — any caller carrying valid Bearer or Basic
+    /// `$authenticated`: any caller carrying valid Bearer or Basic
     /// credentials.
     Authenticated,
-    /// `$anonymous` — only callers *without* valid credentials.
+    /// `$anonymous`: only callers *without* valid credentials.
     Anonymous,
-    /// `$owners` — package owners / maintainers.
+    /// `$owners`: package owners / maintainers.
     Owners,
-    /// A bare token: a username. Matches an authenticated caller whose
-    /// username equals it — never a team name; teams are referenced with
-    /// the explicit `team:` form.
+    /// An immutable account ID. Teams use the explicit `team:` form.
     User(String),
-    /// A `team:<name>` reference to the owning registry's roster. Matches an
-    /// authenticated caller whose username is a member of `name` at the
-    /// moment the token is evaluated.
-    Team { name: String, directory: TeamDirectory },
+    /// `team:<id>`: the members of the team with that ID.
+    Team(String),
 }
 
-/// Only the `$`-sigiled spellings are built-ins; any other token is a
-/// username, which can only *narrow* access, so this stays infallible.
+/// Only the `$`-sigiled spellings are built-ins; any other token is an
+/// account ID, which can only *narrow* access, so this stays infallible.
 /// Near-miss spellings (verdaccio's `@all`/bare aliases, an unknown
-/// `$...`) and `team:` references are handled at YAML load (`AccessSpec`
-/// in the config module): the former are rejected, the latter resolved
-/// against the registry's declared teams. A programmatic caller passing
+/// `$...`) and `team:` references are handled where the graph document is
+/// read (`AccessSpec` in the config module). A programmatic caller passing
 /// one of those spellings just gets a username that matches nobody.
+impl AccessToken {
+    /// The token an access list entry or a grant subject spells, `team:<id>`
+    /// included. A malformed entry is an account ID nobody has; the config
+    /// crate validates entries where they are written.
+    #[must_use]
+    pub fn parse(entry: &str) -> Self {
+        match entry.strip_prefix("team:") {
+            Some(id) => Self::Team(id.to_string()),
+            None => Self::from(entry),
+        }
+    }
+}
+
 impl From<&str> for AccessToken {
     fn from(token: &str) -> Self {
         match token {
@@ -54,7 +61,7 @@ impl AccessList {
         Self(tokens)
     }
 
-    /// Build from individual built-in or username tokens (e.g. the
+    /// Build from individual built-in or account-ID tokens (e.g. the
     /// elements of a YAML sequence). Each string is one token, taken
     /// verbatim; `team:` references cannot be built this way.
     pub fn from_tokens<Tokens, Token>(tokens: Tokens) -> Self
@@ -95,6 +102,10 @@ impl AccessList {
             .any(|token| matches!(token, AccessToken::Owners))
     }
 
+    pub(crate) fn tokens(&self) -> &[AccessToken] {
+        &self.0
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -104,7 +115,7 @@ impl AccessList {
     pub fn references_team(&self, team: &str) -> bool {
         self.0
             .iter()
-            .any(|token| matches!(token, AccessToken::Team { name, .. } if name == team))
+            .any(|token| matches!(token, AccessToken::Team(id) if id == team))
     }
 
     /// Whether the access list admits every caller regardless of identity.
@@ -125,38 +136,60 @@ impl AccessList {
 }
 
 /// The resolved caller identity an [`AccessList`] is evaluated against: the
-/// authenticated username (or its absence), and the team memberships the
-/// credential itself carries. Rosters live in the [`AccessToken::Team`]
-/// tokens' directory, so a credential that carries no memberships still
-/// reaches its roster teams.
+/// authenticated account ID and login name (or their absence), and the IDs of
+/// the teams the caller belongs to as the request arrives.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
     /// No valid credentials were presented.
     Anonymous,
     /// Authenticated as `username`.
-    User { username: String, memberships: Arc<[Membership]> },
-}
-
-/// A team membership that a credential carries, such as one an OIDC session
-/// earned from its groups claim: membership of `team` in the roster
-/// `directory`, whatever the roster itself lists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Membership {
-    pub directory: TeamDirectory,
-    pub team: String,
+    User { id: String, username: String, teams: Arc<[String]> },
 }
 
 impl Identity {
     #[must_use]
-    pub fn user(username: impl Into<String>) -> Self {
-        Self::member(username, Vec::new())
+    pub fn user(user_id: impl Into<String>) -> Self {
+        Self::member(user_id, Vec::new())
     }
 
-    /// A user whose credential carries `memberships`.
+    /// A user in the teams with the IDs `teams`.
     #[must_use]
-    pub fn member(username: impl Into<String>, memberships: Vec<Membership>) -> Self {
-        Self::User { username: username.into(), memberships: memberships.into() }
+    pub fn member(user_id: impl Into<String>, teams: Vec<String>) -> Self {
+        let id = user_id.into();
+        Self::account_member(id.clone(), id, teams)
+    }
+
+    /// Construct an authenticated account with a separate display name.
+    #[must_use]
+    pub fn account(id: impl Into<String>, username: impl Into<String>) -> Self {
+        Self::account_member(id, username, Vec::new())
+    }
+
+    #[must_use]
+    pub fn account_member(
+        id: impl Into<String>,
+        username: impl Into<String>,
+        teams: Vec<String>,
+    ) -> Self {
+        Self::User { id: id.into(), username: username.into(), teams: teams.into() }
+    }
+
+    /// The IDs of the teams the caller belongs to.
+    #[must_use]
+    pub fn teams(&self) -> &[String] {
+        match self {
+            Self::User { teams, .. } => teams,
+            Self::Anonymous => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn user_id(&self) -> Option<&str> {
+        match self {
+            Self::User { id, .. } => Some(id),
+            Self::Anonymous => None,
+        }
     }
 
     #[must_use]
@@ -172,6 +205,12 @@ impl Identity {
         }
     }
 
+    /// Whether the caller is one of the callers `token` names, given
+    /// whether it owns the package in question.
+    pub(crate) fn matches(&self, token: &AccessToken, is_owner: bool) -> bool {
+        self.satisfies_with_context(token, is_owner)
+    }
+
     fn satisfies(&self, token: &AccessToken) -> bool {
         self.satisfies_with_context(token, false)
     }
@@ -182,15 +221,8 @@ impl Identity {
             (AccessToken::Authenticated, Identity::User { .. }) => true,
             (AccessToken::Anonymous, Identity::Anonymous) => true,
             (AccessToken::Owners, Identity::User { .. }) => is_owner,
-            (AccessToken::User(name), Identity::User { username, .. }) => name == username,
-            (AccessToken::Team { name, directory }, Identity::User { username, memberships }) => {
-                directory.has_member(name, username)
-                    || memberships
-                        .iter()
-                        .any(|membership| {
-                            membership.directory == *directory && membership.team == *name
-                        })
-            }
+            (AccessToken::User(id), Identity::User { id: user_id, .. }) => id == user_id,
+            (AccessToken::Team(team), Identity::User { teams, .. }) => teams.contains(team),
             _ => false,
         }
     }
@@ -205,7 +237,7 @@ impl std::fmt::Display for AccessToken {
             AccessToken::Anonymous => formatter.write_str("$anonymous"),
             AccessToken::Owners => formatter.write_str("$owners"),
             AccessToken::User(name) => formatter.write_str(name),
-            AccessToken::Team { name, .. } => write!(formatter, "team:{name}"),
+            AccessToken::Team(id) => write!(formatter, "team:{id}"),
         }
     }
 }

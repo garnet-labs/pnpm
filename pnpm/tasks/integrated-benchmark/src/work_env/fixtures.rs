@@ -1,15 +1,22 @@
 use super::{
-    PEER_HEAVY_DEPTH, PEER_HEAVY_INTEGRITY, PEER_HEAVY_PROVIDER, PEER_HEAVY_VERSION,
+    PEER_HEAVY_PROVIDER,
+    PEER_HEAVY_VERSION,
     PEER_HEAVY_WIDTH,
 };
 use crate::{
     cli_args::BenchmarkScenario,
     fixtures::PACKAGE_JSON,
-    workspace_manifest::{CargoSettings, MinimalWorkspaceManifest},
+    workspace_manifest::{
+        CargoSettings,
+        MinimalWorkspaceManifest,
+    },
 };
 use serde_json::Value;
 use std::{
-    fs::{self, File},
+    fs::{
+        self,
+        File,
+    },
     io::Write,
     path::Path,
 };
@@ -79,83 +86,6 @@ pub(super) fn peer_heavy_root_manifest() -> String {
     }))
     .expect("serialize peer-heavy root manifest")
 }
-/// Commit the peer-heavy packages to the registry metadata database at
-/// `database`. Their archives are never fetched, so none is written.
-pub(crate) fn seed_peer_heavy_registry(database: &Path) {
-    let mut packuments =
-        vec![peer_heavy_packument(PEER_HEAVY_PROVIDER, &serde_json::Map::new(), false)];
-    for level in 0..PEER_HEAVY_DEPTH {
-        let dependencies = if level + 1 == PEER_HEAVY_DEPTH {
-            serde_json::Map::new()
-        } else {
-            (0..PEER_HEAVY_WIDTH)
-                .map(|index| {
-                    (
-                        peer_heavy_package_name(level + 1, index),
-                        Value::String(PEER_HEAVY_VERSION.to_string()),
-                    )
-                })
-                .collect()
-        };
-        for index in 0..PEER_HEAVY_WIDTH {
-            packuments.push(peer_heavy_packument(
-                &peer_heavy_package_name(level, index),
-                &dependencies,
-                true,
-            ));
-        }
-    }
-    pnpr_fixtures::write_packuments_into(database, packuments);
-}
-pub(super) fn peer_heavy_packument(
-    name: &str,
-    dependencies: &serde_json::Map<String, Value>,
-    has_peer: bool,
-) -> (String, Value) {
-    let manifest = peer_heavy_manifest(name, dependencies, has_peer);
-    let versions = serde_json::Map::from_iter([(PEER_HEAVY_VERSION.to_string(), manifest)]);
-    let time = serde_json::Map::from_iter([
-        ("created".to_string(), Value::String("2020-01-01T00:00:00.000Z".to_string())),
-        ("modified".to_string(), Value::String("2020-01-01T00:00:00.000Z".to_string())),
-        (PEER_HEAVY_VERSION.to_string(), Value::String("2020-01-01T00:00:00.000Z".to_string())),
-    ]);
-    let packument = serde_json::json!({
-        "name": name,
-        "dist-tags": { "latest": PEER_HEAVY_VERSION },
-        "versions": versions,
-        "time": time,
-    });
-    (name.to_string(), packument)
-}
-pub(super) fn peer_heavy_manifest(
-    name: &str,
-    dependencies: &serde_json::Map<String, Value>,
-    has_peer: bool,
-) -> Value {
-    let mut manifest = serde_json::json!({
-        "name": name,
-        "version": PEER_HEAVY_VERSION,
-        "dependencies": dependencies,
-        "dist": {
-            "tarball": format!(
-                "http://example.test/{name}/-/{}-{PEER_HEAVY_VERSION}.tgz",
-                name.rsplit('/').next().expect("package name has a final segment"),
-            ),
-            "integrity": PEER_HEAVY_INTEGRITY,
-        },
-    });
-    if has_peer {
-        let peer_dependencies = serde_json::Map::from_iter([(
-            PEER_HEAVY_PROVIDER.to_string(),
-            Value::String(PEER_HEAVY_VERSION.to_string()),
-        )]);
-        manifest
-            .as_object_mut()
-            .expect("package manifest is an object")
-            .insert("peerDependencies".to_string(), Value::Object(peer_dependencies));
-    }
-    manifest
-}
 pub(super) fn peer_heavy_package_name(level: usize, index: usize) -> String {
     format!("@pnpmtest/peer-benchmark-level-{level}-{index:02}")
 }
@@ -187,7 +117,7 @@ pub(super) fn save_pristine_copies(dir: &Path) {
 /// leak in (Copilot review on [#296](https://github.com/pnpm/pacquet/pull/296)).
 ///
 /// If a custom fixture's workspace file already declares `storeDir`,
-/// trust it — that's the user opting into a different store layout
+/// trust it; that's the user opting into a different store layout
 /// (e.g. shared store across revisions to test a specific scenario).
 ///
 /// Also mirrors the `.npmrc` settings into the workspace file as camelCase
@@ -199,7 +129,7 @@ pub(super) fn save_pristine_copies(dir: &Path) {
 pub(super) fn create_pnpm_workspace(
     dst_dir: &Path,
     src_dir: Option<&Path>,
-    registry: &str,
+    registry: String,
     scenario: BenchmarkScenario,
 ) {
     let dst = dst_dir.join("pnpm-workspace.yaml");
@@ -215,7 +145,7 @@ pub(super) fn create_pnpm_workspace(
     if manifest.packages.is_none() {
         manifest.packages = Some(vec![".".to_string()]);
     }
-    manifest.registry = Some(registry.to_string());
+    manifest.registry = Some(registry);
     manifest.auto_install_peers = Some(true);
     manifest.ignore_scripts = Some(true);
     manifest.lockfile = Some(scenario.lockfile_enabled());
@@ -264,7 +194,7 @@ pub(super) fn fixture_workspace_manifest(
         serde_saphyr::from_str(&text).expect("parse fixture pnpm-workspace.yaml");
     if parsed.store_dir.is_none() {
         eprintln!(
-            "warn: fixture's pnpm-workspace.yaml has no top-level `storeDir:` — \
+            "warn: fixture's pnpm-workspace.yaml has no top-level `storeDir:`, \
              injecting `storeDir: ./store-dir` so per-revision store isolation works",
         );
     }

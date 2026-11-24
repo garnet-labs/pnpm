@@ -1,9 +1,16 @@
-pub(crate) use runtime::{archive_filter_for, fetch_binary_resolution_to_cas};
+pub(crate) use runtime::{
+    archive_filter_for,
+    fetch_binary_resolution_to_cas,
+};
 pub use runtime::{
-    binary_store_index_key, host_platform_selector, runtime_platform_selector, variations_platform,
+    binary_store_index_key,
+    host_platform_selector,
+    runtime_platform_selector,
 };
 pub use tarball_resolution::{
-    local_file_tarball_install_url, tarball_url_and_integrity, unverified_fetch_is_allowed,
+    local_file_tarball_install_url,
+    tarball_url_and_integrity,
+    unverified_fetch_is_allowed,
 };
 
 pub(crate) use fetch::walk_directory;
@@ -18,10 +25,11 @@ mod runtime;
 
 mod tarball_resolution;
 
-mod variant_fetch;
-
 use crate::CreateVirtualDirError;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_directory_fetcher::DirectoryFetcherError;
 use pnpm_git_fetcher::GitFetcherError;
@@ -31,15 +39,18 @@ use pnpm_tarball::TarballError;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc,
+        LazyLock,
+    },
 };
 
 /// The running pnpm, which a git-hosted dependency's build is given so it
 /// can install with the package manager it asks for.
 ///
-/// `None` when the executable is something other than pnpm itself — the
+/// `None` when the executable is something other than pnpm itself (the
 /// Node.js addon runs this code inside `node`, where there is no pnpm
-/// binary to forward to — and the build then falls back to whatever
+/// binary to forward to) and the build then falls back to whatever
 /// package managers the host has installed.
 static PNPM_EXECPATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
     let path = pnpm_executor::current_pnpm_exe().ok()?;
@@ -52,8 +63,8 @@ static PNPM_EXECPATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 /// import and symlink creation run concurrently via `rayon::join`
 /// inside [`CreateVirtualDirBySnapshot::run`](crate::CreateVirtualDirBySnapshot::run).
 ///
-/// Holds only what every snapshot of one install shares — the clients,
-/// the store handles, the layout, the policies — so it is built once
+/// Holds only what every snapshot of one install shares (the clients,
+/// the store handles, the layout, the policies) so it is built once
 /// and each snapshot is passed to [`Self::run`].
 #[derive(Clone, Copy)]
 pub struct InstallPackageBySnapshot<'a> {
@@ -66,7 +77,7 @@ pub struct InstallPackageBySnapshot<'a> {
     /// triple unless `supportedArchitectures` targets another platform.
     pub runtime_platform_selector: &'a PlatformSelector,
     /// When `true`, return the fetched CAS paths without populating the
-    /// virtual-store slot ([`CreateVirtualDirBySnapshot`](crate::CreateVirtualDirBySnapshot)) — the caller
+    /// virtual-store slot ([`CreateVirtualDirBySnapshot`](crate::CreateVirtualDirBySnapshot)), the caller
     /// links them itself in a separate parallel pass. The cold batch in
     /// [`crate::CreateVirtualStore`] sets this so the per-snapshot
     /// download futures don't each run a *blocking* `rayon::join` link
@@ -92,7 +103,7 @@ pub enum InstallPackageBySnapshotError {
     /// A plain remote tarball the lockfile pins no `integrity` for.
     /// Message and code mirror the TypeScript
     /// `assertFetchableResolution` in
-    /// `pnpm11/installing/package-requester/src/packageRequester.ts`.
+    /// [`pnpm11/installing/package-requester/src/packageRequester.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/installing/package-requester/src/packageRequester.ts).
     /// See [`unverified_fetch_is_allowed`] for the shapes that are
     /// exempt.
     #[display(
@@ -156,10 +167,10 @@ pub enum InstallPackageBySnapshotError {
     #[diagnostic(code(ERR_PNPM_TARBALL_INTEGRITY))]
     CustomFetcherIntegrityMismatch { package_id: String },
 
-    /// A custom-typed resolution reached the built-in dispatch — no
+    /// A custom-typed resolution reached the built-in dispatch, no
     /// pnpmfile custom fetcher claimed it. Message and code mirror the
     /// TypeScript `pickFetcher` in
-    /// `pnpm11/fetching/pick-fetcher/src/index.ts`.
+    /// [`pnpm11/fetching/pick-fetcher/src/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/fetching/pick-fetcher/src/index.ts).
     #[display(
         "Cannot fetch dependency with custom resolution type \"{resolution_type}\". Custom resolutions must be handled by custom fetchers."
     )]
@@ -173,14 +184,9 @@ pub enum InstallPackageBySnapshotError {
     /// or whether the lockfile was generated without the host's
     /// architecture in mind.
     #[display(
-        "No archive of `{package_key}` runs on the selected platform ({selected_target}). It is published for: {available_targets}"
+        "Package `{package_key}` is a runtime dependency, but none of its declared variants matches the selected triple ({selected_target}). Available variants: {available_targets}"
     )]
-    #[diagnostic(
-        code(ERR_PNPM_PACKAGE_MANAGER_NO_MATCHING_PLATFORM_VARIANT),
-        help(
-            "Install it on one of those platforms, or depend on it as an optional dependency so a host it does not support skips it."
-        )
-    )]
+    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_NO_MATCHING_PLATFORM_VARIANT))]
     NoMatchingPlatformVariant {
         package_key: String,
         selected_target: String,
@@ -193,26 +199,17 @@ pub enum InstallPackageBySnapshotError {
         available_targets: String,
     },
 
-    /// Two platform variants of a package fit the host equally well.
-    /// Publication rejects such a version, so the lockfile is not one a
-    /// registry produced; pnpm fails rather than pick one.
+    /// A variant inside a [`LockfileResolution::Variations`](pnpm_lockfile::LockfileResolution::Variations) carries
+    /// a resolution other than [`LockfileResolution::Binary`](pnpm_lockfile::LockfileResolution::Binary).
+    /// The lockfile contract guarantees variants are atomic
+    /// `BinaryResolution`s; this variant catches lockfile corruption
+    /// or a future shape pacquet doesn't recognise rather than
+    /// silently routing through and confusing the install pipeline.
     #[display(
-        "Package `{package_key}` has more than one platform variant that fits the selected platform ({selected_target}) equally well."
+        "Package `{package_key}` carries a runtime variant whose inner resolution is `{inner_kind}` rather than `binary`; pnpm only knows how to install binary-shaped variants."
     )]
-    #[diagnostic(code(ERR_PNPM_AMBIGUOUS_PLATFORM_VARIANT))]
-    AmbiguousPlatformVariant { package_key: String, selected_target: String },
-
-    /// The archive a [`LockfileResolution::Variations`](pnpm_lockfile::LockfileResolution::Variations)
-    /// selected has a resolution pnpm cannot install from a `variations`
-    /// entry: only a `binary` archive or a registry tarball can be one.
-    /// This catches lockfile corruption or a future shape pacquet doesn't
-    /// recognise rather than silently routing it through the install
-    /// pipeline.
-    #[display(
-        "Package `{package_key}` selects a platform variant whose resolution is `{inner_kind}`; pnpm only installs `binary` archives and registry tarballs as variants."
-    )]
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_UNSUPPORTED_VARIANT_RESOLUTION))]
-    UnsupportedVariantResolution { package_key: String, inner_kind: &'static str },
+    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_VARIANT_HAS_NON_BINARY_RESOLUTION))]
+    VariantHasNonBinaryResolution { package_key: String, inner_kind: &'static str },
 
     /// Serializing the synthesized runtime `package.json` failed.
     /// The manifest is a small fixed-shape JSON object (`name`,

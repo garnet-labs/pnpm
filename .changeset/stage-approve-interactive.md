@@ -1,9 +1,4 @@
 ---
-"@pnpm/releasing.commands": minor
-"@pnpm/network.web-auth": minor
-"@pnpm/text.sanitize": minor
-"@pnpm/installing.commands": patch
-"pacquet": minor
 "pnpm": minor
 ---
 

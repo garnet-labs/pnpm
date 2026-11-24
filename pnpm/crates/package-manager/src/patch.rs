@@ -1,29 +1,65 @@
-pub use verify_projects::{VerifyProjectPatchesError, verify_patches_against_project_lockfiles};
+pub use verify_projects::{
+    VerifyProjectPatchesError,
+    verify_patches_against_project_lockfiles,
+};
 
 use crate::{
-    ImportIndexedDirError, ImportIndexedDirOpts, InstallPackageBySnapshotError, import_indexed_dir,
+    ImportIndexedDirError,
+    ImportIndexedDirOpts,
+    InstallPackageBySnapshotError,
+    import_indexed_dir,
     tarball_url_and_integrity,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
-use node_semver::{Range, Version};
-use pnpm_config::{Config, PackageImportMethod};
-use pnpm_git_fetcher::{GitFetchOutput, GitFetcherError, GitHostedTarballFetcher};
-use pnpm_lockfile::{Lockfile, LockfileResolution, PackageKey};
+use node_semver::{
+    Range,
+    Version,
+};
+use pnpm_config::{
+    Config,
+    PackageImportMethod,
+};
+use pnpm_git_fetcher::{
+    GitFetchOutput,
+    GitFetcherError,
+    GitHostedTarballFetcher,
+};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+};
 use pnpm_network::ThrottledClient;
 use pnpm_reporter::Reporter;
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 use pnpm_store_dir::{
-    SharedVerifiedFilesCache, StoreIndex, StoreIndexError, StoreIndexWriter,
+    SharedVerifiedFilesCache,
+    StoreIndex,
+    StoreIndexError,
+    StoreIndexWriter,
     git_hosted_store_index_key,
 };
-use pnpm_tarball::{IngestTarballToStore, MemCache, TarballError};
+use pnpm_tarball::{
+    IngestTarballToStore,
+    MemCache,
+    TarballError,
+};
 use std::{
     cmp::Ordering,
     collections::BTreeSet,
     io,
-    path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicU8},
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        atomic::AtomicU8,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,7 +203,12 @@ fn lockfile_candidates(current_lockfile: &Lockfile, package_name: &str) -> Vec<P
         }
         let version = metadata.version
             .clone()
-            .unwrap_or_else(|| package_key.suffix.version().to_string());
+            .unwrap_or_else(|| {
+                package_key.suffix
+                    .registry_version()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| package_key.suffix.version().to_string())
+            });
         let git_tarball_url = git_tarball_url(&metadata.resolution);
         if seen.insert((name.clone(), version.clone(), git_tarball_url.clone())) {
             versions.push(PatchCandidate { name, version, git_tarball_url, package_key });
@@ -293,11 +334,11 @@ impl WritePackageForPatch<'_> {
                 auth_headers: &self.config.auth_headers,
                 retry_opts: self.config.retry_opts(),
                 offline: self.config.offline,
-                tar_limits: self.config.tar_limits(),
+                tar_limits: pnpm_tarball::TarLimits::new(self.config.max_tarball_unpacked_size),
             },
             package,
             store: pnpm_tarball::ArchiveStoreContext {
-                dir: &self.config.store_dir,
+                dir: std::borrow::Cow::Borrowed(&self.config.store_dir),
                 index: store_index,
                 index_writer: Some(Arc::clone(store_index_writer)),
                 verify_integrity: self.config.verify_store_integrity,

@@ -112,6 +112,7 @@ fn is_loopback_host(host: &str) -> bool {
         || host
             .trim_matches(['[', ']'])
             .parse::<std::net::IpAddr>()
+            .map(|address| address.to_canonical())
             .is_ok_and(|address| address.is_loopback())
 }
 
@@ -119,11 +120,29 @@ fn is_loopback_host(host: &str) -> bool {
 /// network link. HTTPS and loopback HTTP endpoints are accepted.
 #[must_use]
 pub fn is_url_secure_for_credentials(url: &str) -> bool {
-    ParsedUrl::parse(url)
-        .is_some_and(|parsed| {
-            parsed.scheme.eq_ignore_ascii_case("https")
-                || (parsed.scheme.eq_ignore_ascii_case("http") && is_loopback_host(parsed.host))
-        })
+    reqwest::Url::parse(url).is_ok_and(|url| secure_transport(&url))
+}
+
+fn secure_transport(url: &reqwest::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(is_loopback_host),
+        _ => false,
+    }
+}
+
+/// Remove userinfo that the HTTP client would send as Basic authentication.
+pub fn strip_insecure_url_credentials(url: &mut String) {
+    if !url.contains('@') {
+        return;
+    }
+    let Ok(mut parsed) = reqwest::Url::parse(url) else { return };
+    if !secure_transport(&parsed) && (!parsed.username().is_empty() || parsed.password().is_some())
+    {
+        let _ = parsed.set_password(None);
+        let _ = parsed.set_username("");
+        *url = parsed.into();
+    }
 }
 
 /// Local base64 encode so this crate doesn't pull in `base64` just for
@@ -139,15 +158,14 @@ pub fn base64_encode(input: &str) -> String {
 pub fn base64_encode_bytes(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+    let (chunks, remainder) = bytes.as_chunks::<3>();
+    for &[first, second, third] in chunks {
+        let n = (u32::from(first) << 16) | (u32::from(second) << 8) | u32::from(third);
         out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
         out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
         out.push(ALPHABET[(n & 0x3f) as usize] as char);
     }
-    let remainder = chunks.remainder();
     match remainder.len() {
         1 => {
             let n = u32::from(remainder[0]) << 16;

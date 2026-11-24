@@ -24,11 +24,11 @@ Authorization-related settings are handled via [`.npmrc`](./npmrc.md).
 
 :::
 
-Values in the configuration files may contain env variables using the `${NAME}` syntax. The env variables may also be specified with default values. Using `${NAME-fallback}` will return `fallback` if `NAME` isn't set. `${NAME:-fallback}` will return `fallback` if `NAME` isn't set, or is an empty string. Since v12.7.0, `${NAME?}` expands to an empty string without a warning when `NAME` isn't set, as in npm.
+Values in the configuration files may contain env variables using the `${NAME}` syntax. The env variables may also be specified with default values. Using `${NAME-fallback}` will return `fallback` if `NAME` isn't set. `${NAME:-fallback}` will return `fallback` if `NAME` isn't set, or is an empty string. Since v12.7.0, `${NAME?}` expands to an empty string without a warning when `NAME` isn't set, as in npm. Since v12.23.0, a reference to an unset or empty variable without a fallback fails with [`ERR_PNPM_CONFIG_UNRESOLVED_ENV_VAR`](./errors.md#err_pnpm_config_unresolved_env_var).
 
 :::warning
 
-Env variables are **not** expanded in settings of `pnpm-workspace.yaml` that define registry URLs: `registry` and the URL values of [`registries`](./settings/dependency-resolution.md#registries) and [`namedRegistries`](./settings/dependency-resolution.md#namedregistries). Values containing a `${...}` placeholder in these settings are ignored. In the [registry declaration shape](./registries.md) of `registries`, the URL is the key rather than the value, and the same rule applies to the keys. Because `pnpm-workspace.yaml` is committed to the repository, expanding env variables in registry URLs could be exploited by a malicious repository to leak secrets from the environment to an attacker-controlled registry. Configure dynamic registry URLs in a trusted location instead: the global configuration file or CLI options.
+Env variables are **not** expanded in settings of `pnpm-workspace.yaml` that define registry URLs: `registry` and the URL values of [`registries`](./settings/dependency-resolution.md#registries) and [`namedRegistries`](./settings/dependency-resolution.md#namedregistries). A `${...}` placeholder in these settings fails the command, because ignoring the URL would resolve packages from another registry. In the [registry declaration shape](./registries.md) of `registries`, the URL is the key rather than the value, and the same rule applies to the keys. Because `pnpm-workspace.yaml` is committed to the repository, expanding env variables in registry URLs could be exploited by a malicious repository to leak secrets from the environment to an attacker-controlled registry. Configure dynamic registry URLs in a trusted location instead: the global configuration file or CLI options.
 
 Since v12.7.0, the same applies to [`userAgent`](./settings/network.md#useragent): a `userAgent` in `pnpm-workspace.yaml` that contains a `${...}` placeholder is ignored, because the user agent is sent to the configured registry with every request.
 
@@ -146,6 +146,7 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
 * [overrides](./settings/dependency-resolution.md#overrides)
   * [Convergence overrides](./settings/dependency-resolution.md#convergence-overrides)
   * [Overriding peer dependencies](./settings/dependency-resolution.md#overriding-peer-dependencies)
+* [warnUnusedOverrides](./settings/dependency-resolution.md#warnunusedoverrides)
 * [packageExtensions](./settings/dependency-resolution.md#packageextensions)
 * [allowedDeprecatedVersions](./settings/dependency-resolution.md#alloweddeprecatedversions)
 * [update](./settings/dependency-resolution.md#update)
@@ -161,6 +162,7 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
 * [minimumReleaseAgeExclude](./settings/dependency-resolution.md#minimumreleaseageexclude)
 * [minimumReleaseAgeExcludePrune](./settings/dependency-resolution.md#minimumreleaseageexcludeprune)
 * [minimumReleaseAgeIgnoreMissingTime](./settings/dependency-resolution.md#minimumreleaseageignoremissingtime)
+* [referenceTime](./settings/dependency-resolution.md#referencetime)
 * [minimumReleaseAgeStrict](./settings/dependency-resolution.md#minimumreleaseagestrict)
 * [trustPolicy](./settings/dependency-resolution.md#trustpolicy)
 * [trustPolicyExclude](./settings/dependency-resolution.md#trustpolicyexclude)
@@ -231,6 +233,7 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
 * [symlinkedLockfileTargetDirs](./settings/store.md#symlinkedlockfiletargetdirs)
 * [lockfile.includeResolutionSettings](./settings/store.md#lockfileincluderesolutionsettings)
 * [lockfile.integrityTarget](./settings/store.md#lockfileintegritytarget)
+* [lockfile.format](./settings/store.md#lockfileformat)
 * [gitBranchLockfile](./settings/store.md#gitbranchlockfile)
 * [mergeGitBranchLockfilesBranchPattern](./settings/store.md#mergegitbranchlockfilesbranchpattern)
 * [peersSuffixMaxLength](./settings/store.md#peerssuffixmaxlength)
@@ -272,6 +275,7 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
   * [Conflict Resolution](./settings/peer-dependencies.md#conflict-resolution)
 * [autoInstallPeersFromHighestMatch](./settings/peer-dependencies.md#autoinstallpeersfromhighestmatch)
 * [dedupePeerDependents](./settings/peer-dependencies.md#dedupepeerdependents)
+* [projectScopedOptionalPeers](./settings/peer-dependencies.md#projectscopedoptionalpeers)
 * [dedupePeers](./settings/peer-dependencies.md#dedupepeers)
 * [addMissingPeerTypes](./settings/peer-dependencies.md#addmissingpeertypes)
 * [strictPeerDependencies](./settings/peer-dependencies.md#strictpeerdependencies)
@@ -331,6 +335,7 @@ Every setting is listed below, grouped by topic. Follow a setting to read its do
 
 * [versioning.fixed](./settings/versioning.md#versioningfixed)
 * [versioning.ignore](./settings/versioning.md#versioningignore)
+* [versioning.includePrivatePackages](./settings/versioning.md#versioningincludeprivatepackages)
 * [versioning.maxBump](./settings/versioning.md#versioningmaxbump)
 * [versioning.lanes](./settings/versioning.md#versioninglanes)
 * [versioning.epics](./settings/versioning.md#versioningepics)
@@ -395,12 +400,13 @@ These settings are configured in `pnpm-workspace.yaml` as well, but are document
 
 ### Settings documented elsewhere
 
-* [publishBranch](./cli/publish.md#publishbranch) and [publishWaitTimeout](./cli/publish.md#publishwaittimeout)
+* [publishBranch](./cli/publish.md#publishbranch), [publishWaitTimeout](./cli/publish.md#publishwaittimeout) and [access](./cli/publish.md#access)
 * [patchedDependencies](./cli/patch.md#patcheddependencies)
 * [pnpmfile](./pnpmfile.md#pnpmfile), [globalPnpmfile](./pnpmfile.md#globalpnpmfile) and [ignorePnpmfile](./pnpmfile.md#ignorepnpmfile)
 * [audit.level](./cli/audit.md#auditlevel), [audit.ignore](./cli/audit.md#auditignore) and [audit.ignorePrune](./cli/audit.md#auditignoreprune)
 * [initPackageManager](./cli/init.md#initpackagemanager), [initType](./cli/init.md#inittype), [initVersion](./cli/init.md#initversion), [initLicense](./cli/init.md#initlicense) and [initAuthorName / initAuthorEmail / initAuthorUrl](./cli/init.md#initauthorname-initauthoremail-initauthorurl)
 * [legacyDirFiltering](./filtering.md#legacydirfiltering)
+* [globalPackagesConfig](./configuring.md#settings-for-global-packages)
 * [concurrencyGroups](./workspace-task-orchestration.md#concurrencygroups)
 * [tasks](./workspace-task-orchestration.md#configure-task-dependencies), [pipelines](./cli/pipeline.md#pipelines) and [pipelineBase](./cli/pipeline.md#pipelinebase)
 * [cargo.enabled](./cargo.md#cargoenabled) and [Cargo registries](./cargo.md#registries)

@@ -1,10 +1,25 @@
 use super::{
-    Arc, BTreeMap, ChildEdge, DepPath, DepPathRecording, DirectDep, HashMap, HashSet, NodeId,
-    ParentPkgInfo, ParentRefs, PeerProviderChildren, ResolvedPackage, ResolvedTree, SharedChain,
-    UndoRealize, Walker,
+    Arc,
+    BTreeMap,
+    ChildEdge,
+    DepPath,
+    DepPathRecording,
+    DirectDep,
+    HashMap,
+    HashSet,
+    NodeId,
+    ParentPkgInfo,
+    ParentRefs,
+    PeerProviderChildren,
+    ResolvedPackage,
+    ResolvedTree,
+    SharedChain,
+    SubtreePaths,
+    UndoRealize,
+    Walker,
 };
 
-/// Output of [`Walker::resolve_node`] — the per-node result the parent
+/// Output of [`Walker::resolve_node`], the per-node result the parent
 /// folds into its own state.
 pub(in super::super) struct NodeOutput {
     pub(in super::super) dep_path: DepPath,
@@ -20,6 +35,7 @@ pub(in super::super) struct NodeOutput {
     /// slice, propagated bottom-up so discovery can aggregate it from
     /// the importer's direct deps alone.
     pub(in super::super) subtree_missing_by_pkg: SubtreeMissingByPkg,
+    pub(in super::super) subtree_dep_paths: Option<Arc<SubtreePaths>>,
 }
 
 /// Sentinel for "this node's subtree is still missing peer `X`", carrying the
@@ -50,6 +66,7 @@ pub(super) struct ChildOutputs {
     pub(super) missing_peers: HashMap<String, MissingPeerInfo>,
     pub(super) dep_paths: BTreeMap<String, DepPath>,
     pub(super) missing_summaries: Vec<Arc<MissingSummary>>,
+    pub(super) dep_path_subtrees: Vec<Arc<SubtreePaths>>,
 }
 
 impl ChildOutputs {
@@ -66,12 +83,10 @@ impl ChildOutputs {
             auto_install_resolved_peers,
             missing_peers,
             subtree_missing_by_pkg,
+            subtree_dep_paths,
         } = output;
-        if let Some(summary) = subtree_missing_by_pkg
-            && !self.missing_summaries.iter().any(|existing| Arc::ptr_eq(existing, &summary))
-        {
-            self.missing_summaries.push(summary);
-        }
+        push_arc_unique(&mut self.missing_summaries, subtree_missing_by_pkg);
+        push_arc_unique(&mut self.dep_path_subtrees, subtree_dep_paths);
         match dep_paths {
             DepPathRecording::Record => {
                 self.dep_paths.insert(alias.to_string(), dep_path);
@@ -87,6 +102,14 @@ impl ChildOutputs {
         for (name, info) in missing_peers.iter() {
             merge_missing_peer_info(&mut self.missing_peers, name, info);
         }
+    }
+}
+
+fn push_arc_unique<Item>(target: &mut Vec<Arc<Item>>, incoming: Option<Arc<Item>>) {
+    if let Some(item) = incoming
+        && !target.iter().any(|existing| Arc::ptr_eq(existing, &item))
+    {
+        target.push(item);
     }
 }
 
@@ -190,7 +213,10 @@ pub(in super::super) struct RootWalk {
 
 impl RootWalk {
     pub(in super::super) fn of(walker: &Walker<'_>, parents_direct: &[DirectDep]) -> Self {
-        let importer_parents = Arc::new(walker.build_importer_parents_from(parents_direct));
+        let importer_parents = Arc::new(walker.build_importer_parents_from(
+            parents_direct,
+            &walker.opts.scope.hoisted_peer_provider_node_ids,
+        ));
         let parent_dep_paths = walker.parent_dep_paths_from_refs(&importer_parents);
         Self {
             importer_parents,
@@ -256,6 +282,8 @@ pub(super) struct ChildrenWalk {
 
 /// The node's peer verdict, shared with its caches and records.
 pub(super) struct SettledPeers {
+    /// The parent context the node's peers were resolved against.
+    pub(super) parent_refs: Arc<ParentRefs>,
     pub(super) dep_path: DepPath,
     pub(super) own_resolved: HashMap<String, NodeId>,
     pub(super) all_resolved: Arc<HashMap<String, NodeId>>,
@@ -263,6 +291,20 @@ pub(super) struct SettledPeers {
     pub(super) missing_from_children: Arc<HashMap<String, MissingPeerInfo>>,
     pub(super) subtree_missing_by_pkg: SubtreeMissingByPkg,
     pub(super) is_pure: bool,
+}
+
+impl SettledPeers {
+    pub(super) fn as_walk_result(&self) -> WalkResult<'_> {
+        WalkResult {
+            parent_refs: &self.parent_refs,
+            dep_path: &self.dep_path,
+            all_resolved_peers: &self.all_resolved,
+            all_missing_peers: &self.all_missing,
+            missing_peers_of_children: &self.missing_from_children,
+            subtree_missing_by_pkg: &self.subtree_missing_by_pkg,
+            is_pure: self.is_pure,
+        }
+    }
 }
 
 /// The still-lazy children a discovery walk descends into.
@@ -277,6 +319,8 @@ pub(super) struct DeferredChildren<'a> {
 
 /// What one walked node contributes to the per-`pkgIdWithPatchHash` caches.
 pub(super) struct WalkResult<'a> {
+    /// The parent context the node resolved its peers against.
+    pub(super) parent_refs: &'a ParentRefs,
     pub(super) dep_path: &'a DepPath,
     pub(super) all_resolved_peers: &'a Arc<HashMap<String, NodeId>>,
     pub(super) all_missing_peers: &'a Arc<HashMap<String, MissingPeerInfo>>,
@@ -304,7 +348,7 @@ pub(super) struct NodePeers {
     /// The node's own `peerDependencies`, resolved.
     pub(super) own_resolved: HashMap<String, NodeId>,
     /// The above folded with what the subtree resolved against
-    /// ancestors, minus the node's own name — the set `dep_path`'s
+    /// ancestors, minus the node's own name, the set `dep_path`'s
     /// suffix renders.
     pub(super) all_resolved: HashMap<String, NodeId>,
     pub(super) all_missing: HashMap<String, MissingPeerInfo>,

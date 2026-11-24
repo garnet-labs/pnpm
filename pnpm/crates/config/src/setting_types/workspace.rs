@@ -1,41 +1,7 @@
-use super::{Deserialize, Serialize};
-
-/// How the resolver picks a version for a direct dependency when more
-/// than one satisfies the wanted range.
-///
-/// The setting is `'highest' | 'time-based' | 'lowest-direct'`.
-///
-/// Only direct dependencies are affected by the lowest-version pick;
-/// subdependencies are always picked highest. Under
-/// [`ResolutionMode::TimeBased`] the resolver additionally constrains
-/// subdependencies to versions published no later than the newest
-/// resolved direct dependency (plus a one-hour delta).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ResolutionMode {
-    /// Pick the highest version that satisfies the range, everywhere.
-    #[default]
-    Highest,
-
-    /// Resolve direct dependencies to their lowest satisfying version,
-    /// then resolve subdependencies from versions published before the
-    /// last direct dependency was published.
-    TimeBased,
-
-    /// Resolve direct dependencies to their lowest satisfying version;
-    /// subdependencies are unconstrained (picked highest).
-    LowestDirect,
-}
-
-impl ResolutionMode {
-    /// Whether direct dependencies are resolved to their lowest
-    /// satisfying version. True for both [`Self::TimeBased`] and
-    /// [`Self::LowestDirect`].
-    #[must_use]
-    pub fn picks_lowest_direct(self) -> bool {
-        matches!(self, ResolutionMode::TimeBased | ResolutionMode::LowestDirect)
-    }
-}
+use super::{
+    Deserialize,
+    Serialize,
+};
 
 /// How `pnpm add` / `pnpm update` reconcile a directly-specified version
 /// against a `catalog:` entry for the same package.
@@ -60,10 +26,10 @@ pub enum CatalogMode {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PackageImportMethod {
-    /// Try the platform's cheap link tiers in order — hardlink first on
-    /// Linux, clone first elsewhere — and fall back to copying when none
-    /// is possible. `deps-restorer::link_file::next_auto_tier` implements
-    /// the ladder and carries the rationale.
+    /// Try the platform's cheap link tiers in order (hardlink first on
+    /// Linux and Windows, clone first elsewhere) and fall back to copying
+    /// when none is possible. `deps-restorer::link_file::next_auto_tier`
+    /// implements the ladder and carries the rationale.
     #[default]
     Auto,
 

@@ -1,6 +1,4 @@
 ---
-"@pnpm/installing.commands": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

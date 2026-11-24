@@ -1,13 +1,74 @@
 use super::{
-    super::{GraphToLockfileOptions, ImporterLockfileInput},
-    EMPTY_NAMED_REGISTRIES, EMPTY_REGISTRY_OPTIONS, NPM_REGISTRIES, dependencies_graph_to_lockfile,
-    make_node, write_manifest,
+    super::{
+        GraphToLockfileOptions,
+        ImporterLockfileInput,
+    },
+    EMPTY_NAMED_REGISTRIES,
+    EMPTY_REGISTRY_OPTIONS,
+    NPM_REGISTRIES,
+    dependencies_graph_to_lockfile,
+    make_node,
+    single_importer_opts,
+    write_manifest,
 };
 use pnpm_deps_path::DepPath;
 use pnpm_resolving_deps_resolver::DependenciesGraph;
 use rustc_hash::FxHashSet as HashSet;
 use serde_json::json;
 use std::collections::BTreeMap;
+
+#[test]
+fn excluded_catalog_links_keep_workspace_specifiers() {
+    let should_auto_install_peers = false;
+    let should_exclude_links_from_lockfile = true;
+    for (name, reference, specifier, retained) in [
+        ("default", "catalog:", "workspace:*", true),
+        ("named", "catalog:named", "workspace:shared@*", true),
+        ("default", "catalog:", "link:../shared", false),
+        ("named", "catalog:named", "^1.0.0", false),
+    ] {
+        let (_tmp, manifest) = write_manifest(json!({
+            "dependencies": { "shared": reference },
+        }));
+        let graph = DependenciesGraph::default();
+        let direct =
+            BTreeMap::from([("shared".to_string(), DepPath::from("link:../shared".to_string()))]);
+        let catalogs = BTreeMap::from([(
+            name.to_string(),
+            BTreeMap::from([("shared".to_string(), specifier.to_string())]),
+        )]);
+        let mut opts = single_importer_opts(
+            &manifest,
+            &graph,
+            direct,
+            should_auto_install_peers,
+            should_exclude_links_from_lockfile,
+            None,
+            None,
+        );
+        opts.catalogs = &catalogs;
+
+        let lockfile = dependencies_graph_to_lockfile(opts);
+        let dependency = lockfile
+            .root_project()
+            .unwrap()
+            .dependencies
+            .as_ref()
+            .and_then(|dependencies| {
+                dependencies.get(&pnpm_lockfile::PkgName::parse("shared").unwrap())
+            });
+        if retained {
+            let dependency = dependency.expect("catalog workspace dependency is recorded");
+            assert_eq!(dependency.specifier, reference);
+            assert_eq!(
+                dependency.version,
+                pnpm_lockfile::ImporterDepVersion::Link("../shared".to_string()),
+            );
+        } else {
+            assert!(dependency.is_none(), "non-workspace catalog links remain excluded");
+        }
+    }
+}
 
 #[test]
 fn aliased_catalog_dependency_records_catalog_snapshot() {
@@ -52,12 +113,14 @@ fn aliased_catalog_dependency_records_catalog_snapshot() {
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,

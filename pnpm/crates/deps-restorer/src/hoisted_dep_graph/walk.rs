@@ -1,29 +1,50 @@
 use super::{
-    DepHierarchy, DependenciesGraph, DependenciesGraphNode, DirectDependenciesByImporterId,
-    HoistedDepGraphError, LockfileToDepGraphResult, LockfileToHoistedDepGraphOptions,
-    installability_skip, lookup_package_metadata, package_present_at,
-    path_relative_to_lockfile_dir, resolution_changed_at,
+    DepHierarchy,
+    DependenciesGraph,
+    DependenciesGraphNode,
+    DirectDependenciesByImporterId,
+    HoistedDepGraphError,
+    LockfileToDepGraphResult,
+    LockfileToHoistedDepGraphOptions,
+    installability_skip,
+    lookup_package_metadata,
+    package_present_at,
+    path_relative_to_lockfile_dir,
+    resolution_changed_at,
 };
 use crate::safe_join_modules_dir::safe_join_modules_dir;
 use indexmap::IndexSet;
 use pnpm_deps_path::get_pkg_id_with_patch_hash;
-use pnpm_lockfile::{Lockfile, LockfileResolution, PackageKey, PkgIdWithPatchHash};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+    PkgIdWithPatchHash,
+};
 use pnpm_modules_yaml::DepPath;
-use pnpm_real_hoist::{HoisterResult, RcByPtr};
+use pnpm_real_hoist::{
+    HoisterResult,
+    RcByPtr,
+};
 use std::{
-    collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Every directory each package landed in, in visit order. The first
 /// entry wins for parent → child wiring.
 ///
 /// A lookup tries the exact snapshot key, then falls back to
-/// [`pnpm_real_hoist::pkg_id`]. A peer variant the hoister collapsed
-/// reaches the walk under the first-seen variant's key, so an edge
-/// declared against any other variant finds that node through the
-/// package id. A variant the hoister kept distinct is found by its own
-/// key.
+/// [`pnpm_real_hoist::pkg_id`]. A directory is recorded under its own
+/// key and under every peer variant the hoister deduplicated into it,
+/// so an edge finds the copy that serves the variant it declares. The
+/// package id covers an edge whose variant reached no directory.
 #[derive(Default)]
 pub(super) struct PackageLocations {
     by_pkg_id: BTreeMap<String, Vec<PathBuf>>,
@@ -44,6 +65,15 @@ impl PackageLocations {
         self.by_package_key.get(pkg_key).and_then(|locations| locations.first())
     }
 
+    /// Record `dir` under a further snapshot key it serves: a peer
+    /// variant the hoister deduplicated into this copy.
+    fn record_served(&mut self, pkg_key: PackageKey, dir: PathBuf) {
+        self.by_package_key
+            .entry(pkg_key)
+            .or_default()
+            .push(dir);
+    }
+
     fn record(&mut self, pkg_key: &PackageKey, dir: &Path) {
         self.by_pkg_id
             .entry(pnpm_real_hoist::pkg_id(pkg_key))
@@ -57,7 +87,7 @@ impl PackageLocations {
 }
 
 impl WalkState<'_> {
-    /// Pass 2 — fill in each node's `children` map from the
+    /// Pass 2, fill in each node's `children` map from the
     /// now-complete package location index, then assemble the result.
     ///
     /// The walk intentionally leaves `children` empty: every sibling and
@@ -83,13 +113,13 @@ impl WalkState<'_> {
             root_direct_deps(&root_hierarchy, &self.result.graph),
         );
 
-        // `link:` entries are skipped — they don't enter the hoist tree
+        // `link:` entries are skipped; they don't enter the hoist tree
         // and have no `pkg_locations` entry. The install pipeline handles
         // them via [`crate::SymlinkDirectDependencies`]'s `link_only` pass
         // after the hoisted linker runs.
         for importer_id in self.per_importer_direct_deps.keys() {
             let Some(importer) = self.lockfile.importers.get(importer_id) else { continue };
-            let modules_dir = self.lockfile_dir.join(importer_id).join("node_modules");
+            let modules_dir = self.opts.modules_dirs.of_importer_id(importer_id);
             direct_dependencies_by_importer_id.insert(
                 importer_id.clone(),
                 importer_direct_deps(
@@ -103,10 +133,10 @@ impl WalkState<'_> {
 
         // Hierarchy: one entry per importer root. Root importer gets
         // `lockfile_dir`; non-root workspace importers get
-        // `<lockfile_dir>/<importer_id>` — the linker walks each
+        // `<lockfile_dir>/<importer_id>`, the linker walks each
         // importer's subtree under its own root.
         let mut hierarchy = BTreeMap::new();
-        hierarchy.insert(self.opts.lockfile_dir.clone(), root_hierarchy);
+        hierarchy.insert(self.opts.modules_dirs.lockfile_dir().to_path_buf(), root_hierarchy);
         hierarchy.extend(self.per_importer_hierarchies);
 
         Ok(LockfileToDepGraphResult {
@@ -225,14 +255,13 @@ pub(super) fn fill_children(
     Ok(())
 }
 /// Mutable scratch space the recursive walker threads through
-/// every level. Borrowing the lockfile + `lockfile_dir` + opts up
+/// every level. Borrowing the lockfile + opts up
 /// front avoids passing four separate arguments. `skipped` is
 /// owned (cloned from `opts.skipped`) because the walker mutates
-/// it — every dep that fails the installability check gets added.
+/// it; every dep that fails the installability check gets added.
 pub(super) struct WalkState<'a> {
     pub result: LockfileToDepGraphResult,
     pub(super) lockfile: &'a Lockfile,
-    pub(super) lockfile_dir: &'a Path,
     pub(super) opts: &'a LockfileToHoistedDepGraphOptions<'a>,
     /// The graph the current lockfile produces, when there is one. Only
     /// [`walk_dep`]'s presence check reads it, to see whether the
@@ -258,7 +287,7 @@ pub(super) struct WalkState<'a> {
 /// store-fetch / installability path; here the walker only computes
 /// node identity, location, children, and hoisted-location records.
 ///
-/// No cycle detection — the walk trusts the hoister to produce a
+/// No cycle detection, the walk trusts the hoister to produce a
 /// DAG. The hoister's own cyclic-input tests pin that property.
 pub(super) fn walk_deps(
     state: &mut WalkState<'_>,
@@ -281,9 +310,8 @@ pub(super) fn walk_dep(
     modules: &Path,
     dep: &RcByPtr<HoisterResult>,
 ) -> Result<Option<(PathBuf, DepHierarchy)>, HoistedDepGraphError> {
-    // The hoister keeps every absorbed reference; the first
-    // (alphabetically smallest) is the canonical depPath for this
-    // node's location.
+    // The first reference is the snapshot key of the copy that holds
+    // this directory; see `record_served_variants` for the rest.
     let Some(reference) = dep.0.references
         .borrow()
         .iter()
@@ -305,7 +333,6 @@ pub(super) fn walk_dep(
     let Some(resolved) = resolve_reference(state, &reference)? else {
         return Ok(None);
     };
-    let optional = resolved.snapshot.is_some_and(|snapshot| snapshot.optional);
 
     if installability_skip(state, &resolved.pkg_key, resolved.metadata, resolved.snapshot)? {
         state.result.skipped.insert(reference);
@@ -313,7 +340,7 @@ pub(super) fn walk_dep(
     }
 
     let dir = safe_join_modules_dir(modules, &dep.0.name)?;
-    let dep_location = path_relative_to_lockfile_dir(&dir, state.lockfile_dir);
+    let dep_location = path_relative_to_lockfile_dir(&dir, state.opts.modules_dirs.lockfile_dir());
     let present = package_is_reusable(state, &resolved, &reference, &dep_location, modules, &dir);
 
     // Insert *before* recursing (insert + push to `pkg_locations`, then
@@ -322,9 +349,10 @@ pub(super) fn walk_dep(
     // `fill_children` after the whole walk is done.
     state.result.graph.insert(
         dir.clone(),
-        graph_node(dep, &reference, &resolved, optional, present, &dir, modules),
+        graph_node(dep, reference.clone(), &resolved, present, dir.clone(), modules.to_path_buf()),
     );
     record_package_location(state, &resolved.pkg_key, &dir);
+    record_served_variants(state, &dep.0, &dir);
 
     record_injected_location(&mut state.result, &resolved, &reference, &dir);
 
@@ -386,8 +414,8 @@ pub(super) fn package_is_reusable(
 }
 /// Workspace-kind hoister children are non-root workspace importers.
 /// Recurse into their (post-hoist, often-empty) dependencies under
-/// `<lockfile_dir>/<importer_id>/node_modules` to capture any deps the
-/// hoister couldn't move up — those become nested entries in the
+/// the importer's modules directory to capture any deps the
+/// hoister couldn't move up; those become nested entries in the
 /// per-importer hierarchy. The workspace node itself is *not* added to
 /// the graph or to the parent's hierarchy: it has no package contents
 /// to import. Per-importer `direct_dependencies_by_importer_id` is
@@ -399,9 +427,9 @@ pub(super) fn walk_workspace_importer(
     dep: &RcByPtr<HoisterResult>,
     importer_id: &str,
 ) -> Result<(), HoistedDepGraphError> {
-    let importer_root = state.lockfile_dir.join(importer_id);
-    let importer_hierarchy =
-        walk_deps(state, &importer_root.join("node_modules"), &dep.0.dependencies.borrow())?;
+    let importer_root = state.opts.modules_dirs.lockfile_dir().join(importer_id);
+    let modules_dir = state.opts.modules_dirs.of(&importer_root);
+    let importer_hierarchy = walk_deps(state, &modules_dir, &dep.0.dependencies.borrow())?;
     let has_deps = state.lockfile.importers
         .get(importer_id)
         .is_some_and(|importer| {
@@ -461,16 +489,15 @@ pub(super) fn resolve_reference<'l>(
 }
 pub(super) fn graph_node(
     dep: &RcByPtr<HoisterResult>,
-    reference: &str,
+    reference: String,
     resolved: &ResolvedReference<'_>,
-    optional: bool,
     present: bool,
-    dir: &Path,
-    modules: &Path,
+    dir: PathBuf,
+    modules: PathBuf,
 ) -> DependenciesGraphNode {
     DependenciesGraphNode {
         package: crate::HoistedPackageMetadata {
-            dep_path: DepPath::from(reference.to_string()),
+            dep_path: DepPath::from(reference),
             pkg_id_with_patch_hash: PkgIdWithPatchHash::from(
                 get_pkg_id_with_patch_hash(&resolved.pkg_key.to_string()).to_string(),
             ),
@@ -484,9 +511,9 @@ pub(super) fn graph_node(
         alias: Some(dep.0.name.clone()),
         // `pkgIdWithPatchHash` strips peer-graph hashes but keeps
         // `(patch_hash=...)`.
-        dir: dir.to_path_buf(),
-        modules: modules.to_path_buf(),
-        optional,
+        dir,
+        modules,
+        optional: resolved.snapshot.is_some_and(|snapshot| snapshot.optional),
         optional_dependencies: resolved.snapshot
             .and_then(|snap| snap.optional_dependencies.as_ref())
             .map(|map| {
@@ -516,7 +543,7 @@ pub(super) fn compute_children(
         .flatten()
         .chain(snapshot.optional_dependencies.iter().flatten());
     for (alias_name, dep_ref) in dep_iter {
-        // `link:` deps return `None` here — they live outside the
+        // `link:` deps return `None` here; they live outside the
         // virtual store and don't show up in `pkg_locations`.
         let Some(child_key) = dep_ref.resolve(alias_name) else {
             continue;
@@ -526,6 +553,18 @@ pub(super) fn compute_children(
         }
     }
     children
+}
+
+/// The hoister lists the snapshot keys a directory serves, its own first.
+/// The rest are peer variants it deduplicated into this copy, so an edge
+/// declared against one of them resolves here.
+fn record_served_variants(state: &mut WalkState<'_>, node: &HoisterResult, dir: &Path) {
+    let references = node.references.borrow();
+    for reference in references.iter().skip(1) {
+        if let Ok(pkg_key) = reference.parse::<PackageKey>() {
+            state.package_locations.record_served(pkg_key, dir.to_path_buf());
+        }
+    }
 }
 
 fn record_package_location(state: &mut WalkState<'_>, pkg_key: &PackageKey, dir: &Path) {

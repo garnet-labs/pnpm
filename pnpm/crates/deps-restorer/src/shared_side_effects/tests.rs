@@ -1,5 +1,10 @@
-use super::{package_version, platform::validate_windows_kernel_version};
+use super::{
+    package_version,
+    platform::validate_windows_kernel_version,
+};
 use crate::shared_side_effects::platform::parse_macos_product_version;
+#[cfg(not(windows))]
+use command_extra::CommandExtra;
 use pnpm_lockfile::PackageKey;
 use std::collections::HashMap;
 
@@ -39,8 +44,14 @@ fn package_identity_uses_the_manifest_version_for_non_registry_sources() {
 /// the store already held.
 #[test]
 fn an_artifact_digest_addresses_the_file_the_store_wrote() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use sha2::{Digest as _, Sha512};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
+    use sha2::{
+        Digest as _,
+        Sha512,
+    };
 
     let store = tempfile::tempdir().unwrap();
     let store_dir = pnpm_store_dir::StoreDir::new(store.path());
@@ -51,7 +62,10 @@ fn an_artifact_digest_addresses_the_file_the_store_wrote() {
     let mut located_by_mode = Vec::new();
     for mode in [0o755, 0o644, 0o744] {
         let written = store_dir
-            .write_cas_file(bytes, pnpm_fs::file_mode::is_executable(mode))
+            .write_cas_file(
+                bytes,
+                pnpm_fs::file_mode::is_executable(pnpm_fs::FileMode::from_mode(mode)),
+            )
             .unwrap()
             .file;
         let located = store_dir
@@ -73,8 +87,14 @@ fn an_artifact_digest_addresses_the_file_the_store_wrote() {
 /// installing whatever happens to sit there.
 #[tokio::test]
 async fn corrupted_store_content_is_not_reused() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use sha2::{Digest as _, Sha512};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
+    use sha2::{
+        Digest as _,
+        Sha512,
+    };
 
     let store = tempfile::tempdir().unwrap();
     let store_dir = pnpm_store_dir::StoreDir::new(store.path());
@@ -98,8 +118,14 @@ async fn corrupted_store_content_is_not_reused() {
 /// path is a miss the download and CAS write can repair.
 #[tokio::test]
 async fn a_non_regular_file_is_not_reused_as_store_content() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-    use sha2::{Digest as _, Sha512};
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
+    use sha2::{
+        Digest as _,
+        Sha512,
+    };
 
     let store = tempfile::tempdir().unwrap();
     let store_dir = pnpm_store_dir::StoreDir::new(store.path());
@@ -117,7 +143,7 @@ async fn a_non_regular_file_is_not_reused_as_store_content() {
         let fifo = store.path().join("fifo");
         assert!(
             std::process::Command::new("mkfifo")
-                .arg(&fifo)
+                .with_arg(&fifo)
                 .status()
                 .unwrap()
                 .success(),
@@ -143,7 +169,12 @@ async fn a_non_regular_file_is_not_reused_as_store_content() {
 /// which the overlay names by the link's path rather than by the blob's.
 #[tokio::test]
 async fn a_persisted_symlink_entry_is_valid_while_its_target_blob_is_stored() {
-    use pnpm_store_dir::{CafsFileInfo, SYMLINK_MODE, SideEffectsDiff, SideEffectsOverlay};
+    use pnpm_store_dir::{
+        CafsFileInfo,
+        SYMLINK_MODE,
+        SideEffectsDiff,
+        SideEffectsOverlay,
+    };
 
     let store = tempfile::tempdir().unwrap();
     let store_dir = pnpm_store_dir::StoreDir::new(store.path());
@@ -197,8 +228,11 @@ async fn a_persisted_symlink_entry_is_valid_while_its_target_blob_is_stored() {
 #[tokio::test]
 #[cfg(unix)]
 async fn checking_a_persisted_overlay_records_the_modes_it_read() {
-    use pnpm_store_dir::{CafsFileInfo, SideEffectsDiff, SideEffectsOverlay};
-    use std::os::unix::fs::MetadataExt;
+    use pnpm_store_dir::{
+        CafsFileInfo,
+        SideEffectsDiff,
+        SideEffectsOverlay,
+    };
 
     let store = tempfile::tempdir().unwrap();
     let store_dir = pnpm_store_dir::StoreDir::new(store.path());
@@ -231,7 +265,8 @@ async fn checking_a_persisted_overlay_records_the_modes_it_read() {
             .unwrap(),
     );
 
-    let on_disk = std::fs::metadata(&blob.path).unwrap().mode();
+    let on_disk =
+        pnpm_fs::FileMode::from_permissions(&std::fs::metadata(&blob.path).unwrap().permissions());
     assert_eq!(shared.files[&name].mode(), Some(on_disk));
 }
 
@@ -239,32 +274,74 @@ async fn checking_a_persisted_overlay_records_the_modes_it_read() {
 /// libc, operating-system, and architecture combinations have no restore to
 /// observe, so the platform gates below make that boundary visible to tests.
 mod restore {
-    use crate::{AllowBuildPolicy, RequiresBuildBySnapshot, SideEffectsMapsBySnapshot};
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use crate::{
+        AllowBuildPolicy,
+        RequiresBuildBySnapshot,
+        SideEffectsMapsBySnapshot,
+    };
+    use base64::{
+        Engine as _,
+        engine::general_purpose::STANDARD as BASE64,
+    };
     use p256::{
         SecretKey,
-        pkcs8::{EncodePrivateKey as _, EncodePublicKey as _},
+        pkcs8::{
+            EncodePrivateKey as _,
+            EncodePublicKey as _,
+        },
     };
-    use pnpm_config::{Config, RemoteCacheSettings, RemoteSideEffectsCacheSettings};
+    use pnpm_config::{
+        Config,
+        RemoteCacheSettings,
+        RemoteSideEffectsCacheSettings,
+    };
     use pnpm_lockfile::{
-        ImporterDepVersion, PackageKey, PackageMetadata, ProjectSnapshot, ResolvedDependencySpec,
+        ImporterDepVersion,
+        PackageKey,
+        PackageMetadata,
+        ProjectSnapshot,
+        ResolvedDependencySpec,
         SnapshotEntry,
     };
     use pnpm_pnpr_client::{
-        ARTIFACT_KIND, ArtifactBlobSource, ArtifactCandidate, ArtifactFile, ArtifactManifest,
-        ArtifactPayload, ArtifactPublication, ArtifactStore, ArtifactSubject, BuilderProfile,
-        CompatibilityConstraints, OwnerScope, ResolveArtifactsRequest, SignedArtifactEnvelope,
+        ARTIFACT_KIND,
+        ArtifactBlobSource,
+        ArtifactCandidate,
+        ArtifactFile,
+        ArtifactManifest,
+        ArtifactPayload,
+        ArtifactPublication,
+        ArtifactStore,
+        ArtifactSubject,
+        BuilderProfile,
+        CompatibilityConstraints,
+        OwnerScope,
+        ResolveArtifactsRequest,
+        SignedArtifactEnvelope,
         TurborepoArtifactStore,
     };
     use pnpm_shared_artifact_protocol::{
-        ArtifactVariant, ResolveArtifactsResponse, ResolvedArtifact,
+        ArtifactVariant,
+        ResolveArtifactsResponse,
+        ResolvedArtifact,
     };
     use pnpm_store_dir::{
-        CafsFileInfo, RemoteSideEffectsOrigin, SYMLINK_MODE, SideEffectsDiff, StoreDir,
+        CafsFileInfo,
+        RemoteSideEffectsOrigin,
+        SYMLINK_MODE,
+        SideEffectsDiff,
+        StoreDir,
     };
     use pnpm_testing_utils::turborepo_cache::TurborepoCache;
-    use sha2::{Digest as _, Sha512};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use sha2::{
+        Digest as _,
+        Sha512,
+    };
+    use std::collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    };
 
     const PACKAGE: &str = "native-addon";
     const SNAPSHOT: &str = "native-addon@1.0.0";
@@ -432,7 +509,7 @@ mod restore {
             manifest,
         };
         // Signed the way a publisher signs, so the fixture cannot drift from
-        // the wire format the client verifies — and so a payload this test
+        // the wire format the client verifies, and so a payload this test
         // builds wrong fails here rather than being silently discarded as an
         // unverifiable variant.
         SignedArtifactEnvelope::sign(
@@ -545,9 +622,10 @@ mod restore {
     fn assert_restored_mode_is_known(restored: &pnpm_fs::StoreFile) {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-            let on_disk = std::fs::metadata(&restored.path).expect("stat restored").mode();
-            assert_eq!(restored.mode().map(|mode| mode & 0o777), Some(on_disk & 0o777));
+            let on_disk = pnpm_fs::FileMode::from_permissions(
+                &std::fs::metadata(&restored.path).expect("stat restored").permissions(),
+            );
+            assert_eq!(restored.mode(), Some(on_disk));
         }
         #[cfg(not(unix))]
         let _ = restored;
@@ -580,7 +658,7 @@ mod restore {
         let handshake = server
             .mock("GET", "/-/pnpr")
             .with_header("content-type", "application/json")
-            .with_body(r#"{"pnpr":{"versions":[0],"artifacts":[0]}}"#)
+            .with_body(r#"{"pnpr":{"protocols":{"resolver":{"versions":[0],"features":["projectTransforms"]},"artifacts":{"versions":[0]}}}}"#)
             .create_async()
             .await;
         let resolve = server
@@ -597,14 +675,21 @@ mod restore {
             .create_async()
             .await;
         let blob = server
-            .mock("POST", "/-/pnpr/v0/artifacts/blob")
+            .mock("GET", mockito::Matcher::Regex("^/-/pnpr/v0/artifacts/blobs/[^/]+/".into()))
             .with_body_from_request(move |request| {
-                let request: pnpm_pnpr_client::ArtifactBlobRequest =
-                    serde_json::from_slice(request.body().expect("blob body"))
-                        .expect("blob request");
+                let (_, segment) = request
+                    .path()
+                    .rsplit_once('/')
+                    .expect("blob path");
                 blobs
-                    .get(&request.integrity)
+                    .iter()
+                    .find(|(integrity, _)| {
+                        url::form_urlencoded::byte_serialize(integrity.as_bytes())
+                            .collect::<String>()
+                            == segment
+                    })
                     .expect("a blob the manifest names")
+                    .1
                     .clone()
             })
             .expect(expected_downloads)
@@ -642,7 +727,7 @@ mod restore {
         let _handshake = server
             .mock("GET", "/-/pnpr")
             .with_header("content-type", "application/json")
-            .with_body(r#"{"pnpr":{"versions":[0],"artifacts":[0]}}"#)
+            .with_body(r#"{"pnpr":{"protocols":{"resolver":{"versions":[0],"features":["projectTransforms"]},"artifacts":{"versions":[0]}}}}"#)
             .create_async()
             .await;
         let requested = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -696,8 +781,8 @@ mod restore {
                     )]),
                 },
                 config,
-                snapshots: &snapshots,
-                packages: &packages,
+                wanted: (&snapshots, &packages),
+                supported_architectures: None,
                 requires_build_by_snapshot: &RequiresBuildBySnapshot::from([(
                     snapshot_key.clone(),
                     true,
@@ -925,14 +1010,12 @@ mod restore {
     /// upload. Returns the upload mock.
     async fn accept_blob_uploads(server: &mut mockito::ServerGuard) -> mockito::Mock {
         server
-            .mock("HEAD", "/-/pnpr/v0/artifacts/blob")
-            .match_query(mockito::Matcher::Any)
+            .mock("HEAD", mockito::Matcher::Regex("^/-/pnpr/v0/artifacts/blobs/".into()))
             .with_status(404)
             .create_async()
             .await;
         server
-            .mock("PUT", "/-/pnpr/v0/artifacts/blob")
-            .match_query(mockito::Matcher::Any)
+            .mock("PUT", mockito::Matcher::Regex("^/-/pnpr/v0/artifacts/blobs/".into()))
             .with_status(201)
             .create_async()
             .await

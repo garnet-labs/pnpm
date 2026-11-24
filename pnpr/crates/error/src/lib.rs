@@ -1,20 +1,52 @@
-pub use redact_url::redact_url_credentials;
+pub use redact_url::{
+    redact_connection_url,
+    redact_url_credentials,
+};
 
 mod redact_url;
 #[cfg(feature = "server")]
 mod response;
+#[cfg(feature = "server")]
+pub use response::{
+    PublicErrorCode,
+    PublicErrorMessage,
+    error_body,
+    json_error,
+};
 
-use derive_more::{Display, Error, From};
+use derive_more::{
+    Display,
+    Error,
+    From,
+};
 
 #[derive(Debug, Display, Error, From)]
 #[non_exhaustive]
 pub enum RegistryError {
+    /// A password write committed, but credential cleanup or replica refresh failed.
+    #[display("Password change committed, but credential cleanup failed: {source}")]
+    #[from(skip)]
+    PasswordChangeCommitted {
+        #[error(not(source))]
+        user_id: String,
+        #[error(source)]
+        source: Box<RegistryError>,
+    },
+
     #[display("Upstream request to {url} failed: {source}")]
     #[cfg(feature = "server")]
     Upstream {
         url: String,
         #[error(source)]
         source: reqwest::Error,
+    },
+
+    /// The upstream sent no response head within its `timeout`.
+    #[display("Upstream request to {url} timed out before the response arrived")]
+    #[from(skip)]
+    UpstreamTimeout {
+        #[error(not(source))]
+        url: String,
     },
 
     #[display("Upstream response body from {url} failed: {source}")]
@@ -50,6 +82,7 @@ pub enum RegistryError {
     UpstreamUnavailable {
         #[error(not(source))]
         upstream: String,
+        retry_after: std::time::Duration,
     },
 
     #[display("Storage is temporarily unavailable: {reason}")]
@@ -57,6 +90,13 @@ pub enum RegistryError {
     StorageUnavailable {
         #[error(not(source))]
         reason: String,
+    },
+
+    #[display("Stored archive {key:?} failed integrity verification")]
+    #[from(skip)]
+    CorruptArchive {
+        #[error(not(source))]
+        key: String,
     },
 
     #[display("EINTEGRITY: tarball {filename:?} for package {package:?}: {reason}")]
@@ -91,8 +131,7 @@ pub enum RegistryError {
         filename: String,
     },
 
-    /// The YAML config could not be parsed. Startup-only — this never
-    /// surfaces over HTTP, but `Config` parsing shares this error type.
+    /// The server configuration or database schema is incompatible.
     #[display("Invalid config: {reason}")]
     #[from(skip)]
     InvalidConfig {
@@ -121,15 +160,6 @@ pub enum RegistryError {
         resource: String,
     },
 
-    /// A team mutation (create/destroy/add/rm) hit the npm team API on a
-    /// registry whose teams are declared in the configuration. Maps to 403.
-    #[display(
-        "Teams on this registry are declared in the pnpr configuration; to {action}, ask the \
-         registry operator to update the config"
-    )]
-    #[from(skip)]
-    TeamsConfigManaged { action: &'static str },
-
     /// A conditional write whose `If-Match` names a version the resource no
     /// longer has. Maps to 412.
     #[display("{resource} changed since version {expected}; read it again and repeat the change")]
@@ -140,14 +170,13 @@ pub enum RegistryError {
         expected: String,
     },
 
-    /// A rules edit hit the admin API on a registry whose rules are declared
-    /// in the configuration. Maps to 403.
-    #[display(
-        "The package rules of this registry are declared in the pnpr configuration; to change \
-         them, ask the registry operator to update the config"
-    )]
+    /// This replica has no registry graph it may serve: the stored graph was
+    /// never loaded, or could not be read for longer than the stale limit.
+    /// Also a publish into a hosted namespace that the stored graph retired,
+    /// from a replica that has not loaded that graph yet. Maps to 503.
+    #[display("The registries are temporarily unavailable")]
     #[from(skip)]
-    RulesConfigManaged,
+    RegistriesUnavailable,
 
     /// An admin edit that the current state refuses. Maps to 409.
     #[from(skip)]
@@ -156,7 +185,7 @@ pub enum RegistryError {
         reason: String,
     },
 
-    /// Tarball payload from a publish couldn't be decoded — bad
+    /// Tarball payload from a publish couldn't be decoded, bad
     /// base64, length mismatch, or integrity mismatch.
     #[display("Invalid attachment {filename:?}: {reason}")]
     #[from(skip)]
@@ -166,7 +195,14 @@ pub enum RegistryError {
         reason: String,
     },
 
-    /// Generic client-side error during a write operation —
+    /// The addressed registry cannot accept the package. Maps to 403.
+    #[from(skip)]
+    PublishRejected {
+        #[error(not(source))]
+        reason: String,
+    },
+
+    /// Generic client-side error during a write operation,
     /// missing/invalid JSON body field, etc. Maps to 400.
     #[display("Bad request: {reason}")]
     #[from(skip)]
@@ -200,7 +236,7 @@ pub enum RegistryError {
     /// artifact, for the same reason a `name@version` admits one tarball: a
     /// consumer that resolved it once must not be handed different bytes
     /// later. Replacing a claimed slot is an operator action against the
-    /// store, not something a publishing credential can do — a stolen one
+    /// store, not something a publishing credential can do, a stolen one
     /// would otherwise be able to swap an artifact for a dependency nobody
     /// has looked at in a year.
     #[display("Cannot publish over the artifact already published for this input key and platform")]
@@ -212,15 +248,19 @@ pub enum RegistryError {
         entry: String,
     },
 
-    /// A publish transaction committed, but another writer already owned
-    /// what one of its packages tried to publish, so that package's entry
-    /// was left out of the document rather than pointed at bytes that are
-    /// not the ones it uploaded.
-    #[display("Publish transaction could not record: {packages}")]
+    /// A publish depended on an incarnation of an archive's bytes that a
+    /// reclaim is removing or removed, or that another incarnation replaced,
+    /// so the bytes it stored or found may be gone. A retry stores them
+    /// afresh.
+    #[display(
+        "Archive {artifact:?} of {package} was reclaimed while the publish was in flight; publish again"
+    )]
     #[from(skip)]
-    PublishNotRecorded {
+    ArchiveReclaimed {
         #[error(not(source))]
-        packages: String,
+        package: String,
+        #[error(not(source))]
+        artifact: String,
     },
 
     #[display("Upload {id:?} changed; query its offset before retrying")]
@@ -272,29 +312,20 @@ pub enum RegistryError {
         advisories: String,
     },
 
-    /// New-user registration is off: `auth.htpasswd.max_users` is
+    /// New-user registration is off: `auth.users.max_users` is
     /// unset (the secure default) or set to `-1`. Returned for adduser
     /// on a username that doesn't already exist; existing-user logins
     /// are unaffected.
     #[display(
-        "New user registration is disabled. Set auth.htpasswd.max_users to a positive number to allow sign-ups"
+        "New user registration is disabled. Set auth.users.max_users to a positive number to allow sign-ups"
     )]
     RegistrationDisabled,
 
-    /// `auth.htpasswd.max_users: N` cap reached. Returned for
+    /// `auth.users.max_users: N` cap reached. Returned for
     /// adduser on a username that doesn't already exist.
     #[display("Maximum number of users ({max}) reached")]
     #[from(skip)]
     TooManyUsers { max: u64 },
-
-    /// A registration attempt targeted a reserved username (`auth.admins`,
-    /// an OIDC binding, or a SCIM-provisioned user).
-    #[display("Username {name:?} is reserved")]
-    #[from(skip)]
-    ReservedUsername {
-        #[error(not(source))]
-        name: String,
-    },
 
     /// Caller is not a maintainer of the package.
     #[display("You must be a package maintainer to {action} {package:?}")]
@@ -381,18 +412,6 @@ pub enum RegistryError {
         reason: String,
     },
 
-    /// The htpasswd file on disk couldn't be parsed at startup.
-    /// Surfaced as a startup-time error rather than a silent empty
-    /// store so a corrupted file can't quietly lock every existing
-    /// user out.
-    #[display("Invalid htpasswd file {path}: {reason}")]
-    #[from(skip)]
-    InvalidHtpasswdFile {
-        #[error(not(source))]
-        path: String,
-        reason: String,
-    },
-
     /// Bcrypt hash/verify failure. Operational error, not user-facing.
     #[display("Bcrypt failure: {_0}")]
     #[cfg(feature = "server")]
@@ -409,9 +428,10 @@ pub enum RegistryError {
     #[display("libSQL database error: {_0}")]
     Libsql(libsql::Error),
 
-    /// SQL auth backend failure.
+    /// A failure of a `PostgreSQL` or `MySQL` database: the auth backend or
+    /// the metadata.
     #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
-    #[display("Auth database error: {_0}")]
+    #[display("SQL database error: {_0}")]
     Sqlx(sqlx::Error),
 
     /// SQL auth backend operation timed out.
@@ -441,6 +461,18 @@ pub enum RegistryError {
     #[display("JSON error: {_0}")]
     #[cfg(feature = "server")]
     Json(serde_json::Error),
+}
+
+impl RegistryError {
+    /// The account whose password committed despite this error.
+    #[must_use]
+    pub fn committed_password_user(&self) -> Option<&str> {
+        match self {
+            Self::PasswordChangeCommitted { user_id, .. } => Some(user_id),
+            Self::Shared(inner) => inner.committed_password_user(),
+            _ => None,
+        }
+    }
 }
 
 pub type Result<Value, Error = RegistryError> = std::result::Result<Value, Error>;

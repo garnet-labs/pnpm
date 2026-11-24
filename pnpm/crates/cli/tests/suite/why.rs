@@ -1,9 +1,20 @@
-use crate::_utils::{with_colors, without_colors};
+use crate::_utils::{
+    with_colors,
+    without_colors,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use console::strip_ansi_codes;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use std::{ffi::OsStr, fs, path::Path, process::Command};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
 const DEP: &str = "@pnpm.e2e/dep-of-pkg-with-1-dep";
@@ -212,6 +223,35 @@ fn recursive_why_preserves_distinct_unnamed_projects_with_dedicated_lockfiles() 
 }
 
 #[test]
+fn why_exclude_peers_leaves_out_a_package_a_production_dependency_receives_only_as_a_peer() {
+    let (_root, workspace, _anchor) = setup();
+    fs::write(
+        workspace.join("package.json"),
+        format!(
+            r#"{{ "name": "test-why", "version": "1.0.0", "dependencies": {{ "@pnpm.e2e/has-pkg-with-1-dep-peer": "1.0.0" }}, "devDependencies": {{ "{PKG}": "100.0.0" }} }}"#,
+        ),
+    )
+    .expect("write package.json");
+    pacquet(&workspace, ["install"]).assert().success();
+
+    let why_prod = |extra: &[&str]| {
+        let output = pacquet(&workspace, [&["why", "--prod", DEP][..], extra].concat())
+            .output()
+            .expect("run pacquet why");
+        assert!(output.status.success(), "why {extra:?} should succeed: {output:?}");
+        strip_ansi_codes(&String::from_utf8_lossy(&output.stdout)).into_owned()
+    };
+
+    let with_peers = why_prod(&[]);
+    assert!(
+        with_peers.contains("@pnpm.e2e/has-pkg-with-1-dep-peer@1.0.0"),
+        "the peer path should be shown by default: {with_peers}",
+    );
+    let without_peers = why_prod(&["--exclude-peers"]);
+    assert!(without_peers.is_empty(), "nothing should be shown: {without_peers}");
+}
+
+#[test]
 fn why_shows_reverse_tree_for_direct_dep() {
     let (_root, workspace, _anchor) = setup();
 
@@ -288,7 +328,7 @@ fn why_depth_limits_output() {
 }
 
 /// `why` is recursive by default inside a workspace, so from a member it
-/// reports the whole workspace — including a dependency only a sibling
+/// reports the whole workspace, including a dependency only a sibling
 /// declares. `recursiveInstall: false` is what narrows it to the current
 /// project and its dependencies (pnpm's `{.}...` filter); both halves are
 /// checked against `pnpm why` in pnpm 11.
@@ -448,7 +488,7 @@ fn why_is_recursive_by_default_inside_a_workspace() {
 
 // --- ports of the TypeScript why command tests --------------------------------
 //
-// Source: pnpm11/deps/inspection/commands/test/listing/why.ts.
+// Source: <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/inspection/commands/test/listing/why.ts>
 
 /// Port of upstream's `"why" should show reverse dependency tree for a
 /// non-direct dependency`.
@@ -581,7 +621,7 @@ fn why_displays_finder_message_in_tree_output() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines[0], format!("{PKG}@100.0.0"), "stdout: {stdout}");
-    assert_eq!(lines[1], "\u{2502} Found: has 1 dep", "stdout: {stdout}");
+    assert_eq!(lines[1], "│ Found: has 1 dep", "stdout: {stdout}");
 }
 
 /// Port of upstream's `"why" should display finder message in JSON
@@ -693,9 +733,7 @@ fn why_marks_importer_dep_field_and_prints_summary() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout,
-        format!(
-            "{PKG}@100.0.0\n\u{2514}\u{2500}\u{2500} project@0.0.0 (devDependencies)\n\nFound 1 version of {PKG}\n"
-        ),
+        format!("{PKG}@100.0.0\n└── project@0.0.0 (devDependencies)\n\nFound 1 version of {PKG}\n"),
     );
 }
 
@@ -755,3 +793,5 @@ module.exports = {{ finders: {{ 'test-finder': (ctx) => {{
     )
     .expect("write .pnpmfile.cjs");
 }
+
+mod constraints;

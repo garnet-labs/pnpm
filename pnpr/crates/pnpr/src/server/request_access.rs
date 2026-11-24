@@ -1,31 +1,38 @@
 use super::{
-    AppState, Config, HeaderMap, Identity, Next, RegistryError, Request, Response, State, Upstream,
-    authentication, header, identify,
+    Action,
+    AppState,
+    AuthedCaller,
+    HeaderMap,
+    Identity,
+    Next,
+    RegistryError,
+    Request,
+    Response,
+    Upstream,
+    header,
 };
 use axum::response::IntoResponse;
+use pnpr_config::RoutingConfig;
 
 /// Resolve the upstream behind an authorized `/~<name>/` endpoint request.
 ///
-/// Fails closed: an upstream that does not exist or carries no `access:` policy
-/// is a `404` (it is not a private-route endpoint), and a caller the policy
-/// does not admit is a `403`. Returns the [`Upstream`] to fetch *through* —
+/// Fails closed: an upstream that does not exist is a `404`, and a caller no
+/// grant lets read through it is a `403`. Returns the [`Upstream`] to fetch *through*,
 /// `/~<name>/` requests never read or write the shared proxy mirror, so a
 /// private upstream's packuments and tarballs can never leak across the public
 /// path or another upstream.
-pub(super) fn authorized_upstream<'a>(
-    state: &'a AppState,
+pub(super) fn authorized_upstream(
+    state: &AppState,
     identity: &Identity,
     upstream: &str,
-) -> Result<&'a Upstream, RegistryError> {
-    let Some(config) = state.inner.config.routing.upstreams.get(upstream) else {
+) -> Result<Upstream, RegistryError> {
+    let routing = state.routing();
+    let Some(config) = routing.upstreams.get(upstream) else {
         return Err(RegistryError::NotFound);
     };
-    // A private upstream registry gates by its `access:` list; a public registry
-    // (no access) is reachable by anyone at its `/~<name>/` URL, its upstream
-    // credential (if any) staying server-side either way.
-    if let Some(access) = config.access.as_ref()
-        && !access.allows(identity)
-    {
+    // A caller no grant lets read anything through the upstream may not reach
+    // it at its `/~<name>/` URL.
+    if !config.rules.any_access_admits(identity) {
         let user = require_caller(identity, "upstream access")
             .unwrap_or_else(|_| "<anonymous>".to_string());
         return Err(RegistryError::Forbidden {
@@ -34,22 +41,47 @@ pub(super) fn authorized_upstream<'a>(
             resource: format!("upstream {upstream:?}"),
         });
     }
-    state.inner.proxy.upstreams.get(upstream).ok_or_else(|| RegistryError::NotFound)
+    let client = routing.upstream_clients
+        .get(upstream)
+        .cloned()
+        .ok_or_else(|| RegistryError::NotFound)?;
+    // `cache` on any package of the upstream lets the caller have the origin
+    // fetched. Without it the caller reads what the cache holds.
+    if config.rules.any_admits(Action::Cache, identity) {
+        return Ok(client);
+    }
+    Ok(client.cached_only(
+        identity
+            .username()
+            .unwrap_or("<anonymous>")
+            .to_owned(),
+    ))
 }
 
-pub(super) fn revision_source_registry<'a>(state: &'a AppState, source: &str) -> Option<&'a str> {
-    state.inner.config.routing.upstreams.get(source).map(|config| config.url.as_str())
+pub(super) fn revision_source_registry(state: &AppState, source: &str) -> Option<String> {
+    state
+        .routing()
+        .upstreams
+        .get(source)
+        .map(|config| config.url.clone())
 }
 
-/// The disposable cache namespace for an upstream registry's `/~<name>/` route —
-/// the entry precomputed in [`ProxyState::cache_namespaces`](super::state::ProxyState::cache_namespaces), falling back
+/// The disposable cache namespace for an upstream registry's `/~<name>/` route,
+/// the entry precomputed in [`RoutingSnapshot::upstream_cache_namespaces`](super::registry_graph::RoutingSnapshot::upstream_cache_namespaces), falling back
 /// to a fresh computation only for a name outside [`pnpr_config::RoutingConfig::upstreams`] (which
 /// the registry dispatch never produces).
 pub(super) fn upstream_cache_namespace(state: &AppState, upstream: &str) -> String {
-    state.inner.proxy.cache_namespaces
+    let routing = state.routing();
+    routing.upstream_cache_namespaces
         .get(upstream)
         .cloned()
-        .unwrap_or_else(|| compute_upstream_cache_namespace(&state.inner.config, upstream))
+        .unwrap_or_else(|| {
+            compute_upstream_cache_namespace(
+                &routing,
+                &state.inner.config.resolution_cache_secret,
+                upstream,
+            )
+        })
 }
 
 /// Compute an upstream registry's disposable cache namespace, so its packuments
@@ -58,11 +90,11 @@ pub(super) fn upstream_cache_namespace(state: &AppState, upstream: &str) -> Stri
 /// Both shapes fold in the registry's upstream **URL**: the cache is a mirror of
 /// one declared origin, so repointing a registry's `url:` moves to a fresh
 /// namespace and bytes fetched from the previous origin can never answer for
-/// the new one. The cache-first warm tarball path depends on this — it serves
+/// the new one. The cache-first warm tarball path depends on this; it serves
 /// a cached entry without re-binding it against the current packument.
 ///
-/// A **private** registry — any that declares `access:` (so it is not `public`; the
-/// config loader forbids a public registry from carrying any credential) — is
+/// A **private** registry (any that is not `public` (the
+/// config loader forbids a public registry from carrying any credential)) is
 /// namespaced by an HMAC over `(registry, url, credential)` keyed with
 /// the server secret: the on-disk path leaks neither the registry name nor the
 /// credential, and a credential rotation moves to a fresh namespace. Keying on
@@ -73,27 +105,30 @@ pub(super) fn upstream_cache_namespace(state: &AppState, upstream: &str) -> Stri
 /// is integrity-verified, so it uses a *stable* namespace
 /// (`~public/<digest-of-registry-name-and-url>`) that is shared across process
 /// restarts.
-pub(crate) fn compute_upstream_cache_namespace(config: &Config, upstream: &str) -> String {
-    let ecosystem = config.routing.registries.ecosystem(upstream).unwrap_or_default();
+pub(crate) fn compute_upstream_cache_namespace(
+    routing: &RoutingConfig,
+    cache_secret: &[u8],
+    upstream: &str,
+) -> String {
+    let ecosystem = routing.registries.ecosystem(upstream).unwrap_or_default();
     let local_name = pnpr_registry::Registries::local_name(upstream);
     let canonical = format!("{ecosystem}/{local_name}");
-    let url = config.routing.upstreams
+    let url = routing.upstreams
         .get(upstream)
         .map_or("", |upstream_config| upstream_config.url.as_str());
-    if let Some(upstream_config) = config.routing.upstreams.get(upstream)
-        && upstream_config.access.is_some()
+    if let Some(upstream_config) = routing.upstreams.get(upstream)
+        && !upstream_config.public
     {
         // The credential epoch covers the origin URL and every header the
         // upstream attaches upstream, not just `Authorization`, so repointing
         // the URL or rotating a credential carried in a custom header moves
         // the private cache to a fresh namespace. The NUL separator keeps
-        // `(url, headers)` pairs unambiguous — a URL cannot contain NUL.
+        // `(url, headers)` pairs unambiguous, a URL cannot contain NUL.
         let epoch = pnpr_route::credential_digest(&format!(
             "{url}\0{}",
             pnpr_route::headers_credential_digest(&upstream_config.headers),
         ));
-        let digest =
-            pnpr_route::upstream_cache_digest(&canonical, epoch, &config.resolution_cache_secret);
+        let digest = pnpr_route::upstream_cache_digest(canonical, epoch, cache_secret);
         return format!("~upstreams/{digest}");
     }
     // Public registry: a stable, secret-free namespace keyed by the registry name
@@ -136,62 +171,52 @@ pub(super) fn require_admin(
     }
 }
 
-pub(super) async fn caller_username(
+/// Like [`require_admin`], also admitting the `auth.registryAdmins`: the
+/// callers who may change teams and grants.
+pub(super) fn require_access_admin(
     state: &AppState,
-    headers: &HeaderMap,
-) -> Result<Option<String>, RegistryError> {
-    let authorization = single_authorization_header(headers)?;
-    let username = match authorization.and_then(authentication::bearer_credentials) {
-        Some(raw) if let Some(user) = state.inner.identity.oidc.session(raw)? => {
-            Some(user.username)
-        }
-        _ => identify(authorization, state.inner.identity.auth.tokens.as_ref()).await?,
-    };
-    if let Some(username) = &username
-        && super::scim::is_deprovisioned(state, username)?
-    {
-        return Err(RegistryError::Unauthenticated {
-            resource: "a deprovisioned account".to_string(),
-        });
+    identity: &Identity,
+    action: &'static str,
+    resource: String,
+) -> Result<(), RegistryError> {
+    if state.inner.config.identity.is_registry_admin(identity) {
+        return Ok(());
     }
-    Ok(username)
+    require_admin(state, identity, action, resource)
 }
 
 pub(super) async fn require_resolver_caller(
-    State(state): State<AppState>,
+    caller: AuthedCaller,
     request: Request,
     next: Next,
 ) -> Response {
-    require_protocol_caller(&state, request, next, "dependency resolution").await
+    require_protocol_caller(caller, request, next, "dependency resolution").await
 }
 
 pub(super) async fn require_artifact_caller(
-    State(state): State<AppState>,
+    caller: AuthedCaller,
     request: Request,
     next: Next,
 ) -> Response {
-    require_protocol_caller(&state, request, next, "shared artifacts").await
+    require_protocol_caller(caller, request, next, "shared artifacts").await
 }
 
 pub(super) async fn require_pipeline_caller(
-    State(state): State<AppState>,
+    caller: AuthedCaller,
     request: Request,
     next: Next,
 ) -> Response {
-    require_protocol_caller(&state, request, next, "pipeline runs").await
+    require_protocol_caller(caller, request, next, "pipeline runs").await
 }
 
 pub(super) async fn require_protocol_caller(
-    state: &AppState,
+    AuthedCaller(identity): AuthedCaller,
     request: Request,
     next: Next,
     resource: &str,
 ) -> Response {
-    match caller_username(state, request.headers()).await {
-        Ok(Some(_username)) => next.run(request).await,
-        Ok(None) => {
-            RegistryError::Unauthenticated { resource: resource.to_string() }.into_response()
-        }
+    match require_caller(&identity, resource) {
+        Ok(_) => next.run(request).await,
         Err(error) => error.into_response(),
     }
 }

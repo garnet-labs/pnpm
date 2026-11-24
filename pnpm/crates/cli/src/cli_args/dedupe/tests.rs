@@ -1,15 +1,34 @@
 use super::{
-    DedupeResolutionReporter, emit_dedupe_check_error, render_dedupe_check_error,
-    render_dedupe_check_issues, reusable_skipped_package_id,
+    DedupeResolutionReporter,
+    emit_dedupe_check_error,
+    render_dedupe_check_error,
+    render_dedupe_check_issues,
+    reusable_skipped_package_id,
 };
 use pnpm_lockfile::PackageMetadata;
-use pnpm_package_manager::{InstallabilityHost, LockfileDiff, SnapshotDiff};
-use pnpm_reporter::{LogEvent, ProgressMessage, Reporter};
-use pnpm_store_dir::{PackageFilesIndex, StoreDir, StoreIndex, store_index_key};
+use pnpm_package_manager::{
+    InstallabilityHost,
+    LockfileDiff,
+    SnapshotDiff,
+};
+use pnpm_reporter::{
+    LogEvent,
+    ProgressMessage,
+    Reporter,
+};
+use pnpm_store_dir::{
+    PackageFilesIndex,
+    StoreDir,
+    StoreIndex,
+    store_index_key,
+};
 use std::{
     collections::HashSet,
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 use tempfile::TempDir;
 
@@ -257,7 +276,7 @@ fn engine_incompatible_skipped_packages_are_not_reported_as_reused() {
     .unwrap();
     let host = InstallabilityHost {
         node_version: "22.0.0".to_string(),
-        node_detected: true,
+        node_source: pnpm_deps_restorer::NodeVersionSource::Probed,
         os: "linux",
         cpu: "x64",
         libc: "glibc",

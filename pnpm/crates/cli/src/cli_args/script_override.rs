@@ -1,8 +1,15 @@
 //! Script overrides for built-in commands, per
 //! <https://pnpm.io/scripts#built-in-command-and-script-name-conflicts>.
 
-use super::{dispatch::RunCtx, recursive::RecursiveExecutionArgs, run::RunArgs};
-use derive_more::{Display, Error};
+use super::{
+    dispatch::RunCtx,
+    recursive::RecursiveExecutionArgs,
+    run::RunArgs,
+};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
 use pnpm_fs::lexical_normalize;
@@ -50,7 +57,7 @@ pub(crate) fn resolve(
     if declares_script(safe_read_project_manifest_only(dir)?.as_ref(), command_name) {
         ctx.builtin_replaced_by_script.store(true, Ordering::Relaxed);
         return Ok(Some(RunArgs {
-            script: RunArgs::script(command_name, script_args),
+            script: RunArgs::script(command_name.to_owned(), script_args),
             if_present: false,
             sequential: false,
             dry_run: false,

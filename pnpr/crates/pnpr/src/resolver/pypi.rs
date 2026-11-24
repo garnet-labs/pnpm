@@ -2,8 +2,8 @@
 //!
 //! `POST /-/pnpr/v0/resolve` with `"ecosystem": "pypi"` resolves a Python
 //! project the way the Cargo surface next door resolves a Cargo one: the
-//! client sends what only it has — its requirements and the interpreter
-//! they are for — and the server does the part that costs round trips.
+//! client sends what only it has (its requirements and the interpreter
+//! they are for) and the server does the part that costs round trips.
 //!
 //! For Python that part is most of the work. Resolving a requirement reads
 //! a distribution's `METADATA`, which lives inside a wheel, so a client
@@ -18,41 +18,74 @@
 //!
 //! What comes back is a `pylock.toml` document. The client writes it, then
 //! downloads the wheels it names and checks them against the digests the
-//! index published — and re-solves the project against the metadata of
+//! index published, and re-solves the project against the metadata of
 //! what it actually downloaded, so a wrong answer here cannot become an
 //! installed environment.
 
 mod metadata;
 mod response;
 use metadata::{
-    CachedDocument, metadata_from_wheel, parse_metadata, parse_page, project_page_url, text,
+    CachedDocument,
+    parse_metadata,
+    parse_page,
+    project_page_url,
+    text,
     verify_digest,
 };
 
 use std::{
     collections::BTreeMap,
-    io::Cursor,
-    path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    path::{
+        Path,
+        PathBuf,
     },
-    time::{Duration, SystemTime},
+    sync::{
+        Arc,
+        Mutex,
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
+    },
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
 
-use axum::{http::StatusCode, response::Response};
-use pnpm_network::{AuthHeaders, MetadataCacheScope, RetryOpts, ThrottledClient};
-use pnpm_python_resolver::{
-    IndexCandidate, Offered, Packages, Step, Target, WheelMetadata, candidates_from_page,
-    metadata_url, parse_requirement, validate_url,
+use axum::response::Response;
+use pnpm_network::{
+    AuthHeaders,
+    MetadataCacheScope,
+    RetryOpts,
+    ThrottledClient,
 };
-use pnpr_route::{Footprint, url_has_inline_credentials};
+use pnpm_python_resolver::{
+    IndexCandidate,
+    Offered,
+    Packages,
+    Step,
+    Target,
+    WheelMetadata,
+    candidates_from_page,
+    metadata_url,
+    validate_url,
+};
+use pnpr_pypi::archive::{
+    MAX_METADATA_BYTES,
+    metadata_from_wheel,
+};
+use pnpr_route::Footprint;
 
 use crate::server::StripedLocks;
 
 use super::{
-    Resolver, json_error, json_error_with_code, package_route::PackageRoute,
-    protocol::PypiResolveRequest, request_validation::forbidden_off_allowlist,
+    Resolver,
+    limits::{
+        AdmittedResolve,
+        request_timeout_response,
+    },
+    package_route::PackageRoute,
 };
 
 /// How many requirements one request may name. A project's manifest
@@ -77,9 +110,6 @@ const MAX_METADATA_READS: usize = 20_000;
 /// Cap on a single Simple API page.
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Cap on a single `METADATA` document.
-const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
-
 /// Cap on a wheel read for its metadata, which only an index that
 /// publishes no metadata files forces. Well above an ordinary wheel: the
 /// giant ones are published to indexes that do serve metadata files, so
@@ -97,41 +127,27 @@ const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 pub(super) async fn handle_resolve(
     runtime: &Resolver,
     identity: pnpr_policy::Identity,
-    body: &[u8],
+    body: axum::body::Bytes,
+    deadline: tokio::time::Instant,
+    admitted: AdmittedResolve<'_>,
 ) -> Response {
-    let request: PypiResolveRequest = match serde_json::from_slice(body) {
-        Ok(request) => request,
-        Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+    let validated = match response::validate_request(runtime, body) {
+        Ok(validated) => validated,
+        Err(response) => return response,
     };
-    let index = match index_url(&request.index) {
-        Ok(index) => index,
-        Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
+    let _permit = match admitted.acquire(deadline).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
     };
-    if let Some(response) = reject_unusable_request(runtime, &request, &index) {
-        return response;
+    if tokio::time::Instant::now() >= deadline {
+        return request_timeout_response();
     }
-    let requirements = match request.requirements
-        .iter()
-        .map(|requirement| parse_requirement(requirement))
-        .collect::<miette::Result<Vec<_>>>()
+    match tokio::time::timeout_at(deadline, response::resolve_request(runtime, identity, validated))
+        .await
     {
-        Ok(requirements) => requirements,
-        Err(err) => return json_error(StatusCode::BAD_REQUEST, &super::report_message(&err)),
-    };
-
-    if requirements
-        .iter()
-        .any(|requirement| {
-            matches!(requirement.version_or_url, Some(pep508_rs::VersionOrUrl::Url(_)))
-        })
-    {
-        return json_error_with_code(
-            StatusCode::BAD_REQUEST,
-            "Python direct URL requirements must be resolved by the client",
-            Some("ERR_PNPM_PYPI_CLIENT_RESOLVE_REQUIRED"),
-        );
+        Ok(response) if tokio::time::Instant::now() < deadline => response,
+        Ok(_) | Err(_) => request_timeout_response(),
     }
-    response::resolve_request(runtime, identity, index, request, requirements).await
 }
 
 type Solved = (BTreeMap<pep508_rs::PackageName, pep440_rs::Version>, Packages);
@@ -227,12 +243,7 @@ impl IndexReader {
     fn new(runtime: &Resolver, identity: pnpr_policy::Identity, index: url::Url) -> Self {
         Self {
             client: Arc::clone(&runtime.client),
-            hook: Arc::new(pnpr_route::RouteHook::new(
-                Arc::clone(&runtime.route_context),
-                identity,
-                Arc::new(Mutex::new(Footprint::default())),
-                Arc::clone(&runtime.cache.secret),
-            )),
+            hook: runtime.route_hook(identity, Arc::new(Mutex::new(Footprint::default()))),
             locks: Arc::clone(&runtime.index.python_locks),
             cache_dir: runtime.python_index_cache_dir(index.as_str()),
             ttl: runtime.index.ttl,
@@ -250,7 +261,7 @@ impl IndexReader {
     ) -> Result<Offered, String> {
         let canonical_name = canonical_project_name(name)?;
         let page_url = project_page_url(&self.index, &canonical_name)?;
-        let auth = self.auth_for(&canonical_name);
+        let auth = self.auth_for(canonical_name);
         let cache_path = self.cache_path(&auth, &page_url, None);
         if let Some(cached) = self.cached(&cache_path).await {
             let source = cached.url(&page_url)?;
@@ -295,7 +306,7 @@ impl IndexReader {
         let wheel_url = url::Url::parse(&candidate.wheel.url)
             .map_err(|err| format!("parse the wheel URL for {name}: {err}"))?;
         validate_url(&wheel_url).map_err(|err| super::report_message(&err))?;
-        let auth = self.auth_for(&canonical_name);
+        let auth = self.auth_for(canonical_name);
         // An index that publishes a metadata file vouches for a digest
         // `cached_metadata` re-checks. One that publishes none leaves the
         // extracted document nothing to be checked against, so its cache
@@ -406,12 +417,9 @@ impl IndexReader {
     /// The request auth for a read about `canonical_name`: this server's
     /// route policy for the caller, with the project bound in so the
     /// package-blind fetch helpers still classify by it.
-    fn auth_for(&self, canonical_name: &str) -> AuthHeaders {
+    fn auth_for(&self, canonical_name: String) -> AuthHeaders {
         AuthHeaders::default()
-            .with_route_hook(Arc::new(PackageRoute::new(
-                Arc::clone(&self.hook),
-                canonical_name.to_string(),
-            )))
+            .with_route_hook(Arc::new(PackageRoute::new(Arc::clone(&self.hook), canonical_name)))
     }
 
     /// Where `url`'s document is cached. The route scope keys the
@@ -500,33 +508,3 @@ fn budget_exhausted(kind: &str) -> String {
 
 #[cfg(test)]
 mod tests;
-
-fn reject_unusable_request(
-    runtime: &Resolver,
-    request: &PypiResolveRequest,
-    index: &url::Url,
-) -> Option<Response> {
-    if url_has_inline_credentials(index.as_str()) {
-        return Some(json_error(
-            StatusCode::BAD_REQUEST,
-            "inline URL credentials (user:pass@host) are not allowed; \
-             configure an upstream credential alias instead",
-        ));
-    }
-    if !runtime.route_context.allows_registry(index.as_str()) {
-        return Some(forbidden_off_allowlist(index.as_str()));
-    }
-    if request.requirements.len() > MAX_REQUIREMENTS {
-        return Some(json_error(
-            StatusCode::BAD_REQUEST,
-            &format!("a resolve request may name at most {MAX_REQUIREMENTS} requirements"),
-        ));
-    }
-    if request.target.tags.len() > MAX_TAGS {
-        return Some(json_error(
-            StatusCode::BAD_REQUEST,
-            &format!("a resolve request may name at most {MAX_TAGS} wheel tags"),
-        ));
-    }
-    None
-}

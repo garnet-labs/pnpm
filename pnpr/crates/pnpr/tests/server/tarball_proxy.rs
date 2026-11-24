@@ -1,8 +1,30 @@
 use super::{
-    AccessList, AuthState, Body, PackageRules, Request, ServiceExt, StatusCode, TempDir, Value,
-    access_rule, body_bytes, body_json, config_for, enable_osv, foo_packument, header, json,
-    mock_packument_for_tarball, osv_database, public_cache_blob, public_cache_blobs, router,
-    router_with_auth, sha512_integrity, upstream_endpoint_config,
+    AccessList,
+    Body,
+    Duration,
+    PackageRules,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    Value,
+    access_rule,
+    await_no_tgz,
+    body_bytes,
+    body_json,
+    config_for,
+    enable_osv,
+    foo_packument,
+    header,
+    json,
+    mock_packument_for_tarball,
+    osv_database,
+    public_cache_blob,
+    public_cache_blobs,
+    router,
+    router_with_auth,
+    sha512_integrity,
+    upstream_endpoint_config,
 };
 use crate::tokens::issue_token;
 
@@ -69,8 +91,8 @@ async fn upstream_auth_and_custom_headers_are_forwarded_upstream() {
     upstream.headers.insert("x-org", "acme".parse().unwrap());
     // A credentialed upstream must be access-gated (server construction
     // enforces it), so the read authenticates as an admitted caller.
-    upstream.access = Some(AccessList::from_tokens(["$authenticated"]));
-    let auth = AuthState::in_memory();
+    upstream.set_access(AccessList::from_tokens(["$authenticated"]));
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -155,7 +177,7 @@ async fn upstream_endpoint_serves_packument_with_endpoint_rewritten_tarballs() {
 
     let tmp = TempDir::new().unwrap();
     let config = upstream_endpoint_config(&upstream.url(), tmp.path().to_path_buf(), "alice");
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -199,7 +221,7 @@ async fn upstream_endpoint_rejects_unauthorized_caller() {
     let tmp = TempDir::new().unwrap();
     let config = upstream_endpoint_config("http://127.0.0.1:1", tmp.path().to_path_buf(), "alice");
     let app = router(config);
-    // Anonymous caller is not admitted by the upstream's access policy, and the
+    // No grant lets an anonymous caller read through the upstream, and the
     // request fails closed before any upstream fetch.
     let response = app
         .oneshot(
@@ -209,7 +231,7 @@ async fn upstream_endpoint_rejects_unauthorized_caller() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -225,7 +247,7 @@ async fn upstream_endpoint_tarball_is_verified_and_cached_per_upstream() {
         } } },
     });
     // The packument and verified tarball are cached in the upstream's private
-    // namespace, so two tarball requests hit the upstream exactly once each —
+    // namespace, so two tarball requests hit the upstream exactly once each,
     // the second is served from the private cache, never re-fetched.
     let packument_mock = upstream
         .mock("GET", "/foo")
@@ -245,7 +267,7 @@ async fn upstream_endpoint_tarball_is_verified_and_cached_per_upstream() {
 
     let tmp = TempDir::new().unwrap();
     let config = upstream_endpoint_config(&upstream.url(), tmp.path().to_path_buf(), "alice");
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -273,7 +295,7 @@ async fn upstream_cache_does_not_leak_to_the_public_path() {
     // The public `**` route proxies through the default `npmjs` upstream to the
     // public upstream; a separate access-bearing `corp` upstream serves a
     // *different* upstream at `/~corp/`. After the private `/~corp/foo` tarball
-    // is cached, the public `/foo` request must still serve the public bytes —
+    // is cached, the public `/foo` request must still serve the public bytes,
     // proving the private upstream's cache is namespaced, not shared.
     let mut public_upstream = mockito::Server::new_async().await;
     let mut private_upstream = mockito::Server::new_async().await;
@@ -311,9 +333,9 @@ async fn upstream_cache_does_not_leak_to_the_public_path() {
         .expect("default `npmjs` upstream")
         .clone();
     corp.url = private_upstream.url();
-    corp.access = Some(AccessList::from_tokens(["alice"]));
+    corp.set_access(AccessList::from_tokens(["alice"]));
     config.routing.upstreams.insert("corp".to_string(), corp);
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -347,8 +369,8 @@ async fn upstream_cache_does_not_leak_to_the_public_path() {
 
 /// Repointing a registry's `url:` must abandon the previous origin's cache: the
 /// namespace is keyed by the origin, so a warm entry fetched from the old
-/// upstream — packument or tarball, including via the cache-first tarball
-/// path — can never answer for the new one under the same registry name.
+/// upstream (packument or tarball, including via the cache-first tarball
+/// path) can never answer for the new one under the same registry name.
 #[tokio::test]
 async fn repointing_an_upstream_url_abandons_the_old_origins_cache() {
     let mut old_origin = mockito::Server::new_async().await;
@@ -392,7 +414,7 @@ async fn repointing_an_upstream_url_abandons_the_old_origins_cache() {
     assert_eq!(primed.status(), StatusCode::OK);
     assert_eq!(body_bytes(primed.into_body()).await, old_bytes);
 
-    // Same storage, same registry name, new `url:` — the fresh entries must come
+    // Same storage, same registry name, new `url:`, the fresh entries must come
     // from the new origin, not the still-fresh cache of the old one.
     let app = router(config_for(&new_origin.url(), tmp.path().to_path_buf()));
     let repointed = app
@@ -420,7 +442,7 @@ async fn upstream_endpoint_cache_false_streams_without_caching() {
         } } },
     });
     // A `cache: false` upstream endpoint persists nothing, so each request
-    // re-fetches the packument and tarball — the mocks are hit twice.
+    // re-fetches the packument and tarball, the mocks are hit twice.
     let packument_mock = upstream
         .mock("GET", "/foo")
         .with_body(packument.to_string())
@@ -438,7 +460,7 @@ async fn upstream_endpoint_cache_false_streams_without_caching() {
     let tmp = TempDir::new().unwrap();
     let mut config = upstream_endpoint_config(&upstream.url(), tmp.path().to_path_buf(), "alice");
     config.routing.upstreams.get_mut("npmjs").expect("default `npmjs` upstream").cache = false;
-    let auth = AuthState::in_memory();
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "password"), ("bob", "password")]);
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
 
@@ -578,7 +600,7 @@ async fn osv_refuses_vulnerable_cached_tarball_under_noncanonical_name() {
     // A cache hit must still be OSV-screened on the tarball's *resolved*
     // version, not just the filename-carried one. Here version 1.0.0 declares
     // a non-canonical tarball basename `foo-0.0.1.tgz`, so the request filename
-    // resolves to 1.0.0 — and a cached tarball for a now-blocked 1.0.0 must not
+    // resolves to 1.0.0, and a cached tarball for a now-blocked 1.0.0 must not
     // slip past on the filename's unblocked "0.0.1".
     let mut upstream = mockito::Server::new_async().await;
     let bytes = b"cached vulnerable tarball";
@@ -708,7 +730,7 @@ async fn upstream_5xx_maps_to_bad_gateway() {
 #[tokio::test]
 async fn unreachable_upstream_maps_to_service_unavailable() {
     // Port 0 is never a listening port, so connecting to it is refused
-    // outright — exercising the `is_connect()` branch of the status
+    // outright, exercising the `is_connect()` branch of the status
     // mapping without depending on DNS. Probing for a free ephemeral
     // port instead would race: the suite's mockito servers bind ephemeral
     // ports throughout the run and can claim the probed one before the
@@ -734,7 +756,7 @@ async fn tarball_filename_for_other_package_is_rejected() {
     // A non-canonical filename is admitted only when the package's own
     // packument declares that basename in some version's `dist.tarball` (the
     // preserved-upstream-basename case). `foo`'s packument declares only
-    // `foo-1.0.0.tgz`, so another package's filename is a definitive 404 —
+    // `foo-1.0.0.tgz`, so another package's filename is a definitive 404,
     // never fetched, never cached under `foo`.
     let mut upstream = mockito::Server::new_async().await;
     upstream
@@ -775,7 +797,7 @@ async fn tarball_filename_for_other_package_is_rejected() {
 /// canonical `<name>-<version>.tgz` shape (e.g. esprima-fb's zero-padded
 /// `3001.0001.0000-dev-harmony-fb`). The rewrite preserves that basename in
 /// the served packument, so the serve path must accept it back and bind it
-/// to the declaring version's integrity — otherwise the version is
+/// to the declaring version's integrity; otherwise the version is
 /// un-fetchable through the very URL this server advertised.
 #[tokio::test]
 async fn non_canonical_upstream_tarball_basename_is_served() {
@@ -948,7 +970,7 @@ async fn upstream_pnpr_version_route_tarball_is_proxied() {
         },
     });
     let packument_mock = upstream
-        .mock("GET", "/@scope/foo")
+        .mock("GET", "/@scope%2Ffoo")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(packument.to_string())
@@ -1006,4 +1028,119 @@ async fn upstream_pnpr_version_route_tarball_is_proxied() {
 
     packument_mock.assert_async().await;
     tarball_mock.assert_async().await;
+}
+
+/// `maxTarballSize` caps a tarball fetched from an upstream: one that
+/// declares more is refused before any of it is streamed, and the same tarball
+/// is served once the cap is raised past it. The response carries no reason,
+/// like every upstream failure; the cap is what tells the two runs apart.
+#[tokio::test]
+async fn upstream_tarball_over_max_tarball_size_is_refused_until_the_cap_is_raised() {
+    let mut upstream = mockito::Server::new_async().await;
+    let bytes = vec![0xAB_u8; 8 * 1024];
+    let _packument_mock = mock_packument_for_tarball(&mut upstream, "big", "1.0.0", &bytes).await;
+    let tarball_mock = upstream
+        .mock("GET", "/big/-/big-1.0.0.tgz")
+        .with_status(200)
+        .with_header("content-type", "application/octet-stream")
+        .with_body(&bytes)
+        .expect(2)
+        .create_async()
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let request = || {
+        Request::get("/npm/big/-/big-1.0.0.tgz")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let mut config = config_for(&upstream.url(), tmp.path().to_path_buf());
+    config.http.max_tarball_bytes = 4 * 1024;
+    let refused = router(config)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
+    assert!(!public_cache_blob(tmp.path(), "big", "big-1.0.0.tgz").exists(), "nothing is cached");
+
+    let mut config = config_for(&upstream.url(), tmp.path().to_path_buf());
+    config.http.max_tarball_bytes = 16 * 1024;
+    let served = router(config)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(body_bytes(served.into_body()).await, bytes);
+    tarball_mock.assert_async().await;
+}
+
+/// A cached upstream that declares no size is already streaming to the client
+/// when the tarball crosses `maxTarballSize`, so the cap can only cut the body
+/// off: the status is 200, reading the body fails, and nothing is cached.
+#[tokio::test]
+async fn cached_upstream_tarball_of_undeclared_size_is_cut_off_at_max_tarball_size() {
+    let mut upstream = mockito::Server::new_async().await;
+    let bytes = vec![0xAB_u8; 8 * 1024];
+    let _packument_mock = mock_packument_for_tarball(&mut upstream, "big", "1.0.0", &bytes).await;
+    let chunked = bytes.clone();
+    let tarball_mock = upstream
+        .mock("GET", "/big/-/big-1.0.0.tgz")
+        .with_status(200)
+        .with_header("content-type", "application/octet-stream")
+        .with_chunked_body(move |writer| writer.write_all(&chunked))
+        .expect(1)
+        .create_async()
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let mut config = config_for(&upstream.url(), tmp.path().to_path_buf());
+    config.http.max_tarball_bytes = 4 * 1024;
+
+    let response = router(config)
+        .oneshot(
+            Request::get("/npm/big/-/big-1.0.0.tgz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX).await.is_err(),
+        "crossing the cap mid-stream must surface as a body error",
+    );
+    tarball_mock.assert_async().await;
+    assert!(
+        await_no_tgz(&public_cache_blobs(tmp.path(), "big"), Duration::from_secs(1)).await,
+        "the cut-off tarball is never cached",
+    );
+}
+
+/// A `cache: false` upstream spools the tarball to a temporary file before it
+/// is served, so the same cap applies there.
+#[tokio::test]
+async fn uncached_upstream_tarball_over_max_tarball_size_is_refused() {
+    let mut upstream = mockito::Server::new_async().await;
+    let bytes = vec![0xCD_u8; 8 * 1024];
+    let _packument_mock = mock_packument_for_tarball(&mut upstream, "big", "1.0.0", &bytes).await;
+    let _mock = upstream
+        .mock("GET", "/big/-/big-1.0.0.tgz")
+        .with_status(200)
+        .with_header("content-type", "application/octet-stream")
+        .with_body(&bytes)
+        .create_async()
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let mut config = config_for(&upstream.url(), tmp.path().to_path_buf());
+    config.routing.upstreams.get_mut("npmjs").expect("default `npmjs` upstream").cache = false;
+    config.http.max_tarball_bytes = 4 * 1024;
+
+    let refused = router(config)
+        .oneshot(
+            Request::get("/npm/big/-/big-1.0.0.tgz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
 }

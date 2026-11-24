@@ -1,21 +1,53 @@
-use pnpm_config::{Config, NetworkPolicy};
-use pnpm_network::{RetryOpts, ThrottledClient};
+use pnpm_config::{
+    Config,
+    NetworkPolicy,
+};
+use pnpm_network::{
+    RetryOpts,
+    ThrottledClient,
+};
 use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, NpmResolver, shared_packument_fetch_locker,
+    InMemoryPackageMetaCache,
+    NpmResolver,
+    shared_packument_fetch_locker,
     shared_picked_manifest_cache,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    sync::Arc,
+};
 
 pub(super) struct EnvironmentNetwork {
     pub(super) http_client: Arc<ThrottledClient>,
     pub(super) auth_headers: Arc<pnpm_network::AuthHeaders>,
     pub(super) registries: HashMap<String, String>,
+    pub(super) registry_options_by_url: BTreeMap<String, pnpm_lockfile::RegistryOptions>,
     pub(super) retry_opts: RetryOpts,
     pub(super) offline: bool,
     pub(super) tar_limits: pnpm_tarball::TarLimits,
 }
 
 impl EnvironmentNetwork {
+    pub(super) fn new(
+        http_client: Arc<ThrottledClient>,
+        auth_headers: Arc<pnpm_network::AuthHeaders>,
+        registries: HashMap<String, String>,
+        config: &Config,
+    ) -> Self {
+        Self {
+            http_client,
+            auth_headers,
+            registries,
+            registry_options_by_url: config.registry_options_by_url.clone(),
+            retry_opts: config.retry_opts(),
+            offline: config.offline,
+            tar_limits: pnpm_tarball::TarLimits::new(config.max_tarball_unpacked_size),
+        }
+    }
+
     pub(super) fn resolver(&self, config: &Config) -> NpmResolver<InMemoryPackageMetaCache> {
         NpmResolver {
             registries: self.registries.clone(),
@@ -38,7 +70,7 @@ impl EnvironmentNetwork {
                 registry_options_by_url: std::sync::Arc::new(
                     config.registry_options_by_url.clone(),
                 ),
-                minimum_release_age: config.resolved_minimum_release_age(),
+                minimum_release_age: config.release_age_window_from_now(),
             },
             cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
                 network: NetworkPolicy::from_settings(self.offline, config.prefer_offline),

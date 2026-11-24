@@ -1,25 +1,57 @@
-//! `pacquet store status` — find packages something edited after they
+//! `pacquet store status`: find packages something edited after they
 //! were expanded out of the store.
 //!
 //! A package the store has no row for is skipped: there is nothing to
 //! compare it against.
 
-use derive_more::{Display, Error};
-use miette::{Diagnostic, IntoDiagnostic};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Diagnostic,
+    IntoDiagnostic,
+};
 use pnpm_config::Config;
 use pnpm_deps_restorer::{
-    AllowBuildPolicy, VirtualStoreLayout, safe_join_modules_dir, store_index_key_for_resolution,
-    validate_importer_id, validate_virtual_store_slot_containment,
+    AllowBuildPolicy,
+    VirtualStoreLayout,
+    safe_join_modules_dir,
+    store_index_key_for_resolution,
+    validate_importer_id,
+    validate_virtual_store_slot_containment,
     virtual_store_layout_for_lockfile,
 };
 use pnpm_lockfile::Lockfile;
-use pnpm_modules_yaml::{AllowBuildValue, Host, Modules, read_modules_manifest};
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
-use pnpm_store_dir::{StoreIndex, package_dir_matches_index};
+use pnpm_modules_yaml::{
+    AllowBuildValue,
+    Host,
+    Modules,
+    read_modules_manifest,
+};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
+use pnpm_store_dir::{
+    PackageFilesIndex,
+    StoreDir,
+    StoreIndex,
+    file_content_matches_digest,
+    package_dir_matches_index,
+};
 use rayon::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -145,18 +177,12 @@ fn installed_layout(
     lockfile_dir: &Path,
     virtual_store_dir: &Path,
 ) -> miette::Result<VirtualStoreLayout> {
-    let max_length = modules_manifest.map_or(config.virtual_store_dir_max_length, |manifest| {
-        manifest.virtual_store_dir_max_length
-    }) as usize;
+    let max_length = modules_manifest
+        .map(|manifest| manifest.virtual_store_dir_max_length)
+        .unwrap_or(config.virtual_store_dir_max_length) as usize;
     let layout = if config.enable_global_virtual_store {
         let policy = installed_build_policy(config, modules_manifest)?;
-        virtual_store_layout_for_lockfile(
-            config,
-            config.node_version.as_deref(),
-            lockfile,
-            Some(&policy),
-            Some(lockfile_dir),
-        )
+        virtual_store_layout_for_lockfile(config, lockfile, Some(&policy), Some(lockfile_dir))
     } else {
         VirtualStoreLayout::legacy(virtual_store_dir, max_length)
     };
@@ -279,7 +305,8 @@ fn find_modified(
         .iter()
         .map(|package| package.store_index_key.clone())
         .collect::<Vec<_>>();
-    let rows = store_index.get_many(&keys).into_diagnostic()?;
+    let mut rows = store_index.get_many(&keys).into_diagnostic()?;
+    let invalid_manifest_rows = repair_legacy_git_build_flags(store_dir, &mut rows);
     for package in packages {
         if package.global_virtual_store
             && rows.contains_key(&package.store_index_key)
@@ -295,15 +322,54 @@ fn find_modified(
         .par_iter()
         .filter(|package| {
             rows.get(&package.store_index_key)
-                .is_some_and(|row| !package_dir_matches_index(&package.package_dir, row))
+                .is_some_and(|row| {
+                    invalid_manifest_rows.contains(&package.store_index_key)
+                        || !package_dir_matches_index(&package.package_dir, row)
+                })
         })
         .map(|package| package.dep_path.clone())
         .collect())
 }
 
+fn repair_legacy_git_build_flags(
+    store_dir: &Path,
+    rows: &mut HashMap<String, PackageFilesIndex>,
+) -> HashSet<String> {
+    let store_dir = StoreDir::new(store_dir);
+    rows.iter_mut()
+        .filter_map(|(key, row)| {
+            repair_legacy_git_build_flag(&store_dir, row).err().map(|()| key.clone())
+        })
+        .collect()
+}
+
+fn repair_legacy_git_build_flag(
+    store_dir: &StoreDir,
+    row: &mut PackageFilesIndex,
+) -> Result<(), ()> {
+    if row.requires_prepare.is_none() || row.manifest.is_some() {
+        return Ok(());
+    }
+    let mut cas_paths = HashMap::new();
+    if let Some(file) = row.files.get("package.json") {
+        let path = store_dir
+            .cas_file_path_by_mode(&file.digest, file.mode)
+            .ok_or(())?;
+        if !file_content_matches_digest(&path, &file.digest, &row.algo) {
+            return Err(());
+        }
+        cas_paths.insert("package.json".to_string(), path);
+    }
+    let manifest = pnpm_package_manifest::read_package_json_from_cas_paths(&cas_paths);
+    row.requires_build =
+        Some(pnpm_package_manifest::requires_build_from_files(manifest.as_ref(), row.files.keys()));
+    row.manifest = manifest;
+    Ok(())
+}
+
 /// `.modules.yaml` records the virtual store it built, and is the source
 /// of truth when it exists. Without one, the location an install would
-/// record there is the best answer — relative to the lockfile directory,
+/// record there is the best answer, relative to the lockfile directory,
 /// which is where the setting is anchored when it is not spelled out.
 fn resolve_virtual_store_dir(config: &Config, lockfile_dir: &Path) -> PathBuf {
     let virtual_store_dir = config.virtual_store_dir();

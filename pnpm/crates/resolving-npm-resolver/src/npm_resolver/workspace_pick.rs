@@ -1,11 +1,33 @@
 use super::{
-    HashMap, LockfileResolution, NoMatchingVersionError, Package, PackageVersion,
-    PickedFromRegistry, RegistryPackageSpec, RegistryPackageSpecType, RegistryPick, ResolveError,
-    ResolveFromWorkspaceError, ResolveFromWorkspaceOptions, ResolveOptions, ResolveResult,
-    SavedSpecifierOptions, TrustPolicy, UpdateBehavior, Version, WantedDependency,
-    WorkspacePackages, is_not_found_error, latest_allowed_by_policy, parse_bare_specifier,
-    pick_matching_local_version_or_null, pick_registry_for_package, redact_and_sanitize,
-    resolve_from_local_package, try_resolve_from_workspace, try_resolve_from_workspace_packages,
+    HashMap,
+    LockfileResolution,
+    NoMatchingVersionError,
+    Package,
+    PackageVersion,
+    PickedFromRegistry,
+    RegistryPackageSpec,
+    RegistryPackageSpecType,
+    RegistryPick,
+    ResolveError,
+    ResolveFromWorkspaceError,
+    ResolveFromWorkspaceOptions,
+    ResolveOptions,
+    ResolveResult,
+    SavedSpecifierOptions,
+    TrustPolicy,
+    UpdateBehavior,
+    Version,
+    WantedDependency,
+    WorkspacePackages,
+    is_not_found_error,
+    latest_allowed_by_policy,
+    parse_bare_specifier,
+    pick_matching_local_version_or_null,
+    pick_registry_for_package,
+    redact_and_sanitize,
+    resolve_from_local_package,
+    try_resolve_from_workspace,
+    try_resolve_from_workspace_packages,
 };
 
 /// Retry a failed registry pick against the workspace. `prefer_workspace_error`
@@ -61,8 +83,8 @@ pub(super) fn workspace_shadow_pick(
 /// matches.
 ///
 /// A store-manifest peek, once pacquet grows one, has to run before this fast
-/// path — the TypeScript counterpart
-/// (`pnpm11/resolving/npm-resolver/src/index.ts`) documents why.
+/// path, the TypeScript counterpart
+/// ([`pnpm11/resolving/npm-resolver/src/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/resolving/npm-resolver/src/index.ts)) documents why.
 pub(super) fn prefer_workspace_pick(
     workspace_packages: Option<&std::sync::Arc<WorkspacePackages>>,
     spec: &RegistryPackageSpec,
@@ -115,12 +137,12 @@ pub(super) fn wanted_spec(
     let alias = wanted_dependency.alias
         .as_deref()
         .filter(|alias| !alias.is_empty())?;
-    Some(default_tag_spec(alias, default_tag))
+    Some(default_tag_spec(alias.to_owned(), default_tag.to_owned()))
 }
 
 /// Whether a latest-version lookup should report "no latest" instead of
 /// failing. `minimumReleaseAge` filters the packument before the pick, so
-/// every published version can be too young to match — a policy outcome the
+/// every published version can be too young to match, a policy outcome the
 /// caller renders as "nothing to update to", not an error.
 pub(crate) fn swallowed_as_no_latest(err: &ResolveError, opts: &ResolveOptions) -> bool {
     opts.policy.published_by.is_some() && err.is::<NoMatchingVersionError>()
@@ -235,10 +257,10 @@ pub(super) fn saved_specifier_options(opts: &ResolveOptions) -> SavedSpecifierOp
 
 /// `bare_specifier` is absent but `alias` is present: synthesize a tag
 /// spec pointing at the default tag.
-pub(super) fn default_tag_spec(alias: &str, default_tag: &str) -> RegistryPackageSpec {
+pub(super) fn default_tag_spec(alias: String, default_tag: String) -> RegistryPackageSpec {
     RegistryPackageSpec {
-        name: alias.to_string(),
-        fetch_spec: default_tag.to_string(),
+        name: alias,
+        fetch_spec: default_tag,
         spec_type: RegistryPackageSpecType::Tag,
         revision: None,
         normalized_bare_specifier: None,
@@ -308,7 +330,7 @@ pub(super) fn resolve_workspace_protocol(
     bare: &str,
     default_tag: &str,
 ) -> Result<Option<ResolveResult>, ResolveError> {
-    if bare.starts_with("workspace:.") {
+    if pnpm_workspace_spec::is_workspace_path_specifier(bare) {
         return Ok(None);
     }
     let registry = pick_registry_for_package(

@@ -1,27 +1,30 @@
 //! Recognise and normalise a git-shaped `bareSpecifier`.
 //!
 //! Parsing is pure: no network, no probing. A hosted spec (`github:`,
-//! `gitlab:`, `bitbucket:`, `owner/repo`, or any URL of a known host —
+//! `gitlab:`, `bitbucket:`, `owner/repo`, or any URL of a known host,
 //! HTTPS *and* SSH alike) is treated as an *identity*, not a transport
 //! choice, and always finalises to the host's canonical HTTPS URL.
 //! Which transport a given machine actually uses to reach the host is
 //! that machine's git configuration (credential helpers,
-//! `url.<base>.insteadOf` rewrites) — never something recorded in the
+//! `url.<base>.insteadOf` rewrites), never something recorded in the
 //! manifest or lockfile, because it would be wrong on the next machine.
 //!
 //! * [`parse_bare_specifier`] returns `None` when the input isn't a
 //!   git-shaped specifier (so the resolver chain falls through to the
 //!   next resolver).
 //! * [`PartialSpec::finalize`] completes the hosted branch. URLs of
-//!   unknown hosts pass through verbatim — for them the URL *is* the
+//!   unknown hosts pass through verbatim, for them the URL *is* the
 //!   identity, transport included.
 
-use crate::hosted_git::{HostedGit, HostedOpts};
+use crate::hosted_git::{
+    HostedGit,
+    HostedOpts,
+};
 
 /// Fully resolved spec consumed by [`crate::git_resolver::GitResolver`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostedPackageSpec {
-    /// URL passed to `git ls-remote`. Always carries no committish —
+    /// URL passed to `git ls-remote`. Always carries no committish,
     /// the committish lives in [`Self::git_committish`] /
     /// [`Self::git_range`]. For hosted inputs this is the canonical
     /// HTTPS URL regardless of the representation the user wrote.
@@ -63,7 +66,7 @@ const GIT_PROTOCOLS: &[&str] =
     &["git", "git+http", "git+https", "git+rsync", "git+ftp", "git+file", "git+ssh", "ssh"];
 
 /// Sync prefilter. Returns `None` when the input isn't a git-shaped
-/// specifier — the resolver chain treats this as "no claim" and falls
+/// specifier, the resolver chain treats this as "no claim" and falls
 /// through.
 pub fn parse_bare_specifier(bare: &str) -> Option<PartialSpec> {
     if let Some(hosted) = HostedGit::from_url(bare) {
@@ -189,15 +192,20 @@ struct GitParsedParams {
     path: Option<String>,
 }
 
-/// Parse the `&`-separated committish parameters (`semver:`, `path:`,
-/// or a bare committish) carried in a git specifier's fragment.
+/// Parse the committish parameters (`semver:`, `path:`, or a bare
+/// committish) carried in a git specifier's fragment. They are separated
+/// by `&` or, as npm writes them, by `::`.
 fn parse_git_params(committish: Option<&str>) -> GitParsedParams {
     let mut out = GitParsedParams::default();
     let Some(committish) = committish else { return out };
     if committish.is_empty() {
         return out;
     }
-    for param in committish.split('&') {
+    for param in committish
+        .split('&')
+        .flat_map(|part| part.split("::"))
+        .filter(|param| !param.is_empty())
+    {
         if let Some(range) = param.strip_prefix("semver:") {
             out.git_range = Some(range.to_string());
         } else if let Some(path) = param.strip_prefix("path:") {
@@ -216,7 +224,7 @@ fn from_hosted_git(hosted: HostedGit) -> HostedPackageSpec {
     let params = parse_git_params(hosted.committish.as_deref());
     let https_url = hosted.https(HostedGit::no_committish_no_git_plus());
     // URL-embedded credentials are explicit user content, not
-    // transport — and the host's archive endpoint would not carry
+    // transport, and the host's archive endpoint would not carry
     // them, so the spec stays archive-ineligible. `https_url` is the
     // `ls-remote` target, so it carries no committish.
     if hosted.auth.is_some()

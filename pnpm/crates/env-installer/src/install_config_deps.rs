@@ -7,27 +7,55 @@
 //! level deep as siblings inside the parent's leaf `node_modules`.
 
 use crate::{
-    ConfigDepError, NormalizedConfigDep, NormalizedSubdep, options::ConfigDepsInstallOptions,
+    ConfigDepError,
+    NormalizedConfigDep,
+    NormalizedSubdep,
+    options::ConfigDepsInstallOptions,
     verify_env_lockfile::verify_env_lockfile,
 };
 use pnpm_graph_hasher::{
-    calc_global_virtual_store_path_with_subdeps, calc_leaf_global_virtual_store_path,
+    calc_global_virtual_store_path_with_subdeps,
+    calc_leaf_global_virtual_store_path,
     join_global_virtual_store_path,
 };
-use pnpm_lockfile::{EnvLockfile, LockfileResolution, TarballUrlOptions, npm_tarball_url};
-use pnpm_package_is_installable::{PackageInstallabilityManifest, check_package};
-use pnpm_package_manager::{ImportIndexedDirOpts, import_indexed_dir};
+use pnpm_lockfile::{
+    EnvLockfile,
+    LockfileResolution,
+    TarballUrlOptions,
+    npm_tarball_url,
+};
+use pnpm_package_is_installable::{
+    PackageInstallabilityManifest,
+    check_package,
+};
+use pnpm_package_manager::{
+    ImportIndexedDirOpts,
+    import_indexed_dir,
+};
 use pnpm_reporter::{
-    InstalledConfigDep, InstallingConfigDepsLog, InstallingConfigDepsStatus, LogEvent, LogLevel,
-    Reporter, SkippedOptionalDependencyLog, SkippedOptionalPackage, SkippedOptionalReason,
+    InstalledConfigDep,
+    InstallingConfigDepsLog,
+    InstallingConfigDepsStatus,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
 };
 use pnpm_store_dir::SharedVerifiedFilesCache;
 use pnpm_tarball::IngestTarballToStore;
 use ssri::Integrity;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::atomic::AtomicU8,
 };
 
@@ -39,7 +67,7 @@ pub async fn install_config_deps<Reporter: self::Reporter>(
 ) -> Result<(), ConfigDepError> {
     verify_env_lockfile(env_lockfile)?;
     let normalized = normalize_from_lockfile(env_lockfile, opts)?;
-    let global_virtual_store_dir = opts.store.dir.links();
+    let gvs_dir = opts.store.dir.links();
     let config_modules_dir = opts.root_dir.join("node_modules").join(".pnpm-config");
 
     let existing: Vec<String> = read_dir_names(&config_modules_dir)?;
@@ -51,7 +79,7 @@ pub async fn install_config_deps<Reporter: self::Reporter>(
     let mut installed: Vec<InstalledConfigDep> = Vec::new();
 
     for (name, dep) in &normalized {
-        let paths = config_dep_paths(name, dep, &config_modules_dir, &global_virtual_store_dir);
+        let paths = config_dep_paths(name, dep, config_modules_dir.clone(), gvs_dir.clone());
         let parent_symlink_already_correct = existing
             .iter()
             .any(|entry| entry == name)
@@ -64,7 +92,7 @@ pub async fn install_config_deps<Reporter: self::Reporter>(
             name,
             dep,
             &paths,
-            &global_virtual_store_dir,
+            &gvs_dir,
         )
         .await?;
 
@@ -101,7 +129,12 @@ pub(crate) fn config_deps_installed(
     Ok(normalized
         .iter()
         .all(|(name, dep)| {
-            let paths = config_dep_paths(name, dep, &config_modules_dir, &global_virtual_store_dir);
+            let paths = config_dep_paths(
+                name,
+                dep,
+                config_modules_dir.clone(),
+                global_virtual_store_dir.clone(),
+            );
             symlink_points_to(&paths.config_dep_path, &paths.pkg_dir_in_gvs)
                 && optional_subdeps_installed(
                     opts,
@@ -161,7 +194,7 @@ fn prune_removed<Reporter: self::Reporter>(
     for name in existing {
         if !normalized.contains_key(name) {
             started.report::<Reporter>();
-            prune_link(&pnpm_fs::join_slash_separated_path(config_modules_dir, name));
+            prune_link(&pnpm_fs::join_slash_separated_path(config_modules_dir.to_path_buf(), name));
         }
     }
 }
@@ -177,8 +210,8 @@ struct ConfigDepPaths {
 fn config_dep_paths(
     name: &str,
     dep: &NormalizedConfigDep,
-    config_modules_dir: &Path,
-    global_virtual_store_dir: &Path,
+    config_modules_dir: PathBuf,
+    global_virtual_store_dir: PathBuf,
 ) -> ConfigDepPaths {
     let parent_full_pkg_id = full_pkg_id(name, &dep.version, &dep.integrity);
     let subdep_ids: BTreeMap<String, String> = dep.optional_subdeps
@@ -197,7 +230,7 @@ fn config_dep_paths(
         join_global_virtual_store_path(global_virtual_store_dir, &rel_path).join("node_modules");
     ConfigDepPaths {
         config_dep_path: pnpm_fs::join_slash_separated_path(config_modules_dir, name),
-        pkg_dir_in_gvs: pnpm_fs::join_slash_separated_path(&leaf_node_modules, name),
+        pkg_dir_in_gvs: pnpm_fs::join_slash_separated_path(leaf_node_modules.clone(), name),
         leaf_node_modules,
     }
 }
@@ -237,7 +270,7 @@ impl StartedGate {
     }
 }
 
-/// `<name>@<version>:<integrity>` — the package-id shape the GVS hash
+/// `<name>@<version>:<integrity>`: the package-id shape the GVS hash
 /// incorporates.
 fn full_pkg_id(name: &str, version: &str, integrity: &Integrity) -> String {
     format!("{name}@{version}:{integrity}")
@@ -264,7 +297,7 @@ async fn materialize<Reporter: self::Reporter>(
             id: &package_id,
         },
         store: pnpm_tarball::ArchiveStoreContext {
-            dir: opts.store.dir,
+            dir: std::borrow::Cow::Borrowed(opts.store.dir),
             index: opts.store_index.reader.clone(),
             index_writer: opts.store_index.writer.clone(),
             verify_integrity: opts.store.verify_integrity,
@@ -319,13 +352,15 @@ fn prune_unexpected_siblings<Reporter: self::Reporter>(
 /// Remove a stale `.pnpm-config` entry (or optional-subdep sibling).
 /// These are directory symlinks/junctions created by
 /// [`pnpm_fs::force_symlink_dir`], so they're unlinked via
-/// [`pnpm_fs::remove_symlink_dir`] rather than recursively deleted —
+/// [`pnpm_fs::remove_symlink_dir`] rather than recursively deleted,
 /// `remove_dir_all` is the wrong primitive for a link and behaves
 /// inconsistently across platforms. A real directory left by an older
 /// layout falls back to a recursive remove. A genuine failure (anything
 /// but "already gone") is logged rather than silently swallowed.
 fn prune_link(path: &Path) {
-    let is_link = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    let is_link = fs::symlink_metadata(path)
+        .map(|meta| meta.file_type())
+        .is_ok_and(|file_type| file_type.is_symlink());
     let result = if is_link { pnpm_fs::remove_symlink_dir(path) } else { fs::remove_dir_all(path) };
     if let Err(error) = result
         && error.kind() != std::io::ErrorKind::NotFound
@@ -402,5 +437,7 @@ fn symlink_points_to(link_path: &Path, expected: &Path) -> bool {
 
 mod optional_dependencies;
 use optional_dependencies::{
-    install_optional_subdeps, normalize_from_lockfile, optional_subdeps_installed,
+    install_optional_subdeps,
+    normalize_from_lockfile,
+    optional_subdeps_installed,
 };

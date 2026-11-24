@@ -15,13 +15,12 @@ pnpm-package-name = { workspace = true }
 pnpm-catalogs-types = { workspace = true }
 pnpm-cmd-shim = { workspace = true }
 pnpm-config = { workspace = true }
-pnpm-executor = { workspace = true }
+pnpm-executor = { workspace = true, features = ["shell-emulator"] }
 pnpm-exportable-manifest = { workspace = true }
 pnpm-fs = { workspace = true }
 pnpm-fs-packlist = { workspace = true }
 pnpm-hooks = { workspace = true }
 pnpm-package-manifest = { workspace = true }
-pnpm-platform-variants = { workspace = true }
 pnpm-reporter = { workspace = true }
 pnpm-text-sanitize = { workspace = true }
 

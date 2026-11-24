@@ -4,21 +4,50 @@
 //! See `pnpm/plans/LOCKFILE_RESOLUTION_REUSE.md`.
 
 pub use registry_range::locked_child_admits;
-pub(crate) use registry_range::{any_locked_key_admits, locked_key_is_current};
+pub(crate) use registry_range::{
+    any_locked_key_admits,
+    locked_key_is_current,
+};
 
 mod locked_version;
 mod registry_range;
 
-use locked_version::admits_locked_version;
+use locked_version::{
+    admits_locked_version,
+    runtime_child_admits,
+};
 use pnpm_lockfile::{
-    BundledDependencies, ImporterDepVersion, Lockfile, LockfileResolution, PkgName, PkgNameVer,
-    PkgNameVerPeer, ProjectSnapshot, RegistryContext, ResolvedDependencySpec, SnapshotDepRef,
-    SnapshotEntry, StringOrList, TarballResolution, TarballUrlOptions, npm_tarball_url,
-    pick_registry_for_package, registry_server_type, revision_registry_tarball_url,
+    BundledDependencies,
+    ImporterDepVersion,
+    Lockfile,
+    LockfileResolution,
+    PkgName,
+    PkgNameVer,
+    PkgNameVerPeer,
+    ProjectSnapshot,
+    RegistryContext,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
+    SnapshotEntry,
+    StringOrList,
+    TarballResolution,
+    TarballUrlOptions,
+    VersionPart,
+    npm_tarball_url,
+    pick_registry_for_package,
+    registry_server_type,
+    revision_registry_tarball_url,
 };
 use pnpm_resolving_parse_wanted_dependency::git_specifiers_are_equivalent;
-use pnpm_resolving_resolver_base::{CurrentPkg, PkgResolutionId, ResolveResult};
-use serde_json::{Map, Value};
+use pnpm_resolving_resolver_base::{
+    CurrentPkg,
+    PkgResolutionId,
+    ResolveResult,
+};
+use serde_json::{
+    Map,
+    Value,
+};
 use std::sync::Arc;
 
 /// The `currentPkg` payload for re-resolving `key`'s edge: the prior
@@ -58,12 +87,13 @@ pub(crate) fn current_pkg_from_lockfile(
 
 /// The prior snapshot key recorded for child edge `alias` under
 /// `snapshot`'s dependency maps, when the recorded version still
-/// satisfies `bare_specifier`. A bare range names the package `alias`
-/// itself, so a ref recorded as an `npm:` alias of another package never
-/// satisfies it. Whether the key is one the configuration still writes is
-/// [`locked_key_is_current`]'s question, asked before a subtree is reused;
-/// the version pin holds either way.
+/// satisfies `bare_specifier` or the specifier names the exact locked Git
+/// revision. A bare range names the package `alias` itself, so a ref recorded
+/// as an `npm:` alias of another package never satisfies it.
+/// [`locked_key_is_current`] checks whether the configuration still writes
+/// this key before reusing a subtree.
 pub(crate) fn prior_child_key(
+    lockfile: Option<&Lockfile>,
     snapshot: &SnapshotEntry,
     alias: &str,
     bare_specifier: &str,
@@ -79,7 +109,22 @@ pub(crate) fn prior_child_key(
                 .and_then(|deps| deps.get(&name))
         })?;
     let key = dep_ref.resolve(&name)?;
-    locked_child_admits(&name, &key, bare_specifier, registries)?.then_some(key)
+    if matches!(key.suffix.version(), VersionPart::NonSemver(locator) if locator == bare_specifier)
+        && lockfile
+            .and_then(|lockfile| {
+                lockfile.packages
+                    .as_ref()?
+                    .get(&key.without_peer())
+            })
+            .is_some_and(|metadata| {
+                matches!(reusable_resolution(&metadata.resolution), Some(ReusableResolution::Git))
+            })
+    {
+        return Some(key);
+    }
+    runtime_child_admits(&key, bare_specifier)
+        .or_else(|| locked_child_admits(&name, &key, bare_specifier, registries))?
+        .then_some(key)
 }
 
 /// The snapshot key (`snapshots:` / `packages:` map key) the prior
@@ -88,8 +133,8 @@ pub(crate) fn prior_child_key(
 ///
 /// Registry entries use semver satisfaction. Git entries require the same
 /// selector (allowing equivalent hosted-repository spellings) so moving refs
-/// keep their locked commit during unrelated dependency changes. Other
-/// resolution shapes fall through to a normal resolve.
+/// keep their locked commit during unrelated dependency changes. Local
+/// directories and tarballs require an unchanged specifier.
 pub(crate) fn reusable_importer_dep(
     lockfile: &Lockfile,
     importer_id: &str,
@@ -103,18 +148,14 @@ pub(crate) fn reusable_importer_dep(
     let metadata = lockfile.packages
         .as_ref()?
         .get(&key.without_peer())?;
-    let is_git = matches!(metadata.resolution, LockfileResolution::Git(_))
-        || matches!(
-            metadata.resolution,
-            LockfileResolution::Tarball(ref tarball) if tarball.git_hosted == Some(true),
-        );
-    if is_git
+    if matches!(reusable_resolution(&metadata.resolution), Some(ReusableResolution::Git))
         && (spec.specifier == bare_specifier
             || git_specifiers_are_equivalent(&spec.specifier, bare_specifier))
     {
         return Some(key);
     }
-    if matches!(spec.version, ImporterDepVersion::File(_))
+    if (matches!(spec.version, ImporterDepVersion::File(_))
+        || matches!(metadata.resolution, LockfileResolution::Directory(_)))
         && (spec.specifier == bare_specifier
             || pnpm_local_spec::normalize_specifier(&spec.specifier)
                 == pnpm_local_spec::normalize_specifier(bare_specifier))
@@ -166,8 +207,15 @@ fn importer_dep<'a>(
 ///   `peerDependencies` / `peerDependenciesMeta` / `engines` / `cpu` /
 ///   `os` / `libc` / `hasBin` so `extract_peer_dependencies`
 ///   and the leaf classifier behave identically to a fresh resolve.
-///   `dependencies` are deliberately omitted — the children come from
+///   `dependencies` are deliberately omitted, the children come from
 ///   the snapshot graph, not this manifest.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`alias` is copied only after the early returns for entries that cannot be reused, and the subtree check calls this with a borrowed name only to test reusability, so an owned parameter would allocate on every call."
+    )
+)]
 pub(crate) fn synthesize_reused_result(
     lockfile: &Lockfile,
     key: &PkgNameVerPeer,
@@ -223,7 +271,7 @@ fn synthesize_manifest(
     // bundled-manifest bin linker sees a non-empty bin set; the exact
     // bin paths live in the store-index bundled manifest the install
     // pass reads, not here.
-    if metadata.has_bin == Some(true) {
+    if metadata.has_bin.unwrap_or(false) {
         manifest.insert("bin".to_string(), Value::String(name.to_string()));
     }
 
@@ -233,7 +281,16 @@ fn synthesize_manifest(
 fn snapshot_dep_to_manifest_specifier(dep_ref: &SnapshotDepRef) -> String {
     match dep_ref {
         SnapshotDepRef::Plain(ver_peer) => ver_peer.without_peer().to_string(),
-        SnapshotDepRef::Alias(key) => format!("npm:{}@{}", key.name, key.suffix.without_peer()),
+        SnapshotDepRef::Alias(key) => match key.suffix.version() {
+            // A git, tarball, or `file:` child is named by its URL or path,
+            // which the alias keeps without `npm:`.
+            VersionPart::NonSemver(_) | VersionPart::File(_) => {
+                key.suffix.without_peer().to_string()
+            }
+            VersionPart::Semver(_) | VersionPart::RegistryQualified { .. } => {
+                format!("npm:{}@{}", key.name, key.suffix.without_peer())
+            }
+        },
         SnapshotDepRef::Link(target) => format!("link:{target}"),
     }
 }
@@ -326,7 +383,8 @@ fn string_array(items: &[String]) -> Value {
     Value::Array(
         items
             .iter()
-            .map(|item| Value::String(item.clone()))
+            .cloned()
+            .map(Value::String)
             .collect(),
     )
 }
@@ -408,11 +466,11 @@ fn reusable_resolution(resolution: &LockfileResolution) -> Option<ReusableResolu
     let reusable = match resolution {
         LockfileResolution::Registry(_) => ReusableResolution::Registry,
         LockfileResolution::Tarball(tarball)
-            if tarball.integrity.is_some() && tarball.git_hosted != Some(true) =>
+            if tarball.integrity.is_some() && !tarball.git_hosted.unwrap_or(false) =>
         {
             ReusableResolution::Registry
         }
-        LockfileResolution::Tarball(tarball) if tarball.git_hosted == Some(true) => {
+        LockfileResolution::Tarball(tarball) if tarball.git_hosted.unwrap_or(false) => {
             ReusableResolution::Git
         }
         LockfileResolution::Git(_) => ReusableResolution::Git,

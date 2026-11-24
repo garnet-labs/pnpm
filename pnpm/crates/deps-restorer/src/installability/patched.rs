@@ -1,6 +1,16 @@
-use super::platform::{check_installability, manifest_from_metadata};
-use pnpm_lockfile::{PackageKey, PackageMetadata, SnapshotEntry};
-use pnpm_package_is_installable::{InstallabilityError, InstallabilityOptions};
+use super::platform::{
+    check_installability,
+    manifest_from_metadata,
+};
+use pnpm_lockfile::{
+    PackageKey,
+    PackageMetadata,
+    SnapshotEntry,
+};
+use pnpm_package_is_installable::{
+    InstallabilityError,
+    InstallabilityOptions,
+};
 
 /// Returns whether the snapshot has an applied patch.
 ///
@@ -10,14 +20,13 @@ pub(crate) fn snapshot_is_patched(
     snapshot_key: &PackageKey,
     snapshot: Option<&SnapshotEntry>,
 ) -> bool {
-    snapshot.is_some_and(|snapshot| snapshot.patched == Some(true))
+    snapshot.is_some_and(|snapshot| snapshot.patched.unwrap_or(false))
         || pnpm_deps_path::index_of_dep_path_suffix(&snapshot_key.to_string())
             .patch_hash_index
             .is_some()
 }
 
-/// Checks package installability with engine constraints cleared. The
-/// platforms a version's variants run on still apply.
+/// Checks package installability with engine constraints cleared.
 pub(super) fn without_published_engines(
     metadata_key: &PackageKey,
     metadata: &PackageMetadata,
@@ -27,9 +36,7 @@ pub(super) fn without_published_engines(
     let mut manifest = manifest_from_metadata(metadata_key, metadata);
     manifest.engines = None;
     let options = InstallabilityOptions { optional, ..*base };
-    let package_id = metadata_key.to_string();
-    Ok(check_installability(&package_id, &manifest, &options)?
-        .or_else(|| super::variants::variants_installability(&package_id, metadata, &options)))
+    check_installability(&metadata_key.to_string(), &manifest, &options)
 }
 
 #[cfg(test)]

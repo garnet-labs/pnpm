@@ -1,10 +1,26 @@
 use super::{
-    super::{LockfileToHoistedDepGraphOptions, lockfile_to_hoisted_dep_graph},
-    dep_key, lockfile_version, lockfile_with, metadata_stub, pkg_name, resolved_dep,
+    super::{
+        LockfileToHoistedDepGraphOptions,
+        lockfile_to_hoisted_dep_graph,
+    },
+    dep_key,
+    lockfile_version,
+    lockfile_with,
+    metadata_stub,
+    pkg_name,
+    resolved_dep,
 };
-use pnpm_lockfile::{Lockfile, LockfileSettings, ResolvedDependencyMap, SnapshotEntry};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileSettings,
+    ResolvedDependencyMap,
+    SnapshotEntry,
+};
 use pretty_assertions::assert_eq;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+};
 
 /// Mirrors the `empty_lockfile_yields_empty_root` case from the hoister.
 #[test]
@@ -25,7 +41,7 @@ fn walker_empty_lockfile_produces_empty_result() {
         extra: pnpm_lockfile::LockfileExtra::default(),
     };
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: PathBuf::from("/repo"),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(std::path::Path::new("/repo")),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result =
@@ -39,7 +55,7 @@ fn walker_empty_lockfile_produces_empty_result() {
 // --- prev_graph tests ------------------------------------------------
 
 /// When no current lockfile is supplied, `prev_graph` is `None`
-/// (the empty-graph fallback) — the linker treats it the same as an
+/// (the empty-graph fallback), the linker treats it the same as an
 /// empty map (no orphans to remove on a fresh install).
 #[test]
 fn prev_graph_none_when_current_lockfile_absent() {
@@ -54,7 +70,7 @@ fn prev_graph_none_when_current_lockfile_absent() {
 
     let lockfile = lockfile_with(root_deps, packages, snapshots);
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: PathBuf::from("/repo"),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(std::path::Path::new("/repo")),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -91,7 +107,7 @@ fn prev_graph_none_when_current_lockfile_has_no_packages() {
         extra: pnpm_lockfile::LockfileExtra::default(),
     };
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: PathBuf::from("/repo"),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(std::path::Path::new("/repo")),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result =
@@ -130,7 +146,7 @@ fn prev_graph_none_when_current_lockfile_has_empty_packages() {
         extra: pnpm_lockfile::LockfileExtra::default(),
     };
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: PathBuf::from("/repo"),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(std::path::Path::new("/repo")),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result =
@@ -165,7 +181,7 @@ fn prev_graph_contains_orphan_from_current_only_lockfile() {
 
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&wanted_lockfile, Some(&current_lockfile), &opts)

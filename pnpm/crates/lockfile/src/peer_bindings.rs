@@ -1,13 +1,79 @@
-use std::collections::HashSet;
+use std::{
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    sync::Arc,
+};
 
-use crate::PkgNameVerPeer;
-use pnpm_deps_path::{DepPath, PeerId, create_peer_dep_graph_hash};
+use crate::{
+    LockfileEntries,
+    PkgNameVerPeer,
+};
+use pnpm_deps_path::{
+    DepPath,
+    PeerId,
+    create_peer_dep_graph_hash,
+    index_of_dep_path_suffix,
+};
 
-/// The providers one key's peer bindings name, without their own peers:
-/// peer segments may omit them (`dedupePeers`). `None` for a hashed
-/// suffix, which names none.
+/// Providers recorded before a snapshot's peer suffix was hashed.
+#[derive(Debug, Clone)]
+pub struct RecordedPeerBindings {
+    key: PkgNameVerPeer,
+    providers: BoundProviders,
+    peer_keys: Vec<PkgNameVerPeer>,
+}
+
+impl RecordedPeerBindings {
+    /// `peers` must be the values used to construct `dep_path`.
+    #[must_use]
+    pub fn for_dep_path(dep_path: &DepPath, peers: &[PeerId]) -> Option<Arc<Self>> {
+        let text = dep_path.as_str();
+        let start = index_of_dep_path_suffix(text).peers_index?;
+        let hash = text[start..].strip_prefix('(')?.strip_suffix(')')?;
+        if !is_peer_suffix_hash(hash) {
+            return None;
+        }
+        Self::for_key(&text.parse().ok()?, peers)
+    }
+
+    /// `peers` must be the values used to construct `key`.
+    pub(crate) fn for_key(key: &PkgNameVerPeer, peers: &[PeerId]) -> Option<Arc<Self>> {
+        let hash = key.suffix
+            .peer()
+            .strip_prefix(key.suffix.patch_group())?
+            .strip_prefix('(')?
+            .strip_suffix(')')?;
+        if !is_peer_suffix_hash(hash) {
+            return None;
+        }
+        let mut segments: Vec<_> = peers
+            .iter()
+            .map(PeerId::to_segment)
+            .collect();
+        segments.sort();
+        let peer_keys: Vec<_> = PeerBindings::Explicit(segments).providers().collect();
+        let providers = BoundProviders::from_providers(peer_keys.iter().cloned());
+        Some(Arc::new(Self { key: key.clone(), providers, peer_keys }))
+    }
+
+    /// Provider keys in suffix order, preserving duplicate groups.
+    /// Returns `None` when the snapshot has been rekeyed.
+    #[must_use]
+    pub fn peer_keys_for(&self, key: &PkgNameVerPeer) -> Option<&[PkgNameVerPeer]> {
+        (key == &self.key).then_some(&self.peer_keys)
+    }
+
+    pub(crate) fn providers_for(&self, key: &PkgNameVerPeer) -> Option<&BoundProviders> {
+        (key == &self.key).then_some(&self.providers)
+    }
+}
+
+/// The providers one key's peer bindings name. Provider groups may omit
+/// their own peers (`dedupePeers`). Unrecovered hashes name no providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundProviders(Option<HashSet<PkgNameVerPeer>>);
+pub struct BoundProviders(Option<HashMap<PkgNameVerPeer, HashSet<PkgNameVerPeer>>>);
 
 impl BoundProviders {
     /// The providers `key`'s peer suffix names. Empty when `key` has no
@@ -16,8 +82,26 @@ impl BoundProviders {
     pub fn from_key(key: &PkgNameVerPeer) -> Self {
         match PeerBindings::from_key(key) {
             Some(bindings) => Self::of(&bindings),
-            None => BoundProviders(Some(HashSet::new())),
+            None => Self::from_providers([]),
         }
+    }
+
+    /// The providers named by `key` or recorded for that exact snapshot key.
+    /// An unrecorded hashed suffix stays opaque.
+    #[must_use]
+    pub fn from_recorded_snapshot(entries: LockfileEntries<'_>, key: &PkgNameVerPeer) -> Self {
+        let providers = Self::from_key(key);
+        if !providers.is_hashed() {
+            return providers;
+        }
+        if let Some(providers) = entries.snapshots
+            .and_then(|snapshots| snapshots.get(key))
+            .and_then(|snapshot| snapshot.recorded_peer_bindings.as_ref())
+            .and_then(|bindings| bindings.providers_for(key))
+        {
+            return providers.clone();
+        }
+        providers
     }
 
     /// The providers `bindings` name.
@@ -25,13 +109,19 @@ impl BoundProviders {
     pub fn of(bindings: &PeerBindings) -> Self {
         match bindings {
             PeerBindings::Hashed => BoundProviders(None),
-            PeerBindings::Explicit(_) => BoundProviders(Some(
-                bindings
-                    .providers()
-                    .map(|provider| provider.without_peer())
-                    .collect(),
-            )),
+            PeerBindings::Explicit(_) => Self::from_providers(bindings.providers()),
         }
+    }
+
+    fn from_providers(providers: impl IntoIterator<Item = PkgNameVerPeer>) -> Self {
+        let mut indexed: HashMap<_, HashSet<_>> = HashMap::new();
+        for provider in providers {
+            indexed
+                .entry(provider.without_peer())
+                .or_default()
+                .insert(provider);
+        }
+        BoundProviders(Some(indexed))
     }
 
     /// Whether the suffix was hashed (`peersSuffixMaxLength`) rather than
@@ -47,14 +137,34 @@ impl BoundProviders {
     pub fn binds(&self, target: &PkgNameVerPeer) -> bool {
         self.0
             .as_ref()
-            .is_none_or(|providers| providers.contains(&target.without_peer()))
+            .is_none_or(|providers| providers.contains_key(&target.without_peer()))
+    }
+
+    /// The recorded keys for `target`'s package identity, including any cycle cut.
+    /// `None` when the target is unbound or the hash could not be recovered.
+    #[must_use]
+    pub fn provider_keys(&self, target: &PkgNameVerPeer) -> Option<&HashSet<PkgNameVerPeer>> {
+        self.0
+            .as_ref()?
+            .get(&target.without_peer())
+    }
+
+    /// Matches the full provider key when recorded, or any peer context when
+    /// the recorded group omits the provider's peers.
+    pub(crate) fn binds_snapshot(&self, target: &PkgNameVerPeer) -> bool {
+        let bare = target.without_peer();
+        self.0
+            .as_ref()
+            .is_none_or(|providers| {
+                providers
+                    .get(&bare)
+                    .is_some_and(|keys| keys.contains(target) || keys.contains(&bare))
+            })
     }
 }
 
-/// The peer providers a snapshot key records in its peer suffix. The
-/// suffix is the only record of the providers peer resolution bound,
-/// including where it cut a peer cycle short, so every reader goes
-/// through [`PeerBindings::from_key`].
+/// The peer providers encoded in a snapshot key, including cycle cuts.
+/// Use [`BoundProviders::of_snapshot`] when the snapshot is available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerBindings {
     /// The spelled-out segments, in suffix order. A segment is a
@@ -110,7 +220,8 @@ impl PeerBindings {
         };
         segments
             .iter()
-            .filter_map(|segment| segment.parse().ok())
+            .map(|segment| segment.parse())
+            .filter_map(Result::ok)
     }
 
     /// The peer suffix that records these bindings; see
@@ -131,7 +242,9 @@ impl PeerBindings {
         if !providers.is_empty() {
             let peer_ids: Vec<PeerId> = providers
                 .into_iter()
-                .map(|segment| PeerId::DepPath(DepPath::from(segment.clone())))
+                .cloned()
+                .map(DepPath::from)
+                .map(PeerId::DepPath)
                 .collect();
             suffix.push_str(&Self::suffix_of(&peer_ids, max_length));
         }

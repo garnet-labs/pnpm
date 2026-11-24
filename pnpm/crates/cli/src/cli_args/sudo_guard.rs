@@ -3,25 +3,30 @@
 //! through `sudo`. Those commands would target root's home directory,
 //! which is never what a user coming from `sudo npm install -g` wants.
 //!
-//! `checkSudo` in pnpm v11's `pnpm11/pnpm/src/checkSudo.ts` detects the
+//! `checkSudo` in pnpm v11's [`pnpm11/pnpm/src/checkSudo.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/pnpm/src/checkSudo.ts) detects the
 //! same commands under the same condition, but only warns there:
 //! refusing them is a breaking change, so it lands in v12 while v11
 //! gives users a release to migrate.
 
 #[cfg(unix)]
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 #[cfg(unix)]
 use miette::Diagnostic;
 
 use super::cli_command::CliCommand;
 #[cfg(unix)]
-use super::config::{ConfigArgs, ConfigSubcommand};
+use super::config::{
+    ConfigArgs,
+    ConfigSubcommand,
+};
 
 pub(crate) fn check_sudo(command: &CliCommand) -> miette::Result<()> {
     #[cfg(unix)]
     {
-        // SAFETY: geteuid is always safe to call.
-        let euid = unsafe { libc::geteuid() };
+        let euid = pnpm_ffi_process::effective_user_id();
         let sudo_user = std::env::var("SUDO_USER").ok();
         check_sudo_as(command, euid, sudo_user.as_deref())?;
     }
@@ -50,7 +55,10 @@ fn check_sudo_as(
     if euid != 0 {
         return Ok(());
     }
-    if !sudo_user.is_some_and(|user| !user.is_empty() && user != "root") {
+    if sudo_user
+        .filter(|user| !user.is_empty())
+        .is_none_or(|user| user == "root")
+    {
         return Ok(());
     }
     match sudo_blocked_operation(command) {

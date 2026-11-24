@@ -1,6 +1,22 @@
 use super::{
-    Body, Config, HeaderValue, Ipv4Addr, MaxUsers, Request, ServiceExt, SocketAddr, SocketAddrV4,
-    StatusCode, TempDir, Value, body_bytes, body_json, config_for, header, json, router,
+    Body,
+    Config,
+    HeaderValue,
+    Ipv4Addr,
+    MaxUsers,
+    Request,
+    ServiceExt,
+    SocketAddr,
+    SocketAddrV4,
+    StatusCode,
+    TempDir,
+    Value,
+    body_bytes,
+    body_json,
+    config_for,
+    header,
+    json,
+    router,
 };
 use pnpr_fixtures::MockConfigPresets;
 
@@ -31,19 +47,20 @@ async fn pipeline_surface_records_lists_and_serves_runs_append_only() {
     config.features.registry.enabled = false;
     config.features.resolver.enabled = false;
     config.features.pipeline.enabled = true;
-    for (org, reader, writer) in
+    for (owner, reader, writer) in
         [("demo-abc123", "alice", "alice"), ("hidden", "bob", "bob"), ("read-only", "alice", "bob")]
     {
-        config.features.artifacts.orgs.insert(
-            org.to_string(),
+        config.features.artifacts.owners.insert(
+            owner.to_string(),
             pnpr_config::StorageAccess {
                 access: pnpr_policy::AccessList::from_tokens([reader]),
                 publish: pnpr_policy::AccessList::from_tokens([writer]),
             },
         );
     }
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
-    let app = router(config);
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
+    let auth = crate::tokens::seeded_auth(&config, &[("alice", "secret123"), ("bob", "secret123")]);
+    let app = pnpr::router_with_auth(config, auth);
 
     let handshake = app
         .clone()
@@ -58,52 +75,45 @@ async fn pipeline_surface_records_lists_and_serves_runs_append_only() {
         body_json(handshake.into_body()).await,
         json!({
             "pnpr": {
-                "versions": [],
-                "artifacts": [],
-                "pipeline": [0],
-                "fixLockfile": [],
-                "ecosystems": [],
-                "publish": [],
                 "protocols": {
                     "resolver": {
-                        "version": 0,
                         "versions": [],
-                        "features": [
-                            "fixLockfile",
-                            "verifyLockfile",
-                            "projectTransforms",
-                            "policyEcho",
-                            "errorCodes",
-                            "acceptedLockfileFormats"
-                        ],
-                        "ecosystems": []
+                        "features": [],
+                        "ecosystems": [],
+                        "experimental": false
                     },
                     "artifacts": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "compilerCache": {
-                        "version": 0,
-                        "versions": []
+                        "versions": [],
+                        "features": [],
+                        "experimental": true
                     },
                     "pipeline": {
-                        "version": 0,
-                        "versions": [0]
+                        "versions": [0],
+                        "features": [],
+                        "experimental": true
                     },
                     "publish": {
-                        "version": 0,
                         "versions": [],
-                        "pnpmPublish": []
+                        "features": [],
+                        "experimental": false
+                    },
+                    "pnpmPublish": {
+                        "versions": [],
+                        "features": [],
+                        "experimental": false
+                    },
+                    "records": {
+                        "versions": [],
+                        "features": [],
+                        "experimental": false,
+                        "manifestProfiles": []
                     }
-                },
-                "features": {
-                    "registries": true,
-                    "admin": false,
-                    "scim": false,
-                    "signIn": false
-                },
-                "records": [],
-                "manifestProfiles": []
+                }
             }
         }),
     );
@@ -134,7 +144,7 @@ async fn pipeline_surface_records_lists_and_serves_runs_append_only() {
     let registration = json!({
         "_id": "org.couchdb.user:alice",
         "name": "alice",
-        "password": "secret",
+        "password": "secret123",
         "email": "alice@example.test",
         "type": "user",
         "roles": [],
@@ -313,7 +323,8 @@ async fn cors_allows_only_configured_origins_and_handles_preflight() {
         .unwrap();
     assert!(
         vary.split(',')
-            .any(|header| header.trim().eq_ignore_ascii_case("origin")),
+            .map(str::trim)
+            .any(|trimmed| trimmed.eq_ignore_ascii_case("origin")),
     );
 
     let missing = app
@@ -376,7 +387,8 @@ async fn cors_allows_only_configured_origins_and_handles_preflight() {
     assert!(
         allowed_headers
             .split(',')
-            .any(|header| header.trim().eq_ignore_ascii_case("authorization")),
+            .map(str::trim)
+            .any(|trimmed| trimmed.eq_ignore_ascii_case("authorization")),
     );
 }
 
@@ -500,10 +512,12 @@ async fn readiness_probe_fails_when_storage_is_inaccessible() {
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     let ready_body: Value = serde_json::from_slice(&body_bytes(ready.into_body()).await).unwrap();
     assert_eq!(ready_body["status"], "unhealthy");
+    assert_eq!(ready_body["code"], "ERR_PNPR_SERVICE_UNAVAILABLE");
+    assert_eq!(ready_body["error"], ready_body["reason"]);
     assert_eq!(ready_body["storage"], "unavailable");
     assert_eq!(ready_body["auth"], "ok");
 
-    // /-/ping also returns 503 Service Unavailable when readiness fails
+    // /-/ping stays cheap and returns 200 OK without running storage readiness checks
     let ping = app
         .oneshot(
             Request::get("/-/ping")
@@ -512,23 +526,29 @@ async fn readiness_probe_fails_when_storage_is_inaccessible() {
         )
         .await
         .unwrap();
-    assert_eq!(ping.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(ping.status(), StatusCode::OK);
+    let ping_body: Value = serde_json::from_slice(&body_bytes(ping.into_body()).await).unwrap();
+    assert_eq!(ping_body, json!({}));
 }
 
 #[tokio::test]
 async fn readiness_probe_fails_when_auth_is_inaccessible() {
     let tmp = tempfile::tempdir().unwrap();
-    let tokens_path = tmp.path().join("tokens.db");
+    let auth_path = tmp.path().join("auth.sqlite");
 
     let mut config = config_for("http://upstream.invalid", tmp.path().to_path_buf());
-    config.identity.auth.tokens.file = Some(tokens_path.clone());
+    config.identity.backend = pnpr::BackendConfig::Sqlite(auth_path.clone());
     let auth = pnpr_auth::AuthState::load(&config.identity.auth, &config.identity.backend)
         .await
         .unwrap();
     let app = pnpr::router_with_auth(config, auth);
 
-    // Remove the tokens database file so token store readiness fails
-    std::fs::remove_file(&tokens_path).unwrap();
+    // Drop the accounts table so auth readiness fails. Deleting the file
+    // instead fails on Windows while the server's connections hold it open.
+    rusqlite::Connection::open(&auth_path)
+        .unwrap()
+        .execute_batch("DROP TABLE users")
+        .unwrap();
 
     // /-/ready returns 503 Service Unavailable when auth check fails
     let ready = app
@@ -543,10 +563,12 @@ async fn readiness_probe_fails_when_auth_is_inaccessible() {
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     let ready_body: Value = serde_json::from_slice(&body_bytes(ready.into_body()).await).unwrap();
     assert_eq!(ready_body["status"], "unhealthy");
+    assert_eq!(ready_body["code"], "ERR_PNPR_SERVICE_UNAVAILABLE");
+    assert_eq!(ready_body["error"], ready_body["reason"]);
     assert_eq!(ready_body["storage"], "ok");
     assert_eq!(ready_body["auth"], "unavailable");
 
-    // /-/ping also returns 503 Service Unavailable when auth readiness fails
+    // /-/ping stays cheap and returns 200 OK without running auth readiness checks
     let ping = app
         .oneshot(
             Request::get("/-/ping")
@@ -555,7 +577,9 @@ async fn readiness_probe_fails_when_auth_is_inaccessible() {
         )
         .await
         .unwrap();
-    assert_eq!(ping.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(ping.status(), StatusCode::OK);
+    let ping_body: Value = serde_json::from_slice(&body_bytes(ping.into_body()).await).unwrap();
+    assert_eq!(ping_body, json!({}));
 }
 
 #[cfg(unix)]
@@ -571,4 +595,89 @@ async fn sigterm_signal_handler_installs_cleanly() {
             .await
             .is_err(),
     );
+}
+
+#[tokio::test]
+async fn unsupported_npm_package_endpoints_explain_the_refusal() {
+    let tmp = TempDir::new().unwrap();
+    let app = router(config_for("http://upstream.invalid", tmp.path().to_path_buf()));
+    for endpoint in ["visibility", "collaborators"] {
+        for method in ["GET", "PUT", "DELETE"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/npm/-/package/example/{endpoint}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = body_json(response.into_body()).await;
+            assert_eq!(body["code"], "ERR_PNPR_UNSUPPORTED_ROUTE");
+            assert_eq!(body["error"], body["reason"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn npm_capability_handshakes_advertise_only_reachable_protocols() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = Config::static_serve(
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873)),
+        tmp.path().to_path_buf(),
+    );
+    config.features.resolver.enabled = true;
+    config.features.artifacts.enabled = true;
+    config.features.pipeline.enabled = true;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
+    let auth = crate::tokens::seeded_auth(&config, &[("publisher", "password")]);
+    let token = crate::tokens::issue_token(&auth, "publisher").await;
+    let app = pnpr::router_with_auth(config, auth);
+    for (index, base) in ["", "/npm", "/npm/~local"].into_iter().enumerate() {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{base}/-/pnpr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{base}");
+        let body = body_json(response.into_body()).await;
+        let protocols = &body["pnpr"]["protocols"];
+        let expected = if base.is_empty() { json!([0]) } else { json!([]) };
+        for name in ["resolver", "artifacts", "compilerCache", "pipeline"] {
+            assert_eq!(protocols[name]["versions"], expected, "{base} {name}");
+            assert_eq!(
+                protocols[name]["features"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                !base.is_empty() || name != "resolver",
+                "{base} {name}",
+            );
+        }
+        assert_eq!(protocols["publish"]["versions"], json!([0]));
+        assert_eq!(protocols["pnpmPublish"]["versions"], json!([1]));
+        let package = format!("example-package-{index}");
+        let tarball = crate::npm::npm_tgz(&package, "1.0.0", b"package contents");
+        let document = crate::npm::publish_doc(&package, "1.0.0", &tarball);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(format!("{base}/-/pnpr/v0/publish"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(json!({ "packages": [document] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "{base}");
+        assert_eq!(body_json(response.into_body()).await["ok"], true);
+    }
 }

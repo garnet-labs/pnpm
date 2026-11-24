@@ -1,4 +1,11 @@
-use super::{ArtifactBlobRequest, BASE64, OwnerScope, PnprClient, PnprClientError, Sha512};
+use super::{
+    ArtifactBlobRequest,
+    BASE64,
+    OwnerScope,
+    PnprClient,
+    PnprClientError,
+    Sha512,
+};
 use base64::Engine as _;
 use sha2::Digest as _;
 
@@ -6,7 +13,7 @@ use sha2::Digest as _;
 async fn artifact_blob_download_rejects_bytes_that_do_not_match_the_integrity() {
     let mut server = mockito::Server::new_async().await;
     let mock = server
-        .mock("POST", "/-/pnpr/v0/artifacts/blob")
+        .mock("GET", mockito::Matcher::Regex("^/-/pnpr/v0/artifacts/blobs/acme/sha512-".into()))
         .with_status(200)
         .with_body("poisoned blob")
         .create_async()

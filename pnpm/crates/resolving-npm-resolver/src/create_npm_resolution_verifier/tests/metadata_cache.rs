@@ -1,11 +1,34 @@
 use super::{
-    ABBREVIATED_META_DIR, Arc, AuthHeaders, FAKE_INTEGRITY, LockfileResolution, MetadataCacheScope,
-    Package, PkgName, ResolutionVerification, ScopeHook, TarballResolution, TempDir, TrustPolicy,
-    UpstreamRouteHook, assert_eq, create_npm_resolution_verifier, ctx, default_opts,
-    fake_integrity, get_pkg_mirror_path, load_meta, now_at, persist_meta_to_mirror,
-    registry_resolution, stable_trust_packument,
+    ABBREVIATED_META_DIR,
+    Arc,
+    AuthHeaders,
+    FAKE_INTEGRITY,
+    LockfileResolution,
+    MetadataCacheScope,
+    Package,
+    PkgName,
+    ResolutionVerification,
+    ScopeHook,
+    TarballResolution,
+    TempDir,
+    TrustPolicy,
+    UpstreamRouteHook,
+    assert_eq,
+    create_npm_resolution_verifier,
+    ctx,
+    default_opts,
+    fake_integrity,
+    get_pkg_mirror_path,
+    load_meta,
+    now_at,
+    persist_meta_to_mirror,
+    registry_resolution,
+    stable_trust_packument,
 };
-use crate::{InMemoryPackageMetaCache, PackageMetaCache};
+use crate::{
+    InMemoryPackageMetaCache,
+    PackageMetaCache,
+};
 use pnpm_resolving_resolver_base::ResolutionVerifier;
 
 #[tokio::test]
@@ -153,6 +176,41 @@ async fn planned_fetch_head_shortcut_skips_the_metadata_body() {
     assert_eq!(result, ResolutionVerification::Ok);
 }
 
+#[tokio::test]
+async fn planned_fetch_head_shortcut_declines_the_latest_representable_date() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let _head_mock = server
+        .mock("HEAD", "/acme")
+        .with_status(200)
+        .with_header("last-modified", "Thu, 30 Dec 9999 22:00:00 GMT")
+        .expect(1)
+        .create_async()
+        .await;
+    let _meta_mock = server
+        .mock("GET", "/acme")
+        .with_status(403)
+        .expect(1)
+        .create_async()
+        .await;
+    let mut opts = default_opts(&registry);
+    opts.release_age.minimum_minutes = Some(60 * 24);
+    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+    let planned = pnpm_resolving_resolver_base::PlannedCanonicalFetches::default();
+    planned
+        .set(std::collections::HashSet::from([("acme".to_string(), "1.0.0".to_string(), None)]))
+        .expect("first fill");
+    opts.artifacts.canonical_fetches = Some(std::sync::Arc::clone(&planned));
+    let verifier = create_npm_resolution_verifier(opts);
+    let result = verifier.verify(
+        &registry_resolution(),
+        ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"),
+    )
+    .await;
+    dbg!(&result);
+    assert!(matches!(result, ResolutionVerification::FetchFailed { .. }));
+}
+
 /// A 403 on the metadata fetch (e.g. a CI token that is authenticated but not
 /// authorized to read a private package) must not be reported as a lockfile
 /// tarball-URL mismatch: the lockfile is correct, the fetch is the problem. The
@@ -246,14 +304,15 @@ async fn pnpr_registry_frozen_lockfile_fetches_abbreviated_metadata_for_age_and_
     let mut server = mockito::Server::new_async().await;
     let mut packument = stable_trust_packument("acme");
     // `modified` is newer than the cutoff so the age check must read per-version `time`
-    // from the abbreviated response rather than passing on `modified` alone.
-    packument["modified"] = serde_json::json!("2025-11-30T23:00:00.000Z");
+    // from the abbreviated response rather than passing on `modified` alone. The check
+    // runs at the current time: a fixed time that lags it widens the window the pnpr
+    // document has to cover.
+    packument["modified"] = serde_json::json!(
+        (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)).to_string()
+    );
     let abbrev_mock = server
         .mock("GET", "/acme")
-        .match_header(
-            "accept",
-            "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
-        )
+        .match_header("accept", crate::fetch_full_metadata::ACCEPT_PNPR_DOC)
         .with_status(200)
         .with_body(packument.to_string())
         .expect_at_least(1)
@@ -271,7 +330,6 @@ async fn pnpr_registry_frozen_lockfile_fetches_abbreviated_metadata_for_age_and_
     let mut opts = default_opts(&registry);
     opts.release_age.minimum_minutes = Some(60 * 24);
     opts.trust.policy = Some(TrustPolicy::NoDowngrade);
-    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
     opts.registry_options_by_url = Some(std::collections::BTreeMap::from([(
         registry,
         pnpm_lockfile::RegistryOptions {
@@ -315,4 +373,50 @@ async fn pnpr_registry_offline_falls_back_to_full_mirror_when_abbreviated_mirror
     let result = verifier.verify(&registry_resolution(), ctx(&name, "1.1.0")).await;
 
     assert_eq!(result, ResolutionVerification::Ok);
+}
+
+#[tokio::test]
+async fn shared_trust_lookups_separate_reference_time_windows() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let full = stable_trust_packument("acme");
+    let mut clamped = full.clone();
+    clamped["time"]["1.1.0"] = serde_json::json!("2025-03-01T00:00:00.000Z");
+    let cache: Arc<dyn PackageMetaCache> = Arc::new(InMemoryPackageMetaCache::default());
+    cache.set(format!("{registry}\x00acme"), Arc::new(serde_json::from_value(clamped).unwrap()));
+    let full_fetch = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_body(full.to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let lookups = crate::VerifierLookups::default();
+    let verifier_at = |now| {
+        let mut opts = default_opts(&registry);
+        opts.now = Some(now);
+        opts.trust.policy = Some(TrustPolicy::NoDowngrade);
+        opts.trust.ignore_after = Some(1440);
+        opts.metadata.meta_cache = Some(Arc::clone(&cache));
+        opts.artifacts.lookups = Some(lookups.clone());
+        opts.registry_options_by_url = Some(std::collections::BTreeMap::from([(
+            registry.clone(),
+            pnpm_lockfile::RegistryOptions {
+                server_type: Some(pnpm_lockfile::RegistryServerType::Pnpr),
+                ..Default::default()
+            },
+        )]));
+        create_npm_resolution_verifier(opts)
+    };
+    let now = jiff::Timestamp::now();
+    let recent = verifier_at(now);
+    let earlier = verifier_at(now - jiff::SignedDuration::from_hours(31 * 24));
+    let name: PkgName = "acme".parse().unwrap();
+    let recent_meta = recent.fetch_full_meta_for_trust(&registry, &name).await.unwrap();
+    assert_eq!(recent_meta.time.as_ref().unwrap()["1.1.0"], "2025-03-01T00:00:00.000Z");
+    let earlier_meta = earlier.fetch_full_meta_for_trust(&registry, &name).await.unwrap();
+    assert_eq!(earlier_meta.time.as_ref().unwrap()["1.1.0"], "2025-02-01T00:00:00.000Z");
+    let repeated = earlier.fetch_full_meta_for_trust(&registry, &name).await.unwrap();
+    assert_eq!(repeated.time, earlier_meta.time);
+    full_fetch.assert_async().await;
 }

@@ -1,6 +1,7 @@
 #![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
 #![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
 #![expect(clippy::print_stderr, reason = "developer tool, not part of the pnpm binary")]
+use command_extra::CommandExtra;
 
 mod cli_args;
 mod fixtures;
@@ -9,10 +10,20 @@ mod verify;
 mod work_env;
 mod workspace_manifest;
 
-use cli_args::{RegistryMode, TargetKind};
-use latency_proxy::{LatencyProxy, LinkProfile, mbps_to_bytes_per_sec};
+use cli_args::{
+    RegistryMode,
+    TargetKind,
+};
+use latency_proxy::{
+    LatencyProxy,
+    LinkProfile,
+    mbps_to_bytes_per_sec,
+};
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+    },
     time::Duration,
 };
 
@@ -24,7 +35,8 @@ async fn main() {
         std::fs::canonicalize(&args.build.repository).expect("get absolute path to repository");
     let pnpm_repository = args.build.pnpm_repository
         .as_ref()
-        .map(|path| std::fs::canonicalize(path).expect("get absolute path to pnpm repository"));
+        .map(std::fs::canonicalize)
+        .map(|canonical| canonical.expect("get absolute path to pnpm repository"));
     let work_env = prepared_work_env(&args.work_env);
     let registry = RegistryLink::plan(&args);
 
@@ -154,8 +166,8 @@ async fn spawn_registry(opts: SpawnRegistry<'_>) -> Option<pnpm_registry_mock::M
     match opts.registry_mode {
         RegistryMode::Verdaccio => {
             verify::ensure_program("just")
-                .arg("install")
-                .pipe(verify::executor("just install"));
+                .with_arg("install")
+                .pipe_mut(verify::executor("just install"));
             pnpm_registry_mock::MockInstanceOptions {
                 client: &reqwest::Client::default(),
                 port: opts.spawned_registry_port,
@@ -259,8 +271,9 @@ fn verify_prerequisites(
     }
 }
 
-/// A scenario with its own fixture packages seeds them into the mock
-/// registry's storage before it comes up.
+/// A scenario with its own fixture packages seeds them into the shared mock
+/// registry's storage before it comes up. A revision's own mock gets them
+/// published through it once it is up instead.
 fn seed_scenario_fixture(
     scenario: Option<cli_args::BenchmarkScenario>,
     registry_mode: RegistryMode,
@@ -273,10 +286,10 @@ fn seed_scenario_fixture(
         "the peer-heavy benchmark requires --registry=verdaccio",
     );
     // Seed the fixtures first, so the scenario's packages go into the
-    // database the mocks serve.
+    // database the shared mock serves.
     pnpm_registry_mock::seed_runtime_storage()
         .unwrap_or_else(|err| panic!("seed registry-mock fixtures into runtime storage: {err}"));
-    work_env::seed_peer_heavy_registry(&pnpm_registry_mock::runtime_metadata_path());
+    work_env::seed_peer_heavy_registry(pnpm_registry_mock::runtime_metadata_path());
 }
 
 fn prepared_work_env(work_env: &std::path::Path) -> std::path::PathBuf {

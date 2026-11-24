@@ -1,6 +1,19 @@
 use super::super::{
-    Config, HashSet, IncludedDependencies, InstallError, Lockfile, NodeLinker, Path, PathBuf,
+    Config,
+    HashSet,
+    IncludedDependencies,
+    InstallError,
+    Lockfile,
+    NodeLinker,
+    Path,
+    PathBuf,
     refuse_drifted_modules_dir,
+};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
 };
 
 pub(super) fn is_safe_modules_purge_target(modules_dir: &Path, workspace_root: &Path) -> bool {
@@ -8,7 +21,7 @@ pub(super) fn is_safe_modules_purge_target(modules_dir: &Path, workspace_root: &
 }
 /// The modules directory a drifted layout has to be rebuilt from.
 pub(super) struct InconsistentModulesDir<'a> {
-    pub(super) config: &'static Config,
+    pub(super) config: &'a Config,
     pub(super) workspace_root: &'a Path,
     pub(super) modules_manifest: Option<&'a pnpm_modules_yaml::ModulesLayout>,
     pub(super) node_linker: NodeLinker,
@@ -19,7 +32,7 @@ pub(super) struct InconsistentModulesDir<'a> {
 /// `false` when [`refuse_drifted_modules_dir`] accepts the drift, as upstream
 /// `checkCompatibility` accepts a sibling `v3` store: the tree is kept, so
 /// the install merges into its recorded state.
-pub(super) fn purge_inconsistent_modules_dir(
+pub(super) fn purge_inconsistent_modules_dir<ReporterImpl: Reporter>(
     context: &InconsistentModulesDir<'_>,
 ) -> Result<bool, InstallError> {
     // Only a plain install (upstream `forceNewModules = installsOnly`) of
@@ -38,9 +51,39 @@ pub(super) fn purge_inconsistent_modules_dir(
         return Ok(true);
     }
     if let Some(target) = target_dir {
+        warn_modules_dir_recreated::<ReporterImpl>(context);
         purge_modules_dir_entries(&target, context.config, context.modules_manifest)?;
     }
     Ok(true)
+}
+/// The reason is the error a mutation would have failed with, without its
+/// advice to run `pnpm install`, which is what is happening. A drift that
+/// mutations accept, such as a tree linked from the sibling `v3` store, still
+/// gets a reason, as a plain install recreates the tree all the same.
+fn warn_modules_dir_recreated<ReporterImpl: Reporter>(context: &InconsistentModulesDir<'_>) {
+    let reason =
+        refuse_drifted_modules_dir(context.modules_manifest, context.config, context.node_linker)
+            .err()
+            .map(|error| purge_reason(&error))
+            .unwrap_or_else(|| {
+                "Its recorded layout differs from the current settings.".to_string()
+            });
+    ReporterImpl::emit(&LogEvent::Pnpm(PnpmLog {
+        level: LogLevel::Warn,
+        message: format!(
+            r#"The modules directory at "{}" has to be recreated. {reason}"#,
+            context.config.modules_dir.display(),
+        ),
+        prefix: context.workspace_root.to_string_lossy().into_owned(),
+    }));
+}
+
+fn purge_reason(error: &InstallError) -> String {
+    let message = error.to_string();
+    message
+        .strip_suffix(r#" Run "pnpm install" to recreate the modules directory."#)
+        .map(str::to_string)
+        .unwrap_or_else(|| message.clone())
 }
 /// The canonicalized directory the purge may sweep, and whether sweeping it is
 /// safe at all. Deleting from the validated path closes the
@@ -130,9 +173,7 @@ pub(super) fn recorded_virtual_store_name(
 /// What decides whether direct links excluded by this run have to be pruned.
 pub(super) struct ExcludedGroupPrune<'a> {
     pub(crate) eligibility: crate::install::state_options::PruneEligibility,
-    pub(super) config: &'static Config,
-    pub(super) workspace_root: &'a Path,
-    pub(super) included: IncludedDependencies,
+    pub(crate) tree: crate::install::state_options::ModulesTreeContext<'a>,
     pub(super) modules_manifest: Option<&'a pnpm_modules_yaml::ModulesLayout>,
     pub(super) current_lockfile: Option<&'a Lockfile>,
     pub(super) requested_importer_ids: Option<&'a HashSet<String>>,
@@ -150,11 +191,15 @@ pub(super) struct ManifestLinkProjects<'a> {
 pub(super) fn prune_excluded_direct_deps(
     context: &ExcludedGroupPrune<'_>,
 ) -> Result<(), InstallError> {
-    if context.eligibility.resolve_only || context.eligibility.is_inconsistent {
+    if context.eligibility.resolve_only
+        || context.eligibility.is_inconsistent
+        || (context.tree.config.virtual_store_only
+            && context.tree.node_linker == NodeLinker::Hoisted)
+    {
         return Ok(());
     }
     let Some(modules) = context.modules_manifest else { return Ok(()) };
-    if !context.eligibility.filtered_install && modules.included == context.included {
+    if !context.eligibility.filtered_install && modules.included == context.tree.included {
         return Ok(());
     }
     let selected_prune_importer_ids = selected_prune_importer_ids(context);
@@ -163,21 +208,23 @@ pub(super) fn prune_excluded_direct_deps(
         crate::prune_direct_deps_excluded_by_groups(
             current,
             previously_included,
-            context.included,
-            context.workspace_root,
-            context.config,
+            context.tree.included,
+            context.tree.workspace_root,
+            context.tree.config,
             selected_prune_importer_ids.as_ref(),
         )
         .map_err(InstallError::PruneDirectDeps)?;
     }
     crate::prune_manifest_link_deps(&crate::PruneManifestLinkDeps {
-        workspace_root: context.workspace_root,
+        modules_dirs: &pnpm_deps_restorer::ImporterModulesDirs::from_config(
+            context.tree.config,
+            context.tree.workspace_root,
+        ),
         project_manifests: context.manifest_links.manifests,
         importers: context.current_lockfile.map(|current| &current.importers),
         workspace_links: context.manifest_links.workspace_links,
         previously_included,
-        new_included: context.included,
-        modules_dir_name: context.config.modules_dir_name(),
+        new_included: context.tree.included,
         prunable_importer_ids: selected_prune_importer_ids.as_ref(),
     })
     .map_err(InstallError::PruneDirectDeps)
@@ -204,9 +251,9 @@ fn selected_prune_importer_ids(context: &ExcludedGroupPrune<'_>) -> Option<HashS
         Some(current) => {
             crate::materialization_closure(
                 current,
-                context.workspace_root,
+                context.tree.workspace_root,
                 requested,
-                &crate::GroupSelection::following_every_edge(context.included),
+                &crate::GroupSelection::following_every_edge(context.tree.included),
                 &crate::SkippedSnapshots::new(),
             )
             .importer_ids

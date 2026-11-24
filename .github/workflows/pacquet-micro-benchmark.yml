@@ -30,6 +30,12 @@ jobs:
         os: [blacksmith-8vcpu-ubuntu-2404] # macOS is too unstable to be useful for benchmark, the variance is always huge.
     name: Run benchmark on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Both revisions build with thin LTO and 16 codegen units, so the
+      # comparison stays like for like without the serial fat-LTO link.
+      # Released binaries keep the fat-LTO release profile.
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
     steps:
       - name: Checkout Main Branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,6 +70,11 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
+      # The PR's install settings can differ from main's, and pnpm refuses to
+      # reuse a modules directory created with other settings.
+      - name: Remove main's node_modules
+        run: find . -path ./target -prune -o -type d -name node_modules -prune -exec rm -rf {} +
+
       - name: Install crates
         uses: $/.github/actions/install-crates
 
@@ -95,7 +106,7 @@ jobs:
 
     steps:
       - name: Install critcmp
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: critcmp
 

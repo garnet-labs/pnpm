@@ -11,20 +11,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pnpm-ffi-process = { workspace = true }
 pnpm-package-name = { workspace = true }
 pnpm-deps-path = { workspace = true }
 pnpm-lockfile = { workspace = true }
-pnpm-platform-variants = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-registry = { workspace = true }
 pnpm-resolving-jsr-specifier-parser = { workspace = true }
 pnpm-resolving-resolver-base = { workspace = true }
+pnpm-time = { workspace = true }
 pnpm-version-policy = { workspace = true }
 pnpm-store-dir = { workspace = true }
 pnpm-workspace-range-resolver = { workspace = true }
 pnpm-workspace-spec = { workspace = true }
 
-chrono = { workspace = true }
+jiff = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 httpdate = { workspace = true }
@@ -43,7 +44,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-pnpm-resolving-default-resolver = { workspace = true }
+pnpm-resolving-default-resolver = { workspace = true, features = ["runtime-provisioning", "shell-emulator"] }
 pnpm-resolving-local-resolver = { workspace = true }
 
 futures-util = { workspace = true }

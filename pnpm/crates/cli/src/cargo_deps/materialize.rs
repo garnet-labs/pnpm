@@ -1,9 +1,35 @@
 use super::{
-    Algorithm, Arc, ArchiveStoreProjection, AtomicU8, AuthHeaders, BTreeMap, CARGO_CHECKSUM_FILE,
-    CafsFileInfo, Config, Deserialize, ImportIndexedDirOpts, IngestTarballToStore, Integrity,
-    IntoDiagnostic, LockedCrate, Path, PathBuf, Reporter, Result, RetryOpts, Serialize,
-    SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreDir, StoreIndex, StoreIndexWriter,
-    StreamExt, ThrottledClient, checksum_cache, import_indexed_dir, registry_download_config,
+    Algorithm,
+    Arc,
+    ArchiveStoreProjection,
+    AtomicU8,
+    AuthHeaders,
+    BTreeMap,
+    CARGO_CHECKSUM_FILE,
+    CafsFileInfo,
+    Config,
+    Deserialize,
+    ImportIndexedDirOpts,
+    IngestTarballToStore,
+    Integrity,
+    IntoDiagnostic,
+    LockedCrate,
+    Path,
+    PathBuf,
+    Reporter,
+    Result,
+    RetryOpts,
+    Serialize,
+    SharedReadonlyStoreIndex,
+    SharedVerifiedFilesCache,
+    StoreDir,
+    StoreIndex,
+    StoreIndexWriter,
+    StreamExt,
+    ThrottledClient,
+    checksum_cache,
+    import_indexed_dir,
+    registry_download_config,
     stream,
 };
 use miette::WrapErr;
@@ -13,7 +39,7 @@ use rayon::prelude::*;
 struct CargoChecksum<'a> {
     files: BTreeMap<String, String>,
     /// The registry checksum of the `.crate` archive the files came from.
-    /// Null for a package vendored from a git checkout, which has none —
+    /// Null for a package vendored from a git checkout, which has none,
     /// the same value `cargo vendor` writes for one.
     package: Option<&'a str>,
 }
@@ -134,7 +160,7 @@ async fn create_crate_download(options: &DownloadOptions) -> Result<CrateDownloa
         download_template: registry_config.dl,
         retry_opts: options.config.retry_opts(),
         offline: options.config.offline,
-        tar_limits: options.config.tar_limits(),
+        tar_limits: pnpm_tarball::TarLimits::new(options.config.max_tarball_unpacked_size),
         requester: options.requester.clone(),
     })
 }
@@ -286,7 +312,7 @@ impl CrateDownload {
 impl CrateStore {
     fn archive_context(&self) -> pnpm_tarball::ArchiveStoreContext<'_> {
         pnpm_tarball::ArchiveStoreContext {
-            dir: self.dir,
+            dir: std::borrow::Cow::Borrowed(self.dir),
             index: self.index.as_ref().map(Arc::clone),
             index_writer: Some(Arc::clone(&self.index_writer)),
             verify_integrity: self.verify_integrity,

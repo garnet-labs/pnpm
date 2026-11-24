@@ -1,12 +1,23 @@
-mod open_directory;
-use crate::{FindWorkspaceProjectsError, directory_patterns::negated_directory_pattern};
-use derive_more::{Display, Error};
+use crate::{
+    FindWorkspaceProjectsError,
+    directory_patterns::negated_directory_pattern,
+};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     ffi::OsStr,
-    fs, io,
-    path::{Path, PathBuf},
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 use wax::Program as _;
 
@@ -138,7 +149,7 @@ fn find_workspace_inventory_with(
 }
 
 fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, FindWorkspaceInventoryError> {
-    fs::canonicalize(workspace_root)
+    std::fs::canonicalize(workspace_root)
         .map_err(|source| FindWorkspaceInventoryError::ReadDirectory {
             path: workspace_root.to_path_buf(),
             source,
@@ -150,7 +161,8 @@ fn compile_excluded_directories(
 ) -> Result<wax::Any<'static>, FindWorkspaceInventoryError> {
     let globs = patterns
         .iter()
-        .filter_map(|pattern| negated_directory_pattern(pattern).transpose())
+        .map(|pattern| negated_directory_pattern(pattern))
+        .filter_map(Result::transpose)
         .map(|directory| {
             directory.map(|directory| {
                 wax::Glob::new(&directory).expect("validated directory pattern").into_owned()
@@ -173,10 +185,21 @@ fn ignored_paths_under(
     canonical_root: &Path,
     ignored_directories: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>, FindWorkspaceInventoryError> {
+    ignored_paths_under_with(workspace_root, canonical_root, ignored_directories, |path| {
+        std::fs::canonicalize(path)
+    })
+}
+
+fn ignored_paths_under_with(
+    workspace_root: &Path,
+    canonical_root: &Path,
+    ignored_directories: &[PathBuf],
+    mut canonicalize: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, FindWorkspaceInventoryError> {
     let mut paths = BTreeSet::new();
     for path in ignored_directories {
         let path = workspace_root.join(path);
-        let canonical = match fs::canonicalize(&path) {
+        let canonical = match canonicalize(&path) {
             Ok(path) => path,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(source) => {

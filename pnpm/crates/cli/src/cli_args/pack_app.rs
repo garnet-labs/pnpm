@@ -20,28 +20,63 @@
 
 use crate::process::Command;
 use build::{
-    EmbeddedRuntime, SeaBuild, ad_hoc_sign_mac_binary, ensure_node_runtime, pnpm_home_dir,
-    print_built, reject_non_regular_output_file, reject_non_regular_outputs,
-    resolve_builder_binary, resolve_version, run_command,
+    EmbeddedRuntime,
+    SeaBuild,
+    ad_hoc_sign_mac_binary,
+    ensure_node_runtime,
+    pnpm_home_dir,
+    print_built,
+    reject_non_regular_output_file,
+    reject_non_regular_outputs,
+    resolve_builder_binary,
+    resolve_version,
+    run_command,
 };
-use clap::Args;
+use clap::{
+    Args,
+    ValueHint,
+};
 use config::{
-    ParsedTarget, ReadProjectAppConfigResult, default_runtime_version,
-    derive_output_name_from_package, escapes_project, output_file_name, parse_runtime,
-    parse_target, path_is_within, read_project_app_config, validate_output_name,
+    ParsedTarget,
+    ReadProjectAppConfigResult,
+    default_runtime_version,
+    derive_output_name_from_package,
+    escapes_project,
+    output_file_name,
+    parse_runtime,
+    parse_target,
+    path_is_within,
+    read_project_app_config,
+    validate_output_name,
 };
-use derive_more::{Display, Error};
-use miette::{Context, Diagnostic, IntoDiagnostic};
-use pnpm_config::{Config, Host};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Context,
+    Diagnostic,
+    IntoDiagnostic,
+};
+use pnpm_config::{
+    Config,
+    Host,
+};
 use pnpm_engine_runtime_node_resolver::{
-    get_node_mirror, parse_node_specifier, resolve_node_version,
+    get_node_mirror,
+    parse_node_specifier,
+    resolve_node_version,
 };
 use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::parse_manifest;
 use serde_json::Value;
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
 };
 
 /// Minimum Node.js version that supports `node --build-sea`.
@@ -71,7 +106,7 @@ pub struct PackAppArgs {
     pub params: Vec<String>,
 
     /// Path to the CJS entry file to embed in the executable.
-    #[clap(long)]
+    #[clap(long, value_hint = ValueHint::FilePath)]
     pub entry: Option<String>,
 
     /// Target to build for. May be specified multiple times. Supported:
@@ -87,7 +122,7 @@ pub struct PackAppArgs {
     pub runtime: Option<String>,
 
     /// Output directory for the built executables. Defaults to `dist-app`.
-    #[clap(short = 'o', long = "output-dir")]
+    #[clap(short = 'o', long = "output-dir", value_hint = ValueHint::DirPath)]
     pub output_dir: Option<String>,
 
     /// Name for the output executable (without extension). Defaults to the
@@ -358,7 +393,7 @@ impl PackAppArgs {
         Ok(validate_output_name(&output_name)?)
     }
     /// The created output directory. `outputDir` is repo-controllable, so
-    /// absolute paths and `..` traversal are rejected — build artifacts
+    /// absolute paths and `..` traversal are rejected, build artifacts
     /// must not be written outside the project.
     fn resolve_output_dir(
         &self,

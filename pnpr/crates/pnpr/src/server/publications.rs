@@ -1,41 +1,71 @@
-//! `GET /-/publications/{org}/{id-or-name}` and
-//! `GET /-/publications/{org}?member=<ecosystem>:<name>@<version>`: the
-//! publications of an organization's hosted catalog.
+//! `GET /-/publications/{namespace}/{id-or-name}` and
+//! `GET /-/publications/{namespace}?member=<ecosystem>:<name>@<version>`: the
+//! publications of a hosted namespace.
 //!
-//! `-` names the catalog of the registries without an `org`. A caller sees
+//! `-` names the default namespace of registries without a `namespace`. A caller sees
 //! only the members it may read, and a publication with none answers 404, so
 //! a publication never discloses a package.
 
 use super::{
-    Action, AppState, AuthedCaller, HostedGate, Identity, RegistrySource, authorize_package,
-    hosted_gate, not_found,
-    notes::{NoteRequest, note_text_response, read_note_body},
+    Action,
+    AppState,
+    AuthedCaller,
+    HostedGate,
+    Identity,
+    RegistrySource,
+    authorize_package,
+    hosted_gate,
+    not_found,
+    notes::{
+        NoteRequest,
+        note_text_response,
+        read_note_body,
+    },
     private_no_cache,
 };
 use axum::{
     Json,
-    extract::{Path, Query, State},
-    response::{IntoResponse, Response},
+    extract::{
+        Path,
+        Query,
+        State,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
-use pnpr_registry::{Ecosystem, Resolved};
-use pnpr_storage::metadata::{ArtifactMember, Note, NoteChange, Publication, SqlMetadata};
+use pnpr_registry::{
+    Ecosystem,
+    Resolved,
+};
+use pnpr_storage::database::{
+    ArtifactMember,
+    Note,
+    NoteChange,
+    Publication,
+    SqlDatabase,
+};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::sync::Arc;
 
-/// The path segment naming the catalog of registries without an `org`.
-const DEFAULT_CATALOG: &str = "-";
+/// The path segment naming the default namespace of registries without a `namespace`.
+const DEFAULT_NAMESPACE: &str = "-";
 
 pub(super) async fn serve_publication(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
-    Path((org, id_or_name)): Path<(String, String)>,
+    Path((namespace, id_or_name)): Path<(String, String)>,
 ) -> Response {
-    let catalog = catalog_of(&org);
-    let database = state.inner.storage.sql_metadata();
-    let found = database.publication(catalog, &id_or_name).await;
+    let namespace = namespace_of(&namespace);
+    let database = state.inner.storage.sql_database();
+    let found = database.publication(namespace, &id_or_name).await;
     private_no_cache(respond(&state, &identity, found))
 }
 
@@ -47,11 +77,11 @@ pub(super) struct MemberQuery {
 pub(super) async fn serve_member_publication(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
-    Path(org): Path<String>,
+    Path(namespace): Path<String>,
     Query(query): Query<MemberQuery>,
 ) -> Response {
-    let catalog = catalog_of(&org);
-    let database = state.inner.storage.sql_metadata();
+    let namespace = namespace_of(&namespace);
+    let database = state.inner.storage.sql_database();
     let Some((name, version)) = parse_member(&query.member) else {
         return RegistryError::BadRequest {
             reason: "`member` must be <ecosystem>:<name>@<version>".to_string(),
@@ -73,15 +103,15 @@ pub(super) async fn serve_member_publication(
         version: version.to_string(),
         artifact: String::new(),
     };
-    if !may_read(&state, &identity, catalog, &queried) {
+    if !may_read(&state, &identity, namespace, &queried) {
         return private_no_cache(not_found());
     }
-    let found = database.initial_publication(&name, catalog, version).await;
+    let found = database.initial_publication(&name, namespace, version).await;
     private_no_cache(respond(&state, &identity, found))
 }
 
-fn catalog_of(org: &str) -> &str {
-    if org == DEFAULT_CATALOG { "" } else { org }
+fn namespace_of(segment: &str) -> &str {
+    if segment == DEFAULT_NAMESPACE { "" } else { segment }
 }
 
 /// `npm:@scope/name@1.0.0` as the package and its version.
@@ -116,29 +146,34 @@ fn visible(
     identity: &Identity,
     mut publication: Publication,
 ) -> Option<Publication> {
-    let catalog = publication.catalog.clone();
-    publication.members.retain(|member| may_read(state, identity, &catalog, member));
+    let namespace = publication.namespace.clone();
+    publication.members.retain(|member| may_read(state, identity, &namespace, member));
     (!publication.members.is_empty()).then_some(publication)
 }
 
-/// Whether a hosted registry of `catalog` and the member's ecosystem claims
+/// Whether a hosted registry of `namespace` and the member's ecosystem claims
 /// the member's package and lets `identity` read it.
-fn may_read(state: &AppState, identity: &Identity, catalog: &str, member: &ArtifactMember) -> bool {
-    let routing = &state.inner.config.routing;
+fn may_read(
+    state: &AppState,
+    identity: &Identity,
+    namespace: &str,
+    member: &ArtifactMember,
+) -> bool {
+    let routing = state.routing();
     routing.hosted
         .iter()
         .any(|(source, hosted)| {
-            hosted.org == catalog
+            hosted.namespace == namespace
                 && routing.registries.ecosystem(source) == Some(member.ecosystem)
                 // The registry still claims the name: a package its
-                // namespace no longer covers is not served there.
+                // patterns no longer cover is not served there.
                 && matches!(
                     routing.registries.resolve(source, member.ecosystem, &member.name),
                     Resolved::Concrete { registry, .. } if registry == source,
                 )
                 && matches!(
                     hosted_gate(state, identity, source, &member.name),
-                    HostedGate::Allowed(org) if org == catalog,
+                    HostedGate::Allowed(allowed) if allowed == namespace,
                 )
         })
 }
@@ -157,7 +192,7 @@ fn publication_json(publication: &Publication) -> Value {
         .collect();
     json!({
         "id": publication.id,
-        "org": publication.catalog,
+        "namespace": publication.namespace,
         "name": publication.name,
         "publisher": publication.publisher,
         "committedAt": publication.committed_at,
@@ -167,12 +202,14 @@ fn publication_json(publication: &Publication) -> Value {
 
 /// Whether `identity` may read every member of `publication`.
 fn reads_every_member(state: &AppState, identity: &Identity, publication: &Publication) -> bool {
-    publication.members.iter().all(|member| may_read(state, identity, &publication.catalog, member))
+    publication.members
+        .iter()
+        .all(|member| may_read(state, identity, &publication.namespace, member))
 }
 
 /// Whether anyone, signed in or not, may read `name` through the hosted
 /// registry `source` the request was authorized against. Another registry
-/// of the same org that admits anonymous reads does not make it public.
+/// of the same namespace that admits anonymous reads does not make it public.
 pub(super) fn anonymously_readable(
     state: &AppState,
     source: &str,
@@ -191,10 +228,10 @@ pub(super) fn anonymously_readable(
 pub(super) async fn readable_publication_note(
     state: &AppState,
     identity: &Identity,
-    database: &Arc<SqlMetadata>,
+    database: &Arc<SqlDatabase>,
     publication: Publication,
 ) -> Result<PublicationNoteLink, RegistryError> {
-    let note = database.publication_note(&publication.catalog, publication.id).await?;
+    let note = database.publication_note(&publication.namespace, publication.id).await?;
     // A note added after publishing and then deleted names nothing.
     let note = note.filter(|note| note.text.is_some() || note.initial_digest.is_some());
     let Some(note) = note else {
@@ -229,7 +266,7 @@ pub(super) struct ReadablePublicationNote {
 impl From<ReadablePublicationNote> for super::notes::PublicationLink {
     fn from(readable: ReadablePublicationNote) -> Self {
         Self {
-            org: readable.publication.catalog,
+            namespace: readable.publication.namespace,
             id: readable.publication.id,
             name: readable.publication.name,
             initial_digest: readable.note.initial_digest,
@@ -238,12 +275,12 @@ impl From<ReadablePublicationNote> for super::notes::PublicationLink {
     }
 }
 
-/// `GET|PUT|DELETE /-/publications/{org}/{id-or-name}/notes`. Reading needs
+/// `GET|PUT|DELETE /-/publications/{namespace}/{id-or-name}/notes`. Reading needs
 /// read access to every member, writing the `publish` rule of every member.
 pub(super) async fn serve_publication_note(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
-    Path((org, id_or_name)): Path<(String, String)>,
+    Path((namespace, id_or_name)): Path<(String, String)>,
     method: axum::http::Method,
     body: axum::body::Bytes,
 ) -> Response {
@@ -251,8 +288,8 @@ pub(super) async fn serve_publication_note(
         Ok(request) => request,
         Err(response) => return response,
     };
-    let database = Arc::clone(state.inner.storage.sql_metadata());
-    let publication = match database.publication(catalog_of(&org), &id_or_name).await {
+    let database = Arc::clone(state.inner.storage.sql_database());
+    let publication = match database.publication(namespace_of(&namespace), &id_or_name).await {
         Ok(Some(publication)) if reads_every_member(&state, &identity, &publication) => publication,
         Ok(_) => return not_found(),
         Err(err) => return err.into_response(),
@@ -271,10 +308,10 @@ pub(super) async fn serve_publication_note(
 
 async fn read_publication_note(
     state: &AppState,
-    database: &Arc<SqlMetadata>,
+    database: &Arc<SqlDatabase>,
     publication: &Publication,
 ) -> Result<Response, RegistryError> {
-    let note = database.publication_note(&publication.catalog, publication.id).await?;
+    let note = database.publication_note(&publication.namespace, publication.id).await?;
     let public = reads_every_member(state, &Identity::Anonymous, publication);
     let mut response = match &note {
         Some(note) if note.text.is_some() => note_text_response(note, public),
@@ -291,45 +328,45 @@ async fn read_publication_note(
 async fn change_publication_note(
     state: &AppState,
     identity: &Identity,
-    database: &Arc<SqlMetadata>,
+    database: &Arc<SqlDatabase>,
     publication: &Publication,
     text: Option<String>,
 ) -> Result<Response, RegistryError> {
     for member in &publication.members {
-        authorize_member_publish(state, identity, &publication.catalog, member).await?;
+        authorize_member_publish(state, identity, &publication.namespace, member).await?;
     }
     let principal = identity
-        .username()
+        .user_id()
         .unwrap_or("-")
         .to_string();
-    let change = NoteChange { text, principal: principal.clone() };
-    if !database.set_publication_note(&publication.catalog, publication.id, change).await? {
+    let change = NoteChange { text, principal };
+    if !database.set_publication_note(&publication.namespace, publication.id, change).await? {
         return Err(RegistryError::NotFound);
     }
-    tracing::info!(
-        target: "pnpr::audit",
-        action = "publication.note_change",
-        actor = %principal,
-        org = %publication.catalog,
+    let actor = crate::audit::Actor::of(identity);
+    crate::audit!(
+        actor,
+        "publication.note_change",
+        namespace = %publication.namespace,
         publication = publication.id,
         "publication note changed",
     );
     Ok(axum::http::StatusCode::NO_CONTENT.into_response())
 }
 
-/// Check the `publish` rule of the hosted registry of `catalog` that serves
-/// the member's package: one of its ecosystem whose namespace claims it.
+/// Check the `publish` rule of the hosted registry of `namespace` that serves
+/// the member's package: one of its ecosystem whose patterns claim it.
 async fn authorize_member_publish(
     state: &AppState,
     identity: &Identity,
-    catalog: &str,
+    namespace: &str,
     member: &ArtifactMember,
 ) -> Result<(), RegistryError> {
-    let routing = &state.inner.config.routing;
+    let routing = state.routing();
     let source = routing.hosted
         .iter()
         .find_map(|(source, hosted)| {
-            (hosted.org == catalog
+            (hosted.namespace == namespace
                 && routing.registries.ecosystem(source) == Some(member.ecosystem)
                 && matches!(
                     routing.registries.resolve(source, member.ecosystem, &member.name),
@@ -339,5 +376,6 @@ async fn authorize_member_publish(
         });
     let Some(source) = source else { return Err(RegistryError::NotFound) };
     let hosted = RegistrySource::Hosted(source);
-    authorize_package(state, identity, &hosted, &member.name, Action::Publish, Some(catalog)).await
+    authorize_package(state, identity, &hosted, &member.name, Action::Publish, Some(namespace))
+        .await
 }

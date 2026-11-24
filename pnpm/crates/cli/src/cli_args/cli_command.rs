@@ -1,7 +1,10 @@
 pub(super) mod options;
 
 pub use commands::CliCommand;
-pub use selection_settings::SelectionSettingArgs;
+pub use selection_settings::{
+    SelectionSettingArgs,
+    extract_filter_order,
+};
 
 use super::{
     access::AccessArgs,
@@ -13,11 +16,19 @@ use super::{
     cache::CacheCommand,
     cat_file::CatFileArgs,
     cat_index::CatIndexArgs,
+    catalog::CatalogArgs,
     change::ChangeArgs,
     ci::CiArgs,
     clean::CleanArgs,
-    completion::{CompletionArgs, CompletionServerArgs},
-    config::{ConfigArgs, ConfigGetAliasArgs, ConfigSetAliasArgs},
+    completion::{
+        CompletionArgs,
+        CompletionServerArgs,
+    },
+    config::{
+        ConfigArgs,
+        ConfigGetAliasArgs,
+        ConfigSetAliasArgs,
+    },
     create::CreateArgs,
     dedupe::DedupeArgs,
     deploy::DeployArgs,
@@ -26,10 +37,12 @@ use super::{
     dlx::DlxArgs,
     docs::DocsArgs,
     doctor::DoctorArgs,
+    edit::EditArgs,
     env::EnvArgs,
     exec::ExecArgs,
     fetch::FetchArgs,
     find_hash::FindHashArgs,
+    fund::FundArgs,
     ignored_builds::IgnoredBuildsArgs,
     import::ImportArgs,
     init::InitArgs,
@@ -41,7 +54,6 @@ use super::{
     list::ListArgs,
     login::LoginArgs,
     logout::LogoutArgs,
-    not_implemented::NotImplementedArgs,
     outdated::OutdatedArgs,
     owner::OwnerArgs,
     pack::PackArgs,
@@ -50,7 +62,10 @@ use super::{
     patch_commit::PatchCommitArgs,
     patch_remove::PatchRemoveArgs,
     peers::PeersArgs,
-    permissions::{ApproveArgs, PermissionsArgs},
+    permissions::{
+        ApproveArgs,
+        PermissionsArgs,
+    },
     ping::PingArgs,
     pipeline::PipelineArgs,
     pkg::PkgArgs,
@@ -61,7 +76,10 @@ use super::{
     rebuild::RebuildArgs,
     remove::RemoveArgs,
     repo::RepoArgs,
-    reporter::{LogLevelSetting, ReporterType},
+    reporter::{
+        LogLevelSetting,
+        ReporterType,
+    },
     restart::RestartArgs,
     root::RootArgs,
     run::RunArgs,
@@ -91,9 +109,18 @@ use super::{
     why::WhyArgs,
     with::WithArgs,
 };
-use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use clap::{
+    CommandFactory,
+    Parser,
+    Subcommand,
+    ValueHint,
+    error::ErrorKind,
+};
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pipe_trait::Pipe;
 use pnpm_default_reporter::SummaryScope;
@@ -129,9 +156,9 @@ pub struct CliArgs {
     // The load runs on the main thread before startup, since the process
     // environment must not be mutated once another thread is alive. This
     // field exists so the flag is still accepted, validated, documented,
-    // and completed — a valueless `--env-file` is reported instead of
+    // and completed, a valueless `--env-file` is reported instead of
     // silently ignored.
-    #[clap(long = "env-file", value_name = "PATH", global = true)]
+    #[clap(long = "env-file", value_name = "PATH", value_hint = ValueHint::FilePath, global = true)]
     pub env_file: Vec<PathBuf>,
     #[clap(flatten)]
     pub paths: CliPathArgs,
@@ -159,6 +186,8 @@ pub struct CliWorkspaceArgs {
     pub recursive: bool,
     #[clap(skip)]
     pub recursive_from_command_line: bool,
+    #[clap(skip)]
+    pub no_recursive_from_command_line: bool,
     #[clap(flatten)]
     pub selection: WorkspaceSelectionArgs,
     #[clap(flatten)]
@@ -171,7 +200,14 @@ pub struct CliWorkspaceArgs {
 pub struct CliPathArgs {
     /// Set working directory. Accepted anywhere on the command line,
     /// before or after the subcommand, like every other rc-option.
-    #[clap(short = 'C', long, alias = "prefix", default_value = ".", global = true)]
+    #[clap(
+        short = 'C',
+        long,
+        alias = "prefix",
+        default_value = ".",
+        value_hint = ValueHint::DirPath,
+        global = true
+    )]
     pub dir: PathBuf,
     /// Whether `--dir` came from the command line rather than from its
     /// default. pnpm keeps that distinction: a `--dir` it was given is
@@ -188,17 +224,30 @@ pub struct CliPathArgs {
         long = "store-dir",
         alias = "store",
         value_name = "DIR",
+        value_hint = ValueHint::DirPath,
         global = true,
         overrides_with = "store_dir",
-        value_parser = parse_store_dir
+        value_parser = PathAllowingEmptyParser
     )]
     pub store_dir: Option<PathBuf>,
     /// Directory in which pnpm persists machine-local state.
-    #[clap(long = "state-dir", value_name = "DIR", global = true, overrides_with = "state_dir")]
+    #[clap(
+        long = "state-dir",
+        value_name = "DIR",
+        value_hint = ValueHint::DirPath,
+        global = true,
+        overrides_with = "state_dir",
+        value_parser = PathAllowingEmptyParser
+    )]
     pub state_dir: Option<PathBuf>,
     /// Path to an `.npmrc` to read auth settings from, overriding the
     /// default `~/.npmrc`.
-    #[clap(long = "npmrc-auth-file", visible_alias = "userconfig", global = true)]
+    #[clap(
+        long = "npmrc-auth-file",
+        visible_alias = "userconfig",
+        value_hint = ValueHint::FilePath,
+        global = true
+    )]
     pub npmrc_auth_file: Option<PathBuf>,
     /// Run as if the project were standalone, ignoring any
     /// `pnpm-workspace.yaml` above it.
@@ -247,7 +296,7 @@ pub struct PresentationArgs {
     pub no_color: bool,
     /// Reporter output format.
     // Self-override so a repeated `--reporter` takes the last occurrence,
-    // like nopt does — `--silent` expands to `--reporter=silent` (see
+    // like nopt does, `--silent` expands to `--reporter=silent` (see
     // `crate::shorthands`), so `--silent --reporter=ndjson` must not be a
     // duplicate-argument error.
     #[clap(long, value_enum, global = true, overrides_with = "reporter")]
@@ -277,6 +326,8 @@ pub struct WorkspaceSelectionArgs {
     /// selecting projects.
     #[clap(long = "filter-prod", global = true)]
     pub filter_prod: Vec<String>,
+    #[clap(skip)]
+    pub filter_order: Vec<pnpm_config::FilterSource>,
     /// Run the command on the root workspace project.
     #[clap(short = 'w', long = "workspace-root", global = true)]
     pub workspace_root: bool,
@@ -381,8 +432,29 @@ pub struct LifecycleOutputArgs {
     pub no_hide_prefix: bool,
 }
 
-fn parse_store_dir(value: &str) -> Result<PathBuf, std::convert::Infallible> {
-    Ok(PathBuf::from(value))
+#[derive(Debug, Clone, Copy)]
+struct PathAllowingEmptyParser;
+
+impl clap::builder::TypedValueParser for PathAllowingEmptyParser {
+    type Value = PathBuf;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        Ok(PathBuf::from(value))
+    }
+
+    fn parse(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: std::ffi::OsString,
+    ) -> Result<Self::Value, clap::Error> {
+        Ok(PathBuf::from(value))
+    }
 }
 
 fn parse_color_mode(value: &str) -> Result<pnpm_config::ColorMode, &'static str> {

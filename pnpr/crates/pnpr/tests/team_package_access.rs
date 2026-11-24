@@ -1,16 +1,31 @@
 //! npm's team package access endpoints (`npm access grant`, `revoke`, and
-//! `list packages`) on a registry with `rulesManagedBy: api`: what a grant
-//! writes into the package rules, who may make one, and which packages it
-//! applies to.
+//! `list packages`): what a grant writes into the stored package rules, who
+//! may make one, and which packages it applies to.
 
 use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+    },
 };
-use pnpr::{AuthState, Config, router_with_auth};
-use serde_json::{Value, json};
+use pnpr::{
+    Config,
+    router_with_auth,
+};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
     path::Path,
 };
 use tempfile::TempDir;
@@ -19,48 +34,61 @@ use tower::ServiceExt;
 const CONFIG: &str = "\
 auth:
   admins: [root]
-  htpasswd:
+  users:
     maxUsers: 100
 registries:
   local:
     type: hosted
-    org: \"\"
-    rulesManagedBy: api
-    teams:
-      devs: [carol]
+    namespace: \"\"
     packages:
       '@acme/app':
         access: [root]
         publish: [root]
+      '@acme/lib': {}
       '@acme/*': {}
   fixed:
     type: hosted
-    org: fixed
-    teams:
-      devs: [carol]
+    namespace: fixed
     packages:
       '@fixed/*': {}
   main:
     type: router
     sources: [fixed, local]
 defaultRegistry: main
+teams:
+  devs: { name: devs, members: [carol] }
 ";
 
 const PACKAGES: &str = "/npm/-/team/acme/devs/package";
-const RULES: &str = "/-/pnpr/v0/admin/rules/npm/local";
 
-fn load_config(dir: &Path) -> Config {
+async fn load_config(dir: &Path) -> Config {
+    let yaml = format!("storage: {}\n{CONFIG}", storage_dir(dir).display());
+    crate::managed_registries::managed_config(
+        &dir.join("config.yaml"),
+        &yaml,
+        listen(),
+        public_url(),
+    )
+    .await
+}
+
+fn storage_dir(dir: &Path) -> std::path::PathBuf {
     let storage = dir.join("storage");
     std::fs::create_dir_all(&storage).unwrap();
-    let path = dir.join("config.yaml");
-    std::fs::write(&path, format!("storage: {}\n{CONFIG}", storage.display())).unwrap();
-    let listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873));
-    Config::from_yaml(&path, listen, Some("http://example.test".to_string())).unwrap()
+    storage
+}
+
+fn listen() -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873))
+}
+
+fn public_url() -> Option<String> {
+    Some("http://example.test".to_string())
 }
 
 async fn app_router(config: Config) -> axum::Router {
-    let auth = AuthState::in_memory_with_max_users(config.identity.auth.htpasswd.max_users);
-    auth.users.create_user("root", "secret").await.unwrap();
+    let auth =
+        crate::tokens::seeded_auth(&config, &[("root", "secret123"), ("carol", "secret123")]);
     router_with_auth(config, auth)
 }
 
@@ -78,7 +106,10 @@ async fn send(
     if let Some(token) = token {
         request = request.header("authorization", format!("Bearer {token}"));
     }
-    let body = body.map(|body| Body::from(body.to_string())).unwrap_or_else(Body::empty);
+    let body = body
+        .map(|body| body.to_string())
+        .map(Body::from)
+        .unwrap_or_else(Body::empty);
     let response = app
         .clone()
         .oneshot(request.body(body).unwrap())
@@ -90,7 +121,7 @@ async fn send(
 }
 
 async fn add_user(app: &axum::Router, username: &str) -> String {
-    let body = json!({ "name": username, "password": "secret", "type": "user", "roles": [] });
+    let body = json!({ "name": username, "password": "secret123", "type": "user", "roles": [] });
     let path = format!("/-/user/org.couchdb.user:{username}");
     let (status, payload) = send(app, "PUT", &path, None, Some(body)).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -106,82 +137,122 @@ async fn read_app(app: &axum::Router, token: &str) -> StatusCode {
     send(app, "GET", "/npm/@acme/app", Some(token), None).await.0
 }
 
-async fn app_rule(app: &axum::Router, root: &str) -> Value {
-    let (status, rules) = send(app, "GET", RULES, Some(root), None).await;
-    assert_eq!(status, StatusCode::OK);
-    rules["packages"]["@acme/app"].clone()
+async fn team_packages(app: &axum::Router, token: &str) -> Value {
+    let (status, packages) = send(app, "GET", PACKAGES, Some(token), None).await;
+    assert_eq!(status, StatusCode::OK, "{packages}");
+    packages
 }
 
 #[tokio::test]
-async fn a_grant_edits_the_package_rule_and_a_revoke_undoes_it() {
+async fn a_grant_gives_the_team_the_package_and_a_revoke_takes_it_back() {
     let dir = TempDir::new().unwrap();
-    let app = app_router(load_config(dir.path())).await;
+    let app = app_router(load_config(dir.path()).await).await;
     let root = add_user(&app, "root").await;
     let carol = add_user(&app, "carol").await;
     assert_eq!(read_app(&app, &carol).await, StatusCode::FORBIDDEN);
+    assert_eq!(team_packages(&app, &root).await, json!({}));
 
-    let grant = json!({ "package": "@acme/app", "permissions": "read-write" });
+    let grant = json!({ "package": "@acme/app", "permissions": "read-only" });
     assert_eq!(send(&app, "PUT", PACKAGES, Some(&root), Some(grant)).await.0, StatusCode::CREATED);
     assert_eq!(read_app(&app, &carol).await, StatusCode::NOT_FOUND);
-    let rule = app_rule(&app, &root).await;
-    assert_eq!(rule["access"], json!(["root", "team:devs"]));
-    assert_eq!(rule["publish"], json!(["root", "team:devs"]));
-    let (status, listed) = send(&app, "GET", PACKAGES, Some(&carol), None).await;
-    assert_eq!((status, listed), (StatusCode::OK, json!({ "@acme/app": "read-write" })));
+    assert_eq!(team_packages(&app, &carol).await, json!({ "@acme/app": "read-only" }));
 
-    let grant = json!({ "package": "@acme/app", "permissions": "read-only" });
+    // Granting again replaces what the team has on the package.
+    let grant = json!({ "package": "@acme/app", "permissions": "read-write" });
     assert_eq!(send(&app, "PUT", PACKAGES, Some(&root), Some(grant)).await.0, StatusCode::CREATED);
-    assert_eq!(app_rule(&app, &root).await["publish"], json!(["root"]));
-    let (_, listed) = send(&app, "GET", PACKAGES, Some(&carol), None).await;
-    assert_eq!(listed, json!({ "@acme/app": "read-only" }));
+    assert_eq!(team_packages(&app, &root).await, json!({ "@acme/app": "read-write" }));
 
     let revoke = json!({ "package": "@acme/app" });
-    assert_eq!(
-        send(&app, "DELETE", PACKAGES, Some(&root), Some(revoke)).await.0,
-        StatusCode::NO_CONTENT,
-    );
+    for _ in 0..2 {
+        let (status, _) = send(&app, "DELETE", PACKAGES, Some(&root), Some(revoke.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
     assert_eq!(read_app(&app, &carol).await, StatusCode::FORBIDDEN);
-    assert_eq!(app_rule(&app, &root).await["access"], json!(["root"]));
-    let (_, listed) = send(&app, "GET", PACKAGES, Some(&root), None).await;
-    assert_eq!(listed, json!({}));
+    assert_eq!(team_packages(&app, &root).await, json!({}));
 }
 
 #[tokio::test]
-async fn a_grant_stores_only_the_lists_it_changes() {
+async fn a_grant_is_one_grant_of_the_instance() {
     let dir = TempDir::new().unwrap();
-    let app = app_router(load_config(dir.path())).await;
+    let app = app_router(load_config(dir.path()).await).await;
     let root = add_user(&app, "root").await;
-    let grant = json!({ "package": "@acme/app", "permissions": "read-only" });
+    let grant = json!({ "package": "@acme/lib", "permissions": "read-write" });
     assert_eq!(send(&app, "PUT", PACKAGES, Some(&root), Some(grant)).await.0, StatusCode::CREATED);
 
-    let record = dir.path().join("storage/.rule-overrides/npm/local.json");
-    let stored: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
-    assert_eq!(stored, json!({ "packages": { "@acme/app": { "access": ["root", "team:devs"] } } }));
+    let (_, listed) = send(&app, "GET", "/-/pnpr/v0/admin/grants", Some(&root), None).await;
+    let granted: Vec<&Value> = listed["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|grant| grant["include"] == json!(["@acme/lib"]))
+        .filter(|grant| grant["exclude"] == json!([]))
+        .filter(|grant| grant["subjects"].get("team:devs").is_some())
+        .collect();
+    assert_eq!(granted.len(), 1, "{listed}");
+    assert_eq!(granted[0]["registries"], json!(["local"]));
+    assert_eq!(
+        granted[0]["subjects"]["team:devs"],
+        json!(["annotate", "cache", "publish", "read"]),
+    );
 }
 
 #[tokio::test]
-async fn grants_need_an_admin_a_declared_package_and_a_known_team() {
+async fn the_listing_adds_up_grants_and_leaves_out_what_a_grant_excludes() {
     let dir = TempDir::new().unwrap();
-    let app = app_router(load_config(dir.path())).await;
+    let app = app_router(load_config(dir.path()).await).await;
+    let root = add_user(&app, "root").await;
+    let grants = [
+        ("readers", json!({ "include": ["@acme/app"], "subjects": { "team:devs": ["read"] } })),
+        ("writers", json!({ "include": ["@acme/app"], "subjects": { "team:devs": ["publish"] } })),
+        (
+            "nothing",
+            json!({
+                "include": ["@acme/lib", "@other/lib"],
+                "exclude": ["@acme/*", "@other/lib"],
+                "subjects": { "team:devs": ["read", "publish"] },
+            }),
+        ),
+    ];
+    for (name, mut grant) in grants {
+        grant["registries"] = json!(["local"]);
+        let path = format!("/-/pnpr/v0/admin/grants/{name}");
+        let (status, body) = send(&app, "PUT", &path, Some(&root), Some(grant)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(team_packages(&app, &root).await, json!({ "@acme/app": "read-write" }));
+
+    // A grant on a wider pattern counts for the patterns it covers.
+    let wide = json!({ "registries": ["local"], "subjects": { "team:devs": ["read"] } });
+    let path = "/-/pnpr/v0/admin/grants/everything";
+    assert_eq!(send(&app, "PUT", path, Some(&root), Some(wide)).await.0, StatusCode::OK);
+    let readers = "/-/pnpr/v0/admin/grants/readers";
+    assert_eq!(send(&app, "DELETE", readers, Some(&root), None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        team_packages(&app, &root).await,
+        json!({ "**": "read-only", "@acme/app": "read-write" }),
+    );
+}
+
+#[tokio::test]
+async fn grants_need_an_admin_and_a_known_team() {
+    let dir = TempDir::new().unwrap();
+    let app = app_router(load_config(dir.path()).await).await;
     let root = add_user(&app, "root").await;
     let carol = add_user(&app, "carol").await;
-    let grant = |package: &str| json!({ "package": package, "permissions": "read-write" });
-
-    let cases = [
-        (PACKAGES, &carol, grant("@acme/app"), StatusCode::FORBIDDEN),
-        (PACKAGES, &root, grant("@acme/other"), StatusCode::BAD_REQUEST),
-        (
-            PACKAGES,
-            &root,
-            json!({ "package": "@acme/app", "permissions": "admin" }),
-            StatusCode::BAD_REQUEST,
-        ),
-        ("/npm/-/team/acme/nobody/package", &root, grant("@acme/app"), StatusCode::NOT_FOUND),
-        ("/npm/-/team/fixed/devs/package", &root, grant("@fixed/app"), StatusCode::FORBIDDEN),
-    ];
-    for (path, token, body, expected) in cases {
-        let (status, _) = send(&app, "PUT", path, Some(token), Some(body.clone())).await;
-        assert_eq!(status, expected, "{path} {body}");
-    }
-    assert_eq!(app_rule(&app, &root).await["access"], json!(["root"]));
+    let grant = json!({ "package": "@acme/app", "permissions": "read-write" });
+    assert_eq!(
+        send(&app, "PUT", PACKAGES, Some(&carol), Some(grant.clone())).await.0,
+        StatusCode::FORBIDDEN,
+    );
+    assert_eq!(
+        send(&app, "PUT", "/npm/-/team/acme/absent/package", Some(&root), Some(grant))
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+    );
+    let malformed = json!({ "package": "@acme/**/x", "permissions": "read-only" });
+    assert_eq!(
+        send(&app, "PUT", PACKAGES, Some(&root), Some(malformed)).await.0,
+        StatusCode::BAD_REQUEST,
+    );
 }

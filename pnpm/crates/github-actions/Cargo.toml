@@ -16,24 +16,28 @@ pnpm-fs = { workspace = true }
 pnpm-git-utils = { workspace = true }
 pnpm-matcher = { workspace = true }
 pnpm-network = { workspace = true }
+pnpm-process = { path = "../process" }
 pnpm-reporter = { workspace = true }
-pnpm-resolving-git-resolver = { workspace = true }
+pnpm-resolving-git-resolver = { workspace = true, features = ["shell-emulator"] }
 
-chrono = { workspace = true }
+jiff = { workspace = true }
 futures-util = { workspace = true }
 miette = { workspace = true }
 node-semver = { workspace = true }
+serde-saphyr = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
-yaml_serde = { workspace = true }
 yamlpath = { workspace = true }
+
+[dev-dependencies]
+command-extra = { workspace = true }
+yaml_serde = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = ["net", "signal"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-pnpm-process = { path = "../process" }
 
 [lints]
 workspace = true

@@ -1,6 +1,4 @@
 ---
-"@pnpm/engine.pm.commands": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

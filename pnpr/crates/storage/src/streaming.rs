@@ -9,13 +9,36 @@
 //!   cache and returns the SHA-512 integrity it computed over the bytes.
 //! * [`stream_file`] yields an already verified file to the response.
 
-use crate::{BlobWrite, SealedBlob};
-use axum::body::{Body, Bytes};
-use futures_util::{Stream, StreamExt, stream};
+use crate::{
+    BlobWrite,
+    SealedBlob,
+};
+use axum::body::{
+    Body,
+    Bytes,
+};
+use futures_util::{
+    Stream,
+    StreamExt,
+    stream,
+};
 use pnpm_network::ThrottledResponse;
-use ssri::{Algorithm, Integrity, IntegrityChecker, IntegrityOpts};
-use std::{io, path::PathBuf, pin::Pin};
-use tokio::{fs::File, io::AsyncReadExt};
+use ssri::{
+    Algorithm,
+    Integrity,
+    IntegrityChecker,
+    IntegrityOpts,
+};
+use std::{
+    future::Future,
+    io,
+    path::PathBuf,
+    pin::Pin,
+};
+use tokio::{
+    fs::File,
+    io::AsyncReadExt,
+};
 
 /// Chunk size for reading from a cached file. 64 KiB keeps syscall
 /// overhead low without buffering a meaningful fraction of a
@@ -51,8 +74,8 @@ pub enum BlobStreamError {
 }
 
 /// Stream an upstream response to the client while teeing it into `write`
-/// and hashing it. The client receives bytes as they arrive — it does not
-/// wait for the whole download to land and verify first — and the cache entry
+/// and hashing it. The client receives bytes as they arrive (it does not
+/// wait for the whole download to land and verify first) and the cache entry
 /// is promoted only once the declared SRI matches the full body.
 ///
 /// Integrity failures terminate the body with a stream error and abandon the
@@ -68,21 +91,23 @@ pub fn stream_verified_to_cache(
     stream_verified_to_cache_with_hook(response, write, integrity, max_bytes, None)
 }
 
-/// Like [`stream_verified_to_cache`], invoking `on_cached` with the promoted
-/// cache path once the body has verified and landed in the cache.
-pub fn stream_verified_to_cache_and_then(
+/// Like [`stream_verified_to_cache`], delegating publication of the verified blob
+/// to `promote`. The callback must promote or abandon the sealed blob.
+pub fn stream_verified_with_promotion<
+    Completion: Future<Output = io::Result<()>> + Send + 'static,
+>(
     response: ThrottledResponse,
     write: BlobWrite,
     integrity: &Integrity,
     max_bytes: u64,
-    on_cached: impl FnOnce(PathBuf) + Send + 'static,
+    promote: impl FnOnce(SealedBlob) -> Completion + Send + 'static,
 ) -> Result<Body, BlobStreamError> {
     stream_verified_to_cache_with_hook(
         response,
         write,
         integrity,
         max_bytes,
-        Some(Box::new(on_cached)),
+        Some(Box::new(move |blob| Box::pin(promote(blob)))),
     )
 }
 
@@ -91,7 +116,7 @@ fn stream_verified_to_cache_with_hook(
     write: BlobWrite,
     integrity: &Integrity,
     max_bytes: u64,
-    on_cached: Option<Box<dyn FnOnce(PathBuf) + Send>>,
+    promote: Option<Promotion>,
 ) -> Result<Body, BlobStreamError> {
     // Reject an upstream that already declares an oversize body up front, so it
     // surfaces as an error response instead of a failure mid-stream.
@@ -105,7 +130,7 @@ fn stream_verified_to_cache_with_hook(
         url: redact_url(response.url()),
         upstream: Box::pin(response.bytes_stream()),
         write: Some(write),
-        on_cached,
+        promote,
         checker,
         written: 0,
         max_bytes,
@@ -170,7 +195,7 @@ async fn cache_chunk(write: Option<BlobWrite>, chunk: &[u8]) -> Option<BlobWrite
 async fn finish_tee(mut state: TeeState) -> Option<(io::Result<Bytes>, Option<TeeState>)> {
     match state.checker.result() {
         Ok(_) => {
-            finalize(state.write.take(), state.on_cached.take()).await;
+            finalize(state.write.take(), state.promote.take()).await;
             None
         }
         Err(err) => {
@@ -182,19 +207,18 @@ async fn finish_tee(mut state: TeeState) -> Option<(io::Result<Bytes>, Option<Te
 }
 
 /// Promote a fully-streamed, SRI-matched blob to the cache, logging (not
-/// failing — the client already has the bytes) if the rename can't complete.
-async fn finalize(write: Option<BlobWrite>, on_cached: Option<Box<dyn FnOnce(PathBuf) + Send>>) {
+/// failing, the client already has the bytes) if the rename can't complete.
+async fn finalize(write: Option<BlobWrite>, promote: Option<Promotion>) {
     let Some(write) = write else { return };
-    let final_path = write.final_path().to_path_buf();
-    match write.finalize().await {
-        Ok(()) => {
-            if let Some(on_cached) = on_cached {
-                on_cached(final_path);
-            }
-        }
-        Err(err) => {
-            tracing::warn!(?err, "promoting verified blob to cache failed");
-        }
+    let result = match promote {
+        Some(promote) => match write.seal().await {
+            Ok(blob) => promote(blob).await,
+            Err(err) => Err(err),
+        },
+        None => write.finalize().await,
+    };
+    if let Err(err) = result {
+        tracing::warn!(?err, "promoting verified blob to cache failed");
     }
 }
 
@@ -212,8 +236,12 @@ fn redact_url(url: &reqwest::Url) -> String {
     let _ = url.set_username("");
     let _ = url.set_password(None);
     url.set_query(None);
+    url.set_fragment(None);
     url.to_string()
 }
+
+type Promotion =
+    Box<dyn FnOnce(SealedBlob) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> + Send>;
 
 /// Carries the in-flight tee through [`stream::unfold`]: the upstream byte
 /// stream, the cache writer (dropped once caching is abandoned), the running
@@ -223,7 +251,7 @@ struct TeeState {
     url: String,
     upstream: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
     write: Option<BlobWrite>,
-    on_cached: Option<Box<dyn FnOnce(PathBuf) + Send>>,
+    promote: Option<Promotion>,
     checker: IntegrityChecker,
     written: u64,
     max_bytes: u64,
@@ -318,7 +346,7 @@ async fn download(
     max_bytes: u64,
     mut hash: impl FnMut(&[u8]),
 ) -> Result<u64, BlobStreamError> {
-    let url = response.url().to_string();
+    let url = redact_url(response.url());
     if let Some(received) = response.content_length()
         && received > max_bytes
     {

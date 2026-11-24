@@ -1,12 +1,31 @@
 //! npm `semver` range semantics, built on `node_semver`.
 
-pub use semver_range::{ANY_VERSION_RANGE, is_any_version_range, is_valid_semver_range};
+pub use semver_range::{
+    ANY_VERSION_RANGE,
+    is_any_version_range,
+    is_valid_semver_range,
+    parse_strict_semver_range,
+};
+pub use subset::{
+    ParsedSemverRange,
+    is_semver_subset,
+};
+pub use version_change::{
+    VersionChange,
+    classify_version_change,
+    split_at_changed_field,
+};
 
 use std::borrow::Cow;
 
-use node_semver::{Range, Version};
+use node_semver::{
+    Range,
+    Version,
+};
 
 mod semver_range;
+mod subset;
+mod version_change;
 
 /// A semver range evaluated the way npm's `semver` does with
 /// `includePrerelease: true`.
@@ -48,13 +67,13 @@ impl IncludePrereleaseRange {
     ///
     /// A prerelease is eligible wherever its own release would be, and
     /// clears a lower bound npm synthesized for an omitted component
-    /// exactly when that release clears it — the two halves of
+    /// exactly when that release clears it, the two halves of
     /// `includePrerelease` [`IncludePrereleaseRange`] describes.
     #[must_use]
     pub fn satisfies(&self, version: &Version) -> bool {
         // The eligibility rule `includePrerelease` drops only ever
         // excludes prereleases, so for a release `node_semver` already
-        // answers with the endpoint test — and answers it without the
+        // answers with the endpoint test, and answers it without the
         // single-version ranges the prerelease path has to build.
         if !version.is_prerelease() {
             return self.alternatives
@@ -122,7 +141,9 @@ fn comparators(alternative: &str) -> Option<Vec<Comparator>> {
             (text.into(), !names_a_prerelease(tokens[index]), 3)
         } else {
             let token = tokens[index];
-            let text = npm_upper_bound(token).map_or(Cow::Borrowed(token), Cow::Owned);
+            let text = npm_upper_bound(token)
+                .map(Cow::Owned)
+                .unwrap_or(Cow::Borrowed(token));
             (text, omits_a_component(token), 1)
         };
         if let Ok(bounds) = text.parse::<Range>() {
@@ -135,7 +156,7 @@ fn comparators(alternative: &str) -> Option<Vec<Comparator>> {
 
 /// Removes the whitespace an operator may carry before its version, so
 /// `>= 1.2` stays one comparator instead of splitting into two tokens.
-fn glue_operators_to_versions(alternative: &str) -> String {
+pub(crate) fn glue_operators_to_versions(alternative: &str) -> String {
     let mut glued = String::with_capacity(alternative.len());
     let mut chars = alternative.chars().peekable();
     while let Some(char) = chars.next() {
@@ -149,8 +170,8 @@ fn glue_operators_to_versions(alternative: &str) -> String {
     glued
 }
 
-/// Whether `token` names a version that leaves a component out — `18`,
-/// `18.x`, `^18.0` — the case in which npm lowers the comparator's lower
+/// Whether `token` names a version that leaves a component out (`18`,
+/// `18.x`, `^18.0`) the case in which npm lowers the comparator's lower
 /// bound. A hyphen range's lower endpoint is lowered whether or not it
 /// omits anything, so it is asked [`names_a_prerelease`] instead.
 fn omits_a_component(token: &str) -> bool {
@@ -175,25 +196,29 @@ fn omits_a_component(token: &str) -> bool {
 /// the eligibility rule is dropped, so `<` is rewritten before it sees
 /// it. Returns `None` for every other token, `<=` included: its X-Range
 /// expansion is one `node_semver` already agrees on.
-fn npm_upper_bound(token: &str) -> Option<String> {
+pub(crate) fn npm_upper_bound(token: &str) -> Option<String> {
     let version = token.strip_prefix('<')?;
     if version.starts_with('=') || version.contains(['-', '+']) {
         return None;
     }
-    let version = version.trim_start_matches('v');
-    let mut components = version.split('.');
+    let mut components = version.trim_start_matches('v').split('.');
     let major: u64 = components.next()?.parse().ok()?;
-    let minor: Option<u64> = components
-        .next()
-        .and_then(|minor| minor.parse().ok());
-    let patch_is_named = components
-        .next()
-        .is_some_and(|patch| patch.parse::<u64>().is_ok())
-        && minor.is_some();
-    match (minor, patch_is_named) {
-        (_, true) => None,
+    let minor = parse_optional_component(components.next())?;
+    let patch = parse_optional_component(components.next())?;
+    if components.next().is_some() {
+        return None;
+    }
+    match (minor, patch) {
+        (Some(_), Some(_)) => None,
         (None, _) => Some(format!("<{major}.0.0-0")),
-        (Some(minor), _) => Some(format!("<{major}.{minor}.0-0")),
+        (Some(minor), None) => Some(format!("<{major}.{minor}.0-0")),
+    }
+}
+
+fn parse_optional_component(part: Option<&str>) -> Option<Option<u64>> {
+    match part {
+        None | Some("x" | "X" | "*") => Some(None),
+        Some(digits) => digits.parse::<u64>().ok().map(Some),
     }
 }
 

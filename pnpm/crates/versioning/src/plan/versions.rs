@@ -1,6 +1,17 @@
+use pnpm_semver_include_prerelease::parse_strict_semver_range;
+
 use super::{
-    BTreeMap, BumpState, Identifier, IntentBumpType, Participant, PlannedRelease, Range,
-    ReleaseBumpType, ResolvedEpic, Version, VersioningError, VersioningSettings,
+    BTreeMap,
+    BumpState,
+    Identifier,
+    IntentBumpType,
+    Participant,
+    PlannedRelease,
+    ReleaseBumpType,
+    ResolvedEpic,
+    Version,
+    VersioningError,
+    VersioningSettings,
     parse_workspace_spec_alias,
 };
 
@@ -277,7 +288,7 @@ pub(super) fn apply_epic_band_versions(
 
 /// The band of member majors an epic permits, `[lead_major*100,
 /// lead_major*100+99]`, where `lead_major` is the major the plan establishes
-/// for the lead — its re-based major when the lead crosses to a new stable
+/// for the lead; its re-based major when the lead crosses to a new stable
 /// major, otherwise the lead's current major (a prerelease lead does not open
 /// the next band).
 pub(super) struct EpicBand {
@@ -310,7 +321,7 @@ pub(super) fn epic_band(
 
 /// Enforces that every released member's new major stays inside its epic's
 /// band. The re-base already keeps members in band when the lead moves; this
-/// guards the other direction — an ordinary `major` intent that would carry a
+/// guards the other direction, an ordinary `major` intent that would carry a
 /// member over the band ceiling (`1199.x` -> `1200.0.0` while the lead is
 /// still on 11) is rejected rather than silently landing in the next band.
 pub(super) fn enforce_epic_bands(
@@ -346,11 +357,7 @@ pub(super) fn enforce_epic_bands(
 /// new version falls outside this range.
 #[must_use]
 pub fn materialize_workspace_range(spec: &str, dep_current_version: &str) -> Option<String> {
-    let rest = spec.strip_prefix("workspace:")?;
-    let range = match parse_workspace_spec_alias(rest) {
-        Some(alias) => &rest[alias.len() + 1..],
-        None => rest,
-    };
+    let (_, range) = split_workspace_spec(spec)?;
     Some(match range {
         "^" => format!("^{dep_current_version}"),
         "~" => format!("~{dep_current_version}"),
@@ -359,8 +366,39 @@ pub fn materialize_workspace_range(spec: &str, dep_current_version: &str) -> Opt
     })
 }
 
+fn split_workspace_spec(spec: &str) -> Option<(Option<&str>, &str)> {
+    let rest = spec.strip_prefix("workspace:")?;
+    let alias = parse_workspace_spec_alias(rest);
+    Some((alias, alias.map_or(rest, |name| &rest[name.len() + 1..])))
+}
+
+pub(crate) fn updated_workspace_spec(
+    alias: &str,
+    spec: &str,
+    updates: &std::collections::HashMap<&str, &str>,
+) -> Option<String> {
+    let (target, range) = split_workspace_spec(spec)?;
+    let next = updates.get(target.unwrap_or(alias))?;
+    if matches!(range, "" | "*" | "^" | "~") {
+        return None;
+    }
+    let parsed = parse_strict_semver_range(range)?;
+    if Version::parse(next).ok()?.satisfies(&parsed) {
+        return None;
+    }
+    let version = range
+        .strip_prefix(['^', '~'])
+        .unwrap_or(range);
+    if Version::parse(version.trim()).is_ok() {
+        Some(format!("{}{next}", spec.strip_suffix(version)?))
+    } else {
+        Some(format!("{spec} || {next}"))
+    }
+}
+
 pub(super) fn range_accepts(range: &str, version: &str) -> bool {
-    let (Ok(range), Ok(version)) = (Range::parse(range), Version::parse(version)) else {
+    let (Some(range), Ok(version)) = (parse_strict_semver_range(range), Version::parse(version))
+    else {
         return false;
     };
     version.satisfies(&range)

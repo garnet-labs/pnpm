@@ -5,13 +5,28 @@
 //! shared package walked its children.
 
 use crate::{
-    NodeId, ResolveDependencyTreeError, SkippedOptionalDependency, SkippedOptionalDependencyParent,
+    NodeId,
+    ResolveDependencyTreeError,
+    SkippedOptionalDependency,
+    SkippedOptionalDependencyParent,
     SkippedOptionalLogFn,
     resolve_peers::ImporterPeerInput,
-    resolved_tree::{ChildEdge, ResolvedPackage, ResolvedTree, TreeChildren},
+    resolved_tree::{
+        ChildEdge,
+        ResolvedPackage,
+        ResolvedTree,
+        TreeChildren,
+    },
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::Arc,
+};
 
 /// Each importer's `optionalDependencies`, alias to specifier.
 pub(super) type OptionalDirect = HashMap<String, String>;
@@ -49,9 +64,9 @@ pub(super) fn drop_broken_optional_dependencies(
                 return true;
             }
             report.skip_direct(
-                &dep.alias,
+                dep.alias.clone(),
                 &optional_names[&dep.alias],
-                &root_dir,
+                root_dir.clone(),
                 details(&dep.id),
             );
             false
@@ -130,14 +145,14 @@ pub(super) fn forget_left_out(
 }
 
 impl SkipReport<'_> {
-    fn skip_direct(&self, alias: &str, specifier: &str, prefix: &str, details: String) {
+    fn skip_direct(&self, alias: String, specifier: &str, prefix: String, details: String) {
         self.skip(SkippedOptionalDependency {
             details,
-            name: Some(alias.to_string()),
+            name: Some(alias),
             version: Some(specifier.to_string()),
             bare_specifier: specifier.to_string(),
             parents: Vec::new(),
-            prefix: prefix.to_string(),
+            prefix,
         });
     }
 
@@ -268,10 +283,12 @@ fn skipped_parent(id: &Arc<str>, pkg: Option<&ResolvedPackage>) -> SkippedOption
     SkippedOptionalDependencyParent {
         id: id.to_string(),
         name: pkg
-            .map(|pkg| pkg.name().to_string())
+            .map(ResolvedPackage::name)
+            .map(std::string::ToString::to_string)
             .unwrap_or_default(),
         version: pkg
-            .map(|pkg| pkg.version().to_string())
+            .map(ResolvedPackage::version)
+            .map(std::string::ToString::to_string)
             .unwrap_or_default(),
     }
 }

@@ -1,4 +1,8 @@
-use super::{Config, assert_eq, tempdir};
+use super::{
+    Config,
+    assert_eq,
+    tempdir,
+};
 
 #[test]
 fn patched_dependency_hashes_resolves_and_hashes_each_patch() {
@@ -9,7 +13,8 @@ fn patched_dependency_hashes_resolves_and_hashes_each_patch() {
         .join("graceful-fs@4.2.11.patch");
     std::fs::create_dir_all(patch_path.parent().unwrap()).expect("create patches dir");
     std::fs::write(&patch_path, "--- a/index.js\n+++ b/index.js\n").expect("write patch");
-    let expected = pnpm_patching::create_hex_hash_from_file(&patch_path).expect("hash patch file");
+    let expected =
+        pnpm_patching_config::create_hex_hash_from_file(&patch_path).expect("hash patch file");
 
     let mut config = Config::new();
     assert!(

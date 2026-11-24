@@ -1,13 +1,33 @@
-use crate::{CustomFetcherSession, SkippedSnapshots, VirtualStoreLayout};
+use crate::{
+    CustomFetcherSession,
+    SkippedSnapshots,
+    VirtualStoreLayout,
+};
 use pnpm_cmd_shim::LinkBinsOptions;
-use pnpm_config::{Config, NodeLinker, PackageImportMethod};
-use pnpm_lockfile::{PackageKey, PkgName, SnapshotEntry};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+    PackageImportMethod,
+};
+use pnpm_lockfile::{
+    PackageKey,
+    PkgName,
+    SnapshotEntry,
+};
 use pnpm_network::ThrottledClient;
-use pnpm_store_dir::{SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreIndexWriter};
-use pnpm_tarball::{MemCache, PrefetchedCasPaths, SharedReportedProgressKeys};
-use std::{
-    path::Path,
-    sync::{Arc, atomic::AtomicU8},
+use pnpm_store_dir::{
+    SharedReadonlyStoreIndex,
+    SharedVerifiedFilesCache,
+    StoreIndexWriter,
+};
+use pnpm_tarball::{
+    MemCache,
+    PrefetchedCasPaths,
+    SharedReportedProgressKeys,
+};
+use std::sync::{
+    Arc,
+    atomic::AtomicU8,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -66,11 +86,11 @@ impl<'a> PackageImportOptions<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct SlotImportSource<'a> {
+pub struct SlotImportSource {
     /// Whether this package's file map points at mutable local source
     /// (a `file:` / [`pnpm_lockfile::LockfileResolution::Directory`]
     /// resolution) rather than immutable CAS entries. pnpm's `file:` is
-    /// a copy taken at install time — unlike `link:`, which symlinks —
+    /// a copy taken at install time, unlike `link:`, which symlinks,
     /// so each install must refresh or verify the slot's files: the source
     /// can change without the lockfile changing, and the completion-marker
     /// short-circuit in [`fn@crate::import_indexed_dir`] would otherwise
@@ -78,7 +98,7 @@ pub struct SlotImportSource<'a> {
     pub is_mutable: bool,
     /// Whether the mutable source above was there to read from. `false`
     /// for an injected workspace dependency whose `publishConfig.directory`
-    /// its own `prepare` script has not (re)built yet — the directory
+    /// its own `prepare` script has not (re)built yet, the directory
     /// fetch tolerates that and comes back with an empty file map. Forcing
     /// a reimport from that empty map, the way `is_mutable` normally does,
     /// would overwrite an already-materialized slot with nothing; this
@@ -90,9 +110,10 @@ pub struct SlotImportSource<'a> {
     /// Whether an existing slot contains a different immutable artifact
     /// under the same package key and must be replaced.
     pub force: bool,
-    /// Empty source file imported as `.pnpm-needs-build` before the package's
-    /// atomic completion marker when the package needs a build or patch.
-    pub build_marker: Option<&'a Path>,
+    /// Whether the build phase places this package into its global virtual
+    /// store slot. The link phase then creates only the slot's dependency
+    /// links.
+    pub awaits_build: bool,
     /// Whether a lifecycle script or a patch will still write this slot's
     /// files after the import. Such a slot must not share inodes with its
     /// source, so it imports with `clone-or-copy` unless
@@ -105,7 +126,7 @@ pub struct SlotImportSource<'a> {
 pub struct SnapshotDependencyLinks<'a> {
     pub package_key: &'a PackageKey,
     pub snapshot: &'a SnapshotEntry,
-    /// Snapshots whose slots were not materialized on this host —
+    /// Snapshots whose slots were not materialized on this host,
     /// platform-mismatched optionals, `--no-optional` exclusions, and
     /// swallowed optional fetch failures. `create_symlink_layout`
     /// uses this to skip dangling symlinks to absent slots: an
@@ -174,7 +195,7 @@ pub struct SnapshotFetchContext<'a> {
 #[derive(Clone, Copy)]
 pub struct RegistryFetchContext<'a> {
     pub http_client: &'a ThrottledClient,
-    pub config: &'static Config,
+    pub config: &'a Config,
     pub store_index: Option<&'a SharedReadonlyStoreIndex>,
     pub store_index_writer: Option<&'a Arc<StoreIndexWriter>>,
     /// Install-scoped `verifiedFilesCache` shared across every
@@ -182,7 +203,7 @@ pub struct RegistryFetchContext<'a> {
     /// for the rationale.
     pub verified_files_cache: &'a SharedVerifiedFilesCache,
     /// Warm-cache prefetch result built once per install via
-    /// [`pnpm_tarball::prefetch_cas_paths`] — `cache_key →
+    /// [`pnpm_tarball::prefetch_cas_paths`], `cache_key →
     /// Arc<cas_paths>`. When `Some`, the
     /// `IngestTarballToStore::run_without_mem_cache` cache-lookup
     /// branch reads from here before falling back to the per-snapshot

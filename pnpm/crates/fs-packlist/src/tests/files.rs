@@ -1,4 +1,10 @@
-use super::{fs, json, packlist, tempdir, touch};
+use super::{
+    fs,
+    json,
+    packlist,
+    tempdir,
+    touch,
+};
 
 #[test]
 fn includes_everything_when_files_field_absent() {
@@ -221,6 +227,24 @@ fn gitignore_excludes_when_no_npmignore() {
 }
 
 #[test]
+fn ignore_files_with_a_utf8_bom_keep_their_first_rule() {
+    for ignore_file in [".npmignore", ".gitignore"] {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "package.json");
+        touch(root, "index.js");
+        touch(root, "secret.txt");
+        fs::write(root.join(ignore_file), "\u{feff}secret.txt\n").unwrap();
+
+        let manifest = json!({ "name": "x", "version": "0.0.0" });
+        let mut out = packlist(root, &manifest).unwrap();
+        out.sort();
+
+        assert_eq!(out, ["index.js", "package.json"], "{ignore_file} starting with a BOM");
+    }
+}
+
+#[test]
 fn ignore_files_are_not_packed() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -421,7 +445,7 @@ fn npmignore_in_parent_dir_does_not_leak_in() {
     // Regression: `ignore::WalkBuilder::parents` defaults to `true`,
     // which would let a `.gitignore` above `pkg_dir` exclude files
     // inside it. The packlist must depend only on the package
-    // directory's own contents — we set `parents(false)` precisely
+    // directory's own contents; we set `parents(false)` precisely
     // to prevent this.
     let dir = tempdir().unwrap();
     fs::write(dir.path().join(".gitignore"), "index.js\n").unwrap();
@@ -444,13 +468,13 @@ fn always_excluded_dir_segments_only_match_vcs() {
     let dir = tempdir().unwrap();
     let root = dir.path();
     touch(root, "package.json");
-    // A dir literally named `CVS` — VCS state, must be excluded at
+    // A dir literally named `CVS`, VCS state, must be excluded at
     // any depth.
     touch(root, "lib/CVS/Root");
     // A file whose *basename contains* `CVS` but isn't itself a VCS
-    // segment — must NOT be excluded.
+    // segment, must NOT be excluded.
     touch(root, "lib/cvs-tools.txt");
-    // A `.git`-nested file — must be excluded by the VCS segment.
+    // A `.git`-nested file, must be excluded by the VCS segment.
     touch(root, "scripts/.git/HEAD");
 
     let manifest = json!({ "name": "x", "version": "0.0.0" });

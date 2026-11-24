@@ -4,9 +4,19 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_cargo_resolver::CRATES_IO_SOURCE;
-use pnpm_testing_utils::{diagnostics::assert_diagnostic_contains, git_repo::GitRepoFixture};
-use sha2::{Digest, Sha256};
-use std::{fs, path::Path, process::Command};
+use pnpm_testing_utils::{
+    diagnostics::assert_diagnostic_contains,
+    git_repo::GitRepoFixture,
+};
+use sha2::{
+    Digest,
+    Sha256,
+};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
 /// A `.crate` archive holding the one source file a dependent needs, laid
@@ -348,6 +358,137 @@ fn offline_install_without_registry_crates_never_reads_the_registry_config() {
 }
 
 #[test]
+fn install_accepts_unversioned_path_dependency_on_prerelease_workspace_member() {
+    let root = TempDir::new().expect("create Cargo workspace");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "cargo:\n  enabled: true\n")
+        .expect("enable Cargo");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    )
+    .expect("write workspace Cargo.toml");
+    let shared = root.path().join("crates/shared");
+    fs::create_dir_all(shared.join("src")).expect("create shared src");
+    fs::write(shared.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n")
+        .expect("write shared lib.rs");
+    fs::write(
+        shared.join("Cargo.toml"),
+        "[package]\nname = \"shared\"\nversion = \"0.1.0-alpha.1\"\nedition = \"2021\"\n",
+    )
+    .expect("write shared Cargo.toml");
+
+    let app = root.path().join("crates/app");
+    fs::create_dir_all(app.join("src")).expect("create app src");
+    fs::write(app.join("src/main.rs"), "fn main() { let _ = shared::answer(); }\n")
+        .expect("write app main.rs");
+    fs::write(
+        app.join("Cargo.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"app\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n\n",
+            "[dependencies]\n",
+            "shared = { path = \"../shared\" }\n",
+        ),
+    )
+    .expect("write app Cargo.toml");
+
+    install_in(&root, &["install", "--offline"]);
+    install_in(&root, &["install", "--frozen-lockfile", "--offline"]);
+
+    let lockfile = fs::read_to_string(root.path().join("Cargo.lock")).expect("read Cargo.lock");
+    assert!(lockfile.contains(r#"version = "0.1.0-alpha.1""#), "{lockfile}");
+    Command::new("cargo")
+        .with_current_dir(root.path())
+        .with_args(["check", "--locked", "--offline"])
+        .assert()
+        .success();
+}
+
+/// Write a library crate named `name` at `dir`, with `manifest_tail` after
+/// its `[package]`.
+fn write_library(dir: &Path, name: &str, manifest_tail: &str) {
+    fs::create_dir_all(dir.join("src")).expect("create library source directory");
+    fs::write(dir.join("src/lib.rs"), "").expect("write library source");
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{manifest_tail}",
+        ),
+    )
+    .expect("write library Cargo.toml");
+}
+
+#[test]
+fn install_locks_a_path_dependency_outside_the_workspace() {
+    let outside = TempDir::new().expect("create a directory outside the workspace");
+    let path_of = |name: &str| {
+        outside
+            .path()
+            .join(name)
+            .display()
+            .to_string()
+    };
+    write_library(&outside.path().join("opt"), "opt", "");
+    write_library(&outside.path().join("devonly"), "devonly", "");
+    write_library(
+        &outside.path().join("libfoo"),
+        "libfoo",
+        &format!(
+            "[dependencies]\nopt = {{ path = '{}', optional = true }}\n\n[dev-dependencies]\ndevonly = {{ path = '{}' }}\n\n[features]\nx = [\"dep:opt\"]\n",
+            path_of("opt"),
+            path_of("devonly"),
+        ),
+    );
+    let root = TempDir::new().expect("create Cargo workspace");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "cargo:\n  enabled: true\n")
+        .expect("enable Cargo");
+    write_library(
+        root.path(),
+        "app",
+        &format!(
+            "[dependencies]\nlibfoo = {{ path = '{}', features = [\"x\"] }}\n",
+            path_of("libfoo"),
+        ),
+    );
+
+    install_in(&root, &["install", "--offline"]);
+    install_in(&root, &["install", "--frozen-lockfile", "--offline"]);
+
+    let lockfile = fs::read_to_string(root.path().join("Cargo.lock")).expect("read Cargo.lock");
+    assert!(lockfile.contains(r#"name = "libfoo""#), "{lockfile}");
+    assert!(lockfile.contains(r#"name = "opt""#), "{lockfile}");
+    assert!(!lockfile.contains("devonly"), "{lockfile}");
+    Command::new("cargo")
+        .with_current_dir(root.path())
+        .with_args(["check", "--locked", "--offline"])
+        .assert()
+        .success();
+
+    let libfoo_manifest = outside.path().join("libfoo/Cargo.toml");
+    fs::write(
+        &libfoo_manifest,
+        fs::read_to_string(&libfoo_manifest)
+            .expect("read libfoo Cargo.toml")
+            .replace(r#"version = "0.1.0""#, r#"version = "0.2.0""#),
+    )
+    .expect("write libfoo Cargo.toml");
+    let cargo_home = TempDir::new().expect("create isolated Cargo home");
+    let output =
+        install_command(&root, &cargo_home, &["install", "--frozen-lockfile", "--offline"])
+            .output()
+            .expect("run pnpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_diagnostic_contains(
+        &stderr,
+        "app depends on libfoo =0.2.0, but Cargo.lock locks libfoo 0.1.0",
+    );
+}
+
+#[test]
 fn frozen_install_rejects_a_lockfile_that_does_not_satisfy_the_manifest() {
     let mut registry = mockito::Server::new();
     let archive = crate_archive("demo", "1.0.0");
@@ -573,8 +714,8 @@ fn reuses_workspace_metadata_with_aliased_paths_and_nested_workspaces() {
     }
     for project in [&root, &root.join("a/nested")] {
         Command::new("cargo")
-            .args(["generate-lockfile", "--offline"])
-            .current_dir(project)
+            .with_args(["generate-lockfile", "--offline"])
+            .with_current_dir(project)
             .assert()
             .success();
     }
@@ -600,14 +741,14 @@ fn reuses_workspace_metadata_with_aliased_paths_and_nested_workspaces() {
         fs::write(&log, "").unwrap();
         Command::cargo_bin("pnpm")
             .unwrap()
-            .current_dir(&root)
-            .args(["install", "--frozen-lockfile"])
-            .env("PATH", &path)
-            .env("REAL_CARGO", &cargo)
-            .env("CARGO_CALL_LOG", &log)
-            .env("NPM_CONFIG_WORKSPACE_DIR", &alias)
-            .env("PNPM_CONFIG_CACHE_DIR", repository.path().join("cache"))
-            .env("PNPM_CONFIG_STORE_DIR", repository.path().join("store"))
+            .with_current_dir(&root)
+            .with_args(["install", "--frozen-lockfile"])
+            .with_env("PATH", &path)
+            .with_env("REAL_CARGO", &cargo)
+            .with_env("CARGO_CALL_LOG", &log)
+            .with_env("NPM_CONFIG_WORKSPACE_DIR", &alias)
+            .with_env("PNPM_CONFIG_CACHE_DIR", repository.path().join("cache"))
+            .with_env("PNPM_CONFIG_STORE_DIR", repository.path().join("store"))
             .assert()
             .success();
         assert_eq!(fs::read_to_string(&log).unwrap(), "metadata\nmetadata\n", "{alias:?}");
@@ -675,3 +816,55 @@ fn install_does_not_parse_or_modify_excluded_cargo_workspaces() {
 }
 
 mod lockfile_features;
+
+#[test]
+fn remove_aliased_crates_by_name_and_package_url() {
+    for selector in ["crate:example-crate", "pkg:cargo/example-crate"] {
+        let root = cargo_workspace(
+            "https://registry.example.test/index/",
+            r#"local = { package = "example-crate", version = "1" }"#,
+            "",
+        );
+        install_in(&root, &["remove", "--lockfile-only", selector]);
+        let manifest = std::fs::read_to_string(root.path().join("Cargo.toml")).unwrap();
+        assert!(!manifest.contains("local"), "{manifest}");
+        let lock = std::fs::read_to_string(root.path().join("Cargo.lock")).unwrap();
+        assert!(!lock.contains("example-crate"), "{lock}");
+        assert!(
+            !root
+                .path()
+                .join("package.json")
+                .exists(),
+        );
+    }
+}
+
+#[test]
+fn remove_crate_prunes_existing_lock_and_preserves_other_locked_packages() {
+    let root = cargo_workspace(
+        "https://registry.example.test/index/",
+        "obsolete = { path = 'obsolete' }\nkept = { path = 'kept' }\n[workspace]\nmembers=['kept']",
+        "",
+    );
+    for name in ["obsolete", "kept"] {
+        let dir = root.path().join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname='{name}'\nversion='1.2.3'\nedition='2021'\n"),
+        )
+        .unwrap();
+    }
+    Command::new("cargo")
+        .with_current_dir(root.path())
+        .with_args(["generate-lockfile", "--offline"])
+        .assert()
+        .success();
+    let lock_path = root.path().join("Cargo.lock");
+    assert!(std::fs::read_to_string(&lock_path).unwrap().contains(r#"name = "obsolete""#));
+    install_in(&root, &["remove", "--lockfile-only", "crate:obsolete"]);
+    let lock = std::fs::read_to_string(lock_path).unwrap();
+    assert!(!lock.contains("obsolete"), "{lock}");
+    assert!(lock.contains("name = \"kept\"\nversion = \"1.2.3\""), "{lock}");
+}

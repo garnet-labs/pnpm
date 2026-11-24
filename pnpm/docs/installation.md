@@ -15,14 +15,15 @@ pnpm 12 ships a prebuilt binary for each of these targets:
 
 | Operating system | Architectures |
 | --- | --- |
-| Linux (glibc) | x64, arm64, riscv64, ppc64le, s390x |
+| Linux (glibc) | x64, arm64, riscv64, ppc64le, s390x, loong64 |
 | Linux (musl) | x64, arm64 |
 | macOS | arm64, x64 |
 | Windows | x64, arm64 |
 | FreeBSD | x64 |
+| NetBSD | x64 |
 | Android | arm64, x64 |
 
-FreeBSD, ppc64le, s390x, RISC-V, and Android were added in v12.4.0. On a target with no binary, install the JavaScript [pnpm 11](https://www.npmjs.com/package/pnpm/v/11) instead.
+FreeBSD, ppc64le, s390x, RISC-V, and Android were added in v12.4.0. The NetBSD binary is built and tested on NetBSD 10. On a target with no binary, install the JavaScript [pnpm 11](https://www.npmjs.com/package/pnpm/v/11) instead.
 
 For StackBlitz WebContainers, see the experimental [WebAssembly distribution](./webcontainers.md).
 
@@ -81,6 +82,12 @@ You may use the [pnpm runtime] command then to install Node.js.
 
 :::
 
+On Linux (kernel 5.9 or newer) with a LUKS2-encrypted NVMe SSD, `dm-crypt` queues reads and writes through kernel workqueues by default, which can slow down package installation. Find your `crypt` volume name with `lsblk -o NAME,TYPE,MOUNTPOINTS`, then bypass the workqueues and persist the setting in the LUKS2 header:
+
+```sh
+sudo cryptsetup refresh --perf-no_read_workqueue --perf-no_write_workqueue --persistent <crypt-volume-name>
+```
+
 ### In a Docker container
 
 ```sh
@@ -100,6 +107,18 @@ Before running the install script, you may optionally set an env variable `PNPM_
 curl -fsSL https://get.pnpm.io/install.sh | env PNPM_VERSION=<version> sh -
 ```
 
+### Installing without changing PATH
+
+By default, the install scripts add pnpm to `PATH` through your shell configuration file, or on Windows, your user environment variables. To leave those unchanged, set `PNPM_NO_MODIFY_PATH=1`. pnpm is still installed in `PNPM_HOME`, and the installer prints the `PNPM_HOME` and `PATH` lines for you to add. This needs pnpm 12.16.0 or newer.
+
+```sh
+curl -fsSL https://get.pnpm.io/install.sh | env PNPM_NO_MODIFY_PATH=1 sh -
+```
+
+```powershell
+$env:PNPM_NO_MODIFY_PATH='1'; Invoke-WebRequest https://get.pnpm.io/install.ps1 -UseBasicParsing | Invoke-Expression
+```
+
 ## Using npm
 
 ```sh
@@ -107,6 +126,8 @@ npx get-pnpm
 ```
 
 Node.js 22.13 or newer is needed to run this installer, but not to run pnpm afterwards.
+
+To install without changing `PATH`, run `npx get-pnpm --no-modify-path`. See [Installing without changing PATH](#installing-without-changing-path).
 
 You can also install the `pnpm` package globally with npm, which needs Node.js 18 or newer:
 

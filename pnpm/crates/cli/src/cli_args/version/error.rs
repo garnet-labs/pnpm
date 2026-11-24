@@ -1,4 +1,7 @@
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 
 /// Errors of `pnpm version`. Those of the forms the TypeScript CLI also has
@@ -26,6 +29,10 @@ pub(super) enum VersionError {
     #[display("Invalid version in {dir}: {version}")]
     #[diagnostic(code(ERR_PNPM_INVALID_VERSION))]
     InvalidVersion { dir: String, version: String },
+
+    #[display("Failed to bump version from {current} using {bump}")]
+    #[diagnostic(code(ERR_PNPM_VERSION_BUMP_FAILED))]
+    BumpFailed { current: String, bump: String },
 
     #[display("Version was not changed: {version}")]
     #[diagnostic(code(ERR_PNPM_VERSION_NOT_CHANGED))]

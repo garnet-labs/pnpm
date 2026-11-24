@@ -1,10 +1,21 @@
-use crate::_utils::{with_colors, without_colors};
+use crate::_utils::{
+    with_colors,
+    without_colors,
+};
 use assert_cmd::cargo::CommandCargoExt;
 use command_extra::CommandExtra;
 use console::strip_ansi_codes;
 use pnpm_testing_utils::bin::CommandTempCwd;
-use serde_json::{Value, json};
-use std::{collections::BTreeSet, fs, path::Path, process::Command};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    process::Command,
+};
 
 fn write_workspace(workspace: &Path, manifests: &[(&str, Value)]) {
     fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
@@ -52,6 +63,149 @@ fn recursive_project_names(pacquet: Command, extra_args: &[&str]) -> BTreeSet<St
                 .to_string()
         })
         .collect()
+}
+
+#[test]
+fn recursive_list_sorts_projects_by_workspace_dependencies() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(
+        &workspace,
+        &[
+            (
+                "a",
+                json!({ "name": "a", "version": "1.0.0", "dependencies": { "b": "workspace:*" } }),
+            ),
+            (
+                "b",
+                json!({ "name": "b", "version": "1.0.0", "dependencies": { "c": "workspace:*" } }),
+            ),
+            ("c", json!({ "name": "c", "version": "1.0.0" })),
+        ],
+    );
+
+    for shared_lockfile in [true, false] {
+        if !shared_lockfile {
+            fs::write(
+                workspace.join("pnpm-workspace.yaml"),
+                "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n",
+            )
+            .expect("write dedicated-lockfile workspace settings");
+        }
+
+        for (flags, expected) in [
+            (vec![], vec!["c", "b", "a"]),
+            (vec!["--prod", "--only-projects"], vec!["c", "b", "a"]),
+            (vec!["--no-sort"], vec!["a", "b", "c"]),
+            (vec!["--no-sort", "--reverse"], vec!["c", "b", "a"]),
+            (vec!["--reverse"], vec!["a", "b", "c"]),
+        ] {
+            let mut args =
+                vec!["--filter", "./packages/*", "-r", "list", "--depth", "-1", "--json"];
+            args.extend(flags);
+            let output = run_ok(&workspace, &args);
+            let projects: Vec<Value> = serde_json::from_str(&output).expect("parse list JSON");
+            let names: Vec<&str> = projects
+                .iter()
+                .map(|project| project["name"].as_str().expect("project name"))
+                .collect();
+            assert_eq!(names, expected, "shared lockfile: {shared_lockfile}, args: {args:?}");
+
+            let text_args: Vec<&str> = args
+                .iter()
+                .copied()
+                .filter(|arg| *arg != "--json")
+                .collect();
+            let text_output = run_ok(&workspace, &text_args);
+            let positions: Vec<usize> = expected
+                .iter()
+                .map(|name| {
+                    text_output
+                        .find(&format!("{name}@1.0.0"))
+                        .expect("project in text output")
+                })
+                .collect();
+            assert!(
+                positions
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+                "shared lockfile: {shared_lockfile}, args: {text_args:?}, output: {text_output}",
+            );
+        }
+
+        let project_b_manifest = workspace.join("packages/b/package.json");
+        fs::write(
+            &project_b_manifest,
+            json!({ "name": "b", "version": "1.0.0", "devDependencies": { "c": "workspace:*" } })
+                .to_string(),
+        )
+        .expect("write dev-only workspace edge");
+        let output = run_ok(
+            &workspace,
+            &["--filter-prod", "a", "--filter-prod", "c", "-r", "list", "--depth", "-1", "--json"],
+        );
+        let projects: Vec<Value> = serde_json::from_str(&output).expect("parse list JSON");
+        let names: Vec<&str> = projects
+            .iter()
+            .map(|project| project["name"].as_str().expect("project name"))
+            .collect();
+        assert_eq!(names, ["a", "c"], "shared lockfile: {shared_lockfile}");
+        fs::write(
+            &project_b_manifest,
+            json!({ "name": "b", "version": "1.0.0", "dependencies": { "c": "workspace:*" } })
+                .to_string(),
+        )
+        .expect("restore project manifest");
+    }
+
+    drop(root);
+}
+
+#[test]
+fn list_json_reads_unsaved_dependencies_from_each_project() {
+    for modules_dir in ["node_modules", "vendor/modules"] {
+        let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+        write_workspace(&workspace, &[("app", json!({ "name": "app", "version": "1.0.0" }))]);
+        let app = workspace.join("packages/app");
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            format!("packages:\n  - packages/*\nmodulesDir: {modules_dir}\n"),
+        )
+        .expect("write workspace settings");
+        fs::write(
+            workspace.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  packages/app: {}\n",
+        )
+        .expect("write workspace lockfile");
+        for (project, name) in [(&workspace, "root-extra"), (&app, "app-extra")] {
+            let package = project.join(modules_dir).join(name);
+            fs::create_dir_all(&package).expect("create unsaved package directory");
+            fs::write(
+                package.join("package.json"),
+                json!({ "name": name, "version": "1.0.0" }).to_string(),
+            )
+            .expect("write unsaved package manifest");
+        }
+
+        for (cwd, args, expected_count) in [
+            (workspace.as_path(), ["list", "--json", "--recursive"].as_slice(), 2),
+            (app.as_path(), ["list", "--json"].as_slice(), 1),
+        ] {
+            let output = run_ok(cwd, args);
+            let projects: Vec<Value> = serde_json::from_str(&output).expect("parse list JSON");
+            assert_eq!(projects.len(), expected_count, "{output}");
+            for project in projects {
+                let name = project["name"].as_str().expect("project name");
+                let dependencies =
+                    project["unsavedDependencies"].as_object().expect("unsaved dependencies");
+                assert_eq!(
+                    dependencies.keys().collect::<Vec<_>>(),
+                    [&format!("{name}-extra")],
+                    "{output}",
+                );
+            }
+        }
+        drop(root);
+    }
 }
 
 /// Scaffold a project whose lockfile records exactly one dependency
@@ -190,8 +344,11 @@ fn list_only_projects_omits_unsaved_dependencies() {
 
 // --- ports of the TypeScript listing command tests ---------------------------
 //
-// Sources: pnpm11/deps/inspection/commands/test/listing/{index.ts,json.ts,
-// recursive.ts} and pnpm11/pnpm/test/list.ts.
+// Sources:
+// - <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/inspection/commands/test/listing/index.ts>
+// - <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/inspection/commands/test/listing/json.ts>
+// - <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/deps/inspection/commands/test/listing/recursive.ts>
+// - <https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/pnpm/test/list.ts>
 
 const DEP: &str = "@pnpm.e2e/dep-of-pkg-with-1-dep";
 const HELLO: &str = "@pnpm.e2e/hello-world-js-bin";
@@ -207,9 +364,9 @@ fn setup_registry()
 }
 
 fn pacquet_in(dir: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> Command {
-    let mut command = Command::cargo_bin("pnpm").expect("find the pnpm binary");
-    command.current_dir(dir);
-    command.args(args);
+    let mut command =
+        Command::cargo_bin("pnpm").expect("find the pnpm binary").with_current_dir(dir);
+    command = command.with_args(args);
     command
 }
 
@@ -254,7 +411,7 @@ fn listing_packages_prints_tree_with_legend_and_summary() {
     assert_eq!(
         prod_only,
         format!(
-            "{LEGEND}\n\nproject@0.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{2514}\u{2500}\u{2500} {PKG}@100.0.0\n\n1 package\n"
+            "{LEGEND}\n\nproject@0.0.0 {dir}\n│\n│   dependencies:\n└── {PKG}@100.0.0\n\n1 package\n"
         ),
     );
 
@@ -262,7 +419,7 @@ fn listing_packages_prints_tree_with_legend_and_summary() {
     assert_eq!(
         dev_only,
         format!(
-            "{LEGEND}\n\nproject@0.0.0 {dir}\n\u{2502}\n\u{2502}   devDependencies:\n\u{2514}\u{2500}\u{2500} {HELLO}@1.0.0\n\n1 package\n"
+            "{LEGEND}\n\nproject@0.0.0 {dir}\n│\n│   devDependencies:\n└── {HELLO}@1.0.0\n\n1 package\n"
         ),
     );
 
@@ -270,7 +427,7 @@ fn listing_packages_prints_tree_with_legend_and_summary() {
     assert_eq!(
         both,
         format!(
-            "{LEGEND}\n\nproject@0.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{251c}\u{2500}\u{2500} {PKG}@100.0.0\n\u{2502}\n\u{2502}   devDependencies:\n\u{2514}\u{2500}\u{2500} {HELLO}@1.0.0\n\n2 packages\n"
+            "{LEGEND}\n\nproject@0.0.0 {dir}\n│\n│   dependencies:\n├── {PKG}@100.0.0\n│\n│   devDependencies:\n└── {HELLO}@1.0.0\n\n2 packages\n"
         ),
     );
 }
@@ -280,7 +437,7 @@ fn listing_packages_prints_tree_with_legend_and_summary() {
 /// (`deps/inspection/commands/test/listing/index.ts`). Upstream calls
 /// the handler for the one project; going through the CLI from inside a
 /// workspace member makes the run recursive by default, so the summary
-/// counts the projects too — verified against `pnpm ls` in pnpm 11.
+/// counts the projects too, verified against `pnpm ls` in pnpm 11.
 #[test]
 fn listing_packages_of_a_project_with_an_external_lockfile() {
     let (_root, workspace, _registry) = setup_registry();
@@ -310,7 +467,7 @@ fn listing_packages_of_a_project_with_an_external_lockfile() {
     assert_eq!(
         output,
         format!(
-            "{LEGEND}\n\npkg@1.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{2514}\u{2500}\u{2500} {PKG}@100.0.0\n\n1 package\n"
+            "{LEGEND}\n\npkg@1.0.0 {dir}\n│\n│   dependencies:\n└── {PKG}@100.0.0\n\n1 package\n"
         ),
     );
 }
@@ -347,7 +504,7 @@ fn listing_packages_with_local_file_directory_dependency() {
     assert_eq!(
         output,
         format!(
-            "{LEGEND}\n\npkg@1.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{2514}\u{2500}\u{2500} dep@file:../dep\n\n1 package\n"
+            "{LEGEND}\n\npkg@1.0.0 {dir}\n│\n│   dependencies:\n└── dep@file:../dep\n\n1 package\n"
         ),
     );
 }
@@ -375,7 +532,7 @@ fn listing_packages_with_lockfile_only() {
     assert_eq!(
         prod_only,
         format!(
-            "{LEGEND}\n\nproject@0.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{2514}\u{2500}\u{2500} {PKG}@100.0.0\n\n1 package\n"
+            "{LEGEND}\n\nproject@0.0.0 {dir}\n│\n│   dependencies:\n└── {PKG}@100.0.0\n\n1 package\n"
         ),
     );
 
@@ -383,7 +540,7 @@ fn listing_packages_with_lockfile_only() {
     assert_eq!(
         dev_only,
         format!(
-            "{LEGEND}\n\nproject@0.0.0 {dir}\n\u{2502}\n\u{2502}   devDependencies:\n\u{2514}\u{2500}\u{2500} {HELLO}@1.0.0\n\n1 package\n"
+            "{LEGEND}\n\nproject@0.0.0 {dir}\n│\n│   devDependencies:\n└── {HELLO}@1.0.0\n\n1 package\n"
         ),
     );
 
@@ -391,7 +548,7 @@ fn listing_packages_with_lockfile_only() {
     assert_eq!(
         both,
         format!(
-            "{LEGEND}\n\nproject@0.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{251c}\u{2500}\u{2500} {PKG}@100.0.0\n\u{2502}\n\u{2502}   devDependencies:\n\u{2514}\u{2500}\u{2500} {HELLO}@1.0.0\n\n2 packages\n"
+            "{LEGEND}\n\nproject@0.0.0 {dir}\n│\n│   dependencies:\n├── {PKG}@100.0.0\n│\n│   devDependencies:\n└── {HELLO}@1.0.0\n\n2 packages\n"
         ),
     );
 }
@@ -442,7 +599,7 @@ fn listing_specific_package_with_lockfile_only() {
     assert_eq!(
         output,
         format!(
-            "{LEGEND}\n\nproject@0.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{2514}\u{2500}\u{2500} {PKG}@100.0.0\n\n1 package\n"
+            "{LEGEND}\n\nproject@0.0.0 {dir}\n│\n│   dependencies:\n└── {PKG}@100.0.0\n\n1 package\n"
         ),
     );
 }
@@ -583,6 +740,47 @@ fn ls_with_unknown_finder_fails() {
     assert!(!output.status.success(), "unknown finder should fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("No finder with name no-such-finder is found"), "stderr: {stderr}");
+}
+
+#[test]
+fn finder_returning_empty_string_does_not_match() {
+    let (_root, workspace, _registry) = setup_registry();
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "name": "project",
+            "version": "0.0.0",
+            "dependencies": { HELLO: "1.0.0", "@pnpm.e2e/abc": "1.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        r"module.exports = {
+  finders: {
+    emptyForHello: (ctx) => ctx.name === '@pnpm.e2e/abc' ? 'matched abc' : '',
+  },
+};
+",
+    )
+    .expect("write .pnpmfile.cjs");
+    run_ok(&workspace, &["install"]);
+
+    let list_out = run_ok(&workspace, &["list", "--find-by=emptyForHello"]);
+    assert!(list_out.contains("@pnpm.e2e/abc@1.0.0"), "expected abc match: {list_out}");
+    assert!(list_out.contains("matched abc"), "expected finder message: {list_out}");
+    assert!(
+        !list_out.contains(&format!("{HELLO}@1.0.0")),
+        "empty string return must not match: {list_out}",
+    );
+
+    let why_out = run_ok(&workspace, &["why", "--find-by=emptyForHello"]);
+    assert!(why_out.contains("@pnpm.e2e/abc@1.0.0"), "expected abc match in why: {why_out}");
+    assert!(
+        !why_out.contains(&format!("{HELLO}@1.0.0")),
+        "empty string return must not match in why: {why_out}",
+    );
 }
 
 /// Port of upstream's `pnpm list returns correct paths with global
@@ -737,4 +935,38 @@ fn list_accepts_the_global_loglevel_flag() {
     drop(root);
 }
 
+mod local_refs;
 mod workspace;
+
+#[test]
+fn lockfile_only_finder_reads_manifest_from_configured_store_without_modules() {
+    let (_root, workspace, _registry) = setup_registry();
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "dependencies": { "@pnpm.e2e/abc": "1.0.0" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        r"
+module.exports = { finders: {
+  cached: ctx => ctx.readManifest()?.peerDependencies?.['@pnpm.e2e/peer-a'] === '^1.0.0'
+} }
+",
+    )
+    .unwrap();
+    run_ok(&workspace, &["install", "--lockfile-only"]);
+    run_ok(&workspace, &["fetch"]);
+    if workspace.join("node_modules").exists() {
+        fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+    }
+    let output = run_ok(&workspace, &["list", "--lockfile-only", "--find-by=cached", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed[0]["dependencies"]["@pnpm.e2e/abc"]["version"], "1.0.0");
+    let why = run_ok(&workspace, &["why", "--lockfile-only", "--find-by=cached"]);
+    assert!(why.contains("@pnpm.e2e/abc"), "{why}");
+    assert!(!workspace.join("node_modules").exists());
+}

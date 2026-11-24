@@ -1,4 +1,8 @@
-use super::{is_valid_old_npm_package_name, is_valid_package_version};
+use super::{
+    canonicalize_python_name,
+    is_valid_old_npm_package_name,
+    is_valid_package_version,
+};
 
 #[test]
 fn is_valid_old_npm_package_name_accepts_common_shapes() {
@@ -58,4 +62,59 @@ fn is_valid_package_version_rejects_traversals_and_separators() {
     ] {
         assert!(!is_valid_package_version(bad), "{bad:?} should be invalid");
     }
+}
+
+#[test]
+fn new_package_names_reject_legacy_warnings() {
+    for name in ["Upper", "@Upper/pkg", "a~b", "a'b", "a!b", "a(b", "a)b", "a*b", "http", "fs"] {
+        assert!(super::is_valid_old_npm_package_name(name), "{name}");
+        assert!(!super::is_valid_new_npm_package_name(name), "{name}");
+    }
+    assert!(!super::is_valid_new_npm_package_name(&"a".repeat(215)));
+    assert!(super::is_valid_new_npm_package_name(&"a".repeat(214)));
+}
+
+#[test]
+fn new_package_names_follow_npm_scoped_rules() {
+    for name in [
+        "pkg",
+        "pkg.name",
+        "pkg_name",
+        "1",
+        "@scope/pkg",
+        "@scope/_pkg",
+        "@scope/-pkg",
+        "@~scope/pkg",
+        "@scope/http",
+    ] {
+        assert!(super::is_valid_new_npm_package_name(name), "{name}");
+    }
+    for name in [
+        "",
+        "-pkg",
+        "_pkg",
+        ".pkg",
+        "node_modules",
+        "favicon.ico",
+        "pkg@x",
+        "@scope/pkg@x",
+        "@scope/.pkg",
+        "@scope/pkg~",
+        "café",
+        "@scope/café",
+        "@scope/pkg/extra",
+    ] {
+        assert!(!super::is_valid_new_npm_package_name(name), "{name}");
+    }
+}
+
+#[test]
+fn canonicalize_python_name_normalizes_per_pep_503() {
+    assert_eq!(canonicalize_python_name("Foo.Bar__baz").unwrap(), "foo-bar-baz");
+}
+
+#[test]
+fn canonicalize_python_name_rejects_an_invalid_name() {
+    let error = canonicalize_python_name("demo package").unwrap_err();
+    assert_eq!(error.to_string(), r#""demo package" is not a valid Python project name"#);
 }

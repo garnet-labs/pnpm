@@ -1,5 +1,5 @@
 //! E2E coverage for the `verify-deps-before-run` gate, mirroring the
-//! TypeScript scenarios in `pnpm11/pnpm/test/verifyDepsBeforeRun/` that
+//! TypeScript scenarios in [`pnpm11/pnpm/test/verifyDepsBeforeRun/`](https://github.com/pnpm/pnpm/tree/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/pnpm/test/verifyDepsBeforeRun) that
 //! translate to pacquet (the interactive `prompt` flow needs a PTY and
 //! is exercised only through its non-interactive error branch).
 
@@ -10,12 +10,21 @@ use crate::_utils;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     diagnostics::assert_diagnostic_contains,
     fs::bump_mtime,
 };
 use serde_json::json;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{
+        Path,
+        PathBuf,
+    },
+};
 
 fn write_manifest(workspace: &Path, marker: &Path) {
     write_named_manifest(workspace, "verify-deps-project", marker);
@@ -45,7 +54,7 @@ fn write_manifest_with_dependency_groups(
     write_named_manifest_with_dependency_groups(workspace, "verify-deps-project", marker, groups);
 }
 
-/// The fixture manifest — a `hello` script that touches `marker` —
+/// The fixture manifest (a `hello` script that touches `marker`)
 /// extended with the dependency groups the caller needs.
 fn write_named_manifest_with_dependency_groups(
     workspace: &Path,
@@ -349,7 +358,7 @@ fn error_action_follows_the_dependency_state() {
 
     // Deleting pnpm-lock.yaml and the current lockfile leaves nothing to
     // stand in for it, so the check fails like pnpm's
-    // RUN_CHECK_DEPS_LOCKFILE_NOT_FOUND — and the pre-run check must not
+    // RUN_CHECK_DEPS_LOCKFILE_NOT_FOUND, and the pre-run check must not
     // recreate the file (pnpm's run path never restores the lockfile; only
     // the install command does).
     fs::remove_file(workspace.join("pnpm-lock.yaml")).expect("remove pnpm-lock.yaml");
@@ -392,6 +401,55 @@ fn error_action_follows_the_dependency_state() {
         stderr.contains("ERR_PNPM_VERIFY_DEPS_BEFORE_RUN"),
         "expected the verify-deps error:\n{stderr}",
     );
+
+    drop(root);
+}
+
+/// An edit to a manifest with a `file:` directory dependency passes the gate
+/// while the directory still matches its lockfile entry
+/// ([pnpm/pnpm#17697](https://github.com/pnpm/pnpm/issues/17697)).
+#[cfg(unix)]
+#[test]
+fn error_action_accepts_an_edit_beside_an_unchanged_file_directory_dependency() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let local_dir = workspace.join("local-dir");
+    fs::create_dir_all(&local_dir).expect("create the local directory package");
+    let write_local_dir_manifest = |dependencies: serde_json::Value| {
+        let manifest =
+            json!({ "name": "local-dir", "version": "1.0.0", "dependencies": dependencies });
+        fs::write(local_dir.join("package.json"), manifest.to_string())
+            .expect("write the local directory manifest");
+    };
+    write_local_dir_manifest(json!({}));
+    let groups = json!({ "dependencies": { "local-dir": "file:./local-dir" } });
+    write_manifest_with_dependency_groups(
+        &workspace,
+        &workspace.join("marker.txt"),
+        groups.clone(),
+    );
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let marker = workspace.join("edited-marker.txt");
+    write_manifest_with_dependency_groups(&workspace, &marker, groups.clone());
+    pacquet_in(&workspace)
+        .with_args(["--config.verify-deps-before-run=error", "run", "hello"])
+        .assert()
+        .success();
+    assert!(marker.exists(), "the script must run");
+
+    write_local_dir_manifest(json!({ "@pnpm.e2e/foo": "100.0.0" }));
+    write_manifest_with_dependency_groups(&workspace, &workspace.join("marker.txt"), groups);
+    bump_mtime(&workspace.join("package.json"));
+    let output = pacquet_in(&workspace)
+        .with_args(["--config.verify-deps-before-run=error", "run", "hello"])
+        .output()
+        .expect("spawn pacquet run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "a changed local directory must fail:\n{stderr}");
+    assert!(stderr.contains("ERR_PNPM_VERIFY_DEPS_BEFORE_RUN"), "unexpected error:\n{stderr}");
 
     drop(root);
 }
@@ -787,6 +845,113 @@ fn warn_action_warns_and_runs_the_script() {
     drop(root);
 }
 
+/// `runtimeOnFail` keeps the runtime that `devEngines.runtime` asks to
+/// download out of the install, and the gate reads the manifest the same way
+/// ([pnpm/pnpm#18155](https://github.com/pnpm/pnpm/issues/18155)).
+#[cfg(unix)]
+#[test]
+fn error_action_applies_runtime_on_fail_to_the_manifest() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let marker = workspace.join("marker.txt");
+    write_manifest_with_dependency_groups(
+        &workspace,
+        &marker,
+        json!({
+            "devEngines": {
+                "runtime": { "name": "node", "version": "24.22.3", "onFail": "download" },
+            },
+        }),
+    );
+    fs::write(workspace.join("pnpm-workspace.yaml"), "runtimeOnFail: warn\n")
+        .expect("write pnpm-workspace.yaml");
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read the lockfile");
+    assert!(!lockfile.contains("runtime:"), "the install must skip the runtime:\n{lockfile}");
+
+    let run_hello = || {
+        pacquet_in(&workspace)
+            .with_args(["--config.verify-deps-before-run=error", "run", "hello"])
+            .assert()
+            .success();
+    };
+    run_hello();
+    assert!(marker.exists(), "the script must run");
+
+    // An edit outside the dependency fields makes the gate check the
+    // manifest's content against the lockfile.
+    let manifest_path = workspace.join("package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read package.json"))
+            .expect("parse package.json");
+    manifest["description"] = json!("edited");
+    fs::write(&manifest_path, manifest.to_string()).expect("write the edited package.json");
+    bump_mtime(&manifest_path);
+    run_hello();
+
+    drop(root);
+}
+
+/// [`error_action_applies_runtime_on_fail_to_the_manifest`] for a workspace
+/// project, after an install that reads the workspace projects itself.
+#[cfg(unix)]
+#[test]
+fn error_action_applies_runtime_on_fail_to_workspace_projects() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(workspace.join("package.json"), json!({ "name": "root" }).to_string())
+        .expect("write the root package.json");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\nruntimeOnFail: warn\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    let project_dir = workspace.join("packages/project");
+    fs::create_dir_all(&project_dir).expect("create the workspace project");
+    let marker = workspace.join("marker.txt");
+    write_named_manifest_with_dependency_groups(
+        &project_dir,
+        "project",
+        &marker,
+        json!({
+            "devEngines": {
+                "runtime": { "name": "node", "version": "24.22.3", "onFail": "download" },
+            },
+        }),
+    );
+    let linked = workspace.join("linked-dep");
+    fs::create_dir_all(&linked).expect("create the linked package");
+    fs::write(linked.join("package.json"), json!({ "name": "linked-dep" }).to_string())
+        .expect("write the linked package manifest");
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    // Not recursive, so the install reads the other workspace projects itself.
+    pacquet_in(&workspace)
+        .with_args(["add", "--workspace-root", "link:./linked-dep"])
+        .assert()
+        .success();
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read the lockfile");
+    assert!(!lockfile.contains("runtime:"), "the install must skip the runtime:\n{lockfile}");
+
+    let manifest_path = project_dir.join("package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read package.json"))
+            .expect("parse package.json");
+    manifest["description"] = json!("edited");
+    fs::write(&manifest_path, manifest.to_string()).expect("write the edited package.json");
+    bump_mtime(&manifest_path);
+    pacquet_in(&project_dir)
+        .with_args(["--config.verify-deps-before-run=error", "run", "hello"])
+        .assert()
+        .success();
+    assert!(marker.exists(), "the script must run");
+
+    drop(root);
+}
+
 /// A lockfile that records overrides the root manifest now keeps only in its
 /// ignored `pnpm` field must not be rewritten by an implicit install, which
 /// would drop them. The gate refuses and leaves the lockfile alone
@@ -925,7 +1090,7 @@ fn scripts_get_the_check_disabled_through_their_env() {
 }
 
 /// The `pnpm_config_verify_deps_before_run` env var outranks even the
-/// CLI `--config.` override — that priority is what makes the script
+/// CLI `--config.` override, that priority is what makes the script
 /// env stamp above an effective recursion breaker.
 #[cfg(unix)]
 #[test]
@@ -1066,10 +1231,7 @@ fn exec_keeps_verifier_output_out_of_child_stdout() {
     eprintln!("STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n");
     assert!(output.status.success(), "exec failed");
     assert_eq!(stdout, r#"{"workspace":"test"}"#);
-    assert!(
-        stderr.contains("Scope: all 2 workspace projects") && stderr.contains("Done in"),
-        "the verifier install must report on stderr:\n{stderr}",
-    );
+    assert!(stderr.contains("Done in"), "the verifier install must report on stderr:\n{stderr}");
 
     drop(root);
 }
@@ -2417,4 +2579,132 @@ fn a_pinned_lockfile_dir_starts_an_install() {
     assert!(!project.join("pnpm-lock.yaml").exists());
 
     drop(root);
+}
+
+/// Where [`LocalDirectoryFixture`] puts its project.
+#[derive(Clone, Copy)]
+enum ProjectLayout {
+    /// A workspace project, run with `--filter`.
+    Workspace,
+    /// A project without a workspace.
+    Standalone,
+}
+
+/// A project `app` with a dependency on the local directory `lib`, which is no
+/// workspace project. The manifest of `lib` is what the gate has to read: no
+/// validation records it.
+struct LocalDirectoryFixture {
+    root: tempfile::TempDir,
+    workspace: PathBuf,
+    /// Where the commands run: the workspace, or `app` without one.
+    cwd: PathBuf,
+    layout: ProjectLayout,
+}
+
+impl LocalDirectoryFixture {
+    fn new(layout: ProjectLayout) -> Self {
+        let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+        let cwd = match layout {
+            ProjectLayout::Workspace => {
+                fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - app\n")
+                    .expect("write pnpm-workspace.yaml");
+                fs::write(
+                    workspace.join("package.json"),
+                    json!({ "name": "root", "private": true }).to_string(),
+                )
+                .expect("write the root manifest");
+                workspace.clone()
+            }
+            ProjectLayout::Standalone => workspace.join("app"),
+        };
+        let app = workspace.join("app");
+        fs::create_dir_all(&app).expect("create the project");
+        fs::write(
+            app.join("package.json"),
+            json!({ "name": "app", "version": "1.0.0", "dependencies": { "lib": "file:../lib" } })
+                .to_string(),
+        )
+        .expect("write the project manifest");
+        let fixture = Self { root, workspace, cwd, layout };
+        fixture.write_directory_manifest("lib", &json!({}));
+        fixture.write_directory_manifest("other", &json!({}));
+        fixture
+    }
+
+    fn write_directory_manifest(&self, name: &str, dependencies: &serde_json::Value) {
+        let dir = self.workspace.join(name);
+        fs::create_dir_all(&dir).expect("create the local directory");
+        let manifest = json!({ "name": name, "version": "1.0.0", "dependencies": dependencies });
+        fs::write(dir.join("package.json"), manifest.to_string())
+            .expect("write the local directory's manifest");
+    }
+
+    fn install(&self) {
+        pacquet_in(&self.cwd)
+            .with_arg("install")
+            .assert()
+            .success();
+    }
+
+    fn gated_exec(&self) -> std::process::Output {
+        let mut args = vec!["--config.verify-deps-before-run=error"];
+        match self.layout {
+            ProjectLayout::Workspace => args.extend(["--filter", "app"]),
+            ProjectLayout::Standalone => {}
+        }
+        args.extend(["exec", "node", "-e", ""]);
+        pacquet_in(&self.cwd)
+            .with_args(args)
+            .output()
+            .expect("spawn pacquet exec")
+    }
+
+    #[track_caller]
+    fn assert_gate_passes(&self) {
+        let output = self.gated_exec();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[track_caller]
+    fn assert_gate_fails(&self) {
+        let output = self.gated_exec();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "the lockfile lacks the local directory's new dependency",
+        );
+        assert!(
+            stderr.contains("ERR_PNPM_VERIFY_DEPS_BEFORE_RUN"),
+            "expected the verify-deps error:\n{stderr}",
+        );
+    }
+}
+
+#[test]
+fn a_dependency_added_to_a_local_directory_dependency_fails_the_gate() {
+    for layout in [ProjectLayout::Workspace, ProjectLayout::Standalone] {
+        let fixture = LocalDirectoryFixture::new(layout);
+        fixture.install();
+        fixture.assert_gate_passes();
+        fixture.write_directory_manifest("lib", &json!({ "other": "file:../other" }));
+        fixture.assert_gate_fails();
+        drop(fixture.root);
+    }
+}
+
+/// The lockfile records a local directory's dependencies as a `readPackage`
+/// hook left them, so the gate compares the hooked manifest.
+#[test]
+fn a_local_directory_dependency_a_hook_extends_passes_the_gate() {
+    let fixture = LocalDirectoryFixture::new(ProjectLayout::Workspace);
+    fs::write(
+        fixture.workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { readPackage (pkg) {\n\
+         if (pkg.name === 'lib') pkg.dependencies = { ...pkg.dependencies, other: 'file:../other' }\n\
+         return pkg\n} } }\n",
+    )
+    .expect("write the pnpmfile");
+    fixture.install();
+    fixture.assert_gate_passes();
+    drop(fixture.root);
 }

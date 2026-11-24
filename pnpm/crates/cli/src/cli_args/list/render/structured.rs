@@ -1,5 +1,14 @@
 use super::{
-    DependencyNode, HashSet, LongPkgInfo, Map, Path, ProjectHierarchy, Value, json, plain,
+    DependencyNode,
+    HashSet,
+    LongPkgInfo,
+    Map,
+    Path,
+    ProjectHierarchy,
+    Value,
+    has_pkg_name_prefix,
+    json,
+    plain,
     read_long_pkg_info,
 };
 
@@ -73,7 +82,7 @@ fn parseable_project_line(project: &ProjectHierarchy, long: bool) -> String {
 }
 
 /// One package's parseable line: its path, and under `--long` the
-/// specifier it resolves as — including the `npm:` alias form.
+/// specifier it resolves as, including the `npm:` alias form.
 fn parseable_node_line(node: &DependencyNode, long: bool) -> String {
     if !long {
         return plain(&node.package.path);
@@ -83,13 +92,13 @@ fn parseable_node_line(node: &DependencyNode, long: bool) -> String {
     let name = plain(&node.package.name);
     let version = plain(&node.package.version);
     if alias == name {
-        return if version.contains('@') {
+        return if has_pkg_name_prefix(&version) {
             format!("{path}:{version}")
         } else {
             format!("{path}:{name}@{version}")
         };
     }
-    if version.contains('@') {
+    if has_pkg_name_prefix(&version) {
         format!("{path}:{alias} {version}")
     } else {
         format!("{path}:{alias} npm:{name}@{version}")

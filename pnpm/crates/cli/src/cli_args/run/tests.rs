@@ -1,4 +1,9 @@
-use super::{RunError, ScriptSelector, render_project_commands, throw_or_filter_hidden_scripts};
+use super::{
+    RunError,
+    ScriptSelector,
+    render_project_commands,
+    throw_or_filter_hidden_scripts,
+};
 use clap::Parser;
 use serde_json::json;
 
@@ -11,9 +16,18 @@ fn specified_scripts_exact_match() {
 
 #[test]
 fn specified_scripts_start_fallback() {
+    let tmp = tempfile::TempDir::new().expect("tmp dir");
     let manifest = json!({ "scripts": { "build": "tsc" } });
+    assert!(
+        ScriptSelector::new("start")
+            .unwrap()
+            .select_with_start(&manifest, tmp.path())
+            .is_empty(),
+        "without server.js, start is not selected",
+    );
+    std::fs::write(tmp.path().join("server.js"), "// server").expect("write server.js");
     assert_eq!(
-        ScriptSelector::new("start").unwrap().select_with_start(&manifest),
+        ScriptSelector::new("start").unwrap().select_with_start(&manifest, tmp.path()),
         vec!["start".to_string()],
     );
     assert!(
@@ -50,8 +64,8 @@ fn specified_scripts_selects_every_regexp_match() {
         ScriptSelector::new("/^build:(backend|frontend)$/").unwrap().select(&manifest),
         vec!["build:backend".to_string(), "build:frontend".to_string()],
     );
-    // The pattern is not implicitly anchored to the whole script name —
-    // it is searched for — so `build` matches this one too, and the
+    // The pattern is not implicitly anchored to the whole script name
+    // (it is searched for) so `build` matches this one too, and the
     // matches keep the manifest's declaration order.
     assert_eq!(
         ScriptSelector::new("/^build/").unwrap().select(&manifest),
@@ -102,8 +116,8 @@ fn specified_scripts_rejects_regexp_flags() {
     assert!(matches!(err, RunError::UnsupportedScriptCommandFormat), "got {err:?}");
 }
 
-/// Anything that isn't a well-formed regexp literal — a bare `/`-bearing
-/// name, an empty pattern, or a pattern the engine can't compile — reads
+/// Anything that isn't a well-formed regexp literal (a bare `/`-bearing
+/// name, an empty pattern, or a pattern the engine can't compile) reads
 /// as a plain script name and finds nothing.
 #[test]
 fn specified_scripts_treats_non_literals_as_names() {

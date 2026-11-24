@@ -5,30 +5,60 @@
 //! keep it. A package linked from a modules directory not named
 //! `node_modules` is found only through the projects that the installed
 //! lockfiles list.
+//!
+//! A Python environment rewrites each wheel's `RECORD`, so that store file
+//! has no hard link either while the wheel's other files do.
 
-use pnpm_config::{Host, PackageConfigsSetting, workspace_root_or};
-use pnpm_deps_restorer::{binary_store_index_key, store_index_key_for_resolution};
+use pnpm_config::{
+    Host,
+    PackageConfigsSetting,
+    workspace_root_or,
+};
+use pnpm_deps_restorer::{
+    binary_store_index_key,
+    store_index_key_for_resolution,
+};
 use pnpm_env_replace::env_replace_lossy;
 use pnpm_fs::lexical_normalize;
-use pnpm_lockfile::{Lockfile, LockfileResolution, PackageKey};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+};
 use pnpm_modules_yaml::read_modules_layout;
 use pnpm_package_manifest::safe_read_project_manifest_from_dir;
 use pnpm_store_dir::{
-    CafsFileInfo, InUse, PackageFilesIndex, PruneError, StoreDir, StoreIndex, StoreIndexError,
-    decode_package_files_index, get_registered_projects,
+    InUse,
+    PackageFilesIndex,
+    PruneError,
+    StoreDir,
+    StoreIndex,
+    StoreIndexError,
+    decode_package_files_index,
+    get_registered_projects,
 };
 use pnpm_workspace::read_workspace_manifest_document;
 use serde::Deserialize;
 use std::{
-    collections::{HashMap, HashSet},
-    io, iter,
-    path::{Path, PathBuf},
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    io,
+    iter,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// For each registered project's current lockfile:
 /// - every file of the store index rows of its packages, including the files
 ///   of every side-effects entry;
 /// - the modules directory of every project it lists.
+///
+/// Every file of the rows of the archives each registered project's
+/// `pylock.toml` pins.
 ///
 /// A project without a current lockfile, a project whose lockfile version
 /// this pnpm does not support, and a package without a row add no files. A
@@ -41,6 +71,7 @@ pub(super) fn in_use(store_dir: &StoreDir) -> Result<InUse, PruneError> {
         // The registry joins a relative link target without normalizing it.
         let project = lexical_normalize(&project);
         let modules_dir = modules_dirs.add(&project).map_err(PruneError::InUseFiles)?;
+        keys.extend(python_index_keys(&project).map_err(PruneError::InUseFiles)?);
         for lockfile in
             load_installed_lockfiles(&project, &modules_dir).map_err(PruneError::InUseFiles)?
         {
@@ -66,11 +97,11 @@ fn in_use_files(
         return Ok(HashSet::new());
     }
     let keys: Vec<String> = keys.into_iter().collect();
-    let rows = read_rows(store_dir, &keys)
-        .map_err(|error| PruneError::InUseFiles(io::Error::other(error)))?;
+    let rows =
+        read_rows(store_dir, &keys).map_err(io::Error::other).map_err(PruneError::InUseFiles)?;
     Ok(rows
         .iter()
-        .flat_map(row_files)
+        .flat_map(PackageFilesIndex::all_files)
         .filter_map(|file| store_dir.cas_file_path_by_mode(&file.digest, file.mode))
         .collect())
 }
@@ -166,7 +197,7 @@ impl ModulesDirSettings {
         else {
             return Ok(Self::default());
         };
-        let shares_one_lockfile = settings.shared_workspace_lockfile != Some(false)
+        let shares_one_lockfile = settings.shared_workspace_lockfile.unwrap_or(true)
             || settings.lockfile_dir.is_some();
         let project_modules_dirs = match settings.package_configs {
             Some(package_configs) if !shares_one_lockfile => package_configs
@@ -223,6 +254,20 @@ fn load_installed_lockfile(
     Err(io::Error::other(format!("{}: {error}", install_state_dir.display())))
 }
 
+/// A `pylock.toml` that cannot be parsed stops the prune, as an unreadable
+/// `pnpm-lock.yaml` does, since its project may still use the archives it
+/// pins. The parser's message is left out because it quotes the file.
+fn python_index_keys(project: &Path) -> io::Result<Vec<String>> {
+    let path = project.join("pylock.toml");
+    match pnpm_python_installer::locked_archive_store_index_keys(&path) {
+        Ok(keys) => Ok(keys.unwrap_or_default()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            Err(io::Error::other(format!("{}: not a valid pylock.toml", path.display())))
+        }
+        Err(error) => Err(io::Error::other(format!("{}: {error}", path.display()))),
+    }
+}
+
 fn package_index_keys(lockfile: &Lockfile) -> io::Result<Vec<String>> {
     let mut keys = Vec::new();
     for (key, metadata) in lockfile.packages.iter().flatten() {
@@ -234,8 +279,8 @@ fn package_index_keys(lockfile: &Lockfile) -> io::Result<Vec<String>> {
 /// The lockfile does not say which key the install used for:
 /// - a git-hosted package, which has a key for its built and its unbuilt
 ///   contents;
-/// - a `Variations` resolution, whose variant or fallback depends on the
-///   installing host and its `supportedArchitectures`;
+/// - a `Variations` resolution, whose variant depends on the installing
+///   host and its `supportedArchitectures`;
 /// - a runtime, whose row an older install keyed without its manifest.
 fn add_resolution_index_keys(
     keys: &mut Vec<String>,
@@ -243,8 +288,8 @@ fn add_resolution_index_keys(
     resolution: &LockfileResolution,
 ) -> io::Result<()> {
     if let LockfileResolution::Variations(variations) = resolution {
-        for resolution in variations.resolutions() {
-            add_resolution_index_keys(keys, key, resolution)?;
+        for variant in &variations.variants {
+            add_resolution_index_keys(keys, key, &variant.resolution)?;
         }
         return Ok(());
     }
@@ -258,13 +303,4 @@ fn add_resolution_index_keys(
         keys.push(binary_store_index_key(key, binary).map_err(io::Error::other)?);
     }
     Ok(())
-}
-
-fn row_files(row: &PackageFilesIndex) -> impl Iterator<Item = &CafsFileInfo> {
-    let side_effects_files = row.side_effects
-        .iter()
-        .flat_map(|side_effects| side_effects.values())
-        .filter_map(|diff| diff.added.as_ref())
-        .flat_map(|added| added.values());
-    row.files.values().chain(side_effects_files)
 }

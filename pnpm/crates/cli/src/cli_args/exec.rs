@@ -2,24 +2,46 @@ mod recursive;
 
 use super::reporter::ReporterType;
 use crate::{
-    path_env::{BadPathDir, prepend_dirs_to_path, set_command_path},
-    process::{Command, ExitStatus, Stdio},
+    path_env::{
+        BadPathDir,
+        prepend_dirs_to_path,
+        set_command_path,
+    },
+    process::{
+        Command,
+        ExitStatus,
+        Stdio,
+    },
 };
 
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::Config;
 use pnpm_executor::{
-    ProcessTracker, ScriptExit, ScriptOutput, StreamedScript, exit_like, push_script_arg,
-    select_shell, spawn_child,
+    ProcessTracker,
+    ScriptExit,
+    ScriptOutput,
+    StreamedScript,
+    exit_like,
+    push_script_arg,
+    select_shell,
+    spawn_child,
 };
 use pnpm_package_manager::{
-    make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
+    make_node_package_map_option,
+    make_node_require_option,
+    package_map_path_for_execution,
     pnp_path_for_execution,
 };
 use pnpm_workspace::read_project_name;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+};
 
 /// Run a shell command in the context of a project.
 ///
@@ -111,12 +133,14 @@ impl ExecArgs {
             config,
             reporter,
         )?;
-        let status =
-            spawn_in_dir(&command, dirs, config, self.shell_mode, ScriptOutput::Inherit, None)?;
-        if !status.success() {
-            exit_like(ScriptExit::Process(status));
-        }
-        Ok(())
+        run_prepared(&command, dirs, config, self.shell_mode)
+    }
+
+    /// Like [`Self::run`], but without the dependency verification. For a
+    /// caller that has already verified `dirs.project`.
+    pub(super) fn run_verified(self, dirs: ExecDirs<'_>, config: &Config) -> miette::Result<()> {
+        let command = prepare_command(self.command)?;
+        run_prepared(&command, dirs, config, self.shell_mode)
     }
 
     /// Execute the command across the `--filter`-selected workspace
@@ -130,6 +154,19 @@ impl ExecArgs {
     ) -> miette::Result<()> {
         recursive::exec_recursive(self, config, dir, reporter).await
     }
+}
+
+fn run_prepared(
+    command: &[String],
+    dirs: ExecDirs<'_>,
+    config: &Config,
+    shell_mode: bool,
+) -> miette::Result<()> {
+    let status = spawn_in_dir(command, dirs, config, shell_mode, ScriptOutput::Inherit, None)?;
+    if !status.success() {
+        exit_like(ScriptExit::Process(status));
+    }
+    Ok(())
 }
 
 /// Strip a surviving leading `--` and reject an empty command.
@@ -211,7 +248,7 @@ fn command_in_dir(
         // into a single string and hands it to the shell verbatim (no
         // per-token escaping). Mirror that with the platform shell,
         // appending the joined string through `push_script_arg` so the
-        // Windows `cmd /d /s /c` verbatim path uses `raw_arg` — matching
+        // Windows `cmd /d /s /c` verbatim path uses `raw_arg`, matching
         // execa's `windowsVerbatimArguments` and keeping embedded quoting
         // (e.g. `node -e "..."`) intact.
         let shell = select_shell(None, cfg!(windows)).expect("default shell selection never fails");
@@ -233,7 +270,7 @@ fn command_in_dir(
 
     cmd.current_dir(dir);
     // `updateConfig`-provided env, applied first so pnpm's own keys
-    // below (PATH, user-agent, NODE_OPTIONS, PWD) win on conflict — matching
+    // below (PATH, user-agent, NODE_OPTIONS, PWD) win on conflict, matching
     // TS `makeEnv`, which spreads `...extraEnv` into the base. Empty
     // unless an install-family command populated it.
     cmd.envs(project_extra_env(config, project, project_name.as_deref()));
@@ -315,7 +352,7 @@ fn project_extra_env(
     config.prepend_project_node_path::<pnpm_config::Host>(
         &mut env,
         project,
-        &config.modules_dir_name_for(project, project_name),
+        &config.project_modules_dir(project, project_name),
     );
     env
 }
@@ -326,13 +363,15 @@ fn command_search_path(
     project_name: Option<&str>,
 ) -> Result<std::ffi::OsString, ExecError> {
     let ExecDirs { run: dir, project } = dirs;
-    let modules_dir_name = config.modules_dir_name_for(project, project_name);
     let mut prepend = Vec::with_capacity(2 + config.extra_bin_paths.len());
-    prepend.push(dir.join(&modules_dir_name).join(".bin"));
     if project != dir {
-        prepend.push(project.join(&modules_dir_name).join(".bin"));
+        prepend.push(
+            dir.join(config.modules_dir_name_for(project, project_name))
+                .join(".bin"),
+        );
     }
-    prepend.extend(crate::ecosystem_install::execution_paths(config, project).iter().cloned());
+    prepend.push(config.project_modules_dir(project, project_name).join(".bin"));
+    prepend.extend(crate::ecosystem_install::execution_paths(config, project, dir).iter().cloned());
     prepend_dirs_to_path(&prepend).map_err(ExecError::from)
 }
 

@@ -1,13 +1,20 @@
-use miette::IntoDiagnostic as _;
 use pnpr_config::{
-    BackendConfig, Config, ConfigSource, FeatureOverrides, HostedStoreConfig, MaxUsers,
+    BackendConfig,
+    Config,
+    ConfigSource,
+    FeatureOverrides,
+    HostedStoreConfig,
+    MaxUsers,
     normalize_key_prefix,
 };
 use pnpr_package_name::Ecosystem;
-use pnpr_registry::{Registries, Registry};
-use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
+use pnpr_registry::{
+    Registries,
+    Registry,
+};
+use std::path::{
+    Path,
+    PathBuf,
 };
 
 #[derive(Debug)]
@@ -37,8 +44,11 @@ pub struct ConfigCheckReport {
     pub surfaces: SurfaceSummary,
 }
 
-#[must_use]
-pub fn check_resolved_config(config: &Config, source: &ConfigSource) -> ConfigCheckReport {
+pub fn check_resolved_config(
+    config: &mut Config,
+    source: &ConfigSource,
+) -> pnpr_error::Result<ConfigCheckReport> {
+    crate::config_validation::validate_startup_config(config)?;
     let source_description = match source {
         ConfigSource::Cli(cli_path) => format!("--config {}", cli_path.display()),
         ConfigSource::DefaultPath(default_path) => {
@@ -47,7 +57,22 @@ pub fn check_resolved_config(config: &Config, source: &ConfigSource) -> ConfigCh
         ConfigSource::Bundled => "bundled default".to_string(),
     };
 
-    build_report(config, source_description)
+    Ok(build_report(config, source_description))
+}
+
+/// [`check_resolved_config`] that first reads and validates the registries
+/// the database stores.
+pub async fn check_config_and_stored_registries(
+    config: &mut Config,
+    source: &ConfigSource,
+) -> pnpr_error::Result<ConfigCheckReport> {
+    *config = crate::server::with_stored_routing(
+        config,
+        crate::server::Credentials::Skip,
+        crate::server::FileReferences::Refuse,
+    )
+    .await?;
+    check_resolved_config(config, source)
 }
 
 pub fn check_config(config_path: Option<&Path>) -> miette::Result<ConfigCheckReport> {
@@ -56,30 +81,28 @@ pub fn check_config(config_path: Option<&Path>) -> miette::Result<ConfigCheckRep
         return Err(miette::miette!("config file '{display_path}' does not exist"));
     }
 
-    let default_listen: SocketAddr = Config::DEFAULT_LISTEN.parse().into_diagnostic()?;
     let overrides = FeatureOverrides::default();
     let auto_path = Config::auto_config_path();
-    let (config, source) = Config::resolve_with_overrides(
-        config_path,
-        auto_path.as_deref(),
-        default_listen,
-        None,
-        overrides,
-    )
-    .map_err(|err| miette::miette!("{err}"))?;
+    let (mut config, source) =
+        Config::resolve_with_overrides(config_path, auto_path.as_deref(), None, None, overrides)
+            .map_err(|err| miette::miette!("{err}"))?;
 
-    Ok(check_resolved_config(&config, &source))
+    check_resolved_config(&mut config, &source)
+        .map_err(|error| {
+            let message = error.log_message();
+            miette::miette!("{message}")
+        })
 }
 
 fn summarize_registry(config: &Config, name: &str) -> RegistrySummary {
     let (kind, details) = match config.routing.registries.get(name) {
         Some(Registry::Hosted { patterns }) => {
             let pat_count = patterns.len();
-            let org = config.routing.hosted
+            let namespace = config.routing.hosted
                 .get(name)
-                .map(|hosted_entry| format!("org: {:?}", hosted_entry.org))
+                .map(|hosted_entry| format!("namespace: {:?}", hosted_entry.namespace))
                 .unwrap_or_default();
-            ("hosted".to_string(), format!("{pat_count} patterns, {org}"))
+            ("hosted".to_string(), format!("{pat_count} patterns, {namespace}"))
         }
         Some(Registry::Upstream { patterns }) => {
             let url = config.routing.upstreams
@@ -188,20 +211,14 @@ fn build_report(config: &Config, source_description: String) -> ConfigCheckRepor
 }
 
 fn format_auth_summary(config: &Config) -> String {
-    let ht = &config.identity.auth.htpasswd;
+    let ht = &config.identity.auth.users;
     let max = match ht.max_users {
         MaxUsers::Unlimited => "unlimited".to_string(),
         MaxUsers::Limited(n) => format!("max {n}"),
         MaxUsers::Disabled => "disabled".to_string(),
     };
     let (backend, location) = match &config.identity.backend {
-        BackendConfig::Local => (
-            "htpasswd",
-            match &ht.file {
-                Some(path) => path.display().to_string(),
-                None => "in-memory".to_string(),
-            },
-        ),
+        BackendConfig::Sqlite(path) => ("sqlite", path.display().to_string()),
         BackendConfig::Libsql(settings) => {
             let url = sanitize_diagnostic_url(&settings.url);
             let location = match &settings.replica_path {

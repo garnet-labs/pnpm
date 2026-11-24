@@ -1,21 +1,44 @@
 use axum::{
-    extract::{Path, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    extract::{
+        Path,
+        State,
+    },
+    http::{
+        StatusCode,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use serde::Deserialize;
 use serde_json::json;
 
 use pnpr_error::RegistryError;
-use pnpr_package_name::{CanonicalPackageName, Ecosystem};
+use pnpr_package_name::{
+    CanonicalPackageName,
+    Ecosystem,
+};
 use pnpr_policy::Identity;
 use pnpr_storage::publish::extract_predicate_type;
 use pnpr_upstream::FetchOutcome;
 
 use super::{
-    Action, AppState, AuthedCaller, RegistrySource, TargetRegistry, addressed_registry, authorize,
-    authorized_upstream, ecosystem::upstream_sources, ensure_osv_allowed, hosted_read_namespace,
-    not_found, private_no_cache, resolve_registry_source,
+    Action,
+    AppState,
+    AuthedCaller,
+    RegistrySource,
+    TargetRegistry,
+    addressed_registry,
+    authorize,
+    authorized_upstream,
+    ecosystem::upstream_sources,
+    ensure_osv_allowed,
+    hosted_read_namespace,
+    not_found,
+    private_no_cache,
+    resolve_registry_source,
 };
 
 #[derive(Deserialize)]
@@ -52,7 +75,7 @@ async fn serve_attestations(
     let Some((raw_pkg, version)) = parse_attestation_spec(spec) else {
         return not_found();
     };
-    let Ok(name) = CanonicalPackageName::parse(&raw_pkg, Ecosystem::Npm) else {
+    let Ok(name) = CanonicalPackageName::parse(raw_pkg, Ecosystem::Npm) else {
         return not_found();
     };
     let Some(target) = addressed_registry(state, registry, Ecosystem::Npm) else {
@@ -61,33 +84,32 @@ async fn serve_attestations(
     let resolved_source = resolve_registry_source(state, &target, name.as_str());
     match &resolved_source {
         RegistrySource::Hosted(source) => {
-            serve_hosted_attestations(state, identity, source, &name, &version).await
+            serve_hosted_attestations(state, identity, source, &name, version).await
         }
         RegistrySource::Upstream(source) => {
             if let Err(err) =
-                authorize(state, identity, &resolved_source, name.as_str(), Action::Access)
+                authorize(state, identity, &resolved_source, name.as_str(), Action::Read)
             {
                 return err.into_response();
             }
-            let upstream_spec = format!("{}@{version}", name.as_str());
+            let upstream_spec =
+                format!("{}@{version}", pnpm_network::encode_package_name(name.as_str()));
             serve_upstream_attestations(state, identity, source, &upstream_spec).await
         }
         RegistrySource::Unclaimed | RegistrySource::NotFound => not_found(),
     }
 }
 
-fn parse_attestation_spec(spec: &str) -> Option<(String, String)> {
-    let idx = spec.rfind('@')?;
-    if idx == 0 {
+fn parse_attestation_spec(spec: &str) -> Option<(&str, &str)> {
+    let (raw_pkg, version) = spec.rsplit_once('@')?;
+    if raw_pkg.is_empty()
+        || version.is_empty()
+        || version.contains(['/', '\\', '?', '#'])
+        || version.contains("..")
+    {
         return None;
     }
-    let raw_pkg = &spec[..idx];
-    let version = &spec[idx + 1..];
-    if version.is_empty() || version.contains(['/', '\\', '?', '#']) || version.contains("..") {
-        return None;
-    }
-    let decoded_pkg = pnpr_search::percent_decode(raw_pkg);
-    Some((decoded_pkg, version.to_string()))
+    Some((raw_pkg, version))
 }
 
 async fn serve_hosted_attestations(
@@ -97,15 +119,15 @@ async fn serve_hosted_attestations(
     name: &CanonicalPackageName,
     version: &str,
 ) -> Response {
-    let org = match hosted_read_namespace(state, identity, source, name.as_str()) {
-        Ok(org) => org,
+    let namespace = match hosted_read_namespace(state, identity, source, name.as_str()) {
+        Ok(namespace) => namespace,
         Err(err) => return err.into_response(),
     };
     if let Err(err) = ensure_osv_allowed(state, name, version) {
         return err.into_response();
     }
     let filename = name.sigstore_name_for_version(version);
-    match super::hosted_storage(state, Some(&org)).open_hosted_blob(name, &filename).await {
+    match super::hosted_storage(state, Some(&namespace)).open_hosted_blob(name, &filename).await {
         Ok(Some((body, _len))) => {
             let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
                 Ok(bytes) => bytes,

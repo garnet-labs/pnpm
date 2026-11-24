@@ -1,7 +1,19 @@
-use super::{TrustedSettings, WorkspaceSettings, parse_json_or_string, parse_tri_array};
+use super::{
+    TrustedSettings,
+    WorkspaceSettings,
+    parse_json_or_string,
+    parse_tri_array,
+};
 use crate::{
-    ColorMode, Config, LinkWorkspacePackages, NodeLinker, NodePackageMapType,
-    SaveWorkspaceProtocol, TrustPolicy, VirtualStoreType, api::EnvVar,
+    ColorMode,
+    Config,
+    LinkWorkspacePackages,
+    NodeLinker,
+    NodePackageMapType,
+    SaveWorkspaceProtocol,
+    TrustPolicy,
+    VirtualStoreType,
+    api::EnvVar,
 };
 use pnpm_store_dir::StoreIndexFormat;
 use pretty_assertions::assert_eq;
@@ -145,7 +157,7 @@ fn empty_node_options_env_vars_override_lower_layers() {
 
 /// `savePrefix` is the exception to [`empty_env_var_is_treated_as_unset`]:
 /// `""` is the value that pins an exact version, so
-/// `PNPM_CONFIG_SAVE_PREFIX=` must reach the config as `Some("")` — the
+/// `PNPM_CONFIG_SAVE_PREFIX=` must reach the config as `Some("")`, the
 /// same state `savePrefix: ""` in `pnpm-workspace.yaml` produces.
 #[test]
 fn empty_save_prefix_env_var_survives() {
@@ -286,7 +298,7 @@ fn scope_parses_from_env() {
 /// `scope`, like `savePrefix`, is an exception to
 /// [`empty_env_var_is_treated_as_unset`]: `PNPM_CONFIG_SCOPE=` must reach the
 /// config as `Some("")`, not `None`, so it clobbers a scope set by a
-/// lower-priority layer and yields an unscoped `pnpm login` — matching the
+/// lower-priority layer and yields an unscoped `pnpm login`, matching the
 /// TypeScript CLI, whose env pass keeps the empty value.
 #[test]
 fn empty_scope_env_var_survives_to_clobber_lower_layers() {
@@ -298,6 +310,40 @@ fn empty_scope_env_var_survives_to_clobber_lower_layers() {
     }
     let settings = TrustedSettings::from_pnpm_config_env::<EnvEmptyScope>().machine;
     assert_eq!(settings.scope.as_deref(), Some(""));
+}
+
+#[test]
+fn access_reads_from_environment() {
+    struct Env;
+    impl EnvVar for Env {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_ACCESS").then(|| "restricted".to_owned())
+        }
+    }
+    let settings = TrustedSettings::from_pnpm_config_env::<Env>().settings;
+    assert_eq!(settings.access.as_deref(), Some("restricted"));
+}
+
+#[test]
+fn an_access_env_var_outside_the_closed_set_is_ignored() {
+    struct Env;
+    impl EnvVar for Env {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_ACCESS").then(|| "Public".to_owned())
+        }
+    }
+    assert_eq!(TrustedSettings::from_pnpm_config_env::<Env>().settings.access, None);
+}
+
+#[test]
+fn provenance_env_var_parses_false() {
+    struct Env;
+    impl EnvVar for Env {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_CONFIG_PROVENANCE").then(|| "false".to_owned())
+        }
+    }
+    assert_eq!(TrustedSettings::from_pnpm_config_env::<Env>().settings.provenance, Some(false));
 }
 
 #[test]
@@ -496,7 +542,8 @@ fn every_setting_is_read_from_the_environment() {
     let unread: Vec<&str> = settings
         .keys()
         .map(String::as_str)
-        .filter(|key| !requested.contains(*key) && !SETTINGS_NOT_READ_FROM_ENV.contains(key))
+        .filter(|key| !requested.contains(*key))
+        .filter(|key| !SETTINGS_NOT_READ_FROM_ENV.contains(key))
         .collect();
     assert_eq!(unread, Vec::<&str>::new(), "settings with no PNPM_CONFIG_* read");
 
@@ -512,6 +559,9 @@ const SETTINGS_NOT_READ_FROM_ENV: &[&str] = &[
     // Read under the nested key's suffix, such as `NODE_PACKAGE_MAP_MODE`.
     "nodePackageMap",
     "macosBackup",
+    // A section of the global `config.yaml`, which `PNPM_CONFIG_*` overrides
+    // setting by setting.
+    "globalPackagesConfig",
     // Read with the auth files, not through the overlay.
     "_auth",
     "npmrcAuthFile",

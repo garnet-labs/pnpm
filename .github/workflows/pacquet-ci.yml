@@ -92,8 +92,9 @@ jobs:
               - '.config/pnpm/**'
               - 'rust-toolchain.toml'
               - 'rustfmt.toml'
-              - 'crate-layers.toml'
-              - 'deny.toml'
+              - '.config/crate-layers.toml'
+              - '.config/deny.toml'
+              - '.config/clippy.toml'
               - 'dylint.toml'
               - '.taplo.toml'
               - '.typos.toml'
@@ -101,8 +102,6 @@ jobs:
               - '.cargo/**'
               - '.config/nextest.toml'
               - 'fixtures/**'
-              - 'pnpm11/installing/deps-installer/test/fixtures/patch-pkg/**'
-              - 'pnpm11/deps/compliance/commands/test/sbom/fixtures/**'
               - '.github/actions/rustup/**'
               - '.github/actions/binstall/**'
               - '.github/actions/install-crates/**'
@@ -141,20 +140,14 @@ jobs:
               - 'pnpm/crates/cli/tests/suite/peer_convergence.rs'
               - 'pnpm/crates/cli/tests/suite/peer_convergence/**'
               - 'pnpm/crates/cli/tests/suite/repeat_install_oracle.rs'
+              - 'pnpm/crates/cli/tests/suite/repeat_install_oracle/**'
+              - 'pnpm/crates/cli/tests/suite/repeat_install_read_set.rs'
               - 'pnpm/crates/cli/tests/suite/pnpm_compatibility.rs'
               - 'pnpm/crates/cli/tests/suite/injected_freshness_matrix.rs'
               - 'pnpm/crates/cli/tests/suite/version.rs'
               - 'pnpm/crates/testing-utils/**'
               - 'pnpm/crates/config/**'
-              - 'pnpm11/deps/status/**'
-              - 'pnpm11/exec/commands/**'
-              - 'pnpm11/installing/**'
-              - 'pnpm11/config/reader/**'
-              - 'pnpm11/pnpm/src/**'
-              - 'pnpm11/lockfile/**'
-              - 'pnpm11/resolving/**'
-              - 'pnpm11/releasing/commands/src/deploy/**'
-              - 'pnpm11/workspace/state/**'
+              - 'pnpm/test-oracles/**'
               - 'pnpr/.fixtures/**'
               - '.config/nextest.toml'
               - '.github/workflows/pacquet-ci.yml'
@@ -169,7 +162,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
       - name: Validate changeset files
@@ -177,6 +170,9 @@ jobs:
 
   test:
     name: Rust CI / Test / ${{ matrix.os_label }}
+    permissions:
+      contents: read
+      id-token: write
     needs: changes
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') }}
     # Build the nextest artifacts with line-tables-only debug info. The full
@@ -194,6 +190,8 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       RUST_TEST_SHARED_BUILD: ${{ matrix.shared_test_build }}
+      # Jitter entropy initialization aborts on Windows runners: pnpm/tasks#239.
+      AWS_LC_SYS_NO_JITTER_ENTROPY: ${{ matrix.os_label == 'windows' && '1' || '' }}
       # Main only restores compiler cache entries that main wrote.
       SCCACHE_SCOPE: ${{ github.event.pull_request.number && format('pr{0}', github.event.pull_request.number) || github.ref_name }}
     strategy:
@@ -220,6 +218,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Record runtime with Garnet
+        if: ${{ matrix.os_label == 'ubuntu' && runner.arch == 'X64' }}
+        uses: garnet-org/action@7106b4f608f40dd8df44e44346066fdccbae4433 # v2.5.3
+
       # The nextest build holds a full set of debug artifacts in
       # target/, which no longer fits in the hosted runner's free disk —
       # the linker dies with ENOSPC / SIGBUS mid-build. Drop the
@@ -237,7 +239,7 @@ jobs:
           save-cache: ${{ github.ref_name == 'main' }}
 
       - name: Install pnpm (for compatibility check)
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -258,7 +260,7 @@ jobs:
         continue-on-error: true
 
       - name: Install just
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: just
 
@@ -277,7 +279,7 @@ jobs:
           just install
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest,sccache@0.17.0
 
@@ -480,8 +482,73 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # The peer convergence and repeat-install oracle harnesses through pnpm v11
-  # as well as v12, so a resolution, lockfile, or workspace-state change in
+      - name: Report final disk space
+        if: ${{ always() && matrix.os_label == 'ubuntu' && runner.arch == 'X64' }}
+        run: df -h
+
+  metadata-databases:
+    name: Rust CI / Metadata databases
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -ptest"
+          --health-interval 5s --health-timeout 5s --health-retries 24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/rustup
+      - uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
+        with:
+          install: false
+      - run: pnpm runtime set node 22 --global
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
+        with:
+          tool: just,cargo-nextest
+      - name: Install dependencies
+        run: |
+          unset PNPM_HOME XDG_DATA_HOME
+          just install
+      - name: Build pnpr binaries for scheme checks
+        run: |
+          cargo build --locked -p pnpr --bin pnpr --no-default-features
+          cp target/debug/pnpr "$RUNNER_TEMP/pnpr-sqlite-only"
+          cargo build --locked --release -p pnpr --bin pnpr
+          cp target/release/pnpr "$RUNNER_TEMP/pnpr-release"
+      - name: Run metadata conformance and release binary scheme checks
+        env:
+          PNPR_TEST_POSTGRES_URL: postgres://postgres:test@localhost:5432/postgres
+          PNPR_TEST_MYSQL_URL: mysql://root:test@localhost:3306/mysql
+          PNPR_TEST_RELEASE_BIN: ${{ runner.temp }}/pnpr-release
+          PNPR_TEST_SQLITE_ONLY_BIN: ${{ runner.temp }}/pnpr-sqlite-only
+        run: >-
+          pnpm test:rust -p 'pnpr*'
+          -E 'test(on_postgres::) | test(on_mysql) | test(release_databases::)'
+          --test-threads 8 --run-ignored ignored-only
+
+  # The peer convergence and repeat-install oracle harnesses, and the
+  # repeat-install read-set test, through pnpm v11 as well as v12, so a resolution, lockfile, or workspace-state change in
   # either stack cannot make them drift apart. Both harnesses also run through
   # v12 alone in the test job above.
   convergence:
@@ -507,7 +574,7 @@ jobs:
         uses: $/.github/actions/rustup
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -515,7 +582,7 @@ jobs:
         run: pnpm runtime set node 22 --global
 
       - name: Install just
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: just,cargo-nextest
 
@@ -525,17 +592,12 @@ jobs:
           unset XDG_DATA_HOME
           just install
 
-      - name: Bundle pnpm v11
-        run: |
-          pnpm --filter pnpm exec tsgo --build
-          pnpm --filter pnpm run bundle
-
       - name: Run the convergence harnesses through v11 and v12
         run: |
           unset PNPM_HOME
           unset XDG_DATA_HOME
-          PNPM_V11_BUNDLE="$PWD/pnpm11/pnpm/dist/pnpm.mjs" \
-            pnpm test:rust -p pnpm-cli --run-ignored all -E 'test(/^peer_convergence::/) or test(/^repeat_install_oracle::/) or test(/^pnpm_compatibility::/) or test(/^injected_freshness_matrix::/) or test(/^version::switches_up_to_a_newer_pnpm/) or test(/^version::v11_switches_up/)'
+          PNPM_V11_BUNDLE="$PWD/pnpm/test-oracles/node_modules/pnpm-v11/dist/pnpm.mjs" \
+            pnpm test:rust -p pnpm-cli --run-ignored all -E 'test(/^peer_convergence::/) or test(/^repeat_install_oracle::/) or test(/^repeat_install_read_set::/) or test(/^pnpm_compatibility::/) or test(/^injected_freshness_matrix::/) or test(/^version::switches_up_to_a_newer_pnpm/) or test(/^version::v11_switches_up/)'
 
   clippy:
     name: Rust CI / Clippy / ${{ matrix.os_label }}
@@ -574,7 +636,7 @@ jobs:
           clippy: true
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -588,6 +650,10 @@ jobs:
 
       - name: Clippy
         run: pnpm pipeline rust-clippy --include-workspace-root --full
+
+      - name: Clippy (pnpr without optional database drivers)
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p pnpr --bin pnpr --no-default-features -- -D warnings
 
   doc:
     name: Rust CI / Doc / ${{ matrix.os_label }}
@@ -617,7 +683,7 @@ jobs:
           docs: true
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -667,7 +733,7 @@ jobs:
       # project, which is what pins the repository's runtime, and get-pnpm's
       # TypeScript tests need 22.18 or newer.
       - name: Install pnpm and Node
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           runtime: node@24
           install: false
@@ -677,7 +743,7 @@ jobs:
       # filter does not narrow the Cargo half of the install, which is why the
       # step above provisions Rust.
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter "pacquet..."
+        run: pnpm install --frozen-lockfile --filter "pnpm..."
 
       # Builds get-pnpm before running its tests, and leaves the build output
       # the wrapper's tests bundle.
@@ -735,7 +801,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+      - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
         with:
           files: pnpm pnpr
 
@@ -756,7 +822,7 @@ jobs:
           filters: |
             src:
               - 'Cargo.lock'
-              - 'deny.toml'
+              - '.config/deny.toml'
 
       # `pnpm pipeline` installs before it runs anything, and that install
       # runs `cargo`. Provision the pinned toolchain first so it does not race
@@ -769,13 +835,13 @@ jobs:
 
       - name: Install pnpm
         if: github.event_name == 'merge_group' || steps.filter.outputs.src == 'true'
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
       - name: Install cargo-deny
         if: github.event_name == 'merge_group' || steps.filter.outputs.src == 'true'
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-deny
 
@@ -791,6 +857,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The dependency structure matrix reads co-changes from the
+          # latest 1000 commits, the default of its `--commits`. It leaves
+          # out the oldest commit of a shallow clone.
+          fetch-depth: 1001
 
       - name: Install Rust
         uses: $/.github/actions/rustup
@@ -798,11 +868,26 @@ jobs:
           restore-cache: false
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
       - run: pnpm pipeline rust-layers --include-workspace-root --full --no-cache
+
+      # Runs before the shallow fetch below, which can cut the history short.
+      - name: Write the dependency structure matrix
+        if: ${{ !cancelled() }}
+        run: cargo run --locked --quiet -p pnpm-crate-layers -- dsm --output crate-dsm.html
+
+      - name: Upload the dependency structure matrix
+        if: ${{ !cancelled() }}
+        # The page is a report, so an upload failure leaves the check green.
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crate-dsm
+          path: crate-dsm.html
+          retention-days: 30
 
       # Lists the crate dependency edges the pull request adds or removes, so
       # a review sees a new coupling even when it points downward.
@@ -835,7 +920,7 @@ jobs:
           packages: taplo-cli@0.8.1
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -865,8 +950,9 @@ jobs:
     name: Rust CI / Dylint / ${{ matrix.os_label }}
     needs: changes
     if: ${{ always() && !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.result != 'success') }}
-    # Windows gets its own row for the same reason Clippy does: a Linux-only
-    # run never compiles `#[cfg(windows)]` code, so its findings go unseen.
+    # A run lints only the code compiled for its own target, so Windows and
+    # macOS each get a row for their `#[cfg(windows)]` and
+    # `#[cfg(target_os = "macos")]` code.
     strategy:
       fail-fast: false
       matrix:
@@ -875,6 +961,8 @@ jobs:
             os_label: ubuntu
           - os: blacksmith-4vcpu-windows-2025
             os_label: windows
+          - os: blacksmith-12vcpu-macos-latest
+            os_label: macos
     runs-on: ${{ matrix.os }}
     steps:
       - name: Verify change detection
@@ -941,7 +1029,7 @@ jobs:
           packages: cargo-dylint@6.3.0 dylint-link@6.3.0
 
       - name: Install pnpm
-        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        uses: pnpm/setup@731dfb6463bbd11c11fd0ee11fe00ed0e36d48a1 # v3.2.0
         with:
           install: false
 
@@ -971,6 +1059,7 @@ jobs:
       - change-check
       - test
       - convergence
+      - metadata-databases
       - npm-wrapper
       - clippy
       - doc

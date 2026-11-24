@@ -10,25 +10,43 @@
 //! the install just wrote (the catalog write happens before the install
 //! so the resolver reads the new entries back), so they cannot ride along.
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    EnvLockfile, LoadLockfileError, Lockfile, PackageKey, prune_env_lockfile,
+    EnvLockfile,
+    LoadLockfileError,
+    Lockfile,
+    PackageKey,
+    prune_env_lockfile,
     retain_config_dependencies,
 };
 use pnpm_package_manifest::PackageManifest;
 use pnpm_workspace::{
-    FindWorkspaceDirError, FindWorkspaceProjectsError, FindWorkspaceProjectsOpts, Project,
-    ReadWorkspaceManifestError, find_workspace_projects, read_workspace_manifest,
+    FindWorkspaceDirError,
+    FindWorkspaceProjectsError,
+    FindWorkspaceProjectsOpts,
+    Project,
+    ReadWorkspaceManifestError,
+    find_workspace_projects,
+    read_workspace_manifest,
     workspace_package_patterns,
 };
 use pnpm_workspace_manifest_writer::{
-    CatalogReferenceSources, ResolvedPackageVersions, UpdateWorkspaceManifestError,
-    UpdateWorkspaceManifestOptions, update_workspace_manifest,
+    CatalogReferenceSources,
+    ResolvedPackageVersions,
+    UpdateWorkspaceManifestError,
+    UpdateWorkspaceManifestOptions,
+    update_workspace_manifest,
 };
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 /// Failure modes of the workspace-manifest write (including the
 /// project discovery the cleanup pass needs).
@@ -69,8 +87,7 @@ pub(crate) fn write_workspace_catalogs(
         None => derive_workspace_dir(config, current_manifest)?,
     };
     let projects = if config.catalog_prune {
-        let ignored_directories = config.managed_directories();
-        load_cleanup_projects(&workspace_dir, &ignored_directories)?
+        load_cleanup_projects(&workspace_dir, config.managed_directories())?
     } else {
         Vec::new()
     };
@@ -176,14 +193,14 @@ fn derive_workspace_dir(
 /// lockfile written by the just-finished install no longer records.
 ///
 /// The pass may only drop an entry it can prove nothing resolves, so it
-/// needs a lockfile covering every project the exclude lists govern —
+/// needs a lockfile covering every project the exclude lists govern,
 /// only a shared one does. Under dedicated per-project lockfiles
 /// (`sharedWorkspaceLockfile: false` with no `lockfileDir` pinning them
 /// back together) every entry a sibling project needs would look
 /// unresolved, so the pass no-ops; the commands that install every
 /// selected project one by one run [`prune_against_project_lockfiles`]
 /// once they are done. It also no-ops when the settings are
-/// off, when lockfile persistence is disabled (`lockfile: false` — the
+/// off, when lockfile persistence is disabled (`lockfile: false`, the
 /// on-disk lockfile would be stale), and when no lockfile exists,
 /// mirroring the `all_projects` guard of the catalog cleanup.
 pub(crate) fn post_install_prune(
@@ -233,7 +250,7 @@ pub fn prune_against_project_lockfiles(
         return Ok(());
     }
     let mut project_dirs: Vec<PathBuf> =
-        load_cleanup_projects(workspace_dir, &config.managed_directories())?
+        load_cleanup_projects(workspace_dir, config.managed_directories())?
             .into_iter()
             .map(|project| project.root_dir)
             .collect();
@@ -295,7 +312,7 @@ fn prune_unresolved_entries(
 
 /// Adds each snapshot key to `resolved` with its resolved version.
 /// A registry-qualified slot (`<name>@<registryName>:<version>`)
-/// registers the version after the prefix — `PkgVerPeer::version_semver`
+/// registers the version after the prefix. `PkgVerPeer::version_semver`
 /// treats it as opaque for reuse/preference paths, but here the version
 /// within the named registry is exactly what a versioned exclude entry
 /// names. Packages resolved from a non-semver source (git, tarball,
@@ -319,10 +336,10 @@ fn record_resolved_package_versions<'a>(
 
 /// Every project manifest under `workspace_dir`, read from disk. An
 /// absent `pnpm-workspace.yaml` yields no projects, which disables the
-/// cleanup pass — there is no workspace manifest to clean either.
+/// cleanup pass; there is no workspace manifest to clean either.
 fn load_cleanup_projects(
     workspace_dir: &Path,
-    ignored_directories: &[PathBuf],
+    ignored_directories: Vec<PathBuf>,
 ) -> Result<Vec<Project>, WriteWorkspaceCatalogsError> {
     let Some(workspace_manifest) = read_workspace_manifest(workspace_dir)
         .map_err(WriteWorkspaceCatalogsError::ReadWorkspaceManifest)?
@@ -331,7 +348,7 @@ fn load_cleanup_projects(
     };
     let opts = FindWorkspaceProjectsOpts {
         patterns: Some(workspace_package_patterns(&workspace_manifest)),
-        ignored_directories: ignored_directories.to_vec(),
+        ignored_directories,
     };
     find_workspace_projects(workspace_dir, &opts)
         .map_err(WriteWorkspaceCatalogsError::FindWorkspaceProjects)

@@ -1,13 +1,23 @@
 use super::{
     importers::SortedImporters,
-    options::{PassSettings, WorkspaceImporter},
+    options::{
+        PassSettings,
+        WorkspaceImporter,
+    },
 };
 use crate::{
-    resolve_dependency_tree::importer_direct_wanted_specs, resolve_importer::ResolveImporterOptions,
+    resolve_dependency_tree::importer_direct_wanted_specs,
+    resolve_importer::ResolveImporterOptions,
 };
-use chrono::{DateTime, Duration, Utc};
+use jiff::{
+    SignedDuration,
+    Timestamp,
+};
 use pnpm_package_manifest::DependencyGroup;
-use pnpm_resolving_resolver_base::{Resolver, parse_packument_timestamp};
+use pnpm_resolving_resolver_base::{
+    Resolver,
+    parse_packument_timestamp,
+};
 use std::collections::BTreeMap;
 
 /// The `minimumReleaseAge` cutoff is set uniformly on every importer's
@@ -35,7 +45,7 @@ where
 pub(super) struct TimeBasedCutoff {
     /// The ceiling every transitive dependency's publish date must
     /// respect.
-    pub(super) published_by: Option<DateTime<Utc>>,
+    pub(super) published_by: Option<Timestamp>,
     /// Publish date per direct dependency, for the lockfile's `time:`
     /// section.
     pub(super) time: BTreeMap<String, String>,
@@ -44,22 +54,22 @@ pub(super) struct TimeBasedCutoff {
 /// Resolve every importer's direct dependencies and derive the
 /// `time-based` publish-date cutoff for transitive deps.
 ///
-/// Each direct dependency's publish date comes from its packument, or —
-/// against a registry whose abbreviated metadata omits publish times —
+/// Each direct dependency's publish date comes from its packument, or
+/// (against a registry whose abbreviated metadata omits publish times)
 /// from `recorded_time`, the date the lockfile's `time:` section
 /// recorded for it. The cutoff is the newest of those dates plus an
 /// hour, clamped by `maximum_published_by`.
 ///
 /// Only the direct deps' publish date is read here, so the throwaway
 /// resolves warm the resolver's packument cache for the real walk that
-/// follows. Resolver errors are ignored here — the real walk surfaces
+/// follows. Resolver errors are ignored here, the real walk surfaces
 /// them.
 pub(super) async fn compute_time_based_cutoff<Chain>(
     resolver: &Chain,
     sorted: &SortedImporters<'_, '_>,
     dependency_groups: &[DependencyGroup],
     settings: &PassSettings,
-    maximum_published_by: Option<DateTime<Utc>>,
+    maximum_published_by: Option<Timestamp>,
 ) -> TimeBasedCutoff
 where
     Chain: Resolver + ?Sized,
@@ -81,7 +91,10 @@ where
         .values()
         .filter_map(|published_at| parse_packument_timestamp(published_at))
         .max();
-    let candidate = newest.and_then(|date| date.checked_add_signed(Duration::hours(1)));
+    let candidate = newest.and_then(|date| {
+        date.checked_add(SignedDuration::from_hours(1))
+            .ok()
+    });
     let published_by = match (candidate, maximum_published_by) {
         (Some(candidate), Some(maximum)) => Some(candidate.min(maximum)),
         (Some(candidate), None) => Some(candidate),

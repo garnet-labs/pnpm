@@ -1,9 +1,28 @@
 use super::{
-    Catalogs, Context, DependencyGroup, Diagnostic, Display, Error, InstallFamilySelection,
-    IntoDiagnostic, Lockfile, LockfileResolution, PathBuf, PnprLink, PnprSession, PublishConfig,
-    ResolveProject, ResolveProjectsOptions, State, discover_workspace_projects,
-    get_catalogs_from_workspace_manifest, prefetch_allowed,
+    Catalogs,
+    Context,
+    DependencyGroup,
+    Diagnostic,
+    Display,
+    Error,
+    InstallFamilySelection,
+    IntoDiagnostic,
+    Lockfile,
+    LockfileResolution,
+    PathBuf,
+    PnprLink,
+    PnprSession,
+    PublishConfig,
+    ResolveProject,
+    ResolveProjectsOptions,
+    State,
+    discover_workspace_projects,
+    get_catalogs_from_workspace_manifest,
+    pnpr_lockfile::pnpr_exotic_subdeps_policy,
+    pnpr_lockfile_dir,
+    prefetch_allowed,
 };
+use pnpm_lockfile_verification::ExoticSubdepsPolicy;
 use pnpm_network::normalize_registry_url;
 
 const BENCHMARK_PNPR_SERVER_REGISTRY_ENV: &str = "PACQUET_BENCHMARK_PNPR_SERVER_REGISTRY";
@@ -21,14 +40,16 @@ pub(super) struct PnprRequestInputs {
     pub(super) pnpmfile_hook: Option<std::sync::Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     pub(super) prefetch_allowed: bool,
     pub(super) lockfile_path: PathBuf,
+    pub(super) exotic_subdeps: ExoticSubdepsPolicy,
 }
 
 pub(super) async fn pnpr_request_inputs(
     state: &State,
     link: &PnprLink<'_>,
-    lockfile_dir: &std::path::Path,
+    session: &PnprSession<'_>,
     pnpmfile_hook: Option<std::sync::Arc<dyn pnpm_hooks::PnpmfileHooks>>,
 ) -> miette::Result<PnprRequestInputs> {
+    let lockfile_dir = pnpr_lockfile_dir(state, link);
     let overrides = state.config.overrides
         .as_ref()
         .map(serde_json::to_value)
@@ -48,6 +69,7 @@ pub(super) async fn pnpr_request_inputs(
         Some(lockfile_path) => lockfile_path.to_path_buf(),
         None => lockfile_dir.join(state.config.wanted_lockfile_name()),
     };
+    let exotic_subdeps = pnpr_exotic_subdeps_policy(state, link, session);
     Ok(PnprRequestInputs {
         overrides,
         patched_dependencies,
@@ -56,6 +78,7 @@ pub(super) async fn pnpr_request_inputs(
         pnpmfile_hook,
         prefetch_allowed,
         lockfile_path,
+        exotic_subdeps,
     })
 }
 
@@ -64,7 +87,7 @@ pub(super) async fn pnpr_request_inputs(
 /// the client never runs `verify_lockfile_resolutions` on the pnpr
 /// path ([pnpm/pnpm#12139](https://github.com/pnpm/pnpm/issues/12139)).
 /// `trustPolicy: no-downgrade` is enforced
-/// server-side — both for reused entries (the input-lockfile
+/// server-side; both for reused entries (the input-lockfile
 /// verifier) and freshly-resolved ones (the resolver's pick-time
 /// gate, since the policy is wired into the server's config).
 pub(super) fn resolve_projects_options(
@@ -83,7 +106,7 @@ pub(super) fn resolve_projects_options(
             // Only the caller's identity to pnpr is sent. Upstream registry
             // credentials are never forwarded: pnpr selects them from its own
             // route policy, so they stay out of the request body.
-            authorization: state.config.auth_headers.for_url(pnpr_server),
+            authorization: state.config.auth_headers.for_secure_url(pnpr_server),
         },
         transforms: pnpm_pnpr_client::ManifestTransforms {
             overrides: inputs.overrides.take(),
@@ -92,22 +115,35 @@ pub(super) fn resolve_projects_options(
             allow_unused_patches: state.config.allow_unused_patches,
             catalogs: session.catalogs.take(),
         },
-        resolution: pnpm_pnpr_client::ResolutionSettings {
-            auto_install_peers: Some(state.config.auto_install_peers),
-            dedupe_peers: Some(state.config.dedupe_peers),
-            exclude_links_from_lockfile: Some(state.config.exclude_links_from_lockfile),
-            add_missing_peer_types: Some(state.config.add_missing_peer_types),
-            resolution_mode: state.config.resolution_mode,
-        },
+        resolution: resolution_settings(state.config),
         reuse: pnpm_pnpr_client::LockfileReuseOptions {
             lockfile: session.previous_wanted.cloned(),
             frozen_lockfile: link.lockfile.frozen,
             prefer_frozen_lockfile: Some(link.lockfile.prefer_frozen),
             update_patches: link.lockfile.update_patches,
+            update_checksums: link.lockfile.update_checksums,
             ignore_manifest_check: link.lockfile.ignore_manifest_check,
             trust_lockfile: link.lockfile.trust,
         },
         verification: verification_policy(state.config),
+    }
+}
+
+/// The client's settings that shape the lockfile the server resolves.
+fn resolution_settings(config: &pnpm_config::Config) -> pnpm_pnpr_client::ResolutionSettings {
+    pnpm_pnpr_client::ResolutionSettings {
+        auto_install_peers: Some(config.auto_install_peers),
+        dedupe_peers: Some(config.dedupe_peers),
+        exclude_links_from_lockfile: Some(config.exclude_links_from_lockfile),
+        add_missing_peer_types: Some(config.add_missing_peer_types),
+        project_scoped_optional_peers: Some(config.project_scoped_optional_peers_take_effect()),
+        resolution_mode: config.resolution_mode,
+        dependency_graph: pnpm_pnpr_client::DependencyGraphSettings {
+            inject_workspace_packages: config.inject_workspace_packages,
+            dedupe_injected_deps: (!config.dedupe_injected_deps).then_some(false),
+            ignored_optional_dependencies: config.ignored_optional_dependencies.clone(),
+            block_exotic_subdeps: config.block_exotic_subdeps,
+        },
     }
 }
 
@@ -122,13 +158,29 @@ pub(super) fn resolve_projects_options(
 )]
 pub(super) struct AddMissingPeerTypesIgnoredByPnpr;
 
+/// `projectScopedOptionalPeers` took effect, but the lockfile the pnpr
+/// server returned was resolved without it, like
+/// [`AddMissingPeerTypesIgnoredByPnpr`].
+#[derive(Debug, Display, Error, Diagnostic)]
+#[display("The pnpr server resolved the lockfile without the projectScopedOptionalPeers setting.")]
+#[diagnostic(
+    code(ERR_PNPM_PNPR_SERVER_IGNORED_PROJECT_SCOPED_OPTIONAL_PEERS),
+    help("Upgrade the pnpr server, or set projectScopedOptionalPeers to false.")
+)]
+pub(super) struct ProjectScopedOptionalPeersIgnoredByPnpr;
+
 /// Reject a server lockfile resolved without a setting the request sent.
 pub(super) fn check_pnpr_applied_settings(
     config: &pnpm_config::Config,
     returned: Option<&pnpm_lockfile::LockfileSettings>,
-) -> Result<(), AddMissingPeerTypesIgnoredByPnpr> {
+) -> miette::Result<()> {
     if config.add_missing_peer_types && !pnpm_lockfile::recorded_add_missing_peer_types(returned) {
-        return Err(AddMissingPeerTypesIgnoredByPnpr);
+        return Err(AddMissingPeerTypesIgnoredByPnpr.into());
+    }
+    if config.project_scoped_optional_peers_take_effect()
+        && !pnpm_lockfile::recorded_project_scoped_optional_peers(returned)
+    {
+        return Err(ProjectScopedOptionalPeersIgnoredByPnpr.into());
     }
     Ok(())
 }
@@ -191,6 +243,12 @@ fn resolve_project(
             .dependencies([DependencyGroup::Peer])
             .map(|(name, spec)| (name.to_string(), spec.to_string()))
             .collect(),
+        dependencies_meta: manifest
+            .value()
+            .get("dependenciesMeta")
+            .and_then(serde_json::Value::as_object)
+            .filter(|meta| !meta.is_empty())
+            .cloned(),
     }
 }
 
@@ -288,7 +346,8 @@ impl PnprBenchmarkRegistryOverride {
     pub(super) fn client_tarball_url(&self, url: &str) -> String {
         self.tarball_rewrite
             .as_ref()
-            .map_or_else(|| url.to_string(), |rewrite| rewrite.url(url))
+            .map(|rewrite| rewrite.url(url))
+            .unwrap_or_else(|| url.to_string())
     }
 
     pub(super) fn rewrite_lockfile(&self, lockfile: &mut Lockfile) {
@@ -326,7 +385,8 @@ impl BenchmarkRegistryRewrite {
         self.from
             .iter()
             .find_map(|from| url.strip_prefix(from))
-            .map_or_else(|| url.to_string(), |suffix| format!("{}{}", self.to, suffix))
+            .map(|suffix| format!("{}{}", self.to, suffix))
+            .unwrap_or_else(|| url.to_string())
     }
 }
 
@@ -342,11 +402,11 @@ pub(super) fn rewrite_resolution_registry(
             resolution.url = rewrite.url(&resolution.url);
         }
         LockfileResolution::Variations(resolution) => {
-            for resolution in resolution.resolutions_mut() {
-                rewrite_resolution_registry(resolution, rewrite);
+            for variant in &mut resolution.variants {
+                rewrite_resolution_registry(&mut variant.resolution, rewrite);
             }
         }
-        // Custom resolutions are opaque — the benchmark rewrite can't
+        // Custom resolutions are opaque, the benchmark rewrite can't
         // know which of their fields (if any) is a registry URL.
         LockfileResolution::Directory(_)
         | LockfileResolution::Git(_)
@@ -362,6 +422,7 @@ pub(super) fn verification_policy(
         minimum_release_age: config.minimum_release_age,
         minimum_release_age_exclude: config.minimum_release_age_exclude.clone(),
         minimum_release_age_ignore_missing_time: config.minimum_release_age_ignore_missing_time,
+        minimum_release_age_strict: config.resolved_minimum_release_age_strict(),
         trust_policy: config.trust_policy,
         trust_policy_exclude: config.trust_policy_exclude.clone(),
         trust_policy_ignore_after: config.trust_policy_ignore_after,

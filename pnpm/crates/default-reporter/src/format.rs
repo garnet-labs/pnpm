@@ -8,7 +8,7 @@ use std::borrow::Cow;
 pub const PREFIX_MAX_LENGTH: usize = 40;
 
 /// Port of `pretty-bytes` with `{ minimumFractionDigits: 2,
-/// maximumFractionDigits: 2 }` — base-1000 units, always two decimals, a
+/// maximumFractionDigits: 2 }`, base-1000 units, always two decimals, a
 /// space before the unit. pnpm's pinned version truncates at two fractional
 /// digits for these progress values.
 #[must_use]
@@ -37,11 +37,11 @@ pub fn pretty_ms(ms: u128) -> String {
     }
     let mut secs = ms as f64 / 1000.0;
     let days = (secs / 86_400.0).floor();
-    secs -= days * 86_400.0;
+    secs = days.mul_add(-86_400.0, secs);
     let hours = (secs / 3_600.0).floor();
-    secs -= hours * 3_600.0;
+    secs = hours.mul_add(-3_600.0, secs);
     let mins = (secs / 60.0).floor();
-    secs -= mins * 60.0;
+    secs = mins.mul_add(-60.0, secs);
 
     let mut parts = Vec::new();
     if days > 0.0 {
@@ -128,7 +128,8 @@ pub fn cut_line(line: &str, max: isize) -> String {
 pub fn printable_script_line(line: &str, keep_colors: bool) -> Cow<'_, str> {
     if !line
         .chars()
-        .any(|ch| ch.is_control() && ch != '\t')
+        .filter(|ch| ch.is_control())
+        .any(|ch| ch != '\t')
     {
         return Cow::Borrowed(line);
     }
@@ -201,10 +202,10 @@ fn escape_len(text: &str) -> usize {
 
 /// Parameter and intermediate bytes up to and including the final byte.
 fn csi_len(text: &str) -> usize {
-    let Some(end) = text.find(|ch: char| !('\u{20}'..='\u{3f}').contains(&ch)) else {
+    let Some(end) = text.find(|ch: char| !('\u{20}'..='?').contains(&ch)) else {
         return text.len();
     };
-    let has_final_byte = text[end..].starts_with(|ch: char| ('\u{40}'..='\u{7e}').contains(&ch));
+    let has_final_byte = text[end..].starts_with(|ch: char| ('@'..='~').contains(&ch));
     end + usize::from(has_final_byte)
 }
 
@@ -319,7 +320,7 @@ pub fn highlight_last_folder(path: &str, colors: &crate::colors::Colors) -> Stri
 /// Substring containment after slash-normalization, used by the lifecycle
 /// "collapsed" rule. Ports pnpm's `wd.includes(NODE_MODULES)` /
 /// `wd.includes(TMP_DIR_IN_STORE)` checks in `reportLifecycleScripts.ts`,
-/// which are plain `String.includes` calls — segment-aware matching would
+/// which are plain `String.includes` calls, segment-aware matching would
 /// diverge from pnpm. The needles pnpm passes (`/node_modules/`, `tmp/_tmp_`)
 /// already carry their own separators, so substring matching is sufficient.
 #[must_use]

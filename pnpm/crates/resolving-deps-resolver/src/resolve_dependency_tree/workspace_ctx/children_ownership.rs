@@ -1,6 +1,17 @@
 use super::{
-    AncestorPkgIds, Arc, BTreeMap, DependenciesTreeNode, HashMap, HashSet, NodeId,
-    ParentPkgAliases, PeerDep, PkgNameVerPeer, TreeChildren, TreeCtx, UpdateReuseScope,
+    AncestorPkgIds,
+    Arc,
+    BTreeMap,
+    DependenciesTreeNode,
+    HashMap,
+    HashSet,
+    NodeId,
+    ParentPkgAliases,
+    PeerDep,
+    PkgNameVerPeer,
+    TreeChildren,
+    TreeCtx,
+    UpdateReuseScope,
     lock_recoverable,
 };
 
@@ -76,7 +87,7 @@ pub(in super::super) struct RecordedChildrenContext {
 
 impl RecordedChildrenContext {
     /// Whether a walk under `other` would re-resolve what the prior
-    /// lockfile pinned for this recording — the churn reuse exists to
+    /// lockfile pinned for this recording, the churn reuse exists to
     /// avoid, and which leaves the occurrences that realized the
     /// pinned subtree pointing at children the record no longer holds.
     ///
@@ -93,7 +104,7 @@ impl RecordedChildrenContext {
 pub(in super::super) struct ChildrenOwnerClaim {
     pub(in super::super) owner: ChildrenOwner,
     pub(in super::super) owns_children: bool,
-    /// The shadowed-dependency set in force for the package id — this
+    /// The shadowed-dependency set in force for the package id; this
     /// occurrence's when it won the claim, the standing owner's when it
     /// lost. See [`ChildrenOwnerEntry::peer_shadowed`].
     pub(in super::super) peer_shadowed: Arc<HashSet<String>>,
@@ -243,7 +254,7 @@ pub(in super::super) fn record_children(
         children.insert(Arc::clone(pkg_id), RecordedChildren { edges, context });
         recording
     };
-    ctx.workspace.tree.record_children_by_id_write(pkg_id);
+    ctx.workspace.tree.record_children_by_id_write(pkg_id.to_string());
     ctx.workspace.note_finalization_candidate(pkg_id);
     recording
 }
@@ -293,7 +304,7 @@ pub(in super::super) fn register_peer_dep_names(
     let mut all_peers = lock_recoverable(&ctx.workspace.tree.all_peer_dep_names);
     for name in peer_dependencies.keys() {
         if all_peers.insert(name.clone()) {
-            ctx.workspace.tree.record_peer_dep_name(name);
+            ctx.workspace.tree.record_peer_dep_name(name.clone());
         }
     }
 }
@@ -376,7 +387,7 @@ pub(in super::super) fn make_non_owner_nodes_lazy(
             continue;
         }
         // An occurrence already reading the owner's children needs no
-        // rewrite — and must not report one, since the signal makes the
+        // rewrite, and must not report one, since the signal makes the
         // discovery engine rebuild from scratch. In a peer-heavy graph
         // most occurrences of a package are already lazy.
         if let Some(node) = tree.get_mut(&node_id)
@@ -393,5 +404,23 @@ pub(in super::super) fn make_non_owner_nodes_lazy(
     }
     if rewrote_any {
         ctx.workspace.tree.record_children_rewrite();
+    }
+}
+
+impl super::WorkspaceTreeCtx {
+    pub(in super::super) fn record_locked_resolution(
+        &self,
+        node_id: &NodeId,
+        locked: Option<Box<crate::resolved_tree::LockedResolution>>,
+    ) {
+        let mut nodes = lock_recoverable(&self.tree.dependencies_tree);
+        let node = nodes.get_mut(node_id).expect("locked resolution belongs to an inserted node");
+        // A shared leaf records artifact provenance; update precedence belongs to its importer.
+        if locked.is_none() && matches!(node_id, NodeId::Leaf(_)) {
+            return;
+        }
+        node.locked = locked;
+        drop(nodes);
+        self.tree.record_tree_node_write(node_id);
     }
 }

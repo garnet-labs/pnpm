@@ -1,8 +1,19 @@
 use super::{
-    MAX_VIRTUAL_SHIM_METADATA_BYTES, Path, PathBuf, VIRTUAL_SHIM_STATE_PREFIX, VirtualShimState,
-    create_short_hash, fs, io, is_safe_bin_name, is_valid_old_npm_package_name,
+    MAX_VIRTUAL_SHIM_METADATA_BYTES,
+    Path,
+    PathBuf,
+    VIRTUAL_SHIM_STATE_PREFIX,
+    VirtualShimState,
+    create_short_hash,
+    fs,
+    io,
+    is_safe_bin_name,
+    is_valid_old_npm_package_name,
 };
-use miette::{Context, IntoDiagnostic};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
 use std::io::Read as _;
 
 pub(super) fn read_virtual_shim_state(path: &Path) -> miette::Result<Option<VirtualShimState>> {
@@ -48,10 +59,10 @@ pub(super) fn read_virtual_shim_state(path: &Path) -> miette::Result<Option<Virt
 pub(crate) fn record_virtual_shim_state(
     bin_dir: &Path,
     package: &str,
-    bins: &[String],
+    bins: Vec<String>,
 ) -> miette::Result<()> {
     let path = virtual_shim_state_path(bin_dir, package);
-    let state = VirtualShimState { package: package.to_string(), bins: bins.to_vec() };
+    let state = VirtualShimState { package: package.to_string(), bins };
     let bytes = serde_json::to_vec(&state).into_diagnostic().wrap_err("serialize virtual shims")?;
     pnpm_fs::write_atomic(&path, &bytes)
         .into_diagnostic()

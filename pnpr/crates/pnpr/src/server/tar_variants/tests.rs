@@ -1,8 +1,17 @@
-use super::{COPY_QUOTA_BYTES, CopyReservation, MAX_VARIANT_TAR_BYTES, Ordering, TarVariantQueue};
-use std::{path::PathBuf, sync::Arc};
+use super::{
+    COPY_QUOTA_BYTES,
+    CopyReservation,
+    MAX_VARIANT_TAR_BYTES,
+    Ordering,
+    TarVariantQueue,
+};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+};
 
 fn reservation(queue: &TarVariantQueue, variant: &str) -> CopyReservation {
-    assert!(queue.claim(variant), "{variant} is free to claim");
+    assert!(queue.claim(variant.to_owned()), "{variant} is free to claim");
     CopyReservation {
         quota: Arc::clone(&queue.copies),
         variant: variant.to_string(),
@@ -15,9 +24,9 @@ fn reservation(queue: &TarVariantQueue, variant: &str) -> CopyReservation {
 fn one_copy_per_variant_is_in_flight_at_a_time() {
     let queue = TarVariantQueue::new();
     let copy = reservation(&queue, "a.tar.zst");
-    assert!(!queue.claim("a.tar.zst"), "a concurrent miss shares the copy in flight");
+    assert!(!queue.claim("a.tar.zst".to_owned()), "a concurrent miss shares the copy in flight");
     drop(copy);
-    assert!(queue.claim("a.tar.zst"), "a dropped copy frees its variant");
+    assert!(queue.claim("a.tar.zst".to_owned()), "a dropped copy frees its variant");
 }
 
 #[test]
@@ -46,7 +55,7 @@ async fn a_copy_offered_to_a_full_queue_is_dropped() {
         &pnpr_config::HostedStoreConfig::Fs,
         storage_dir.path().join("storage"),
         storage_dir.path().join("cache"),
-        &pnpr_config::MetadataBackend::Sqlite(storage_dir.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(storage_dir.path().join("metadata.sqlite")),
     )
     .unwrap();
     let name =

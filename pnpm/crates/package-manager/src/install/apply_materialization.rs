@@ -1,28 +1,56 @@
 pub(in crate::install) mod commit;
 pub(in crate::install) mod completion;
 
-use commit::{CommitModulesStateInputs, commit_modules_state};
+use commit::{
+    CommitModulesStateInputs,
+    commit_modules_state,
+};
 use completion::{
-    MaterializedProjectScriptsInputs, ReportInstallCompletionInputs, ResolveOnlyCompletionInputs,
-    complete_resolve_only, report_install_completion, run_materialized_project_scripts,
+    MaterializedProjectScriptsInputs,
+    ReportInstallCompletionInputs,
+    ResolveOnlyCompletionInputs,
+    complete_resolve_only,
+    report_install_completion,
+    run_materialized_project_scripts,
 };
 
 mod selection;
 use selection::{
-    LinkMaterializedLockfiles, LinkMaterializedManifestLinks, LinkMaterializedProjectsInputs,
-    MaterializedState, SelectMaterializedStateInputs, link_materialized_projects,
+    LinkMaterializedLockfiles,
+    LinkMaterializedManifestLinks,
+    LinkMaterializedProjectsInputs,
+    MaterializedState,
+    SelectMaterializedStateInputs,
+    link_materialized_projects,
     select_materialized_state,
 };
 
 use super::{
-    BTreeMap, CarriedSettings, HoistedDependencies, InstallError, Lockfile, Materialized, Reporter,
-    StateWrite, recorded_workspace_state, update_workspace_state_or_warn,
+    BTreeMap,
+    CarriedSettings,
+    HoistedDependencies,
+    InstallError,
+    Lockfile,
+    LogLevel,
+    Materialized,
+    Reporter,
+    StateWrite,
+    SummaryLog,
+    recorded_workspace_state,
+    update_workspace_state_or_warn,
 };
-use crate::install_state::{ResolvedImporters, filesystem_now_ms_in_modules, validation::Vouched};
-use std::{collections::HashSet, path::PathBuf};
+use crate::install_state::{
+    ResolvedImporters,
+    filesystem_now_ms_in_modules,
+    validation::Vouched,
+};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+};
 
 pub(super) struct ApplyMaterializationInputs<'a, 'selection> {
-    pub(crate) completion: crate::install::state_options::ApplyCompletionContext,
+    pub(crate) completion: crate::install::state_options::ApplyCompletionContext<'a>,
     pub(crate) mode: crate::install::state_options::CompletionMode,
     pub(crate) prior: crate::install::state_options::ApplyPriorState,
     pub(crate) projects: crate::install::state_options::ApplyProjectSelection<'a>,
@@ -55,6 +83,8 @@ fn select_apply_state<'a>(inputs: &'a ApplyMaterializationInputs<'_, '_>) -> Mat
         },
         projects: inputs.projects.importers,
 
+        node_linker: inputs.projects.node_linker,
+        virtual_store_only: inputs.completion.config.virtual_store_only,
         workspace_root: &inputs.projects.workspace_root,
         groups: applied_groups(inputs),
         install_skipped: &inputs.materialized.install_skipped,
@@ -72,16 +102,14 @@ fn applied_groups(inputs: &ApplyMaterializationInputs<'_, '_>) -> crate::GroupSe
     inputs.materialized.fresh_lockfile
         .as_ref()
         .or(inputs.resolution.loaded)
-        .map_or_else(
-            || crate::GroupSelection::following_every_edge(included),
-            |lockfile| {
-                crate::GroupSelection::classify(
-                    lockfile,
-                    included,
-                    inputs.completion.config.peer_edge_options(),
-                )
-            },
-        )
+        .map(|lockfile| {
+            crate::GroupSelection::classify(
+                lockfile,
+                included,
+                inputs.completion.config.peer_edge_options(),
+            )
+        })
+        .unwrap_or_else(|| crate::GroupSelection::following_every_edge(included))
 }
 
 async fn link_apply_projects<Reporter: self::Reporter + 'static>(
@@ -99,12 +127,13 @@ async fn link_apply_projects<Reporter: self::Reporter + 'static>(
         },
         workspace_root: &inputs.projects.workspace_root,
         manifest_links: LinkMaterializedManifestLinks {
-            workspace_links: inputs.projects.workspace_packages
-                .as_deref()
-                .map(|packages| crate::WorkspaceLinks {
-                    packages,
-                    catalogs: &inputs.completion.catalogs,
-                }),
+            workspace_links: Some(crate::WorkspaceLinks {
+                packages: inputs.projects.workspace_packages.as_deref(),
+                workspace_dir: inputs.completion.config.workspace_dir
+                    .as_deref()
+                    .unwrap_or(&inputs.projects.workspace_root),
+                catalogs: &inputs.completion.catalogs,
+            }),
             included: inputs.projects.included,
             project_manifests: inputs.projects.importers.manifests,
         },
@@ -216,7 +245,7 @@ async fn apply<Reporter: self::Reporter + 'static>(
 ) -> Result<(), InstallError> {
     // What this run installed: a `--filter`ed install acts only on its
     // selection, every other one on the whole workspace. The lockfile
-    // can hold more — importers a filtered run left alone, or ones
+    // can hold more, importers a filtered run left alone, or ones
     // `pruneLockfileImporters` has yet to drop.
     let installed_importer_ids =
         inputs.projects.importers.requested_ids.unwrap_or(inputs.projects.importers.real_ids);
@@ -262,6 +291,8 @@ async fn apply<Reporter: self::Reporter + 'static>(
     )
 }
 
+/// The resolve-only run's peer workspace: it installs nothing, so siblings
+/// answer from their wanted lockfiles.
 fn peer_report_workspace<'a>(
     inputs: &'a ApplyMaterializationInputs<'_, '_>,
 ) -> crate::peer_dependency_issues::PeerReportWorkspace<'a> {
@@ -269,6 +300,7 @@ fn peer_report_workspace<'a>(
         lockfile_dir: &inputs.projects.workspace_root,
         catalogs: inputs.completion.catalog_context_present.then_some(&inputs.completion.catalogs),
         project_manifests: inputs.projects.importers.declared_manifests.as_slice(),
+        sibling_lockfile: crate::peer_dependency_issues::SiblingLockfile::Wanted,
     }
 }
 
@@ -291,10 +323,11 @@ fn finish_apply<Reporter: self::Reporter>(
     materialized_dirs: Option<&HashSet<PathBuf>>,
     (selected_current_lockfile, current_lockfile): (Option<Lockfile>, Option<Lockfile>),
 ) -> Result<(), InstallError> {
-    let peer_catalogs =
-        inputs.completion.catalog_context_present.then_some(&inputs.completion.catalogs);
     let installed_importer_ids =
         inputs.projects.importers.requested_ids.unwrap_or(inputs.projects.importers.real_ids);
+    let summary = install_summary(&mut inputs, installed_importer_ids);
+    let peer_catalogs =
+        inputs.completion.catalog_context_present.then_some(&inputs.completion.catalogs);
     // Nothing below reads the materialized lockfiles, and each holds a
     // workspace-scale importer map.
     pnpm_fs::background_drop((
@@ -320,7 +353,7 @@ fn finish_apply<Reporter: self::Reporter>(
             project_manifests: inputs.projects.importers.declared_manifests.as_slice(),
         },
 
-        prefix: inputs.completion.prefix,
+        summary,
         ignored_builds: inputs.materialized.ignored_builds,
         verified_file_integrity_baseline: inputs.completion.verified_file_integrity_baseline,
         resolved_lockfile: inputs.materialized.fresh_lockfile.as_ref(),
@@ -330,6 +363,61 @@ fn finish_apply<Reporter: self::Reporter>(
     });
     pnpm_fs::background_drop(inputs.materialized.fresh_lockfile);
     completion
+}
+
+/// The `pnpm:summary` that closes the install.
+fn install_summary(
+    inputs: &mut ApplyMaterializationInputs<'_, '_>,
+    installed_importer_ids: &HashSet<String>,
+) -> SummaryLog {
+    SummaryLog {
+        level: LogLevel::Debug,
+        new_projects: new_projects(inputs, installed_importer_ids),
+        project_names: project_names(inputs),
+        prefix: std::mem::take(&mut inputs.completion.prefix),
+    }
+}
+
+/// See [`SummaryLog::new_projects`]. A project had no
+/// previous install when the current lockfile has no importer for it.
+fn new_projects(
+    inputs: &ApplyMaterializationInputs<'_, '_>,
+    installed_importer_ids: &HashSet<String>,
+) -> Option<Vec<String>> {
+    let importers = &inputs.projects.importers;
+    if importers.real_ids.len() < 2 {
+        return None;
+    }
+    let previous_importers = inputs.prior.lockfile.as_ref().map(|lockfile| &lockfile.importers);
+    let new_projects = importers.manifests
+        .iter()
+        .filter(|(project_dir, _)| {
+            let importer_id = pnpm_workspace::importer_id_from_root_dir(
+                &inputs.projects.workspace_root,
+                project_dir,
+            );
+            installed_importer_ids.contains(&importer_id)
+                && previous_importers.is_none_or(|previous| !previous.contains_key(&importer_id))
+        })
+        .map(|(project_dir, _)| project_dir.to_string_lossy().into_owned())
+        .collect();
+    Some(new_projects)
+}
+
+/// See [`SummaryLog::project_names`].
+fn project_names(inputs: &ApplyMaterializationInputs<'_, '_>) -> Option<BTreeMap<String, String>> {
+    let importers = &inputs.projects.importers;
+    if importers.real_ids.len() < 2 {
+        return None;
+    }
+    let names = importers.manifests
+        .iter()
+        .filter_map(|(project_dir, manifest)| {
+            let name = manifest.value().get("name")?.as_str()?;
+            Some((project_dir.to_string_lossy().into_owned(), name.to_string()))
+        })
+        .collect();
+    Some(names)
 }
 
 /// The settings an install's state write takes from the run. See
@@ -346,6 +434,7 @@ fn applied_carried_settings<'a>(
         (true, false) => ResolvedImporters::All,
     };
     CarriedSettings {
+        trust_lockfile: inputs.resolution.trust_lockfile,
         established_auto_dedupe: (config.auto_dedupe && resolved.is_some()).then_some(true),
         registry_keys_verified: crate::install::registry_keys_current(config, lockfile),
         registry_routes: Some(crate::install_state::recorded_registry_routes_after_install(

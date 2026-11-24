@@ -1,8 +1,17 @@
 use super::{
-    BadPeerIssue, IssuesByProjects, MissingPeerIssue, ParentPkg, PeerIssues,
-    filter::parse_allowed_versions, filter_peer_issues, intersect_multiple_ranges,
-    linked::canonical_path_within, merge_missing_peers, ranges::normalize_version_str,
-    render::format_range, satisfies,
+    BadPeerIssue,
+    IssuesByProjects,
+    MissingPeerIssue,
+    ParentPkg,
+    PeerIssues,
+    filter::parse_allowed_versions,
+    filter_peer_issues,
+    intersect_multiple_ranges,
+    linked::LinkRoots,
+    merge_missing_peers,
+    ranges::normalize_version_str,
+    render::format_range,
+    satisfies,
 };
 use pnpm_config::PeerDependencyRules;
 use std::collections::BTreeMap;
@@ -30,13 +39,17 @@ fn tarball_peer_versions_use_metadata_through_aliases_and_peer_suffixes() {
             }))
             .expect("parse lockfile");
             let report = super::peer_issues_for_lockfile(
-                &lockfile,
-                std::path::Path::new("."),
-                &[".".to_string()],
+                super::ImporterPeerCheck {
+                    lockfile: &lockfile,
+                    lockfile_dir: std::path::Path::new("."),
+                    workspace_dir: None,
+                    importer_ids: &[".".to_string()],
+                    catalogs: None,
+                    resolve_peers_from_workspace_root: true,
+                    project_manifests: &super::ProjectManifests::new(),
+                },
                 &PeerDependencyRules::default(),
                 None,
-                true,
-                &super::ProjectManifests::new(),
             )
             .expect("inspect peers");
             if version == "1.0.0" {
@@ -90,13 +103,17 @@ fn remote_tarball_peer_versions_of_linked_packages_use_metadata() {
         }))
         .expect("parse lockfile");
         let report = super::peer_issues_for_lockfile(
-            &lockfile,
-            temp.path(),
-            &["packages/app".to_string()],
+            super::ImporterPeerCheck {
+                lockfile: &lockfile,
+                lockfile_dir: temp.path(),
+                workspace_dir: None,
+                importer_ids: &["packages/app".to_string()],
+                catalogs: None,
+                resolve_peers_from_workspace_root: true,
+                project_manifests: &super::ProjectManifests::new(),
+            },
             &PeerDependencyRules::default(),
             None,
-            true,
-            &super::ProjectManifests::new(),
         )
         .expect("inspect peers");
         if version == "1.0.0" {
@@ -329,8 +346,8 @@ fn test_intersect_widens_partial_versions_like_npm() {
     }
 }
 
-/// A `-0` the user wrote out is honored where it decides anything —
-/// matching — and dropped where pnpm drops it: `semver-range-intersect`
+/// A `-0` the user wrote out is honored where it decides anything
+/// (matching) and dropped where pnpm drops it: `semver-range-intersect`
 /// renders `intersect("<2.0.0-0", ">=1.0.0")` as `>=1.0.0 <2.0.0`, so
 /// rendering the suffix here would be the divergence, not hiding it.
 #[test]
@@ -498,6 +515,18 @@ fn test_parse_allowed_versions_by_parent() {
     assert!(match_all.is_empty());
     assert_eq!(by_parent.len(), 1);
     assert_eq!(by_parent["@foo/bar"][0].peer_rules["react"], vec!["^18.0.0"]);
+}
+
+#[test]
+fn parse_allowed_versions_keeps_parent_range_with_greater_than() {
+    let mut allowed = BTreeMap::new();
+    allowed.insert("mypkg@>=1.0.0>pos".to_string(), "1".to_string());
+    let (match_all, by_parent) = parse_allowed_versions(&allowed);
+    assert!(match_all.is_empty());
+    let rules = &by_parent["mypkg"];
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].parent_range.as_deref(), Some(">=1.0.0"));
+    assert_eq!(rules[0].peer_rules["pos"], vec!["1"]);
 }
 
 #[test]
@@ -750,14 +779,20 @@ fn test_path_is_within() {
     let sub = base.join("foo");
     std::fs::create_dir(&sub).unwrap();
 
-    assert!(canonical_path_within(&sub, base).is_some());
-    assert!(canonical_path_within(base, base).is_some());
+    let roots = LinkRoots::same(base);
+    assert!(roots.canonical_target(&sub).is_some());
+    assert!(roots.canonical_target(base).is_some());
+
+    let sibling = base.join("sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    assert!(LinkRoots::same(&sub).canonical_target(&sibling).is_none());
+    assert!(LinkRoots::new(&sub, Some(base)).canonical_target(&sibling).is_some());
 
     let outside = base.join("../bar");
-    assert!(canonical_path_within(&outside, base).is_none());
+    assert!(roots.canonical_target(&outside).is_none());
 
     let absolute_outside = std::path::Path::new("/etc");
-    assert!(canonical_path_within(absolute_outside, base).is_none());
+    assert!(roots.canonical_target(absolute_outside).is_none());
 }
 
 #[cfg(unix)]
@@ -772,7 +807,8 @@ fn linked_packages_share_targets_reached_through_a_symlinked_root() {
     std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
 
     let no_manifests = super::ProjectManifests::new();
-    let mut linked_packages = super::LinkedPackages::new(&linked_root, &no_manifests);
+    let roots = super::LinkRoots::same(&linked_root);
+    let mut linked_packages = super::LinkedPackages::new(&roots, &no_manifests, None, None);
     for importer in ["packages/app", "packages/web"] {
         assert!(
             linked_packages
@@ -799,7 +835,8 @@ fn linked_packages_resolve_targets_through_symlinks_like_the_filesystem() {
 
     for lockfile_dir in [linked_root, dunce::canonicalize(&real_root).unwrap()] {
         let no_manifests = super::ProjectManifests::new();
-        let mut linked_packages = super::LinkedPackages::new(&lockfile_dir, &no_manifests);
+        let roots = super::LinkRoots::same(&lockfile_dir);
+        let mut linked_packages = super::LinkedPackages::new(&roots, &no_manifests, None, None);
         let mut importer_id = |importer: &str, link_target: &str| {
             linked_packages
                 .resolve(&lockfile_dir.join(importer), link_target)
@@ -835,7 +872,7 @@ fn snapshot_peer_versions_use_named_registry_semver() {
                 &dep_ref,
                 &"peer".parse().unwrap(),
                 &std::collections::HashMap::new(),
-                std::path::Path::new("."),
+                &super::LinkRoots::same(std::path::Path::new(".")),
             ),
             Some(expected.to_string()),
             "{reference}",

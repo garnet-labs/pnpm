@@ -1,13 +1,21 @@
 use std::path::Path;
 
 use pretty_assertions::assert_eq;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 
-use super::{DependentsOptions, RenderDependentsInput, build_trees, render_dependents};
+use super::{
+    DependentsOptions,
+    RenderDependentsInput,
+    build_trees,
+    render_dependents,
+};
 
 /// A workspace whose root project depends on `dep@1.0.0`, which in turn
 /// depends on `nested@2.0.0`. Only the lockfile and the manifests the tree
-/// walk reads are written — the walk never resolves or fetches.
+/// walk reads are written, the walk never resolves or fetches.
 fn write_workspace(dir: &Path) {
     std::fs::write(
         dir.join("package.json"),
@@ -69,7 +77,9 @@ fn options(dir: &Path, packages: &[&str]) -> DependentsOptions {
         registries: None,
         virtual_store_dir_max_length: None,
         manifest_fields: None,
+        include_requires: None,
         resolve_peers_from_workspace_root: None,
+        exclude_peer_dependencies: None,
     }
 }
 
@@ -92,7 +102,7 @@ fn reports_the_chain_from_the_importer_down_to_the_searched_package() {
 }
 
 /// The excluded importer is the only one that reaches `dep`, so excluding
-/// it leaves nothing to report — proof the pattern is applied to the walk
+/// it leaves nothing to report, proof the pattern is applied to the walk
 /// roots rather than only to the rendered output.
 #[test]
 fn excluded_importers_are_not_walked() {
@@ -103,6 +113,54 @@ fn excluded_importers_are_not_walked() {
 
     let trees = build_trees(&opts).unwrap();
 
+    assert!(trees.is_empty());
+}
+
+/// `parent` receives `peer` only as a resolved peer: the root project does
+/// not depend on `peer` itself.
+#[test]
+fn exclude_peer_dependencies_leaves_out_a_package_reached_only_as_a_peer() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("pnpm-lock.yaml"),
+        r"lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      parent:
+        specifier: 1.0.0
+        version: 1.0.0(peer@1.0.0)
+
+packages:
+
+  parent@1.0.0:
+    resolution: {integrity: sha512-parent}
+    peerDependencies:
+      peer: ^1.0.0
+
+  peer@1.0.0:
+    resolution: {integrity: sha512-peer}
+
+snapshots:
+
+  parent@1.0.0(peer@1.0.0):
+    dependencies:
+      peer: 1.0.0
+
+  peer@1.0.0: {}
+",
+    )
+    .unwrap();
+    let mut opts = options(workspace.path(), &["peer"]);
+
+    let with_peers = build_trees(&opts).unwrap();
+    dbg!(&with_peers);
+    assert_eq!(with_peers.len(), 1);
+    opts.exclude_peer_dependencies = Some(true);
+    let trees = build_trees(&opts).unwrap();
+    dbg!(&trees);
     assert!(trees.is_empty());
 }
 
@@ -150,6 +208,20 @@ fn without_manifest_fields_no_manifest_is_read() {
     let trees = build_trees(&options(workspace.path(), &["nested"])).unwrap();
 
     assert!(trees[0].manifest.is_none());
+}
+
+#[test]
+fn requires_is_filled_only_when_asked_for() {
+    let workspace = tempfile::tempdir().unwrap();
+    write_workspace(workspace.path());
+    let mut opts = options(workspace.path(), &["dep"]);
+
+    let trees = build_trees(&opts).unwrap();
+    assert_eq!(trees[0].dependents[0].requires, None);
+
+    opts.include_requires = Some(true);
+    let trees = build_trees(&opts).unwrap();
+    assert_eq!(trees[0].dependents[0].requires.as_deref(), Some("1.0.0"));
 }
 
 #[test]

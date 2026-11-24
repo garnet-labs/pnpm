@@ -2,7 +2,10 @@
 //! document, kept under [`RELEASE_RECORDS_DIR`] as
 //! `<registry>/<package>/<version>+r<revision>.json`.
 
-use super::{CacheCommand, walk_metadata_files};
+use super::{
+    CacheCommand,
+    walk_metadata_files,
+};
 use miette::IntoDiagnostic;
 use pnpm_config::Config;
 use pnpm_resolving_npm_resolver::mirror::RELEASE_RECORDS_DIR;
@@ -25,7 +28,7 @@ pub(super) fn delete(
         packages
             .iter()
             .map(|pkg| {
-                CacheCommand::reject_path_traversal(pkg)?;
+                let pkg = CacheCommand::package_pattern(pkg)?;
                 Ok(format!("{registry_prefix}/{pkg}/*.json"))
             })
             .collect::<miette::Result<Vec<_>>>()?

@@ -1,13 +1,24 @@
 use crate::{
     cli_args::global::remove_global_groups,
-    shim_dispatch::{ShimTarget, native_shim_target, remove_native_shim},
+    shim_dispatch::{
+        ShimTarget,
+        native_shim_target,
+        remove_native_shim,
+    },
 };
 use miette::IntoDiagnostic;
 use pnpm_cmd_shim::remove_bin as remove_cmd_shim;
 use pnpm_config::Config;
-use pnpm_global::{find_global_package, is_global_install_subdir};
+use pnpm_global::{
+    find_global_package,
+    is_global_install_subdir,
+};
 use pnpm_reporter::Reporter;
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+};
 
 pub async fn run_remove<Reporter: self::Reporter + 'static>(
     versions: Vec<String>,
@@ -44,7 +55,29 @@ pub async fn run_remove<Reporter: self::Reporter + 'static>(
 }
 
 fn matches_node_version(actual: &str, requested: &str) -> bool {
-    actual == requested || actual.starts_with(&format!("{requested}."))
+    let (explicit_channel, raw_version) = match requested.split_once('/') {
+        Some((channel, rest))
+            if pnpm_engine_runtime_node_resolver::RELEASE_CHANNELS.contains(&channel) =>
+        {
+            (Some(channel), rest)
+        }
+        Some(_) => return false,
+        None => (None, requested),
+    };
+    let normalized = pnpm_engine_runtime_node_resolver::strip_leading_v(raw_version);
+    if normalized.is_empty() {
+        return false;
+    }
+    if let Some(channel) = explicit_channel {
+        let Ok(actual_parsed) = pnpm_engine_runtime_node_resolver::parse_node_specifier(actual)
+        else {
+            return false;
+        };
+        if actual_parsed.release_channel != channel {
+            return false;
+        }
+    }
+    actual == normalized || actual.starts_with(&format!("{normalized}."))
 }
 
 /// Remove a global `node` package when its installed version matches.

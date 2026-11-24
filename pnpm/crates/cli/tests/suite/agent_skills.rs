@@ -2,10 +2,22 @@
 //! approval on install, linked into the agent skill directories once
 //! `permissions` approves them, and pruned once it no longer does.
 
+mod local_deps;
+
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use std::{fs, path::Path, process::Command};
+use pnpm_testing_utils::{
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
+    git_repo::GitRepoFixture,
+};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
 const PACKAGE: &str = "@pnpm.e2e/with-agent-skills";
 const LINK: &str = ".claude/skills/guide";
@@ -30,7 +42,7 @@ fn pnpm(workspace: &Path) -> Command {
         "CODEX_SANDBOX",
         "AI_AGENT",
     ] {
-        command.env_remove(var);
+        command = command.without_env(var);
     }
     command.with_current_dir(workspace)
 }
@@ -86,7 +98,7 @@ fn install_records_unapproved_skills_and_links_nothing() {
     let output = output_of(pnpm(&workspace).with_arg("install"));
 
     assert!(
-        output.contains("Agent skills awaiting approval: @pnpm.e2e/with-agent-skills."),
+        output.contains("Packages awaiting approval:\n  @pnpm.e2e/with-agent-skills  skills"),
         "{output}",
     );
     assert_eq!(pending_skills(&workspace), Some(vec![format!("{PACKAGE}@1.0.0")]));
@@ -448,4 +460,90 @@ fn peer_variants_keep_one_link_target_and_replace_unrecorded_links() {
     assert_ne!(after_peer_change, first);
     assert!(first.is_dir(), "the variant that left the lockfile is still installed");
     drop(harness);
+}
+
+/// `approve-builds` prints no `Done in ...` footer, so the approval notice
+/// that append-only output holds until the end of the command is printed
+/// when the command finishes.
+#[test]
+fn approve_builds_reports_skills_still_awaiting_approval_in_append_only_output() {
+    let (harness, workspace) = project(PACKAGE, "strictDepBuilds: false\n");
+    let package_json = serde_json::json!({
+        "dependencies": { "@pnpm.e2e/install-script-example": "1.0.0" },
+        "devDependencies": { PACKAGE: "1.0.0" },
+    });
+    fs::write(workspace.join("package.json"), package_json.to_string())
+        .expect("write package.json");
+    output_of(pnpm(&workspace).with_arg("install"));
+
+    let output = output_of(
+        pnpm(&workspace)
+            .with_env("CI", "true")
+            .with_args(["approve-builds", "--all", "--reporter=append-only"]),
+    );
+
+    assert!(
+        output.contains("Packages awaiting approval:\n  @pnpm.e2e/with-agent-skills  skills"),
+        "{output}",
+    );
+    assert_eq!(output.matches("Packages awaiting approval:").count(), 1, "{output}");
+    drop(harness);
+}
+
+#[test]
+fn repository_approval_links_a_pending_git_skill_across_updates() {
+    let harness = CommandTempCwd::init();
+    let workspace = &harness.workspace;
+    let repo = GitRepoFixture::init(harness.root.path(), "sample");
+    repo.write_file("package.json", r#"{"name":"sample","version":"1.0.0"}"#);
+    let skill = "skills/sample-guide/SKILL.md";
+    repo.write_file(skill, "---\nname: sample-guide\n---\nFirst revision");
+    let commit = repo.commit("first revision");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": { "sample": repo.git_url_at("main") },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let settings = workspace.join("pnpm-workspace.yaml");
+    fs::write(&settings, "skills:\n  dirs:\n    - .agents/skills\n").unwrap();
+    pnpm(workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    assert!(pending_skills(workspace).is_some());
+    let selector = format!("sample@git+{}", repo.file_url());
+    let original_settings = fs::read(&settings).unwrap();
+    let exact = format!("{selector}#{commit}");
+    for invalid in ["sample", &format!("!{selector}#main")] {
+        let rejected = pnpm(workspace)
+            .with_args(["approve", &selector, invalid])
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+        assert!(stderr.contains("ERR_PNPM_APPROVE_BUILDS_EXACT_SELECTOR_REQUIRED"), "{stderr}");
+        assert!(stderr.contains(&format!("{selector},")), "{stderr}");
+        assert!(stderr.contains(&exact), "{stderr}");
+        assert_eq!(fs::read(&settings).unwrap(), original_settings);
+        assert!(pending_skills(workspace).is_some());
+    }
+    let output = output_of(pnpm(workspace).with_args(["approve", &selector]));
+    assert!(!output.contains("not awaiting approval"), "{output}");
+    let yaml: serde_json::Value =
+        serde_saphyr::from_str(&fs::read_to_string(settings).unwrap()).unwrap();
+    assert_eq!(yaml["permissions"][&selector]["skills"], true);
+    assert!(pending_skills(workspace).is_none());
+    let updated = "---\nname: sample-guide\n---\nUpdated revision";
+    repo.write_file(skill, updated);
+    let _ = repo.commit("update skill");
+    pnpm(workspace)
+        .with_args(["update", "sample"])
+        .assert()
+        .success();
+    assert!(pending_skills(workspace).is_none());
+    let linked =
+        fs::read_to_string(workspace.join(".agents/skills/sample-guide/SKILL.md")).unwrap();
+    assert!(linked.lines().eq(updated.lines()));
 }

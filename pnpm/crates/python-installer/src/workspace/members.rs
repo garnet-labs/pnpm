@@ -7,13 +7,25 @@
 //! repository whose projects genuinely conflict to split into separate
 //! workspaces; per-project resolution needs no such split.
 
-use super::{Manifest, Workspace};
+use super::{
+    Manifest,
+    Workspace,
+};
 use crate::manifest::UvWorkspace;
-use miette::{Result, bail};
+use miette::{
+    Result,
+    bail,
+};
 use pep508_rs::PackageName;
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 use wax::Program as _;
@@ -130,6 +142,29 @@ impl Workspace {
         }
         Membership { root: lock_root.to_path_buf(), members, shared: true }
     }
+
+    /// The project directories a command targeting `dir` acts on: all
+    /// members of the shared environment rooted at `dir` when `dir`
+    /// declares one, `dir` itself when it declares a `[project]`, or none
+    /// for an unshared virtual workspace root.
+    pub(crate) fn target_projects(&self, dir: &Path) -> Vec<PathBuf> {
+        let target =
+            if self.manifests.contains_key(dir) { dir.to_path_buf() } else { canonical(dir) };
+        let Some(manifest) = self.manifests.get(&target) else {
+            return Vec::new();
+        };
+        if manifest.shares_environment() {
+            return self.shared
+                .iter()
+                .filter(|(_, root)| **root == target)
+                .map(|(member, _)| member.clone())
+                .collect();
+        }
+        if manifest.project.is_some() {
+            return vec![target];
+        }
+        Vec::new()
+    }
 }
 
 /// The distributions a workspace contains, which is what a member may
@@ -164,12 +199,28 @@ fn member_projects<'a>(
 #[derive(Default)]
 pub(crate) struct DeclaredWorkspaces {
     declarations: BTreeMap<PathBuf, Patterns>,
+    /// The declaring roots whose members share an environment.
+    sharing: BTreeSet<PathBuf>,
 }
 
 impl DeclaredWorkspaces {
     pub(crate) fn add(&mut self, root: &Path, manifest: &Manifest) {
         let Some(declaration) = manifest.tool.uv.workspace.as_ref() else { return };
         self.declarations.insert(root.to_path_buf(), Patterns::of(declaration));
+        if manifest.shares_environment() {
+            self.sharing.insert(root.to_path_buf());
+        }
+    }
+
+    /// Whether `candidate` installs into the environment of the nearest
+    /// workspace declared at or above it, not into one of its own.
+    pub(crate) fn shares_environment(&self, candidate: &Path) -> bool {
+        candidate
+            .ancestors()
+            .find_map(|root| Some((root, self.declarations.get(root)?)))
+            .is_some_and(|(root, patterns)| {
+                self.sharing.contains(root) && patterns.contain(root, candidate)
+            })
     }
 
     /// Whether the nearest workspace declaration contains `candidate`.
@@ -208,33 +259,47 @@ impl Patterns {
     }
 }
 
-/// The directory whose environment a command run in `dir` uses: the root
-/// of the workspace the project containing `dir` shares an environment
-/// with, else that project's own directory. Read from the manifests
-/// between `dir` and `workspace`, the way an install reads them: the
-/// project is the nearest directory with a manifest, and the workspace it
-/// belongs to is the nearest one declared at or above it. A command reads
-/// this without an install's discovery, so a manifest that does not
-/// parse counts for nothing here and is reported by the next install.
+/// Find the environment for the nearest project or requirements file between
+/// `dir` and `workspace`. A member of a shared environment uses the declaring
+/// workspace root. A tool-only pyproject does not identify a project.
 pub(crate) fn environment_root_of(workspace: Option<&Path>, dir: &Path) -> PathBuf {
     let Some(stop) = workspace else { return dir.to_path_buf() };
     // The workspace may be configured by a path that reaches it through
     // a link, while the command's directory is canonical.
     let stop = canonical(stop);
     let dir = canonical(dir);
-    let project = dir
+    let mut project = None;
+    for ancestor in dir
         .ancestors()
         .take_while(|ancestor| ancestor.starts_with(&stop))
-        .find(|ancestor| ancestor.join("pyproject.toml").is_file())
-        .unwrap_or(&dir);
-    let declared = project
-        .ancestors()
-        .take_while(|ancestor| ancestor.starts_with(&stop))
-        .find_map(|ancestor| Some((ancestor, workspace_declaration(ancestor)?)));
-    match declared {
-        Some((root, (true, patterns))) if patterns.contain(root, project) => root.to_path_buf(),
-        _ => project.to_path_buf(),
+    {
+        let manifest = read_project_manifest(ancestor);
+        if let Some(environment) = manifest
+            .as_ref()
+            .and_then(|manifest| {
+                declared_environment(manifest, ancestor, project.unwrap_or(ancestor))
+            })
+        {
+            return environment.to_path_buf();
+        }
+        if project.is_none()
+            && (manifest.is_some_and(|manifest| manifest.project.is_some())
+                || ancestor.join("requirements.txt").is_file())
+        {
+            project = Some(ancestor);
+        }
     }
+    project.unwrap_or(&dir).to_path_buf()
+}
+
+fn declared_environment<'a>(
+    manifest: &Manifest,
+    root: &'a Path,
+    project: &'a Path,
+) -> Option<&'a Path> {
+    let declaration = manifest.tool.uv.workspace.as_ref()?;
+    let shared = manifest.shares_environment() && Patterns::of(declaration).contain(root, project);
+    Some(if shared { root } else { project })
 }
 
 /// Whether a `[tool.uv.workspace]` is declared at or above `project`, up
@@ -247,7 +312,31 @@ pub fn in_declared_workspace(workspace: &Path, project: &Path) -> bool {
     canonical(project)
         .ancestors()
         .take_while(|ancestor| ancestor.starts_with(&stop))
-        .any(|ancestor| workspace_declaration(ancestor).is_some())
+        .filter_map(read_project_manifest)
+        .any(|manifest| manifest.tool.uv.workspace.is_some())
+}
+
+/// The manifest of the nearest enclosing `[tool.uv.workspace]` up to
+/// `workspace` that contains `project_dir`, when `project_dir` does not
+/// declare a workspace of its own.
+pub(crate) fn inherited_workspace_manifest(
+    workspace: Option<&Path>,
+    project_dir: &Path,
+) -> Option<Manifest> {
+    let stop = canonical(workspace?);
+    let dir = canonical(project_dir);
+    for ancestor in dir
+        .ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor.starts_with(&stop))
+    {
+        let Some(manifest) = read_project_manifest(ancestor) else { continue };
+        let Some(declaration) = manifest.tool.uv.workspace.as_ref() else {
+            continue;
+        };
+        return Patterns::of(declaration).contain(ancestor, &dir).then_some(manifest);
+    }
+    None
 }
 
 /// The path with links resolved, or as given where that fails: a path
@@ -256,14 +345,9 @@ fn canonical(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Whether the manifest at `root` shares its environment, and which
-/// projects it contains, for one that declares a workspace.
-fn workspace_declaration(root: &Path) -> Option<(bool, Patterns)> {
-    let manifest = std::fs::read_to_string(root.join("pyproject.toml"))
-        .ok()
-        .and_then(|contents| Manifest::parse(&contents).ok())?;
-    let declaration = manifest.tool.uv.workspace.as_ref()?;
-    Some((manifest.shares_environment(), Patterns::of(declaration)))
+fn read_project_manifest(root: &Path) -> Option<Manifest> {
+    let contents = std::fs::read_to_string(root.join("pyproject.toml")).ok()?;
+    Manifest::parse(&contents).ok()
 }
 
 /// A pattern that cannot be read matches nothing, the way a member

@@ -1,7 +1,20 @@
-use super::{find_workspace_inventory, find_workspace_inventory_with};
+use super::{
+    find_workspace_inventory,
+    find_workspace_inventory_with,
+};
+#[cfg(not(windows))]
+use command_extra::CommandExtra;
 use pnpm_fs::symlink_dir as symlink;
 use pretty_assertions::assert_eq;
 use std::fs;
+
+#[cfg(windows)]
+use super::ignored_paths_under_with;
+#[cfg(windows)]
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 #[test]
 fn discovers_multiple_manifest_kinds_in_one_inventory() {
@@ -189,6 +202,35 @@ fn prunes_managed_paths_before_opening_without_excluding_matching_project_names(
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn ignores_mapped_aliases_without_ignoring_paths_outside_the_root() {
+    let ignored = ignored_paths_under_with(
+        Path::new(r"H:\repo"),
+        Path::new(r"\\?\UNC\server\share\repo"),
+        &[
+            PathBuf::from(r"J:\repo\cache"),
+            PathBuf::from(r"J:\repo-other\cache"),
+            PathBuf::from(r"K:\repo\cache"),
+        ],
+        |path| match path {
+            path if path == Path::new(r"J:\repo\cache") => {
+                Ok(PathBuf::from(r"\\?\UNC\server\share\repo\cache"))
+            }
+            path if path == Path::new(r"J:\repo-other\cache") => {
+                Ok(PathBuf::from(r"\\?\UNC\server\share\repo-other\cache"))
+            }
+            path if path == Path::new(r"K:\repo\cache") => {
+                Ok(PathBuf::from(r"\\?\UNC\other-server\share\repo\cache"))
+            }
+            path => Err(std::io::Error::other(format!("unexpected path {}", path.display()))),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(ignored, [PathBuf::from("cache")].into());
+}
+
 #[test]
 fn reads_children_without_accumulating_unvisited_sibling_handles() {
     let workspace = tempfile::tempdir().unwrap();
@@ -260,13 +302,8 @@ fn discovers_deep_trees_with_a_small_handle_limit() {
         let root_handle =
             cap_primitives::fs::open_ambient_dir(root, cap_primitives::ambient_authority())
                 .unwrap();
-        let mut probe_opens = 0;
-        super::open_directory::open_directory(
-            &root_handle,
-            std::path::Path::new("d/d"),
-            &mut probe_opens,
-        )
-        .unwrap();
+        let (_probe, probe_opens) =
+            pnpm_ffi_fs::open_directory_beneath(&root_handle, std::path::Path::new("d/d")).unwrap();
         let expected_opens = match probe_opens {
             1 => 257,
             2 => 1 + 2 * (1..=128).sum::<usize>(),
@@ -287,14 +324,14 @@ fn discovers_deep_trees_with_a_small_handle_limit() {
     }
     fs::write(directory.join("Cargo.toml"), "[workspace]\n").unwrap();
     let output = std::process::Command::new("sh")
-        .args(["-c", r#"ulimit -n 64; exec "$@""#, "sh"])
-        .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "--nocapture"])
-        .arg(format!(
+        .with_args(["-c", r#"ulimit -n 64; exec "$@""#, "sh"])
+        .with_arg(std::env::current_exe().unwrap())
+        .with_args(["--exact", "--nocapture"])
+        .with_arg(format!(
             "{}::discovers_deep_trees_with_a_small_handle_limit",
             module_path!().split_once("::").unwrap().1,
         ))
-        .env(ROOT_ENV, workspace.path())
+        .with_env(ROOT_ENV, workspace.path())
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -423,7 +460,7 @@ fn rejects_parent_navigation_and_absolute_descendant_paths() {
         cap_primitives::fs::open_ambient_dir(workspace.path(), cap_primitives::ambient_authority())
             .unwrap();
     for path in [std::path::Path::new("../outside"), workspace.path(), std::path::Path::new("")] {
-        let error = super::open_directory::open_directory(&root, path, &mut 0).unwrap_err();
+        let error = pnpm_ffi_fs::open_directory_beneath(&root, path).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
@@ -436,9 +473,8 @@ fn rejects_intermediate_links_to_directories_inside_the_workspace() {
     let root =
         cap_primitives::fs::open_ambient_dir(workspace.path(), cap_primitives::ambient_authority())
             .unwrap();
-    let error =
-        super::open_directory::open_directory(&root, std::path::Path::new("linked/child"), &mut 0)
-            .unwrap_err();
+    let error = pnpm_ffi_fs::open_directory_beneath(&root, std::path::Path::new("linked/child"))
+        .unwrap_err();
     eprintln!("intermediate link error: {error}");
     assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
 }

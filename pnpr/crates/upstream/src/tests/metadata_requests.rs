@@ -1,6 +1,15 @@
 use super::{
-    CacheValidators, CanonicalPackageName, FetchOutcome, HeaderMap, PackumentFetch, RegistryError,
-    UPSTREAM_ERROR_BODY_LIMIT, auth_and_custom_headers, breaking_upstream, json, upstream,
+    CacheValidators,
+    CanonicalPackageName,
+    FetchOutcome,
+    HeaderMap,
+    PackumentFetch,
+    RegistryError,
+    UPSTREAM_ERROR_BODY_LIMIT,
+    auth_and_custom_headers,
+    breaking_upstream,
+    json,
+    upstream,
 };
 
 #[tokio::test]
@@ -208,7 +217,7 @@ async fn fetch_packument_replays_validators_and_handles_304() {
 async fn fetch_packument_304_without_validators_is_an_error() {
     let mut server = mockito::Server::new_async().await;
     // No conditional header is sent (empty validators), so a `304` here is
-    // a misbehaving upstream — there's no body and nothing to revalidate
+    // a misbehaving upstream; there's no body and nothing to revalidate
     // against. It must surface as an error, not a `NotModified` that the
     // caller could mistake for "keep serving the cache".
     let mock = server
@@ -415,5 +424,62 @@ async fn get_keys_forwards_request() {
     let upstream = upstream(server.url(), HeaderMap::new());
     let res = upstream.get_keys().await.unwrap();
     assert!(matches!(res, FetchOutcome::Ok(bytes) if bytes == br#"{"keys":[]}"#));
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn packument_body_limit_accepts_exact_size_and_rejects_overflow() {
+    for (chunked, size) in [(false, 16), (false, 17), (true, 16), (true, 17)] {
+        let mut server = mockito::Server::new_async().await;
+        let mut mock = server.mock("GET", "/example").with_status(200);
+        let chunk = move |writer: &mut dyn std::io::Write| writer.write_all(&vec![b' '; size]);
+        if chunked {
+            mock = mock.with_chunked_body(chunk);
+        } else {
+            mock = mock.with_body(vec![b' '; size]);
+        }
+        let mock = mock.create_async().await;
+        let mut config = pnpr_config::UpstreamConfig::with_defaults(server.url(), HeaderMap::new());
+        config.requests.max_packument_size = 16;
+        let client = super::Upstream::new("example".to_owned(), &config);
+        let name =
+            CanonicalPackageName::parse("example", pnpr_package_name::Ecosystem::Npm).unwrap();
+        let result = client.fetch_packument(&name, &CacheValidators::default()).await;
+        if size == 16 {
+            assert!(matches!(result, Ok(PackumentFetch::Modified(body)) if body.bytes.len() == 16));
+        } else {
+            assert!(
+                matches!(result, Err(RegistryError::UpstreamResponse { reason, .. }) if reason.contains("16-byte limit")),
+            );
+        }
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn default_packument_limit_accepts_large_registry_documents() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/example")
+        .with_status(200)
+        .with_chunked_body(|writer| {
+            let chunk = vec![b' '; 1024 * 1024];
+            for _ in 0..33 {
+                writer.write_all(&chunk)?;
+            }
+            Ok(())
+        })
+        .expect(1)
+        .create_async()
+        .await;
+    let client = upstream(server.url(), HeaderMap::new());
+    let name = CanonicalPackageName::parse("example", pnpr_package_name::Ecosystem::Npm).unwrap();
+    let result = client
+        .fetch_packument(&name, &CacheValidators::default())
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, PackumentFetch::Modified(body) if body.bytes.len() == 33 * 1024 * 1024),
+    );
     mock.assert_async().await;
 }

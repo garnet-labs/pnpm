@@ -1,16 +1,48 @@
 use super::{
-    Arc, Catalogs, ChildEdge, Cow, DependencySpec, FrontierNode, HashSet, NodeSeed, Path,
-    PendingNode, Pipe, PkgNameVerPeer, PreferredVersionsOverlay, ResolveDependencyTreeError,
-    Resolver, ReuseSource, SeededNode, SnapshotEntry, TreeCtx, WantedDependency, async_recursion,
-    catalog_anchor, declaring_manifest_dir, extract_children, finish_reused_seeds, future,
-    higher_direct_dep_version, keeps_locked_version, level_aliases, level_versions,
-    lock_recoverable, prior_child_key, read_recoverable, real_package_name_of, resolve_node_seed,
-    warm_children_resolutions, write_recoverable,
+    Arc,
+    Catalogs,
+    ChildEdge,
+    Cow,
+    DependencySpec,
+    FrontierNode,
+    HashSet,
+    NodeSeed,
+    ParentOrigin,
+    Path,
+    PendingNode,
+    Pipe,
+    PkgNameVerPeer,
+    PreferredVersionsOverlay,
+    ResolveDependencyTreeError,
+    Resolver,
+    ReuseSource,
+    SeededNode,
+    SnapshotEntry,
+    TreeCtx,
+    WantedDependency,
+    async_recursion,
+    catalog_anchor,
+    declaring_manifest_dir,
+    extract_children,
+    finish_reused_seeds,
+    future,
+    higher_direct_dep_version,
+    keeps_locked_version,
+    level_aliases,
+    level_versions,
+    lock_recoverable,
+    prior_child_key,
+    read_recoverable,
+    real_package_name_of,
+    resolve_node_seed,
+    warm_children_resolutions,
+    write_recoverable,
 };
+use std::path::PathBuf;
 
-/// Seed every child edge of one occurrence — its manifest's
+/// Seed every child edge of one occurrence (its manifest's
 /// dependencies less the names its own `peerDependencies` shadow, with
-/// a workspace project's catalog specifiers resolved — and derive the
+/// a workspace project's catalog specifiers resolved) and derive the
 /// scope its grandchildren will resolve in.
 ///
 /// The whole level seeds before any of it settles, so this resolves
@@ -106,7 +138,7 @@ pub(super) struct ChildSeedScope<'s> {
     /// re-resolve. A parent that freshly resolved but landed back on its
     /// previously recorded version keeps the prior child refs alive
     /// (pnpm's non-`parentPkg.updated` arm), and each child edge
-    /// re-enters the reuse gate with its recorded key — so a
+    /// re-enters the reuse gate with its recorded key, so a
     /// still-satisfied subtree is reused rather than re-resolved.
     /// Re-resolving those children would re-pick open ranges (`*`) at
     /// their newest versions and churn the lockfile.
@@ -115,12 +147,12 @@ pub(super) struct ChildSeedScope<'s> {
     /// whole child fanout instead of locking per edge.
     pub(super) direct_versions: Option<Arc<super::super::workspace_ctx::DirectDepVersions>>,
     pub(super) declaring_dir: Option<Arc<Path>>,
-    pub(super) parent_is_workspace: bool,
+    pub(super) parent_origin: ParentOrigin<'s>,
 }
 
 impl<'s> ChildSeedScope<'s> {
-    pub(super) fn of(ctx: &'s TreeCtx, pending: &PendingNode) -> Self {
-        let landed_prior = pending.prior_key
+    pub(super) fn of(ctx: &'s TreeCtx, pending: &'s PendingNode) -> Self {
+        let landed_prior = pending.lockfile.prior_key
             .as_ref()
             .filter(|key| {
                 landed_on_prior_entry(
@@ -136,7 +168,7 @@ impl<'s> ChildSeedScope<'s> {
     /// lockfile entry `landed_prior` when it has one.
     pub(super) fn for_result(
         ctx: &'s TreeCtx,
-        result: &pnpm_resolving_resolver_base::ResolveResult,
+        result: &'s pnpm_resolving_resolver_base::ResolveResult,
         landed_prior: Option<&PkgNameVerPeer>,
     ) -> Self {
         Self {
@@ -151,7 +183,7 @@ impl<'s> ChildSeedScope<'s> {
                 .get(&ctx.importer.id)
                 .map(Arc::clone),
             declaring_dir: declaring_manifest_dir(&ctx.importer.lockfile_dir, result),
-            parent_is_workspace: result.resolved_via == "workspace",
+            parent_origin: ParentOrigin::of(result),
         }
     }
 }
@@ -180,7 +212,7 @@ where
             pick_overlay: node.children_overlay.clone(),
             parent_dir: scope.declaring_dir.as_deref(),
             parent_pkg_aliases: &node.children_pkg_aliases,
-            parent_is_workspace: scope.parent_is_workspace,
+            parent_origin: scope.parent_origin,
         },
     )
     .await?;
@@ -213,7 +245,13 @@ pub(super) fn child_wanted(
         ..WantedDependency::default()
     };
     let mut prior = scope.prior_children_snapshot.and_then(|snapshot| {
-        prior_child_key(snapshot, alias, bare_specifier, &ctx.workspace.cache.registry_context)
+        prior_child_key(
+            ctx.workspace.reuse.lockfile.as_deref(),
+            snapshot,
+            alias,
+            bare_specifier,
+            &ctx.workspace.cache.registry_context,
+        )
     });
     if let Some(key) = prior.as_ref()
         && let Some(higher) = super::super::workspace_ctx::DirectDepVersion::of(
@@ -221,7 +259,7 @@ pub(super) fn child_wanted(
             &key.suffix,
             &ctx.workspace.cache.registry_context,
         )
-        .zip(bare_specifier.parse::<node_semver::Range>().ok())
+        .zip(pnpm_resolving_resolver_base::parse_strict_semver_range(bare_specifier))
         .and_then(|(pinned, parsed)| {
             higher_direct_dep_version(scope.direct_versions.as_deref(), alias, &pinned, &parsed)
         })
@@ -262,7 +300,7 @@ pub(crate) fn parent_ids_contain_sequence(
 }
 
 /// Whether a freshly resolved node landed back on its previously
-/// recorded lockfile entry — the non-`updated` arm, which keeps the
+/// recorded lockfile entry, the non-`updated` arm, which keeps the
 /// prior child refs alive. An entry the registry configuration re-keys
 /// still names the same package from the same registry.
 pub(super) fn landed_on_prior_entry(
@@ -281,7 +319,7 @@ pub(super) fn landed_on_prior_entry(
 /// overlay under for one wanted edge: the alias itself, plus the real
 /// package name from [`real_package_name_of`] when it differs (the
 /// inner target of an `npm:` alias or the folded `@jsr/...` name of a
-/// `jsr:` specifier) — mirroring the name derivation in the npm
+/// `jsr:` specifier), mirroring the name derivation in the npm
 /// resolver's `parse_bare_specifier`, which keys its overlay merge by
 /// the resolved `spec.name` rather than the outer alias.
 ///
@@ -299,14 +337,38 @@ pub(super) fn overlay_lookup_names<'edge>(
 }
 
 /// Whether this package's child specifiers pass through the importer's
-/// catalogs, which makes them a property of the resolving importer
-/// rather than of the package id — the one input
+/// catalogs: an injected workspace project does, whether it was declared by a
+/// `workspace:` specifier or by a path to a workspace project. Any other
+/// `file:` directory is not part of the workspace, so a `catalog:` spec in it
+/// stays unsupported. That makes them a property of the resolving importer
+/// rather than of the package id, the one input
 /// [`fn@crate::resolve_dependency_tree::workspace_ctx::recorded_children_match`] cannot compare, since the recorded
 /// context does not carry the catalogs the recording importer used.
 pub(super) fn resolves_children_through_catalogs(
+    ctx: &TreeCtx,
     result: &pnpm_resolving_resolver_base::ResolveResult,
 ) -> bool {
-    result.resolved_via == "workspace" && result.id.as_str().starts_with("file:")
+    let Some(dir) = declaring_manifest_dir(&ctx.importer.lockfile_dir, result) else {
+        return false;
+    };
+    result.resolved_via == "workspace" || workspace_project_dirs(ctx).contains(dir.as_ref())
+}
+
+fn workspace_project_dirs(ctx: &TreeCtx) -> &HashSet<PathBuf> {
+    ctx.importer.workspace_project_dirs.get_or_init(|| {
+        ctx.options.base.project.workspace_packages
+            .iter()
+            .flat_map(|packages| packages.values())
+            .flat_map(|versions| versions.values())
+            .flat_map(|package| {
+                let linked = pnpm_resolving_npm_resolver::resolve_workspace_package_dir(
+                    &package.root_dir,
+                    &package.manifest,
+                );
+                [package.root_dir.as_path(), linked.as_path()].map(pnpm_fs::lexical_normalize)
+            })
+            .collect()
+    })
 }
 
 pub(super) fn catalogs_for_children(
@@ -314,4 +376,20 @@ pub(super) fn catalogs_for_children(
     resolves_children_through_catalogs: bool,
 ) -> Option<&Catalogs> {
     (resolves_children_through_catalogs && !ctx.catalogs.is_empty()).then_some(&ctx.catalogs)
+}
+
+/// Catalogs for the taken peers of a resolved package.
+///
+/// An ordinary `file:` dependency is not a workspace project, so its child
+/// specifiers do not inherit the importer's catalogs (see
+/// [`resolves_children_through_catalogs`]). Its taken peers are different:
+/// the consuming importer binds them, so a `catalog:` peer range resolves
+/// through the same catalogs a workspace package uses.
+pub(super) fn catalogs_for_peers<'a>(
+    ctx: &'a TreeCtx,
+    result: &pnpm_resolving_resolver_base::ResolveResult,
+) -> Option<&'a Catalogs> {
+    (!ctx.catalogs.is_empty()
+        && declaring_manifest_dir(&ctx.importer.lockfile_dir, result).is_some())
+    .then_some(&ctx.catalogs)
 }

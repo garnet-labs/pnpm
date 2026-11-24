@@ -2,7 +2,7 @@
 //! end to end, recording the computed integrity in the lockfile.
 //!
 //! URL/tarball resolvers carry no `name@version`/`integrity` at resolve
-//! time — those live in the tarball's `package.json`. pacquet builds
+//! time; those live in the tarball's `package.json`. pacquet builds
 //! the lockfile before the install pass, so the [`TarballResolver`]
 //! downloads the tarball during resolution to compute its sha512
 //! integrity and read its manifest (see <https://github.com/pnpm/pnpm/issues/12053>).
@@ -17,7 +17,7 @@
 //! `--frozen-lockfile` install doesn't fail closed.
 //!
 //! Reaching the [`TarballResolver`] requires a bare specifier whose URL
-//! does *not* start with the configured registry — a registry-host
+//! does *not* start with the configured registry, a registry-host
 //! tarball URL is parsed by the npm resolver instead (see
 //! `parse_bare_specifier`) and carries the registry's integrity from
 //! metadata. The test points at the loopback registry via `localhost`
@@ -26,11 +26,18 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     fixtures::minimal_tarball,
     fs::bump_mtime,
 };
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
 fn pacquet_at(workspace: &Path) -> Command {
     Command::cargo_bin("pnpm").expect("find the pnpm binary").with_current_dir(workspace)
@@ -95,8 +102,8 @@ fn remote_tarball_integrity_survives_unrelated_install() {
 
     // The mocked registry is `http://127.0.0.1:PORT/`; pointing at the
     // same loopback server via `localhost` keeps the URL from matching
-    // the registry prefix, so the TarballResolver — not the npm resolver
-    // — claims it. `localhost` resolves to 127.0.0.1, so the tarball is
+    // the registry prefix, so the TarballResolver (not the npm resolver)
+    // claims it. `localhost` resolves to 127.0.0.1, so the tarball is
     // still downloadable from that server.
     let tarball = format!(
         "{}is-positive/-/is-positive-1.0.0.tgz",
@@ -104,7 +111,7 @@ fn remote_tarball_integrity_survives_unrelated_install() {
     );
     // A non-registry tarball is keyed by `name@<url>` (the version lives
     // in `resolution.tarball` + the `version:` field), not `name@1.0.0`.
-    // Mirrors pnpm — see `installing/deps-installer/test/lockfile.ts`
+    // Mirrors pnpm; see `installing/deps-installer/test/lockfile.ts`
     // ("packages installed via tarball URL ... are normalized").
     let package_key = format!("is-positive@{tarball}");
     let manifest_path = workspace.join("package.json");
@@ -127,7 +134,7 @@ fn remote_tarball_integrity_survives_unrelated_install() {
         });
 
     // Install an unrelated package. This rewrites the lockfile while the
-    // tarball dependency is re-resolved — the exact
+    // tarball dependency is re-resolved, the exact
     // <https://github.com/pnpm/pnpm/issues/12001> trigger.
     fs::write(
         &manifest_path,
@@ -246,7 +253,7 @@ fn remote_tarball_reresolves_from_warm_store_without_refetch() {
 /// ([#13308](https://github.com/pnpm/pnpm/issues/13308)).
 ///
 /// The refusal comes from the lockfile-verification gate, which batches
-/// every offending entry into one error before anything is fetched —
+/// every offending entry into one error before anything is fetched,
 /// not from the per-entry fetch-path backstop
 /// (`tarball_url_and_integrity`), which only speaks up for entries that
 /// reach a fetch without having passed the gate
@@ -255,8 +262,8 @@ fn remote_tarball_reresolves_from_warm_store_without_refetch() {
 /// "before anything is fetched": a refusal that only came from the fetch
 /// path would have downloaded the bytes first.
 ///
-/// Git-host archive URLs are the exemption — they are what older pnpm
-/// versions wrote without an `integrity` — and that shape is covered
+/// Git-host archive URLs are the exemption (they are what older pnpm
+/// versions wrote without an `integrity`) and that shape is covered
 /// by `unverified_fetch_is_allowed`'s unit tests, since no local
 /// server can answer for a git host.
 #[test]
@@ -350,7 +357,7 @@ fn frozen_install_refuses_a_remote_tarball_without_integrity() {
 }
 
 /// A remote tarball lands in the store index under exactly one row, keyed
-/// by the bare URL — the `pkgId` the TypeScript CLI writes, so a store
+/// by the bare URL, the `pkgId` the TypeScript CLI writes, so a store
 /// warmed by one stack stays warm for the other
 /// ([#13365](https://github.com/pnpm/pnpm/issues/13365)).
 ///
@@ -404,17 +411,8 @@ fn a_remote_tarball_is_indexed_once_under_the_bare_url() {
     drop((head_mock, get_mock, root, mock_instance, tarball_server));
 }
 
-/// A tarball whose host answers the preflight with an immutable redirect
-/// is still reused from a warm store on re-resolution.
-///
-/// The lockfile records the *post-redirect* URL in `resolution.tarball`
-/// while the entry's `pkg_id` — its key, and the store-index row it
-/// lands at — stays the bare specifier the manifest asked for. A
-/// re-resolve looks the warm entry up by that specifier, before any
-/// preflight has revealed the redirect, so both sides have to agree on
-/// it. The proof is the same as
-/// [`remote_tarball_reresolves_from_warm_store_without_refetch`]: tear
-/// the host down, then re-resolve.
+/// The lockfile records an immutable redirect's final URL. The store index
+/// still uses the requested URL, which a warm re-resolution looks up.
 #[test]
 fn remote_tarball_behind_an_immutable_redirect_reuses_the_warm_store() {
     let CommandTempCwd { workspace, root, npmrc_info, .. } =
@@ -426,17 +424,17 @@ fn remote_tarball_behind_an_immutable_redirect_reuses_the_warm_store() {
     let mut tarball_server = mockito::Server::new();
     let canonical_url = format!("{}{canonical_path}", tarball_server.url());
     let redirect_mock = tarball_server
-        .mock("HEAD", requested_path)
+        .mock("GET", requested_path)
         .with_status(302)
         .with_header("location", &canonical_url)
         .create();
     let head_mock = tarball_server
-        .mock("HEAD", canonical_path)
-        .with_status(200)
-        .with_header("cache-control", "immutable")
+        .mock("HEAD", requested_path)
+        .expect(0)
         .create();
     let get_mock = tarball_server
         .mock("GET", canonical_path)
+        .with_header("cache-control", "immutable")
         .with_status(200)
         .with_body(minimal_tarball("pkg-from-tarball", "1.0.0"))
         .create();
@@ -465,6 +463,9 @@ fn remote_tarball_behind_an_immutable_redirect_reuses_the_warm_store() {
             )
         });
 
+    head_mock.assert();
+    redirect_mock.assert();
+    get_mock.assert();
     drop((redirect_mock, head_mock, get_mock, tarball_server));
 
     pacquet_at(&workspace)
@@ -536,7 +537,7 @@ fn fresh_remote_tarball_skips_the_network_without_a_lockfile() {
         .with_status(200)
         .with_header("etag", r#""pkg-from-tarball""#)
         .with_header("cache-control", "public, max-age=31536000, immutable")
-        .expect(1)
+        .expect(0)
         .create();
     let get_mock = tarball_server
         .mock("GET", tarball_path)
@@ -598,7 +599,7 @@ fn stale_remote_tarball_revalidates_with_if_none_match() {
         .with_status(200)
         .with_header("etag", r#""pkg-from-tarball""#)
         .with_header("cache-control", "public, max-age=31536000, immutable")
-        .expect(1)
+        .expect(0)
         .create();
     let get_mock = tarball_server
         .mock("GET", tarball_path)
@@ -769,7 +770,7 @@ fn response_varying_on_user_agent_is_not_reused() {
     let head = tarball_server
         .mock("HEAD", "/pkg.tgz")
         .with_status(200)
-        .expect(2)
+        .expect(0)
         .create();
     let get = tarball_server
         .mock("GET", "/pkg.tgz")
@@ -814,7 +815,7 @@ fn not_modified_varying_on_user_agent_downloads_again() {
     let head = tarball_server
         .mock("HEAD", "/pkg.tgz")
         .with_status(200)
-        .expect(2)
+        .expect(0)
         .create();
     let get = tarball_server
         .mock("GET", "/pkg.tgz")
@@ -936,4 +937,48 @@ fn remote_tarball_peer_of_a_linked_package_uses_the_manifest_version() {
 
         drop((root, mock_instance, tarball_server));
     }
+}
+
+#[test]
+fn remote_tarball_resolves_an_immutable_redirect_with_one_download() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let requested_path = "/pkg-from-tarball.tgz";
+    let canonical_path = "/cdn/pkg-from-tarball-1.0.0.tgz";
+    let mut tarball_server = mockito::Server::new();
+    let canonical_url = format!("{}{canonical_path}", tarball_server.url());
+    let head_mock = tarball_server
+        .mock("HEAD", requested_path)
+        .expect(0)
+        .create();
+    let redirect_mock = tarball_server
+        .mock("GET", requested_path)
+        .with_status(302)
+        .with_header("location", &canonical_url)
+        .create();
+    let get_mock = tarball_server
+        .mock("GET", canonical_path)
+        .with_status(200)
+        .with_header("cache-control", "immutable")
+        .with_body(minimal_tarball("pkg-from-tarball", "1.0.0"))
+        .create();
+    let requested_url = format!("{}{requested_path}", tarball_server.url());
+
+    pacquet_at(&workspace)
+        .with_args(["add", &requested_url, &requested_url])
+        .assert()
+        .success();
+
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(
+        lockfile.contains(&canonical_url),
+        "lockfile must record post-redirect URL:\n{lockfile}",
+    );
+
+    head_mock.assert();
+    redirect_mock.assert();
+    get_mock.assert();
+    drop((tarball_server, root, mock_instance));
 }

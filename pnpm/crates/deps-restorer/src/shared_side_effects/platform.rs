@@ -1,10 +1,26 @@
-use crate::{install_frozen_lockfile::find_runtime_node_major, process::Command};
+use crate::{
+    install_frozen_lockfile::find_runtime_node_major,
+    process::Command,
+};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use pnpm_lockfile::{PackageKey, ProjectSnapshot};
+use base64::{
+    Engine as _,
+    engine::general_purpose::STANDARD as BASE64,
+};
+use pnpm_lockfile::{
+    PackageKey,
+    ProjectSnapshot,
+};
 use pnpm_pnpr_client::{
-    LinuxGlibcPlatform, MacOsPlatform, WindowsPlatform, linux_glibc_supported_tags,
-    linux_glibc_tag, macos_supported_tags, macos_tag, windows_supported_tags, windows_tag,
+    LinuxGlibcPlatform,
+    MacOsPlatform,
+    WindowsPlatform,
+    linux_glibc_supported_tags,
+    linux_glibc_tag,
+    macos_supported_tags,
+    macos_tag,
+    windows_supported_tags,
+    windows_tag,
 };
 use std::collections::HashMap;
 #[cfg(windows)]
@@ -102,7 +118,10 @@ pub(super) fn parse_macos_product_version(value: &str) -> Option<(u32, u32)> {
 }
 #[cfg(windows)]
 pub(super) fn windows_kernel_version() -> Option<(u32, u32, u32)> {
-    let build = System::kernel_version()?.parse().ok()?;
+    let build = System::kernel_version()
+        .ok()?
+        .parse()
+        .ok()?;
     // Windows 10 and 11 both use NT kernel version 10.0; sysinfo provides the build number.
     validate_windows_kernel_version(10, 0, build)
 }
@@ -127,7 +146,9 @@ pub(super) fn patch_hash(snapshot_key: &PackageKey) -> Option<String> {
     Some(value.split_once(')')?.0.to_string())
 }
 pub(super) fn package_version(package_key: &PackageKey, metadata_version: Option<&str>) -> String {
-    metadata_version.map_or_else(|| package_key.suffix.version().to_string(), ToString::to_string)
+    metadata_version
+        .map(ToString::to_string)
+        .unwrap_or_else(|| package_key.suffix.version().to_string())
 }
 pub(super) fn digest_integrity(digest: &str) -> Result<String, String> {
     if !digest.len().is_multiple_of(2) {
@@ -135,7 +156,9 @@ pub(super) fn digest_integrity(digest: &str) -> Result<String, String> {
     }
     let bytes = digest
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
             u8::from_str_radix(pair, 16).map_err(|error| error.to_string())

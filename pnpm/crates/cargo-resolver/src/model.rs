@@ -1,8 +1,14 @@
-use semver::{Version, VersionReq};
+use semver::{
+    Version,
+    VersionReq,
+};
 use serde::Deserialize;
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     fmt,
 };
 
@@ -20,12 +26,15 @@ pub(crate) struct MetadataPackage {
     pub(crate) dependencies: Vec<MetadataDependency>,
     #[serde(default)]
     pub(crate) features: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub(crate) manifest_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MetadataDependency {
     pub(crate) name: String,
-    pub(crate) source: Option<String>,
+    #[serde(flatten)]
+    pub(crate) origin: DependencyOrigin,
     pub(crate) req: VersionReq,
     #[serde(default)]
     pub(crate) kind: DependencyKind,
@@ -37,6 +46,15 @@ pub(crate) struct MetadataDependency {
     pub(crate) uses_default_features: bool,
     #[serde(default)]
     pub(crate) features: Vec<String>,
+}
+
+/// Where a dependency comes from: a registry or git `source`, or, for a path
+/// dependency, no source and the `path` of its directory.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DependencyOrigin {
+    pub(crate) source: Option<String>,
+    #[serde(default)]
+    pub(crate) path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +165,43 @@ impl fmt::Display for PackageKey {
             }
         }
     }
+}
+
+/// Error returned when cooperative cancellation aborts Cargo discovery or resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelError;
+
+impl fmt::Display for CancelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Cargo resolution cancelled")
+    }
+}
+
+impl std::error::Error for CancelError {}
+
+impl miette::Diagnostic for CancelError {}
+
+/// Whether a dependency declared with `requirement` and `source` accepts
+/// `version`.
+///
+/// A path (`None`) or git (`git+…`) dependency declared without a version
+/// appears in `cargo metadata` as `*`. Cargo accepts any version for it,
+/// prereleases included, while semver's `*` rejects prereleases. A registry
+/// `*` is a requirement the manifest spells out, so it keeps semver's rule.
+pub(crate) fn accepts_declared_version(
+    requirement: &VersionReq,
+    source: Option<&str>,
+    version: &Version,
+) -> bool {
+    let unversioned =
+        *requirement == VersionReq::STAR && source.is_none_or(|source| source.starts_with("git+"));
+    unversioned || requirement.matches(version)
+}
+
+pub(crate) fn ensure_not_cancelled(
+    should_cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> miette::Result<()> {
+    if should_cancel() { Err(CancelError.into()) } else { Ok(()) }
 }
 
 const fn default_true() -> bool {

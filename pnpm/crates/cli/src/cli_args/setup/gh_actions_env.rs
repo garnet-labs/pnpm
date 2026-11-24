@@ -12,10 +12,18 @@
 //! symlink, or a directory is therefore left alone rather than created or
 //! followed.
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_config::EnvVarOs;
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "wasi")]
@@ -23,9 +31,20 @@ use std::os::wasi::fs::OpenOptionsExt;
 use std::{
     ffi::OsStr,
     fs,
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    fs::{
+        File,
+        OpenOptions,
+    },
+    io::{
+        Read,
+        Seek,
+        SeekFrom,
+        Write,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Called before `setup` performs any side effect, so an unusable value
@@ -125,7 +144,7 @@ fn append_gh_actions_env_file<Reporter: self::Reporter>(
     if let Err(err) = append_line_to_regular_file(path, line) {
         warn::<Reporter>(
             prefix_dir,
-            &format!(
+            format!(
                 "Failed to write GitHub Actions environment file {target_name} ({}): {err}",
                 path.display(),
             ),
@@ -176,10 +195,10 @@ fn write_line(file: &mut File, line: &str) -> std::io::Result<()> {
     file.write_all(output.as_bytes())
 }
 
-fn warn<Reporter: self::Reporter>(prefix: &Path, message: &str) {
+fn warn<Reporter: self::Reporter>(prefix: &Path, message: String) {
     Reporter::emit(&LogEvent::Pnpm(PnpmLog {
         level: LogLevel::Warn,
-        message: message.to_string(),
+        message,
         prefix: prefix.to_string_lossy().into_owned(),
     }));
 }

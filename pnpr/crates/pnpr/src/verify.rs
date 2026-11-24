@@ -1,17 +1,16 @@
 use axum::body::to_bytes;
-use futures_util::StreamExt as _;
 use miette::IntoDiagnostic as _;
 use pnpr_config::Config;
 use pnpr_package_name::CanonicalPackageName;
-use pnpr_storage::Storage;
+use pnpr_storage::{
+    Storage,
+    database::BlobState,
+};
 use serde_json::Value;
-use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
     pub check_hashes: bool,
-    pub prune_orphans: bool,
-    pub min_age_secs: u64,
 }
 
 #[derive(Debug, Default)]
@@ -23,14 +22,11 @@ pub struct VerifyReport {
     pub missing_blobs: Vec<String>,
     pub corrupted_blobs: Vec<String>,
     pub orphaned_blobs: Vec<String>,
-    pub prune_failures: Vec<String>,
 }
 
 struct VerifyContext<'a> {
     storage: &'a Storage,
     options: &'a VerifyOptions,
-    referenced_blobs: &'a mut HashSet<String>,
-    verified_npm_packages: &'a mut HashSet<String>,
     report: &'a mut VerifyReport,
 }
 
@@ -38,42 +34,24 @@ pub async fn verify_storage(
     config: &Config,
     options: &VerifyOptions,
 ) -> miette::Result<VerifyReport> {
-    let storage = crate::export::open_hosted_storage(config).await?;
+    let storage = crate::hosted_storage::open_hosted_storage(config).await?;
 
     let mut report = VerifyReport::default();
-    let namespaces = crate::export::configured_hosted_namespaces(config);
+    let namespaces = crate::hosted_storage::configured_hosted_namespaces(config);
 
-    for org in namespaces {
-        let org_storage = storage.for_hosted(&org, pnpr_registry::Ecosystem::Npm);
-        let mut referenced_blobs = HashSet::new();
-        let mut verified_npm_packages = HashSet::new();
-
-        let package_names = org_storage
+    for namespace in namespaces {
+        let npm_storage = storage.for_hosted(&namespace, pnpr_registry::Ecosystem::Npm);
+        let package_names = npm_storage
             .hosted_package_names()
             .await
             .map_err(|err| miette::miette!("failed to list hosted packages: {err}"))?;
-
-        {
-            let mut ctx = VerifyContext {
-                storage: &org_storage,
-                options,
-                referenced_blobs: &mut referenced_blobs,
-                verified_npm_packages: &mut verified_npm_packages,
-                report: &mut report,
-            };
-            for pkg_name in package_names {
-                verify_package(&mut ctx, &pkg_name).await?;
-            }
+        let mut ctx = VerifyContext { storage: &npm_storage, options, report: &mut report };
+        for pkg_name in package_names {
+            verify_package(&mut ctx, &pkg_name).await?;
         }
-
-        check_orphaned_blobs(
-            &org_storage,
-            &referenced_blobs,
-            &verified_npm_packages,
-            options,
-            &mut report,
-        )
-        .await?;
+        for ecosystem in pnpr_registry::Ecosystem::all() {
+            check_orphaned_archives(&storage.for_hosted(&namespace, ecosystem), &mut report).await?;
+        }
     }
 
     Ok(report)
@@ -83,7 +61,6 @@ async fn verify_package(ctx: &mut VerifyContext<'_>, pkg_name: &str) -> miette::
     let Ok(canonical) = CanonicalPackageName::parse(pkg_name, pnpr_registry::Ecosystem::Npm) else {
         return Ok(());
     };
-    ctx.verified_npm_packages.insert(pkg_name.to_string());
 
     let doc_bytes = ctx.storage
         .read_hosted_document(&canonical)
@@ -128,16 +105,16 @@ async fn verify_version_tarball(
     };
 
     // A hosted tar registry stores the version's tar in place of its `.tgz`.
-    let tar = canonical.tar_name_for_version(ver);
-    ctx.referenced_blobs.insert(format!("{pkg_name}/{filename}"));
-    ctx.referenced_blobs.insert(format!("{pkg_name}/{tar}"));
-
-    if let Some(bytes) = read_blob(ctx, canonical, filename).await? {
-        if ctx.options.check_hashes {
+    match read_blob(ctx, canonical, filename).await? {
+        BlobRead::Read(bytes) if ctx.options.check_hashes => {
             check_hash_mismatch(pkg_name, ver, filename, &bytes, dist, ctx.report);
         }
-    } else if !verify_stored_tar(ctx, canonical, ver, dist).await? {
-        ctx.report.missing_blobs.push(format!("{pkg_name}@{ver}: {filename}"));
+        BlobRead::Missing => {
+            if !verify_stored_tar(ctx, canonical, ver, dist).await? {
+                ctx.report.missing_blobs.push(format!("{pkg_name}@{ver}: {filename}"));
+            }
+        }
+        BlobRead::Read(_) | BlobRead::Corrupt => {}
     }
     Ok(())
 }
@@ -151,7 +128,11 @@ async fn verify_stored_tar(
     dist: &serde_json::Map<String, Value>,
 ) -> miette::Result<bool> {
     let tar = canonical.tar_name_for_version(ver);
-    let Some(bytes) = read_blob(ctx, canonical, &tar).await? else { return Ok(false) };
+    let bytes = match read_blob(ctx, canonical, &tar).await? {
+        BlobRead::Read(bytes) => bytes,
+        BlobRead::Missing => return Ok(false),
+        BlobRead::Corrupt => return Ok(true),
+    };
     if ctx.options.check_hashes
         && let Some(problem) = stored_tar_problem(ctx.storage, canonical, &bytes, dist).await?
     {
@@ -178,7 +159,8 @@ async fn stored_tar_problem(
     let expected = dist
         .get("integrity")
         .and_then(Value::as_str)
-        .and_then(|integrity| integrity.parse::<ssri::Integrity>().ok())
+        .map(str::parse::<ssri::Integrity>)
+        .and_then(Result::ok)
         .and_then(|integrity| table.get(&integrity.to_string()));
     let Some(expected) = expected else {
         return Ok(Some("no recorded tar integrity".to_string()));
@@ -191,21 +173,35 @@ async fn stored_tar_problem(
     }))
 }
 
-/// The bytes of the hosted blob `filename`, counted as checked.
+enum BlobRead {
+    Read(axum::body::Bytes),
+    Missing,
+    Corrupt,
+}
+
 async fn read_blob(
     ctx: &mut VerifyContext<'_>,
     canonical: &CanonicalPackageName,
     filename: &str,
-) -> miette::Result<Option<axum::body::Bytes>> {
-    let opened = ctx.storage
-        .open_hosted_blob(canonical, filename)
-        .await
-        .map_err(|err| miette::miette!("error opening blob for '{}': {err}", canonical.as_str()))?;
-    let Some((body, _)) = opened else { return Ok(None) };
+) -> miette::Result<BlobRead> {
+    let opened = match ctx.storage.open_hosted_blob(canonical, filename).await {
+        Err(error @ pnpr_error::RegistryError::CorruptArchive { .. }) => {
+            ctx.report.blobs_checked += 1;
+            ctx.report.corrupted_blobs.push(format!(
+                "{}: {filename} ({error})",
+                canonical.as_str(),
+            ));
+            return Ok(BlobRead::Corrupt);
+        }
+        result => result.map_err(|err| {
+            miette::miette!("error opening blob for '{}': {err}", canonical.as_str())
+        })?,
+    };
+    let Some((body, _)) = opened else { return Ok(BlobRead::Missing) };
     let bytes = to_bytes(body, usize::MAX).await.into_diagnostic()?;
     ctx.report.blobs_checked += 1;
     ctx.report.bytes_verified += bytes.len() as u64;
-    Ok(Some(bytes))
+    Ok(BlobRead::Read(bytes))
 }
 
 fn check_hash_mismatch(
@@ -251,120 +247,45 @@ async fn verify_version_attestation(
     };
 
     let filename = canonical.sigstore_name_for_version(ver);
-    let blob_key = format!("{pkg_name}/{filename}");
-    ctx.referenced_blobs.insert(blob_key);
 
-    let opened = ctx.storage
-        .open_hosted_blob(canonical, &filename)
-        .await
-        .map_err(|err| miette::miette!("error opening attestation for '{pkg_name}': {err}"))?;
-
-    if opened.is_none() {
-        ctx.report.missing_blobs.push(format!("{pkg_name}@{ver} attestation: {filename}"));
+    match read_blob(ctx, canonical, &filename).await? {
+        BlobRead::Missing => {
+            ctx.report.missing_blobs.push(format!("{pkg_name}@{ver} attestation: {filename}"));
+        }
+        BlobRead::Read(_) | BlobRead::Corrupt => {}
     }
     Ok(())
 }
 
-async fn check_orphaned_blobs(
+/// Report every archive `storage` holds that is not the live incarnation of
+/// a blob some file maps: what a refused publish, an interrupted reclaim, or
+/// an unpublish left. `pnpr gc` removes them, fenced against commits that
+/// land meanwhile.
+async fn check_orphaned_archives(
     storage: &Storage,
-    referenced: &HashSet<String>,
-    verified_npm_packages: &HashSet<String>,
-    options: &VerifyOptions,
     report: &mut VerifyReport,
 ) -> miette::Result<()> {
-    let mut stream = storage.hosted_blob_files();
-    while let Some(file_res) = stream.next().await {
-        let file = file_res.map_err(|err| miette::miette!("failed to list blobs: {err}"))?;
-        let Some(blob) = &file.blob else {
-            continue;
-        };
-        let path = format!("{}/{blob}", file.package);
-        if !verified_npm_packages.contains(&file.package) || referenced.contains(&path) {
-            continue;
+    let listed = |err| miette::miette!("failed to list archives: {err}");
+    let stored = storage.stored_incarnations().await.map_err(listed)?;
+    if stored.is_empty() {
+        return Ok(());
+    }
+    let ids = stored
+        .iter()
+        .map(|(blob, _)| blob.id.clone())
+        .collect();
+    let rows = storage.blob_rows(ids).await.map_err(listed)?;
+    let unmapped = storage.unmapped_blobs().await.map_err(listed)?;
+    for (blob, _) in stored {
+        let mapped_live = rows
+            .get(&blob.id)
+            .is_some_and(|row| row.state == BlobState::Live && row.incarnation == blob.incarnation)
+            && !unmapped.contains_key(&blob.id);
+        if !mapped_live {
+            report.orphaned_blobs.push(blob.key());
         }
-
-        let is_young = file.modified
-            .elapsed()
-            .map_or(true, |elapsed| elapsed.as_secs() < options.min_age_secs);
-        if options.prune_orphans && is_young {
-            continue;
-        }
-
-        handle_orphan_blob(storage, &path, options.prune_orphans, report).await;
     }
     Ok(())
-}
-
-async fn handle_orphan_blob(storage: &Storage, path: &str, prune: bool, report: &mut VerifyReport) {
-    if prune {
-        if is_blob_referenced_in_fresh_packument(storage, path).await {
-            return;
-        }
-        if let Err(err) = prune_orphan_blob(storage, path).await {
-            report.prune_failures.push(format!("{path}: {err}"));
-            report.orphaned_blobs.push(path.to_string());
-            return;
-        }
-    }
-    report.orphaned_blobs.push(path.to_string());
-}
-
-async fn is_blob_referenced_in_fresh_packument(storage: &Storage, path: &str) -> bool {
-    let Some((pkg, file_name)) = path.rsplit_once('/') else {
-        return false;
-    };
-    let Ok(canon) = CanonicalPackageName::parse(pkg, pnpr_registry::Ecosystem::Npm) else {
-        return false;
-    };
-    let Ok(Some(doc_bytes)) = storage.read_hosted_document(&canon).await else {
-        return false;
-    };
-    let Ok(packument) = serde_json::from_slice::<Value>(&doc_bytes) else {
-        return false;
-    };
-    check_packument_for_blob(&packument, &canon, file_name)
-}
-
-fn check_packument_for_blob(
-    packument: &Value,
-    canon: &CanonicalPackageName,
-    file_name: &str,
-) -> bool {
-    let Some(versions) = packument.get("versions").and_then(Value::as_object) else {
-        return false;
-    };
-    for (ver, v) in versions {
-        let tarball_match = v
-            .get("dist")
-            .and_then(|d| d.get("tarball"))
-            .and_then(Value::as_str)
-            .and_then(filename_from_url)
-            .is_some_and(|name| name == file_name);
-        let attestation_match = v
-            .get("dist")
-            .and_then(|d| d.get("attestations"))
-            .and_then(|a| a.get("url"))
-            .is_some()
-            && canon.sigstore_name_for_version(ver) == file_name;
-        if tarball_match || attestation_match {
-            return true;
-        }
-    }
-    false
-}
-
-async fn prune_orphan_blob(storage: &Storage, path: &str) -> Result<(), String> {
-    let Some((pkg, file_name)) = path.rsplit_once('/') else {
-        return Err("invalid blob path format".to_string());
-    };
-    let Ok(canon) = CanonicalPackageName::parse(pkg, pnpr_registry::Ecosystem::Npm) else {
-        return Err(format!("cannot parse npm package name from path '{pkg}'"));
-    };
-    storage
-        .remove_hosted_blob(&canon, file_name)
-        .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
 }
 
 fn safe_filename(name: &str) -> Option<&str> {
@@ -395,12 +316,14 @@ fn filename_from_url(url: &str) -> Option<&str> {
 fn verify_blob_integrity(bytes: &[u8], integrity_str: &str) -> bool {
     integrity_str
         .parse::<ssri::Integrity>()
-        .is_ok_and(|expected| expected.check(bytes).is_ok())
+        .map(|expected| expected.check(bytes))
+        .is_ok_and(|bytes| bytes.is_ok())
 }
 
 fn verify_blob_shasum(bytes: &[u8], expected_hex: &str) -> bool {
     ssri::Integrity::from_hex(expected_hex, ssri::Algorithm::Sha1)
-        .is_ok_and(|expected| expected.check(bytes).is_ok())
+        .map(|expected| expected.check(bytes))
+        .is_ok_and(|bytes| bytes.is_ok())
 }
 
 #[must_use]
@@ -426,12 +349,6 @@ pub fn format_verify_report(report: &VerifyReport) -> String {
     let _ = writeln!(out, "  Orphaned blobs: {}", report.orphaned_blobs.len());
     for orphan in &report.orphaned_blobs {
         let _ = writeln!(out, "    - ORPHANED: {orphan}");
-    }
-    if !report.prune_failures.is_empty() {
-        let _ = writeln!(out, "  Prune failures: {}", report.prune_failures.len());
-        for failure in &report.prune_failures {
-            let _ = writeln!(out, "    - PRUNE FAILED: {failure}");
-        }
     }
     out
 }

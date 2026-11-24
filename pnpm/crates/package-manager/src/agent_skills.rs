@@ -9,12 +9,18 @@
 //! the same skill name, or the name is already taken in an agent skill
 //! directory, the entry is `pnpm-<package>-<skill>` instead.
 
-pub(crate) use installed::resync_agent_skills_at;
+pub(crate) use installed::resync_agent_skills_dep_paths_at;
 pub use installed::{
-    ResyncAgentSkillsError, SkillApprovalError, SkillApprovalOptions,
-    resync_installed_agent_skills, skill_approval_options,
+    ResyncAgentSkillsError,
+    SkillApprovalError,
+    SkillApprovalOptions,
+    resync_installed_agent_skills,
+    skill_approval_options,
 };
-pub use targets::{agent_skills_dir_from_env, detected_agent_dirs};
+pub use targets::{
+    agent_skills_dir_from_env,
+    detected_agent_dirs,
+};
 
 /// Whether an install whose tree is up to date still has agent skills to
 /// link, because an approved skill's target directories changed since the
@@ -32,7 +38,7 @@ pub(crate) fn agent_skill_targets_changed(config: &Config, workspace_root: &Path
         return false;
     };
     let linked = modules.linked_skills.unwrap_or_default();
-    (!linked.is_empty() || modules.has_unlinked_skills == Some(true))
+    (!linked.is_empty() || modules.has_unlinked_skills.unwrap_or(false))
         && targets::targets_changed(config, workspace_root, agent_skills_dir_from_env(), &linked)
 }
 
@@ -42,19 +48,51 @@ mod installed;
 mod links;
 mod targets;
 
-use crate::{SkillsPolicy, VersionPolicyError};
-use derive_more::{Display, Error};
-use discovery::{Skill, SkillSource, discover_skill_sources};
+use crate::{
+    SkillsPolicy,
+    VersionPolicyError,
+};
+use derive_more::{
+    Display,
+    Error,
+};
+use discovery::{
+    Skill,
+    SkillSource,
+    discover_skill_sources,
+    local_identity::{
+        DIGEST_HEX_LEN,
+        MAX_SKILL_ENTRY_BYTES,
+        dedup_approved_local_copies,
+        disambiguate_local_segments,
+        truncate_utf8,
+    },
+};
 use gitignore::update_gitignores;
-use links::{ensure_unoccupied, is_occupied, materialize, prune};
+use links::{
+    ensure_unoccupied,
+    is_occupied,
+    materialize,
+    prune,
+};
 use miette::Diagnostic;
-use pnpm_config::{Config, SkillsPermission};
+use pnpm_config::{
+    Config,
+    SkillsPermission,
+};
 use pnpm_lockfile::Lockfile;
 use pnpm_modules_yaml::IncludedDependencies;
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        btree_map,
+    },
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// The prefix of every entry pnpm links into an agent skill directory.
@@ -91,6 +129,17 @@ pub struct AgentSkillsState {
 }
 
 impl AgentSkillsState {
+    /// The keys `permissions` approves the pending packages under, sorted.
+    #[must_use]
+    pub fn pending_keys(&self) -> Vec<String> {
+        self.pending
+            .iter()
+            .map(|dep_path| crate::skill_approval_key(dep_path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(crate) fn update_modules(self, modules: &mut pnpm_modules_yaml::Modules) -> bool {
         let pending = (!self.pending.is_empty()).then(|| {
             self.pending
@@ -110,17 +159,6 @@ impl AgentSkillsState {
         modules.linked_skills = linked;
         modules.has_unlinked_skills = unlinked;
         true
-    }
-
-    /// The keys `permissions` approves the pending packages under, sorted.
-    #[must_use]
-    pub fn pending_keys(&self) -> Vec<String> {
-        self.pending
-            .iter()
-            .map(|dep_path| crate::allow_build_key_from_ignored_build(dep_path))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
     }
 }
 
@@ -242,6 +280,8 @@ fn decide_sources(
             approved.push(SkillSource { skills, ..source });
         }
     }
+    dedup_approved_local_copies(&mut approved);
+    disambiguate_local_segments(&mut approved);
     (pending, approved)
 }
 
@@ -250,7 +290,7 @@ fn decide_sources(
 ///
 /// A skill name one approved package ships is the entry name, unless a
 /// target directory holds an entry pnpm must not replace there (a link
-/// pnpm recorded may be replaced; anything else may not) — then the
+/// pnpm recorded may be replaced; anything else may not); then the
 /// prefixed name is the entry, in every directory, so the names do not
 /// differ across them. A skill name several approved packages ship gets
 /// the prefixed form everywhere.
@@ -313,9 +353,32 @@ fn target_of(source: &SkillSource, skill: &Skill) -> PathBuf {
     source.package_dir.join("skills").join(&skill.dir)
 }
 
-/// The fallback entry name: `pnpm-<package>-<skill>`.
+/// The fallback entry name: `pnpm-<package>-<skill>`, shortened with a SHA-256
+/// digest of `(dep_path, skill)` when the combined name would exceed
+/// [`MAX_SKILL_ENTRY_BYTES`].
 fn prefixed_name(source: &SkillSource, skill: &Skill) -> String {
-    format!("{AGENT_SKILL_LINK_PREFIX}{}-{}", source.link_segment, skill.name)
+    let full = format!("{AGENT_SKILL_LINK_PREFIX}{}-{}", source.link_segment, skill.name);
+    if full.len() <= MAX_SKILL_ENTRY_BYTES {
+        return full;
+    }
+    let digest =
+        &pnpm_crypto_hash::create_short_hash(&format!("{}\0{}", source.dep_path, skill.name))
+            [..DIGEST_HEX_LEN];
+    let min_with_skill =
+        AGENT_SKILL_LINK_PREFIX.len() + DIGEST_HEX_LEN + 1 + skill.name.len();
+    if min_with_skill <= MAX_SKILL_ENTRY_BYTES {
+        let room = MAX_SKILL_ENTRY_BYTES - min_with_skill;
+        if room > 1 {
+            let prefix = truncate_utf8(&source.link_segment, room - 1);
+            if !prefix.is_empty() {
+                return format!("{AGENT_SKILL_LINK_PREFIX}{prefix}-{digest}-{}", skill.name);
+            }
+        }
+        return format!("{AGENT_SKILL_LINK_PREFIX}{digest}-{}", skill.name);
+    }
+    let skill_room = MAX_SKILL_ENTRY_BYTES - AGENT_SKILL_LINK_PREFIX.len() - DIGEST_HEX_LEN - 1;
+    let skill_prefix = truncate_utf8(&skill.name, skill_room);
+    format!("{AGENT_SKILL_LINK_PREFIX}{digest}-{skill_prefix}")
 }
 
 /// Whether every target directory can take an entry named `name`: an

@@ -1,42 +1,86 @@
 pub(crate) use environment::script_environment;
-pub(super) use execution::{RunContext, get_run_script_commands, run_stages};
+pub(super) use execution::{
+    RunContext,
+    get_run_script_commands,
+    run_stages,
+};
 pub(crate) use injected_sync::project_modules_dirs;
 pub(super) use listing::ScriptSelector;
 
 use super::{
-    exec::{ExecArgs, ExecDirs, ExecError},
-    reporter::{ReporterType, reporter_emit, script_output_colors, suppresses_info_output},
+    exec::{
+        ExecArgs,
+        ExecDirs,
+        ExecError,
+    },
+    reporter::{
+        ReporterType,
+        reporter_emit,
+        script_output_colors,
+        suppresses_info_output,
+    },
 };
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 
 use execution::{
-    ScriptOutcome, no_matching_script, run_selected_scripts, script_concurrency, script_extra_env,
+    MissingScript,
+    ScriptOutcome,
+    run_selected_scripts,
+    script_concurrency,
+    script_extra_env,
     selected_scripts,
 };
 use filter_hint::filter_placement_hint;
 use indexmap::IndexMap;
 
-use listing::{render_project_commands, throw_or_filter_hidden_scripts};
-use miette::{Diagnostic, IntoDiagnostic};
+use listing::{
+    render_project_commands,
+    throw_or_filter_hidden_scripts,
+};
+use miette::{
+    Diagnostic,
+    IntoDiagnostic,
+};
 use pnpm_config::Config;
 use pnpm_executor::{
-    ProcessTracker, RunScript, ScriptExit, ScriptOutput, exit_like, interrupt_count, run_script,
+    ProcessTracker,
+    RunScript,
+    ScriptExit,
+    ScriptOutput,
+    exit_like,
+    interrupt_count,
+    run_script,
 };
 use pnpm_package_manager::{
-    make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
+    make_node_package_map_option,
+    make_node_require_option,
+    package_map_path_for_execution,
     pnp_path_for_execution,
 };
 use pnpm_package_manifest::PackageManifest;
-use pnpm_workspace::{ReadProjectManifestOnlyError, read_project_manifest_only};
-use pnpm_workspace_task_scheduler::{ScheduleGraphOptions, TaskCompletion, schedule_graph};
+use pnpm_workspace::{
+    ReadProjectManifestOnlyError,
+    read_project_manifest_only,
+};
+use pnpm_workspace_task_scheduler::{
+    ScheduleGraphOptions,
+    TaskCompletion,
+    schedule_graph,
+};
 use recursive::RecursiveRunOutcome;
 use regress::Regex;
 use serde_json::Value;
 use std::{
     collections::HashMap,
     env,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Mutex,
 };
 
@@ -49,7 +93,7 @@ pub struct RunArgs {
     /// A pre-defined package script followed by the arguments passed to
     /// it. When empty, the available scripts are listed.
     // One positional rather than a script name plus a separate argument
-    // list, so parsing stops *at* the script name — pnpm puts `run` in
+    // list, so parsing stops *at* the script name, pnpm puts `run` in
     // `SPECIALLY_ESCAPED_CMDS` to the same effect. Every later token
     // reaches the script verbatim, including a `--` separator and
     // anything shaped like a pnpm flag. Splitting the two lets clap keep
@@ -144,11 +188,11 @@ impl RunError {
 impl RunArgs {
     /// Build the positional from a script name and its arguments, for the
     /// paths that synthesize a `run` rather than parsing one.
-    pub(super) fn script<Args>(name: &str, args: Args) -> Vec<String>
+    pub(super) fn script<Args>(name: String, args: Args) -> Vec<String>
     where
         Args: IntoIterator<Item = String>,
     {
-        std::iter::once(name.to_string()).chain(args).collect()
+        std::iter::once(name).chain(args).collect()
     }
 
     /// The script to run, or `None` when `run` was given no positional and
@@ -175,7 +219,7 @@ impl RunArgs {
     /// pnpm 11, to a single selected script: every script runs, and the
     /// command ends with [`RunError::SomeScriptsFailed`] if any failed.
     pub fn run(self, dir: &Path, config: &Config, reporter: ReporterType) -> miette::Result<()> {
-        self.run_inner(ExecDirs::same(dir), config, reporter, false)
+        self.run_inner(ExecDirs::same(dir), config, reporter, MissingScript::ReportError)
     }
 
     /// Like [`Self::run`], but a name that matches no script is handed to
@@ -186,7 +230,7 @@ impl RunArgs {
         config: &Config,
         reporter: ReporterType,
     ) -> miette::Result<()> {
-        self.run_inner(dirs, config, reporter, true)
+        self.run_inner(dirs, config, reporter, MissingScript::FallbackToExec)
     }
 
     fn run_inner(
@@ -194,7 +238,7 @@ impl RunArgs {
         dirs: ExecDirs<'_>,
         config: &Config,
         reporter: ReporterType,
-        fallback_to_exec: bool,
+        missing_script: MissingScript,
     ) -> miette::Result<()> {
         let dir = dirs.project;
         // Before the dependency verification: an unsupported flag must
@@ -213,25 +257,20 @@ impl RunArgs {
         };
         let manifest = match read_project_manifest_only(dir) {
             Ok(manifest) => manifest,
-            Err(ReadProjectManifestOnlyError::NoImporterManifestFound { .. })
-                if fallback_to_exec =>
-            {
-                return exec_fallback(script_name, args, dirs, config, reporter);
+            Err(err @ ReadProjectManifestOnlyError::NoImporterManifestFound { .. }) => {
+                match missing_script {
+                    MissingScript::FallbackToExec => {
+                        return exec_fallback(script_name, args, dirs, config);
+                    }
+                    MissingScript::ReportError => return Err(RunError::Manifest(err).into()),
+                }
             }
             Err(err) => return Err(RunError::Manifest(err).into()),
         };
 
-        let specified = selected_scripts(&manifest, script_name)?;
+        let specified = selected_scripts(&manifest, dir, script_name)?;
         if specified.is_empty() {
-            return no_matching_script(
-                script_name,
-                args,
-                dirs,
-                config,
-                reporter,
-                self.if_present,
-                fallback_to_exec,
-            );
+            return self.no_matching_script(script_name, args, dirs, config, missing_script);
         }
         self.run_scripts_here(dir, &manifest, config, reporter, specified, args)
     }
@@ -332,9 +371,8 @@ fn exec_fallback(
     args: &[String],
     dirs: ExecDirs<'_>,
     config: &Config,
-    reporter: ReporterType,
 ) -> miette::Result<()> {
-    let result = exec_script_name(script_name, args, dirs, config, reporter);
+    let result = exec_script_name(script_name.to_owned(), args, dirs, config);
     let Some(hint) = filter_placement_hint(script_name, args) else {
         return result;
     };
@@ -348,11 +386,10 @@ fn exec_fallback(
 }
 
 fn exec_script_name(
-    script_name: &str,
+    script_name: String,
     args: &[String],
     dirs: ExecDirs<'_>,
     config: &Config,
-    reporter: ReporterType,
 ) -> miette::Result<()> {
     ExecArgs {
         command: RunArgs::script(script_name, args.iter().cloned()),
@@ -366,7 +403,7 @@ fn exec_script_name(
             parallel: false,
         },
     }
-    .run(dirs, config, reporter)
+    .run_verified(dirs, config)
 }
 
 #[cfg(test)]

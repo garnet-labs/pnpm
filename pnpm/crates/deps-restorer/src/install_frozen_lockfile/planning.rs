@@ -1,14 +1,34 @@
-use super::{InstallFrozenLockfileError, LockfileVerificationOverride};
-use crate::{
-    AllowBuildPolicy, CreateVirtualStore, CreateVirtualStoreOutput, SkippedSnapshots,
-    VirtualStoreLayout, any_installability_constraint,
+use super::{
+    InstallFrozenLockfileError,
+    LockfileVerificationOverride,
 };
-use pnpm_lockfile::{Lockfile, LockfileEntries, PackageKey, PackageMetadata, SnapshotEntry};
-use pnpm_modules_yaml::{Host, IncludedDependencies, read_modules_manifest};
+use crate::{
+    AllowBuildPolicy,
+    CreateVirtualStore,
+    CreateVirtualStoreOutput,
+    SkippedSnapshots,
+    VirtualStoreLayout,
+    any_installability_constraint,
+};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileEntries,
+    PackageKey,
+    PackageMetadata,
+    SnapshotEntry,
+};
+use pnpm_modules_yaml::{
+    Host,
+    IncludedDependencies,
+    read_modules_manifest,
+};
 use pnpm_store_dir::StoreIndexWriter;
 use pnpm_tarball::SharedReportedProgressKeys;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::PathBuf,
     sync::Arc,
 };
@@ -58,6 +78,44 @@ impl<'a> FrozenInputs<'a> {
 
     pub(super) fn groups(&self) -> &'a crate::GroupSelection {
         self.projects.groups
+    }
+
+    pub(super) async fn effective_local_policy(
+        &self,
+    ) -> Result<pnpm_lockfile_verification::LocalResolutionPolicy, super::InstallFrozenLockfileError>
+    {
+        if let Some(policy) = self.lockfiles.policies.local_policy.cloned() {
+            return Ok(policy);
+        }
+        let mut base = crate::attach_live_project_manifests(
+            crate::local_resolution_policy_for_config(
+                self.drivers.config,
+                self.drivers.pnpmfile_hook.is_some(),
+            )
+            .with_lockfile_dir(self.projects.workspace_root),
+            self.projects.manifests,
+        );
+        if !self.projects.manifests.is_empty() {
+            base = crate::attach_selected_project_manifests(base, self.projects.manifests);
+        }
+        crate::enrich_local_policy_for_install(
+            base,
+            self.lockfiles.verified,
+            crate::LocalPolicyEnrichDrivers {
+                config: Some(self.drivers.config),
+                http_client: Some(self.drivers.http_client),
+                hook: self.drivers.pnpmfile_hook.map(Arc::as_ref),
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::EnrichLocalPolicyError::ReadPackageHook(error) => {
+                super::InstallFrozenLockfileError::ReadPackageHook(error)
+            }
+            crate::EnrichLocalPolicyError::InvalidPackageExtensionSelector(error) => {
+                super::InstallFrozenLockfileError::InvalidPackageExtensionSelector(error)
+            }
+        })
     }
 
     // Declared projects may live outside the lockfile directory, unlike untrusted importer keys.
@@ -147,6 +205,7 @@ impl<'a> FrozenInputs<'a> {
         &self,
         allow_build_policy: &AllowBuildPolicy,
         engine_name: Option<&str>,
+        local_policy: pnpm_lockfile_verification::LocalResolutionPolicy,
     ) -> Result<VirtualStoreLayout, InstallFrozenLockfileError> {
         let install = self;
         let LockfileEntries { packages, snapshots } = install.entries();
@@ -178,13 +237,18 @@ impl<'a> FrozenInputs<'a> {
         // Reject a lockfile whose dependency names, aliases, or
         // virtual-store slots would escape the project or the store once
         // joined into a filesystem path. Runs before any materialization
-        // and before the warm-install skip filter, and unconditionally —
+        // and before the warm-install skip filter, and unconditionally,
         // so it is not bypassed by `trustLockfile`, which disables the
         // resolution-verification fan-out where the offline name check
         // would otherwise run. The slot-containment half needs the
         // install-time `layout`, so it can't live in the verifier crate.
         pnpm_lockfile_verification::verify_lockfile_dependency_names(install.lockfiles.verified)
             .map_err(InstallFrozenLockfileError::LockfileVerification)?;
+        pnpm_lockfile_verification::verify_lockfile_local_resolutions(
+            install.lockfiles.verified,
+            Some(local_policy),
+        )
+        .map_err(InstallFrozenLockfileError::LockfileVerification)?;
         pnpm_lockfile_verification::verify_lockfile_importer_snapshot_links(
             install.lockfiles.verified,
         )
@@ -295,7 +359,7 @@ pub(super) struct SkipSetPlan {
 /// `pnpm:skipped-optional-dependency` from being re-emitted for a
 /// known-skipped package.
 ///
-/// A read error (corrupt yaml, permissions) degrades to an empty seed —
+/// A read error (corrupt yaml, permissions) degrades to an empty seed,
 /// `.modules.yaml` is a cache artifact, not an authoritative source.
 pub(super) fn seed_skip_set(
     config: &pnpm_config::Config,
@@ -323,7 +387,7 @@ pub(super) fn seed_skip_set(
     }
 }
 /// Detecting the host is what costs a `node --version`, so it is skipped
-/// entirely for the common constraint-free lockfile — otherwise the
+/// entirely for the common constraint-free lockfile; otherwise the
 /// probe serializes against the extraction that dominates a cold
 /// install.
 ///
@@ -352,14 +416,14 @@ pub(super) struct HostDetectionInputs<'a> {
         Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
     pub(super) needs_installability_check: bool,
 }
-/// The global-virtual-store layout needs the engine name — and so the
-/// host — synchronously, but otherwise the detection stays pending and
+/// The global-virtual-store layout needs the engine name (and so the
+/// host) synchronously, but otherwise the detection stays pending and
 /// is only resolved once the skip-set computation needs the host, so the
 /// probe runs under the store-side warm-cache prefetch instead of
 /// serializing before it. A detection the install entry point already
 /// spawned (before the lockfile parse) is adopted so its head start
 /// counts; an early detection a constraint-free lockfile turns out not
-/// to need is dropped — the probe finishes in the background and its
+/// to need is dropped, the probe finishes in the background and its
 /// result goes unused.
 pub(super) async fn detect_host(
     inputs: HostDetectionInputs<'_>,
@@ -438,21 +502,21 @@ impl EngineNamePlan {
 /// `node: runtime:<version>` dependency, and anchoring the GVS hash and the
 /// side-effects-cache key prefix to that pinned Node is what keeps
 /// pinned and non-pinned installs on one host from splitting the shared
-/// store. Otherwise the name is derived from the host — synchronously
+/// store. Otherwise the name is derived from the host, synchronously
 /// when it is already detected, through
 /// [`EngineNamePlan::pending_slot`] while a detection is in flight, and
 /// through [`EngineNamePlan::deferred`] when no detection was needed at
-/// all. A synthetic fallback host (`detected: false`) yields `None` so a
-/// bogus `99999.0.0`-derived key can't poison either the cache or the
-/// GVS hash.
+/// all or an override replaced the host's version. A
+/// synthetic fallback host (`detected: false`) yields `None` so a bogus
+/// `99999.0.0`-derived key can't poison either the cache or the GVS hash.
 pub(super) async fn plan_engine_name(
     config: &pnpm_config::Config,
     host_detection: &crate::materialization_plan::HostDetection,
     importers: &HashMap<String, pnpm_lockfile::ProjectSnapshot>,
     needs_deferred_probe: bool,
 ) -> EngineNamePlan {
-    let host = match host_detection {
-        crate::materialization_plan::HostDetection::Pending { .. } => {
+    let host_node = match host_detection {
+        crate::materialization_plan::HostDetection::Pending { probes_node: true, .. } => {
             let name = crate::materialization_plan::engine_name_from_runtime_pin(importers);
             if name.is_some() {
                 return EngineNamePlan { name, deferred: None, pending_slot: None };
@@ -463,9 +527,11 @@ pub(super) async fn plan_engine_name(
                 pending_slot: Some(std::sync::Arc::new(std::sync::OnceLock::new())),
             };
         }
-        crate::materialization_plan::HostDetection::Resolved(host) => host,
+        crate::materialization_plan::HostDetection::Pending { .. } => None,
+        crate::materialization_plan::HostDetection::Resolved(host) => {
+            crate::materialization_plan::execution_host_node(host.as_ref())
+        }
     };
-    let host_node = host.as_ref().map(crate::materialization_plan::HostNode::from);
     let (name, deferred) = crate::materialization_plan::resolve_engine_name(
         config.enable_global_virtual_store,
         importers,

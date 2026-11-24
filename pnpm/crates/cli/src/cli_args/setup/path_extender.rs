@@ -5,14 +5,26 @@
 //! current shell's rc file is edited. The Windows changes are rendered into
 //! the same `old_settings` / `new_settings` shape the POSIX path reports.
 
-pub(super) use posix::{detect_current_shell, render_shell_settings, sh_quote};
+pub(super) use posix::{
+    detect_current_shell,
+    pwsh_quote,
+    render_shell_settings,
+    sh_quote,
+};
+pub(super) use windows::persisted_path_dirs;
 
 mod posix;
 mod windows;
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 /// Where the new directory is inserted into `PATH` (defaulting to `start`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +47,24 @@ pub(super) enum ConfigFileChangeType {
 }
 
 /// The config file that was touched and how. `None` on Windows, where the
-/// registry — not a file — is edited.
+/// registry (not a file) is edited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ConfigReport {
     pub path: PathBuf,
     pub change_type: ConfigFileChangeType,
+}
+
+impl ConfigReport {
+    /// The command that loads the config file into the running shell.
+    pub fn reload_command(&self) -> String {
+        if self.path
+            .extension()
+            .is_some_and(|extension| extension == "ps1")
+        {
+            return format!(". {}", pwsh_quote(&self.path.to_string_lossy()));
+        }
+        format!("source {}", self.path.display())
+    }
 }
 
 /// The before/after of a path-extension run.
@@ -79,7 +104,7 @@ pub(crate) enum PathExtenderError {
     #[diagnostic(
         code(ERR_PNPM_UNKNOWN_SHELL),
         help(
-            "Set the SHELL environment variable to your active shell.\nSupported shell languages are bash, zsh, fish, ksh, dash, sh, and nushell."
+            "Set the SHELL environment variable to your active shell.\nSupported shell languages are bash, zsh, fish, ksh, dash, sh, nushell, and PowerShell."
         )
     )]
     UnknownShell,
@@ -87,7 +112,9 @@ pub(crate) enum PathExtenderError {
     #[display(r#"Can't setup configuration for "{shell}" shell"#)]
     #[diagnostic(
         code(ERR_PNPM_UNSUPPORTED_SHELL),
-        help("Supported shell languages are bash, zsh, fish, ksh, dash, sh, and nushell.")
+        help(
+            "Supported shell languages are bash, zsh, fish, ksh, dash, sh, nushell, and PowerShell."
+        )
     )]
     UnsupportedShell {
         shell: String,
@@ -131,17 +158,17 @@ pub(crate) enum PathExtenderError {
         current_value: String,
     },
 
-    #[display("exec chcp failed: {message}")]
-    #[diagnostic(code(ERR_PNPM_CHCP))]
-    Chcp {
+    #[display("could not read the console code page: {message}")]
+    #[diagnostic(code(ERR_PNPM_CODE_PAGE))]
+    CodePage {
         message: String,
     },
 
-    #[display("`{command}` failed: {stderr}")]
+    #[display("`{command}` failed: {message}")]
     #[diagnostic(code(ERR_PNPM_SETUP_COMMAND_FAILED))]
     CommandFailed {
         command: String,
-        stderr: String,
+        message: String,
     },
 
     #[display("win32 registry environment values could not be retrieved")]

@@ -1,9 +1,27 @@
 use super::{
-    BTreeMap, BinaryArchive, BinaryResolution, BinarySpec, DirectoryResolution, GIT_COMMIT,
-    GitResolution, LockfileFormError, LockfileResolution, PlatformAssetResolution,
-    PlatformAssetTarget, REVISION_SHA512, RegistryResolution, SHA512, TarballResolution,
-    TarballRevision, VariationsResolution, assert_eq, custom_cdn_resolution, integrity,
-    render_resolution, text_block, undeclared_form,
+    BTreeMap,
+    BinaryArchive,
+    BinaryResolution,
+    BinarySpec,
+    DirectoryResolution,
+    GIT_COMMIT,
+    GitResolution,
+    LockfileFormError,
+    LockfileResolution,
+    PlatformAssetResolution,
+    PlatformAssetTarget,
+    REVISION_SHA512,
+    RegistryResolution,
+    SHA512,
+    TarballResolution,
+    TarballRevision,
+    VariationsResolution,
+    assert_eq,
+    custom_cdn_resolution,
+    integrity,
+    render_resolution,
+    text_block,
+    undeclared_form,
 };
 
 #[test]
@@ -457,7 +475,6 @@ fn deserialize_variations_resolution() {
 #[test]
 fn serialize_variations_resolution() {
     let resolution = LockfileResolution::Variations(VariationsResolution {
-        revision: None,
         variants: vec![PlatformAssetResolution {
             resolution: LockfileResolution::Binary(BinaryResolution {
                 url: "https://nodejs.org/dist/v22.0.0/node-v22.0.0-darwin-arm64.tar.gz".to_string(),
@@ -472,7 +489,6 @@ fn serialize_variations_resolution() {
                 os: "darwin".to_string(),
                 cpu: "arm64".to_string(),
                 libc: None,
-                ..PlatformAssetTarget::default()
             }],
         }],
     });

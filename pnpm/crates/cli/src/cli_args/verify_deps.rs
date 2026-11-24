@@ -1,26 +1,44 @@
 //! The verify-deps-before-run gate: before `pnpm run` / `pnpm exec`
 //! execute anything, verify that `node_modules` is in sync with the
-//! lockfile and apply the configured action — spawn an install, prompt
+//! lockfile and apply the configured action, spawn an install, prompt
 //! for one, error out, or warn. pnpm's counterpart is
 //! `runDepsStatusCheck` in `exec/commands`.
 
 use super::{
     legacy_pnpm_field::ignored_lockfile_pnpm_field_keys,
     package_manager::read_root_manifest,
-    reporter::{ReporterType, quiet_loglevel_arg},
+    reporter::{
+        ReporterType,
+        quiet_loglevel_arg,
+    },
 };
 use crate::process::Command;
-use derive_more::{Display, Error};
-use miette::{Diagnostic, IntoDiagnostic};
-use pnpm_config::{Config, VerifyDepsBeforeRun};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Diagnostic,
+    IntoDiagnostic,
+};
+use pnpm_config::{
+    Config,
+    VerifyDepsBeforeRun,
+};
 use pnpm_default_reporter::colors::Colors;
 use pnpm_fs::DirLock;
 use pnpm_package_manager::{
-    GateWorkspace, RunDepsStatus, check_deps_status_before_run_at, deps_install_root,
+    GateWorkspace,
+    RunDepsStatus,
+    check_deps_status_before_run_at,
+    deps_install_root,
 };
 use std::{
     collections::HashSet,
-    io::{self, IsTerminal},
+    io::{
+        self,
+        IsTerminal,
+    },
     path::Path,
     time::Duration,
 };
@@ -62,7 +80,7 @@ enum VerifyDepsError {
 }
 
 /// Run the configured verify-deps-before-run action for the project at
-/// `dir`. `Ok(())` means the script may proceed — including after a
+/// `dir`. `Ok(())` means the script may proceed, including after a
 /// spawned install, a declined prompt, or a warning.
 ///
 /// `selected_project_dirs` are the project directories the gated command
@@ -396,7 +414,7 @@ fn prompt_install(
 /// project, and such an install already covers the project.
 fn install_selection_args(config: &Config) -> Vec<String> {
     if config.shares_one_lockfile() {
-        filter_selector_args(&config.filter, &config.filter_prod)
+        filter_selector_args(&config.filter, &config.filter_prod, &config.filter_order)
     } else {
         Vec::new()
     }
@@ -406,14 +424,21 @@ fn install_selection_args(config: &Config) -> Vec<String> {
 /// command's project selection in the install the gate spawns. Each selector
 /// also selects its dependencies, because a selected project needs the
 /// workspace projects it depends on installed too.
-fn filter_selector_args(filters: &[String], filter_prod: &[String]) -> Vec<String> {
-    let filters = filters
-        .iter()
-        .map(|selector| format!("--filter={}", with_dependencies(selector)));
-    let filter_prod = filter_prod
-        .iter()
-        .map(|selector| format!("--filter-prod={}", with_dependencies(selector)));
-    filters.chain(filter_prod).collect()
+fn filter_selector_args(
+    filters: &[String],
+    filter_prod: &[String],
+    filter_order: &[pnpm_config::FilterSource],
+) -> Vec<String> {
+    pnpm_config::ordered_filter_entries(filters, filter_prod, filter_order)
+        .into_iter()
+        .map(|(source, selector)| {
+            let flag = match source {
+                pnpm_config::FilterSource::Filter => "--filter",
+                pnpm_config::FilterSource::FilterProd => "--filter-prod",
+            };
+            format!("{flag}={}", with_dependencies(selector))
+        })
+        .collect()
 }
 
 pub(crate) fn with_dependencies(selector: &str) -> String {

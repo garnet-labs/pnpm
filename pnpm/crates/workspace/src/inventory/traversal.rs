@@ -1,9 +1,19 @@
-use super::{FindWorkspaceInventoryError, IgnoredDirectories, is_ignorable_discovery_error};
-use cap_primitives::{ambient_authority, fs};
+use super::{
+    FindWorkspaceInventoryError,
+    IgnoredDirectories,
+    is_ignorable_discovery_error,
+};
+use cap_primitives::{
+    ambient_authority,
+    fs,
+};
 use std::{
     ffi::OsStr,
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 struct OpenDirectory<'a> {
@@ -33,13 +43,15 @@ pub(super) fn walk_workspace(
     while let Some(path) = pending.pop() {
         let handle = match before_open_directory(&path)
             .and_then(|()| {
-                super::open_directory::open_directory(
+                pnpm_ffi_fs::open_directory_beneath(
                     &root_handle,
                     path.strip_prefix(workspace_root).expect("descendant of workspace root"),
-                    &mut navigation_opens,
                 )
             }) {
-            Ok(handle) => handle,
+            Ok((handle, opens)) => {
+                navigation_opens += opens;
+                handle
+            }
             Err(error) if is_changed_candidate_error(&error) => continue,
             Err(source) => {
                 return Err(FindWorkspaceInventoryError::InspectCandidate { path, source });

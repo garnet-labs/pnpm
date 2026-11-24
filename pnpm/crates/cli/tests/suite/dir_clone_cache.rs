@@ -1,7 +1,7 @@
 //! The macOS directory-clone materialization cache
 //! (`pnpm-deps-restorer/src/dir_clone_cache.rs`): a local-virtual-store
 //! install materializes each package's canonical slot under
-//! `<store_dir>/links` and projects it into `node_modules/.pnpm` with
+//! `<store_dir>/dir-clone-cache` and projects it into `node_modules/.pnpm` with
 //! one directory `clonefile(2)`. Regression coverage for the macOS
 //! hot-install slowdown of
 //! <https://github.com/pnpm/pnpm/issues/14231>.
@@ -9,29 +9,51 @@
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_store_dir::STORE_VERSION;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_store_dir::StoreDir;
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 
-/// `<store_dir>/v11/links` — where the canonical slots live, shared
-/// with `enableGlobalVirtualStore` installs.
-fn links_root(store_dir: &Path) -> PathBuf {
-    store_dir.join(STORE_VERSION).join("links")
+/// The disposable canonical slots used by local-store installs.
+fn cache_root(store_dir: &Path) -> PathBuf {
+    StoreDir::new(store_dir).dir_clone_cache()
 }
 
 /// The package's materialized directory inside its sole canonical slot.
+/// Slots are keyed by content (`content/<xx>/<rest>`), so the one holding
+/// `name@version` is found by its manifest.
 fn canonical_pkg_dir(store_dir: &Path, name: &str, version: &str) -> PathBuf {
-    let version_dir = links_root(store_dir).join(name).join(version);
-    let hashes: Vec<PathBuf> = fs::read_dir(&version_dir)
-        .unwrap_or_else(|err| panic!("read hash dirs under {version_dir:?}: {err}"))
-        .map(|entry| entry.expect("read hash dir entry").path())
+    let content_dir = cache_root(store_dir).join("content");
+    let read_dir = |dir: &Path| -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read {dir:?}: {err}"))
+            .map(|entry| entry.expect("read slot entry"))
+            .map(|entry| entry.path())
+            .collect()
+    };
+    let matches: Vec<PathBuf> = read_dir(&content_dir)
+        .iter()
+        .flat_map(|shard| read_dir(shard))
+        .map(|slot| slot.join("node_modules"))
+        .map(|modules_dir| modules_dir.join(name))
+        .filter(|pkg_dir| {
+            fs::read(pkg_dir.join("package.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|manifest| manifest["version"] == version)
+        })
         .collect();
-    assert_eq!(hashes.len(), 1, "expected one hash dir under {version_dir:?}, got {hashes:?}");
-    hashes[0].join("node_modules").join(name)
+    assert_eq!(matches.len(), 1, "expected one slot for {name}@{version}, got {matches:?}");
+    matches.into_iter().next().unwrap()
 }
 
 fn pacquet(workspace: &Path) -> Command {
@@ -52,8 +74,8 @@ fn project_pkg_manifest(workspace: &Path) -> PathBuf {
 }
 
 /// The planted bytes are what prove the source: only a clone of the
-/// canonical slot — not a re-import from the CAS — can carry them into
-/// the project copy.
+/// canonical slot can carry them into the project copy. A re-import from
+/// the CAS cannot.
 #[test]
 fn warm_reinstall_is_served_from_the_canonical_slot() {
     let CommandTempCwd {
@@ -163,9 +185,42 @@ fn explicit_copy_method_bypasses_the_cache() {
         "the package must land on the flat project-local layout",
     );
     assert!(
-        !links_root(&store_dir).exists(),
+        !cache_root(&store_dir).exists(),
         "an explicit copy install must not populate canonical slots",
     );
 
     drop(mock_instance);
+}
+
+#[test]
+fn prune_removes_cached_clones_without_global_virtual_store() {
+    let CommandTempCwd {
+        root: _root, workspace, npmrc_info, ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+    write_manifest(&workspace);
+    pacquet(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let cached_package = canonical_pkg_dir(&store_dir, "@pnpm.e2e/pkg-with-1-dep", "100.0.0");
+    assert!(cached_package.join("package.json").exists());
+    assert!(!StoreDir::new(&store_dir).links().exists());
+    let installed_manifest = project_pkg_manifest(&workspace);
+    let manifest = fs::read(&installed_manifest).unwrap();
+
+    pacquet(&workspace)
+        .with_args(["store", "prune"])
+        .assert()
+        .success();
+
+    assert!(!cached_package.exists(), "prune must remove the unreferenced clone cache");
+    assert_eq!(fs::read(&installed_manifest).unwrap(), manifest);
+    drop(mock_instance);
+    fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+    pacquet(&workspace)
+        .with_args(["install", "--offline", "--frozen-lockfile"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(installed_manifest).unwrap(), manifest);
 }

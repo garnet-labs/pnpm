@@ -3,24 +3,53 @@
     reason = "struct-literal test fixtures; field types are evident from the literal and naming each would force ~20 imports"
 )]
 
-use super::{InstallPackageFromRegistry, InstallPackageFromRegistryError};
+use super::{
+    InstallPackageFromRegistry,
+    InstallPackageFromRegistryError,
+};
 use pipe_trait::Pipe;
 use pnpm_config::Config;
-use pnpm_lockfile::{LockfileResolution, TarballResolution};
-use pnpm_network::{RetryOpts, ThrottledClient};
-use pnpm_reporter::{LogEvent, ProgressMessage, Reporter, SilentReporter};
+use pnpm_lockfile::{
+    LockfileResolution,
+    TarballResolution,
+};
+use pnpm_network::{
+    RetryOpts,
+    ThrottledClient,
+};
+use pnpm_reporter::{
+    LogEvent,
+    ProgressMessage,
+    Reporter,
+    SilentReporter,
+};
 use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, NpmResolver, shared_packument_fetch_locker,
+    InMemoryPackageMetaCache,
+    NpmResolver,
+    shared_packument_fetch_locker,
     shared_picked_manifest_cache,
 };
-use pnpm_resolving_resolver_base::{ResolveOptions, ResolveResult, Resolver, WantedDependency};
-use pnpm_store_dir::{SharedVerifiedFilesCache, StoreDir, StoreIndexFormat};
+use pnpm_resolving_resolver_base::{
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
+    WantedDependency,
+};
+use pnpm_store_dir::{
+    SharedVerifiedFilesCache,
+    StoreDir,
+    StoreIndexFormat,
+};
 use pnpm_testing_utils::registry::TestRegistry;
 use pretty_assertions::assert_eq;
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex, atomic::AtomicU8},
+    sync::{
+        Arc,
+        Mutex,
+        atomic::AtomicU8,
+    },
 };
 use tempfile::tempdir;
 
@@ -31,6 +60,7 @@ fn create_config(
     cache_dir: &Path,
 ) -> Config {
     Config {
+        dir: Default::default(),
         node_linker_excluded: Vec::new(),
         prune_direct_dependencies: false,
         tools: std::collections::BTreeMap::new(),
@@ -77,6 +107,7 @@ fn create_config(
         store_dir: StoreDir::new(store_dir),
         skip_store_dir_resolution: false,
         settings_read: Default::default(),
+        global_packages_config: None,
         store_dir_placement_skipped: false,
         store_relocation: None,
         state_dir: store_dir.join("state"),
@@ -108,6 +139,7 @@ fn create_config(
         peers_suffix_max_length: pnpm_config::default_peers_suffix_max_length(),
         lockfile: false,
         lockfile_dir: None,
+        configured_lockfile_dir: None,
         prefer_frozen_lockfile: false,
         frozen_lockfile: None,
         optimistic_repeat_install: false,
@@ -131,6 +163,7 @@ fn create_config(
         symlinked_lockfile_target_dirs: Vec::new(),
         lockfile_include_resolution_settings: false,
         lockfile_integrity_target: pnpm_lockfile::IntegrityTarget::Resource,
+        lockfile_format: pnpm_lockfile::LockfileFormat::default(),
         registry: "https://registry.npmjs.com/".to_string(),
         scope: None,
         registries_by_scope: Default::default(),
@@ -152,6 +185,7 @@ fn create_config(
         prefer_workspace_packages: false,
         external_dependencies: Default::default(),
         dedupe_peer_dependents: false,
+        project_scoped_optional_peers: false,
         dedupe_peers: false,
         auto_dedupe: false,
         dedupe_direct_deps: true,
@@ -161,6 +195,7 @@ fn create_config(
         add_missing_peer_types: false,
         resolve_peers_from_workspace_root: false,
         block_exotic_subdeps: false,
+        warn_unused_overrides: true,
         verify_store_integrity: true,
         include_workspace_root: false,
         ignore_workspace_cycles: false,
@@ -207,6 +242,7 @@ fn create_config(
         git_checks: true,
         publish_wait_timeout: 0,
         provenance: None,
+        access: None,
         tag_version_prefix: "v".to_string(),
         enable_pre_post_scripts: false,
         script_shell: None,
@@ -219,6 +255,7 @@ fn create_config(
         recursive: false,
         filter: Vec::new(),
         filter_prod: Vec::new(),
+        filter_order: Vec::new(),
         workspace_root: false,
         fail_if_no_match: false,
         test_pattern: Vec::new(),
@@ -230,6 +267,7 @@ fn create_config(
         supported_architectures: None,
         ignored_optional_dependencies: None,
         overrides: None,
+        hook_added_overrides: Default::default(),
         package_extensions: None,
         package_configs: None,
         cache_dir: cache_dir.to_path_buf(),
@@ -238,6 +276,7 @@ fn create_config(
         minimum_release_age_exclude: None,
         minimum_release_age_ignore_missing_time: true,
         minimum_release_age_strict: None,
+        reference_time: None,
         trust_lockfile: false,
         trust_policy: Default::default(),
         init_package_manager: true,
@@ -287,6 +326,7 @@ fn create_config(
         cli: Default::default(),
         raw_auth_config: Default::default(),
         config_dir: None,
+        editor: None,
     }
 }
 
@@ -533,7 +573,7 @@ async fn second_visit_skips_progress_emits_but_still_links() {
     drop((store_dir, modules_dir, second_parent_dir, virtual_store_dir, cache_dir, mock_instance));
 }
 
-/// Pin the order with a recording reporter — a regression in either
+/// Pin the order with a recording reporter, a regression in either
 /// the sequence or the `package_id`/`requester` payload would
 /// currently slip through since the tarball-side and
 /// frozen-lockfile-side tests don't exercise this code path.
@@ -647,7 +687,7 @@ async fn install_emits_progress_sequence() {
     drop((store_dir, modules_dir, virtual_store_dir, cache_dir, mock_instance));
 }
 
-/// A missing `name_ver` (every non-npm resolver — git / tarball /
+/// A missing `name_ver` (every non-npm resolver, git / tarball /
 /// local) must surface as an error rather than panicking. Pins the
 /// install path's contract once the git resolver is wired into the
 /// chain.

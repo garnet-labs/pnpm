@@ -1,8 +1,8 @@
 //! Multi-importer workspace resolution: the peer-hoist loop and the
 //! importer barrier around it.
 //!
-//! Two sizes of the same fixture — a layered dependency graph shared by
-//! many importers, peer hoisting enabled, no wanted lockfile — so the
+//! Two sizes of the same fixture (a layered dependency graph shared by
+//! many importers, peer hoisting enabled, no wanted lockfile) so the
 //! whole graph resolves:
 //!
 //! - [`Size::Ci`] is what the criterion group measures on every PR. It is
@@ -11,8 +11,8 @@
 //!   that scales with the workspace.
 //! - [`Size::Full`] is a large real workspace's scale: 331 importers over
 //!   5,000 packages. It is too slow and too memory-hungry for a
-//!   statistical harness — a regressed run can take minutes and several
-//!   GiB — so `--full-workspace-resolution` runs each shape once and
+//!   statistical harness (a regressed run can take minutes and several
+//!   GiB) so `--full-workspace-resolution` runs each shape once and
 //!   prints its timing instead.
 //!
 //! The [`Shape::PeersHoisted`] shape is the one that runs the hoist loop.
@@ -21,7 +21,10 @@
 
 use criterion::Criterion;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     hint::black_box,
     path::PathBuf,
     str::FromStr,
@@ -29,15 +32,37 @@ use std::{
     time::Instant,
 };
 
-use pnpm_lockfile::{LockfileResolution, PkgName, PkgNameVer, RegistryContext, TarballResolution};
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_lockfile::{
+    LockfileResolution,
+    PkgName,
+    PkgNameVer,
+    RegistryContext,
+    TarballResolution,
+};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_resolving_deps_resolver::{
-    ResolveImporterOptions, UpdateDepth, UpdateReuseScope, UpdateTargets, WorkspaceImporter,
-    WorkspaceResolveOptions, resolve_workspace,
+    ResolveImporterOptions,
+    UpdateDepth,
+    UpdateReuseScope,
+    UpdateTargets,
+    WorkspaceImporter,
+    WorkspaceResolveOptions,
+    resolve_workspace,
 };
 use pnpm_resolving_resolver_base::{
-    LatestQuery, PkgResolutionId, PreferredVersions, ResolveError, ResolveFuture,
-    ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver, WantedDependency,
+    LatestQuery,
+    PkgResolutionId,
+    PreferredVersions,
+    ResolveError,
+    ResolveFuture,
+    ResolveLatestFuture,
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
+    WantedDependency,
 };
 
 const PACKAGES_PER_LAYER: usize = 20;
@@ -248,11 +273,12 @@ fn importer_options(importer: &WorkspaceImporter<'_>) -> ResolveImporterOptions 
         },
         peers_suffix_max_length: 1000,
         peers: pnpm_resolving_deps_resolver::ImporterPeerOptions {
+            explicitly_requested_direct_dependencies: std::collections::HashSet::default(),
             auto_install_peers: true,
             auto_install_peers_from_highest_match: false,
             resolve_peers_from_workspace_root: false,
             dedupe_peers: true,
-            dedupe_peer_dependents: true,
+            dedupe_peer_dependents: pnpm_resolving_deps_resolver::PeerDependentsDedupe::On,
         },
         links: pnpm_resolving_deps_resolver::PeerLinkOptions {
             exclude_links_from_lockfile: false,
@@ -285,24 +311,14 @@ fn workspace_options() -> WorkspaceResolveOptions {
         peers: pnpm_resolving_deps_resolver::WorkspacePeerResolutionOptions {
             dedupe_peers: true,
             dedupe_injected_deps: true,
-            dedupe_peer_dependents: true,
+            dedupe_peer_dependents: pnpm_resolving_deps_resolver::PeerDependentsDedupe::On,
             resolve_peers_from_workspace_root: false,
             exclude_links_from_lockfile: false,
             lockfile_dir: PathBuf::from("/workspace"),
             peers_suffix_max_length: 1000,
             auto_install_peers: true,
         },
-        hooks: pnpm_resolving_deps_resolver::WorkspaceResolveHooks {
-            read_package_log: None,
-            skipped_optional_log: None,
-            finalized_package: None,
-            deprecation_log: None,
-            manifests: pnpm_resolving_deps_resolver::ManifestTransformHooks {
-                manifest_hook: None,
-                overrides_hook: None,
-                pnpmfile_hook: None,
-            },
-        },
+        hooks: pnpm_resolving_deps_resolver::WorkspaceResolveHooks::default(),
         reuse: pnpm_resolving_deps_resolver::WorkspaceLockfileReuse {
             lockfile: None,
             subtrees: true,
@@ -310,11 +326,13 @@ fn workspace_options() -> WorkspaceResolveOptions {
             scope: UpdateReuseScope::All,
             scopes_by_importer: BTreeMap::new(),
             depth: UpdateDepth::UNLIMITED,
+            runtimes: pnpm_resolving_deps_resolver::LockedRuntimeReuse::Repick,
         },
         version: pnpm_resolving_deps_resolver::WorkspaceVersionResolution {
             pick_lowest_direct: false,
             time_based: false,
         },
+        parsed_overrides: None,
     }
 }
 

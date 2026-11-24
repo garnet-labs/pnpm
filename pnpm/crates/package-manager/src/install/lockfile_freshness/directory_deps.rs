@@ -1,12 +1,23 @@
 pub(crate) use crate::install_state::ProjectManifestsByDir;
 pub(crate) use importer_deps::check_directory_dependencies_freshness;
-pub(super) use injected_manifest::{InjectedDirectory, is_deploy_file_url_key, unhooked_manifest};
-pub(crate) use injected_manifest::{dependency_manifests_by_dir, project_manifests_by_dir};
+pub(super) use injected_manifest::{
+    InjectedDirectory,
+    is_deploy_file_url_key,
+    unhooked_manifest,
+};
+pub(crate) use injected_manifest::{
+    dependency_manifests_by_dir,
+    project_manifests_by_dir,
+};
 pub(crate) use nested::{
-    GraphEdges, NestedByImporter, NestedDirectoryPackage, check_nested_directory_package,
+    GraphEdges,
+    NestedByImporter,
+    NestedDirectoryPackage,
+    check_nested_directory_package,
     nested_directory_packages,
 };
 pub(super) use package::overridden_unhooked_manifest;
+pub(crate) use recorded_peer_children::RecordedPeerChildren;
 pub(crate) use spec::spec_target_and_range;
 
 mod children;
@@ -15,6 +26,8 @@ mod injected_manifest;
 mod nested;
 mod package;
 mod peers;
+mod recorded;
+mod recorded_peer_children;
 mod scope;
 mod spec;
 
@@ -29,12 +42,9 @@ use pnpm_lockfile::StalenessReason;
 use spec::SpecDirs;
 use std::path::Path;
 
+#[derive(Clone, Copy)]
 struct LocalDepContext<'a> {
     name: &'a str,
-    /// The importer declared the dependency with a `file:` spec, which the
-    /// resolver reads from the directory itself rather than from a workspace
-    /// project.
-    declared_as_file: bool,
     rel_path: &'a str,
     dir: &'a Path,
     dirs: SpecDirs<'a>,
@@ -43,33 +53,30 @@ struct LocalDepContext<'a> {
 
 impl<'a> LocalDepContext<'a> {
     fn outdated(&self) -> FreshnessCheckError {
-        local_dependency_outdated(self.name, self.rel_path)
+        local_dependency_outdated(self.name.to_owned(), self.rel_path.to_owned())
     }
 
-    fn child(&self, name: &'a str, spec: &str, rel_path: &'a str, dir: &'a Path) -> Self {
-        Self {
-            name,
-            declared_as_file: is_declared_local_directory(spec),
-            rel_path,
-            dir,
-            dirs: self.dirs,
-            catalogs: self.catalogs,
-        }
+    fn child(&self, name: &'a str, rel_path: &'a str, dir: &'a Path) -> Self {
+        Self { name, rel_path, dir, dirs: self.dirs, catalogs: self.catalogs }
     }
 }
 
-fn local_dependency_outdated(name: &str, path: &str) -> FreshnessCheckError {
-    FreshnessCheckError::Stale(StalenessReason::LocalDependencyOutdated {
-        name: name.to_string(),
-        path: path.to_string(),
-    })
+fn local_dependency_outdated(name: String, path: String) -> FreshnessCheckError {
+    FreshnessCheckError::Stale(StalenessReason::LocalDependencyOutdated { name, path })
+}
+
+/// Whether the local resolver claims `spec` as a filesystem path, a `file:`
+/// spec or a bare one such as `../lib`, and resolves it relative to the
+/// declaring directory, not through the workspace.
+pub(crate) fn is_declared_by_path(spec: &str) -> bool {
+    pnpm_local_spec::is_local_filesystem_specifier(spec)
 }
 
 pub(crate) fn is_declared_local_directory(spec: &str) -> bool {
     let Some(path) = spec.strip_prefix("file:") else {
         return false;
     };
-    !pnpm_lockfile::is_local_tarball_path(path)
+    !pnpm_local_spec::is_tarball_filename(path)
 }
 
 fn spec_dirs<'a>(check: &'a ImporterSatisfactionCheck<'a>) -> SpecDirs<'a> {

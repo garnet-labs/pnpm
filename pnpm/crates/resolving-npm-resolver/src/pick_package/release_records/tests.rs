@@ -1,15 +1,38 @@
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::Arc,
+};
 
-use pnpm_lockfile::{RegistryOptions, RegistryServerType};
-use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
-use pnpm_registry::{InstallV2Entry, PackageVersion};
+use pnpm_lockfile::{
+    RegistryOptions,
+    RegistryServerType,
+};
+use pnpm_network::{
+    AuthHeaders,
+    RetryOpts,
+    ThrottledClient,
+};
+use pnpm_registry::{
+    InstallV2Entry,
+    PackageVersion,
+};
 use pnpm_resolving_resolver_base::NetworkPolicy;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 
-use super::{record_revision, with_release_record};
+use super::{
+    record_revision,
+    with_release_record,
+};
 use crate::{
-    InMemoryPackageMetaCache, PackumentFetchLocker, RegistryRevisionSelector,
-    pick_package::PickPackageContext, shared_packument_fetch_locker,
+    InMemoryPackageMetaCache,
+    PackumentFetchLocker,
+    RegistryRevisionSelector,
+    pick_package::PickPackageContext,
+    shared_packument_fetch_locker,
 };
 
 const INTEGRITY: &str = "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==";
@@ -213,21 +236,49 @@ async fn an_override_of_another_revision_reads_that_revisions_record() {
 
 #[test]
 fn the_record_a_pick_needs() {
+    let registry = "https://registry.example/";
     let external = listed("acme", InstallV2Entry::External, &json!({ "revision": 2 }));
-    assert_eq!(record_revision(&external, None), Some(2));
+    assert_eq!(record_revision(&external, registry, None).unwrap(), Some(2));
     let complete = listed("acme", InstallV2Entry::Complete, &json!({ "revision": 2 }));
-    assert_eq!(record_revision(&complete, None), None);
+    assert_eq!(record_revision(&complete, registry, None).unwrap(), None);
     let selected = RegistryRevisionSelector::Valid(2);
-    assert_eq!(record_revision(&complete, Some(&selected)), None);
+    assert_eq!(record_revision(&complete, registry, Some(&selected)).unwrap(), None);
     let original = RegistryRevisionSelector::Valid(0);
-    assert_eq!(record_revision(&complete, Some(&original)), Some(0));
+    assert_eq!(record_revision(&complete, registry, Some(&original)).unwrap(), Some(0));
     // A version outside the revision protocol has only its original.
     let ordinary = listed("acme", InstallV2Entry::Complete, &json!({}));
-    assert_eq!(record_revision(&ordinary, Some(&RegistryRevisionSelector::Valid(1))), None);
+    assert_eq!(
+        record_revision(&ordinary, registry, Some(&RegistryRevisionSelector::Valid(1))).unwrap(),
+        None,
+    );
     let ordinary_external = listed("acme", InstallV2Entry::External, &json!({}));
-    assert_eq!(record_revision(&ordinary_external, None), Some(0));
+    assert_eq!(record_revision(&ordinary_external, registry, None).unwrap(), Some(0));
     let another = RegistryRevisionSelector::Valid(1);
-    assert_eq!(record_revision(&ordinary_external, Some(&another)), None);
+    assert_eq!(record_revision(&ordinary_external, registry, Some(&another)).unwrap(), None);
+
+    for invalid in [json!("bad"), json!(-1), json!(9_007_199_254_740_992_u64)] {
+        let malformed = listed("acme", InstallV2Entry::External, &json!({ "revision": invalid }));
+        assert!(record_revision(&malformed, registry, None).is_err());
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_revision_is_rejected_without_reading_a_record() {
+    use miette::Diagnostic as _;
+
+    let registry = "http://127.0.0.1:9/";
+    let install = Install::new(registry, true);
+    let ctx = install.ctx(None, NetworkPolicy::default());
+    let picked = listed("acme", InstallV2Entry::External, &json!({ "revision": "bad" }));
+    let error = with_release_record(&ctx, registry, picked, None).await.expect_err("rejected");
+    assert_eq!(
+        error
+            .code()
+            .map(|code| code.to_string())
+            .as_deref(),
+        Some("ERR_PNPM_MALFORMED_METADATA"),
+    );
+    assert!(error.to_string().contains("acme@1.0.0"), "{error}");
 }
 
 #[tokio::test]
@@ -304,4 +355,68 @@ async fn the_record_address_decides_the_revision() {
     let picked = listed("acme", InstallV2Entry::External, &json!({}));
     let picked = with_release_record(&ctx, &registry, picked, None).await.expect("read");
     assert_eq!(picked.dist.revision, None);
+}
+
+#[tokio::test]
+async fn local_release_records_retry_transient_statuses_but_not_denials() {
+    use std::{
+        sync::atomic::Ordering,
+        time::Duration,
+    };
+
+    for status in [503, 403] {
+        let mut server = mockito::Server::new_async().await;
+        let failed = server
+            .mock("GET", "/acme/1.0.0+r0")
+            .with_status(status)
+            .expect(1)
+            .create_async()
+            .await;
+        let retries = usize::from(status == 503);
+        let succeeded = server
+            .mock("GET", "/acme/1.0.0+r0")
+            .with_body(record("acme", "1.0.0"))
+            .expect(retries)
+            .create_async()
+            .await;
+        let registry = format!("{}/", server.url());
+        let mut install = Install::new(&registry, true);
+        let hook = Arc::new(LocalRecord::default());
+        install.auth_headers =
+            AuthHeaders::default().with_route_hook(Arc::<LocalRecord>::clone(&hook));
+        let mut ctx = install.ctx(None, NetworkPolicy::default());
+        ctx.metadata.http.retry_opts = RetryOpts {
+            retries: 1,
+            factor: 1,
+            min_timeout: Duration::ZERO,
+            max_timeout: Duration::ZERO,
+        };
+        let picked = listed("acme", InstallV2Entry::External, &json!({}));
+        let result = with_release_record(&ctx, &registry, picked, None).await;
+        assert_eq!(result.is_ok(), status == 503);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1 + retries);
+        failed.assert_async().await;
+        succeeded.assert_async().await;
+    }
+}
+
+#[derive(Default)]
+struct LocalRecord {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl pnpm_network::UpstreamRouteHook for LocalRecord {
+    fn authorize(&self, _: &str, _: Option<&str>) -> Option<String> {
+        None
+    }
+
+    fn fetch_local(
+        &self,
+        url: &str,
+        _: reqwest::header::HeaderMap,
+    ) -> Option<pnpm_network::LocalResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let url = url.to_string();
+        Some(Box::pin(async move { reqwest::get(url).await.unwrap() }))
+    }
 }

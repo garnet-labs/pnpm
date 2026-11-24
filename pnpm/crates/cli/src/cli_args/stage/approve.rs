@@ -1,4 +1,4 @@
-//! `pnpm stage approve` — publish staged versions, chosen interactively
+//! `pnpm stage approve`: publish staged versions, chosen interactively
 //! when none are named.
 //!
 //! A batch of versions is approved through a single [`OtpSession`], so one
@@ -6,34 +6,72 @@
 //! first, and its published manifest determines dependency order.
 
 use super::{
-    StageArgs, StageContext, StageError, StageRegistryError, fetch_stage_items,
-    fetch_stage_tarball, global_info, global_warn, is_uuid, stage_endpoint_url, stage_json_request,
-    stage_request_in_session, summarize_tarball::read_tarball_manifest,
+    StageArgs,
+    StageContext,
+    StageError,
+    StageRegistryError,
+    fetch_stage_items,
+    fetch_stage_tarball,
+    global_info,
+    global_warn,
+    is_uuid,
+    stage_endpoint_url,
+    stage_json_request,
+    stage_request_in_session,
+    summarize_tarball::read_tarball_manifest,
 };
-use crate::cli_args::{recursive::sequence_graph, sanitize::sanitize_inline};
+use crate::cli_args::{
+    recursive::sequence_graph,
+    sanitize::sanitize_inline,
+};
 #[cfg(target_family = "wasm")]
 use crate::dialoguer_wasm::MultiSelect;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 #[cfg(not(target_family = "wasm"))]
 use dialoguer::MultiSelect;
-use miette::{Diagnostic, IntoDiagnostic};
+use miette::{
+    Diagnostic,
+    IntoDiagnostic,
+};
 use node_semver::Version;
-use ordering::{read_stage_approval_order, sort_items_for_approval, unavailable_dependencies};
+use ordering::{
+    read_stage_approval_order,
+    sort_items_for_approval,
+    unavailable_dependencies,
+};
 use pnpm_config::Config;
-use pnpm_network_web_auth::{Host as WebAuthHost, OtpSession, StdinIsTty, StdoutIsTty};
+use pnpm_network_web_auth::{
+    Host as WebAuthHost,
+    OtpSession,
+    StdinIsTty,
+    StdoutIsTty,
+};
 use pnpm_package_manifest::PackageManifest;
 use pnpm_package_name::is_valid_old_npm_package_name;
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::{
-    ANY_VERSION_RANGE, is_any_version_range, is_valid_semver_range,
+    ANY_VERSION_RANGE,
+    is_any_version_range,
+    is_valid_semver_range,
 };
-use pnpm_workspace::{GraphPkg, Project};
+use pnpm_workspace::{
+    GraphPkg,
+    Project,
+};
 use pnpm_workspace_projects_graph::{
-    CreateProjectsGraphOptions, ProjectGraph, create_projects_graph,
+    CreateProjectsGraphOptions,
+    ProjectGraph,
+    create_projects_graph,
 };
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::PathBuf,
 };
 
@@ -64,9 +102,9 @@ struct StageApprovalItem {
 impl StageApprovalItem {
     /// A staged version named on the command line, before the registry
     /// listing filled in what it publishes.
-    fn from_id(id: &str) -> Self {
+    fn from_id(id: String) -> Self {
         StageApprovalItem {
-            id: id.to_owned(),
+            id,
             package_name: None,
             version: None,
             tag: None,
@@ -85,7 +123,8 @@ impl StageApprovalItem {
         let string_field = |field: &str| {
             item.get(field)
                 .and_then(Value::as_str)
-                .map(|value| sanitize_inline(value).into_owned())
+                .map(sanitize_inline)
+                .map(std::borrow::Cow::into_owned)
                 .filter(|value| !value.is_empty())
         };
         // The id and the package name are validated as they came: removing a
@@ -154,16 +193,17 @@ impl StageApprovalItem {
 
 pub(super) async fn stage_approve<Reporter: self::Reporter>(
     args: &StageArgs,
+    dir: &std::path::Path,
     config: &Config,
 ) -> miette::Result<Option<String>> {
-    let context = args.stage_context(config, None)?;
+    let context = args.stage_context(dir, config, None)?;
     let stage_ids = parse_stage_ids(&args.params)?;
     if let [stage_id] = stage_ids.as_slice() {
         let mut session = OtpSession::new(context.web_auth_fetch_options.clone());
         approve_staged_package::<Reporter>(
             &context,
             &mut session,
-            &StageApprovalItem::from_id(stage_id),
+            &StageApprovalItem::from_id(stage_id.clone()),
         )
         .await?;
         return Ok(Some(format!("Staged package {stage_id} approved and published successfully.")));
@@ -250,7 +290,7 @@ async fn resolve_approval_items(
             described
                 .as_ref()
                 .and_then(|item| StageApprovalItem::from_value(&with_id(item, stage_id)))
-                .unwrap_or_else(|| StageApprovalItem::from_id(stage_id)),
+                .unwrap_or_else(|| StageApprovalItem::from_id(stage_id.clone())),
         );
     }
     Ok(items)
@@ -302,7 +342,7 @@ async fn approve_staged_packages<Reporter: self::Reporter>(
         let blockers = unavailable_dependencies(item, &unpublished_stage_ids, &order);
         if !blockers.is_empty() {
             unpublished_stage_ids.insert(item.id.clone());
-            global_warn::<Reporter>(&format!(
+            global_warn::<Reporter>(format!(
                 "Skipped {}, as it depends on {}, which could not be approved",
                 item.label(),
                 blockers.join(", "),
@@ -312,14 +352,14 @@ async fn approve_staged_packages<Reporter: self::Reporter>(
         match approve_staged_package::<Reporter>(context, &mut session, item).await {
             Ok(()) => {
                 approved += 1;
-                global_info::<Reporter>(&format!("Approved {}", item.label()));
+                global_info::<Reporter>(format!("Approved {}", item.label()));
             }
             // Only the registry's verdict on one staged version is
             // survivable. An authentication failure or a broken connection
             // applies to every remaining version too, so it aborts the batch.
             Err(error) if is_stage_registry_error(&error) => {
                 unpublished_stage_ids.insert(item.id.clone());
-                global_warn::<Reporter>(&format!("{error}"));
+                global_warn::<Reporter>(format!("{error}"));
             }
             Err(error) => return Err(error),
         }

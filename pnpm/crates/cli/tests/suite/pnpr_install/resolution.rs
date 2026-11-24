@@ -1,8 +1,23 @@
 use super::{
-    AddMockedRegistry, CONFLICTED_DEPENDENCY, CommandExtra, CommandTempCwd, IS_POSITIVE_PATCH,
-    Path, assert_merged_conflicted_lockfile, configure_pnpr_auth, fs, get_all_files,
-    is_symlink_or_junction, pacquet_at, point_npmrc_registry_at, read_workspace_lockfile,
-    start_pnpr, start_pnpr_for, workspace_importer_version, write_conflicted_lockfile_fixture,
+    AddMockedRegistry,
+    CONFLICTED_DEPENDENCY,
+    CommandExtra,
+    CommandTempCwd,
+    IS_POSITIVE_PATCH,
+    Path,
+    assert_merged_conflicted_lockfile,
+    configure_pnpr_auth,
+    fs,
+    get_all_files,
+    is_symlink_or_junction,
+    pacquet_at,
+    pnpr_done_frame,
+    point_npmrc_registry_at,
+    read_workspace_lockfile,
+    start_pnpr,
+    start_pnpr_for,
+    workspace_importer_version,
+    write_conflicted_lockfile_fixture,
 };
 use assert_cmd::assert::OutputAssertExt;
 
@@ -258,8 +273,8 @@ fn add_missing_peer_types_resolves_via_pnpr() {
     drop((root, mock_instance));
 }
 
-/// A server that predates `addMissingPeerTypes` drops it from the request
-/// and returns a lockfile resolved without it, which the client must not save.
+/// A server confirms `addMissingPeerTypes` but returns a lockfile resolved
+/// without it. The client must not save the inconsistent lockfile.
 #[test]
 fn install_via_pnpr_rejects_a_lockfile_resolved_without_add_missing_peer_types() {
     let CommandTempCwd {
@@ -278,7 +293,7 @@ fn install_via_pnpr_rejects_a_lockfile_resolved_without_add_missing_peer_types()
     let resolve_mock = older_server
         .mock("POST", "/-/pnpr/v0/resolve")
         .with_header("content-type", "application/x-ndjson")
-        .with_body(format!("{done}\n"))
+        .with_body_from_request(move |request| pnpr_done_frame(request, done.clone()))
         .expect(1)
         .create();
 
@@ -297,10 +312,102 @@ fn install_via_pnpr_rejects_a_lockfile_resolved_without_add_missing_peer_types()
     assert!(!output.status.success());
     assert!(format!("{stdout}{stderr}").contains(
         "ERR_PNPM_PNPR_SERVER_IGNORED_ADD_MISSING_PEER_TYPES"
-    ),);
+    ));
     assert!(!workspace.join("pnpm-lock.yaml").exists());
     resolve_mock.assert();
 
+    drop((root, mock_instance));
+}
+
+fn refusing_pnpr_server() -> (mockito::ServerGuard, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let resolve = server
+        .mock("POST", "/-/pnpr/v0/resolve")
+        .with_status(400)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "error": "pnpr does not support the request field `projects`",
+                "code": "ERR_PNPR_UNSUPPORTED_REQUEST_FIELD",
+            })
+            .to_string(),
+        )
+        .expect(1)
+        .create();
+    (server, resolve)
+}
+
+fn assert_resolved_locally(output: &std::process::Output, workspace: &Path) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.status.success(), "{combined}");
+    assert!(combined.contains("Resolving dependencies locally"), "{combined}");
+    assert!(workspace.join("node_modules/.pnpm/@foo+no-deps@1.0.0").exists());
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(lockfile.contains("'@foo/no-deps@1.0.0'"), "{lockfile}");
+}
+
+#[test]
+fn install_resolves_locally_when_pnpr_refuses_the_request() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let (server, resolve_mock) = refusing_pnpr_server();
+    let package_json = serde_json::json!({
+        "dependencies": { "@foo/no-deps": "1.0.0" },
+    });
+    fs::write(workspace.join("package.json"), package_json.to_string())
+        .expect("write package.json");
+
+    let output = pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--pnpr-server", &server.url()])
+        .output()
+        .expect("run pnpm install");
+
+    assert_resolved_locally(&output, &workspace);
+    resolve_mock.assert();
+    drop((root, mock_instance));
+}
+
+#[test]
+fn update_patches_resolves_locally_when_pnpr_refuses_the_request() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let package_json = serde_json::json!({
+        "dependencies": { "@foo/no-deps": "1.0.0" },
+    });
+    fs::write(workspace.join("package.json"), package_json.to_string())
+        .expect("write package.json");
+    pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_arg("install")
+        .assert()
+        .success();
+    let (server, resolve_mock) = refusing_pnpr_server();
+
+    let output = pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["update", "--patches", "--pnpr-server", &server.url()])
+        .output()
+        .expect("run pnpm update");
+
+    assert_resolved_locally(&output, &workspace);
+    resolve_mock.assert();
     drop((root, mock_instance));
 }
 
@@ -405,7 +512,9 @@ fn frozen_install_via_pnpr_verifies_the_local_lockfile_without_resolving_or_redo
         .mock("POST", "/-/pnpr/v0/verify-lockfile")
         .with_status(200)
         .with_header("content-type", "application/x-ndjson")
-        .with_body("{\"type\":\"done\"}\n")
+        .with_body_from_request(|request| {
+            pnpr_done_frame(request, serde_json::json!({ "type": "done" }))
+        })
         .expect(1)
         .create();
 
@@ -499,7 +608,7 @@ fn install_via_pnpr_skips_the_server_when_the_lockfile_satisfies_the_manifest() 
         workspace,
         npmrc_info,
         ..
-    } = CommandTempCwd::init().add_mocked_registry();
+    } = CommandTempCwd::init().add_recording_mocked_registry();
     let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
 
     let (pnpr_url, token) = start_pnpr(mock_instance.url());
@@ -519,19 +628,13 @@ fn install_via_pnpr_skips_the_server_when_the_lockfile_satisfies_the_manifest() 
         .assert()
         .success();
     fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    let _ = mock_instance.take_requests();
 
     let mut silent_pnpr = mockito::Server::new();
     let no_pnpr_requests = silent_pnpr
         .mock("POST", mockito::Matcher::Any)
         .expect(0)
         .create();
-    // The warm store must serve every tarball; reject any registry fetch.
-    let mut silent_registry = mockito::Server::new();
-    let no_downloads = silent_registry
-        .mock("GET", mockito::Matcher::Any)
-        .expect(0)
-        .create();
-    point_npmrc_registry_at(&npmrc_path, &silent_registry.url());
 
     pacquet_at(&workspace)
         .with_arg("install")
@@ -541,7 +644,9 @@ fn install_via_pnpr_skips_the_server_when_the_lockfile_satisfies_the_manifest() 
         .success();
 
     no_pnpr_requests.assert();
-    no_downloads.assert();
+    // The warm store and verification cache must serve without hitting the registry.
+    let requests = mock_instance.take_requests();
+    assert!(requests.is_empty(), "expected zero registry requests, got {requests:?}");
     let symlink_path = workspace.join("node_modules/@foo/no-deps");
     assert!(is_symlink_or_junction(&symlink_path).unwrap(), "direct dep should be symlinked");
 
@@ -590,7 +695,9 @@ fn satisfied_install_via_pnpr_delegates_verification_when_the_cache_is_cold() {
         .mock("POST", "/-/pnpr/v0/verify-lockfile")
         .with_status(200)
         .with_header("content-type", "application/x-ndjson")
-        .with_body("{\"type\":\"done\"}\n")
+        .with_body_from_request(|request| {
+            pnpr_done_frame(request, serde_json::json!({ "type": "done" }))
+        })
         .expect(1)
         .create();
     let no_resolve = verifier
@@ -902,5 +1009,125 @@ fn delegated_install_rekeys_an_existing_secondary_registry_alias() {
         ["@foo/no-deps@work:1.0.0"],
     );
     assert!(workspace.join("node_modules/@foo/no-deps/package.json").exists());
+    drop((root, mock_instance));
+}
+
+#[test]
+fn loose_minimum_release_age_picks_are_persisted_and_reused_via_pnpr() {
+    let CommandTempCwd {
+        pacquet: _,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"@foo/no-deps":"1.0.0"}}"#)
+        .expect("write package.json");
+    let workspace_config = workspace.join("pnpm-workspace.yaml");
+    let mut settings = fs::read_to_string(&workspace_config).expect("read workspace config");
+    settings.push_str("\nminimumReleaseAge: 52560000\nminimumReleaseAgeStrict: false\n");
+    fs::write(&workspace_config, settings).expect("write release-age settings");
+
+    let install = || {
+        let assert = pacquet_at(&workspace)
+            .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+            .with_args(["install", "--pnpr-server", &pnpr_url])
+            .assert()
+            .success();
+        String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+    };
+    let stdout = install();
+    assert!(
+        stdout.contains(
+            "Added 1 entry to minimumReleaseAgeExclude in pnpm-workspace.yaml (set minimumReleaseAgeStrict to true to gate these updates with a prompt):\n  @foo/no-deps@1.0.0"
+        ),
+        "loose pnpr resolution did not report the saved pick:\n{stdout}",
+    );
+    let workspace_yaml = fs::read_to_string(&workspace_config).expect("read collected excludes");
+    assert!(
+        workspace_yaml.contains("minimumReleaseAgeExclude:")
+            && workspace_yaml.contains("@foo/no-deps@1.0.0"),
+        "loose pnpr resolution did not persist the allowed pick: {workspace_yaml}",
+    );
+    install();
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn pnpr_patch_refresh_does_not_persist_release_age_picks_under_no_save() {
+    let CommandTempCwd {
+        pacquet: _,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"@foo/no-deps":"1.0.0"}}"#)
+        .expect("write package.json");
+
+    pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--pnpr-server", &pnpr_url])
+        .assert()
+        .success();
+
+    let workspace_config = workspace.join("pnpm-workspace.yaml");
+    let mut settings = fs::read_to_string(&workspace_config).expect("read workspace config");
+    settings.push_str(
+        "\nminimumReleaseAge: 52560000\nminimumReleaseAgeStrict: false\ntrustLockfile: true\n",
+    );
+    fs::write(&workspace_config, settings).expect("write release-age settings");
+
+    pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["update", "--patches", "--no-save", "--pnpr-server", &pnpr_url])
+        .assert()
+        .success();
+
+    let workspace_yaml = fs::read_to_string(&workspace_config).expect("read workspace config");
+    assert!(
+        !workspace_yaml.contains("minimumReleaseAgeExclude:"),
+        "--no-save persisted release-age picks: {workspace_yaml}",
+    );
+    drop((root, mock_instance));
+}
+
+#[test]
+fn strict_minimum_release_age_rejects_immature_picks_via_pnpr() {
+    let CommandTempCwd {
+        pacquet: _,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"@foo/no-deps":"1.0.0"}}"#)
+        .expect("write package.json");
+    let workspace_config = workspace.join("pnpm-workspace.yaml");
+    let mut settings = fs::read_to_string(&workspace_config).expect("read workspace config");
+    settings.push_str("\nminimumReleaseAge: 52560000\nminimumReleaseAgeStrict: true\n");
+    fs::write(&workspace_config, settings).expect("write release-age settings");
+
+    let output = pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--pnpr-server", &pnpr_url])
+        .output()
+        .expect("run pnpm install");
+    assert!(!output.status.success(), "strict pnpr install unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ERR_PNPR_NO_MATURE_MATCHING_VERSION"),
+        "expected the stable maturity error code, got: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
     drop((root, mock_instance));
 }

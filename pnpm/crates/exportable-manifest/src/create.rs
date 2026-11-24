@@ -21,25 +21,55 @@
 
 use crate::{
     replace::{
-        ReplaceWorkspaceProtocolError, WorkspacePackageManifest, replace_workspace_protocol,
+        ReplaceWorkspaceProtocolError,
+        WorkspacePackageLookup,
+        WorkspacePackageManifest,
+        replace_workspace_protocol,
         replace_workspace_protocol_peer_dependency,
     },
-    transform::{TransformError, transform},
+    transform::{
+        TransformError,
+        transform,
+    },
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_catalogs_resolver::{
-    CatalogAnchor, CatalogResolutionError, CatalogResolutionResult, WantedDependency,
+    CatalogAnchor,
+    CatalogResolutionError,
+    CatalogResolutionResult,
+    WantedDependency,
     resolve_from_catalog,
 };
 use pnpm_catalogs_types::Catalogs;
-use pnpm_package_manifest::{ReadmeKind, decode_readme, is_preferred_readme, readme_kind};
-use pnpm_resolving_jsr_specifier_parser::{ParseJsrSpecifierError, parse_jsr_specifier};
-use serde_json::{Map, Value};
+use pnpm_package_manifest::{
+    ReadmeKind,
+    decode_readme,
+    is_preferred_readme,
+    readme_kind,
+};
+use pnpm_resolving_jsr_specifier_parser::{
+    ParseJsrSpecifierError,
+    parse_jsr_specifier,
+};
+use serde_json::{
+    Map,
+    Value,
+};
 use std::{
-    collections::HashMap,
-    fs, io,
-    path::{Path, PathBuf},
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Lifecycle scripts removed from the published manifest's `scripts`
@@ -51,7 +81,7 @@ const PREPUBLISH_SCRIPTS: &[&str] =
 /// Manifest keys hoisted from `publishConfig` onto the manifest root.
 ///
 /// `name` lets a package be published under a name it cannot carry in the
-/// workspace — typically because a sibling project already owns that name.
+/// workspace, typically because a sibling project already owns that name.
 /// Nothing else in the workspace observes the rename: dependents,
 /// `pnpm-lock.yaml`, and the changeset ledger all keep addressing the project
 /// by its manifest name.
@@ -84,7 +114,7 @@ pub struct CreateExportableManifestOptions<'a> {
     /// Directory holding `pnpm-workspace.yaml`, which a `file:` /
     /// `link:` catalog entry's relative path is measured from. `None`
     /// leaves such an entry as the catalog writes it, for a caller with
-    /// no workspace — and so no catalogs — of its own.
+    /// no workspace (and so no catalogs) of its own.
     pub workspace_dir: Option<&'a Path>,
     /// Where workspace dependencies are installed. Defaults to
     /// `<dir>/node_modules` when `None`.
@@ -99,6 +129,8 @@ pub struct CreateExportableManifestOptions<'a> {
     pub embed_readme: bool,
     /// Workspace packages lookup used when a dependency is not in `node_modules`.
     pub workspace_packages: Option<&'a HashMap<String, WorkspacePackageManifest>>,
+    /// See [`WorkspacePackageLookup::prefer_workspace_for`].
+    pub bumped_workspace_packages: Option<&'a HashSet<String>>,
 }
 
 /// Failures from [`create_exportable_manifest`].
@@ -129,6 +161,29 @@ pub enum CreateExportableManifestError {
 /// Build the publish manifest for the project at `dir` from its
 /// `original_manifest`.
 pub fn create_exportable_manifest(
+    dir: &Path,
+    original_manifest: &Value,
+    opts: &CreateExportableManifestOptions<'_>,
+) -> Result<Value, CreateExportableManifestError> {
+    let manifest = prepare_exportable_manifest(dir, original_manifest, opts)?;
+    finalize_exportable_manifest(manifest)
+}
+
+/// Normalize the manifest returned by the packing hooks.
+pub fn finalize_exportable_manifest(
+    mut manifest: Value,
+) -> Result<Value, CreateExportableManifestError> {
+    let object = manifest
+        .as_object_mut()
+        .ok_or(CreateExportableManifestError::Transform(TransformError::MissingRequiredField {
+            field: "name",
+        }))?;
+    transform(object).map_err(CreateExportableManifestError::Transform)?;
+    Ok(manifest)
+}
+
+/// Prepare the registry fields that packing hooks receive.
+pub fn prepare_exportable_manifest(
     dir: &Path,
     original_manifest: &Value,
     opts: &CreateExportableManifestOptions<'_>,
@@ -167,7 +222,6 @@ pub fn create_exportable_manifest(
         publish.insert("readme".to_string(), Value::String(readme));
     }
 
-    transform(&mut publish).map_err(CreateExportableManifestError::Transform)?;
     Ok(Value::Object(publish))
 }
 
@@ -242,21 +296,21 @@ fn convert_dependency_for_publish(
     opts: &CreateExportableManifestOptions<'_>,
     kind: DependencyKind,
 ) -> Result<String, CreateExportableManifestError> {
-    let after_catalog = replace_catalog_protocol(dep_name, spec, dir, opts)?;
+    let after_catalog = replace_catalog_protocol(dep_name.to_owned(), spec, dir, opts)?;
+    let lookup = WorkspacePackageLookup {
+        packages: opts.workspace_packages,
+        prefer_workspace_for: opts.bumped_workspace_packages,
+    };
     let after_workspace = match kind {
-        DependencyKind::Regular => replace_workspace_protocol(
-            dep_name,
-            &after_catalog,
-            dir,
-            opts.modules_dir,
-            opts.workspace_packages,
-        ),
+        DependencyKind::Regular => {
+            replace_workspace_protocol(dep_name, &after_catalog, dir, opts.modules_dir, lookup)
+        }
         DependencyKind::Peer => replace_workspace_protocol_peer_dependency(
             dep_name,
             &after_catalog,
             dir,
             opts.modules_dir,
-            opts.workspace_packages,
+            lookup,
         ),
     }
     .map_err(CreateExportableManifestError::ReplaceWorkspaceProtocol)?;
@@ -270,13 +324,13 @@ fn convert_dependency_for_publish(
 /// the package being exported, so it means the same place a local
 /// dependency written directly in that package's manifest would. Both
 /// are read relative to the exported manifest.
-fn replace_catalog_protocol(
-    alias: &str,
+pub(crate) fn replace_catalog_protocol(
+    alias: String,
     spec: &str,
     dir: &Path,
     opts: &CreateExportableManifestOptions<'_>,
 ) -> Result<String, CreateExportableManifestError> {
-    let wanted = WantedDependency { alias: alias.to_string(), bare_specifier: spec.to_string() };
+    let wanted = WantedDependency { alias, bare_specifier: spec.to_string() };
     let anchor = match opts.workspace_dir {
         Some(workspace_dir) => CatalogAnchor::Reanchor { workspace_dir, consumer_dir: Some(dir) },
         None => CatalogAnchor::AsWritten,
@@ -346,7 +400,7 @@ fn override_publish_config(publish: &mut Map<String, Value>) {
 }
 
 /// Read a root README accepted by npm for embedding. Only a regular
-/// file is embedded — a symlink is skipped so it can't leak the
+/// file is embedded, a symlink is skipped so it can't leak the
 /// contents of a target outside the project.
 pub fn read_readme_file(dir: &Path) -> io::Result<Option<String>> {
     let mut selected: Option<(ReadmeKind, String, PathBuf)> = None;

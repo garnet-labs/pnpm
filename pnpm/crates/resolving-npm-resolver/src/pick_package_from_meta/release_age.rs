@@ -1,6 +1,13 @@
 use super::{
-    Arc, DerivedPackuments, OnceCell, Package, PackageVersionPolicy, PackageVersions, PolicyMatch,
-    Version, parse_packument_timestamp,
+    Arc,
+    DerivedPackuments,
+    OnceCell,
+    Package,
+    PackageVersionPolicy,
+    PackageVersions,
+    PolicyMatch,
+    Version,
+    parse_packument_timestamp,
 };
 
 /// What the `publishedBy` cutoff leaves visible, as computed by
@@ -13,7 +20,7 @@ pub(crate) struct PublishedByView {
 
     /// The cutoff could not be applied: the metadata is abbreviated, so
     /// there are no per-version timestamps to filter on. Whether that
-    /// is fatal is the caller's call — the pick needs full metadata to
+    /// is fatal is the caller's call, the pick needs full metadata to
     /// honor the cutoff, while a caller reasoning about a pick that
     /// already succeeded knows the versions cleared the cutoff some
     /// other way.
@@ -26,12 +33,12 @@ pub(crate) struct PublishedByView {
 /// in regardless of their age.
 ///
 /// Every consumer of the cutoff goes through here so they agree on what
-/// the policy admits — a baseline that filters differently from the
+/// the policy admits, a baseline that filters differently from the
 /// pick would misreport why a version was chosen.
 #[must_use]
 pub(crate) fn apply_published_by_policy(
     meta: &Package,
-    cutoff: chrono::DateTime<chrono::Utc>,
+    cutoff: jiff::Timestamp,
     exclude: Option<&PackageVersionPolicy>,
 ) -> PublishedByView {
     let exclude_result = exclude.map_or(PolicyMatch::No, |policy| policy.matches(&meta.name));
@@ -64,12 +71,12 @@ pub(crate) fn apply_published_by_policy(
 /// document, whose version manifests are the ones `meta` holds.
 ///
 /// Panics if `meta.time` is `None`. Go through
-/// `apply_published_by_policy`, which reports abbreviated metadata as
+/// the published-by policy, which reports abbreviated metadata as
 /// `needs_full_metadata` rather than filtering it.
 #[must_use]
 pub fn filter_pkg_metadata_by_publish_date(
     meta: &Package,
-    cutoff: chrono::DateTime<chrono::Utc>,
+    cutoff: jiff::Timestamp,
     trusted_versions: Option<&[String]>,
 ) -> Arc<Package> {
     let policy_key = publish_date_policy_key(cutoff, trusted_versions);
@@ -83,14 +90,14 @@ pub fn filter_pkg_metadata_by_publish_date(
 /// differ, and they must not read each other's view.
 ///
 /// The cutoff goes in at the precision it is compared at: it comes from
-/// `Utc::now()` and packument timestamps parse to the same resolution,
+/// `Timestamp::now()` and packument timestamps parse to the same resolution,
 /// so a key rounded to the millisecond would let two cutoffs that keep
 /// different versions share one derived packument.
 pub(super) fn publish_date_policy_key(
-    cutoff: chrono::DateTime<chrono::Utc>,
+    cutoff: jiff::Timestamp,
     trusted_versions: Option<&[String]>,
 ) -> String {
-    let mut key = format!("{}.{}", cutoff.timestamp(), cutoff.timestamp_subsec_nanos());
+    let mut key = format!("{}.{}", cutoff.as_second(), cutoff.subsec_nanosecond());
     for trusted in trusted_versions.unwrap_or_default() {
         key.push('\0');
         key.push_str(trusted);
@@ -100,7 +107,7 @@ pub(super) fn publish_date_policy_key(
 
 pub(super) fn filter_pkg_metadata_by_publish_date_uncached(
     meta: &Package,
-    cutoff: chrono::DateTime<chrono::Utc>,
+    cutoff: jiff::Timestamp,
     trusted_versions: Option<&[String]>,
 ) -> Package {
     let time = meta.time

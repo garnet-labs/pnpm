@@ -1,4 +1,8 @@
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+};
 use pnpm_text_sanitize::sanitize_inline;
 
 /// The warning for a package that is about to be depended on through
@@ -7,6 +11,13 @@ use pnpm_text_sanitize::sanitize_inline;
 /// A `link:` dependency is a symlink, so Node resolves the package's imports
 /// from its own directory and never sees the peers installed in the project
 /// that links it.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "the prefix is copied only when the package declares peer dependencies, and callers borrow it"
+    )
+)]
 pub fn linked_peer_dependencies_warning(
     package_name: &str,
     package_manifest: &serde_json::Value,
@@ -21,7 +32,10 @@ pub fn linked_peer_dependencies_warning(
         .iter()
         .map(|(key, value)| {
             let sanitized_key = sanitize_warning_text(key);
-            let val_str = value.as_str().map_or_else(|| value.to_string(), ToString::to_string);
+            let val_str = value
+                .as_str()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| value.to_string());
             let sanitized_val = sanitize_warning_text(&val_str);
             format!("  - {sanitized_key}@{sanitized_val}")
         })

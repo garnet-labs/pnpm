@@ -1,8 +1,18 @@
 use super::{
-    Cow, Integrity, InvalidRevisionSpecifierError, InvalidTarballRevisionMetadataError,
-    MalformedRevisionHistoryError, NoMatchingRevisionError, PackageVersion, RegistryPackageSpec,
-    RegistryRevisionSelector, ResolveError, TarballRevision, has_complete_sha512_digest,
-    is_on_revision_tarball_route, is_revision_registry_tarball_url,
+    Cow,
+    Integrity,
+    InvalidRevisionSpecifierError,
+    InvalidTarballRevisionMetadataError,
+    MalformedRevisionHistoryError,
+    NoMatchingRevisionError,
+    PackageVersion,
+    RegistryPackageSpec,
+    RegistryRevisionSelector,
+    ResolveError,
+    TarballRevision,
+    has_complete_sha512_digest,
+    is_on_revision_tarball_route,
+    is_revision_registry_tarball_url,
 };
 
 /// The tarball's revision, when the registry serves one: it must pair
@@ -15,7 +25,7 @@ pub(super) fn tarball_revision(
     integrity: Option<&Integrity>,
     registry: &str,
 ) -> Result<Option<TarballRevision>, ResolveError> {
-    let revision = parse_dist_revision(picked)?;
+    let revision = parse_dist_revision(picked, tarball)?;
     let revision_addressed = revision
         .zip(integrity)
         .is_some_and(|(revision, integrity)| {
@@ -37,7 +47,10 @@ pub(super) fn tarball_revision(
     }
 }
 
-fn parse_dist_revision(picked: &PackageVersion) -> Result<Option<TarballRevision>, ResolveError> {
+fn parse_dist_revision(
+    picked: &PackageVersion,
+    tarball: &str,
+) -> Result<Option<TarballRevision>, ResolveError> {
     picked.dist.revision
         .as_ref()
         .map(|revision| {
@@ -50,8 +63,7 @@ fn parse_dist_revision(picked: &PackageVersion) -> Result<Option<TarballRevision
         })
         .transpose()
         .map_err(|reason| {
-            Box::new(InvalidTarballRevisionMetadataError::new(&picked.dist.tarball, reason))
-                as ResolveError
+            Box::new(InvalidTarballRevisionMetadataError::new(tarball, reason)) as ResolveError
         })
 }
 
@@ -222,7 +234,8 @@ pub(super) fn validate_current_package_revision(
     };
     let revision = raw_revision
         .as_u64()
-        .and_then(|revision| TarballRevision::try_from(revision).ok())
+        .map(TarballRevision::try_from)
+        .and_then(Result::ok)
         .map(TarballRevision::get)
         .ok_or_else(|| {
             malformed_revision_history(

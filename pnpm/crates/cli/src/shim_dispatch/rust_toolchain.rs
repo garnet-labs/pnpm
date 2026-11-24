@@ -10,20 +10,40 @@
 //! program of its name on `PATH`, such as a rustup proxy.
 
 use super::{
-    Candidate, ShimInvocation,
-    run_program::{exec_program_with_bin_dirs, exec_program_with_env},
+    Candidate,
+    ShimInvocation,
+    run_program::{
+        exec_program_with_bin_dirs,
+        exec_program_with_env,
+    },
 };
 use pnpm_config::Config;
 use pnpm_crypto_hash::create_hex_hash_bytes;
-use pnpm_reporter::{LogEvent, Reporter};
+use pnpm_reporter::{
+    LogEvent,
+    Reporter,
+};
 use pnpm_rust_toolchain::{
-    Channel, InstalledToolchain, ToolchainRequest, expire_resolution, find_toolchain_file,
-    install_toolchain, installed_release, installed_toolchain, read_toolchain_file,
+    Channel,
+    InstalledToolchain,
+    ToolchainRequest,
+    expire_resolution,
+    find_toolchain_file,
+    install_toolchain,
+    installed_release,
+    installed_toolchain,
+    read_toolchain_file,
 };
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::{
+        OsStr,
+        OsString,
+    },
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// The package `pnpm shim add` takes for the Rust tools, and the key of
@@ -137,19 +157,15 @@ pub(super) fn find_rust_candidate(cwd: &Path, rustup_settings: Option<&Path>) ->
     if override_dir.is_some_and(|override_dir| override_dir.starts_with(project_dir)) {
         return RustSelection::Rustup;
     }
-    managed_candidate(file, project_dir)
+    managed_candidate(file, project_dir.to_path_buf())
         .map(RustSelection::Managed)
         .unwrap_or(RustSelection::Rustup)
 }
 
-fn managed_candidate(file: &Path, project_dir: &Path) -> Option<Candidate> {
+fn managed_candidate(file: &Path, project_dir: PathBuf) -> Option<Candidate> {
     let bytes = std::fs::read(file).ok()?;
     let request = pnpm_rust_toolchain::read_toolchain_file(file).ok()?.ok()?;
-    Some(Candidate::RustToolchain {
-        project_dir: project_dir.to_path_buf(),
-        request,
-        identity: create_hex_hash_bytes(&bytes),
-    })
+    Some(Candidate::RustToolchain { project_dir, request, identity: create_hex_hash_bytes(&bytes) })
 }
 
 /// The nearest directory at or above `cwd` that rustup's `settings` file

@@ -1,3 +1,5 @@
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
 // `plan_add`'s install future carries the engine's whole resolve-and-fetch
 // graph; proving it `Send` walks deeper than rustc's default limit.
 #![recursion_limit = "256"]
@@ -5,24 +7,42 @@
 #[cfg(target_family = "wasm")]
 extern crate pnpm_which as which;
 
-#[cfg(target_family = "wasm")]
 pub(crate) use pnpm_process as process;
-#[cfg(target_family = "wasm")]
 pub(crate) use pnpm_process::asynchronous as async_process;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) use std::process;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) use tokio::process as async_process;
 
-pub use add::{AddOptions, plan_add, writable_project};
-pub use discovery::{Discovery, PythonProject, discover};
+pub use add::{
+    AddOptions,
+    plan_add,
+    plan_remove,
+    writable_project,
+};
+pub use discovery::{
+    Discovery,
+    PythonProject,
+    discover,
+};
 pub use manifest::DependencySelection;
 pub use outdated::{
-    DeclaredPythonDep, PythonDependencyGroup, declared_dependencies, locked_versions,
-    lockfile_dir_for, project_name, resolve_target_version,
+    DeclaredPythonDep,
+    LockedPythonPackages,
+    PythonDependencyGroup,
+    PythonIndexCache,
+    TargetPyproject,
+    declared_dependencies,
+    inspect_target_pyproject,
+    lockfile_dir_for,
+    project_name,
+    resolve_target_version,
 };
-pub use pep508_rs::PackageName;
-pub use update::{UpdateOptions, plan_update};
+pub use pep508_rs::{
+    PackageName,
+    VersionOrUrl,
+};
+pub use store_keys::locked_archive_store_index_keys;
+pub use update::{
+    UpdateOptions,
+    plan_update,
+};
 pub use workspace::members::in_declared_workspace;
 
 mod add;
@@ -43,25 +63,65 @@ mod resolutions;
 mod resolver;
 mod settings;
 mod sources;
+mod store_keys;
 mod targets;
 mod update;
 mod workspace;
 
-use environment::{Generation, LockfileInputs, PythonPrepare, Shared, publish_link};
+use environment::{
+    Generation,
+    LockfileInputs,
+    PythonPrepare,
+    Shared,
+    publish_link,
+};
 use generation::EnvironmentProject;
 use host::Interpreter;
-use interpreter::{Interpreters, Mismatch};
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
-use pnpm_pnpr_client::{PYPI_ECOSYSTEM, PnprClient, PypiResolveOptions};
-use pnpm_python_resolver::{Inputs, Lockfile};
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
-use pnpm_store_dir::{StoreIndex, StoreIndexWriter};
+use interpreter::{
+    Interpreters,
+    Mismatch,
+};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
+use pnpm_pnpr_client::{
+    PYPI_ECOSYSTEM,
+    PnprClient,
+    PypiResolveOptions,
+};
+use pnpm_python_resolver::{
+    Inputs,
+    Lockfile,
+};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
+use pnpm_store_dir::{
+    StoreIndex,
+    StoreIndexWriter,
+};
 use registry::Registry;
-use settings::{Index, python_index};
+use settings::{
+    Index,
+    python_index,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs, io,
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 use targets::Environments;
@@ -99,10 +159,24 @@ pub fn plan<Reporter: self::Reporter + 'static>(
         .iter()
         .map(|membership| membership.root.join("pylock.toml"))
         .collect();
+    report_unmanaged_requirements::<Reporter>(&discovery.unmanaged);
     pnpm_install_coordinator::InstallTask::new(
         metadata,
         prepare::<Reporter>(context, discovery, false, selection, selected),
     )
+}
+
+fn report_unmanaged_requirements<Reporter: self::Reporter + 'static>(unmanaged: &[PathBuf]) {
+    for root in unmanaged {
+        let environment = root.join(".venv");
+        let message = format!(
+            "Skipping the Python requirements in {}: pnpm did not create {}. Remove that \
+             directory to let pnpm install them.",
+            root.display(),
+            environment.display(),
+        );
+        Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }));
+    }
 }
 
 /// Say which of the platforms this install prepares for pnpm cannot
@@ -171,7 +245,31 @@ async fn prepare<Reporter: self::Reporter + 'static>(
         .wrap_err("join Python artifact store index writer")?
         .into_diagnostic()
         .wrap_err("flush Python artifact store index")?;
-    result
+    let prepared = result?;
+    register_in_store(&context, &prepared);
+    Ok(prepared)
+}
+
+/// Register the root of every environment as a user of the store, so a
+/// store prune keeps the archives its `pylock.toml` pins.
+fn register_in_store(context: &InstallOptions, prepared: &[Prepared]) {
+    let config = context.config;
+    if config.frozen_store {
+        return;
+    }
+    for project in prepared.iter().filter(|project| project.environment.is_some()) {
+        // Unlike an npm project, one whose store is inside it is registered
+        // too: its `RECORD` files have no hard link to keep them.
+        if let Err(error) =
+            pnpm_store_dir::register_loaded_project(&config.store_dir, &project.root)
+        {
+            tracing::warn!(
+                target: "pnpm::python",
+                ?error,
+                "Failed to register a Python project in the store project registry; install continues",
+            );
+        }
+    }
 }
 
 impl PythonPrepare<'_> {
@@ -244,7 +342,7 @@ impl PythonPrepare<'_> {
             interpreter: self.interpreter,
             resolution: registry::Resolution::new(self.interpreter.target.clone()),
             store: pnpm_tarball::ArchiveStoreContext {
-                dir: &self.context.config.store_dir,
+                dir: std::borrow::Cow::Borrowed(&self.context.config.store_dir),
                 index: self.store.index.clone(),
                 index_writer: Some(Arc::clone(self.store.writer)),
                 verify_integrity: self.context.config.verify_store_integrity,

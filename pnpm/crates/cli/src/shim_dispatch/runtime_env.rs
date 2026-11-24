@@ -9,12 +9,22 @@ use crate::{
     State,
     cli_args::{
         add::add_package,
-        reporter::{CliReporter, EventFilter},
+        reporter::{
+            CliReporter,
+            EventFilter,
+        },
     },
     slot_lock,
 };
-use miette::{Context, IntoDiagnostic};
-use pnpm_config::{Config, Host, NodeLinker};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
+use pnpm_config::{
+    Config,
+    Host,
+    NodeLinker,
+};
 use pnpm_crypto_hash::create_hex_hash;
 use pnpm_fs::DirLock;
 use pnpm_package_manifest::DependencyGroup;
@@ -23,7 +33,10 @@ use pnpm_store_dir::PrivateInstall;
 use serde_json::Value;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// A runtime installed and ready to run.
@@ -55,7 +68,7 @@ pub(super) const PACKAGE_MANAGER_ENVS_DIR_NAME: &str = "global-shim-package-mana
 /// project-controllable: a repository that redirects `storeDir` could
 /// pre-seed a poisoned global-virtual-store slot for the executable a
 /// dispatch is about to run. The configuration is therefore anchored
-/// inside pnpm's own state dir — the seeded empty workspace manifest
+/// inside pnpm's own state dir, the seeded empty workspace manifest
 /// stops ancestor discovery, so only the global `config.yaml`, user
 /// files, and the environment contribute.
 pub(crate) fn trusted_runtime_config(environments_dir: &Path) -> miette::Result<Config> {
@@ -91,6 +104,10 @@ pub(crate) fn trusted_runtime_config(environments_dir: &Path) -> miette::Result<
 /// setting inherited from the environment or the global config would
 /// materialize the runtime inside the environment directory, where
 /// [`managed_runtime_bin`] does not accept it for a shared install.
+/// The lockfile directory, `virtualStoreOnly`, and `symlink` are pinned
+/// too. A `PNPM_CONFIG_*` variable inherited from a parent pnpm would
+/// otherwise move the lockfile out of the environment or leave the
+/// runtime unlinked, and the dispatch would find no executable.
 pub(super) fn hardened_install_config(
     config: Config,
     environment_dir: &Path,
@@ -105,6 +122,10 @@ pub(super) fn hardened_install_config(
     }
     install_config.node_linker = NodeLinker::Isolated;
     install_config.workspace_dir = Some(environment_dir.to_path_buf());
+    install_config.configured_lockfile_dir = None;
+    install_config.lockfile_dir = Some(environment_dir.to_path_buf());
+    install_config.virtual_store_only = false;
+    install_config.symlink = true;
     install_config.lockfile = true;
     install_config.frozen_lockfile = Some(false);
     install_config.prefer_frozen_lockfile = false;
@@ -148,7 +169,7 @@ pub(crate) async fn materialize_runtime(
     }
 
     let Some(_lock) = runtime_slot_lock(&environments_dir, &key) else {
-        return install_runtime_privately(config, &name, &version_spec).await;
+        return Box::pin(install_runtime_privately(config, &name, &version_spec)).await;
     };
     if let Some(bin) = managed_runtime_bin(&environment_dir, &name, &global_virtual_store_dir) {
         return Ok(MaterializedRuntime::shared(bin));

@@ -1,7 +1,10 @@
 use super::{
     implicit::resolves_float,
     scalars::is_plain_safe,
-    style::CollectionStyle::{Block, Flow},
+    style::CollectionStyle::{
+        Block,
+        Flow,
+    },
     to_string,
 };
 use serde_json::json;
@@ -79,6 +82,13 @@ fn nan_resolves_as_float() {
 }
 
 #[test]
+fn signed_leading_dot_floats_are_quoted() {
+    assert!(resolves_float("+.5"));
+    let yaml = to_string(json!({ "a": "+.5", "b": "-.5" }));
+    assert_eq!(yaml, "a: '+.5'\n\nb: '-.5'\n");
+}
+
+#[test]
 fn timestamp_strings_are_quoted() {
     let yaml = to_string(json!({ "t": "2021-01-01" }));
     assert_eq!(yaml, "t: '2021-01-01'\n");
@@ -102,7 +112,7 @@ fn key_at_simple_key_limit_renders_inline() {
 // astral characters are 513 Rust chars but 1026 code units.
 #[test]
 fn key_length_is_measured_in_utf16_code_units() {
-    let key = "\u{1F600}".repeat(513);
+    let key = "😀".repeat(513);
     let yaml = to_string(json!({ &key: { "b": "c" } }));
     assert_eq!(yaml, format!("? {key}\n: b: c\n"));
 }

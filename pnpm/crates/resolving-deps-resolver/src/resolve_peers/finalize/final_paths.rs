@@ -1,7 +1,17 @@
 use super::{
-    BTreeMap, BTreeSet, DepPath, FinalPeerContext, HashMap, HashSet, NodeId, PeerId,
-    PeerNameTarjan, PeerSccPass, Walker, link_path_to_peer_version, peer_id_pair,
+    DepPath,
+    FinalPeerContext,
+    HashMap,
+    HashSet,
+    NodeId,
+    PeerId,
+    Walker,
+    link_path_to_peer_version,
+    peer_id_pair,
 };
+
+use pnpm_lockfile::RecordedPeerBindings;
+use std::sync::Arc;
 
 /// The depPaths [`Walker::build_final_dep_paths`] settled on.
 pub(crate) struct FinalDepPaths {
@@ -10,6 +20,7 @@ pub(crate) struct FinalDepPaths {
     /// pass that later retargets those peers can build the suffix again.
     /// Empty unless [`Walker::build_final_dep_paths`] was asked for them.
     pub(crate) peer_ids: HashMap<DepPath, Vec<PeerId>>,
+    bindings: HashMap<DepPath, Arc<RecordedPeerBindings>>,
     recording: PeerIdRecording,
     visiting: HashSet<NodeId>,
 }
@@ -29,16 +40,20 @@ impl Walker<'_> {
     /// peer slot carries the peer's own depPath. The cycle detection
     /// runs synchronously over the already-walked graph.
     pub(in super::super) fn build_final_dep_paths(
-        &self,
+        &mut self,
         recording: PeerIdRecording,
     ) -> FinalDepPaths {
         let (_, scc_of) = self.peer_sccs();
         let cyclic_peer_names = self.cyclic_peer_names();
         let context = FinalPeerContext { scc_of: &scc_of, cyclic_peer_names: &cyclic_peer_names };
+        if !self.opts.dedupe_peers {
+            self.propagate_cyclic_external_peers(context);
+        }
         let mut final_dep_paths = FinalDepPaths {
             recording,
             by_node_id: HashMap::default(),
             peer_ids: HashMap::default(),
+            bindings: HashMap::default(),
             visiting: HashSet::default(),
         };
         let mut node_ids: Vec<NodeId> = self.nodes.external_peers
@@ -81,6 +96,9 @@ impl Walker<'_> {
             pnpm_lockfile::PeerBindings::suffix_of(&peer_ids, self.opts.peers_suffix_max_length);
         let pkg_id = &self.tree.dependencies_tree[node_id].resolved_package_id;
         let dep_path = DepPath::from(format!("{}{}", self.tree.packages[pkg_id].id, suffix));
+        if let Some(bindings) = RecordedPeerBindings::for_dep_path(&dep_path, &peer_ids) {
+            final_dep_paths.bindings.insert(dep_path.clone(), bindings);
+        }
         match final_dep_paths.recording {
             PeerIdRecording::Record => {
                 final_dep_paths.peer_ids.insert(dep_path.clone(), peer_ids);
@@ -138,13 +156,7 @@ impl Walker<'_> {
         if self.opts.dedupe_peers && self.tree.dependencies_tree.contains_key(peer_node_id) {
             return pair();
         }
-        if context.scc_of
-            .get(node_id)
-            .is_some_and(|node_scc| context.scc_of.get(peer_node_id) == Some(node_scc))
-        {
-            return pair();
-        }
-        if context.cyclic_peer_names.contains(peer_alias) {
+        if Self::is_cyclic_peer(node_id, peer_alias, peer_node_id, context) {
             return pair();
         }
         PeerId::DepPath(self.final_dep_path_for_node(peer_node_id, context, final_dep_paths))
@@ -166,108 +178,14 @@ impl Walker<'_> {
             .map(|node_id| (node_id.clone(), self.final_dep_path_of(node_id, final_dep_paths)))
             .collect()
     }
+}
 
-    pub(super) fn cyclic_peer_names(&self) -> HashSet<String> {
-        let graph = self.peer_name_graph();
-
-        let mut tarjan = PeerNameTarjan {
-            graph: &graph,
-            index_of: HashMap::default(),
-            low_of: HashMap::default(),
-            on_stack: HashSet::default(),
-            tarjan_stack: Vec::new(),
-            cyclic: HashSet::default(),
-            next_index: 0,
-        };
-        for name in graph.keys() {
-            if !tarjan.index_of.contains_key(name.as_str()) {
-                tarjan.strongconnect(name);
+impl FinalDepPaths {
+    pub(in super::super) fn record_bindings(&self, graph: &mut crate::DependenciesGraph) {
+        for (dep_path, bindings) in &self.bindings {
+            if let Some(node) = graph.get_mut(dep_path) {
+                node.recorded_peer_bindings = Some(Arc::clone(bindings));
             }
         }
-        tarjan.cyclic
-    }
-
-    /// The `package name → resolved peer names` graph, with every peer name
-    /// present as a vertex of its own.
-    ///
-    /// Collected by package id, which every occurrence already carries, and
-    /// rendered to names only when folding the result: the graph is over
-    /// package *names*, of which a workspace has far fewer than the
-    /// occurrences contributing to them, and rendering one costs an
-    /// allocation (`PkgName` holds scope and bare name separately). Two
-    /// package ids can share a name — different versions of one package — so
-    /// the fold unions their edges.
-    pub(super) fn peer_name_graph(&self) -> BTreeMap<String, BTreeSet<&str>> {
-        let mut edges_of_pkg: HashMap<&str, BTreeSet<&str>> = HashMap::default();
-        for (node_id, peers) in &self.nodes.external_peers {
-            if peers.is_empty() {
-                continue;
-            }
-            let pkg_id = &*self.tree.dependencies_tree[node_id].resolved_package_id;
-            let edges = edges_of_pkg.entry(pkg_id).or_default();
-            for peer_alias in peers.keys() {
-                edges.insert(peer_alias.as_str());
-            }
-        }
-
-        let mut graph: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-        for (pkg_id, edges) in edges_of_pkg {
-            graph
-                .entry(self.tree.packages[pkg_id].name().to_string())
-                .or_default()
-                .extend(edges);
-        }
-        let peer_names: Vec<&str> = graph
-            .values()
-            .flat_map(|edges| edges.iter().copied())
-            .collect();
-        for peer_name in peer_names {
-            if !graph.contains_key(peer_name) {
-                graph.insert(peer_name.to_string(), BTreeSet::default());
-            }
-        }
-        graph
-    }
-
-    /// Strongly-connected components of the peer graph (node → resolved
-    /// peers, restricted to peers that themselves carry peers — peerless
-    /// peers can't close a cycle). Iterative Tarjan, returning the SCCs
-    /// in reverse-topological order plus a `NodeId → SCC index` map.
-    ///
-    /// Vertices and edge targets are canonicalized through
-    /// [`Self::cache_owner_node_id`] to match the owner-keyed lookups
-    /// in [`Self::final_peer_id`]: a cycle through a cache-hit
-    /// occurrence is a cycle through its owner.
-    pub(super) fn peer_sccs(&self) -> (Vec<Vec<NodeId>>, HashMap<NodeId, usize>) {
-        let mut participants: Vec<NodeId> = self.nodes.external_peers
-            .iter()
-            .filter(|(_, peers)| !peers.is_empty())
-            .map(|(node_id, _)| self.cache_owner_node_id(node_id).clone())
-            .collect();
-        participants.sort();
-        participants.dedup();
-        let participant_set: HashSet<NodeId> = participants.iter().cloned().collect();
-        let neighbors = |node_id: &NodeId| -> Vec<NodeId> {
-            let mut out: Vec<NodeId> = self.nodes.external_peers
-                .get(node_id)
-                .into_iter()
-                .flat_map(|peers| peers.values())
-                .map(|peer| self.cache_owner_node_id(peer))
-                .filter(|peer| participant_set.contains(*peer))
-                .cloned()
-                .collect();
-            out.sort();
-            out.dedup();
-            out
-        };
-
-        let mut pass = PeerSccPass::default();
-        for root in &participants {
-            if pass.index_of.contains_key(root) {
-                continue;
-            }
-            pass.visit_root(root, &neighbors);
-        }
-        (pass.sccs, pass.scc_of)
     }
 }

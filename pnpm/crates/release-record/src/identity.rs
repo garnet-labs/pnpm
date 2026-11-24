@@ -5,10 +5,23 @@ pub use log_entry::*;
 
 mod log_entry;
 
-use crate::{digest::lowercase_hex, profile::Profile, purl::Purl};
-use derive_more::{Display, Error};
-use sha2::{Digest as _, Sha256};
-use std::{fmt, str::FromStr};
+use crate::{
+    digest::lowercase_hex,
+    profile::Profile,
+    purl::Purl,
+};
+use derive_more::{
+    Display,
+    Error,
+};
+use sha2::{
+    Digest as _,
+    Sha256,
+};
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 /// What a record describes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,14 +89,14 @@ impl Authority {
     /// The authority of the log named `log_name` whose TUF repository's first
     /// root version has `first_root_digest` as its SHA-256.
     #[must_use]
-    pub fn new(log_name: &str, first_root_digest: [u8; 32]) -> Self {
-        Authority { log_name: log_name.to_owned(), first_root_digest }
+    pub fn new(log_name: String, first_root_digest: [u8; 32]) -> Self {
+        Authority { log_name, first_root_digest }
     }
 
     /// The authority of the log named `log_name` whose TUF repository's first
     /// root version is `first_root`.
     #[must_use]
-    pub fn of_first_root(log_name: &str, first_root: &[u8]) -> Self {
+    pub fn of_first_root(log_name: String, first_root: &[u8]) -> Self {
         Authority::new(log_name, Sha256::digest(first_root).into())
     }
 
@@ -120,7 +133,7 @@ impl FromStr for Authority {
             return Err(error());
         }
         let first_root_digest = parse_lowercase_hex(digest).ok_or_else(error)?;
-        Ok(Authority::new(log_name, first_root_digest))
+        Ok(Authority::new(log_name.to_owned(), first_root_digest))
     }
 }
 

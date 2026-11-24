@@ -1,11 +1,24 @@
 use super::{
-    super::tarball_url_and_integrity, DUMMY_SHA512, custom_resolution_metadata,
-    leaked_offline_config, run_snapshot_install_with_session, scripted_session,
+    super::tarball_url_and_integrity,
+    DUMMY_SHA512,
+    custom_resolution_metadata,
+    leaked_offline_config,
+    run_snapshot_install_with_session,
+    scripted_session,
 };
 use crate::install_package_by_snapshot::fetch::emit_progress_resolved;
 use pnpm_config::Config;
-use pnpm_lockfile::{LockfileResolution, PackageKey, RegistryResolution, TarballRevision};
-use pnpm_reporter::{LogEvent, ProgressMessage, Reporter};
+use pnpm_lockfile::{
+    LockfileResolution,
+    PackageKey,
+    RegistryResolution,
+    TarballRevision,
+};
+use pnpm_reporter::{
+    LogEvent,
+    ProgressMessage,
+    Reporter,
+};
 use pretty_assertions::assert_eq;
 use std::sync::Mutex;
 
@@ -26,7 +39,7 @@ fn emits_resolved_with_supplied_identifiers() {
     }
 
     EVENTS.lock().unwrap().clear();
-    emit_progress_resolved::<RecordingReporter>("react@18.0.0", "/proj");
+    emit_progress_resolved::<RecordingReporter>("react@18.0.0".to_owned(), "/proj".to_owned());
 
     let captured = EVENTS.lock().unwrap();
     assert!(

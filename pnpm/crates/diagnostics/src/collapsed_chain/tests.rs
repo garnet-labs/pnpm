@@ -1,6 +1,18 @@
-use super::{Collapsed, CollapsingHandler, collapsed_message};
-use miette::{Diagnostic, MietteHandlerOpts, ReportHandler};
-use std::{error::Error, fmt};
+use super::{
+    Collapsed,
+    CollapsingHandler,
+    collapsed_message,
+    handler_options,
+};
+use miette::{
+    Diagnostic,
+    MietteHandlerOpts,
+    ReportHandler,
+};
+use std::{
+    error::Error,
+    fmt,
+};
 
 /// A `#[diagnostic(transparent)]` wrapper: displays as its inner error
 /// and keeps it as the source.
@@ -63,6 +75,18 @@ fn messages(collapsed: &Collapsed<'_>) -> Vec<String> {
         source = cause.source();
     }
     messages
+}
+
+fn render(handler: &CollapsingHandler, diagnostic: &dyn Diagnostic) -> String {
+    struct Rendered<'a>(&'a CollapsingHandler, &'a dyn Diagnostic);
+
+    impl fmt::Debug for Rendered<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.debug(self.1, formatter)
+        }
+    }
+
+    format!("{:?}", Rendered(handler, diagnostic))
 }
 
 #[test]
@@ -173,7 +197,7 @@ fn a_coincidental_tail_match_is_not_a_restatement() {
     );
 }
 
-/// The kept levels keep answering for themselves — the collapsed head
+/// The kept levels keep answering for themselves, the collapsed head
 /// still carries the code miette prints above the report.
 #[test]
 fn the_head_keeps_its_diagnostic_code() {
@@ -222,22 +246,49 @@ fn a_diagnostic_source_is_folded_like_an_error_source() {
 /// it.
 #[test]
 fn the_handler_renders_a_repeated_message_once() {
-    struct Rendered<'a>(&'a CollapsingHandler, &'a dyn Diagnostic);
-
-    impl fmt::Debug for Rendered<'_> {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            self.0.debug(self.1, formatter)
-        }
-    }
-
     let handler = CollapsingHandler { inner: MietteHandlerOpts::new().build() };
     let wrapped = Wrapper { inner: Wrapper { inner: Leaf { message: "boom", source: None } } };
 
-    let rendered = format!("{:?}", Rendered(&handler, &wrapped));
+    let rendered = render(&handler, &wrapped);
 
     assert_eq!(
         rendered.matches("boom").count(),
         1,
         "the message must be rendered once, got:\n{rendered}",
     );
+}
+
+/// The suffixed level folds into the prefixed one, and the level below it
+/// must still fold, though the prefixed line neither starts nor ends with it.
+#[test]
+fn a_prefixed_wrapper_over_a_suffixed_one_absorbs_both() {
+    let leaf = Leaf {
+        message: "Failed to resolve dependency tree: Failed to resolve dependency: hook failed\n\nFailed to resolve is-number@^7.0.0",
+        source: Some(Box::new(Leaf {
+            message: "Failed to resolve dependency: hook failed\n\nFailed to resolve is-number@^7.0.0",
+            source: Some(Box::new(Leaf {
+                message: "Failed to resolve dependency: hook failed",
+                source: Some(Box::new(Leaf { message: "hook failed", source: None })),
+            })),
+        })),
+    };
+
+    let collapsed = Collapsed::new(&leaf);
+
+    assert_eq!(
+        messages(&collapsed),
+        vec!["Failed to resolve dependency tree: Failed to resolve dependency: hook failed\n\nFailed to resolve is-number@^7.0.0".to_string()],
+    );
+}
+
+#[test]
+fn long_messages_are_not_wrapped_at_the_output_width() {
+    let message =
+        "https://example.com/merge#%7B%22destination%22%3A%22MyVersionSet%2Fdevelopment%22%7D";
+    let diagnostic = Leaf { message, source: None };
+    let handler = CollapsingHandler { inner: handler_options().width(20).build() };
+
+    let rendered = render(&handler, &diagnostic);
+
+    assert!(rendered.contains(message), "the message must stay on one line, got:\n{rendered}");
 }

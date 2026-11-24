@@ -6,50 +6,110 @@
 //! What a `pacquet update` reaches, and so excludes from reuse, is
 //! [`super::update_scope`].
 
-pub(crate) use direct_versions::{preseed_changed_direct_versions, record_changed_direct_deps};
+pub(crate) use direct_versions::{
+    direct_dep_specifier_unchanged,
+    preseed_changed_direct_versions,
+    record_changed_direct_deps,
+    resolve_direct_dependency_detached,
+};
 
 pub(super) use direct_versions::{
-    higher_direct_dep_version, node_depends_on_changed_direct_dep, record_direct_dep_versions,
+    higher_direct_dep_version,
+    node_depends_on_changed_direct_dep,
+    record_direct_dep_versions,
 };
 
 pub(super) use snapshot_children::PendingReusedNode;
-pub(super) use subtree::{SubtreeReuseCache, TargetDistances};
+pub(super) use subtree::{
+    LockfileReuseCache,
+    TargetDistances,
+};
 
 mod direct_versions;
 mod snapshot_children;
 mod subtree;
-use snapshot_children::{reused_children, reused_identity};
+use snapshot_children::{
+    reused_children,
+    reused_identity,
+};
 use subtree::subtree_fully_reusable;
 
 use async_recursion::async_recursion;
 use pnpm_lockfile::{
-    PkgName, PkgNameVerPeer, ProjectSnapshot, ResolvedDependencyMap, SnapshotDepRef, SnapshotEntry,
+    PkgName,
+    PkgNameVerPeer,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    SnapshotDepRef,
+    SnapshotEntry,
 };
-use pnpm_resolving_resolver_base::{Resolver, WantedDependency};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use pnpm_resolving_resolver_base::{
+    Resolver,
+    WantedDependency,
+    is_valid_semver_range,
+};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use crate::{
-    lockfile_reuse::{locked_key_is_current, reusable_importer_dep, synthesize_reused_result},
+    lockfile_reuse::{
+        locked_key_is_current,
+        reusable_importer_dep,
+        synthesize_reused_result,
+    },
     node_id::NodeId,
     parent_pkg_aliases::ParentPkgAliases,
     resolved_tree::{
-        AncestorPkgIds, DirectDep, PeerSet, ResolvedPackage, ResolvedPackageInput, TreeChildren,
+        AncestorPkgIds,
+        DirectDep,
+        PeerSet,
+        ResolvedPackage,
+        ResolvedPackageInput,
+        TreeChildren,
     },
+    unwrap_package_name::unwrap_package_name,
 };
 
 use super::{
-    DependencySpec, ResolveDependencyTreeError, UpdateReuseScope, lock_recoverable,
-    manifest::{build_pkg_id_with_patch_hash, emit_deprecation_if_needed},
+    DependencySpec,
+    ResolveDependencyTreeError,
+    UpdateReuseScope,
+    lock_recoverable,
+    manifest::{
+        build_pkg_id_with_patch_hash,
+        report_created_package,
+    },
     tree_ctx::TreeCtx,
     walk::{
-        ChildEdge, NodeSeed, closes_cycle, level_aliases, node_alias, node_id_for,
-        resolve_node_seed, walk_from_seeds,
+        ChildEdge,
+        NodeSeed,
+        ParentOrigin,
+        closes_cycle,
+        level_aliases,
+        node_alias,
+        node_id_for,
+        resolve_node_seed,
+        walk_from_seeds,
     },
     workspace_ctx::{
-        ChildrenOwnerClaim, ChildrenRecording, DirectDepVersion, DirectDepVersions,
-        PackageRegistration, RecordedChildrenContext, claim_children_owner, insert_tree_node,
-        is_current_children_owner, make_non_owner_nodes_lazy, record_children,
+        ChildrenOwnerClaim,
+        ChildrenRecording,
+        DirectDepVersion,
+        DirectDepVersions,
+        PackageRegistration,
+        RecordedChildrenContext,
+        claim_children_owner,
+        insert_tree_node,
+        is_current_children_owner,
+        make_non_owner_nodes_lazy,
+        record_children,
     },
 };
 
@@ -68,10 +128,10 @@ pub(super) enum ReuseSource {
     Importer { importer_id: String },
     /// A transitive dependency whose resolved snapshot key the parent's
     /// snapshot already pins. `Some` reuses that key directly (no semver
-    /// check — the parent version pins it); `None` means an updated
+    /// check, the parent version pins it); `None` means an updated
     /// ancestor discarded its child-refs, forcing this subtree to
     /// re-resolve. The parent may itself be reused (snapshot walk) or
-    /// freshly resolved onto its previously recorded version — both
+    /// freshly resolved onto its previously recorded version; both
     /// keep the prior child refs alive, mirroring pnpm's
     /// `parentPkg.updated ? undefined : resolvedDependencies`.
     Transitive { key: Option<PkgNameVerPeer> },
@@ -80,7 +140,7 @@ pub(super) enum ReuseSource {
 }
 
 impl ReuseSource {
-    /// The prior lockfile snapshot key recorded for this edge, if any —
+    /// The prior lockfile snapshot key recorded for this edge, if any,
     /// the basis of both subtree reuse and the `currentPkg` payload.
     /// The `Importer` arm applies the semver-satisfies gate
     /// ([`reusable_importer_dep`]): a lockfile reference is only reused
@@ -121,7 +181,7 @@ impl ReuseSource {
 /// `ResolveResult` synthesized from the lockfile metadata.
 pub(super) struct ReusedNode {
     key: PkgNameVerPeer,
-    result: pnpm_resolving_resolver_base::ResolveResult,
+    pub(super) result: pnpm_resolving_resolver_base::ResolveResult,
 }
 
 /// Decide whether the current edge can reuse the prior lockfile's
@@ -214,31 +274,8 @@ pub(super) fn wanted_lockfile_contains_satisfying_entry(
     )
 }
 
-/// Normalize an `npm:` alias specifier into the real package name and
-/// the wanted range (`("is-positive", "^1.0.0")` for the edge
-/// `my-alias@npm:is-positive@^1.0.0`; the range is `"*"` for the
-/// spec-less `npm:is-positive` form). A specifier without the `npm:`
-/// prefix is returned as-is: the alias is the real package name.
-///
-/// Mirrors the TypeScript resolver's `unwrapPackageName`; unlike
-/// [`fn@real_package_name_of`] it also yields the range and does not
-/// special-case the `npm:<range>` form, so the locked-entry check
-/// matches its TypeScript counterpart byte for byte.
-pub(crate) fn unwrap_package_name<'a>(
-    alias: &'a str,
-    bare_specifier: &'a str,
-) -> (&'a str, &'a str) {
-    let Some(rest) = bare_specifier.strip_prefix("npm:") else {
-        return (alias, bare_specifier);
-    };
-    match rest.rfind('@') {
-        None | Some(0) => (rest, "*"),
-        Some(index) => (&rest[..index], &rest[index + 1..]),
-    }
-}
-
 /// Resolve the *real* package name an `(alias, bare_specifier)` edge
-/// targets — the name update targeting matches against, not the local
+/// targets, the name update targeting matches against, not the local
 /// install alias, which an `npm:` alias or a `jsr:` specifier can
 /// differ from. The picker and the lockfile snapshots key on this name.
 /// `walk::overlay_lookup_names` builds its candidate set from it.
@@ -252,7 +289,7 @@ pub fn real_package_name_of<'edge>(
     let bare = bare_specifier?;
     if let Some(rest) = bare.strip_prefix("npm:") {
         let alias_keeps_name = alias.is_some_and(|alias| {
-            !alias.is_empty() && rest.parse::<node_semver::Range>().is_ok()
+            !alias.is_empty() && !rest.is_empty() && is_valid_semver_range(rest)
         });
         if !alias_keeps_name {
             let last_at = rest
@@ -288,9 +325,9 @@ pub(super) async fn seed_reused_node(
     // The synthesized result must stay out of `resolved_by_wanted`: its
     // manifest deliberately omits `dependencies` (a reused node's
     // children come from the snapshot graph), so if the fresh-resolve
-    // path ever read it back — e.g. an identical edge denied reuse by
+    // path ever read it back (e.g. an identical edge denied reuse by
     // the changed-direct-dep gate or by `subtree_fully_reusable`'s
-    // provisional-`false` cycle guard — `extract_children` /
+    // provisional-`false` cycle guard) `extract_children` /
     // `pkg_is_leaf` would misread the package as dependency-less and
     // record it as a leaf, emptying its lockfile snapshot.
     let result = Arc::new(reused.result);
@@ -304,12 +341,18 @@ pub(super) async fn seed_reused_node(
         register_reused_package(ctx, id, &result, current_is_optional, identity.is_leaf);
     let id = match registration {
         PackageRegistration::Created(id) => {
-            emit_deprecation_if_needed(ctx, &result, &id, edge.depth);
+            report_created_package(ctx, &result, &id, edge.depth);
             id
         }
         PackageRegistration::Existing(id) => id,
     };
-    let ancestry = snapshot_children::ReusedNodeAncestry::new(edge, &id, current_is_optional);
+    let non_local_parent = matches!(ParentOrigin::of(&result), ParentOrigin::NonLocal(_));
+    let ancestry = snapshot_children::ReusedNodeAncestry::new(
+        edge,
+        &id,
+        current_is_optional,
+        non_local_parent,
+    );
     Ok(NodeSeed::Reused(Box::new(PendingReusedNode {
         dep: DirectDep { alias, node_id: identity.node_id, id },
         key: reused.key,
@@ -344,6 +387,11 @@ where
     let node_id = reused.dep.node_id;
     let id = reused.dep.id;
     insert_tree_node(ctx, node_id.clone(), &id, children, depth);
+    super::locked_resolution::record(
+        ctx,
+        &node_id,
+        super::locked_resolution::from_prior(ctx, &reused.key),
+    );
     if is_current_children_owner(ctx, &id, &children_owner.owner) {
         make_non_owner_nodes_lazy(ctx, &id, &node_id);
     }

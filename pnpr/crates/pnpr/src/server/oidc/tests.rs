@@ -1,10 +1,25 @@
 use super::{
-    HANDOFF_COOKIE_PREFIX, LoginReturn, LoginSession, OidcState, WorkloadScope,
-    check_workload_request, redeem, signed_in, validate_workloads,
+    HANDOFF_COOKIE_PREFIX,
+    LoginReturn,
+    LoginSession,
+    OidcState,
+    WorkloadScope,
+    check_workload_request,
+    redeem,
+    signed_in,
+    validate_workloads,
 };
 use axum::{
     body::Body,
-    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, header},
+    http::{
+        HeaderMap,
+        HeaderValue,
+        Method,
+        Request,
+        StatusCode,
+        Uri,
+        header,
+    },
 };
 use pnpr_config::Config;
 use std::net::SocketAddr;
@@ -25,24 +40,32 @@ auth:
       workloads:
         - identity:
             subject: repo:org/repo:ref:refs/heads/main
-            username: ci
+            userId: ci
             claims:
               repository_id: '123'
           registry: private
           packages: ['@org/pkg']
 ";
 
-fn config(yaml: &str) -> Config {
+/// The config `yaml` declares, with the directory it is read from: the
+/// storage paths it leaves at their defaults resolve inside that directory,
+/// so it lives as long as the config.
+fn config(yaml: &str) -> (Config, tempfile::TempDir) {
     let directory = tempfile::TempDir::new().unwrap();
     let path = directory.path().join("config.yaml");
     std::fs::write(&path, yaml).unwrap();
-    Config::from_yaml(&path, "127.0.0.1:0".parse::<SocketAddr>().unwrap(), None).unwrap()
+    let config = pnpr_fixtures::load_seeded_config(
+        &path,
+        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        None,
+    );
+    (config, directory)
 }
 
 #[test]
 fn workload_credentials_only_permit_named_package_publication() {
-    let config = config(CONFIG);
-    validate_workloads(&config).unwrap();
+    let (config, _config_dir) = config(CONFIG);
+    validate_workloads(&config, &config.routing).unwrap();
     let workload = &config.identity.auth.oidc[0].workloads[0];
     for path in ["/npm/~private/@org/pkg", "/npm/~private/@org%2fpkg", "/npm/~private/%40org%2Fpkg"]
     {
@@ -58,7 +81,10 @@ fn workload_credentials_only_permit_named_package_publication() {
         "/-/user/org.couchdb.user:ci",
         "/-/npm/v1/tokens",
         "/npm/~other/-/pnpr/v0/publish",
-        "/npm/~other/-/pnpr/v0/artifacts/blob",
+        "/npm/~other/-/pnpr/v0/publish/archives/sha512-x",
+        "/-/pnpr/v0/publish/archives/",
+        "/-/pnpr/v0/publish/archives",
+        "/npm/~private/-/pnpr/v0/artifacts/blobs/acme/sha512-x",
         "/-/pnpr/v0/publish/extra",
         "/v2/token",
         "/npm/~private/@org%252fpkg",
@@ -80,11 +106,11 @@ fn workload_credentials_only_permit_named_package_publication() {
 /// commit checks each entry against the workload's packages.
 #[test]
 fn workload_credentials_permit_staging_and_publish_commits() {
-    let config = config(CONFIG);
+    let (config, _config_dir) = config(CONFIG);
     let workload = &config.identity.auth.oidc[0].workloads[0];
     for base in ["", "/npm", "/npm/~private"] {
         for method in [Method::PUT, Method::HEAD] {
-            let path = format!("{base}/-/pnpr/v0/artifacts/blob");
+            let path = format!("{base}/-/pnpr/v0/publish/archives/sha512-a%2Fb%3D%3D");
             check_workload_request(workload, &method, &path).unwrap();
         }
         let path = format!("{base}/-/pnpr/v0/publish");
@@ -93,7 +119,7 @@ fn workload_credentials_permit_staging_and_publish_commits() {
             assert!(check_workload_request(workload, &method, &path).is_err(), "{method} {path}");
         }
     }
-    let scope = WorkloadScope::new(&config, workload);
+    let scope = WorkloadScope::new(&config.routing, workload);
     scope.check_ecosystem(pnpr_registry::Ecosystem::Npm).unwrap();
     assert!(scope.check_ecosystem(pnpr_registry::Ecosystem::Cargo).is_err());
     let private =
@@ -107,10 +133,10 @@ fn workload_credentials_permit_staging_and_publish_commits() {
 /// workload's packages, whichever address it is sent to.
 #[tokio::test]
 async fn a_workload_batch_is_scoped_to_its_packages() {
-    let mut config = config(CONFIG);
+    let (mut config, _config_dir) = config(CONFIG);
     let storage = tempfile::TempDir::new().unwrap();
     config.storage.hosted_dir = storage.path().to_path_buf();
-    let scope = WorkloadScope::new(&config, &config.identity.auth.oidc[0].workloads[0]);
+    let scope = WorkloadScope::new(&config.routing, &config.identity.auth.oidc[0].workloads[0]);
     let record = pnpr_auth::TokenRecord::new("ci", 1, 1);
     let app = super::super::tests::app_with_config_and_token(config, "tok", record)
         .layer(axum::Extension(scope));
@@ -129,6 +155,17 @@ async fn a_workload_batch_is_scoped_to_its_packages() {
             "versions": { "1.0.0": { "name": name, "version": "1.0.0" } },
         })
     };
+    let invalid_version = send(
+        "/npm/~private/-/pnpr/v0/publish",
+        serde_json::json!({
+            "packages": [{
+                "name": "@org/other",
+                "versions": { "banana": { "name": "@org/other", "version": "banana" } },
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(invalid_version.status(), StatusCode::BAD_REQUEST);
     let other = send(
         "/npm/~private/-/pnpr/v0/publish",
         serde_json::json!({ "packages": [entry("@org/other")] }),
@@ -162,7 +199,7 @@ async fn archives_are_staged_under_a_registry_address() {
     use sha2::Digest as _;
 
     let storage = tempfile::TempDir::new().unwrap();
-    let mut config = config(CONFIG);
+    let (mut config, _config_dir) = config(CONFIG);
     config.storage.hosted_dir = storage.path().to_path_buf();
     let record = pnpr_auth::TokenRecord::new("ci", 1, 1);
     let app = super::super::tests::app_with_config_and_token(config, "tok", record);
@@ -171,10 +208,8 @@ async fn archives_are_staged_under_a_registry_address() {
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&bytes)),
     );
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("integrity", &integrity)
-        .finish();
-    let path = format!("/npm/~private/-/pnpr/v0/artifacts/blob?{query}");
+    let archive = archive_segment(&integrity);
+    let path = format!("/npm/~private/-/pnpr/v0/publish/archives/{archive}");
     let put = Request::put(&path)
         .header(header::AUTHORIZATION, "Bearer tok")
         .header(header::CONTENT_LENGTH, bytes.len())
@@ -188,7 +223,7 @@ async fn archives_are_staged_under_a_registry_address() {
             .status(),
         StatusCode::CREATED,
     );
-    let head = Request::head(format!("/npm/-/pnpr/v0/artifacts/blob?{query}"))
+    let head = Request::head(format!("/npm/-/pnpr/v0/publish/archives/{archive}"))
         .header(header::AUTHORIZATION, "Bearer tok")
         .body(Body::empty())
         .unwrap();
@@ -199,14 +234,14 @@ async fn archives_are_staged_under_a_registry_address() {
 
 #[test]
 fn workload_targets_validate_at_startup() {
-    let mut config = config(CONFIG);
+    let (mut config, _config_dir) = config(CONFIG);
     config.identity.auth.oidc[0].workloads[0].registry = "unknown".to_string();
-    assert!(validate_workloads(&config).is_err());
+    assert!(validate_workloads(&config, &config.routing).is_err());
     config.identity.auth.oidc[0].workloads[0].registry = "private".to_string();
     config.identity.auth.oidc[0].workloads[0].packages = vec!["@org/*".to_string()];
-    assert!(validate_workloads(&config).is_err());
+    assert!(validate_workloads(&config, &config.routing).is_err());
     config.identity.auth.oidc[0].workloads[0].packages.clear();
-    assert!(validate_workloads(&config).is_err());
+    assert!(validate_workloads(&config, &config.routing).is_err());
 }
 
 #[test]
@@ -217,7 +252,7 @@ fn callback_secrets_never_appear_in_request_logs() {
 
 #[tokio::test]
 async fn invalid_oidc_credentials_fail_closed_on_public_endpoints() {
-    let mut config = config(CONFIG);
+    let (mut config, _config_dir) = config(CONFIG);
     let storage = tempfile::TempDir::new().unwrap();
     config.storage.hosted_dir = storage.path().to_path_buf();
     let app = crate::try_router(config).unwrap();
@@ -258,7 +293,7 @@ async fn a_ui_sign_in_hands_the_token_only_to_the_browser_and_flow_that_signed_i
     let sign_in = |flow: &str, token: &str| {
         let session = LoginSession {
             token: token.to_string(),
-            expires: chrono::Utc::now().timestamp() + 60,
+            expires: jiff::Timestamp::now().as_second() + 60,
             returns_to: LoginReturn::Ui,
         };
         let landed = signed_in(&oidc, flow, session);
@@ -306,4 +341,9 @@ async fn a_ui_sign_in_hands_the_token_only_to_the_browser_and_flow_that_signed_i
     assert_eq!(token(redeemed).await, "pnpr_oidc_first");
     assert_eq!(redeem(&oidc, "flow-a", &both).status(), StatusCode::UNAUTHORIZED);
     assert_eq!(token(redeem(&oidc, "flow-b", &both)).await, "pnpr_oidc_second");
+}
+
+/// `integrity` as one path segment.
+fn archive_segment(integrity: &str) -> String {
+    url::form_urlencoded::byte_serialize(integrity.as_bytes()).collect()
 }

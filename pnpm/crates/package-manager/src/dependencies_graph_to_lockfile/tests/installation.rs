@@ -1,20 +1,42 @@
 use super::{
-    super::DependenciesGraphToLockfileError, dependencies_graph_to_lockfile,
-    error_from_single_node_graph, make_file_node, make_named_registry_node, make_node,
-    make_node_with_optional, named_registries_with, single_importer_opts, write_manifest,
+    super::DependenciesGraphToLockfileError,
+    dependencies_graph_to_lockfile,
+    error_from_single_node_graph,
+    make_file_node,
+    make_named_registry_node,
+    make_node,
+    make_node_with_optional,
+    named_registries_with,
+    single_importer_opts,
+    write_manifest,
 };
-use crate::dependencies_graph_to_lockfile::packages::{read_engines, read_string_or_list};
+use crate::dependencies_graph_to_lockfile::packages::{
+    read_engines,
+    read_string_or_list,
+};
 use pnpm_deps_path::DepPath;
 use pnpm_lockfile::{
-    ImporterDepVersion, LockfileResolution, PackageKey, PackageMetadata, PkgName,
-    RegistryResolution, SnapshotDepRef,
+    ImporterDepVersion,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    RegistryResolution,
+    SnapshotDepRef,
 };
-use pnpm_resolving_deps_resolver::{DependenciesGraph, DependenciesGraphNode};
+use pnpm_resolving_deps_resolver::{
+    DependenciesGraph,
+    DependenciesGraphNode,
+};
 use pnpm_resolving_resolver_base::ResolveResult;
 use rustc_hash::FxHashSet as HashSet;
 use serde_json::json;
 use ssri::Integrity;
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+    sync::Arc,
+};
 
 /// An install that resolved no publish dates leaves the section out
 /// rather than writing an empty map.
@@ -84,6 +106,59 @@ fn fresh_install_records_a_single_direct_dependency() {
     assert!(snapshot.dependencies.is_none());
     assert!(snapshot.optional_dependencies.is_none());
     assert!(snapshot.transitive_peer_dependencies.is_none());
+}
+
+#[test]
+fn v13_directory_without_a_manifest_returns_a_conversion_error() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "local": "file:../local" },
+    }));
+    let mut node = make_file_node("local", "../local");
+    Arc::get_mut(&mut node.resolve_result).expect("unique resolve result")
+        .package
+        .manifest = None;
+    let direct = BTreeMap::from([("local".to_string(), node.dep_path.clone())]);
+    let mut graph = DependenciesGraph::default();
+    graph.insert(node.dep_path.clone(), node);
+    let mut opts = single_importer_opts(&manifest, &graph, direct, false, false, None, None);
+    opts.metadata_sources.lockfile_format = pnpm_lockfile::LockfileFormat::V13;
+
+    let error = super::super::dependencies_graph_to_lockfile(opts)
+        .expect_err("a V13 directory record requires a manifest");
+    assert!(matches!(
+        error,
+        super::super::DependenciesGraphToLockfileError::DirectoryManifestMissing { .. }
+    ));
+}
+
+#[test]
+fn v13_directory_with_an_invalid_dependency_alias_returns_a_conversion_error() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "local": "file:../local" },
+    }));
+    let mut node = make_file_node("local", "../local");
+    Arc::get_mut(&mut node.resolve_result).expect("unique resolve result")
+        .package
+        .manifest = Some(Arc::new(json!({
+        "name": "local",
+        "dependencies": { "not a package name": "1.0.0" },
+    })));
+    let direct = BTreeMap::from([("local".to_string(), node.dep_path.clone())]);
+    let mut graph = DependenciesGraph::default();
+    graph.insert(node.dep_path.clone(), node);
+    let mut opts = single_importer_opts(&manifest, &graph, direct, false, false, None, None);
+    opts.metadata_sources.lockfile_format = pnpm_lockfile::LockfileFormat::V13;
+
+    let error = super::super::dependencies_graph_to_lockfile(opts)
+        .expect_err("invalid directory dependency names cannot be serialized");
+    assert!(matches!(
+        error,
+        super::super::DependenciesGraphToLockfileError::DirectorySpecifiers { .. }
+    ));
 }
 #[test]
 fn fresh_install_records_string_libc_without_coercing_scalar_bundle_metadata() {
@@ -183,7 +258,7 @@ fn duplicate_manifest_alias_uses_pnpm_dependency_field_precedence() {
 /// A resolver that hands back no package name leaves a bare
 /// `file:<path>` depPath, which keys neither `packages:` nor
 /// `snapshots:`. Dropping it would write a lockfile whose importer
-/// points at a package neither map describes — see
+/// points at a package neither map describes; see
 /// <https://github.com/pnpm/pnpm/issues/13410>.
 #[test]
 fn nameless_dep_path_returns_structured_error() {
@@ -476,7 +551,7 @@ fn file_dep_child_renders_as_bare_file_ref() {
     assert_eq!(dbg!(child_ref).to_string(), "file:child");
 }
 /// An injected workspace dep whose alias equals its package name must
-/// serialize as the plain `file:<path>(peers)` ref, matching pnpm v11 —
+/// serialize as the plain `file:<path>(peers)` ref, matching pnpm v11,
 /// the `<name>@<ref>` alias form is reserved for renamed deps, and
 /// consumers compose `alias@version` into a snapshot key, so a
 /// self-aliased ref would double-prefix that key.
@@ -485,6 +560,7 @@ fn same_name_injected_dep_serializes_as_plain_file_ref() {
     use pnpm_lockfile::ImporterDepVersion;
 
     let node = DependenciesGraphNode {
+        recorded_peer_bindings: None,
         dep_path: DepPath::from("@scope/comp1@file:comp1(react@16.0.0)".to_string()),
         resolved_package_id: "file:comp1".to_string(),
         resolve_result: std::sync::Arc::new(ResolveResult {
@@ -537,8 +613,8 @@ fn same_name_injected_dep_serializes_as_plain_file_ref() {
         "renamed aliases must keep the <name>@<ref> form: {renamed:?}",
     );
 }
-/// A canonical named-registry tarball drops its URL — it is rebuilt from
-/// the alias on read — and its presence stamps lockfile format 12.0.
+/// A canonical named-registry tarball drops its URL (it is rebuilt from
+/// the alias on read) and its presence stamps lockfile format 12.0.
 #[test]
 fn named_registry_package_keeps_the_format_and_drops_a_canonical_tarball() {
     let (_tmp, manifest) = write_manifest(json!({

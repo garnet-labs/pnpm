@@ -1,5 +1,9 @@
 use super::{
-    NetworkConfigInput, STORE_VERSION, build_overlay, install_options, network_config,
+    NetworkConfigInput,
+    STORE_VERSION,
+    build_overlay,
+    install_options,
+    network_config,
     resolve_config,
 };
 
@@ -117,4 +121,71 @@ fn resolved_config_applies_add_missing_peer_types() {
             expected,
         );
     }
+}
+
+#[test]
+fn resolved_config_applies_lockfile_format() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    for (lockfile_format, expected) in [
+        (Some("v13"), pnpm_lockfile::LockfileFormat::V13),
+        (Some("v9"), pnpm_lockfile::LockfileFormat::V9),
+        (None, pnpm_lockfile::LockfileFormat::V9),
+    ] {
+        let mut options = install_options();
+        options.lockfile_format = lockfile_format.map(str::to_string);
+        let overlay = build_overlay(&options, false).expect("overlay");
+        assert_eq!(resolve_config(dir.path(), &overlay).expect("config").lockfile_format, expected);
+    }
+}
+
+#[test]
+fn an_unknown_lockfile_format_is_rejected() {
+    let mut options = install_options();
+    options.lockfile_format = Some("v10".to_string());
+    let Err(error) = build_overlay(&options, false) else {
+        panic!(r#"lockfileFormat "v10" must be rejected"#);
+    };
+    assert!(error.reason.contains("invalid lockfileFormat"), "{}", error.reason);
+}
+
+#[test]
+fn invalid_layout_and_network_values_are_rejected() {
+    let mut options = install_options();
+    options.node_linker = Some("flat".to_string());
+    assert_invalid_option(&options, "nodeLinker");
+
+    let mut options = install_options();
+    options.package_import_method = Some("symlink".to_string());
+    assert_invalid_option(&options, "packageImportMethod");
+
+    let mut options = install_options();
+    options.network_config = Some(NetworkConfigInput {
+        local_address: Some("not-an-ip".to_string()),
+        ..network_config()
+    });
+    assert_invalid_option(&options, "networkConfig.localAddress");
+}
+
+fn assert_invalid_option(options: &super::InstallOptions, option: &str) {
+    let Err(error) = build_overlay(options, false) else {
+        panic!("an invalid `{option}` must be rejected");
+    };
+    assert!(error.reason.contains(r#""code":"ERR_PNPM_INVALID_OPTION""#), "{}", error.reason);
+    assert!(error.reason.contains(option), "{}", error.reason);
+}
+
+#[test]
+fn every_declared_layout_value_is_accepted() {
+    for node_linker in ["isolated", "hoisted", "pnp", "loaded"] {
+        let mut options = install_options();
+        options.node_linker = Some(node_linker.to_string());
+        assert!(build_overlay(&options, false).is_ok(), "nodeLinker {node_linker:?}");
+    }
+    let mut options = install_options();
+    options.package_import_method = Some("clone-or-copy".to_string());
+    assert_eq!(
+        build_overlay(&options, false).expect("overlay").package_import_method,
+        Some(pnpm_config::PackageImportMethod::CloneOrCopy),
+    );
 }

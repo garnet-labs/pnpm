@@ -18,17 +18,31 @@
 //! demands it.
 
 use pnpm_network::{
-    AuthHeaders, RetryOpts, ThrottledClient, ThrottledClientGuard, read_self_delimiting_body,
-    redact_url_credentials, redact_url_for_display, retry_async, send_with_retry_at_priority,
+    AuthHeaders,
+    PackageRequest,
+    RetryOpts,
+    ThrottledClient,
+    ThrottledClientGuard,
+    read_self_delimiting_body,
+    redact_url_credentials,
+    redact_url_for_display,
+    retry_async,
 };
 use pnpm_registry::Package;
-use reqwest::{Response, StatusCode, header};
+use reqwest::{
+    Response,
+    StatusCode,
+    header,
+};
 use std::time::Duration;
 
 use crate::{
     FetchMetadataError,
     decode_pool::run_decode,
-    metadata_cache_policy::{DocumentKind, normalizes_to_abbreviated},
+    metadata_cache_policy::{
+        DocumentKind,
+        normalizes_to_abbreviated,
+    },
     mirror::clear_meta,
     registry_url::to_registry_url,
 };
@@ -71,7 +85,8 @@ pub(crate) fn metadata_response_is_uncacheable(headers: &header::HeaderMap) -> b
     headers
         .get_all(header::CACHE_CONTROL)
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .filter_map(Result::ok)
         .any(cache_control_value_is_uncacheable)
 }
 
@@ -98,7 +113,8 @@ fn cache_control_value_is_uncacheable(value: &str) -> bool {
 pub(crate) fn is_abbreviated_content_type(headers: &header::HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .is_some_and(|value| {
             let media_type = value.split_once(';').map_or(value, |(media_type, _)| media_type);
             let media_type = media_type.trim();
@@ -116,9 +132,11 @@ fn parse_metadata(body: &str, install_v2: bool) -> serde_json::Result<Package> {
 fn is_install_v2_content_type(headers: &header::HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .and_then(|value| value.split(';').next())
-        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(INSTALL_V2_CONTENT_TYPE))
+        .map(str::trim)
+        .is_some_and(|trimmed| trimmed.eq_ignore_ascii_case(INSTALL_V2_CONTENT_TYPE))
 }
 
 /// Warn, once per registry, that `registry` sent a package document with
@@ -152,7 +170,7 @@ pub struct FetchFullMetadataOptions<'a> {
     /// instead of a body.
     pub etag: Option<&'a str>,
     /// Optional `If-Modified-Since` header value. Same role as
-    /// [`Self::etag`] — gives the registry a chance to short-circuit
+    /// [`Self::etag`], gives the registry a chance to short-circuit
     /// the body re-download.
     pub modified: Option<&'a str>,
     pub http: crate::MetadataHttpClient<'a>,
@@ -286,30 +304,31 @@ async fn send_once<'a>(
     validators: &Validators<'_>,
     bypass_cache: bool,
 ) -> Result<(ThrottledClientGuard<'a>, Response), FetchMetadataError> {
-    send_with_retry_at_priority(
-        opts.http.http_client,
-        opts.url,
-        opts.priority,
-        opts.http.retry_opts,
-        |client| {
-            let mut request = client.get(opts.url).header(header::ACCEPT, opts.accept);
-            if let Some(value) =
-                opts.http.auth_headers.for_url_with_package(opts.url, Some(opts.pkg_name))
-            {
-                request = request.header(header::AUTHORIZATION, value);
-            }
-            if let Some(etag) = validators.etag {
-                request = request.header(header::IF_NONE_MATCH, etag);
-            }
-            if let Some(modified) = validators.modified.as_deref() {
-                request = request.header(header::IF_MODIFIED_SINCE, modified);
-            }
-            if bypass_cache {
-                request = request.header(header::CACHE_CONTROL, "no-cache");
-            }
-            request
-        },
-    )
+    let headers = metadata_headers(opts.accept, validators, bypass_cache);
+    if let Some(response) =
+        opts.http.auth_headers.fetch_local(opts.url, Some(opts.pkg_name), headers)
+    {
+        let guard =
+            opts.http.http_client.acquire_for_url_with_priority(opts.url, opts.priority).await;
+        return Ok((guard, response.await));
+    }
+    send_remote_once(opts, validators, bypass_cache).await
+}
+
+async fn send_remote_once<'a>(
+    opts: &MetadataRequestOptions<'a>,
+    validators: &Validators<'_>,
+    bypass_cache: bool,
+) -> Result<(ThrottledClientGuard<'a>, Response), FetchMetadataError> {
+    PackageRequest {
+        url: opts.url,
+        package: opts.pkg_name,
+        auth: opts.http.auth_headers,
+        headers: metadata_headers(opts.accept, validators, bypass_cache),
+        method: reqwest::Method::GET,
+        priority: opts.priority,
+    }
+    .send(opts.http.http_client, opts.http.retry_opts)
     .await
     .map_err(|error| FetchMetadataError::Network {
         url: redact_url_credentials(opts.url),
@@ -317,26 +336,51 @@ async fn send_once<'a>(
     })
 }
 
-/// Convert a stored `modified` value — the packument's ISO-8601
-/// `time.modified` — to the HTTP-date form `If-Modified-Since` requires
+fn metadata_headers(
+    accept: &str,
+    validators: &Validators<'_>,
+    bypass_cache: bool,
+) -> header::HeaderMap {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::ACCEPT, accept.parse().expect("static accept header"));
+    for (name, value) in [
+        (header::IF_NONE_MATCH, validators.etag),
+        (header::IF_MODIFIED_SINCE, validators.modified.as_deref()),
+    ] {
+        if let Some(value) = value.map(str::parse).and_then(Result::ok) {
+            headers.insert(name, value);
+        }
+    }
+    if bypass_cache {
+        headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache"));
+    }
+    headers
+}
+
+/// Convert a stored `modified` value (the packument's ISO-8601
+/// `time.modified`) to the HTTP-date form `If-Modified-Since` requires
 /// (RFC 9110 §8.8.3), the same conversion the TypeScript CLI applies with
 /// `toUTCString()`. A date without a time is midnight UTC, as JavaScript's
 /// `Date` reads it. A value already in HTTP-date form is kept. `None` when
 /// the value parses as none of these, or names a time outside the years
 /// 1970 to 9999 that an HTTP date can carry, so it is dropped instead of
-/// sent — a recipient must ignore a malformed `If-Modified-Since` anyway.
+/// sent, a recipient must ignore a malformed `If-Modified-Since` anyway.
 fn to_http_date(value: &str) -> Option<String> {
-    let time: chrono::DateTime<chrono::Utc> =
-        if let Ok(datetime) = chrono::DateTime::parse_from_rfc3339(value) {
-            datetime.into()
-        } else if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-            date.and_time(chrono::NaiveTime::MIN).and_utc()
-        } else {
-            return httpdate::parse_http_date(value).ok().map(httpdate::fmt_http_date);
-        };
+    let time: jiff::Timestamp = if let Ok(datetime) = pnpm_time::parse_rfc3339(value) {
+        datetime
+    } else if let Ok(date) = jiff::civil::Date::strptime("%Y-%m-%d", value) {
+        date.at(0, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .ok()?
+            .timestamp()
+    } else {
+        return httpdate::parse_http_date(value).ok().map(httpdate::fmt_http_date);
+    };
     // `fmt_http_date` panics outside that range.
-    let in_range = time.timestamp() >= 0 && chrono::Datelike::year(&time) <= 9999;
-    in_range.then(|| httpdate::fmt_http_date(time.into()))
+    if time < jiff::Timestamp::UNIX_EPOCH {
+        return None;
+    }
+    std::time::SystemTime::try_from(time).ok().map(httpdate::fmt_http_date)
 }
 
 /// Fetch the registry metadata document for `pkg_name`. The

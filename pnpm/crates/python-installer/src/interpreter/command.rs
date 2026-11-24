@@ -9,11 +9,17 @@
 use crate::async_process::Command;
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     env,
     ffi::OsString,
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// How to run one interpreter: the program, and any arguments of its own
@@ -35,8 +41,8 @@ impl InterpreterCommand {
         Some(Self { program: locate(&self.program, path)?, ..self })
     }
 
-    fn at(self, program: &str) -> Self {
-        Self { program: program.to_string(), ..self }
+    fn at(self, program: String) -> Self {
+        Self { program, ..self }
     }
 
     /// The Windows launcher, which selects an installed version by
@@ -220,11 +226,11 @@ pub(super) async fn launcher_interpreters(path: &OsString) -> Vec<InterpreterCom
             let selector = line.split_whitespace().next()?;
             selector
                 .starts_with('-')
-                .then(|| InterpreterCommand::launcher(selector.to_string()).at(&launcher))
+                .then(|| InterpreterCommand::launcher(selector.to_string()).at(launcher.clone()))
         })
         .collect();
     if selectors.is_empty() {
-        vec![InterpreterCommand::launcher("-3".to_string()).at(&launcher)]
+        vec![InterpreterCommand::launcher("-3".to_string()).at(launcher)]
     } else {
         selectors
     }

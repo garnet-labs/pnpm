@@ -4,36 +4,95 @@
 //! pins fixed blocks below scrolling non-fixed blocks, with one rendering
 //! path per log channel.
 
-pub use options::{LifecycleOptions, ProgressOptions, ReporterOptions, ScopeOptions};
+pub use checks::CommandOutcome;
+pub use options::{
+    LifecycleOptions,
+    ProgressOptions,
+    ReporterOptions,
+    ScopeOptions,
+};
 
 mod options;
 
 use std::{
-    collections::HashMap,
-    path::{Component, Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+        HashSet,
+    },
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
 };
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use pnpm_reporter::{
-    AddedRoot, ContextLog, DedupeCheckLog, DependencyType, DeprecationLog, ExecutionTimeLog,
-    FetchingProgressMessage, HookLog, IgnoredScriptsLog, InstallingConfigDepsLog,
-    InstallingConfigDepsStatus, LifecycleMessage, LifecycleStdio, LockfileVerificationMessage,
-    LogEvent, LogLevel, PackageImportMethod, PackageManifestMessage, PendingSkillsLog,
-    ProgressMessage, RemovedRoot, RequestRetryLog, ScopeLog, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalReason, Stage, StatsMessage, UpdateCheckLog,
+    AddedRoot,
+    ContextLog,
+    DedupeCheckLog,
+    DependencyType,
+    DeprecationLog,
+    ExecutionTimeLog,
+    FetchingProgressMessage,
+    HookLog,
+    IgnoredScriptsLog,
+    InstallingConfigDepsLog,
+    InstallingConfigDepsStatus,
+    LifecycleMessage,
+    LifecycleStdio,
+    LockfileVerificationMessage,
+    LogEvent,
+    LogLevel,
+    PackageImportMethod,
+    PackageManifestMessage,
+    PeerDependencyIssuesLog,
+    PendingSkillsLog,
+    ProgressMessage,
+    RemovedRoot,
+    RequestRetryLog,
+    ScopeLog,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
+    Stage,
+    StatsMessage,
+    SummaryLog,
+    UnusedOverrideLog,
+    UpdateCheckLog,
 };
 use serde_json::Value;
 
 use pnpm_config::standalone_install_command;
-use pnpm_matcher::{Matcher, create_matcher};
+use pnpm_matcher::{
+    Matcher,
+    create_matcher,
+};
 
+use self::approvals::{
+    PendingApprovals,
+    pending_approval_packages,
+};
 use crate::{
-    MaxLogLevel, SummaryScope,
+    MaxLogLevel,
+    SummaryScope,
     colors::Colors,
     format::{
-        contains_path, cut_line, format_prefix, format_prefix_no_trim, highlight_last_folder,
-        normalize, pretty_bytes, pretty_ms, pretty_ms_compact, printable_script_line, relative,
-        visible_width, zoom_out,
+        contains_path,
+        cut_line,
+        format_prefix,
+        format_prefix_no_trim,
+        highlight_last_folder,
+        normalize,
+        pretty_bytes,
+        pretty_ms,
+        pretty_ms_compact,
+        printable_script_line,
+        relative,
+        visible_width,
+        zoom_out,
     },
 };
 
@@ -55,10 +114,20 @@ struct ProgressStats {
     imported: u64,
 }
 
+/// One project's halves of `pnpm:stats`, each `None` until it arrives.
+#[derive(Debug, Default, Clone, Copy)]
+struct ProjectStats {
+    added: Option<u64>,
+    removed: Option<u64>,
+}
+
 #[derive(Debug, Default)]
 struct ProgressEntry {
     stats: ProgressStats,
     slot: BlockSlot,
+    /// Set once a stats line counted this requester's packages. Its
+    /// progress line goes when it finishes, without a `, done` line.
+    reported: bool,
     /// Set once the `, done` line is rendered. Like pnpm's `takeWhile`
     /// on `importingDone$`, later progress events for the requester are
     /// dropped instead of starting a new line.
@@ -74,12 +143,17 @@ struct PackageDiff {
     real_name: Option<String>,
     version: Option<String>,
     latest: Option<String>,
+    /// See [`AddedRoot::registry_package`].
+    registry_package: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct ManifestDiff {
     initial: Option<Value>,
     updated: Option<Value>,
+    /// Whether the edit from `initial` to `updated` is already folded into
+    /// the summary's changes.
+    applied: bool,
 }
 
 /// The five dependency buckets, in summary render order.
@@ -161,7 +235,6 @@ struct DisplayState {
     scope_slot: BlockSlot,
     config_deps_slot: BlockSlot,
     lockfile_verification_slot: BlockSlot,
-    pending_lockfile_message: Option<String>,
     exec_slot: BlockSlot,
 }
 
@@ -171,14 +244,32 @@ struct InstallProgress {
     import_method: Option<PackageImportMethod>,
     context_slot: BlockSlot,
     context_rendered: bool,
-    stats_added: Option<u64>,
-    stats_removed: Option<u64>,
+    /// The `pnpm:stats` of each project the install reports on, keyed by
+    /// prefix: the current one, and each one that reported progress.
+    stats: BTreeMap<String, ProjectStats>,
     stats_slot: BlockSlot,
+    /// The stats reported no package added or removed. "Already up to
+    /// date" waits for the summary: a manifest edit can still change it.
+    no_package_changed: bool,
+    /// Some stats line showed an added or removed package, which a later
+    /// round without changes does not undo.
+    package_changed: bool,
 }
 
+/// [`PackageDiff`]s keyed by [`diff_key`], then by sign and name.
+type DiffBuckets = HashMap<&'static str, HashMap<String, PackageDiff>>;
+
 struct SummaryState {
-    diff: HashMap<&'static str, HashMap<String, PackageDiff>>,
+    /// The changes of the current project, or of every project under
+    /// [`SummaryScope::AllPrefixes`].
+    diff: DiffBuckets,
+    /// The changes of the other projects, keyed by normalized prefix. Only
+    /// a workspace summary renders them.
+    other_projects: HashMap<String, DiffBuckets>,
+    /// Keyed by normalized prefix.
     manifest_diffs: HashMap<String, ManifestDiff>,
+    /// Set by a `pnpm:summary` that covers a workspace of several projects.
+    workspace: Option<WorkspaceSummary>,
     slot: BlockSlot,
     seen: bool,
     rendered: bool,
@@ -199,9 +290,12 @@ struct LifecycleState {
 struct NoticeState {
     warnings: usize,
     collapsed_slot: BlockSlot,
-    deprecated_subdeps: Vec<DeprecationLog>,
-    deprecated_slot: BlockSlot,
-    reported_peer_issues: bool,
+    /// `pnpm:unused-override` selectors withheld until
+    /// `pnpm:stage { stage: "resolution_done" }`, mirroring
+    /// `reportUnusedOverrides.ts`'s `buffer(resolutionDone$)`.
+    unused_overrides: Vec<String>,
+    checks: ChecksState,
+    approvals: PendingApprovals,
 }
 
 #[derive(Default)]
@@ -283,22 +377,7 @@ impl ReporterState {
         if !self.level_permits(event) {
             return Output::None;
         }
-        if matches!(event, LogEvent::Summary(_) | LogEvent::ExecutionTime(_)) {
-            self.flush_pending_lockfile_message();
-        }
         self.handle_event(event);
-        if matches!(
-            event,
-            LogEvent::LockfileVerification(log)
-                if matches!(
-                    &log.message,
-                    LockfileVerificationMessage::Cached { .. }
-                        | LockfileVerificationMessage::Done { .. }
-                        | LockfileVerificationMessage::Failed { .. }
-                ),
-        ) {
-            self.flush_pending_lockfile_message();
-        }
         self.display.finish(self.options.append_only)
     }
 
@@ -318,12 +397,18 @@ impl ReporterState {
             LogEvent::Stats(log) => self.on_stats(&log.message),
             LogEvent::Root(log) => self.on_root(&log.message),
             LogEvent::PackageManifest(log) => self.on_manifest(&log.message),
-            LogEvent::Summary(log) => self.on_summary(&log.prefix),
+            LogEvent::Summary(log) => self.on_summary(log),
             LogEvent::Lifecycle(log) => self.on_lifecycle(&log.message),
             LogEvent::IgnoredScripts(log) => self.on_ignored_scripts(log),
             LogEvent::PendingSkills(log) => self.on_pending_skills(log),
             LogEvent::UpdateCheck(log) => self.on_update_check(log),
             LogEvent::SkippedOptionalDependency(log) => self.on_skipped_optional(log),
+            // The message names a package from the lockfile, which a contributor can edit.
+            LogEvent::InstallCheck(log) => self.on_pnpm(
+                log.level,
+                &pnpm_text_sanitize::sanitize_inline(&log.message),
+                &log.prefix,
+            ),
             LogEvent::InstallingConfigDeps(log) => self.on_config_deps(log),
             LogEvent::LockfileVerification(log) => self.on_lockfile_verification(&log.message),
             LogEvent::Lockfile(log) => self.on_pnpm(log.level, &log.message, &log.prefix),
@@ -337,7 +422,8 @@ impl ReporterState {
             LogEvent::ExecutionTime(log) => self.on_execution_time(log),
             LogEvent::Hook(log) => self.on_hook(log),
             LogEvent::Deprecation(log) => self.on_deprecation(log),
-            LogEvent::PeerDependencyIssues(_) => self.on_peer_dependency_issues(),
+            LogEvent::UnusedOverride(log) => self.on_unused_override(log),
+            LogEvent::PeerDependencyIssues(log) => self.on_peer_dependency_issues(log),
             // Debug-only / non-rendered channels in pnpm's default reporter.
             LogEvent::BrokenModules(_) => {}
         }
@@ -348,12 +434,15 @@ impl ReporterState {
     /// `pnpm` / `pnpm:global` misc streams filter per message level in
     /// [`Self::on_pnpm`], so errors always pass. Lifecycle events always
     /// pass: below `info`, [`Self::on_lifecycle`] buffers each script and
-    /// prints only failed ones. Dedupe-check issues always pass too —
+    /// prints only failed ones. Dedupe-check issues always pass too,
     /// upstream reports them as an error-level log
-    /// (`ERR_PNPM_DEDUPE_CHECK_ISSUES` in `reportError.ts`).
+    /// (`ERR_PNPM_DEDUPE_CHECK_ISSUES` in `reportError.ts`). The
+    /// `resolution_done` stage passes wherever warnings do, since it is what
+    /// flushes the buffered unused-override warnings.
     fn level_permits(&self, event: &LogEvent) -> bool {
         match event {
             LogEvent::Lockfile(_)
+            | LogEvent::InstallCheck(_)
             | LogEvent::Pnpm(_)
             | LogEvent::Global(_)
             | LogEvent::DedupeCheck(_)
@@ -362,11 +451,16 @@ impl ReporterState {
             | LogEvent::PendingSkills(_)
             | LogEvent::RequestRetry(_)
             | LogEvent::Deprecation(_)
+            | LogEvent::UnusedOverride(_)
             | LogEvent::PeerDependencyIssues(_) => self.options.max_log_level >= MaxLogLevel::Warn,
+            LogEvent::Stage(log) if log.stage == Stage::ResolutionDone => {
+                self.options.max_log_level >= MaxLogLevel::Warn
+            }
             LogEvent::LockfileVerification(log) => {
                 matches!(log.message, LockfileVerificationMessage::Failed { .. })
                     || self.options.max_log_level >= MaxLogLevel::Info
             }
+            LogEvent::ExecutionTime(_) if self.options.append_only => true,
             _ => self.options.max_log_level >= MaxLogLevel::Info,
         }
     }
@@ -380,21 +474,26 @@ fn lifecycle_ids(message: &LifecycleMessage) -> (&str, &str, &str) {
     }
 }
 
-fn entries_label(entries: u64) -> String {
-    if entries == 1 { "1 entry".to_string() } else { format!("{entries} entries") }
+fn progress_label(checked: u64, entries: u64) -> String {
+    if entries == 1 { format!("{checked}/1 entry") } else { format!("{checked}/{entries} entries") }
 }
 
 /// How a cache-satisfied verification verdict is dated: relative to `now`
 /// when the record carries a parseable timestamp, timeless otherwise. The
 /// age is clamped at zero so a clock that moved backwards between the
 /// verification run and this install cannot render a negative age.
-fn cached_verdict(verified_at: Option<&str>, now: DateTime<Utc>) -> String {
+fn cached_verdict(verified_at: Option<&str>, now: Timestamp) -> String {
     let elapsed_ms = verified_at
-        .and_then(|verified_at| DateTime::parse_from_rfc3339(verified_at).ok())
-        .map(|verified_at| (now - verified_at.with_timezone(&Utc)).num_milliseconds().max(0));
+        .map(pnpm_time::parse_rfc3339)
+        .and_then(Result::ok)
+        .map(|verified_at| {
+            now.duration_since(verified_at)
+                .as_millis()
+                .max(0)
+        });
     match elapsed_ms {
         Some(elapsed_ms) => {
-            format!("verified {} ago", pretty_ms_compact(elapsed_ms.unsigned_abs().into()))
+            format!("verified {} ago", pretty_ms_compact(elapsed_ms.unsigned_abs()))
         }
         None => "previously verified".to_string(),
     }
@@ -407,21 +506,44 @@ mod progress;
 
 mod summary;
 
+mod checks;
+use checks::{
+    ChecksState,
+    RESOLUTION_SKIPPED,
+};
+
+mod workspace_summary;
+use workspace_summary::WorkspaceSummary;
+
 mod manifest_diff;
 use manifest_diff::{
-    added_diff, diff_key, manifest_dep_versions, record_missing, remove_optional_from_prod,
+    added_diff,
+    diff_key,
+    manifest_dep_versions,
+    record_missing,
+    remove_optional_from_prod,
     removed_diff,
 };
 
 mod lifecycle;
 
+mod approvals;
+
 mod notices;
 
 mod update_check;
-use update_check::{detect_install_source, is_strictly_newer, update_command};
+use update_check::{
+    detect_install_source,
+    is_strictly_newer,
+    update_command,
+};
 
 mod frame;
-use frame::{BlockPlacement, BlockSlot, Frame};
+use frame::{
+    BlockPlacement,
+    BlockSlot,
+    Frame,
+};
 
 mod paths;
 use paths::normalized_prefix;
@@ -433,7 +555,7 @@ impl DisplayState {
             if lines.is_empty() { Output::None } else { Output::Lines(lines) }
         } else {
             let frame = self.frame.render();
-            if self.last_frame.as_deref() == Some(frame.as_str()) {
+            if self.last_frame.as_deref().unwrap_or_default() == frame {
                 Output::None
             } else {
                 self.last_frame = Some(frame.clone());
@@ -450,14 +572,20 @@ impl Frame {
     }
 }
 
+fn empty_diff_buckets() -> DiffBuckets {
+    SUMMARY_ORDER
+        .into_iter()
+        .map(|kind| (diff_key(kind), HashMap::new()))
+        .collect()
+}
+
 impl Default for SummaryState {
     fn default() -> Self {
         Self {
-            diff: SUMMARY_ORDER
-                .into_iter()
-                .map(|kind| (diff_key(kind), HashMap::new()))
-                .collect(),
+            diff: empty_diff_buckets(),
+            other_projects: HashMap::new(),
             manifest_diffs: HashMap::new(),
+            workspace: None,
             slot: BlockSlot::default(),
             seen: false,
             rendered: false,

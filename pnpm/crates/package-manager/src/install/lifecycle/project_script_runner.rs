@@ -1,14 +1,29 @@
 use super::{
     super::{
-        Config, DependencyGroup, HashMap, HashSet, InstallError, NodeLinker, PackageManifest, Path,
-        PathBuf, Reporter, RunPostinstallHooks, link_project_bins,
-        project_requires_implicit_gyp_build, run_project_lifecycle_stages,
+        Config,
+        DependencyGroup,
+        HashMap,
+        HashSet,
+        InstallError,
+        NodeLinker,
+        PackageManifest,
+        Path,
+        PathBuf,
+        Reporter,
+        RunPostinstallHooks,
+        project_requires_implicit_gyp_build,
+        run_project_lifecycle_stages,
     },
     project_lifecycle_extra_env,
 };
 
 use pnpm_executor::LifecycleScriptError;
-use pnpm_injected_deps_syncer::{BinLinkSettings, CopyFiles, SyncInjectedDeps, sync_injected_deps};
+use pnpm_injected_deps_syncer::{
+    BinLinkSettings,
+    CopyFiles,
+    SyncInjectedDeps,
+    sync_injected_deps,
+};
 use pnpm_package_manifest::project_manifest_path;
 use std::sync::Mutex;
 
@@ -22,12 +37,14 @@ pub(super) fn run_project_stages(
     mut extra_env: HashMap<String, String>,
     stages: impl FnOnce(&RunPostinstallHooks<'_>) -> Result<bool, LifecycleScriptError>,
 ) -> Result<bool, LifecycleScriptError> {
-    let root_modules_dir = project_dir.join(config.modules_dir_name());
+    let root_modules_dir =
+        pnpm_deps_restorer::ImporterModulesDirs::from_config(config, workspace_root)
+            .of(project_dir);
     let bin_dir = root_modules_dir.join(".bin");
     config.prepend_project_node_path::<pnpm_config::Host>(
         &mut extra_env,
         project_dir,
-        config.modules_dir_name(),
+        &root_modules_dir,
     );
     let dep_path = project_dir.to_string_lossy();
     stages(&RunPostinstallHooks {
@@ -63,6 +80,7 @@ pub(super) struct ProjectScriptRunner<'a> {
     config: &'a Config,
     workspace_root: &'a Path,
     normalized_workspace_root: PathBuf,
+    modules_dirs: pnpm_deps_restorer::ImporterModulesDirs,
     /// The root project's `preinstall` ran before the install began, here
     /// (see [`super::run_root_hook`]) or in the CLI that delegated the install,
     /// so its run here starts at `install`.
@@ -81,9 +99,12 @@ impl ProjectScriptRunner<'_> {
         manifest: &PackageManifest,
         stages: &[&str],
     ) -> Result<(), InstallError> {
-        let root_modules_dir = project_dir.join(self.config.modules_dir_name());
-        link_project_bins(&root_modules_dir, &direct_dep_names(manifest), &self.link_options)
-            .map_err(InstallError::ProjectBinLink)?;
+        crate::link_bins_dir(
+            &self.modules_dirs.of(project_dir),
+            crate::BinCandidates::ProjectModulesDir(&direct_dep_names(manifest)),
+            crate::BinsDirPass::new(&self.link_options),
+        )
+        .map_err(InstallError::ProjectBinLink)?;
         let stages = if self.root_preinstall_ran
             && stages.first() == Some(&"preinstall")
             && pnpm_fs::lexical_normalize(project_dir) == self.normalized_workspace_root
@@ -96,6 +117,14 @@ impl ProjectScriptRunner<'_> {
         if !self.run_without_bin_linking::<Reporter>(project_dir, stages)? {
             return Ok(());
         }
+        self.sync_injected_deps(project_dir, manifest)
+    }
+
+    fn sync_injected_deps(
+        &self,
+        project_dir: &Path,
+        manifest: &PackageManifest,
+    ) -> Result<(), InstallError> {
         // Injected copies are hardlinks of the files that existed when they
         // were materialized, so the output of a build script reaches them
         // only when they are re-synced.
@@ -116,8 +145,11 @@ impl ProjectScriptRunner<'_> {
             project_modules_dirs: &[],
             bin_links: BinLinkSettings {
                 modules_dir_name: self.config.modules_dir_name(),
-                extend_node_path: self.config.extend_node_path,
-                ignored_directories: self.config.managed_directories(),
+                link_options: self.link_options.clone(),
+                projects: pnpm_workspace::FindWorkspaceProjectsOpts {
+                    patterns: self.config.workspace_package_patterns.clone(),
+                    ignored_directories: self.config.managed_directories(),
+                },
             },
         })
         .map_err(InstallError::SyncInjectedDeps)
@@ -192,6 +224,10 @@ impl<'a> ProjectScriptRunner<'a> {
             config,
             workspace_root,
             normalized_workspace_root: pnpm_fs::lexical_normalize(workspace_root),
+            modules_dirs: pnpm_deps_restorer::ImporterModulesDirs::from_config(
+                config,
+                workspace_root,
+            ),
             root_preinstall_ran,
             extra_env: project_lifecycle_extra_env(config, node_linker, workspace_root),
             link_options: crate::shim_link_options(config, node_linker),

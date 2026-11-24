@@ -1,5 +1,8 @@
 use super::SaveLockfileError;
-use crate::{Lockfile, SymlinkedLockfile};
+use crate::{
+    Lockfile,
+    SymlinkedLockfile,
+};
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::tempdir;
@@ -90,9 +93,9 @@ fn round_trip_parse_save_parse_preserves_lockfile() {
 
 /// Byte-for-byte parity: parsing a pnpm-authored v9 lockfile and saving it
 /// reproduces the exact bytes pnpm wrote. [`LOCKFILE_YAML`] is laid out the way
-/// pnpm's `js-yaml` dumper writes it — blank lines between top-level and
+/// pnpm's `js-yaml` dumper writes it (blank lines between top-level and
 /// section entries, single-quoted ambiguous scalars, single-line
-/// `resolution` / `engines`, and priority-then-lexical key ordering — so an
+/// `resolution` / `engines`, and priority-then-lexical key ordering) so an
 /// exact match proves pacquet's writer matches pnpm's formatting.
 #[test]
 fn save_reproduces_pnpm_authored_bytes() {
@@ -105,6 +108,50 @@ fn save_reproduces_pnpm_authored_bytes() {
     let saved_bytes = std::fs::read_to_string(&path).expect("read saved lockfile");
     // `text_block!` omits the trailing newline; the writer appends one.
     assert_eq!(saved_bytes, format!("{LOCKFILE_YAML}\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_metadata_describes_the_written_file_not_a_later_replacement() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let lockfile: Lockfile = serde_saphyr::from_str(LOCKFILE_YAML).expect("parse fixture lockfile");
+    let tmp = tempdir().expect("create tempdir");
+    let path = tmp.path().join("pnpm-lock.yaml");
+
+    let written = lockfile
+        .save_to_path_with_metadata(&path, SymlinkedLockfile::Refuse)
+        .expect("save lockfile")
+        .expect("a Unix save reads the metadata from the writing handle");
+    let on_disk = std::fs::metadata(&path).expect("stat saved lockfile");
+    assert_eq!(
+        (written.ino(), written.mtime_nsec(), written.ctime_nsec()),
+        (on_disk.ino(), on_disk.mtime_nsec(), on_disk.ctime_nsec()),
+    );
+
+    let replacement = tmp.path().join("replacement");
+    std::fs::write(&replacement, "lockfileVersion: '9.0'\n").expect("write replacement");
+    std::fs::rename(&replacement, &path).expect("replace saved lockfile");
+    let replaced = std::fs::metadata(&path).expect("stat replaced lockfile");
+    assert_ne!(written.ino(), replaced.ino());
+}
+
+#[cfg(unix)]
+#[test]
+fn skipped_save_reports_the_metadata_of_the_unchanged_file() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let lockfile: Lockfile = serde_saphyr::from_str(LOCKFILE_YAML).expect("parse fixture lockfile");
+    let tmp = tempdir().expect("create tempdir");
+    let path = tmp.path().join("pnpm-lock.yaml");
+    lockfile.save_to_path(&path, SymlinkedLockfile::Refuse).expect("save lockfile");
+    let before = std::fs::metadata(&path).expect("stat saved lockfile");
+
+    let unchanged = lockfile
+        .save_to_path_with_metadata(&path, SymlinkedLockfile::Refuse)
+        .expect("save unchanged lockfile")
+        .expect("the skipped save read the file through a handle");
+    assert_eq!((unchanged.ino(), unchanged.mtime_nsec()), (before.ino(), before.mtime_nsec()));
 }
 
 #[test]
@@ -267,6 +314,7 @@ fn peers_suffix_max_length_omitted_from_settings_when_unset() {
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
@@ -308,6 +356,7 @@ fn peers_suffix_max_length_serialized_when_set() {
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: Some(10),
             integrity_target: None,
@@ -441,7 +490,7 @@ fn write_current_surfaces_create_dir_error_when_parent_is_a_file() {
     // Make `tmp/blocker` a regular file, then ask to write the
     // lockfile under `tmp/blocker/.pacquet`. `create_dir_all` will
     // fail with `NotADirectory` (or `AlreadyExists` on some
-    // platforms) — either way it must land as `CreateDir`.
+    // platforms); either way it must land as `CreateDir`.
     let blocker = tmp.path().join("blocker");
     std::fs::write(&blocker, b"not a dir").expect("seed blocker file");
 
@@ -479,7 +528,7 @@ fn write_current_surfaces_remove_file_error_when_target_is_a_directory() {
         matches!(err, SaveLockfileError::RemoveFile { .. }),
         "expected RemoveFile error, got: {err:?}",
     );
-    // The directory is still there — the failure was reported, not silently swallowed.
+    // The directory is still there, the failure was reported, not silently swallowed.
     assert!(dir_at_target.is_dir());
 }
 
@@ -510,7 +559,8 @@ fn write_atomic_rename_failure_surfaces_as_rename_file_error() {
     // not have been left behind.
     let leftovers: Vec<_> = std::fs::read_dir(&virtual_store_dir)
         .unwrap()
-        .map(|entry| entry.unwrap().file_name())
+        .map(Result::unwrap)
+        .map(|value| value.file_name())
         .filter(|name| {
             let name_str = name.to_string_lossy();
             name_str != Lockfile::CURRENT_FILE_NAME
@@ -876,7 +926,8 @@ fn save_leaves_no_temp_file_behind() {
 
     let leftovers: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
-        .map(|entry| entry.unwrap().file_name())
+        .map(Result::unwrap)
+        .map(|value| value.file_name())
         .filter(|name| name.to_string_lossy() != Lockfile::FILE_NAME)
         .collect();
     assert!(leftovers.is_empty(), "temp file should not be left behind, found: {leftovers:?}");
@@ -1027,4 +1078,26 @@ fn has_staged_temp_file(dir: &Path) -> bool {
                     .metadata()
                     .is_ok_and(|metadata| metadata.len() > 0)
         })
+}
+
+/// A lockfile an `afterAllResolved` hook returns is a document in today's
+/// shape; under the next format's version it is written in the next
+/// format, and under today's as it is.
+#[test]
+fn a_hook_lockfile_is_written_in_the_format_its_version_names() {
+    let document = serde_json::json!({
+        "lockfileVersion": "13.0",
+        "importers": { ".": { "dependencies": { "foo": { "specifier": "1.0.0", "version": "1.0.0" } } } },
+        "packages": { "foo@1.0.0": { "resolution": { "integrity": "sha512-AAAA" } } },
+        "snapshots": { "foo@1.0.0": {} },
+    });
+    let next = crate::render_hook_lockfile(&document).expect("render the next format");
+    assert!(next.starts_with("{\n\t\"lockfileVersion\": \"13.0\",\n"), "{next}");
+    assert!(!next.contains("snapshots"), "{next}");
+
+    let mut today = document;
+    today["lockfileVersion"] = serde_json::json!("9.0");
+    let yaml = crate::render_hook_lockfile(&today).expect("render today's format");
+    assert!(yaml.starts_with("lockfileVersion: '9.0'\n"), "{yaml}");
+    assert!(yaml.contains("\nsnapshots:\n"), "{yaml}");
 }

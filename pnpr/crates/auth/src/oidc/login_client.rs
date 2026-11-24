@@ -2,9 +2,21 @@
 //! discovered metadata and the client-secret method it advertises.
 
 use super::{
-    AuthType, ClientId, ClientSecret, CoreClient, CoreClientAuthMethod, CoreProviderMetadata,
-    EndpointMaybeSet, EndpointNotSet, EndpointSet, OidcState, Provider, RedirectUrl, Result,
-    invalid_config, rejected,
+    AuthType,
+    ClientId,
+    ClientSecret,
+    CoreClient,
+    CoreClientAuthMethod,
+    CoreProviderMetadata,
+    EndpointMaybeSet,
+    EndpointNotSet,
+    EndpointSet,
+    OidcState,
+    Provider,
+    RedirectUrl,
+    Result,
+    invalid_config,
+    rejected,
 };
 
 pub(super) type LoginClient = CoreClient<
@@ -38,18 +50,21 @@ impl OidcState {
             AuthType::RequestBody
         } else {
             return Err(invalid_config(
-                "OIDC provider does not support client secret authentication",
+                "OIDC provider does not support client secret authentication".to_owned(),
             ));
         };
         Ok(CoreClient::from_provider_metadata(
             metadata,
             ClientId::new(config.audience.clone()),
-            login.client_secret.clone().map(ClientSecret::new),
+            login.client_secret
+                .clone()
+                .map(pnpr_config::Secret::into_inner)
+                .map(ClientSecret::new),
         )
         .set_auth_type(auth_type)
         .set_redirect_uri(
             RedirectUrl::new(format!("{}/-/oidc/{}/callback", self.public_url, config.name))
-                .map_err(|_| invalid_config("invalid OIDC callback URL"))?,
+                .map_err(|_| invalid_config("invalid OIDC callback URL".to_owned()))?,
         ))
     }
 }

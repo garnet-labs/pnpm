@@ -1,9 +1,124 @@
 use super::{
-    CommandExtra, CommandTempCwd, GitRepoFixture, Value, allow_builds, append_workspace_yaml_key,
-    assert_eq, assert_success, fs, importer_version, json, pnpm_at, read_lockfile,
+    CommandExtra,
+    CommandTempCwd,
+    GitRepoFixture,
+    Value,
+    allow_builds,
+    append_workspace_yaml_key,
+    assert_eq,
+    assert_success,
+    fs,
+    importer_version,
+    json,
+    pnpm_at,
+    read_lockfile,
     write_dependencies,
 };
 use assert_cmd::assert::OutputAssertExt;
+
+#[test]
+fn store_status_rejects_a_corrupted_legacy_git_manifest() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let repo = GitRepoFixture::init(root.path(), "legacy-plain");
+    repo.write_file("package.json", r#"{"name":"legacy-plain","version":"1.0.0"}"#);
+    repo.write_file("index.js", "module.exports = true\n");
+    let commit = repo.commit("init");
+    let spec = repo.git_url_at(&commit);
+    write_dependencies(&workspace, &[("legacy-plain", &spec)]);
+    allow_builds(&workspace, &[&format!("legacy-plain@{spec}")]);
+    pacquet
+        .with_args(["install", "--package-import-method=copy"])
+        .assert()
+        .success();
+    fs::write(workspace.join("node_modules/legacy-plain/index.js"), "// edited\n").unwrap();
+
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir.clone());
+    let key = pnpm_store_dir::git_hosted_store_index_key(&spec, true);
+    let store_index = pnpm_store_dir::StoreIndex::open_in(&store_dir).unwrap();
+    let mut row = store_index.get(&key).unwrap().unwrap();
+    row.manifest = None;
+    row.requires_build = Some(false);
+    row.requires_prepare = Some(false);
+    let manifest_file = &row.files["package.json"];
+    let manifest_path =
+        store_dir.cas_file_path_by_mode(&manifest_file.digest, manifest_file.mode).unwrap();
+    fs::write(manifest_path, r#"{"scripts":{"postinstall":"node build.js"}}"#).unwrap();
+    store_index.set(&key, &row).unwrap();
+    drop(store_index);
+
+    let output = pnpm_at(&workspace)
+        .with_args(["store", "status"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ERR_PNPM_MODIFIED_DEPENDENCY"));
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn store_status_rechecks_legacy_git_rows_against_the_pristine_manifest() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let repo = GitRepoFixture::init(root.path(), "legacy-git");
+    repo.write_file(
+        "package.json",
+        r#"{"name":"legacy-git","version":"1.0.0","scripts":{"postinstall":"node -e \"require('fs').appendFileSync('index.js', '// built\\n')\""}}"#,
+    );
+    repo.write_file("index.js", "module.exports = true\n");
+    let commit = repo.commit("init");
+    let spec = repo.git_url_at(&commit);
+    write_dependencies(&workspace, &[("legacy-git", &spec)]);
+    allow_builds(&workspace, &[&format!("legacy-git@{spec}")]);
+    pacquet
+        .with_args(["install", "--no-side-effects-cache"])
+        .assert()
+        .success();
+    assert!(
+        fs::read_to_string(workspace.join("node_modules/legacy-git/index.js"))
+            .unwrap()
+            .contains("// built\n"),
+    );
+    fs::write(workspace.join("node_modules/legacy-git/package.json"), "{}").unwrap();
+
+    let store_dir = pnpm_store_dir::StoreDir::from(npmrc_info.store_dir.clone());
+    let key = pnpm_store_dir::git_hosted_store_index_key(&spec, true);
+    let store_index = pnpm_store_dir::StoreIndex::open_in(&store_dir).unwrap();
+    let mut row = store_index.get(&key).unwrap().unwrap();
+    row.manifest = None;
+    row.requires_build = Some(false);
+    row.requires_prepare = Some(false);
+    store_index.set(&key, &row).unwrap();
+    drop(store_index);
+
+    pnpm_at(&workspace)
+        .with_args(["store", "status"])
+        .assert()
+        .success();
+
+    let installed_file = workspace.join("node_modules/legacy-git/index.js");
+    let external_file = root.path().join("hardlinked.js");
+    fs::copy(&installed_file, &external_file).unwrap();
+    fs::remove_file(&installed_file).unwrap();
+    fs::hard_link(&external_file, &installed_file).unwrap();
+    let output = pnpm_at(&workspace)
+        .with_args(["store", "status"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ERR_PNPM_MODIFIED_DEPENDENCY"));
+    drop((root, npmrc_info));
+}
 
 /// TS: `run prepare script for git-hosted dependencies`
 /// (`lifecycleScripts.ts:311`).
@@ -291,7 +406,7 @@ fn a_git_dependency_is_prepared_with_the_package_manager_it_pins() {
     // The provisioning runs in a child pnpm, outside this project, so the
     // registry to provision from travels in the environment. Every
     // directory the engine could land in is pinned into the test's own
-    // root, so the run cannot reach into the developer's — and so the
+    // root, so the run cannot reach into the developer's, and so the
     // engine it installs can be found below.
     let output = pnpm_at(&workspace)
         .with_args(["install"])

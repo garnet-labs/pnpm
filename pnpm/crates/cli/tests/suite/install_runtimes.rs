@@ -2,13 +2,29 @@ mod no_runtime;
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_graph_hasher::{host_arch, host_platform};
-use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
+use pnpm_graph_hasher::{
+    host_arch,
+    host_platform,
+};
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
+use sha2::{
+    Digest,
+    Sha256,
+};
 use std::{
     fs,
-    io::{Cursor, Write},
-    path::{Path, PathBuf},
+    io::{
+        Cursor,
+        Write,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
 };
 use tempfile::TempDir;
@@ -149,6 +165,38 @@ fn installs_node_runtime_for_the_requested_target_architecture() {
             .join(expected_bin)
             .exists(),
     );
+}
+
+#[test]
+fn relinks_the_runtime_when_the_selected_archive_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = prepare_workspace(&root, "");
+    let mut server = mockito::Server::new();
+    let mut linux = runtime_fixture(&mut server, "node", "22.0.0", "linux", "x64");
+    let windows = runtime_fixture(&mut server, "node", "22.0.0", "win32", "x64");
+    linux.resolution["variants"]
+        .as_array_mut()
+        .unwrap()
+        .push(windows.resolution["variants"][0].clone());
+    let fixtures = [linux];
+    write_runtime_manifest(&workspace, &fixtures);
+    write_runtime_lockfile(&workspace, &fixtures);
+
+    let runtime = workspace.join("node_modules/node");
+    for (os, expected, stale) in [
+        ("linux", "bin/node", "node.exe"),
+        ("win32", "node.exe", "bin/node"),
+        ("linux", "bin/node", "node.exe"),
+    ] {
+        command(&workspace)
+            .with_args(["install", "--frozen-lockfile", "--os", os, "--cpu", "x64"])
+            .assert()
+            .success();
+        assert!(runtime.join(expected).is_file(), "missing {expected} for {os}");
+        assert!(!runtime.join(stale).exists(), "stale {stale} for {os}");
+    }
+    fixtures[0].archive_mock.assert();
+    windows.archive_mock.assert();
 }
 
 #[test]
@@ -312,6 +360,37 @@ fn update_moves_a_devengines_runtime_range_onto_a_stable_pick() {
     );
 }
 
+#[test]
+fn update_preserves_compound_node_ranges_in_engine_declarations() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new();
+    let index = server
+        .mock("GET", "/index.json")
+        .with_body(r#"[{"version":"v22.11.0","lts":false},{"version":"v24.0.0","lts":false}]"#)
+        .expect_at_least(1)
+        .create();
+    let workspace = prepare_workspace(
+        &root,
+        &format!("nodeDownloadMirrors:\n  release: '{}/'\n", server.url()),
+    );
+    let manifest = serde_json::json!({
+        "name": "runtime-ranges",
+        "version": "1.0.0",
+        "engines": { "runtime": { "name": "node", "version": ">= 20 <23", "onFail": "warn" } },
+        "devEngines": { "runtime": { "name": "node", "version": ">20 <24", "onFail": "warn" } },
+    });
+    let path = workspace.join("package.json");
+    fs::write(&path, manifest.to_string()).unwrap();
+
+    command(&workspace)
+        .with_arg("update")
+        .assert()
+        .success();
+
+    index.assert();
+    assert_eq!(serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(), manifest);
+}
+
 /// The pick is a prerelease, which the runtime resolver pins exactly so the rc
 /// channel survives in the version.
 #[test]
@@ -461,6 +540,86 @@ fn add_keeps_the_locked_devengines_runtime_version() {
 
     command(&workspace)
         .with_args(["add", "../dep", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lockfile.contains("version: runtime:24.0.0") && !lockfile.contains("24.1.0"),
+        "the runtime stays at its locked version: {lockfile}",
+    );
+}
+
+#[test]
+fn dedupe_keeps_the_locked_runtime_of_a_dependency_engine() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new();
+    let mocks = mock_node_releases(&mut server, &["24.0.0"], None);
+    let workspace = prepare_workspace(
+        &root,
+        format!("nodeDownloadMirrors:\n  rc: '{}/'\n", server.url()).as_str(),
+    );
+    let dependency = workspace.join("dependency");
+    fs::create_dir(&dependency).unwrap();
+    fs::write(
+        dependency.join("package.json"),
+        json!({
+            "name": "dependency",
+            "version": "1.0.0",
+            "engines": {
+                "runtime": { "name": "node", "version": "rc/^24.0.0", "onFail": "download" },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("package.json"),
+        json!({ "dependencies": { "dependency": "file:dependency" } }).to_string(),
+    )
+    .unwrap();
+    command(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    drop(mocks);
+    let _mocks = mock_node_releases(&mut server, &["24.0.0", "24.1.0"], None);
+
+    command(&workspace)
+        .with_args(["dedupe", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lockfile.contains("node@runtime:24.0.0") && !lockfile.contains("24.1.0"),
+        "the runtime stays at its locked version: {lockfile}",
+    );
+}
+
+#[test]
+fn dedupe_keeps_the_locked_devengines_runtime_version() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new();
+    let mocks = mock_node_releases(&mut server, &["24.0.0"], None);
+    let workspace = prepare_workspace(
+        &root,
+        format!("nodeDownloadMirrors:\n  rc: '{}/'\n", server.url()).as_str(),
+    );
+    write_devengines_manifest(&workspace, "rc/^24.0.0", Some("download"));
+    command(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    drop(mocks);
+    let _mocks = mock_node_releases(&mut server, &["24.0.0", "24.1.0"], None);
+
+    command(&workspace)
+        .with_args(["dedupe", "--check"])
+        .assert()
+        .success();
+    command(&workspace)
+        .with_args(["dedupe", "--lockfile-only"])
         .assert()
         .success();
 
@@ -863,6 +1022,102 @@ fn runtime_on_fail_ignore_removes_the_synthesized_runtime_dependency() {
 }
 
 #[test]
+fn dependency_edits_preserve_declared_runtime_policies() {
+    assert_dependency_edits_preserve_runtime(&[]);
+}
+
+#[test]
+fn filtered_dependency_edits_preserve_declared_runtime_policies() {
+    assert_dependency_edits_preserve_runtime(&["--filter", "project"]);
+}
+
+fn assert_dependency_edits_preserve_runtime(selection: &[&str]) {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = prepare_workspace(&root, "packages: [member]\nruntimeOnFail: ignore\n");
+    let project = if selection.is_empty() {
+        workspace.clone()
+    } else {
+        let dir = workspace.join("member");
+        fs::create_dir(&dir).unwrap();
+        fs::write(workspace.join("package.json"), "{}").unwrap();
+        dir
+    };
+    let manifest_path = project.join("package.json");
+    let manifest = json!({
+        "name": "project",
+        "devEngines": { "runtime": { "name": "node", "version": "24" } },
+        "engines": { "runtime": [{ "name": "bun", "version": "1", "onFail": "download" }] },
+    });
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+    fs::create_dir(project.join("fixture")).unwrap();
+    fs::write(project.join("fixture/package.json"), r#"{"name":"fixture","version":"1.0.0"}"#)
+        .unwrap();
+
+    for (args, expected_dependency) in [
+        (vec!["add", "fixture@link:./fixture"], Some("link:./fixture")),
+        (vec!["update"], Some("link:./fixture")),
+        (vec!["update", "--latest", "--offline"], Some("link:./fixture")),
+        (vec!["remove", "fixture"], None),
+    ] {
+        command(&project)
+            .with_args(selection)
+            .with_args(args)
+            .assert()
+            .success();
+        let saved: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(saved["dependencies"]["fixture"].as_str(), expected_dependency);
+        assert_eq!(saved["devEngines"], manifest["devEngines"]);
+        assert_eq!(saved["engines"], manifest["engines"]);
+        let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+        assert!(!lockfile.contains("bun@runtime:"), "lockfile was:\n{lockfile}");
+    }
+
+    command(&project)
+        .with_args(selection)
+        .with_args(["--config.runtime-on-fail=download", "remove", "--offline", "node", "bun"])
+        .assert()
+        .success();
+    let saved: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(saved["devEngines"].get("runtime"), None);
+    assert_eq!(saved["engines"].get("runtime"), None);
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    assert!(!lockfile.contains("runtime:"), "lockfile was:\n{lockfile}");
+}
+
+#[test]
+fn repeat_install_acts_on_a_runtime_on_fail_change() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new();
+    let version = "24.0.0-rc.4";
+    let _mocks = mock_node_release(&mut server, version);
+    let mirrors = format!("nodeDownloadMirrors:\n  rc: '{}/'\n", server.url());
+    let workspace = prepare_workspace(&root, &format!("{mirrors}runtimeOnFail: ignore\n"));
+    write_devengines_manifest(&workspace, version, None);
+    command(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let workspace_manifest = workspace.join("pnpm-workspace.yaml");
+    let settings = fs::read_to_string(&workspace_manifest).unwrap();
+    fs::write(
+        &workspace_manifest,
+        settings.replace("runtimeOnFail: ignore", "runtimeOnFail: download"),
+    )
+    .unwrap();
+
+    command(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lockfile.contains(format!("node@runtime:{version}").as_str()),
+        "lockfile was:\n{lockfile}",
+    );
+    assert!(workspace.join("node_modules/node/package.json").exists());
+}
+
+#[test]
 fn explicit_node_version_takes_priority_over_the_manifest_runtime() {
     let root = tempfile::tempdir().unwrap();
     let workspace = prepare_workspace(&root, "engineStrict: true\nnodeVersion: 20.0.0\n");
@@ -936,7 +1191,7 @@ fn devengines_runtime_range_does_not_replace_the_running_node_version() {
 
 fn running_node_major() -> u64 {
     let output = Command::new("node")
-        .arg("--version")
+        .with_arg("--version")
         .output()
         .expect("run node --version");
     assert!(output.status.success(), "node --version must succeed");
@@ -1224,7 +1479,9 @@ fn build_zip(name: &str, target_os: &str, prefix: Option<&str>, node_extras: boo
             .compression_method(zip::CompressionMethod::Stored)
             .unix_permissions(0o100755);
         let path = |relative: &str| {
-            prefix.map_or_else(|| relative.to_string(), |p| format!("{p}/{relative}"))
+            prefix
+                .map(|p| format!("{p}/{relative}"))
+                .unwrap_or_else(|| relative.to_string())
         };
         writer
             .start_file(path(runtime_bin_path(name, target_os).as_str()), options)
@@ -1269,7 +1526,7 @@ fn mock_node_release_with_auth(
         .expect("one version serves an index, its sums and its archive")
 }
 
-fn mock_node_releases(
+pub(crate) fn mock_node_releases(
     server: &mut mockito::Server,
     versions: &[&str],
     authorization: Option<&str>,

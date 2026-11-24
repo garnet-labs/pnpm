@@ -1,12 +1,30 @@
 use crate::cli_args::{
     profile::ProfileError,
-    registry_client::{apply_auth_and_otp, join_registry_endpoint},
-    sanitize::{DEFAULT_ERROR_BODY_LIMIT, read_sanitized_error_body},
+    registry_client::{
+        apply_auth_and_otp,
+        join_registry_endpoint,
+    },
+    sanitize::{
+        DEFAULT_ERROR_BODY_LIMIT,
+        read_sanitized_error_body,
+    },
 };
-use miette::{Context, IntoDiagnostic};
-use pnpm_network::{RetryOpts, ThrottledClient, UNPRIORITIZED, read_limited_body, send_with_retry};
+use miette::{
+    Context,
+    IntoDiagnostic,
+};
+use pnpm_network::{
+    RetryOpts,
+    ThrottledClient,
+    UNPRIORITIZED,
+    read_limited_body,
+    send_with_retry,
+};
 use pnpm_network_web_auth::otp_challenge_from_unauthorized_body;
-use serde_json::{Map, Value};
+use serde_json::{
+    Map,
+    Value,
+};
 
 const PROFILE_BODY_LIMIT: usize = 1024 * 1024;
 
@@ -50,6 +68,7 @@ impl ProfileRegistry<'_> {
         let request = client
             .post(&endpoint)
             .header("content-type", "application/json")
+            .header("npm-command", "profile")
             .body(body_bytes);
         let response = apply_auth_and_otp(request, Some(self.auth_header), self.otp)
             .send()

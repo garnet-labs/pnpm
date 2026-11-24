@@ -1,20 +1,44 @@
 use super::{
-    super::CreateVirtualStore, DUMMY_SHA512, SeededStoreInstall, directory_metadata,
-    git_hosted_tarball_metadata, git_metadata, gvs_layout, key, metadata_with_integrity, name,
-    slot_link, snapshot_with_dep, tarball_metadata_without_integrity,
+    super::CreateVirtualStore,
+    DUMMY_SHA512,
+    SeededStoreInstall,
+    directory_metadata,
+    git_hosted_tarball_metadata,
+    git_metadata,
+    gvs_layout,
+    key,
+    metadata_with_integrity,
+    name,
+    slot_link,
+    snapshot_with_dep,
+    tarball_metadata_without_integrity,
 };
 use crate::{
-    CheckVerdict, ConcurrentCheck, create_virtual_store::cache_keys::snapshot_cache_key,
+    CheckVerdict,
+    ConcurrentCheck,
+    create_virtual_store::cache_keys::snapshot_cache_key,
     install_package_by_snapshot::host_platform_selector,
 };
-use pnpm_lockfile::{LockfileEntries, PackageKey, PkgName, SnapshotEntry};
+use pnpm_lockfile::{
+    LockfileEntries,
+    PackageKey,
+    PkgName,
+    SnapshotEntry,
+};
 use pnpm_reporter::SilentReporter;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     fs,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{
+            AtomicBool,
+            AtomicU8,
+            Ordering,
+        },
     },
 };
 
@@ -31,8 +55,16 @@ struct ColdMemCacheBatch {
 
 impl ColdMemCacheBatch {
     fn new(package_count: usize) -> Self {
-        use pnpm_config::{Config, PackageImportMethod};
-        use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
+        use pnpm_config::{
+            Config,
+            PackageImportMethod,
+        };
+        use pnpm_tarball::{
+            CacheValue,
+            CachedTarball,
+            MemCache,
+            package_mem_cache_key,
+        };
 
         let root = tempfile::tempdir().expect("create temp dir");
         let workspace_root = root.path().join("workspace");
@@ -118,7 +150,11 @@ impl ColdMemCacheBatch {
         probe: &crate::create_virtual_dir_by_snapshot::tests::LinkConcurrencyProbe,
         check: Option<ConcurrentCheck<'_>>,
     ) -> Result<super::super::CreateVirtualStoreOutput, super::super::CreateVirtualStoreError> {
-        use crate::{AllowBuildPolicy, SkippedSnapshots, VirtualStoreLayout};
+        use crate::{
+            AllowBuildPolicy,
+            SkippedSnapshots,
+            VirtualStoreLayout,
+        };
         use pnpm_config::NodeLinker;
         use pnpm_store_dir::StoreIndexWriter;
         use pnpm_tarball::SharedReportedProgressKeys;
@@ -247,7 +283,7 @@ async fn cold_batch_links_slots_in_parallel() {
         "build-free cold-batch packages must populate precalculated package_bins",
     );
     assert_eq!(
-        output.materialized_snapshots.into_iter().collect::<HashSet<_>>(),
+        output.snapshot_placement.materialized.into_iter().collect::<HashSet<_>>(),
         HashSet::from([cold_a, cold_b, key("cold-02", "1.0.0"), key("cold-03", "1.0.0"),]),
     );
 }
@@ -274,7 +310,7 @@ async fn cold_downloads_complete_while_a_link_pass_runs() {
         Some(PACKAGE_COUNT),
         "the first link pass started before the drain delivered every capture",
     );
-    assert_eq!(output.materialized_snapshots.len(), PACKAGE_COUNT);
+    assert_eq!(output.snapshot_placement.materialized.len(), PACKAGE_COUNT);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aborting_concurrent_check_stops_the_fetch() {
@@ -293,6 +329,74 @@ async fn an_aborting_concurrent_check_stops_the_fetch() {
             .map(ToString::to_string),
     );
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verification_can_make_a_locked_tarball_available_during_the_cold_batch() {
+    let mut batch = ColdMemCacheBatch::new(3);
+    let url = "https://registry.test/cold-01@1.0.0";
+    let integrity: ssri::Integrity = DUMMY_SHA512.parse().unwrap();
+    for (name, tarball) in
+        [("cold-00", "https://registry.test/cold-00/-/cold-00-1.0.0.tgz"), ("cold-01", url)]
+    {
+        let metadata = batch.packages
+            .get_mut(&key(name, "1.0.0"))
+            .unwrap();
+        metadata.resolution =
+            pnpm_lockfile::LockfileResolution::Tarball(pnpm_lockfile::TarballResolution {
+                tarball: tarball.to_string(),
+                integrity: Some(integrity.clone()),
+                revision: None,
+                git_hosted: None,
+                path: None,
+            });
+    }
+    let canonical = pnpm_tarball::package_mem_cache_key(
+        "https://registry.test/cold-01/-/cold-01-1.0.0.tgz",
+        Some(&integrity),
+        false,
+    );
+    let explicit = pnpm_tarball::package_mem_cache_key(url, Some(&integrity), false);
+    let (_, archive) = batch.mem_cache.remove(&canonical).unwrap();
+    let package = key("cold-02", "1.0.0");
+    let mut digest = ssri::IntegrityOpts::new().algorithm(ssri::Algorithm::Sha512);
+    digest.input(b"revision tarball");
+    let integrity = digest.result();
+    let revision = pnpm_lockfile::TarballRevision::try_from(1).unwrap();
+    batch.packages.get_mut(&package).unwrap().resolution =
+        pnpm_lockfile::LockfileResolution::Registry(pnpm_lockfile::RegistryResolution {
+            integrity: integrity.clone(),
+            revision: Some(revision),
+        });
+    let original = pnpm_tarball::package_mem_cache_key(
+        "https://registry.test/cold-02/-/cold-02-1.0.0.tgz",
+        Some(&DUMMY_SHA512.parse().unwrap()),
+        false,
+    );
+    let revised = pnpm_tarball::package_mem_cache_key(
+        "https://registry.test/cold-02@1.0.0+r1",
+        Some(&integrity),
+        true,
+    );
+    let (_, revision_archive) = batch.mem_cache.remove(&original).unwrap();
+    let probe = crate::create_virtual_dir_by_snapshot::tests::LinkConcurrencyProbe::default();
+    let check: ConcurrentCheck<'_> = Box::pin(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while probe.total_entered() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the canonical tarball can be linked during verification");
+        batch.mem_cache.insert(explicit, archive);
+        batch.mem_cache.insert(revised, revision_archive);
+        CheckVerdict::Continue
+    });
+    let output = batch
+        .run(&probe, Some(check))
+        .await
+        .unwrap();
+    assert_eq!(output.snapshot_placement.materialized.len(), 3);
+}
+
 /// The check only reaches its verdict once every slot is linked, so the
 /// fetch has to keep driving it after its own work is done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -317,7 +421,23 @@ async fn the_fetch_drives_its_concurrent_check_to_the_verdict() {
         settled.load(Ordering::SeqCst),
         "the check must reach its verdict before the fetch returns",
     );
-    assert_eq!(output.materialized_snapshots.len(), 4);
+    assert_eq!(output.snapshot_placement.materialized.len(), 4);
+}
+/// `select!` polls its branches in random order, so the race repeats
+/// until an unbiased order would have let the finished work win.
+#[tokio::test]
+async fn a_ready_check_is_polled_before_ready_work() {
+    for _ in 0..64 {
+        let mut check: Option<ConcurrentCheck<'_>> = Some(Box::pin(async { CheckVerdict::Abort }));
+
+        let outcome = super::super::run_checked(&mut check, async { Ok(()) }).await;
+
+        assert!(
+            matches!(outcome, Err(super::super::CreateVirtualStoreError::ConcurrentCheckAborted)),
+            "the ready check must decide before the ready work returns: {outcome:?}",
+        );
+        assert!(check.is_none(), "the check settles once it reaches its verdict");
+    }
 }
 /// A warm global-virtual-store slot is skipped without its store row's
 /// CAS blobs being checked: nothing imports them, and the row still
@@ -326,15 +446,18 @@ async fn the_fetch_drives_its_concurrent_check_to_the_verdict() {
 async fn skipped_warm_slot_keeps_its_store_row_without_checking_cas_blobs() {
     let install = SeededStoreInstall::new(None);
     let first = install.run().await.expect("seeded store satisfies the offline install");
-    assert_eq!(first.materialized_snapshots.as_slice(), std::slice::from_ref(&install.package_key));
+    assert_eq!(
+        first.snapshot_placement.materialized.as_slice(),
+        std::slice::from_ref(&install.package_key),
+    );
 
     fs::remove_file(&install.body_blob).expect("remove the CAS blob behind index.js");
 
     let second = install.run().await.expect("an existing slot needs no CAS blob");
     assert!(
-        second.materialized_snapshots.is_empty(),
+        second.snapshot_placement.materialized.is_empty(),
         "the slot is current: {:?}",
-        second.materialized_snapshots,
+        second.snapshot_placement.materialized,
     );
     assert_eq!(second.requires_build_by_snapshot.get(&install.package_key), Some(&false));
 }
@@ -347,7 +470,7 @@ async fn skipped_warm_slot_with_a_side_effects_row_is_still_checked() {
     let first = install.run().await.expect("seeded store satisfies the offline install");
     assert_eq!(first.requires_build_by_snapshot.get(&install.package_key), Some(&false));
     assert!(
-        first.side_effects_maps_by_snapshot.contains_key(&install.package_key),
+        first.side_effects.maps.contains_key(&install.package_key),
         "the seeded side-effects row must reach the build phase while its files verify",
     );
 
@@ -355,12 +478,12 @@ async fn skipped_warm_slot_with_a_side_effects_row_is_still_checked() {
 
     let second = install.run().await.expect("an existing slot needs no CAS blob");
     assert!(
-        second.materialized_snapshots.is_empty(),
+        second.snapshot_placement.materialized.is_empty(),
         "the slot is current: {:?}",
-        second.materialized_snapshots,
+        second.snapshot_placement.materialized,
     );
     assert!(
-        !second.side_effects_maps_by_snapshot.contains_key(&install.package_key),
+        !second.side_effects.maps.contains_key(&install.package_key),
         "a row that failed its files check must not feed the build phase",
     );
     assert_eq!(
@@ -371,16 +494,28 @@ async fn skipped_warm_slot_with_a_side_effects_row_is_still_checked() {
 }
 /// Under the global virtual store, peer variants hashing to one slot
 /// directory must produce one link task through the whole
-/// [`CreateVirtualStore::run`] pass — the probe's lifetime counter
+/// [`CreateVirtualStore::run`] pass, the probe's lifetime counter
 /// distinguishes a real dedup from duplicates that happened to
 /// serialize.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gvs_link_pass_materializes_shared_slot_once() {
-    use crate::{AllowBuildPolicy, SkippedSnapshots, VirtualStoreLayout};
-    use pnpm_config::{Config, NodeLinker, PackageImportMethod};
+    use crate::{
+        AllowBuildPolicy,
+        SkippedSnapshots,
+        VirtualStoreLayout,
+    };
+    use pnpm_config::{
+        Config,
+        NodeLinker,
+        PackageImportMethod,
+    };
     use pnpm_store_dir::StoreIndexWriter;
     use pnpm_tarball::{
-        CacheValue, CachedTarball, MemCache, SharedReportedProgressKeys, package_mem_cache_key,
+        CacheValue,
+        CachedTarball,
+        MemCache,
+        SharedReportedProgressKeys,
+        package_mem_cache_key,
     };
 
     let root = tempfile::tempdir().expect("create temp dir");
@@ -426,7 +561,7 @@ async fn gvs_link_pass_materializes_shared_slot_once() {
         );
     }
     // Two variants of `shared`, one bare and one peer-suffixed, with
-    // identical dependency sets — the collision the fix is about.
+    // identical dependency sets, the collision the fix is about.
     snapshots.insert(key("shared", "1.0.0"), SnapshotEntry::default());
     snapshots.insert(key("shared", "1.0.0(peer@1.0.0)"), SnapshotEntry::default());
     snapshots.insert(key("solo", "1.0.0"), SnapshotEntry::default());
@@ -533,7 +668,7 @@ async fn gvs_link_pass_materializes_shared_slot_once() {
 /// `Git` resolutions go through the warm batch under a
 /// `gitHostedStoreIndexKey`-shaped key (`pkg_id\tbuilt|not-built`),
 /// not under the integrity-based key. This is the read-side mirror
-/// of what both fetchers write at install time — a drift between
+/// of what both fetchers write at install time, a drift between
 /// the two would silently degrade every git-hosted re-install to
 /// the cold path.
 #[test]
@@ -638,7 +773,7 @@ fn group_slots_by_dir_keeps_diverging_peer_variants_apart() {
     let mut snapshots = HashMap::new();
     snapshots.insert(plain.clone(), SnapshotEntry::default());
     // The peered variant resolves an extra child, so its recursive
-    // hash — and therefore its slot — must diverge from the plain one.
+    // hash (and therefore its slot) must diverge from the plain one.
     snapshots.insert(peered.clone(), snapshot_with_dep("leaf", "1.0.0"));
     snapshots.insert(child.clone(), SnapshotEntry::default());
     let mut packages = HashMap::new();
@@ -692,184 +827,7 @@ fn group_slots_by_dir_is_identity_without_gvs() {
     assert_eq!(groups.len(), 2, "non-GVS slots are unique per key; nothing may merge");
     assert!(groups.iter().all(|group| group.duplicates.is_empty()));
 }
-/// A registry package's variants follow the host, whatever platform
-/// `supportedArchitectures` names: the dependency graph the installer
-/// links is the host variant's, so its archive must be too.
-#[test]
-fn snapshot_cache_key_for_package_variants_follows_the_host() {
-    use pnpm_lockfile::{
-        LockfileResolution, PlatformAssetResolution, PlatformAssetTarget, PlatformSelector,
-        RegistryResolution, VariationsResolution,
-    };
-    let host = host_platform_selector();
-    let registry = |digit: char| {
-        LockfileResolution::Registry(RegistryResolution {
-            integrity: format!("sha512-{}==", digit.to_string().repeat(86))
-                .parse()
-                .expect("parse integrity"),
-            revision: None,
-        })
-    };
-    let pkg = key("variations-pkg", "1.0.0");
-    let mut metadata = git_metadata();
-    metadata.resolution = LockfileResolution::Variations(VariationsResolution {
-        variants: vec![
-            PlatformAssetResolution::any(registry('A')),
-            PlatformAssetResolution {
-                resolution: registry('B'),
-                targets: vec![PlatformAssetTarget {
-                    os: host.os,
-                    cpu: host.cpu,
-                    libc: host.libc.filter(|libc| libc == "musl"),
-                    ..Default::default()
-                }],
-            },
-        ],
-        revision: None,
-    });
-    let packages = HashMap::from([(pkg.clone(), metadata)]);
-    let configured = PlatformSelector {
-        os: "aix".to_string(),
-        cpu: "ppc64".to_string(),
-        libc: None,
-        floors: None,
-    };
 
-    let received = snapshot_cache_key(&pkg, &packages, false, &configured)
-        .expect("snapshot_cache_key must not error");
-    let value = received.value.expect("the host variant has a warm key");
-    assert!(value.starts_with(&format!("sha512-{}", "B".repeat(20))), "{value}");
-}
-/// A git-hosted tarball a `variations` resolution selects is keyed as a
-/// lone one is, so an explicit build denial narrows it to the not-built
-/// key as the fetch path does.
-#[test]
-fn snapshot_cache_key_for_a_git_hosted_variations_any_archive_is_git_hosted() {
-    use pnpm_lockfile::{
-        LockfileResolution, PlatformAssetResolution, PlatformAssetTarget, RegistryResolution,
-        VariationsResolution,
-    };
-    let pkg = key("foo", "1.0.0");
-    let mut metadata = git_hosted_tarball_metadata();
-    let any_archive = metadata.resolution.clone();
-    metadata.resolution = LockfileResolution::Variations(VariationsResolution {
-        variants: vec![
-            PlatformAssetResolution::any(any_archive),
-            PlatformAssetResolution {
-                resolution: LockfileResolution::Registry(RegistryResolution {
-                    integrity: format!("sha512-{}==", "B".repeat(86))
-                        .parse()
-                        .expect("parse integrity"),
-                    revision: None,
-                }),
-                targets: vec![PlatformAssetTarget {
-                    os: "aix".to_string(),
-                    cpu: "ppc64".to_string(),
-                    ..Default::default()
-                }],
-            },
-        ],
-        revision: None,
-    });
-    let packages = HashMap::from([(pkg.clone(), metadata)]);
-
-    let received = snapshot_cache_key(&pkg, &packages, false, &host_platform_selector())
-        .expect("snapshot_cache_key must not error");
-    assert_eq!(received.value, Some(format!("{pkg}\tbuilt")));
-    assert!(received.is_git_hosted);
-}
-/// The warm build-policy check sees a git-hosted archive a `variations`
-/// resolution selects by its key, as it sees a lone git-hosted tarball.
-#[test]
-fn a_git_hosted_variations_any_archive_key_is_a_git_hosted_archive() {
-    use crate::create_virtual_store::warm::keys_git_hosted_archive;
-    use pnpm_lockfile::{
-        LockfileResolution, PlatformAssetResolution, PlatformAssetTarget, RegistryResolution,
-        VariationsResolution,
-    };
-    let pkg = key("foo", "1.0.0");
-    let package_id = pkg.pkg_id();
-    let integrity = format!("sha512-{}==", "B".repeat(86));
-    let any_archive = git_hosted_tarball_metadata().resolution;
-    let resolution = LockfileResolution::Variations(VariationsResolution {
-        variants: vec![
-            PlatformAssetResolution::any(any_archive),
-            PlatformAssetResolution {
-                resolution: LockfileResolution::Registry(RegistryResolution {
-                    integrity: integrity.parse().expect("parse integrity"),
-                    revision: None,
-                }),
-                targets: vec![PlatformAssetTarget {
-                    os: "aix".to_string(),
-                    cpu: "ppc64".to_string(),
-                    ..Default::default()
-                }],
-            },
-        ],
-        revision: None,
-    });
-
-    for built in [true, false] {
-        let git_key = pnpm_store_dir::git_hosted_store_index_key(&package_id, built);
-        assert!(keys_git_hosted_archive(&resolution, &git_key, &package_id), "{git_key}");
-    }
-    let variant_key = pnpm_store_dir::store_index_key(&integrity, &package_id);
-    assert!(!keys_git_hosted_archive(&resolution, &variant_key, &package_id));
-}
-/// The warm reuse of a git-hosted archive a `variations` resolution
-/// selects runs the build-permission check the fetch path runs: a package
-/// that needs preparing and that no policy allows is refused.
-#[test]
-fn warm_reuse_of_a_git_hosted_variations_any_archive_checks_build_permission() {
-    use crate::{AllowBuildPolicy, create_virtual_store::warm::enforce_cached_git_prepare_policy};
-    use pnpm_lockfile::{
-        LockfileResolution, PlatformAssetResolution, PlatformAssetTarget, RegistryResolution,
-        VariationsResolution,
-    };
-    let pkg = key("foo", "1.0.0");
-    let mut metadata = git_hosted_tarball_metadata();
-    let any_archive = metadata.resolution.clone();
-    metadata.resolution = LockfileResolution::Variations(VariationsResolution {
-        variants: vec![
-            PlatformAssetResolution::any(any_archive),
-            PlatformAssetResolution {
-                resolution: LockfileResolution::Registry(RegistryResolution {
-                    integrity: format!("sha512-{}==", "B".repeat(86))
-                        .parse()
-                        .expect("parse integrity"),
-                    revision: None,
-                }),
-                targets: vec![PlatformAssetTarget {
-                    os: "aix".to_string(),
-                    cpu: "ppc64".to_string(),
-                    ..Default::default()
-                }],
-            },
-        ],
-        revision: None,
-    });
-    let packages = HashMap::from([(pkg.clone(), metadata)]);
-    let git_key = pnpm_store_dir::git_hosted_store_index_key(&pkg.pkg_id(), true);
-    let mut prefetch = pnpm_tarball::PrefetchResult::default();
-    prefetch.cas_paths.insert(git_key.clone(), Arc::new(pnpm_fs::CasPaths::new()));
-    prefetch.requires_prepare.insert(git_key.clone(), true);
-    prefetch.manifests.insert(
-        git_key.clone(),
-        Arc::new(serde_json::json!({ "name": "foo", "version": "1.0.0" })),
-    );
-    let snapshot = SnapshotEntry::default();
-    let mut snapshots = [(&pkg, &snapshot, Some(git_key))];
-
-    let result = enforce_cached_git_prepare_policy(
-        &mut snapshots,
-        &packages,
-        &prefetch,
-        &AllowBuildPolicy::default(),
-        false,
-        true,
-    );
-    assert!(result.is_err(), "the warm path must refuse a build no policy allows: {result:?}");
-}
 /// An `integrity` with no hash pins nothing, so the fetch path refuses the
 /// tarball as it refuses one with no `integrity`, and it gets no warm key.
 #[test]
@@ -882,7 +840,7 @@ fn snapshot_cache_key_for_a_tarball_with_an_empty_integrity_is_absent() {
     tarball.integrity = Some(ssri::Integrity { hashes: Vec::new() });
     let packages = HashMap::from([(pkg.clone(), metadata)]);
 
-    let received = snapshot_cache_key(&pkg, &packages, false, &host_platform_selector())
+    let received = snapshot_cache_key(&pkg, &packages, false, &crate::host_platform_selector())
         .expect("snapshot_cache_key must not error");
     assert_eq!(received.value, None);
 }

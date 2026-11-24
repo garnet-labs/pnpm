@@ -1,46 +1,48 @@
-use super::{Digest, ErrorCode, ImageDocument, Request, error, no_content, registry_error};
-use crate::{
-    oci_maintenance::referenced_document_blobs,
-    server::{Action, RegistrySource, authorize},
+use super::{
+    Action,
+    Digest,
+    ErrorCode,
+    HostedRepo,
+    ImageDocument,
+    Ownership,
+    RegistrySource,
+    Request,
+    authorize_with_ownership,
+    error,
+    no_content,
+    registry_error,
 };
-use axum::{http::StatusCode, response::Response};
+use crate::archive_gc::liveness::referenced_document_blobs;
+use axum::{
+    http::StatusCode,
+    response::Response,
+};
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
-use pnpr_storage::{DOCUMENT_WRITE_RETRIES, DocumentWrite};
+use pnpr_storage::{
+    DOCUMENT_WRITE_RETRIES,
+    database::BlobLookup,
+    wait_after_document_write_conflict,
+};
 
 impl Request {
     pub(super) async fn delete_blob(&self, name: &str, digest: &Digest) -> Response {
-        let (key, source) = match self.hosted_source(name) {
-            Ok(target) => target,
+        let repo = match self.hosted_repo(name) {
+            Ok(repo) => repo,
             Err(refusal) => return refusal.respond(),
         };
-        let org = match crate::server::hosted_read_namespace(
-            &self.state,
-            &self.identity,
-            &source,
-            key.as_str(),
-        ) {
-            Ok(org) => org,
-            Err(err) => return registry_error(err),
-        };
-        if let Err(err) = authorize(
-            &self.state,
-            &self.identity,
-            &RegistrySource::Hosted(source.clone()),
-            key.as_str(),
-            Action::Unpublish,
-        ) {
-            return registry_error(err);
-        }
-        let storage = self.state.inner.storage.for_hosted(&org, pnpr_registry::Ecosystem::Oci);
+        let key = &repo.key;
         let _guard = self.state.inner.locks.packages.lock(key.as_str()).await;
         let result = async {
-            for _ in 0..DOCUMENT_WRITE_RETRIES {
-                let Some(response) = self.try_delete_blob(&storage, &key, digest).await? else {
+            for attempt in 0..DOCUMENT_WRITE_RETRIES {
+                let Some(response) = self.try_delete_blob(&repo, digest).await? else {
+                    if attempt + 1 < DOCUMENT_WRITE_RETRIES {
+                        wait_after_document_write_conflict(attempt).await;
+                    }
                     continue;
                 };
                 if response.status().is_success() {
-                    self.log_oci_blob_deleted(&key, digest);
+                    self.log_oci_blob_deleted(key, digest);
                 }
                 return Ok(response);
             }
@@ -51,125 +53,87 @@ impl Request {
     }
 
     fn log_oci_blob_deleted(&self, repository: &CanonicalPackageName, digest: &Digest) {
-        let actor = self.identity.username().unwrap_or("-");
-        tracing::info!(
-            target: "pnpr::audit",
-            action = "oci.delete_blob",
-            actor = %actor,
+        let actor = crate::audit::Actor::of(&self.identity);
+        crate::audit!(
+            actor,
+            "oci.delete_blob",
             repository = %repository.as_str(),
             digest = %digest,
             "oci blob deleted",
         );
     }
 
-    async fn ensure_blob_unreferenced(
+    /// One attempt at deleting the blob: dropping the repository's mapping
+    /// of it, which holds only while the repository's document is the one it
+    /// was found unreferenced in, and reclaiming its bytes unless another
+    /// repository maps them. `None` means another writer moved the document
+    /// first and the attempt should be repeated.
+    async fn try_delete_blob(
         &self,
-        storage: &pnpr_storage::Storage,
-        key: &CanonicalPackageName,
+        repo: &HostedRepo,
         digest: &Digest,
-        document: &ImageDocument,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<Option<Response>, RegistryError> {
+        let (key, storage) = (&repo.key, &repo.storage);
+        let filename = digest.blob_filename();
+        let lookup = BlobLookup { ids: Vec::new(), artifacts: vec![filename.clone()] };
+        let base = storage.read_hosted_document_for_publish(key, &lookup).await?;
+        let document = self.authorize_blob_deletion(repo, base.stored.as_ref()).await?;
+        if base.artifacts.is_empty() {
+            return Ok(Some(error(ErrorCode::BlobUnknown, "no such blob")));
+        }
         let reachable = referenced_document_blobs(
             storage,
             key,
-            document,
+            &document,
             self.state.inner.config.http.oci.max_manifest_bytes,
         )
         .await?;
-        if reachable.contains(&digest.blob_filename()) {
-            return Err(RegistryError::BadRequest {
-                reason: format!("{digest} is referenced by a retained manifest"),
-            });
+        if reachable.contains(&filename) {
+            return Ok(Some(error(
+                ErrorCode::Denied,
+                format!("{digest} is referenced by a retained manifest"),
+            )));
         }
-        Ok(())
+        let expected = base.package_generation();
+        match storage.unmap_hosted_artifacts(key, expected, vec![filename]).await? {
+            Some(_) => Ok(Some(no_content(StatusCode::ACCEPTED))),
+            None => Ok(None),
+        }
     }
 
-    /// One attempt at the two-phase blob deletion: mark the document, remove
-    /// the blob, then clear the mark. `None` means another writer moved the
-    /// document first and the attempt should be repeated.
-    async fn try_delete_blob(
+    async fn authorize_blob_deletion(
         &self,
-        storage: &pnpr_storage::Storage,
-        key: &CanonicalPackageName,
-        digest: &Digest,
-    ) -> Result<Option<Response>, RegistryError> {
-        let snapshot = storage.read_hosted_document_for_update(key).await?;
-        let mut document =
-            parse_deletion_target(snapshot.as_ref().map(|stored| stored.bytes.as_slice()), key)?;
-        if storage
-            .open_hosted_blob(key, &digest.blob_filename())
-            .await?
-            .is_none()
-        {
-            return Ok(Some(error(ErrorCode::BlobUnknown, "no such blob")));
-        }
-        self.ensure_blob_unreferenced(storage, key, digest, &document).await?;
-        document.generation = document.generation
-            .checked_add(1)
-            .ok_or_else(|| RegistryError::Internal {
-                reason: "OCI document generation exhausted".to_string(),
-            })?;
-        document.deleting_blob = Some(digest.clone());
-        let marked = storage.write_hosted_document_if_current(
-            key,
-            &document.to_bytes(),
-            snapshot.as_ref().map(|stored| &stored.version),
-            None,
-        )
-        .await?;
-        if marked == DocumentWrite::Conflict {
-            return Ok(None);
-        }
-        storage.remove_hosted_blob(key, &digest.blob_filename()).await?;
-        clear_deletion_mark(storage, key, digest).await?;
-        Ok(Some(no_content(StatusCode::ACCEPTED)))
+        repo: &HostedRepo,
+        stored: Option<&pnpr_storage::HostedDocumentForUpdate>,
+    ) -> Result<ImageDocument, RegistryError> {
+        let Some(stored) = stored else {
+            self.authorize_unpublish(repo).await?;
+            return Ok(ImageDocument::new(repo.key.as_str().to_owned()));
+        };
+        let document = ImageDocument::parse(&stored.bytes)?;
+        let source = RegistrySource::Hosted(repo.source.clone());
+        let ownership = Ownership::Owners(&document.owners);
+        authorize_with_ownership(
+            &self.state,
+            &self.identity,
+            &source,
+            (repo.key.as_str(), &ownership),
+            Action::Delete,
+        )?;
+        check_deletion_target(document, &repo.key)
     }
 }
 
-/// Clear the mark that named the blob being deleted, now that it is gone.
-async fn clear_deletion_mark(
-    storage: &pnpr_storage::Storage,
-    key: &CanonicalPackageName,
-    digest: &Digest,
-) -> Result<(), RegistryError> {
-    storage.update_hosted_document_with_retry(key, DOCUMENT_WRITE_RETRIES, None, |bytes| {
-        let mut document = ImageDocument::parse(bytes.ok_or_else(|| RegistryError::Internal {
-            reason: "OCI deletion document disappeared".to_string(),
-        })?)?;
-        if document.format_version > pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION {
-            return Err(RegistryError::DocumentFormatTooNew {
-                document: key.as_str().to_string(),
-                format_version: document.format_version,
-                supported_version: pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION,
-            });
-        }
-        if document.deleting_blob.as_ref() != Some(digest) {
-            return Err(RegistryError::DocumentWriteConflict { package: key.as_str().to_string() });
-        }
-        document.deleting_blob = None;
-        Ok(Some(document.to_bytes()))
-    })
-    .await?;
-    Ok(())
-}
-
-fn parse_deletion_target(
-    existing_bytes: Option<&[u8]>,
+fn check_deletion_target(
+    document: ImageDocument,
     key: &CanonicalPackageName,
 ) -> Result<ImageDocument, RegistryError> {
-    let document = existing_bytes
-        .map(ImageDocument::parse)
-        .transpose()?
-        .unwrap_or_else(|| ImageDocument::new(key.as_str()));
     if document.format_version > pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION {
         return Err(RegistryError::DocumentFormatTooNew {
             document: key.as_str().to_string(),
             format_version: document.format_version,
             supported_version: pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION,
         });
-    }
-    if document.deleting_blob.is_some() {
-        return Err(RegistryError::DocumentWriteConflict { package: key.as_str().to_string() });
     }
     Ok(document)
 }

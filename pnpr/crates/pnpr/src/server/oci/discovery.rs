@@ -1,8 +1,31 @@
 use super::{
-    Action, CanonicalPackageName, Catalog, ECOSYSTEM, Ecosystem, ErrorCode, ImageDocument, Method,
-    Refusal, RegistryError, RegistrySource, Request, Response, StatusCode, TagList,
-    addressed_registry, authorize, error, hosted_sources, insert_header, json, method_not_allowed,
-    private_no_cache, query_param, read_hosted_document, registry_error, resolve_ecosystem_source,
+    Action,
+    CanonicalPackageName,
+    Catalog,
+    ECOSYSTEM,
+    Ecosystem,
+    ErrorCode,
+    ImageDocument,
+    Method,
+    Refusal,
+    RegistryError,
+    RegistrySource,
+    Request,
+    Response,
+    StatusCode,
+    TagList,
+    addressed_registry,
+    authorize,
+    error,
+    hosted_sources,
+    insert_header,
+    json,
+    method_not_allowed,
+    private_no_cache,
+    query_param,
+    read_hosted_document,
+    registry_error,
+    resolve_ecosystem_source,
     unknown_repository,
 };
 
@@ -46,7 +69,7 @@ impl Request {
         })
     }
 
-    /// `GET /v2/_catalog` — the repository names this caller may read.
+    /// `GET /v2/_catalog`: the repository names this caller may read.
     pub(super) async fn catalog(&self) -> Response {
         if self.method != Method::GET {
             return method_not_allowed();
@@ -129,10 +152,11 @@ impl Request {
         source: &str,
         last: Option<&str>,
     ) -> Result<Vec<String>, RegistryError> {
-        let Some(hosted) = self.state.inner.config.routing.hosted.get(source) else {
+        let routing = self.state.routing();
+        let Some(hosted) = routing.hosted.get(source) else {
             return Ok(Vec::new());
         };
-        let storage = self.state.inner.storage.for_hosted(&hosted.org, ECOSYSTEM);
+        let storage = self.state.inner.storage.for_hosted(&hosted.namespace, ECOSYSTEM);
         let names = storage.hosted_package_names().await?;
         // A listing may only name what this caller could have fetched.
         Ok(names
@@ -146,7 +170,7 @@ impl Request {
                     &self.identity,
                     &RegistrySource::Hosted(source.to_string()),
                     name,
-                    Action::Access,
+                    Action::Read,
                 )
                 .is_ok()
         })

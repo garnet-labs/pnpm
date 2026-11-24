@@ -8,14 +8,32 @@
 
 use crate::tokens::issue_token;
 use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+    },
 };
-use pnpr::{AuthState, Config, PublicRoute, router_with_auth};
+use pnpr::{
+    AuthState,
+    Config,
+    PublicRoute,
+    router_with_auth,
+};
 use pnpr_fixtures::MockConfigPresets;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
     path::PathBuf,
     time::Duration,
 };
@@ -121,7 +139,8 @@ async fn frames(body: Body) -> Vec<Value> {
     String::from_utf8_lossy(&bytes)
         .lines()
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).expect("frame is JSON"))
+        .map(serde_json::from_str)
+        .map(|parsed| parsed.expect("frame is JSON"))
         .collect()
 }
 
@@ -130,10 +149,44 @@ async fn resolved_lockfile(response: axum::response::Response) -> String {
     let frames = frames(response.into_body()).await;
     assert_eq!(frames.len(), 1, "{frames:?}");
     assert_eq!(frames[0]["type"], "done", "{frames:?}");
+    assert_eq!(frames[0]["lockfileFormat"], "cargo-lock", "{frames:?}");
     frames[0]["lockfile"]
         .as_str()
         .expect("done frame carries the lockfile")
         .to_string()
+}
+
+#[tokio::test]
+async fn resolves_through_private_local_cargo_registry() {
+    let (index, mocks) = sparse_index(1).await;
+    let tmp = TempDir::new().unwrap();
+    let mut config = crate::ecosystem::mixed_router_config(
+        tmp.path().to_owned(),
+        pnpr::Ecosystem::Cargo,
+        crate::ecosystem::HostedSource {
+            name: "hosted",
+            namespace: "hosted",
+            access: "$all",
+            packages: &["other"],
+        },
+        ("crates", &index.url()),
+    );
+    config.routing.upstreams
+        .get_mut("crates")
+        .unwrap()
+        .set_access(pnpr_policy::AccessList::from_tokens(["reader"]));
+    let registry = format!("{}/cargo/~crates/index", config.http.public_url);
+    let auth = crate::tokens::seeded_auth(&config, &[("reader", "password")]);
+    let token = issue_token(&auth, "reader").await;
+    let app = router_with_auth(config, auth);
+    let response = app
+        .oneshot(cargo_resolve_request(&registry, &token))
+        .await
+        .unwrap();
+    assert!(resolved_lockfile(response).await.contains(r#"name = "foo""#));
+    for mock in mocks {
+        mock.assert_async().await;
+    }
 }
 
 #[tokio::test]
@@ -161,6 +214,32 @@ async fn cargo_resolve_walks_the_index_and_returns_a_lockfile() {
     for mock in mocks {
         mock.assert_async().await;
     }
+}
+
+#[tokio::test]
+async fn cargo_resolve_sends_the_private_index_headers() {
+    let mut index = mockito::Server::new_async().await;
+    let entry = index
+        .mock("GET", "/3/f/foo")
+        .match_header("x-api-key", "example-key")
+        .with_body(index_entry("foo", "1.0.0", &json!([])))
+        .create_async()
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let auth = AuthState::in_memory();
+    let token = issue_token(&auth, "reader").await;
+    let mut config = config_for(tmp.path().to_path_buf());
+    let mut upstream =
+        pnpr_config::UpstreamConfig::with_defaults(index.url(), reqwest::header::HeaderMap::new());
+    upstream.set_access(pnpr_policy::AccessList::from_tokens(["$authenticated"]));
+    upstream.headers.insert("x-api-key", "example-key".parse().unwrap());
+    config.routing.upstreams.insert("cargo/mirror".to_string(), upstream);
+    let response = router_with_auth(config, auth)
+        .oneshot(cargo_resolve_request(&index.url(), &token))
+        .await
+        .unwrap();
+    entry.assert_async().await;
+    assert!(resolved_lockfile(response).await.contains(r#"name = "foo""#));
 }
 
 #[tokio::test]

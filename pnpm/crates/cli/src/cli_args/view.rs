@@ -1,4 +1,4 @@
-//! `pacquet view` (aliases `info`, `show`, `v`) — print package metadata
+//! `pacquet view` (aliases `info`, `show`, `v`), print package metadata
 //! from the registry.
 //!
 //! When the package name is omitted, the nearest project manifest's `name`
@@ -8,27 +8,55 @@
 
 use crate::cli_args::{
     registry_client::{
-        build_registry_client, package_endpoint_url, resolve_registries_with_override,
+        build_registry_client,
+        package_endpoint_url,
+        resolve_registries_with_override,
         resolve_target_registry_for_package,
     },
-    release_notes::{NotesReader, render_upgrade_notes, stores_notes, upgrade_notes_json},
+    release_notes::{
+        NotesReader,
+        render_upgrade_notes,
+        stores_notes,
+        upgrade_notes_json,
+    },
 };
-use chrono::{DateTime, Utc};
 use clap::Args;
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
+use jiff::Timestamp;
 use miette::Diagnostic;
-use owo_colors::{OwoColorize, Stream, Style};
+use owo_colors::{
+    OwoColorize,
+    Stream,
+    Style,
+};
 use pnpm_config::Config;
 use pnpm_package_manifest::safe_read_project_manifest_from_dir;
 use pnpm_resolving_npm_resolver::{
-    FetchFullMetadataOptions, FetchFullMetadataOutcome, PickPackageFromMetaOptions,
-    fetch_full_metadata, parse_bare_specifier, pick_package_from_meta,
+    FetchFullMetadataOptions,
+    FetchFullMetadataOutcome,
+    PickPackageFromMetaOptions,
+    fetch_full_metadata,
+    parse_bare_specifier,
+    pick_package_from_meta,
     pick_version_by_version_range,
 };
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
-use render::{render_fields, render_summary, to_pretty};
-use serde_json::{Map, Value};
-use std::{path::Path, sync::Arc};
+use render::{
+    render_fields,
+    render_summary,
+    to_pretty,
+};
+use serde_json::{
+    Map,
+    Value,
+};
+use std::{
+    path::Path,
+    sync::Arc,
+};
 
 /// Errors from `pacquet view`. The codes are the `ERR_PNPM_*` codes pnpm
 /// defines for these failures.
@@ -96,7 +124,7 @@ impl ViewArgs {
         };
         let fields = self.params.get(1..).unwrap_or(&[]);
 
-        let (meta, picked) =
+        let FetchedPackage { meta, picked, registry } =
             fetch_package_metadata(config, self.registry.as_deref(), &package_spec, "view").await?;
         let mut info = assemble_info(&meta, &picked);
         if fields
@@ -115,7 +143,7 @@ impl ViewArgs {
         if self.json {
             return Ok(to_pretty(&info));
         }
-        Ok(render_summary(&info))
+        Ok(render_summary(&info, &registry))
     }
 }
 
@@ -200,6 +228,13 @@ fn invalid_manifest(dir: &Path) -> ViewError {
     }
 }
 
+/// A packument, the version picked from it, and the registry it was read from.
+pub(super) struct FetchedPackage {
+    pub meta: pnpm_registry::Package,
+    pub picked: Arc<pnpm_registry::PackageVersion>,
+    pub registry: String,
+}
+
 /// Fetch the registry packument for `package_spec` and select the version that
 /// satisfies the spec. The caller decides how much of the result to assemble.
 pub(super) async fn fetch_package_metadata(
@@ -207,7 +242,7 @@ pub(super) async fn fetch_package_metadata(
     registry_override: Option<&str>,
     package_spec: &str,
     _command_name: &str,
-) -> miette::Result<(pnpm_registry::Package, Arc<pnpm_registry::PackageVersion>)> {
+) -> miette::Result<FetchedPackage> {
     let parsed = parse_wanted_dependency(package_spec);
     let alias = parsed.alias.as_deref();
     let bare = parsed.bare_specifier.as_deref().unwrap_or("latest");
@@ -223,7 +258,7 @@ pub(super) async fn fetch_package_metadata(
     let meta = fetch_metadata_outcome(config, &registry, &spec.name).await?;
     let picked = pick_view_version(&meta, &spec)?;
 
-    Ok((meta, picked))
+    Ok(FetchedPackage { meta, picked, registry })
 }
 
 async fn fetch_metadata_outcome(
@@ -252,7 +287,7 @@ async fn fetch_metadata_outcome(
     match outcome {
         FetchFullMetadataOutcome::Modified(meta) => Ok(*meta),
         FetchFullMetadataOutcome::NotModified => {
-            miette::bail!("registry returned 304 Not Modified unexpectedly for {package_name}")
+            miette::bail!("registry returned 304 Not Modified unexpectedly for {package_name}");
         }
     }
 }

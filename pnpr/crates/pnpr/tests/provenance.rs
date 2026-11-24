@@ -1,19 +1,44 @@
 //! Integration tests for npm publish with sigstore provenance,
 //! and the `/-/npm/v1/attestations` and `/-/npm/v1/keys` endpoints.
 
-use crate::{network::loopback_networks, npm::publish_doc, tokens::issue_token};
-use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+use crate::{
+    network::loopback_networks,
+    npm::publish_doc,
+    tokens::issue_token,
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use pnpr::{AuthState, Config, MaxUsers, router, router_with_auth};
+use axum::{
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+    },
+};
+use base64::{
+    Engine,
+    engine::general_purpose::STANDARD as BASE64,
+};
+use pnpr::{
+    AuthState,
+    Config,
+    MaxUsers,
+    router,
+    router_with_auth,
+};
 use pnpr_fixtures::MockConfigPresets;
-use pnpr_storage::layout::local_blob_path;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
     fmt::Write as _,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
     path::PathBuf,
     time::Duration,
 };
@@ -26,7 +51,7 @@ fn static_config(storage: PathBuf) -> Config {
     let listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873));
     let mut config = Config::static_serve(listen, storage);
     config.http.public_url = PUBLIC_URL.to_string();
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     config
 }
 
@@ -57,7 +82,7 @@ async fn get_req(app: &axum::Router, path: &str) -> axum::response::Response {
         .unwrap()
 }
 
-fn sample_sigstore_bundle(predicate_type: &str) -> Value {
+pub(super) fn sample_sigstore_bundle(predicate_type: &str) -> Value {
     let statement = json!({
         "_type": "https://in-toto.io/Statement/v0.1",
         "predicateType": predicate_type,
@@ -101,7 +126,7 @@ fn naming(bundle: &Value, subjects: &[(&str, &str)]) -> Value {
 
 /// A publish document of `tarball` with `sig_bundle` attached, its
 /// statement naming the published archive.
-fn doc_with_sigstore(
+pub(super) fn doc_with_sigstore(
     name: &str,
     version: &str,
     tarball: &[u8],
@@ -229,6 +254,8 @@ async fn publish_scoped_package_with_sigstore_json_attachment() {
         let payload = body_json(res.into_body()).await;
         assert_eq!(payload["attestations"][0]["predicateType"], "https://slsa.dev/provenance/v0.2");
     }
+    let response = get_req(&app, "/npm/-/npm/v1/attestations/@scope%252Fprov-pkg@2.0.0").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -254,16 +281,7 @@ async fn unpublish_tarball_cleans_up_sigstore_blob() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
 
-    assert!(
-        local_blob_path(
-            &storage,
-            "",
-            pnpr_storage::Ecosystem::Npm,
-            "del-pkg",
-            "del-pkg-1.0.0.sigstore"
-        )
-        .exists(),
-    );
+    assert!(crate::storage::hosted_file(&storage, "del-pkg", "del-pkg-1.0.0.sigstore").is_some());
 
     let del = Request::delete("/npm/del-pkg/-/del-pkg-1.0.0.tgz/-rev/anything")
         .header("Authorization", format!("Bearer {token}"))
@@ -278,16 +296,7 @@ async fn unpublish_tarball_cleans_up_sigstore_blob() {
         StatusCode::CREATED,
     );
 
-    assert!(
-        !local_blob_path(
-            &storage,
-            "",
-            pnpr_storage::Ecosystem::Npm,
-            "del-pkg",
-            "del-pkg-1.0.0.sigstore"
-        )
-        .exists(),
-    );
+    assert!(crate::storage::hosted_file(&storage, "del-pkg", "del-pkg-1.0.0.sigstore").is_none());
 
     let get_attest = Request::get("/npm/-/npm/v1/attestations/del-pkg@1.0.0")
         .body(Body::empty())
@@ -327,7 +336,7 @@ async fn upstream_attestations_and_keys_proxy() {
         .await;
 
     let attest_mock = upstream
-        .mock("GET", "/-/npm/v1/attestations/proxied-pkg@1.0.0")
+        .mock("GET", "/-/npm/v1/attestations/@example%2Fproxied-pkg@1.0.0")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
@@ -347,7 +356,7 @@ async fn upstream_attestations_and_keys_proxy() {
     assert_eq!(keys_payload["keys"][0]["keyid"], "sigstore-root");
 
     // Attestations proxied
-    let attest_res = get_req(&app, "/npm/-/npm/v1/attestations/proxied-pkg@1.0.0").await;
+    let attest_res = get_req(&app, "/npm/-/npm/v1/attestations/@example%2Fproxied-pkg@1.0.0").await;
     assert_eq!(attest_res.status(), StatusCode::OK);
     let attest_payload = body_json(attest_res.into_body()).await;
     assert_eq!(
@@ -513,11 +522,8 @@ async fn an_archive_with_two_sha512_digests_cannot_be_named() {
     );
 }
 
-/// npm names a package in its provenance with only a leading `@`
-/// percent-encoded, so a legacy name such as `legacy!pkg` is named as npm
-/// spells it.
 #[tokio::test]
-async fn a_statement_names_a_legacy_package_as_npm_spells_it() {
+async fn a_statement_names_a_scoped_package_as_npm_spells_it() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
     let token = issue_token(&auth, "alice").await;
@@ -525,9 +531,9 @@ async fn a_statement_names_a_legacy_package_as_npm_spells_it() {
 
     let bundle = sample_sigstore_bundle("https://slsa.dev/provenance/v1");
     let doc =
-        doc_with_sigstore("legacy!pkg", "1.0.0", b"tarball", "legacy!pkg-1.0.0.sigstore", &bundle);
+        doc_with_sigstore("@example!scope/pkg", "1.0.0", b"tarball", "pkg-1.0.0.sigstore", &bundle);
     let res = app
-        .oneshot(put_publish("/npm/legacy!pkg", &token, &doc))
+        .oneshot(put_publish("/npm/@example!scope%2Fpkg", &token, &doc))
         .await
         .unwrap();
     let status = res.status();

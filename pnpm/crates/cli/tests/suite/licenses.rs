@@ -1,12 +1,25 @@
 use crate::_utils;
+use command_extra::CommandExtra;
 
-use _utils::{enable_gvs_in_workspace_yaml, pacquet_in};
+use _utils::{
+    enable_gvs_in_workspace_yaml,
+    pacquet_in,
+};
 use assert_cmd::prelude::*;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use serde_json::{Value, json};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[test]
@@ -106,7 +119,7 @@ snapshots:
     .expect("write zeta manifest");
 
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(
@@ -128,7 +141,7 @@ snapshots:
     assert_eq!(report["Zlib"][0]["homepage"], "https://github.com/example/alpha#readme");
 
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list"])
+        .with_args(["licenses", "list"])
         .output()
         .expect("run licenses");
     assert!(
@@ -149,13 +162,14 @@ fn licenses_requires_a_lockfile() {
     fs::write(project.path().join("package.json"), "{}").expect("write manifest");
 
     let output = pacquet_in(project.path())
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ERR_PNPM_LICENSES_NO_LOCKFILE"), "{stderr}");
-    assert!(stderr.contains("No pnpm-lock.yaml found"), "{stderr}");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse JSON error");
+    assert_eq!(report["error"]["code"], "ERR_PNPM_LICENSES_NO_LOCKFILE");
+    let message = report["error"]["message"].as_str().expect("error message");
+    assert!(message.contains("No pnpm-lock.yaml found"), "{message}");
 }
 
 #[test]
@@ -174,7 +188,7 @@ fn licenses_renders_empty_results_in_the_requested_format() {
         (vec!["licenses", "list", "--prod"], "No licenses in packages found\n"),
     ] {
         let output = pacquet_in(project.path())
-            .args(arguments)
+            .with_args(arguments)
             .output()
             .expect("run licenses");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -198,10 +212,10 @@ fn licenses_renders_empty_results_when_no_recursive_projects_match() {
             .expect("write project manifest");
 
         for (json, expected) in [(false, "No licenses in packages found\n"), (true, "{}\n")] {
-            let mut command = pacquet_in(workspace.path());
-            command.args(["--filter", "no-such-pkg", "--recursive", "licenses", "list"]);
+            let mut command = pacquet_in(workspace.path())
+                .with_args(["--filter", "no-such-pkg", "--recursive", "licenses", "list"]);
             if json {
-                command.arg("--json");
+                command = command.with_arg("--json");
             }
             let output = command.output().expect("run licenses");
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -234,7 +248,7 @@ fn licenses_does_not_use_root_dependencies_for_an_unrecorded_workspace_project()
     .expect("write package manifest");
 
     let output = pacquet_in(&project)
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -246,7 +260,7 @@ fn licenses_does_not_use_root_dependencies_for_an_unrecorded_workspace_project()
     );
 
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list", "--dev"])
+        .with_args(["licenses", "list", "--dev"])
         .output()
         .expect("run licenses for dev dependencies");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -292,18 +306,18 @@ fn licenses_reads_global_store_metadata_with_a_manifest_selected_runtime() {
     )
     .expect("write package.json");
 
-    let mut pacquet = pacquet;
+    let pacquet = pacquet;
     pacquet
-        .env("XDG_CONFIG_HOME", &config_home)
-        .arg("install")
+        .with_env("XDG_CONFIG_HOME", &config_home)
+        .with_arg("install")
         .assert()
         .success();
 
     for subcommand in ["list", "ls"] {
-        let mut licenses_command = pacquet_in(&workspace);
+        let licenses_command = pacquet_in(&workspace);
         let output = licenses_command
-            .env("XDG_CONFIG_HOME", &config_home)
-            .args(["licenses", subcommand, "--json"])
+            .with_env("XDG_CONFIG_HOME", &config_home)
+            .with_args(["licenses", subcommand, "--json"])
             .output()
             .expect("spawn pacquet licenses");
         assert!(
@@ -525,7 +539,7 @@ snapshots:
 /// The `MIT` group of `pnpm licenses list --json` run with `args` in `dir`.
 fn listed_mit_packages(dir: &Path, args: &[&str]) -> Vec<Value> {
     let output = pacquet_in(dir)
-        .args(args)
+        .with_args(args)
         .output()
         .expect("run licenses");
     assert!(
@@ -639,7 +653,7 @@ snapshots:
 
     let listed = |dir: &str, args: &[&str]| -> Vec<(String, String)> {
         let output = pacquet_in(&workspace.path().join(dir))
-            .args(args)
+            .with_args(args)
             .output()
             .expect("run licenses");
         assert!(
@@ -713,7 +727,7 @@ fn licenses_lists_all_valid_copies_of_a_collapsed_hoisted_variant() {
         },
     }).to_string()).expect("write modules manifest");
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -760,7 +774,7 @@ fn licenses_lists_distinct_isolated_peer_installations_of_one_version() {
         .expect("write manifest");
     }
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -864,7 +878,7 @@ publicHoistPattern:
     .expect("write .modules.yaml");
 
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(
@@ -957,7 +971,7 @@ hoistedLocations:
     .expect("write .modules.yaml");
 
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(
@@ -1050,7 +1064,7 @@ snapshots:
     .expect("write .modules.yaml");
 
     let output = pacquet_in(workspace.path())
-        .args(["licenses", "list", "--json"])
+        .with_args(["licenses", "list", "--json"])
         .output()
         .expect("run licenses");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -1061,7 +1075,8 @@ snapshots:
         .as_object()
         .expect("license groups")
         .values()
-        .flat_map(|group| group.as_array().expect("license group"))
+        .map(Value::as_array)
+        .flat_map(|array| array.expect("license group"))
         .filter(|pkg| pkg["name"] == "is-positive")
         .flat_map(|pkg| {
             let versions = pkg["versions"]
@@ -1101,4 +1116,146 @@ snapshots:
             || nested_path == workspace.path().join(virtual_store_path),
         "the root package holds another version, so 1.0.0 falls back to its virtual-store path, got {nested_path:?}",
     );
+}
+
+mod named_registries;
+
+#[test]
+fn licenses_reads_cached_metadata_without_node_modules() {
+    let CommandTempCwd {
+        root: _root,
+        workspace,
+        npmrc_info: _registry,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "dependencies": { "@pnpm.e2e/legacy-license": "1.0.0" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for args in [["install", "--lockfile-only"].as_slice(), ["fetch"].as_slice()] {
+        pacquet_in(&workspace)
+            .with_args(args)
+            .assert()
+            .success();
+    }
+    let read_licenses = || {
+        let output = pacquet_in(&workspace)
+            .with_args(["licenses", "list", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let before = read_licenses();
+    assert_eq!(before["MIT"][0]["name"], "@pnpm.e2e/legacy-license");
+    if workspace.join("node_modules").exists() {
+        fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+    }
+    let after = read_licenses();
+    assert_eq!(after, before);
+    assert!(!workspace.join("node_modules").exists());
+}
+
+#[test]
+fn licenses_reads_license_file_from_cached_local_tarball() {
+    for format in ["sqlite", "files"] {
+        let CommandTempCwd {
+            root,
+            workspace,
+            npmrc_info: _registry,
+            ..
+        } = CommandTempCwd::init().add_mocked_registry();
+        let package = root.path().join("archive-source");
+        fs::create_dir(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            json!({
+                "name": "cached-license-example", "version": "1.0.0",
+                "license": "SEE LICENSE IN LICENSE", "description": "Cached package details",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(package.join("LICENSE"), "MIT License").unwrap();
+        pacquet_in(&package)
+            .with_args(["pack", "--pack-destination"])
+            .with_arg(&workspace)
+            .assert()
+            .success();
+        fs::write(workspace.join("package.json"), json!({
+            "dependencies": { "cached-license-example": "file:cached-license-example-1.0.0.tgz" },
+        }).to_string()).unwrap();
+        let config_path = workspace.join("pnpm-workspace.yaml");
+        let config = fs::read_to_string(&config_path).unwrap_or_default();
+        let config = format!("{config}\nstoreIndexFormat: {format}\n");
+        fs::write(&config_path, &config).unwrap();
+        pacquet_in(&workspace)
+            .with_args(["install", "--lockfile-only"])
+            .assert()
+            .success();
+        assert!(!workspace.join("node_modules").exists());
+        pacquet_in(&workspace)
+            .with_arg("fetch")
+            .assert()
+            .success();
+        if workspace.join("node_modules").exists() {
+            fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+        }
+        fs::write(&config_path, format!("{config}frozenStore: true\n")).unwrap();
+        let output = pacquet_in(&workspace)
+            .with_args(["licenses", "list", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(parsed["MIT"][0]["name"], "cached-license-example", "{parsed}");
+        assert_eq!(parsed["MIT"][0]["description"], "Cached package details");
+        assert!(!workspace.join("node_modules").exists());
+    }
+}
+
+#[test]
+fn licenses_reads_cached_git_metadata() {
+    use pnpm_testing_utils::git_repo::GitRepoFixture;
+
+    for ignore_scripts in [false, true] {
+        let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init().add_mocked_registry();
+        let repo = GitRepoFixture::init(root.path(), "cached-git-example");
+        repo.write_file(
+            "package.json",
+            r#"{"name":"cached-git-example","version":"1.0.0","license":"SEE LICENSE IN LICENSE"}"#,
+        );
+        repo.write_file("LICENSE", "MIT License");
+        let commit = repo.commit("init");
+        fs::write(
+            workspace.join("package.json"),
+            json!({
+                "dependencies": { "cached-git-example": repo.git_url_at(&commit) },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args =
+            if ignore_scripts { vec!["install", "--ignore-scripts"] } else { vec!["install"] };
+        pacquet_in(&workspace)
+            .with_args(args)
+            .assert()
+            .success();
+        fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+        let mut args = vec!["licenses", "list", "--json"];
+        if ignore_scripts {
+            args.push("--ignore-scripts");
+        }
+        let output = pacquet_in(&workspace)
+            .with_args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(parsed["MIT"][0]["name"], "cached-git-example", "{parsed}");
+    }
 }

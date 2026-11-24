@@ -1,9 +1,29 @@
 use super::{
-    Diagnostic, Display, Error, OtpChallenge, OtpError, OtpErrorBody, OtpSession, PER_PAGE,
-    Reporter, RetryOpts, STAGE_BODY_LIMIT, STAGE_ERROR_BODY_LIMIT, STAGE_LIST_MAX_PAGES,
-    STAGE_TARBALL_BODY_LIMIT, StageError, StageListResponse, ThrottledClient, Value,
-    WebAuthFetchOptions, WebAuthHost, WithOtpError, body_display_string, read_limited_body,
-    redact_url_credentials, send_with_retry,
+    Diagnostic,
+    Display,
+    Error,
+    OtpChallenge,
+    OtpError,
+    OtpErrorBody,
+    OtpSession,
+    PER_PAGE,
+    Reporter,
+    RetryOpts,
+    STAGE_BODY_LIMIT,
+    STAGE_ERROR_BODY_LIMIT,
+    STAGE_LIST_MAX_PAGES,
+    STAGE_TARBALL_BODY_LIMIT,
+    StageError,
+    StageListResponse,
+    ThrottledClient,
+    Value,
+    WebAuthFetchOptions,
+    WebAuthHost,
+    WithOtpError,
+    body_display_string,
+    read_limited_body,
+    redact_url_credentials,
+    send_with_retry,
 };
 use crate::cli_args::registry_client::apply_auth_and_otp;
 
@@ -48,13 +68,13 @@ pub(super) async fn fetch_stage_tarball(
     let action = format!("download staged package {stage_id}");
     let (_guard, response) = stage_send(context, reqwest::Method::GET, url.as_str(), None)
         .await
-        .map_err(|source| request_failed(&action, source))?;
+        .map_err(|source| request_failed(action.clone(), source))?;
     if !response.status().is_success() {
         return Err(registry_error_from_response(response, &action).await.into());
     }
     let tarball_data = read_limited_body(response, STAGE_TARBALL_BODY_LIMIT)
         .await
-        .map_err(|source| request_failed(&action, source))?;
+        .map_err(|source| request_failed(action.clone(), source))?;
     if tarball_data.truncated {
         return Err(StageError::RequestFailed {
             operation: action,
@@ -71,7 +91,18 @@ pub(super) struct StageContext {
     pub(super) http_client: ThrottledClient,
     pub(super) retry_opts: RetryOpts,
     pub(super) otp: Option<String>,
+    pub(super) otp_registry_confirmed: bool,
     pub(super) web_auth_fetch_options: WebAuthFetchOptions,
+}
+
+impl StageContext {
+    fn require_otp_registry(&self) -> Result<(), StageHttpError> {
+        if self.otp_registry_confirmed {
+            Ok(())
+        } else {
+            Err(StageHttpError::Request(Box::new(StageError::OtpRegistryRequired)))
+        }
+    }
 }
 
 /// An HTTP-level failure of a stage mutation, handed to the
@@ -128,7 +159,7 @@ pub(super) async fn stage_request_in_session<Reporter: self::Reporter>(
         .run::<WebAuthHost, Reporter, (), StageHttpError, _, _>(
             // A plain `FnMut` returning an `async move` block (not an
             // `AsyncFnMut`) so the produced future carries an ordinary `Send`
-            // obligation — see `with_otp_handling`'s `Operation` bound.
+            // obligation; see `with_otp_handling`'s `Operation` bound.
             move |challenge_otp: Option<String>| {
                 // The web-auth-provided OTP (a fresh challenge) takes precedence
                 // over any statically configured one.
@@ -161,9 +192,12 @@ async fn stage_mutation(
     action: &str,
     otp: Option<&str>,
 ) -> Result<(), StageHttpError> {
+    if otp.is_some() {
+        context.require_otp_registry()?;
+    }
     let (_guard, response) = stage_send(context, method, url, otp).await
         .map_err(|source| {
-            StageHttpError::Request(Box::new(request_failed_error(action, source)))
+            StageHttpError::Request(Box::new(request_failed_error(action.to_owned(), source)))
         })?;
     let status = response.status();
     if status.is_success() {
@@ -176,15 +210,17 @@ async fn stage_mutation(
     let www_authenticate = response
         .headers()
         .get(reqwest::header::WWW_AUTHENTICATE)
-        .and_then(|value| value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .map(str::to_owned);
     let body = read_limited_body(response, STAGE_ERROR_BODY_LIMIT).await
         .map_err(|source| {
-            StageHttpError::Request(Box::new(request_failed_error(action, source)))
+            StageHttpError::Request(Box::new(request_failed_error(action.to_owned(), source)))
         })?;
     if status.as_u16() == 401
         && let Some(challenge) = parse_stage_otp_challenge(www_authenticate.as_deref(), &body.bytes)
     {
+        context.require_otp_registry()?;
         return Err(StageHttpError::Otp { challenge });
     }
     Err(StageHttpError::Registry(StageRegistryError::new(
@@ -234,12 +270,12 @@ pub(super) async fn stage_json_request<Body: serde::de::DeserializeOwned>(
 ) -> miette::Result<Body> {
     let (_guard, response) = stage_send(context, reqwest::Method::GET, url, None)
         .await
-        .map_err(|source| request_failed(action, source))?;
+        .map_err(|source| request_failed(action.to_owned(), source))?;
     if !response.status().is_success() {
         return Err(registry_error_from_response(response, action).await.into());
     }
     let body = read_limited_body(response, STAGE_BODY_LIMIT).await
-        .map_err(|source| request_failed(action, source))?;
+        .map_err(|source| request_failed(action.to_owned(), source))?;
     if body.truncated {
         return Err(StageError::RequestFailed {
             operation: action.to_owned(),
@@ -247,7 +283,7 @@ pub(super) async fn stage_json_request<Body: serde::de::DeserializeOwned>(
         }
         .into());
     }
-    serde_json::from_slice(&body.bytes).map_err(|source| request_failed(action, source))
+    serde_json::from_slice(&body.bytes).map_err(|source| request_failed(action.to_owned(), source))
 }
 
 /// Send one request to a `-/stage` endpoint with the stage headers
@@ -297,21 +333,22 @@ fn parse_stage_otp_challenge(www_authenticate: Option<&str>, body: &[u8]) -> Opt
     let auth_url = read("authUrl");
     let done_url = read("doneUrl");
     let has_web_auth_urls = auth_url.is_some() && done_url.is_some();
-    let header_mentions_otp =
-        www_authenticate.is_some_and(|value| value.to_lowercase().contains("otp"));
+    let header_mentions_otp = www_authenticate
+        .map(str::to_lowercase)
+        .is_some_and(|lowercase| lowercase.contains("otp"));
     if !has_web_auth_urls && !header_mentions_otp {
         return None;
     }
     Some(OtpChallenge { body: Some(OtpErrorBody { auth_url, done_url }) })
 }
 
-fn request_failed(action: &str, source: impl std::fmt::Display) -> miette::Report {
+fn request_failed(action: String, source: impl std::fmt::Display) -> miette::Report {
     request_failed_error(action, source).into()
 }
 
-fn request_failed_error(action: &str, source: impl std::fmt::Display) -> StageError {
+fn request_failed_error(action: String, source: impl std::fmt::Display) -> StageError {
     StageError::RequestFailed {
-        operation: action.to_owned(),
+        operation: action,
         reason: redact_url_credentials(&source.to_string()),
     }
 }
@@ -320,5 +357,5 @@ fn request_failed_error(action: &str, source: impl std::fmt::Display) -> StageEr
 pub(super) fn stage_endpoint_url(registry: &str, path: &str) -> miette::Result<reqwest::Url> {
     reqwest::Url::parse(registry)
         .and_then(|url| url.join(path))
-        .map_err(|source| request_failed("build the registry staging URL", source))
+        .map_err(|source| request_failed("build the registry staging URL".to_owned(), source))
 }

@@ -1,13 +1,22 @@
 use super::{
-    Envelope, LockfileVerificationLog, LockfileVerificationMessage, LogEvent, LogLevel, Pipe,
-    SkippedOptionalDependencyLog, SkippedOptionalPackage, SkippedOptionalParent,
-    SkippedOptionalReason, Value, assert_eq,
+    Envelope,
+    LockfileVerificationLog,
+    LockfileVerificationMessage,
+    LogEvent,
+    LogLevel,
+    Pipe,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalParent,
+    SkippedOptionalReason,
+    Value,
+    assert_eq,
 };
 
 /// `resolution_failure` payload uses the second `package` variant:
 /// no `id`, optional `name` / `version`, and a `bareSpecifier`
 /// (camelCase on the wire). The resolver-time emit carries whatever
-/// fields the resolver had at fail time — bare specifier always
+/// fields the resolver had at fail time, bare specifier always
 /// present; `name` / `version` only when the resolver advanced far
 /// enough to extract them.
 #[test]
@@ -103,14 +112,41 @@ fn lockfile_verification_started_event_matches_pnpm_wire_shape() {
     assert!(json.get("elapsedMs").is_none(), "elapsedMs must be absent on started");
 }
 
-/// `pnpm:lockfile-verification` `done` event adds `elapsedMs` in
-/// camelCase, with `status: "done"`.
+/// `pnpm:lockfile-verification` `progress` event carries the running
+/// checked count with `status: "progress"`.
+#[test]
+fn lockfile_verification_progress_event_matches_pnpm_wire_shape() {
+    let event = LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Progress {
+            entries: 12,
+            checked: 7,
+            lockfile_path: Some("/proj/pnpm-lock.yaml".to_string()),
+        },
+    });
+    let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
+    let json: Value = envelope
+        .pipe_ref(serde_json::to_string)
+        .expect("serialize envelope")
+        .pipe_as_ref(serde_json::from_str)
+        .expect("parse JSON");
+    assert_eq!(json["name"], "pnpm:lockfile-verification");
+    assert_eq!(json["status"], "progress");
+    assert_eq!(json["entries"], 12);
+    assert_eq!(json["checked"], 7);
+    assert_eq!(json["lockfilePath"], "/proj/pnpm-lock.yaml");
+    assert!(json.get("elapsedMs").is_none(), "elapsedMs must be absent on progress");
+}
+
+/// `pnpm:lockfile-verification` `done` event adds the checked count
+/// and `elapsedMs` in camelCase, with `status: "done"`.
 #[test]
 fn lockfile_verification_done_event_matches_pnpm_wire_shape() {
     let event = LogEvent::LockfileVerification(LockfileVerificationLog {
         level: LogLevel::Debug,
         message: LockfileVerificationMessage::Done {
             entries: 12,
+            checked: 12,
             elapsed_ms: 234,
             lockfile_path: Some("/proj/pnpm-lock.yaml".to_string()),
         },
@@ -124,14 +160,15 @@ fn lockfile_verification_done_event_matches_pnpm_wire_shape() {
     assert_eq!(json["name"], "pnpm:lockfile-verification");
     assert_eq!(json["status"], "done");
     assert_eq!(json["entries"], 12);
+    assert_eq!(json["checked"], 12);
     assert_eq!(json["elapsedMs"], 234);
     assert_eq!(json["lockfilePath"], "/proj/pnpm-lock.yaml");
 }
 
 /// `pnpm:lockfile-verification` `failed` mirrors the `done` shape
 /// except for the discriminator. Upstream sends it whenever the gate
-/// emitted `started` but didn't reach `done` — policy violations and
-/// unexpected throws alike — so the reporter can close out the
+/// emitted `started` but didn't reach `done` (policy violations and
+/// unexpected throws alike) so the reporter can close out the
 /// transient frame.
 #[test]
 fn lockfile_verification_failed_event_matches_pnpm_wire_shape() {
@@ -139,6 +176,7 @@ fn lockfile_verification_failed_event_matches_pnpm_wire_shape() {
         level: LogLevel::Debug,
         message: LockfileVerificationMessage::Failed {
             entries: 12,
+            checked: 0,
             elapsed_ms: 999,
             lockfile_path: Some("/proj/pnpm-lock.yaml".to_string()),
         },
@@ -151,13 +189,14 @@ fn lockfile_verification_failed_event_matches_pnpm_wire_shape() {
         .expect("parse JSON");
     assert_eq!(json["status"], "failed");
     assert_eq!(json["entries"], 12);
+    assert_eq!(json["checked"], 0);
     assert_eq!(json["elapsedMs"], 999);
     assert_eq!(json["lockfilePath"], "/proj/pnpm-lock.yaml");
 }
 
 /// `pnpm:lockfile-verification` `cached` carries the discriminator,
 /// the camelCase `verifiedAt` of the reused verdict, and the optional
-/// camelCase `lockfilePath` — no `entries` or `elapsedMs`, because
+/// camelCase `lockfilePath`, no `entries` or `elapsedMs`, because
 /// the cache short-circuit happens before candidates are collected.
 #[test]
 fn lockfile_verification_cached_event_matches_pnpm_wire_shape() {
@@ -184,7 +223,7 @@ fn lockfile_verification_cached_event_matches_pnpm_wire_shape() {
 
 /// A cached record written before `verifiedAt` existed surfaces as
 /// `None` and must be omitted from the wire rather than rendered as
-/// `null` — pnpm's reporter falls back to a timeless message on
+/// `null`, pnpm's reporter falls back to a timeless message on
 /// absence.
 #[test]
 fn lockfile_verification_cached_omits_absent_verified_at() {
@@ -206,7 +245,7 @@ fn lockfile_verification_cached_omits_absent_verified_at() {
 
 /// `lockfilePath` is upstream-optional (undefined in test paths that
 /// skip the cache wiring). When `None`, the field must be omitted
-/// rather than rendered as `null` — pnpm's reporter dispatches on
+/// rather than rendered as `null`, pnpm's reporter dispatches on
 /// presence to decide whether to render the path suffix.
 #[test]
 fn lockfile_verification_omits_absent_lockfile_path() {

@@ -1,24 +1,43 @@
-use super::{InstallFrozenLockfileError, LockfileVerificationOverride};
-use crate::{CheckVerdict, ConcurrentCheck, CreateVirtualStore, CreateVirtualStoreOutput};
+use super::{
+    InstallFrozenLockfileError,
+    LockfileVerificationOverride,
+};
+use crate::{
+    CheckVerdict,
+    ConcurrentCheck,
+    CreateVirtualStore,
+    CreateVirtualStoreOutput,
+};
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
-use pnpm_lockfile_verification::{VerifyLockfileResolutionsOptions, verify_lockfile_resolutions};
+use pnpm_lockfile_verification::{
+    ExoticSubdepsPolicy,
+    LocalResolutionPolicy,
+    LockfileCacheSource,
+    VerifyLockfileResolutionsOptions,
+    verify_lockfile_resolutions,
+};
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::ResolutionVerifier;
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::Arc,
+};
 
 /// The lockfile verification that runs alongside the fetch.
 ///
 /// `precomputed` is a verdict the caller already has in flight; when it
-/// is set the verifiers are not consulted. An empty `verifiers` with no
-/// `precomputed` verdict means `trustLockfile` — verification is a
-/// no-op.
+/// is set the verifiers are not consulted. Empty `verifiers` with an
+/// unenforced `exotic_subdeps` policy and no `precomputed` verdict means
+/// `trustLockfile`, verification is a no-op.
 pub(super) struct ConcurrentVerification<'a> {
     pub(super) lockfile: &'a Lockfile,
     pub(super) verifiers: &'a [Arc<dyn ResolutionVerifier>],
+    pub(super) exotic_subdeps: ExoticSubdepsPolicy,
     pub(super) precomputed: Option<LockfileVerificationOverride<'a>>,
-    pub(super) lockfile_path: Option<&'a Path>,
+    pub(super) lockfile_source: Option<LockfileCacheSource<'a>>,
     pub(super) cache_dir: &'a Path,
+    pub(super) local_policy: LocalResolutionPolicy,
 }
 /// Materialize the virtual store while verifying the lockfile, and
 /// return the fetch's output once the lockfile is known trusted.
@@ -82,14 +101,16 @@ impl ConcurrentVerification<'_> {
         let ConcurrentVerification {
             lockfile,
             verifiers,
+            exotic_subdeps,
             precomputed,
-            lockfile_path,
+            lockfile_source,
             cache_dir,
+            local_policy,
         } = self;
         if let Some(precomputed) = precomputed {
             return precomputed.await;
         }
-        if verifiers.is_empty() {
+        if verifiers.is_empty() && !exotic_subdeps.is_enforced() {
             return Ok(());
         }
         verify_lockfile_resolutions::<Reporter>(
@@ -97,10 +118,13 @@ impl ConcurrentVerification<'_> {
             verifiers,
             &VerifyLockfileResolutionsOptions {
                 concurrency: None,
-                lockfile_path,
+                lockfile_path: lockfile_source.map(|source| source.path),
+                lockfile_stat: lockfile_source.and_then(|source| source.stat.cloned()),
                 cache_dir: Some(cache_dir),
                 replaced: None,
                 repairs_lockfile: false,
+                exotic_subdeps,
+                local_policy: Some(local_policy),
             },
         )
         .await

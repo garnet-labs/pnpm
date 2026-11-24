@@ -1,11 +1,20 @@
 use super::{
     _utils,
-    workspace_yaml::{allow_builds, append_workspace_yaml_key},
+    workspace_yaml::{
+        allow_builds,
+        append_workspace_yaml_key,
+    },
 };
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use std::{fs, path::Path};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
+use std::{
+    fs,
+    path::Path,
+};
 
 fn enable_shell_emulator(workspace: &Path) {
     append_workspace_yaml_key(workspace, "shellEmulator", true);
@@ -115,8 +124,7 @@ fn expands_braced_parameter_expansions_in_scripts() {
 
     // The fallback is only reached when the variable is unset, so the host's
     // own environment must not decide it.
-    let mut without_the_var = _utils::pacquet_in(&workspace);
-    without_the_var.env_remove("MY_VAR");
+    let without_the_var = _utils::pacquet_in(&workspace).without_env("MY_VAR");
     without_the_var
         .with_arg("run")
         .with_arg("write-var")
@@ -126,6 +134,48 @@ fn expands_braced_parameter_expansions_in_scripts() {
         fs::read_to_string(workspace.join("out.txt")).expect("read out.txt"),
         "prefallbackpost",
     );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn preserves_quoting_after_escaped_backslashes_and_single_quotes() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("record.cjs"),
+        "require('node:fs').writeFileSync('args.json', JSON.stringify(process.argv.slice(2)))",
+    )
+    .expect("write record.cjs");
+    let package_json = serde_json::json!({
+        "name": "project-reading-escaped-backslashes",
+        "version": "1.0.0",
+        "scripts": {
+            "repro": r#"node record.cjs "a\\" '${UNSET_VAR:-expanded_by_mistake}' "dist\\${OUT_DIR:-app}" \' ${OUT_DIR:-app}"#,
+        },
+    });
+    fs::write(workspace.join("package.json"), package_json.to_string())
+        .expect("write package.json");
+    enable_shell_emulator(&workspace);
+
+    let command = pacquet.without_env("UNSET_VAR").without_env("OUT_DIR");
+    command
+        .with_args(["run", "repro"])
+        .assert()
+        .success();
+
+    let recorded: Vec<String> =
+        serde_json::from_slice(&fs::read(workspace.join("args.json")).expect("read args.json"))
+            .expect("parse args.json");
+    dbg!(&recorded);
+    assert_eq!(recorded, vec![r"a\", "${UNSET_VAR:-expanded_by_mistake}", r"dist\app", "'", "app"]);
 
     drop((root, mock_instance));
 }

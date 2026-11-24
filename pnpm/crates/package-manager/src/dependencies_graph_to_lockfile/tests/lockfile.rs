@@ -1,13 +1,30 @@
 use super::{
-    super::{GraphToLockfileOptions, ImporterLockfileInput},
-    EMPTY_CATALOGS, EMPTY_NAMED_REGISTRIES, EMPTY_REGISTRY_OPTIONS, NPM_REGISTRIES,
-    dependencies_graph_to_lockfile, make_link_node, make_node, single_importer_opts,
+    super::{
+        GraphToLockfileOptions,
+        ImporterLockfileInput,
+    },
+    EMPTY_CATALOGS,
+    EMPTY_NAMED_REGISTRIES,
+    EMPTY_REGISTRY_OPTIONS,
+    NPM_REGISTRIES,
+    dependencies_graph_to_lockfile,
+    make_link_node,
+    make_node,
+    single_importer_opts,
     write_manifest,
 };
 use indexmap::IndexMap;
 use pnpm_deps_path::DepPath;
-use pnpm_lockfile::{ImporterDepVersion, PackageKey, PkgName, SnapshotDepRef};
-use pnpm_resolving_deps_resolver::{DependenciesGraph, PeerDep};
+use pnpm_lockfile::{
+    ImporterDepVersion,
+    PackageKey,
+    PkgName,
+    SnapshotDepRef,
+};
+use pnpm_resolving_deps_resolver::{
+    DependenciesGraph,
+    PeerDep,
+};
 use rustc_hash::FxHashSet as HashSet;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -161,12 +178,14 @@ fn dedupe_peers_round_trips_through_lockfile_settings() {
             dedupe_peers: Some(true),
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,
@@ -203,12 +222,14 @@ fn dedupe_peers_round_trips_through_lockfile_settings() {
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,
@@ -297,12 +318,14 @@ fn patched_dependencies_flow_into_lockfile_and_empty_is_omitted() {
                 dedupe_peers: None,
                 exclude_links_from_lockfile: false,
                 add_missing_peer_types: None,
+                project_scoped_optional_peers: None,
                 inject_workspace_packages: false,
                 peers_suffix_max_length: None,
                 integrity_target: None,
                 resolution: pnpm_lockfile::ResolutionSettings::default(),
             },
             metadata_sources: crate::PackageMetadataSources {
+                lockfile_format: pnpm_lockfile::LockfileFormat::V9,
                 registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
                 registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
                 registries: &NPM_REGISTRIES,
@@ -401,12 +424,14 @@ fn snapshot_link_uses_lockfile_root_while_importer_link_uses_project_root() {
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,
@@ -507,12 +532,14 @@ fn multi_importer_workspace_writes_per_project_lockfile_entries() {
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
             add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
             integrity_target: None,
             resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: pnpm_lockfile::LockfileFormat::V9,
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
             registries: &NPM_REGISTRIES,

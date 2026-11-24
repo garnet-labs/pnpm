@@ -1,8 +1,12 @@
 //! Translate a `workspace:` bare specifier into the npm-shaped form
 //! the [`crate::parse_bare_specifier()`] flow consumes.
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
+use pnpm_workspace_range_resolver::matches_any_workspace_version;
 use pnpm_workspace_spec::WorkspaceSpec;
 
 /// Error raised when the input does not start with `workspace:` (and
@@ -28,8 +32,7 @@ pub fn workspace_pref_to_npm(
         });
     };
     let WorkspaceSpec { alias, version } = parsed;
-    let version_part =
-        if version == "^" || version == "~" || version.is_empty() { "*" } else { version.as_str() };
+    let version_part = if matches_any_workspace_version(&version) { "*" } else { version.as_str() };
     Ok(match alias {
         Some(alias) => format!("npm:{alias}@{version_part}"),
         None => version_part.to_string(),

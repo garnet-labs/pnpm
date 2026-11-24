@@ -2,7 +2,11 @@
 //! install: the `pnpm install` shortcut the CLI takes before starting the
 //! async runtime, and the verify-deps gate before `pnpm run` and `pnpm exec`.
 
-pub use discovery::{GateWorkspace, check_deps_status_before_run_at, deps_install_root};
+pub use discovery::{
+    GateWorkspace,
+    check_deps_status_before_run_at,
+    deps_install_root,
+};
 pub use per_project::install_already_up_to_date_per_project;
 
 mod discovery;
@@ -15,25 +19,51 @@ mod stand_ins;
 
 mod nothing_to_install;
 
-use super::{check_optimistic_repeat_install_with_state, config_blocks_fast_path};
+use super::{
+    check_optimistic_repeat_install_with_state,
+    config_blocks_fast_path,
+};
 use crate::{
     install::{
-        build_project_manifests_list, check_strict_dep_builds_for_fast_path,
-        configured_or_discovered_workspace_dir, effective_node_version, gvs_build_markers_complete,
-        included_dependencies, load_workspace_projects, lockfile_root_for,
-        project_requires_lifecycle_scripts, register_workspace_in_store,
+        build_project_manifests_list,
+        check_strict_dep_builds_for_fast_path,
+        configured_or_discovered_workspace_dir,
+        included_dependencies,
+        load_workspace_projects,
+        lockfile_root_for,
+        project_requires_lifecycle_scripts,
+        register_workspace_in_store,
     },
-    install_state::{Decision, OptimisticRepeatInstallCheck, Scope},
+    install_state::{
+        Decision,
+        OptimisticRepeatInstallCheck,
+        Scope,
+    },
 };
 use pnpm_catalogs_config::get_catalogs_from_workspace_manifest;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{Config, NodeLinker};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+};
 use pnpm_executor::PROJECT_LIFECYCLE_STAGES;
-use pnpm_lockfile::{LazyLockfile, MaybeLazyLockfile};
+use pnpm_lockfile::{
+    LazyLockfile,
+    MaybeLazyLockfile,
+};
 use pnpm_modules_yaml::IncludedDependencies;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_workspace_state::{WorkspaceState, load_workspace_state};
-use std::path::{Path, PathBuf};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_workspace_state::{
+    WorkspaceState,
+    load_workspace_state,
+};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 /// Inputs for [`install_already_up_to_date`].
 pub struct UpToDateFastPathCheck<'a> {
@@ -42,21 +72,72 @@ pub struct UpToDateFastPathCheck<'a> {
     pub dependency_groups: Vec<DependencyGroup>,
     pub node_linker: NodeLinker,
     /// The CLI-merged effective `supportedArchitectures` (yaml plus
-    /// `--cpu` / `--os` / `--libc`) — the fast path must not report
+    /// `--cpu` / `--os` / `--libc`), the fast path must not report
     /// "Already up to date" when a flag changed the target platforms.
     pub supported_architectures: Option<pnpm_package_is_installable::SupportedArchitectures>,
 }
 
 /// What an up-to-date install reports about the workspace it covered.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct UpToDateWorkspace {
-    /// The workspace root — the reporter `prefix` for the "Already up to
+    /// The workspace root, the reporter `prefix` for the "Already up to
     /// date" emission.
     pub root: PathBuf,
     /// How many projects the workspace has, or `None` when there is no
     /// `pnpm-workspace.yaml`. Feeds the `pnpm:scope` report, which the
     /// full install path derives from the same walk.
     pub project_count: Option<usize>,
+    /// What each covered project requires of the host, per
+    /// [`pnpm_deps_restorer::project_host_requirements`], by project
+    /// directory. A project that requires nothing is left out.
+    pub host_requirements: Vec<(PathBuf, pnpm_deps_restorer::ProjectHostRequirements)>,
+}
+
+/// The projects a check found up to date.
+struct CoveredProjects {
+    /// See [`UpToDateWorkspace::project_count`].
+    count: Option<usize>,
+    /// See [`UpToDateWorkspace::host_requirements`].
+    host_requirements: Vec<(PathBuf, pnpm_deps_restorer::ProjectHostRequirements)>,
+}
+
+impl CoveredProjects {
+    fn new<'a>(
+        count: Option<usize>,
+        manifests: impl IntoIterator<Item = (&'a Path, &'a PackageManifest)>,
+        runtime_on_fail: Option<&str>,
+    ) -> Self {
+        let host_requirements = manifests
+            .into_iter()
+            .filter_map(|(root_dir, manifest)| {
+                pnpm_deps_restorer::project_host_requirements(manifest.value(), runtime_on_fail)
+                    .map(|requirements| (root_dir.to_path_buf(), requirements))
+            })
+            .collect();
+        CoveredProjects { count, host_requirements }
+    }
+
+    fn into_workspace(self, root: PathBuf) -> UpToDateWorkspace {
+        UpToDateWorkspace {
+            root,
+            project_count: self.count,
+            host_requirements: self.host_requirements,
+        }
+    }
+
+    fn of(
+        count: Option<usize>,
+        manifests: &[(PathBuf, &PackageManifest)],
+        runtime_on_fail: Option<&str>,
+    ) -> Self {
+        Self::new(
+            count,
+            manifests
+                .iter()
+                .map(|(root_dir, manifest)| (root_dir.as_path(), *manifest)),
+            runtime_on_fail,
+        )
+    }
 }
 
 /// [`crate::check_optimistic_repeat_install`] inputs, callable from a
@@ -110,7 +191,7 @@ fn already_up_to_date(
     // The lockfile the install wrote sits at its `lockfileDir`, which
     // both `sharedWorkspaceLockfile: false` and an explicit pin move away
     // from the discovered workspace root. The workspace *state* keeps its
-    // own root, which only a pin moves — `state_root` below.
+    // own root, which only a pin moves, `state_root` below.
     let lockfile_root = lockfile_root_for(check.config, workspace_dir_opt.as_deref(), manifest_dir);
     let state_root = check.config.lockfile_dir.as_deref().unwrap_or(workspace_root);
     let state = load_fast_path_state(check.config, &lockfile_root, state_root)?;
@@ -120,14 +201,13 @@ fn already_up_to_date(
     let lockfile = lazy_wanted_lockfile(check.config, &lockfile_root);
     let context = FastPathContext {
         state_root,
-        lockfile_root: &lockfile_root,
         workspace_root,
         workspace_manifest: workspace_manifest.as_ref(),
         lockfile: &lockfile,
         catalogs: &catalogs,
     };
-    let project_count = match stand_ins::check_from_records(check, &context, &state) {
-        stand_ins::RecordsCheck::UpToDate(project_count) => Some(project_count),
+    let covered = match stand_ins::check_from_records(check, &context, &state) {
+        stand_ins::RecordsCheck::UpToDate(covered) => covered,
         stand_ins::RecordsCheck::Undecided(listed) => match decide {
             Decide::FromRecordsOrFiles => {
                 from_files::check_from_files(check, &context, &state, listed)?
@@ -136,7 +216,7 @@ fn already_up_to_date(
         },
     };
     register_fast_path_workspace(check.config, &lockfile_root)?;
-    Ok(UpToDateWorkspace { root: state_root.to_path_buf(), project_count })
+    Ok(covered.into_workspace(state_root.to_path_buf()))
 }
 
 fn load_fast_path_state(
@@ -163,7 +243,6 @@ fn load_fast_path_state(
 /// before it reads any project.
 struct FastPathContext<'a> {
     state_root: &'a Path,
-    lockfile_root: &'a Path,
     workspace_root: &'a Path,
     /// `None` when no `pnpm-workspace.yaml` drives the install.
     workspace_manifest: Option<&'a pnpm_workspace::WorkspaceManifest>,
@@ -216,12 +295,7 @@ fn check_fast_path_repeat_install(
         Scope::Workspace,
     );
     match decision {
-        Decision::UpToDate => gvs_build_markers_complete(
-            check.config,
-            MaybeLazyLockfile::Lazy(context.lockfile),
-            context.lockfile_root,
-            effective_node_version(check.config, check.manifest).as_deref(),
-        ),
+        Decision::UpToDate => Ok(()),
         Decision::Skipped { reason } => Err(reason),
     }
 }
@@ -248,7 +322,7 @@ fn fast_path_workspace_context(
     Some((workspace_manifest, catalogs))
 }
 
-/// The wanted lockfile, read on first use — or a stand-in that never reads
+/// The wanted lockfile, read on first use, or a stand-in that never reads
 /// one when the install is configured without a lockfile.
 fn lazy_wanted_lockfile(config: &Config, lockfile_root: &Path) -> LazyLockfile {
     if config.lockfile {

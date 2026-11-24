@@ -1,33 +1,54 @@
-use super::{
-    Arc, Command, Glob, InputsUnavailable, IntoDiagnostic, Path, ProjectFiles, ProjectInputHashes,
-    TaskCache, TaskKeyInputs, TaskNode, TaskSettings, check_input_directories, create_hex_hash,
-    create_hex_hash_bytes, create_hex_hash_from_file, env, fs, io,
-};
-use wax::Program;
+mod globs;
+mod lockfile;
 
-#[derive(Debug)]
+use super::{
+    Arc,
+    Command,
+    FileIterator,
+    InputsUnavailable,
+    IntoDiagnostic,
+    Lockfile,
+    OutputGlobs,
+    Path,
+    PathBuf,
+    ProjectFiles,
+    ProjectInputHashes,
+    TaskCache,
+    TaskKeyInputs,
+    TaskNode,
+    TaskSettings,
+    WantedLockfileSelection,
+    check_ancestors,
+    check_input_directories,
+    create_hex_hash,
+    create_hex_hash_bytes,
+    create_hex_hash_from_file,
+    env,
+    fs,
+    io,
+    validate_relative_path,
+};
+use globs::{
+    ConfiguredInputs,
+    InputSelection,
+    ParentGlob,
+    parse_inputs,
+    walk_additive_inputs,
+};
+use wax::{
+    Program,
+    walk::EntryResidue,
+};
+
+#[derive(Debug, Clone)]
 pub(super) struct HashedFile {
     pub(super) rel_path: String,
     pub(super) hash: String,
 }
 
-/// The globs a task's `inputs` declaration replaces the default set with,
-/// and the `+`-prefixed ones that add to it.
-fn input_globs(inputs: Option<&[String]>) -> miette::Result<(Vec<Glob<'_>>, Vec<Glob<'static>>)> {
-    let Some(patterns) = inputs else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let (add, replace): (Vec<&String>, Vec<&String>) = patterns
-        .iter()
-        .partition(|pattern| pattern.starts_with('+'));
-    Ok((
-        compile_globs_ref(&replace)?,
-        compile_globs_owned(
-            &add.iter()
-                .map(|pattern| pattern[1..].to_string())
-                .collect::<Vec<_>>(),
-        )?,
-    ))
+enum TrackedPathSet {
+    Cached(Arc<Vec<String>>),
+    Fresh(Arc<Vec<String>>),
 }
 
 /// A tracked input's contribution to the key, or `None` when the file is
@@ -54,40 +75,14 @@ fn hash_input(path: &Path) -> io::Result<Option<String>> {
             Err(error) => Err(error),
         };
     }
+    if !metadata.file_type().is_file() && !metadata.file_type().is_dir() {
+        return Ok(None);
+    }
     match create_hex_hash_from_file(path) {
         Ok(hash) => Ok(Some(hash)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-pub(super) fn compile_globs(patterns: &[String]) -> miette::Result<Vec<Glob<'_>>> {
-    patterns
-        .iter()
-        .map(|pattern| {
-            Glob::new(pattern).map_err(|error| miette::miette!("invalid glob {pattern:?}: {error}"))
-        })
-        .collect()
-}
-
-fn compile_globs_ref<'a>(patterns: &[&'a String]) -> miette::Result<Vec<Glob<'a>>> {
-    patterns
-        .iter()
-        .map(|pattern| {
-            Glob::new(pattern).map_err(|error| miette::miette!("invalid glob {pattern:?}: {error}"))
-        })
-        .collect()
-}
-
-fn compile_globs_owned(patterns: &[String]) -> miette::Result<Vec<Glob<'static>>> {
-    patterns
-        .iter()
-        .map(|pattern| {
-            Glob::new(pattern)
-                .map(Glob::into_owned)
-                .map_err(|error| miette::miette!("invalid glob {pattern:?}: {error}"))
-        })
-        .collect()
 }
 
 fn has_submodule_inputs(project: &Path) -> miette::Result<bool> {
@@ -136,10 +131,11 @@ fn tracked_input_files(project: &Path) -> miette::Result<crate::process::Output>
     Ok(output)
 }
 
-fn hash_tracked_inputs(project: &Path) -> miette::Result<Vec<HashedFile>> {
+fn tracked_input_paths(project: &Path) -> miette::Result<Vec<String>> {
+    check_ancestors(project, Path::new("")).into_diagnostic()?;
     let project_display = project.display();
     let output = tracked_input_files(project)?;
-    let mut files: Vec<HashedFile> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
     for rel_path in output.stdout.split(|byte| *byte == 0) {
         if rel_path.is_empty() {
             continue;
@@ -154,42 +150,38 @@ fn hash_tracked_inputs(project: &Path) -> miette::Result<Vec<HashedFile>> {
         if rel_path == "node_modules" || rel_path.starts_with("node_modules/") {
             continue;
         }
-        check_input_directories(project, Path::new(rel_path)).into_diagnostic()?;
-        let hash = hash_input(&project.join(rel_path))
-            .map_err(|error| {
-                miette::miette!("hashing cache input {rel_path:?} in {project_display}: {error}")
-            })?;
-        let Some(hash) = hash else { continue };
-        files.push(HashedFile { rel_path: rel_path.to_string(), hash });
+        paths.push(rel_path.to_string());
     }
-    Ok(files)
+    paths.sort();
+    Ok(paths)
 }
 
 impl TaskCache {
-    /// The task's cache key: `pnpm-pipeline-task:v0` over the components
+    /// The task's cache key: `pnpm-pipeline-task:v1` over the components
     /// the RFC names, NUL-separated and hashed.
     pub fn compute_task_key(&self, inputs: &TaskKeyInputs<'_>) -> miette::Result<Option<String>> {
+        let lockfile_hash = self.lockfile_hash(inputs.lockfile_dir, inputs.lockfile_selection)?;
         let mut components: Vec<String> = vec![
             "pnpm-pipeline-task:v1".to_string(),
             platform_cache_component(),
+            format!(
+                "shell:{:?}:{}",
+                inputs.environment.script_shell, inputs.environment.shell_emulator,
+            ),
             format!("outputs:{:?}", inputs.settings.and_then(|settings| settings.outputs.as_ref())),
             self.project_rel(&inputs.node.project),
             inputs.node.task_name.clone(),
-            format!("lockfile:{}", self.lockfile_hash),
+            format!("lockfile:{lockfile_hash}"),
             format!("runtime:{}", self.runtime_fingerprint),
         ];
         for (stage, body) in inputs.script_bodies {
             components.push(format!("script:{stage}={body}"));
         }
-        for name in inputs.settings.and_then(|settings| settings.env.as_deref()).unwrap_or_default()
-        {
-            let value = inputs.environment
-                .get(name)
-                .cloned()
-                .or_else(|| env::var(name).ok());
-            components.push(format!("env:{name}={value:?}"));
-        }
-        let Some(files) = self.input_files(inputs.node, inputs.settings)? else { return Ok(None) };
+        components.extend(environment_components(inputs));
+        let Some(files) = self.input_files(inputs.node, inputs.settings, inputs.sibling_outputs)?
+        else {
+            return Ok(None);
+        };
         for file in files.iter() {
             components.push(format!("file:{}={}", file.rel_path, file.hash));
         }
@@ -197,6 +189,44 @@ impl TaskCache {
             components.push(format!("dep:{dependency_key}"));
         }
         Ok(Some(create_hex_hash(&components.join("\0"))))
+    }
+
+    pub(super) fn hash_cached_file(&self, path: &Path) -> io::Result<Option<String>> {
+        if let Some(cached) = self.file_hashes
+            .lock()
+            .expect("file-hashes lock is not poisoned")
+            .get(path)
+        {
+            return Ok(cached.clone());
+        }
+        let hashed = hash_input(path)?;
+        self.file_hashes
+            .lock()
+            .expect("file-hashes lock is not poisoned")
+            .insert(path.to_path_buf(), hashed.clone());
+        Ok(hashed)
+    }
+
+    fn hash_tracked_file(&self, project: &Path, rel_path: &str) -> miette::Result<Option<String>> {
+        let full_path = project.join(rel_path);
+        if let Some(cached) = self.file_hashes
+            .lock()
+            .expect("file-hashes lock is not poisoned")
+            .get(&full_path)
+        {
+            return Ok(cached.clone());
+        }
+        check_input_directories(project, Path::new(rel_path)).into_diagnostic()?;
+        let hashed = hash_input(&full_path)
+            .map_err(|error| {
+                let project_display = project.display();
+                miette::miette!("hashing cache input {rel_path:?} in {project_display}: {error}")
+            })?;
+        self.file_hashes
+            .lock()
+            .expect("file-hashes lock is not poisoned")
+            .insert(full_path, hashed.clone());
+        Ok(hashed)
     }
 
     pub fn project_rel(&self, project: &Path) -> String {
@@ -208,60 +238,98 @@ impl TaskCache {
 
     /// The task's input files with their content hashes: the project's
     /// tracked (and untracked, unignored) files minus its declared
-    /// outputs and `node_modules`, narrowed by the task's `inputs` globs
-    /// when declared (`+`-prefixed entries add to the default set
-    /// instead).
+    /// outputs and `node_modules`, narrowed or extended by the task's
+    /// `inputs` globs when declared.
     fn input_files(
         &self,
         node: &TaskNode,
         settings: Option<&TaskSettings>,
+        sibling_outputs: &[OutputGlobs<'_>],
     ) -> miette::Result<ProjectInputHashes> {
-        let Some(all) = self.hashed_project_files(&node.project)? else { return Ok(None) };
-        let output_globs = compile_globs(
+        let selection =
+            parse_inputs(settings.and_then(|settings| settings.inputs.as_deref()))?;
+        if matches!(selection, InputSelection::Empty) {
+            check_ancestors(&node.project, Path::new("")).into_diagnostic()?;
+            return Ok(Some(Arc::new(Vec::new())));
+        }
+        let output_globs = [OutputGlobs::new(
             settings.and_then(|settings| settings.outputs.as_deref()).unwrap_or_default(),
-        )?;
-        let (replace_globs, add_globs) =
-            input_globs(settings.and_then(|settings| settings.inputs.as_deref()))?;
-        let filtered: Vec<HashedFile> = all
-            .iter()
-            .filter(|file| {
-                !output_globs
-                    .iter()
-                    .any(|glob| glob.is_match(file.rel_path.as_str()))
-            })
-            .filter(|file| {
-                let in_default = replace_globs.is_empty()
-                    || replace_globs
-                        .iter()
-                        .any(|glob| glob.is_match(file.rel_path.as_str()));
-                in_default
-                    || add_globs
-                        .iter()
-                        .any(|glob| glob.is_match(file.rel_path.as_str()))
-            })
-            .map(|file| HashedFile { rel_path: file.rel_path.clone(), hash: file.hash.clone() })
-            .collect();
-        Ok(Some(Arc::new(filtered)))
+        )?];
+        match selection {
+            InputSelection::Default => {
+                self.hash_selected_project_files(&node.project, |rel_path| {
+                    !matches_project_output(rel_path, &output_globs)
+                        && !matches_project_output(rel_path, sibling_outputs)
+                })
+            }
+            InputSelection::Empty => Ok(Some(Arc::new(Vec::new()))),
+            InputSelection::Configured(configured) => {
+                resolve_configured_inputs(self, &node.project, &output_globs, &configured)
+            }
+        }
     }
 
-    pub(super) fn hashed_project_files(
+    fn hash_selected_project_files(
         &self,
         project: &Path,
+        mut include: impl FnMut(&str) -> bool,
     ) -> miette::Result<ProjectInputHashes> {
-        if let Some(files) = self.project_files
+        let Some(path_set) = self.cached_or_tracked_paths(project)? else {
+            return Ok(None);
+        };
+        let paths = match &path_set {
+            TrackedPathSet::Cached(paths) | TrackedPathSet::Fresh(paths) => paths,
+        };
+        let mut files: Vec<HashedFile> = Vec::new();
+        for rel_path in paths.iter() {
+            if !include(rel_path) {
+                continue;
+            }
+            if let Some(hash) = self.hash_tracked_file(project, rel_path)? {
+                files.push(HashedFile { rel_path: rel_path.clone(), hash });
+            }
+        }
+        match path_set {
+            TrackedPathSet::Fresh(paths) => {
+                self.project_files
+                    .lock()
+                    .expect("project-files lock is not poisoned")
+                    .insert(project.to_path_buf(), ProjectFiles::Tracked(paths));
+            }
+            TrackedPathSet::Cached(_) => {}
+        }
+        Ok(Some(Arc::new(files)))
+    }
+
+    fn cached_or_tracked_paths(&self, project: &Path) -> miette::Result<Option<TrackedPathSet>> {
+        if let Some(entry) = self.project_files
             .lock()
             .expect("project-files lock is not poisoned")
             .get(project)
         {
-            return Ok(files.hashes());
+            return Ok(match entry {
+                ProjectFiles::Tracked(paths) => Some(TrackedPathSet::Cached(Arc::clone(paths))),
+                ProjectFiles::Unavailable(_) => None,
+            });
         }
-        let files = project_files(project)?;
-        let hashes = files.hashes();
-        self.project_files
-            .lock()
-            .expect("project-files lock is not poisoned")
-            .insert(project.to_path_buf(), files);
-        Ok(hashes)
+        match project_tracked_paths(project)? {
+            ProjectFiles::Tracked(paths) => Ok(Some(TrackedPathSet::Fresh(paths))),
+            ProjectFiles::Unavailable(reason) => {
+                self.project_files
+                    .lock()
+                    .expect("project-files lock is not poisoned")
+                    .insert(project.to_path_buf(), ProjectFiles::Unavailable(reason));
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn hashed_project_files(
+        &self,
+        project: &Path,
+    ) -> miette::Result<ProjectInputHashes> {
+        self.hash_selected_project_files(project, |_| true)
     }
 
     /// Why the project has no file set, when it has none.
@@ -274,23 +342,92 @@ impl TaskCache {
     }
 }
 
-/// A project's file set, or why it has none.
-fn project_files(project: &Path) -> miette::Result<ProjectFiles> {
+fn resolve_configured_inputs(
+    cache: &TaskCache,
+    project: &Path,
+    output_globs: &[OutputGlobs<'_>],
+    configured: &ConfiguredInputs<'_>,
+) -> miette::Result<ProjectInputHashes> {
+    let Some(selected) = cache.hash_selected_project_files(project, |rel_path| {
+        (configured.replace.is_empty()
+            || configured.replace
+                .iter()
+                .any(|glob| glob.is_match(rel_path)))
+            && !is_excluded_input(project, rel_path, output_globs, &configured.exclude)
+    })?
+    else {
+        return Ok(None);
+    };
+    let mut files = Arc::unwrap_or_clone(selected);
+    files.extend(walk_additive_inputs(cache, project, output_globs, configured)?);
+    files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    files.dedup_by(|left, right| left.rel_path == right.rel_path);
+    Ok(Some(Arc::new(files)))
+}
+
+fn is_excluded_input(
+    project: &Path,
+    rel_path: &str,
+    output_globs: &[OutputGlobs<'_>],
+    exclude: &[ParentGlob],
+) -> bool {
+    matches_project_output(rel_path, output_globs)
+        || exclude
+            .iter()
+            .any(|glob| glob.matches_rel_path(project, rel_path))
+}
+
+fn is_outside_project(rel_path: &str) -> bool {
+    rel_path == ".." || rel_path.starts_with("../")
+}
+
+fn matches_project_output(rel_path: &str, output_globs: &[OutputGlobs<'_>]) -> bool {
+    !is_outside_project(rel_path)
+        && output_globs
+            .iter()
+            .any(|glob| glob.is_match(rel_path))
+}
+
+fn output_residue(rel_path: &str, output_globs: &[OutputGlobs<'_>]) -> Option<EntryResidue> {
+    if is_outside_project(rel_path) {
+        return None;
+    }
+    let mut matched = false;
+    for globs in output_globs {
+        if !globs.is_match(rel_path) {
+            continue;
+        }
+        if globs.exclude.is_empty()
+            && globs.include
+                .iter()
+                .any(|glob| {
+                    glob.is_match(rel_path)
+                        && matches!(glob.is_exhaustive(), wax::query::When::Always)
+                })
+        {
+            return Some(EntryResidue::Tree);
+        }
+        matched = true;
+    }
+    matched.then_some(EntryResidue::File)
+}
+
+/// A project's tracked-file path list, or why it has none.
+fn project_tracked_paths(project: &Path) -> miette::Result<ProjectFiles> {
     if !git_work_tree(project)? {
         return Ok(ProjectFiles::Unavailable(InputsUnavailable::NoGit));
     }
     if has_submodule_inputs(project)? {
         return Ok(ProjectFiles::Unavailable(InputsUnavailable::Submodules));
     }
-    let mut files = hash_tracked_inputs(project)?;
-    files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    Ok(ProjectFiles::Hashed(Arc::new(files)))
+    let paths = tracked_input_paths(project)?;
+    Ok(ProjectFiles::Tracked(Arc::new(paths)))
 }
 
 /// Whether git can enumerate the project's files at all.
 ///
 /// The default input set is `git ls-files`, so a project outside a work
-/// tree — or a machine without `git` — has no discoverable inputs. That is
+/// tree (or a machine without `git`) has no discoverable inputs. That is
 /// a reason to run the task without a cache key, not to abort the whole
 /// pipeline: the caller reports it and the task runs uncached.
 fn git_work_tree(project: &Path) -> miette::Result<bool> {
@@ -321,4 +458,21 @@ fn platform_cache_component() -> String {
         };
         format!("platform:{os}:{}", pnpm_detect_libc::host_target_arch())
     }
+}
+
+fn environment_components(inputs: &TaskKeyInputs<'_>) -> Vec<String> {
+    let mut components = Vec::new();
+    let mut environment: Vec<_> = inputs.environment.variables.iter().collect();
+    environment.sort_unstable_by_key(|(name, _)| *name);
+    for (name, value) in environment {
+        components.push(format!("configured-env:{name}={value:?}"));
+    }
+    for name in inputs.settings.and_then(|settings| settings.env.as_deref()).unwrap_or_default() {
+        let value = inputs.environment.variables
+            .get(name)
+            .cloned()
+            .or_else(|| env::var(name).ok());
+        components.push(format!("env:{name}={value:?}"));
+    }
+    components
 }

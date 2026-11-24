@@ -1,11 +1,40 @@
+#[cfg(test)]
+mod tests;
+
 use super::{
-    Arc, BTreeMap, ChildrenOwnerClaim, ChildrenRecording, DependencySpec, DirectDep, FrontierNode,
-    HashMap, HashSet, NodeId, NodeKind, NodeSeed, ParentPkgAliases, PendingNode,
-    PreferredVersionsOverlay, RecordedChildrenContext, ResolveDependencyTreeError, SeededNode,
-    SkippedOptionalDependencyParent, TreeChildren, TreeCtx, catalogs_for_children,
-    claim_children_owner, claim_recorded_subtree_owners, extract_peer_dependencies,
-    insert_tree_node, is_current_children_owner, lock_recoverable, make_non_owner_nodes_lazy,
-    record_children, recorded_children_match, recorded_prior_key, register_peer_dep_names,
+    Arc,
+    BTreeMap,
+    ChildrenOwnerClaim,
+    ChildrenRecording,
+    DependencySpec,
+    DirectDep,
+    FrontierNode,
+    HashMap,
+    HashSet,
+    NodeId,
+    NodeKind,
+    NodeSeed,
+    ParentPkgAliases,
+    PendingNode,
+    PreferredVersionsOverlay,
+    RecordedChildrenContext,
+    ResolveDependencyTreeError,
+    SeededNode,
+    SkippedOptionalDependencyParent,
+    TreeChildren,
+    TreeCtx,
+    catalogs_for_peers,
+    claim_children_owner,
+    claim_recorded_subtree_owners,
+    extract_peer_dependencies,
+    insert_tree_node,
+    is_current_children_owner,
+    lock_recoverable,
+    make_non_owner_nodes_lazy,
+    record_children,
+    recorded_children_match,
+    recorded_prior_key,
+    register_peer_dep_names,
 };
 
 /// Settle children ownership across every occurrence one level seeded.
@@ -65,11 +94,7 @@ pub(super) fn assign_level_owners<'seed>(
     Ok(())
 }
 
-/// Split the package's envelope into children and peers the way its
-/// children owner reads its manifest. Which of a package's
-/// dependencies its own `peerDependencies` shadow follows from the
-/// scope the occurrence resolved in, so a package first seeded by one
-/// occurrence and owned by another has to be re-split.
+/// Classify the package's peers using its children owner's scope.
 pub(super) fn install_owner_peer_dependencies(
     ctx: &TreeCtx,
     pending: &PendingNode,
@@ -83,7 +108,9 @@ pub(super) fn install_owner_peer_dependencies(
     let peer_set = extract_peer_dependencies(
         &pending.result,
         &claim.peer_shadowed,
-        catalogs_for_children(ctx, pending.resolves_children_through_catalogs),
+        catalogs_for_peers(ctx, &pending.result),
+        ctx.catalogs_dir.as_deref(),
+        &ctx.importer.lockfile_dir,
     )?;
     let mut packages = lock_recoverable(&ctx.workspace.tree.packages);
     let Some(existing) = packages.get_mut(&pending.identity.id) else { return Ok(()) };
@@ -123,7 +150,7 @@ fn settle_one_seed(
 ) -> Option<FrontierNode> {
     let NodeSeed::Pending(mut pending) = seed else { return None };
     let claim = pending.claim.take();
-    // Linked nodes don't walk their manifest's deps — see
+    // Linked nodes don't walk their manifest's deps; see
     // [`NodeKind::Link`]. They get an empty `Realized` map: a linked
     // node has no children of its own here.
     match pending.kind {
@@ -147,10 +174,15 @@ fn settle_one_seed(
             &pending.identity.node_id,
             &claim.owner,
         );
+        super::super::locked_resolution::record(
+            ctx,
+            &pending.identity.node_id,
+            pending.lockfile.locked_resolution.clone(),
+        );
         return None;
     }
-    if pending.prior_key.is_none() && !ctx.update_scope().unpins_every_edge() {
-        pending.prior_key = recorded_prior_key(ctx, &pending.identity.id);
+    if pending.lockfile.prior_key.is_none() && !ctx.update_scope().unpins_every_edge() {
+        pending.lockfile.prior_key = recorded_prior_key(ctx, &pending.identity.id);
     }
     Some(FrontierNode {
         pending,
@@ -252,7 +284,7 @@ pub(super) fn record_walked_children(
 }
 
 /// The edge one seed contributes to its parent's children. `None` for
-/// a seed the walk dropped — a cycle re-entry or a skipped optional.
+/// a seed the walk dropped, a cycle re-entry or a skipped optional.
 pub(super) fn seeded_dep(seed: &NodeSeed) -> Option<DirectDep> {
     match seed {
         NodeSeed::Done(dep) => dep.clone(),
@@ -276,7 +308,7 @@ pub(super) fn children_context(
     RecordedChildrenContext {
         children_scope: Arc::clone(children_pkg_aliases),
         peer_shadowed: Arc::clone(&claim.peer_shadowed),
-        prior_key: pending.prior_key
+        prior_key: pending.lockfile.prior_key
             .clone()
             .filter(|_| !ctx.update_scope().unpins_every_edge()),
         reused: false,
@@ -299,6 +331,11 @@ pub(super) fn insert_walked_node(ctx: &TreeCtx, pending: &PendingNode, children:
         NodeKind::Leaf | NodeKind::Branch => pending.ancestry.depth,
     };
     insert_tree_node(ctx, pending.identity.node_id.clone(), &pending.identity.id, children, depth);
+    super::super::locked_resolution::record(
+        ctx,
+        &pending.identity.node_id,
+        pending.lockfile.locked_resolution.clone(),
+    );
 }
 
 /// The install aliases one resolved level contributes to its
@@ -319,7 +356,7 @@ pub(in super::super) fn level_aliases(seeds: &[NodeSeed]) -> HashSet<String> {
 
 /// The `(name → versions)` additions one resolved level contributes
 /// to its children's preferred-versions overlay. Linked nodes carry no
-/// `name_ver` and contribute nothing — they're skipped in the fold.
+/// `name_ver` and contribute nothing, they're skipped in the fold.
 pub(in super::super) fn level_versions(
     ctx: &TreeCtx,
     seeds: &[NodeSeed],

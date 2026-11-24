@@ -1,7 +1,21 @@
-use super::{MissingIntegrityTarball, pin_still_applies, set_integrity};
-use pnpr_package_name::{CanonicalPackageName, Ecosystem};
-use serde_json::{Value, json};
-use ssri::{Algorithm, Integrity, IntegrityOpts};
+use super::{
+    MissingIntegrityTarball,
+    pin_still_applies,
+    set_integrity,
+};
+use pnpr_package_name::{
+    CanonicalPackageName,
+    Ecosystem,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use ssri::{
+    Algorithm,
+    Integrity,
+    IntegrityOpts,
+};
 
 fn digest(algorithm: Algorithm, bytes: &[u8]) -> Integrity {
     let mut opts = IntegrityOpts::new().algorithm(algorithm);
@@ -10,10 +24,12 @@ fn digest(algorithm: Algorithm, bytes: &[u8]) -> Integrity {
 }
 
 fn pinned(version: &str, shasum_of: Option<&[u8]>) -> MissingIntegrityTarball {
+    let url = format!("https://registry.test/foo/-/foo-{version}.tgz");
     MissingIntegrityTarball {
         version: version.to_string(),
         filename: format!("foo-{version}.tgz"),
-        version_route: None,
+        route: pnpr_upstream::UpstreamTarballRoute::Url(url.clone()),
+        url,
         needs_integrity: true,
         expected_shasum: shasum_of.map(|bytes| digest(Algorithm::Sha1, bytes)),
     }
@@ -65,4 +81,13 @@ fn set_integrity_writes_the_pin_into_the_version_dist() {
     set_integrity(&mut doc, "1.0.0", &integrity);
 
     assert_eq!(doc["versions"]["1.0.0"]["dist"]["integrity"], integrity.to_string());
+}
+
+#[test]
+fn background_pin_is_discarded_when_tarball_url_changes() {
+    let name = CanonicalPackageName::parse("foo", Ecosystem::Npm).unwrap();
+    let doc = json!({"versions": {"1.0.0": {"dist": {
+        "tarball": "https://other.test/foo/-/foo-1.0.0.tgz",
+    }}}});
+    assert!(!pin_still_applies(&doc, &name, &pinned("1.0.0", None)));
 }

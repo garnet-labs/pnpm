@@ -3,18 +3,29 @@
 
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{
+        Request,
+        StatusCode,
+    },
 };
-use pnpr::{LogConfig, LogFormat, logging::log_subscriber, router};
+use pnpr::{
+    LogConfig,
+    LogFormat,
+    logging::log_subscriber,
+    router,
+};
 use std::{
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::registry_groups;
+use crate::multi_ecosystem;
 
 const ACCESS_FIELDS: [&str; 9] = [
     "request_id",
@@ -60,7 +71,7 @@ impl CapturedOutput {
 
 async fn ping_under(format: LogFormat) -> (StatusCode, String) {
     let tmp = TempDir::new().unwrap();
-    let config = registry_groups::grouped_config(tmp.path(), "$all");
+    let config = multi_ecosystem::multi_ecosystem_config(tmp.path(), "$all");
     let output = CapturedOutput::default();
     let writer = {
         let output = output.clone();

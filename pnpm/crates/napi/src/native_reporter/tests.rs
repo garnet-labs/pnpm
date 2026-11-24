@@ -1,10 +1,26 @@
-use std::sync::{Arc, Mutex};
-
-use pnpm_reporter::{
-    LogEvent, LogLevel, ProgressLog, ProgressMessage, StatsLog, StatsMessage, SummaryLog,
+use std::sync::{
+    Arc,
+    Mutex,
 };
 
-use super::{Destination, NativeRenderer, ReporterOptions};
+use pnpm_reporter::{
+    DeprecationLog,
+    LockfileVerificationLog,
+    LockfileVerificationMessage,
+    LogEvent,
+    LogLevel,
+    ProgressLog,
+    ProgressMessage,
+    StatsLog,
+    StatsMessage,
+    SummaryLog,
+};
+
+use super::{
+    Destination,
+    NativeRenderer,
+    ReporterOptions,
+};
 
 const DIR: &str = "/repo";
 
@@ -39,7 +55,12 @@ fn stats(added: u64) -> LogEvent {
 }
 
 fn summary() -> LogEvent {
-    LogEvent::Summary(SummaryLog { level: LogLevel::Debug, prefix: DIR.to_string() })
+    LogEvent::Summary(SummaryLog {
+        level: LogLevel::Debug,
+        prefix: DIR.to_string(),
+        new_projects: None,
+        project_names: None,
+    })
 }
 
 #[test]
@@ -70,7 +91,7 @@ fn in_place_mode_writes_a_frame_with_cursor_control() {
 }
 
 /// Progress redraws inside the throttle window are dropped, but the state
-/// still folds them — the next event that is not a progress update renders
+/// still folds them, the next event that is not a progress update renders
 /// the current counts.
 #[test]
 fn progress_is_throttled_and_the_next_non_progress_event_catches_up() {
@@ -164,6 +185,7 @@ fn linked_root(name: &str) -> LogEvent {
                 id: None,
                 latest: None,
                 linked_from: Some("/elsewhere".to_string()),
+                registry_package: None,
             },
         },
     })
@@ -177,8 +199,8 @@ fn an_unknown_log_level_falls_back_to_info() {
     );
 }
 
-/// A host that computed its width the way pnpm does — the terminal's
-/// columns less two — can arrive at zero from a one- or two-column
+/// A host that computed its width the way pnpm does (the terminal's
+/// columns less two) can arrive at zero from a one- or two-column
 /// terminal. The renderer floors it rather than trying to wrap at nothing.
 #[test]
 fn a_zero_width_is_floored_to_one_column() {
@@ -191,4 +213,61 @@ fn a_zero_width_is_floored_to_one_column() {
     renderer.handle(&progress());
 
     assert!(!written(&buffer).is_empty());
+}
+
+/// `warn` filters the summary out, and an engine call emits no footer.
+#[test]
+fn checks_footer_prints_when_the_renderer_is_dropped() {
+    let (mut renderer, buffer) = renderer(&ReporterOptions {
+        append_only: Some(true),
+        log_level: Some("warn".to_string()),
+        ..ReporterOptions::default()
+    });
+    renderer.handle(&LogEvent::Deprecation(DeprecationLog {
+        level: LogLevel::Debug,
+        pkg_name: "express".to_string(),
+        pkg_version: "0.14.1".to_string(),
+        pkg_id: "express@0.14.1".to_string(),
+        prefix: DIR.to_string(),
+        depth: 0,
+        non_deprecated_alternative: None,
+        already_installed: false,
+    }));
+    renderer.handle(&summary());
+    assert_eq!(written(&buffer), "");
+
+    drop(renderer);
+
+    assert_eq!(written(&buffer), "\n✗ 1 package is deprecated: express@0.14.1\n\n");
+}
+
+fn supply_chain_passed() -> LogEvent {
+    LogEvent::LockfileVerification(LockfileVerificationLog {
+        level: LogLevel::Debug,
+        message: LockfileVerificationMessage::Cached { verified_at: None, lockfile_path: None },
+    })
+}
+
+/// A passing verdict beside a failed engine call's error is noise.
+#[test]
+fn failed_engine_call_prints_no_passing_checks() {
+    let (mut renderer, buffer) =
+        renderer(&ReporterOptions { append_only: Some(true), ..ReporterOptions::default() });
+    renderer.handle(&supply_chain_passed());
+
+    drop(renderer);
+
+    assert_eq!(written(&buffer), "");
+}
+
+#[test]
+fn succeeded_engine_call_prints_the_passing_checks() {
+    let (mut renderer, buffer) =
+        renderer(&ReporterOptions { append_only: Some(true), ..ReporterOptions::default() });
+    renderer.handle(&supply_chain_passed());
+    renderer.mark_succeeded();
+
+    drop(renderer);
+
+    assert_eq!(written(&buffer), "\n✓ Lockfile passes supply-chain policies\n\n");
 }

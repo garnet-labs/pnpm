@@ -1,6 +1,15 @@
 use super::{
-    CatalogMode, Config, EnvVar, HoistingLimits, LinkWorkspacePackages, Path, RegistryEntry,
-    StoreDir, WORKSPACE_MANIFEST_FILENAME, WorkspaceSettings, assert_eq,
+    CatalogMode,
+    Config,
+    EnvVar,
+    HoistingLimits,
+    LinkWorkspacePackages,
+    Path,
+    RegistryEntry,
+    StoreDir,
+    WORKSPACE_MANIFEST_FILENAME,
+    WorkspaceSettings,
+    assert_eq,
 };
 
 /// `scope` is a valid key in the global `config.yaml` (pnpm's
@@ -72,31 +81,36 @@ ignoredBuiltDependencies: [core-js]
 /// values into outbound requests.
 #[test]
 fn ignores_env_vars_inside_workspace_request_destination_values() {
-    struct EnvWithHost;
-    impl EnvVar for EnvWithHost {
-        fn var(name: &str) -> Option<String> {
-            (name == "WORK_HOST").then(|| "internal.example.com".to_owned())
-        }
-    }
-
     let yaml = r"
 pnprServer: https://${WORK_HOST}/pnpr/
-registry: https://${WORK_HOST}/npm/
 httpsProxy: http://${WORK_HOST}:8080/
 httpProxy: http://${WORK_HOST}:8081/
 noProxy: ${WORK_HOST}
 proxy: http://${WORK_HOST}:8082/
 noproxy: ${WORK_HOST}
+userAgent: agent/${WORK_HOST}
 registries:
   '@safe': https://safe.example.com/npm/
-  '@work': https://${WORK_HOST}/scope/
 namedRegistries:
   literal: 'https://registry.example.com/${/npm/'
   stable: https://registry.example.com/npm/
-  work: https://${WORK_HOST}/npm/
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithHost>();
+    let warnings = settings.substitute_env_untrusted::<EnvWithWorkHost>().unwrap();
+    let ignored: Vec<&str> = warnings
+        .iter()
+        .map(|warning| {
+            warning
+                .strip_prefix(r#"Ignored ""#)
+                .and_then(|rest| rest.split_once('"'))
+                .map(|(setting, _)| setting)
+                .expect("an ignored-setting warning")
+        })
+        .collect();
+    assert_eq!(
+        ignored,
+        ["pnprServer", "httpsProxy", "httpProxy", "proxy", "userAgent", "noProxy", "noproxy",],
+    );
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
     assert_eq!(config.pnpr_server, None);
@@ -106,7 +120,6 @@ namedRegistries:
         config.registries_by_scope.get("@safe").map(String::as_str),
         Some("https://safe.example.com/npm/"),
     );
-    assert_eq!(config.registries_by_scope.get("@work"), None);
     assert_eq!(
         config.registries_by_prefix.get("stable").map(String::as_str),
         Some("https://registry.example.com/npm/"),
@@ -115,7 +128,67 @@ namedRegistries:
         config.registries_by_prefix.get("literal").map(String::as_str),
         Some("https://registry.example.com/${/npm/"),
     );
-    assert_eq!(config.registries_by_prefix.get("work"), None);
+}
+
+/// Dropping a registry URL would resolve the packages it serves from another
+/// registry.
+/// <https://github.com/pnpm/pnpm/issues/17762>
+#[test]
+fn refuses_env_vars_inside_workspace_registry_routes() {
+    for (yaml, expected_setting) in [
+        ("registry: https://${WORK_HOST}/npm/\n", "registry"),
+        ("registries:\n  default: https://${WORK_HOST}/npm/\n", "registries['default']"),
+        (
+            "registries:\n  https://${WORK_HOST}/:\n    serverType: artifactory\n",
+            "registries['https://${WORK_HOST}/']",
+        ),
+        ("registries:\n  '@work': https://${WORK_HOST}/scope/\n", "registries['@work']"),
+        ("namedRegistries:\n  work: https://${WORK_HOST}/npm/\n", "namedRegistries['work']"),
+        (
+            "registries:\n  https://${WORK_HOST}/:\n    scopes: ['@work']\n",
+            "registries['https://${WORK_HOST}/']",
+        ),
+        (
+            "registries:\n  https://${WORK_HOST}/:\n    prefix: work\n",
+            "registries['https://${WORK_HOST}/']",
+        ),
+        (
+            "registries:\n  https://${WORK_HOST}/simple/:\n    ecosystem: pypi\n    packages: [alpha]\n",
+            "registries['https://${WORK_HOST}/simple/']",
+        ),
+    ] {
+        let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+        let error = settings.substitute_env_untrusted::<EnvWithWorkHost>().unwrap_err();
+        eprintln!("{yaml}=> {error}");
+        assert!(matches!(
+            &error,
+            crate::LoadWorkspaceYamlError::RegistryEnvNotExpanded { setting, file }
+                if setting == expected_setting && file == WORKSPACE_MANIFEST_FILENAME
+        ));
+    }
+}
+
+#[test]
+fn a_config_dependency_entry_error_names_the_entry() {
+    let path = Path::new("/store/config-dep/pnpm-config.yaml");
+    let error = WorkspaceSettings::read_config_dependency_entry::<EnvWithWorkHost>(
+        "registries:\n  '@work': https://${WORK_HOST}/scope/\n",
+        path,
+    )
+    .unwrap_err();
+    eprintln!("{error}");
+    assert!(matches!(
+        &error,
+        crate::LoadWorkspaceYamlError::RegistryEnvNotExpanded { file, .. }
+            if file == &path.display().to_string()
+    ));
+}
+
+struct EnvWithWorkHost;
+impl EnvVar for EnvWithWorkHost {
+    fn var(name: &str) -> Option<String> {
+        (name == "WORK_HOST").then(|| "internal.example.com".to_owned())
+    }
 }
 
 #[test]
@@ -140,7 +213,7 @@ scriptShell: ${SHELL}
 nodeOptions: --require=${HOOK}
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithPaths>();
+    settings.substitute_env_untrusted::<EnvWithPaths>().unwrap();
 
     let base = Path::new("/workspace/root");
     let mut config = Config::new();
@@ -165,16 +238,16 @@ fn drops_a_workspace_user_agent_with_an_env_placeholder() {
 
     let yaml = "userAgent: agent/${PNPM_TEST_TOKEN}\n";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithToken>();
+    settings.substitute_env_untrusted::<EnvWithToken>().unwrap();
     assert_eq!(settings.user_agent, None);
 
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_trusted::<EnvWithToken>();
+    settings.substitute_env_trusted::<EnvWithToken>().unwrap();
     assert_eq!(settings.user_agent.as_deref(), Some("agent/super-secret-token"));
 
     let mut settings: WorkspaceSettings =
         serde_saphyr::from_str("userAgent: my-agent/2.0\n").unwrap();
-    settings.substitute_env_untrusted::<EnvWithToken>();
+    settings.substitute_env_untrusted::<EnvWithToken>().unwrap();
     assert_eq!(settings.user_agent.as_deref(), Some("my-agent/2.0"));
 }
 
@@ -197,7 +270,7 @@ cacheDir: 日本語/${CACHE_DIR}
 scriptShell: ./ünicode-shell
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithPaths>();
+    settings.substitute_env_untrusted::<EnvWithPaths>().unwrap();
 
     let base = Path::new("/workspace/root");
     let mut config = Config::new();
@@ -236,8 +309,8 @@ fn parses_fail_if_no_match_from_yaml_and_applies() {
     assert!(config.fail_if_no_match);
 }
 
-/// The two workspace-cycle knobs are independent keys — one silences the
-/// report, the other promotes it to an error — so a file setting both is
+/// The two workspace-cycle knobs are independent keys (one silences the
+/// report, the other promotes it to an error) so a file setting both is
 /// applied to both fields.
 #[test]
 fn parses_the_workspace_cycle_settings_from_yaml_and_applies() {
@@ -286,7 +359,7 @@ fn patches_dir_reads_from_workspace_yaml() {
 }
 
 /// `testPattern` / `changedFilesIgnorePattern` cannot be set from the
-/// global `config.yaml` — pnpm lists both in its excluded keys.
+/// global `config.yaml`, pnpm lists both in its excluded keys.
 #[test]
 fn test_pattern_and_changed_files_ignore_pattern_cleared_as_workspace_only_fields() {
     let yaml = r"
@@ -481,7 +554,7 @@ fn python_settings_parse_apply_and_remain_workspace_only() {
 }
 
 /// The trust boundary follows the fields rather than the spelling, so the
-/// canonical form must refuse everything the older one does — and the message
+/// canonical form must refuse everything the older one does, and the message
 /// has to name the key the file actually wrote.
 #[test]
 fn rejects_workspace_controlled_trust_material_under_the_canonical_spelling() {
@@ -635,7 +708,7 @@ fn inject_workspace_packages_defaults_off_when_absent() {
     assert!(!config.inject_workspace_packages);
 }
 
-/// A positive `workspaceConcurrency` is taken verbatim — same
+/// A positive `workspaceConcurrency` is taken verbatim, same
 /// resolution as `childConcurrency`.
 #[test]
 fn parses_positive_workspace_concurrency_from_yaml_and_applies() {
@@ -682,7 +755,7 @@ fn workspace_and_child_concurrency_are_independent() {
 }
 
 /// `hoistPattern` and `publicHoistPattern` are tri-state via
-/// [`super::super::deserialize_double_option`] — pacquet must distinguish
+/// [`super::super::deserialize_double_option`], pacquet must distinguish
 /// "key missing" (defaults stay) from "explicit null" (hoist
 /// disabled) from "explicit list" (override). This test exercises
 /// all three for both sides plus the `apply_to` plumbing.
@@ -1002,4 +1075,58 @@ fn remote_cache_environment_overrides_the_files() {
     );
     assert_eq!(remote.build_env, None);
     assert_eq!(remote.publish, Some(true));
+}
+
+#[test]
+fn load_global_retains_global_resolution_and_machine_tools_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        r"
+blockExoticSubdeps: true
+excludeLinksFromLockfile: true
+tools:
+  node:
+    mirror: https://mirror.example.com/node/download
+",
+    )
+    .unwrap();
+
+    let loaded = crate::TrustedSettings::load_global(dir.path())
+        .expect("parse global config.yaml")
+        .expect("global config.yaml exists");
+    assert_eq!(loaded.settings.block_exotic_subdeps, Some(true));
+    assert_eq!(loaded.settings.exclude_links_from_lockfile, Some(true));
+    assert_eq!(
+        loaded.machine.tools
+            .as_ref()
+            .and_then(|tools| tools.get(&crate::Tool::Node)),
+        Some(&crate::ToolSettings {
+            mirror: Some("https://mirror.example.com/node/download".to_string()),
+            channels: None,
+        }),
+    );
+
+    let mut config = Config::new();
+    config.record_explicit_settings(&loaded);
+    loaded.apply_to(&mut config, dir.path());
+    assert!(config.block_exotic_subdeps);
+    assert!(config.exclude_links_from_lockfile);
+    assert_eq!(
+        config.explicit_settings.get("blockExoticSubdeps"),
+        Some(&serde_json::Value::Bool(true)),
+    );
+    assert_eq!(
+        config.explicit_settings.get("excludeLinksFromLockfile"),
+        Some(&serde_json::Value::Bool(true)),
+    );
+    assert_eq!(
+        config.explicit_settings.get("tools"),
+        Some(&serde_json::json!({
+            "node": {
+                "mirror": "https://mirror.example.com/node/download",
+                "channels": null
+            }
+        })),
+    );
 }

@@ -1,6 +1,15 @@
 use crate::ComVer;
-use derive_more::{AsRef, Deref, Display, Error, Into};
-use serde::{Deserialize, Serialize};
+use derive_more::{
+    AsRef,
+    Deref,
+    Display,
+    Error,
+    Into,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::fmt;
 
 /// Wrapper that checks compatibility with the lockfile versions this client supports.
@@ -14,7 +23,7 @@ impl<const MAJOR: u16> LockfileVersion<MAJOR> {
     /// Check if `comver` is compatible with `MAJOR`.
     #[must_use]
     pub const fn is_compatible(comver: ComVer) -> bool {
-        comver.major == MAJOR || MAJOR == 9 && comver.major == 12
+        comver.major == MAJOR || MAJOR == 9 && matches!(comver.major, 12 | 13)
     }
 }
 

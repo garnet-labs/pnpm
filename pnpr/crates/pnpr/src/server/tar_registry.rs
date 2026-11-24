@@ -6,13 +6,29 @@
 //! request by [`super::tar_responses::tar_response`]. Its hash is derived at publish or on the first
 //! decode, and kept in the storage's tar-integrity table.
 
+pub(super) use pnpr_route::split_package_identifier;
+
 use super::{
-    AppState, CanonicalPackageName, RegistryError, RegistrySource, Value, revision_source_registry,
+    AppState,
+    CanonicalPackageName,
+    RegistryError,
+    RegistrySource,
+    Value,
 };
-use pnpm_package_manifest::{MAX_PRECALCULATED_BINS_BYTES, serialize_precalculated_bins};
+use pnpm_package_manifest::{
+    MAX_PRECALCULATED_BINS_BYTES,
+    serialize_precalculated_bins,
+};
+use pnpr_config::RoutingConfig;
 use pnpr_storage::DerivedTar;
-use ssri::{Algorithm, Integrity};
-use std::{collections::BTreeMap, sync::Arc};
+use ssri::{
+    Algorithm,
+    Integrity,
+};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 /// Maximum cumulative serialized JSON byte size of `dist.pnpr.bins` across
 /// all versions in a single packument response.
@@ -21,12 +37,13 @@ const MAX_PACKUMENT_BINS_BYTES: usize = 64 * 1024;
 /// How a served document describes each version's tarball.
 #[derive(Clone, Copy)]
 pub(super) struct DistView<'a> {
+    pub(super) hosted: bool,
     /// The upstream whose revision tarballs may be linked. Every
     /// other version is described by its canonical resource.
     pub(super) revision_registry: Option<&'a str>,
     /// Derived tar metadata of each version's `.tgz` (see
     /// [`pnpr_storage::Storage::read_tar_integrities`]).
-    pub(super) tar_integrities: Option<&'a BTreeMap<String, DerivedTar>>,
+    pub(super) tar_integrities: Option<&'a Arc<BTreeMap<String, DerivedTar>>>,
     /// Whether the addressed registry declares `tarballs: tar`.
     pub(super) tar_registry: bool,
 }
@@ -47,21 +64,29 @@ pub(super) async fn tar_integrities_of(
 /// How a document served through `registry` from `source` describes each
 /// version's tarball, given the derived tar table of the package.
 pub(super) fn dist_view<'a>(
-    state: &'a AppState,
+    state: &AppState,
+    routing: &'a RoutingConfig,
     registry: &str,
     source: &RegistrySource,
-    tar_integrities: Option<&'a BTreeMap<String, DerivedTar>>,
+    tar_integrities: Option<&'a Arc<BTreeMap<String, DerivedTar>>>,
 ) -> DistView<'a> {
     let revision_registry = match source {
-        RegistrySource::Upstream(source) => revision_source_registry(state, source),
+        RegistrySource::Upstream(source) => {
+            routing.upstreams.get(source).map(|upstream| upstream.url.as_str())
+        }
         RegistrySource::Hosted(_) | RegistrySource::Unclaimed | RegistrySource::NotFound => None,
     };
-    DistView { revision_registry, tar_integrities, tar_registry: is_tar_registry(state, registry) }
+    DistView {
+        hosted: matches!(source, RegistrySource::Hosted(_)),
+        revision_registry,
+        tar_integrities,
+        tar_registry: is_tar_registry(state, registry),
+    }
 }
 
 /// Whether the registry `key` declares `tarballs: tar`.
 pub(super) fn is_tar_registry(state: &AppState, key: &str) -> bool {
-    state.inner.config.routing.tar_registries.contains(key)
+    state.routing().tar_registries.contains(key)
 }
 
 /// Overlay derived tar metadata onto every version of a packument, and on a
@@ -113,17 +138,6 @@ pub(super) fn describe_tar(
     describe_tar_with_budget(version, table, tar_registry, &mut bins_budget);
 }
 
-/// Whether `table` holds every fact pnpr derives from the archive `version`'s
-/// `dist` names, so describing it again would add nothing.
-pub(super) fn has_settled_tar_facts(version: &Value, table: &BTreeMap<String, DerivedTar>) -> bool {
-    version
-        .get("dist")
-        .and_then(Value::as_object)
-        .and_then(tgz_integrity_key)
-        .and_then(|key| table.get(&key))
-        .is_some_and(DerivedTar::is_fully_scanned)
-}
-
 fn describe_tar_with_budget(
     version: &mut Value,
     table: &BTreeMap<String, DerivedTar>,
@@ -166,7 +180,7 @@ fn apply_derived_tar_metadata(
     if let Some(requires_build) = derived.requires_build {
         pnpr.insert("requiresBuild".to_string(), Value::Bool(requires_build));
     }
-    if derived.requires_build == Some(false)
+    if !derived.requires_build.unwrap_or(true)
         && let Some((bins_value, bins_bytes)) =
             derived.bins.as_ref().and_then(serialize_precalculated_bins)
         && bins_bytes <= *bins_budget
@@ -235,20 +249,11 @@ pub(super) fn tgz_integrity_key(dist: &serde_json::Map<String, Value>) -> Option
         return integrity
             .parse::<Integrity>()
             .ok()
+            .filter(|integrity| !integrity.hashes.is_empty())
             .map(|integrity| integrity.to_string());
     }
     let shasum = dist.get("shasum").and_then(Value::as_str)?;
     Integrity::from_hex(shasum, Algorithm::Sha1).ok().map(|integrity| integrity.to_string())
-}
-
-/// Split `<name>@<version>` into its parts. A package name holds `@` only as
-/// its scope prefix, so the version follows the last `@` past the first byte.
-pub(super) fn split_package_identifier(identifier: &str) -> Option<(&str, &str)> {
-    let at = identifier
-        .rfind('@')
-        .filter(|at| *at > 0)?;
-    let (name, version) = (&identifier[..at], &identifier[at + 1..]);
-    (!version.is_empty() && !name.ends_with('/')).then_some((name, version))
 }
 
 #[cfg(test)]

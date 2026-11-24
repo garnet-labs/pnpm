@@ -1,12 +1,38 @@
 use super::{
-    Arc, ArtifactBlobRequest, ArtifactCandidate, ArtifactSubject, BASE64, BTreeMap, Barrier,
-    HashSet, OwnerScope, PackageIdentity, PnprClient, RegistryDeclaration, ResolveArtifactsOptions,
-    Sha512, SigningKey, TestRegistry, deps, options, signed_artifact_fixture,
-    signed_artifact_fixture_for_platform, start_pnpr, start_pnpr_artifacts, start_pnpr_inner,
+    Arc,
+    ArtifactBlobRequest,
+    ArtifactCandidate,
+    ArtifactSubject,
+    BASE64,
+    BTreeMap,
+    Barrier,
+    HashSet,
+    OwnerScope,
+    PackageIdentity,
+    PnprClient,
+    PnprClientError,
+    RegistryDeclaration,
+    ResolveArtifactsOptions,
+    Sha512,
+    SigningKey,
+    TcpListener,
+    TestRegistry,
+    capture_one_request_with_response,
+    deps,
+    options,
+    signed_artifact_fixture,
+    signed_artifact_fixture_for_platform,
+    start_pnpr,
+    start_pnpr_artifacts,
+    start_pnpr_inner,
 };
 use base64::Engine as _;
 use p256::pkcs8::EncodePublicKey as _;
 use sha2::Digest as _;
+use tokio::io::{
+    AsyncReadExt as _,
+    AsyncWriteExt as _,
+};
 
 #[tokio::test]
 async fn resolves_a_package() {
@@ -24,7 +50,8 @@ async fn resolves_a_package() {
     assert!(
         packages
             .keys()
-            .any(|key| key.to_string().starts_with("@foo/no-deps@1.0.0")),
+            .map(std::string::ToString::to_string)
+            .any(|text| text.starts_with("@foo/no-deps@1.0.0")),
         "lockfile should contain @foo/no-deps@1.0.0, got: {:?}",
         packages
             .keys()
@@ -47,7 +74,7 @@ async fn handshake_rejects_a_non_pnpr_server() {
 
     let client = PnprClient::new(server.url());
     let err = client.handshake().await.expect_err("a non-pnpr server should be rejected");
-    assert!(err.to_string().contains("not a pnpr server"), "got: {err}");
+    assert!(err.to_string().contains("/-/pnpr returned 404"), "got: {err}");
     mock.assert_async().await;
 }
 
@@ -71,7 +98,7 @@ async fn artifact_handshake_is_independent_from_the_resolver_protocol() {
         .mock("GET", "/-/pnpr")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"pnpr":{"versions":[],"artifacts":[0]}}"#)
+        .with_body(r#"{"pnpr":{"protocols":{"resolver":{"versions":[],"features":["projectTransforms"]},"artifacts":{"versions":[0]}}}}"#)
         .create_async()
         .await;
 
@@ -255,17 +282,22 @@ async fn concurrent_artifact_publications_apply_the_variant_limit_at_read_time()
     let (payload, _) = fixture.envelope.decode_payload().expect("decode fixture payload");
     let candidate =
         ArtifactCandidate { key: fixture.key, subject: payload.subject, owner: payload.owner };
+    // One client, as a publishing pnpm has: sixteen of them would be
+    // sixteen connection pools opening sixteen sockets, which is
+    // contention the limit under test has nothing to do with. The
+    // barrier is what makes the publications overlap.
+    let client = Arc::new(PnprClient::new(pnpr_url.clone()));
     let barrier = Arc::new(Barrier::new(PUBLICATIONS + 1));
     let mut publications = Vec::with_capacity(PUBLICATIONS);
     for index in 0..PUBLICATIONS {
         let barrier = Arc::clone(&barrier);
-        let pnpr_url = pnpr_url.clone();
+        let client = Arc::clone(&client);
         let pnpr_auth = pnpr_auth.clone();
         let (publish, _, _, blobs) = signed_artifact_fixture_for_platform(index);
         publications.push(tokio::spawn(async move {
             let _blobs = blobs;
             barrier.wait().await;
-            PnprClient::new(pnpr_url).publish_artifact(&publish, Some(&pnpr_auth)).await
+            client.publish_artifact(&publish, Some(&pnpr_auth)).await
         }));
     }
     barrier.wait().await;
@@ -291,18 +323,94 @@ async fn concurrent_artifact_publications_apply_the_variant_limit_at_read_time()
     assert_eq!(variants.len(), pnpm_shared_artifact_protocol::MAX_VARIANTS_PER_CANDIDATE);
 }
 
+/// An upload the server reads to its end keeps its connection, whether it
+/// stored the blob or verified a copy already stored. One refused before
+/// its body arrived leaves that body on the wire, so the connection cannot
+/// carry another request. The answer says so, and the publisher's next
+/// request goes to a connection of its own rather than into a socket the
+/// server has already shut.
+#[tokio::test]
+async fn only_an_upload_refused_before_it_arrives_retires_its_connection() {
+    let (pnpr_url, pnpr_auth, _storage) = start_pnpr_artifacts().await;
+    let authority = pnpr_url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let blob = b"native-addon";
+    let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(blob)));
+    let integrity: String = url::form_urlencoded::byte_serialize(integrity.as_bytes()).collect();
+    let upload_head = |length: u64| {
+        format!(
+            "PUT /-/pnpr/v0/artifacts/blobs/pnpr-client/{integrity} HTTP/1.1\r\n\
+             host: {authority}\r\n\
+             authorization: {pnpr_auth}\r\n\
+             content-type: application/octet-stream\r\n\
+             content-length: {length}\r\n\r\n",
+        )
+    };
+    let request = upload_head(blob.len() as u64);
+
+    let mut socket = tokio::net::TcpStream::connect(&authority).await.expect("connect to pnpr");
+    let stored = put_blob(&mut socket, &request, blob).await;
+    assert!(stored.starts_with("HTTP/1.1 201 "), "the first upload stores the blob: {stored}");
+    assert!(
+        !stored.to_ascii_lowercase().contains("connection: close"),
+        "an upload that stored its blob keeps its connection: {stored}",
+    );
+
+    // Reaching the server at all proves the first answer kept the
+    // connection.
+    let verified = put_blob(&mut socket, &request, blob).await;
+    assert!(
+        verified.starts_with("HTTP/1.1 200 "),
+        "an upload of a stored blob stores nothing: {verified}",
+    );
+    assert!(
+        !verified.to_ascii_lowercase().contains("connection: close"),
+        "an upload verified against the stored blob keeps its connection: {verified}",
+    );
+
+    let oversized = upload_head(pnpm_shared_artifact_protocol::MAX_BLOB_SIZE + 1);
+    let refused = put_blob(&mut socket, &oversized, b"").await;
+    assert!(refused.starts_with("HTTP/1.1 400 "), "an oversized upload is refused: {refused}");
+    assert!(
+        refused.to_ascii_lowercase().contains("connection: close"),
+        "an upload refused before it arrived retires its connection: {refused}",
+    );
+
+    let mut remainder = Vec::new();
+    socket.read_to_end(&mut remainder).await.expect("read the closed connection");
+    let body = String::from_utf8_lossy(&remainder);
+    assert!(!body.contains("HTTP/1.1"), "nothing follows the refusal: {body}");
+}
+
+/// Send one blob upload on `socket` and return its response head.
+async fn put_blob(socket: &mut tokio::net::TcpStream, request: &str, blob: &[u8]) -> String {
+    socket.write_all(request.as_bytes()).await.expect("write the upload head");
+    socket.write_all(blob).await.expect("write the upload body");
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let read = socket.read(&mut byte).await.expect("read the response head");
+        assert_ne!(read, 0, "the response head ended early: {:?}", String::from_utf8_lossy(&head));
+        head.extend_from_slice(&byte);
+    }
+    String::from_utf8(head).expect("the response head is UTF-8")
+}
+
 #[tokio::test]
 async fn artifact_blob_misses_and_errors_are_caller_scoped() {
     let (pnpr_url, pnpr_auth, _storage) = start_pnpr_artifacts().await;
     let http = reqwest::Client::new();
     let missing_integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(b"missing")));
+    let blob_url = |integrity: &str| {
+        let integrity: String =
+            url::form_urlencoded::byte_serialize(integrity.as_bytes()).collect();
+        format!("{pnpr_url}-/pnpr/v0/artifacts/blobs/pnpr-client/{integrity}")
+    };
     let missing = http
-        .post(format!("{pnpr_url}-/pnpr/v0/artifacts/blob"))
+        .get(blob_url(&missing_integrity))
         .header(reqwest::header::AUTHORIZATION, &pnpr_auth)
-        .json(&ArtifactBlobRequest {
-            owner: OwnerScope::organization("pnpr-client"),
-            integrity: missing_integrity,
-        })
         .send()
         .await
         .expect("missing blob response");
@@ -311,12 +419,8 @@ async fn artifact_blob_misses_and_errors_are_caller_scoped() {
     assert_eq!(missing.headers()[reqwest::header::VARY], "Authorization");
 
     let invalid = http
-        .post(format!("{pnpr_url}-/pnpr/v0/artifacts/blob"))
+        .get(blob_url("not-an-integrity"))
         .header(reqwest::header::AUTHORIZATION, &pnpr_auth)
-        .json(&serde_json::json!({
-            "owner": { "type": "organization", "name": "pnpr-client" },
-            "integrity": "not-an-integrity",
-        }))
         .send()
         .await
         .expect("invalid blob response");
@@ -399,7 +503,8 @@ async fn resolves_a_scope_from_the_registry_declared_for_it() {
     assert!(
         packages
             .keys()
-            .any(|key| key.to_string().starts_with("@foo/no-deps@1.0.0")),
+            .map(std::string::ToString::to_string)
+            .any(|text| text.starts_with("@foo/no-deps@1.0.0")),
         "the declared registry should have served the scope, got: {:?}",
         packages
             .keys()
@@ -410,7 +515,7 @@ async fn resolves_a_scope_from_the_registry_declared_for_it() {
 
 /// A client describes its whole configuration, including scopes a given
 /// resolve never reaches. Declaring a registry this pnpr does not serve is
-/// therefore not an error by itself — only fetching from one is.
+/// therefore not an error by itself, only fetching from one is.
 #[tokio::test]
 async fn a_declared_registry_the_resolve_never_reaches_is_not_rejected() {
     let registry = TestRegistry::start();
@@ -430,7 +535,8 @@ async fn a_declared_registry_the_resolve_never_reaches_is_not_rejected() {
     assert!(
         packages
             .keys()
-            .any(|key| key.to_string().starts_with("@foo/no-deps@1.0.0")),
+            .map(std::string::ToString::to_string)
+            .any(|text| text.starts_with("@foo/no-deps@1.0.0")),
     );
 }
 
@@ -456,4 +562,37 @@ async fn a_declared_registry_the_resolve_reaches_is_refused() {
     let error = error.to_string();
     assert!(error.contains("is not allowed by this pnpr server"), "{error}");
     assert!(error.contains("169.254.169.254"), "the refused origin is named: {error}");
+}
+
+#[tokio::test]
+async fn unreadable_error_bodies_keep_the_request_and_status() {
+    for (length, body) in [(100, "short"), (65537, "")] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}",
+        );
+        let server = tokio::spawn(capture_one_request_with_response(listener, response));
+        let error = PnprClient::new(format!("http://{address}"))
+            .resolve(options(
+                "https://registry.example.test/",
+                "token",
+                deps([("example-package", "1.0.0")]),
+            ))
+            .await
+            .unwrap_err();
+        let PnprClientError::Server { message, code } = error else {
+            panic!("expected a server error, got {error}");
+        };
+        assert!(
+            message.starts_with("/-/pnpr/v0/resolve returned 503 Service Unavailable:"),
+            "{message}",
+        );
+        assert!(message.contains("failed to read"), "{message}");
+        assert!(code.is_none());
+        if length > 65536 {
+            assert!(message.contains("65536-byte limit"), "{message}");
+        }
+        assert!(server.await.unwrap().starts_with("POST /-/pnpr/v0/resolve "));
+    }
 }

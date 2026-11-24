@@ -1,5 +1,10 @@
 use super::{
-    AddMockedRegistry, CommandExtra, CommandTempCwd, dead_registry_url, fs, pacquet_at,
+    AddMockedRegistry,
+    CommandExtra,
+    CommandTempCwd,
+    dead_registry_url,
+    fs,
+    pacquet_at,
     write_two_member_workspace,
 };
 use assert_cmd::assert::OutputAssertExt;
@@ -208,7 +213,8 @@ fn dropping_a_dependency_from_the_manifest_skips_resolution() {
             .as_ref()
             .expect("packages")
             .keys()
-            .any(|key| key.to_string().starts_with("is-positive@")),
+            .map(std::string::ToString::to_string)
+            .any(|text| text.starts_with("is-positive@")),
         "the dropped package is pruned from the lockfile",
     );
     assert!(
@@ -285,7 +291,8 @@ fn remove_command_drops_the_dependency_without_resolving() {
             .as_ref()
             .expect("packages")
             .keys()
-            .any(|key| key.to_string().starts_with("is-positive@")),
+            .map(std::string::ToString::to_string)
+            .any(|text| text.starts_with("is-positive@")),
         "the removed package is pruned from the lockfile",
     );
     assert!(
@@ -339,6 +346,11 @@ fn moving_a_dependency_between_groups_skips_resolution() {
         .to_string(),
     )
     .expect("write package.json");
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let workspace_yaml =
+        fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml_path, format!("{workspace_yaml}trustLockfile: true\n"))
+        .expect("enable trusted lockfile");
     pacquet_at(&workspace)
         .with_arg("install")
         .assert()
@@ -448,6 +460,11 @@ fn a_remove_with_an_unchanged_pnpmfile_skips_resolution() {
         .to_string(),
     )
     .expect("write package.json");
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let workspace_yaml =
+        fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml_path, format!("{workspace_yaml}trustLockfile: true\n"))
+        .expect("enable trusted lockfile");
     pacquet_at(&workspace)
         .with_arg("install")
         .assert()
@@ -484,9 +501,12 @@ fn a_remove_with_an_unchanged_pnpmfile_skips_resolution() {
     assert!(
         pinned.dependencies
             .as_ref()
-            .is_some_and(|dependencies| dependencies
-                .get(&"@pnpm.e2e/dep-of-pkg-with-1-dep".parse().expect("alias"))
-                .is_some_and(|reference| reference.to_string() == "100.0.0")),
+            .map(|dependencies| dependencies.get(
+                &"@pnpm.e2e/dep-of-pkg-with-1-dep".parse().expect("alias")
+            ))
+            .is_some_and(|parsed| parsed.is_some_and(
+                |reference| reference.to_string() == "100.0.0"
+            )),
         "the hook's pin survives the fast update",
     );
 
@@ -519,6 +539,11 @@ fn a_remove_keeps_the_specifiers_a_project_rewriting_pnpmfile_recorded() {
         .to_string(),
     )
     .expect("write package.json");
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let workspace_yaml =
+        fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml_path, format!("{workspace_yaml}trustLockfile: true\n"))
+        .expect("enable trusted lockfile");
     pacquet_at(&workspace)
         .with_arg("install")
         .assert()
@@ -594,6 +619,11 @@ fn removing_a_workspace_project_prunes_its_importer_without_resolving() {
         CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, npmrc_path, .. } = npmrc_info;
     write_two_member_workspace(&workspace);
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let workspace_yaml =
+        fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml_path, format!("{workspace_yaml}trustLockfile: true\n"))
+        .expect("enable trusted lockfile");
     pacquet_at(&workspace)
         .with_arg("install")
         .assert()
@@ -637,7 +667,8 @@ fn removing_a_workspace_project_prunes_its_importer_without_resolving() {
             .as_ref()
             .expect("packages")
             .keys()
-            .any(|key| key.to_string().starts_with("@pnpm.e2e/bar@")),
+            .map(std::string::ToString::to_string)
+            .any(|text| text.starts_with("@pnpm.e2e/bar@")),
         "and so is what only it depended on",
     );
 

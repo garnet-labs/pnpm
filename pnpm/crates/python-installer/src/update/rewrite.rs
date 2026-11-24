@@ -1,166 +1,267 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     ops::Range,
     path::Path,
 };
 
-use miette::{IntoDiagnostic, Result, WrapErr};
-use pep508_rs::{PackageName, Requirement};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+};
+use pep508_rs::{
+    PackageName,
+    Requirement,
+};
 use pnpm_python_resolver::parse_requirement;
+use toml::{
+    Spanned,
+    de::{
+        DeTable,
+        DeValue,
+    },
+};
 
-use crate::{manifest, outdated::PythonDependencyGroup};
+use crate::{
+    manifest,
+    outdated::PythonDependencyGroup,
+    workspace::Workspace,
+};
 
-type TomlTable = toml::Spanned<BTreeMap<String, toml::Spanned<toml::Value>>>;
+#[cfg(test)]
+mod tests;
 
 pub(super) fn rewrite_pyproject(
-    path: &Path,
+    member: &Path,
+    workspace: &Workspace,
     mut transform: impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Requirement>>,
 ) -> Result<()> {
-    let original = fs::read_to_string(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("read {}", path.display()))?;
-    let non_index = non_index_sources(&original)?;
-    let document: BTreeMap<String, TomlTable> = toml::from_str(&original).into_diagnostic()?;
-    let mut edits = collect_pyproject_edits(&document, &non_index, &mut transform)?;
-    if edits.is_empty() {
+    rewrite_pyproject_many(member, workspace, |group, req| {
+        Ok(transform(group, req)?.map(|updated| vec![updated]))
+    })
+}
+
+pub(super) fn rewrite_pyproject_many(
+    member: &Path,
+    workspace: &Workspace,
+    mut transform: impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Vec<Requirement>>>,
+) -> Result<()> {
+    let path = member.join("pyproject.toml");
+    let original = match fs::read_to_string(&path) {
+        Ok(original) => original,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && member.join("requirements.txt").is_file() =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("read {}", path.display()));
+        }
+    };
+    let parsed = manifest::Manifest::parse(&original)?;
+    let non_index = workspace.non_index_sources(member, &parsed);
+    let Some(updated) = rewrite_manifest_text(&original, &non_index, &mut transform)? else {
         return Ok(());
+    };
+    pnpm_fs::write_atomic(&path, updated.as_bytes()).into_diagnostic()
+}
+
+pub(crate) fn remove_requirements(
+    path: &Path,
+    names: &BTreeSet<PackageName>,
+    group: Option<PythonDependencyGroup>,
+    removed: &mut BTreeSet<PackageName>,
+) -> Result<()> {
+    let original = fs::read_to_string(path).into_diagnostic()?;
+    if let Some(updated) = rewrite_manifest_text(&original, &BTreeSet::new(), &mut |field, req| {
+        if group.is_none_or(|group| group == field) && names.contains(&req.name) {
+            removed.insert(req.name);
+            Ok(Some(Vec::new()))
+        } else {
+            Ok(None)
+        }
+    })? {
+        pnpm_fs::write_atomic(path, updated.as_bytes()).into_diagnostic()?;
     }
-    edits.sort_by_key(|right| std::cmp::Reverse(right.0.start));
-    let mut updated = original;
+    Ok(())
+}
+
+fn rewrite_manifest_text(
+    original: &str,
+    non_index: &BTreeSet<PackageName>,
+    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Vec<Requirement>>>,
+) -> Result<Option<String>> {
+    let document = DeTable::parse(original).into_diagnostic()?;
+    let mut edits = collect_pyproject_edits(document.get_ref(), original, non_index, transform)?;
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.0.start));
+    let mut updated = original.to_owned();
     for (span, replacement) in edits {
         updated.replace_range(span, &replacement);
     }
     manifest::Manifest::parse(&updated)?;
-    pnpm_fs::write_atomic(path, updated.as_bytes()).into_diagnostic()
-}
-
-fn non_index_sources(original: &str) -> Result<BTreeSet<PackageName>> {
-    let parsed = manifest::Manifest::parse(original)?;
-    Ok(parsed.tool.uv.sources
-        .iter()
-        .filter(|(_, decl)| {
-            decl.sources()
-                .iter()
-                .any(|source| {
-                    source.workspace
-                        || source.path.is_some()
-                        || source.git.is_some()
-                        || source.url.is_some()
-                })
-        })
-        .map(|(name, _)| name.clone())
-        .collect())
+    Ok(Some(updated))
 }
 
 fn collect_pyproject_edits(
-    document: &BTreeMap<String, TomlTable>,
+    document: &DeTable<'_>,
+    original: &str,
     non_index: &BTreeSet<PackageName>,
-    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Requirement>>,
+    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Vec<Requirement>>>,
 ) -> Result<Vec<(Range<usize>, String)>> {
     let mut edits = Vec::new();
-    if let Some(project) = document.get("project") {
-        collect_project_edits(project.get_ref(), non_index, transform, &mut edits)?;
+    if let Some(project) =
+        table_entry(document, "project").map(Spanned::get_ref).and_then(DeValue::as_table)
+    {
+        collect_project_edits(project, original, non_index, transform, &mut edits)?;
     }
-    if let Some(groups) = document.get("dependency-groups") {
-        for value in groups.get_ref().values() {
-            if let Some(edit) =
-                rewrite_spanned_array(value, PythonDependencyGroup::Dev, non_index, transform)?
-            {
-                edits.push(edit);
-            }
-        }
+    if let Some(groups) = table_entry(document, "dependency-groups") {
+        collect_table_of_arrays_edits(
+            groups,
+            original,
+            PythonDependencyGroup::Dev,
+            non_index,
+            transform,
+            &mut edits,
+        )?;
     }
     Ok(edits)
 }
 
 fn collect_project_edits(
-    project: &BTreeMap<String, toml::Spanned<toml::Value>>,
+    project: &DeTable<'_>,
+    original: &str,
     non_index: &BTreeSet<PackageName>,
-    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Requirement>>,
+    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Vec<Requirement>>>,
     edits: &mut Vec<(Range<usize>, String)>,
 ) -> Result<()> {
-    if let Some(deps) = project.get("dependencies")
-        && let Some(edit) =
-            rewrite_spanned_array(deps, PythonDependencyGroup::Prod, non_index, transform)?
-    {
-        edits.push(edit);
+    if let Some(deps) = table_entry(project, "dependencies") {
+        collect_array_edits(
+            deps,
+            original,
+            PythonDependencyGroup::Prod,
+            non_index,
+            transform,
+            edits,
+        )?;
     }
-    if let Some(opt_deps) = project.get("optional-dependencies")
-        && let Some(edit) = rewrite_spanned_table_of_arrays(
+    if let Some(opt_deps) = table_entry(project, "optional-dependencies") {
+        collect_table_of_arrays_edits(
             opt_deps,
+            original,
             PythonDependencyGroup::Optional,
             non_index,
             transform,
-        )?
-    {
-        edits.push(edit);
+            edits,
+        )?;
     }
     Ok(())
 }
 
-fn rewrite_spanned_array(
-    spanned: &toml::Spanned<toml::Value>,
+fn collect_table_of_arrays_edits(
+    spanned: &Spanned<DeValue<'_>>,
+    original: &str,
     group: PythonDependencyGroup,
     non_index: &BTreeSet<PackageName>,
-    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Requirement>>,
-) -> Result<Option<(Range<usize>, String)>> {
-    let Some(entries) = spanned.get_ref().as_array() else {
-        return Ok(None);
-    };
-    let (new_entries, changed) = rewrite_array_entries(entries, group, non_index, transform)?;
-    Ok(changed.then(|| (spanned.span(), toml::Value::Array(new_entries).to_string())))
-}
-
-fn rewrite_spanned_table_of_arrays(
-    spanned: &toml::Spanned<toml::Value>,
-    group: PythonDependencyGroup,
-    non_index: &BTreeSet<PackageName>,
-    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Requirement>>,
-) -> Result<Option<(Range<usize>, String)>> {
+    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Vec<Requirement>>>,
+    edits: &mut Vec<(Range<usize>, String)>,
+) -> Result<()> {
     let Some(table) = spanned.get_ref().as_table() else {
-        return Ok(None);
+        return Ok(());
     };
-    let mut updated_table = table.clone();
-    let mut any_changed = false;
-    for (key, val) in table {
-        let Some(entries) = val.as_array() else {
-            continue;
-        };
-        let (new_entries, changed) = rewrite_array_entries(entries, group, non_index, transform)?;
-        if changed {
-            any_changed = true;
-            updated_table.insert(key.clone(), toml::Value::Array(new_entries));
-        }
+    for value in table.values() {
+        collect_array_edits(value, original, group, non_index, transform, edits)?;
     }
-    Ok(any_changed.then(|| (spanned.span(), toml::Value::Table(updated_table).to_string())))
+    Ok(())
 }
 
-fn rewrite_array_entries(
-    entries: &[toml::Value],
+fn collect_array_edits(
+    spanned: &Spanned<DeValue<'_>>,
+    original: &str,
     group: PythonDependencyGroup,
     non_index: &BTreeSet<PackageName>,
-    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Requirement>>,
-) -> Result<(Vec<toml::Value>, bool)> {
-    let mut out = Vec::with_capacity(entries.len());
-    let mut changed = false;
-    for entry in entries {
-        if let Some(rendered) = rewrite_single_entry(entry, group, non_index, transform)? {
-            changed = true;
-            out.push(toml::Value::String(rendered));
-        } else {
-            out.push(entry.clone());
+    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Vec<Requirement>>>,
+    edits: &mut Vec<(Range<usize>, String)>,
+) -> Result<()> {
+    let DeValue::Array(entries) = spanned.get_ref() else {
+        return Ok(());
+    };
+    let outcomes = entries
+        .iter()
+        .map(|entry| rewrite_single_entry(entry.get_ref(), group, non_index, transform))
+        .collect::<Result<Vec<_>>>()?;
+    if outcomes.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    if outcomes
+        .iter()
+        .map(Option::as_ref)
+        .any(|value| value.is_some_and(Vec::is_empty))
+    {
+        edits.push((spanned.span(), render_filtered_array(entries, &outcomes, original)));
+        return Ok(());
+    }
+    for (entry, rendered) in entries
+        .iter()
+        .zip(outcomes)
+        .filter_map(|(entry, outcome)| outcome.map(|rendered| (entry, rendered)))
+    {
+        edits.push((entry.span(), format_rendered_entries(&rendered)));
+    }
+    Ok(())
+}
+
+fn render_filtered_array(
+    entries: &[Spanned<DeValue<'_>>],
+    outcomes: &[Option<Vec<String>>],
+    original: &str,
+) -> String {
+    let mut kept = Vec::with_capacity(entries.len());
+    for (entry, outcome) in entries.iter().zip(outcomes) {
+        match outcome {
+            None => kept.push(original[entry.span()].to_owned()),
+            Some(rendered) => kept.extend(
+                rendered
+                    .iter()
+                    .cloned()
+                    .map(format_toml_string),
+            ),
         }
     }
-    Ok((out, changed))
+    format!("[{}]", kept.join(", "))
+}
+
+fn format_rendered_entries(rendered: &[String]) -> String {
+    rendered
+        .iter()
+        .cloned()
+        .map(format_toml_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_toml_string(value: String) -> String {
+    toml::Value::String(value).to_string()
+}
+
+fn table_entry<'a, 'i>(table: &'a DeTable<'i>, name: &str) -> Option<&'a Spanned<DeValue<'i>>> {
+    table
+        .iter()
+        .find_map(|(key, value)| (key.get_ref().as_ref() == name).then_some(value))
 }
 
 fn rewrite_single_entry(
-    entry: &toml::Value,
+    entry: &DeValue<'_>,
     group: PythonDependencyGroup,
     non_index: &BTreeSet<PackageName>,
-    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Requirement>>,
-) -> Result<Option<String>> {
+    transform: &mut impl FnMut(PythonDependencyGroup, Requirement) -> Result<Option<Vec<Requirement>>>,
+) -> Result<Option<Vec<String>>> {
     let Some(raw_req) = entry.as_str() else {
         return Ok(None);
     };
@@ -170,9 +271,15 @@ fn rewrite_single_entry(
     if non_index.contains(&req.name) {
         return Ok(None);
     }
-    let Some(updated_req) = transform(group, req)? else {
+    let Some(updated_reqs) = transform(group, req)? else {
         return Ok(None);
     };
-    let rendered = updated_req.to_string();
-    Ok((rendered != raw_req).then_some(rendered))
+    let rendered: Vec<String> = updated_reqs
+        .into_iter()
+        .map(|item| item.to_string())
+        .collect();
+    if rendered.len() == 1 && rendered[0] == raw_req {
+        return Ok(None);
+    }
+    Ok(Some(rendered))
 }

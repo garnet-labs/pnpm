@@ -1,20 +1,35 @@
 #[cfg(unix)]
 use super::process_group_probe;
 use super::{
-    Command, CommandExtra, CommandTempCwd, Value, WORKSPACE_ROOT_START_DIRS,
-    build_appends_run_order, build_writes_marker, fs, json, workspace_root_run_selection,
-    write_marker_script, write_node_bin, write_workspace, write_workspace_with_root_and_packages,
+    Command,
+    CommandExtra,
+    CommandTempCwd,
+    Value,
+    WORKSPACE_ROOT_START_DIRS,
+    build_appends_run_order,
+    build_writes_marker,
+    fs,
+    json,
+    workspace_root_run_selection,
+    write_marker_script,
+    write_node_bin,
+    write_workspace,
+    write_workspace_with_root_and_packages,
 };
 #[cfg(unix)]
 use crate::_utils::terminal::Terminal;
-use assert_cmd::{assert::OutputAssertExt, cargo::CommandCargoExt};
+use assert_cmd::{
+    assert::OutputAssertExt,
+    cargo::CommandCargoExt,
+};
+use pnpm_testing_utils::command_env::CommandTestExt;
 
 /// A single filtered script cannot run alongside a sibling, so at a
 /// terminal it stays in pacquet's own process group: a child moved into
 /// its own group is stopped the moment it reads from the terminal.
 ///
 /// Unix-only by subject: the assertion compares POSIX process groups,
-/// which Windows has no counterpart for — pnpm keeps a script's children
+/// which Windows has no counterpart for, pnpm keeps a script's children
 /// in a job object there instead.
 #[cfg(unix)]
 #[test]
@@ -55,7 +70,7 @@ fn filtered_run_keeps_single_script_in_foreground_process_group() {
 }
 
 /// A member's script resolves binaries from the workspace root's
-/// `node_modules/.bin` — pnpm puts it on PATH via `extraBinPaths`, so
+/// `node_modules/.bin`, pnpm puts it on PATH via `extraBinPaths`, so
 /// root-level dev tools are callable from every workspace project.
 #[test]
 fn recursive_run_finds_workspace_root_bin_on_path() {
@@ -198,7 +213,7 @@ fn recursive_run_filter_selects_only_matching_project() {
 }
 
 /// An exclude selector (`!<name>`) runs the script in every project
-/// except the excluded one — the shape pnpm's release workflow leans on
+/// except the excluded one, the shape pnpm's release workflow leans on
 /// with `--filter=!pnpm`.
 #[test]
 fn recursive_run_exclude_filter_skips_excluded_project() {
@@ -349,7 +364,8 @@ fn filtered_run_prints_the_script_command_unless_silent() {
     assert!(
         stderr
             .lines()
-            .all(|line| serde_json::from_str::<Value>(line).is_ok()),
+            .map(serde_json::from_str::<Value>)
+            .all(|value| value.is_ok()),
         "NDJSON filtered build must contain only JSON records: {stderr}",
     );
 
@@ -406,7 +422,7 @@ fn include_workspace_root_flag_keeps_the_root_in_a_recursive_run() {
 }
 
 /// The flag is the CLI half of the `includeWorkspaceRoot` setting, which
-/// reads from `pnpm-workspace.yaml` too — and `--no-include-workspace-root`
+/// reads from `pnpm-workspace.yaml` too, and `--no-include-workspace-root`
 /// overrides the setting back off, the way pnpm's `--no-` negation does.
 #[test]
 fn include_workspace_root_setting_is_read_from_the_workspace_manifest() {
@@ -435,10 +451,9 @@ fn include_workspace_root_setting_is_read_from_the_workspace_manifest() {
         fs::remove_file(marker).expect("clear the marker");
     }
 
-    let mut negated = Command::cargo_bin("pnpm").unwrap();
-    negated.current_dir(&workspace);
+    let negated = Command::cargo_bin("pnpm").unwrap().with_current_dir(&workspace);
     negated
-        .args(["-r", "--no-include-workspace-root", "run", "build"])
+        .with_args(["-r", "--no-include-workspace-root", "run", "build"])
         .assert()
         .success();
     assert!(!markers[0].exists(), "--no-include-workspace-root must override the setting");
@@ -454,7 +469,7 @@ fn include_workspace_root_setting_is_read_from_the_workspace_manifest() {
 /// An all-exclusion selection (`--filter=!<name>`) also drops the
 /// workspace root, matching the release-workflow shape
 /// (`--filter=!pnpm --filter=!@pnpm/exe`): `-r --filter=!project-2 run
-/// build` runs project-1 only — project-2 is excluded by the selector
+/// build` runs project-1 only, project-2 is excluded by the selector
 /// and the root by the `!{<workspace-root>}` augmentation.
 #[test]
 fn recursive_run_all_exclusion_filter_also_drops_root() {
@@ -586,7 +601,7 @@ fn recursive_run_filter_no_matching_script_reports_no_selected_packages() {
 /// `--filter-prod <pkg>...` walks production dependencies only, so a
 /// dev-only edge is excluded from the selected set. With `app` depending
 /// on `lib` through `devDependencies`, `--filter-prod app...` runs `app`
-/// but skips `lib` — whereas plain `--filter app...` would run both.
+/// but skips `lib`, whereas plain `--filter app...` would run both.
 /// This is what distinguishes `--filter-prod` from `--filter`: the
 /// `follow_prod_deps_only` branch builds the graph with dev edges
 /// dropped, so the `...` dependency walk never reaches `lib`.
@@ -625,8 +640,8 @@ fn recursive_run_filter_prod_follows_production_deps_only() {
 }
 
 /// A mixed `--filter` / `--filter-prod` selection lists prod-selected
-/// projects before regular ones. With `alpha` and `beta` independent — so
-/// they share one topological chunk — `--filter alpha` `--filter-prod beta`
+/// projects before regular ones. With `alpha` and `beta` independent (so
+/// they share one topological chunk) `--filter alpha` `--filter-prod beta`
 /// runs `beta` before `alpha`.
 #[test]
 fn recursive_run_mixed_filter_runs_prod_selected_before_regular() {
@@ -792,8 +807,8 @@ fn recursive_run_diff_selector_selects_changed_projects() {
     );
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&workspace)
+            .with_args(args)
+            .with_current_dir(&workspace)
             .output()
             .expect("spawn git");
         assert!(
@@ -885,6 +900,46 @@ fn filtered_run_follows_npm_alias_of_a_sibling() {
 
     let order = fs::read_to_string(workspace.join("order.log")).expect("read order log");
     assert_eq!(order, "math\napp\n");
+
+    drop(root);
+}
+
+#[test]
+fn update_config_relative_path_filter_works_with_dir_and_subdir_cwd() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(
+        &workspace,
+        &[
+            ("packages/app", build_writes_marker("packages/app")),
+            ("packages/other", build_writes_marker("packages/other")),
+        ],
+    );
+    fs::write(
+        workspace.join(".pnpmfile.mjs"),
+        "export const hooks = { updateConfig (config) { return Object.assign(config, { filter: config.filter ?? ['./packages/app'] }) } }\n",
+    )
+    .expect("write .pnpmfile.mjs");
+
+    let app_marker = workspace.join("packages/app/ran.txt");
+    let other_marker = workspace.join("packages/other/ran.txt");
+
+    pacquet
+        .with_args(["--dir", "packages/other", "-r", "run", "build"])
+        .assert()
+        .success();
+    assert!(app_marker.exists(), "--dir packages/other should select packages/app");
+    assert!(!other_marker.exists(), "packages/other must not run");
+
+    fs::remove_file(&app_marker).expect("remove app marker");
+    Command::cargo_bin("pnpm")
+        .expect("find pnpm binary")
+        .without_ambient_pnpm_config()
+        .with_current_dir(workspace.join("packages/other"))
+        .with_args(["-r", "run", "build"])
+        .assert()
+        .success();
+    assert!(app_marker.exists(), "running from packages/other should select packages/app");
+    assert!(!other_marker.exists(), "packages/other must not run");
 
     drop(root);
 }

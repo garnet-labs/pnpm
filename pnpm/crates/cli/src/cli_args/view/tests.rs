@@ -1,11 +1,25 @@
-use super::{nearest_manifest_name, render_fields, render_summary};
-use crate::cli_args::view::render::{
-    bin_summary, format_bytes, format_field_value, format_person, format_time_ago_since,
-    get_nested_property, parse_date, published_info, publisher,
+use super::{
+    nearest_manifest_name,
+    render_fields,
+    render_summary,
 };
-use chrono::{DateTime, Utc};
+use crate::cli_args::view::render::{
+    bin_summary,
+    format_bytes,
+    format_field_value,
+    format_person,
+    format_time_ago_since,
+    get_nested_property,
+    parse_date,
+    published_info,
+    publisher,
+};
+use jiff::Timestamp;
 use miette::Diagnostic;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 
 #[test]
 fn invalid_project_names_report_format_neutral_diagnostic() {
@@ -50,8 +64,8 @@ fn nearest_project_name_uses_alternative_manifests_and_precedence() {
     assert!(error.to_string().contains("package.json"));
 }
 
-fn utc(rfc3339: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(rfc3339).expect("valid timestamp").with_timezone(&Utc)
+fn utc(rfc3339: &str) -> Timestamp {
+    pnpm_time::parse_rfc3339(rfc3339).expect("valid timestamp")
 }
 
 #[test]
@@ -143,7 +157,7 @@ fn rich_info() -> Value {
 
 #[test]
 fn render_summary_includes_every_section() {
-    let out = render_summary(&rich_info());
+    let out = render_summary(&rich_info(), "https://registry.example/");
     for needle in [
         "is-negative@1.0.0",
         "deps: ",
@@ -162,14 +176,31 @@ fn render_summary_includes_every_section() {
         "dist-tags:",
         "latest:",
         "published ",
+        "registry: https://registry.example/",
     ] {
         assert!(out.contains(needle), "summary missing {needle:?}:\n{out}");
     }
 }
 
 #[test]
+fn render_summary_redacts_and_sanitizes_registry() {
+    let out = render_summary(
+        &json!({ "name": "x", "version": "1.0.0" }),
+        "https://user:secret@registry.example/\u{1b}[2Knpm/?token=query-secret#fragment-secret",
+    );
+    // Stripping the renderer's color also strips an unsanitized `ESC[2K`, so
+    // the `[2K` left in the expected suffix proves the URL's own escape was
+    // removed before printing.
+    let out = console::strip_ansi_codes(&out);
+    assert!(out.ends_with("\nregistry: https://registry.example/[2Knpm/"), "{out:?}");
+    for leaked in ["secret", "token", "fragment"] {
+        assert!(!out.contains(leaked), "registry line must not print {leaked:?}: {out:?}");
+    }
+}
+
+#[test]
 fn render_summary_minimal_shows_deps_none() {
-    let out = render_summary(&json!({ "name": "x", "version": "1.0.0" }));
+    let out = render_summary(&json!({ "name": "x", "version": "1.0.0" }), "https://r.example/");
     assert!(out.contains("x@1.0.0"), "{out}");
     assert!(out.contains("deps: none"), "{out}");
 }
@@ -304,12 +335,12 @@ async fn fetch_package_metadata_honors_registry_override_for_scoped_package() {
     config.registries_by_scope.insert("@scope".to_string(), "https://other.registry/".to_string());
 
     let server_url = server.url();
-    let (pkg, version) =
-        super::fetch_package_metadata(&config, Some(&server_url), "@scope/acme", "view")
-            .await
-            .expect("fetch package metadata");
+    let fetched = super::fetch_package_metadata(&config, Some(&server_url), "@scope/acme", "view")
+        .await
+        .expect("fetch package metadata");
 
-    assert_eq!(pkg.name, "@scope/acme");
-    assert_eq!(version.version.to_string(), "1.0.0");
+    assert_eq!(fetched.meta.name, "@scope/acme");
+    assert_eq!(fetched.picked.version.to_string(), "1.0.0");
+    assert!(fetched.registry.starts_with(&server_url), "{}", fetched.registry);
     mock.assert_async().await;
 }

@@ -1,24 +1,21 @@
-#[cfg(target_family = "wasm")]
-pub(crate) use pnpm_process as process;
-#[cfg(target_family = "wasm")]
-pub(crate) use pnpm_process::asynchronous as async_process;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) use std::process;
-#[cfg(not(target_family = "wasm"))]
-pub(crate) use tokio::process as async_process;
-
 pub mod custom_fetcher_adapter;
 pub mod custom_resolver_adapter;
 pub mod finder;
 pub mod node_runtime;
 pub mod worker;
+
+pub(crate) use pnpm_process as process;
+pub(crate) use pnpm_process::asynchronous as async_process;
 pub use worker::LogFn;
 
 use async_trait::async_trait;
 use derive_more::Display;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{
+    mpsc,
+    oneshot,
+};
 
 /// The `loadPnpmfile(path)` helper the worker script starts with.
 pub(crate) const LOAD_PNPMFILE: &str = include_str!("load_pnpmfile.cjs");
@@ -84,9 +81,10 @@ pub type ReadPackageResult = Arc<Value>;
 
 /// An error raised while running a pnpmfile hook in Node.js.
 ///
-/// Covers the `ERR_PNPM_PNPMFILE_FAIL` / `ERR_PNPM_BAD_READ_PACKAGE_HOOK_RESULT` conditions: a
-/// throwing or syntactically invalid pnpmfile, or a `readPackage` hook that
-/// returns something that is not a package manifest, aborts the install.
+/// Covers the `ERR_PNPM_PNPMFILE_FAIL`, `ERR_PNPM_BAD_READ_PACKAGE_HOOK_RESULT`,
+/// `ERR_PNPM_CONFIG_IS_UNDEFINED`, and `ERR_PNPM_BAD_AFTER_ALL_RESOLVED_RETURN`
+/// conditions: a throwing or syntactically invalid pnpmfile, or a hook that
+/// returns an invalid value, aborts the command.
 #[derive(Debug, Display, Clone)]
 pub enum HookError {
     #[display("pnpmfile hook '{_0}' timed out after {_1} seconds")]
@@ -99,6 +97,14 @@ pub enum HookError {
     },
 
     BadReadPackageResult {
+        message: String,
+    },
+
+    ConfigIsUndefined {
+        message: String,
+    },
+
+    BadAfterAllResolvedReturn {
         message: String,
     },
 }
@@ -147,7 +153,7 @@ pub trait PnpmfileHooks: Send + Sync {
     ///
     /// Returns the (possibly modified) manifest. A hook that throws, or returns
     /// something other than a package manifest object, yields a [`HookError`] so
-    /// the install fails loudly — a bad `readPackage` hook aborts resolution.
+    /// the install fails loudly, a bad `readPackage` hook aborts resolution.
     async fn read_package(
         &self,
         pkg: Value,
@@ -188,8 +194,8 @@ pub trait PnpmfileHooks: Send + Sync {
     ///
     /// Called with `(manifest, dir, context)`, mirroring pnpm's cooked
     /// `beforePacking(pkg, dir, context)` signature. Returns the
-    /// (possibly modified) manifest; a hook that returns nothing — and
-    /// the default no-op — leaves `manifest` unchanged. A throwing hook
+    /// (possibly modified) manifest; a hook that returns nothing (and
+    /// the default no-op) leaves `manifest` unchanged. A throwing hook
     /// yields a [`HookError`] and aborts packing.
     async fn before_packing(
         &self,
@@ -299,7 +305,7 @@ pub trait PnpmfileHooks: Send + Sync {
 ///
 /// The pnpmfile hook is invoked with the same positional arguments as the
 /// TypeScript CLI's `CustomFetcher.fetch(cafs, resolution, opts, fetchers)`
-/// (`pnpm11/hooks/types/src/index.ts`). During installation, built-in tarball
+/// ([`pnpm11/hooks/types/src/index.ts`](https://github.com/pnpm/pnpm/blob/664d81d95b84d7fca2f91f737c5ab56e3784a81e/pnpm11/hooks/types/src/index.ts)). During installation, built-in tarball
 /// fetches cross the worker IPC boundary and finish before the callback returns.
 #[async_trait]
 pub trait CustomFetcher: Send + Sync {
@@ -327,7 +333,7 @@ pub trait CustomFetcher: Send + Sync {
     /// Calls the fetcher hook. The returned JSON envelope is interpreted by the
     /// installer:
     ///
-    /// - `{ "delegate": <resolution> }` — rewrites the lockfile resolution and
+    /// - `{ "delegate": <resolution> }`, rewrites the lockfile resolution and
     ///   falls through to the built-in fetch path for the rewritten value.
     /// - A built-in fetch result containing `filesMap` is reused directly.
     /// - Any other shape fails the install (`custom_fetcher_failed`).
@@ -347,7 +353,7 @@ pub trait CustomFetcher: Send + Sync {
 }
 
 /// A custom resolver exported from a pnpmfile. The pnpmfile interface's
-/// methods are all optional — the `has_*` accessors report which ones the
+/// methods are all optional, the `has_*` accessors report which ones the
 /// underlying resolver actually implements, so callers can skip the
 /// corresponding calls for absent methods.
 #[async_trait]

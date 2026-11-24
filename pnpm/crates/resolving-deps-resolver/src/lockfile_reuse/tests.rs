@@ -1,18 +1,35 @@
 use std::collections::HashMap;
 
-/// The registry facts with only the scope map populated — what these tests
+/// The registry facts with only the scope map populated, what these tests
 /// vary; the aliases and per-registry settings stay empty.
 fn registry_context(registries: HashMap<String, String>) -> pnpm_lockfile::RegistryContext {
     pnpm_lockfile::RegistryContext { registries, ..Default::default() }
 }
 
 use pnpm_lockfile::{
-    BundledDependencies, ComVer, GitResolution, ImporterDepVersion, Lockfile, LockfileResolution,
-    LockfileVersion, PackageMetadata, PkgName, PkgNameVerPeer, PkgVerPeer, ProjectSnapshot,
-    RegistryResolution, ResolvedDependencySpec, StringOrList, TarballResolution, TarballRevision,
+    BundledDependencies,
+    ComVer,
+    GitResolution,
+    ImporterDepVersion,
+    Lockfile,
+    LockfileResolution,
+    LockfileVersion,
+    PackageMetadata,
+    PkgName,
+    PkgNameVerPeer,
+    PkgVerPeer,
+    ProjectSnapshot,
+    RegistryResolution,
+    ResolvedDependencySpec,
+    StringOrList,
+    TarballResolution,
+    TarballRevision,
 };
 
-use super::{reusable_importer_dep, synthesize_reused_result};
+use super::{
+    reusable_importer_dep,
+    synthesize_reused_result,
+};
 
 fn single_dep_lockfile(alias: &str, specifier: &str, resolved: &str) -> Lockfile {
     let mut deps = HashMap::new();
@@ -55,6 +72,7 @@ fn empty_lockfile() -> Lockfile {
 
 fn registry_metadata() -> PackageMetadata {
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Registry(RegistryResolution {
             integrity: "sha512-gf6ZldcfCDyNXPRiW3lQjEP1Z9rrUM/4Cn7BZbv3SdTA82zxWRP8OmLwvGR974uuENhGCFgFdN11z3n1Ofpprg=="
                 .parse()
@@ -263,6 +281,7 @@ fn reuses_an_unchanged_git_specifier_at_its_locked_commit() {
     lockfile.packages = Some(HashMap::from([(
         key.clone(),
         PackageMetadata {
+            specifiers: None,
             resolution: LockfileResolution::Git(GitResolution {
                 repo: "file:///repo".to_string(),
                 commit: "0123456789012345678901234567890123456789".to_string(),
@@ -569,19 +588,36 @@ fn prior_child_key_applies_the_satisfies_gate() {
         serde_json::from_value(serde_json::json!({ "dependencies": { "bar": "1.2.0" } }))
             .expect("parse snapshot entry");
 
-    let key =
-        super::prior_child_key(&snapshot, "bar", "^1.0.0", &registry_context(default_registry()))
-            .expect("recorded ref satisfies");
+    let key = super::prior_child_key(
+        None,
+        &snapshot,
+        "bar",
+        "^1.0.0",
+        &registry_context(default_registry()),
+    )
+    .expect("recorded ref satisfies");
     assert_eq!(key.to_string(), "bar@1.2.0");
 
     assert!(
-        super::prior_child_key(&snapshot, "bar", "^2.0.0", &registry_context(default_registry()))
-            .is_none(),
+        super::prior_child_key(
+            None,
+            &snapshot,
+            "bar",
+            "^2.0.0",
+            &registry_context(default_registry())
+        )
+        .is_none(),
         "an edited range the recorded version no longer satisfies yields no prior key",
     );
     assert!(
-        super::prior_child_key(&snapshot, "baz", "^1.0.0", &registry_context(default_registry()))
-            .is_none(),
+        super::prior_child_key(
+            None,
+            &snapshot,
+            "baz",
+            "^1.0.0",
+            &registry_context(default_registry())
+        )
+        .is_none(),
         "unrecorded alias",
     );
 
@@ -590,6 +626,7 @@ fn prior_child_key_applies_the_satisfies_gate() {
             .expect("parse snapshot entry");
     assert!(
         super::prior_child_key(
+            None,
             &prerelease_snapshot,
             "bar",
             "21.0.0",
@@ -599,12 +636,88 @@ fn prior_child_key_applies_the_satisfies_gate() {
     );
     assert!(
         super::prior_child_key(
+            None,
             &prerelease_snapshot,
             "bar",
             "^21.0.0",
             &registry_context(default_registry())
         )
         .is_none(),
+    );
+}
+
+#[test]
+fn prior_child_key_admits_only_the_recorded_git_locator() {
+    let commit = "0123456789012345678901234567890123456789";
+    let locator = format!("git+file:///repo#{commit}");
+    let package = format!("git-pkg@{locator}");
+    let key: PkgNameVerPeer = package.parse().expect("parse git key");
+    let snapshot: pnpm_lockfile::SnapshotEntry = serde_json::from_value(serde_json::json!({
+        "optionalDependencies": { "git-alias": package },
+    }))
+    .expect("parse snapshot entry");
+    let mut lockfile = empty_lockfile();
+    let registries = registry_context(default_registry());
+    let prior_key = |lockfile: &Lockfile, specifier: &str| {
+        super::prior_child_key(Some(lockfile), &snapshot, "git-alias", specifier, &registries)
+    };
+
+    assert_eq!(prior_key(&lockfile, &locator), None);
+    let metadata = PackageMetadata {
+        resolution: LockfileResolution::Git(GitResolution {
+            repo: "file:///repo".to_string(),
+            commit: commit.to_string(),
+            integrity: None,
+            path: None,
+        }),
+        ..registry_metadata()
+    };
+    lockfile.packages = Some(HashMap::from([(key.clone(), metadata)]));
+    assert_eq!(prior_key(&lockfile, &locator), Some(key));
+    assert_eq!(prior_key(&lockfile, "git+file:///repo#main"), None);
+}
+
+#[test]
+fn prior_child_key_admits_a_locked_runtime_its_range_still_admits() {
+    let snapshot: pnpm_lockfile::SnapshotEntry =
+        serde_json::from_value(serde_json::json!({ "dependencies": { "node": "runtime:24.0.0" } }))
+            .expect("parse snapshot entry");
+    let prior_key = |bare_specifier| {
+        super::prior_child_key(
+            None,
+            &snapshot,
+            "node",
+            bare_specifier,
+            &registry_context(default_registry()),
+        )
+        .map(|key| key.to_string())
+    };
+
+    assert_eq!(prior_key("runtime:^24.0.0").as_deref(), Some("node@runtime:24.0.0"));
+    assert_eq!(prior_key("runtime:rc/^24.0.0").as_deref(), Some("node@runtime:24.0.0"));
+    assert_eq!(prior_key("runtime:^25.0.0"), None);
+    assert_eq!(prior_key("runtime:lts"), None);
+}
+
+#[test]
+fn a_locked_nightly_runtime_is_reused_while_its_range_admits_it() {
+    let nightly = "runtime:25.0.0-nightly20250101abcdef";
+    let snapshot: pnpm_lockfile::SnapshotEntry =
+        serde_json::from_value(serde_json::json!({ "dependencies": { "node": nightly } }))
+            .expect("parse snapshot entry");
+    let registries = registry_context(default_registry());
+    assert!(
+        super::prior_child_key(None, &snapshot, "node", "runtime:nightly/^25", &registries)
+            .is_some(),
+    );
+    assert!(
+        super::prior_child_key(None, &snapshot, "node", "runtime:nightly/^26", &registries)
+            .is_none(),
+    );
+
+    let lockfile = single_dep_lockfile("node", "runtime:nightly/^25", nightly);
+    assert!(
+        reusable_importer_dep(&lockfile, ".", "node", "runtime:nightly/^25", &registries).is_some(),
     );
 }
 
@@ -617,8 +730,14 @@ fn prior_child_key_rejects_an_alias_ref_for_a_bare_range() {
     .expect("parse snapshot entry");
 
     assert!(
-        super::prior_child_key(&snapshot, "bar", "^1.0.0", &registry_context(default_registry()))
-            .is_none(),
+        super::prior_child_key(
+            None,
+            &snapshot,
+            "bar",
+            "^1.0.0",
+            &registry_context(default_registry())
+        )
+        .is_none(),
     );
 }
 
@@ -752,7 +871,7 @@ fn prior_child_key_keeps_the_pin_of_a_key_the_registries_setting_rekeys() {
         ("@work/baz", "zeta:^1.0.0"),
     ] {
         assert!(
-            super::prior_child_key(&snapshot, alias, specifier, &context).is_some(),
+            super::prior_child_key(None, &snapshot, alias, specifier, &context).is_some(),
             "{alias} {specifier}",
         );
     }
@@ -878,4 +997,45 @@ fn locked_child_admits_a_bare_named_registry_spec_only_for_the_alias_package() {
     assert_eq!(super::locked_child_admits(&alias, &other, "work:bar@^1.0.0", &context), Some(true));
     let own: PkgNameVerPeer = "foo@work:1.2.0".parse().expect("parse key");
     assert_eq!(super::locked_child_admits(&alias, &own, "work:^1.0.0", &context), Some(true));
+}
+
+#[test]
+fn npm_alias_reuses_only_the_named_package_from_the_routed_registry() {
+    let registries = registry_context(HashMap::from([
+        ("default".to_string(), "https://registry.example/".to_string()),
+        ("@fixture".to_string(), "https://scoped.example/".to_string()),
+    ]));
+    let alias: PkgName = "aliased".parse().unwrap();
+    for (key, specifier, expected) in [
+        ("@fixture/target@1.2.0", "npm:@fixture/target@^1.0.0", Some(true)),
+        ("@fixture/target@1.2.0", "npm:@fixture/target@^2.0.0", Some(false)),
+        ("@fixture/other@1.2.0", "npm:@fixture/target@^1.0.0", Some(false)),
+        ("target@1.2.0", "npm:@fixture/target@^1.0.0", Some(false)),
+        ("@fixture/target@1.2.0", "npm:@fixture/target", Some(true)),
+    ] {
+        assert_eq!(
+            super::locked_child_admits(&alias, &key.parse().unwrap(), specifier, &registries),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn directory_entry_seeds_children_only_for_an_unchanged_specifier() {
+    let mut lockfile = single_dep_lockfile("fixture", "workspace:*", "file:../fixture");
+    let metadata = lockfile.packages
+        .as_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    metadata.resolution = LockfileResolution::Directory(pnpm_lockfile::DirectoryResolution {
+        directory: "../fixture".to_string(),
+    });
+    let registries = registry_context(HashMap::new());
+    assert_eq!(
+        reusable_importer_dep(&lockfile, ".", "fixture", "workspace:*", &registries),
+        Some("fixture@file:../fixture".parse().unwrap()),
+    );
+    assert_eq!(reusable_importer_dep(&lockfile, ".", "fixture", "workspace:^2", &registries), None);
 }

@@ -1,8 +1,14 @@
 use super::{
-    AmazonS3Builder, AmazonS3ConfigKey, Arc, Deserialize, ObjectStore, fmt, redact_url_credentials,
+    AmazonS3Builder,
+    AmazonS3ConfigKey,
+    Arc,
+    Deserialize,
+    ObjectStore,
+    fmt,
+    redact_url_credentials,
 };
 
-/// The YAML `s3:` block. Selects the object store for hosted packages and
+/// The YAML `storage.s3` block. Selects the object store for hosted packages and
 /// enabled shared artifacts.
 /// Credentials fall back to the standard AWS environment variables
 /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) when not set here,
@@ -28,13 +34,13 @@ pub struct S3Settings {
     #[serde(default)]
     pub access_key_id: Option<String>,
     #[serde(default)]
-    pub secret_access_key: Option<String>,
+    pub secret_access_key: Option<crate::Secret>,
     /// Force path-style addressing (`endpoint/bucket/key`) instead of
     /// virtual-hosted (`bucket.endpoint/key`). `MinIO` typically needs
     /// this; AWS and R2 work with the default.
     #[serde(default)]
     pub force_path_style: Option<bool>,
-    /// Allow plain-HTTP endpoints — needed for a local `MinIO` over
+    /// Allow plain-HTTP endpoints, needed for a local `MinIO` over
     /// `http://`. Defaults to HTTPS-only.
     #[serde(default)]
     pub allow_http: Option<bool>,
@@ -71,7 +77,7 @@ impl S3Settings {
     }
 }
 
-/// Build the object-store client from the YAML `s3:` settings. The
+/// Build the object-store client from the YAML `storage.s3` settings. The
 /// builder seeds from the AWS environment first so env credentials
 /// work out of the box, then the explicit YAML values override.
 /// Failures here are config errors surfaced at startup, not over HTTP.
@@ -103,7 +109,7 @@ pub(super) fn s3_builder(settings: &S3Settings) -> AmazonS3Builder {
         builder = builder.with_access_key_id(key);
     }
     if let Some(secret) = &settings.secret_access_key {
-        builder = builder.with_secret_access_key(secret);
+        builder = builder.with_secret_access_key(secret.expose());
     }
     if let Some(force_path_style) = settings.force_path_style {
         builder = builder.with_virtual_hosted_style_request(!force_path_style);
@@ -117,7 +123,7 @@ pub(super) fn s3_builder(settings: &S3Settings) -> AmazonS3Builder {
 
 /// A key prefix normalized to either `""` or a value ending in `/`, so the
 /// store can concatenate it onto an object key. Every prefix reaching a store
-/// goes through this — a raw `packages` would otherwise key `packagesfoo/…`.
+/// goes through this, a raw `packages` would otherwise key `packagesfoo/…`.
 #[must_use]
 pub fn normalize_key_prefix(prefix: Option<&str>) -> String {
     match prefix
@@ -133,16 +139,16 @@ pub fn normalize_key_prefix(prefix: Option<&str>) -> String {
 }
 
 /// The resolved hosted-store backend. Like [`crate::BackendConfig`], this carries
-/// settings rather than a live client, so a parsed config stays plain data —
+/// settings rather than a live client, so a parsed config stays plain data;
 /// nothing here holds a constructed `ObjectStore` that a reader has to reason
 /// about the lifetime of. `Storage::new` builds the client.
 #[derive(Debug, Clone)]
 pub enum HostedStoreConfig {
-    /// Local directory — [`crate::StorageConfig::hosted_dir`].
+    /// Local directory, [`crate::StorageConfig::hosted_dir`].
     Fs,
-    /// S3-compatible bucket, as declared by the YAML `s3:` block.
+    /// S3-compatible bucket, as declared by the YAML `storage.s3` block.
     S3(S3Settings),
-    /// A caller-supplied object store. Parsing never produces this variant —
+    /// A caller-supplied object store. Parsing never produces this variant;
     /// it is how an embedder brings its own [`ObjectStore`]: a provider pnpr
     /// has no settings shape for, or an in-memory one under test. `prefix` is
     /// normalized on the way in, so a raw `packages` works.

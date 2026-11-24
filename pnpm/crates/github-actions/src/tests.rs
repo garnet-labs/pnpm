@@ -1,13 +1,46 @@
 use super::{
-    ActionReference, RepoVersion, find_current, find_outdated_with_runner, is_selector,
-    normalize_selector, render_target_ref, render_target_value,
-    repo_versions as versions_from_refs, selector_matcher, update_with_runner,
+    ActionReference,
+    RepoVersion,
+    find_outdated_with_runner,
+    is_selector,
+    normalize_selector,
+    selector_matcher,
+    update_with_runner,
 };
-use crate::workflow::split_uses_value;
+use crate::{
+    edits::{
+        render_target_ref,
+        render_target_value,
+    },
+    versions::{
+        find_current,
+        repo_versions as versions_from_refs,
+    },
+    workflow::{
+        action_reference,
+        uses_values,
+    },
+};
 use node_semver::Version;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter, SilentReporter};
-use pnpm_resolving_git_resolver::{GitCommandRunner, GitRunError};
-use std::{collections::HashMap, fs, future::Future, path::PathBuf, pin::Pin, sync::Mutex};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SilentReporter,
+};
+use pnpm_resolving_git_resolver::{
+    GitCommandRunner,
+    GitRunError,
+};
+use std::{
+    collections::HashMap,
+    fs,
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::Mutex,
+};
 
 const SHA_V4_1_0: &str = "1111111111111111111111111111111111111111";
 const SHA_V4_2_0: &str = "2222222222222222222222222222222222222222";
@@ -29,23 +62,13 @@ fn refs(entries: &[(&str, &str)]) -> HashMap<String, String> {
 }
 
 fn action(original_value: &str) -> ActionReference {
-    let (value, comment) = split_uses_value(original_value);
-    let (name, ref_) = value.rsplit_once('@').expect("action reference");
-    ActionReference {
-        file: PathBuf::from("workflow.yml"),
-        name: name.to_string(),
-        ref_: ref_.to_string(),
-        repo: "actions/checkout".to_string(),
-        source: crate::WorkflowValue {
-            comment_version: comment
-                .and_then(|comment| comment.split_whitespace().next())
-                .map(str::to_string),
-            flow_style: false,
-            indentation: String::new(),
-            original_value: original_value.to_string(),
-            range: 0..original_value.len(),
-        },
-    }
+    let snippet = format!("jobs:\n  test:\n    steps:\n      - uses: {original_value}\n");
+    let uses = uses_values(&snippet)
+        .expect("parse uses snippet")
+        .into_iter()
+        .next()
+        .expect("uses value");
+    action_reference(uses, Path::new("workflow.yml")).expect("action reference")
 }
 
 struct FakeGitRunner;
@@ -123,9 +146,9 @@ fn parses_annotated_semver_tags() {
 #[test]
 fn preserves_quoting_and_updates_sha_comment() {
     let action = action(&format!("'actions/checkout@{SHA_V4_1_0}' # v4.1.0 keep pinned"));
-    let target = &repo_versions()[1];
+    let versions = repo_versions();
     assert_eq!(
-        render_target_value(&action, target),
+        render_target_value(&action, &versions[0].version, &versions[1]),
         format!("'actions/checkout@{SHA_V4_2_0}' # v4.2.0 keep pinned"),
     );
 }
@@ -543,6 +566,8 @@ async fn rejects_a_server_url_that_is_not_http() {
     assert!(error.to_string().contains("must use HTTPS, except for HTTP on loopback hosts"));
 }
 
+mod anchors;
 mod concurrent_edits;
 mod release_age;
+mod selectors_and_comments;
 mod server_urls;

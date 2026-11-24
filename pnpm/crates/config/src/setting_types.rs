@@ -1,8 +1,20 @@
-pub use workspace::{CatalogMode, PackageImportMethod, ResolutionMode};
+pub use workspace::{
+    CatalogMode,
+    PackageImportMethod,
+};
 
-pub use pnpm_resolving_resolver_base::{LinkWorkspacePackages, SaveWorkspaceProtocol, TrustPolicy};
+pub use pnpm_resolving_resolver_base::{
+    LinkWorkspacePackages,
+    ResolutionMode,
+    SaveWorkspaceProtocol,
+    TrustPolicy,
+};
+pub use pnpm_workspace_state::RuntimeOnFail;
 
-use super::{Deserialize, Serialize};
+use super::{
+    Deserialize,
+    Serialize,
+};
 
 /// Controls ANSI color rendering in CLI output.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -33,6 +45,15 @@ pub enum ReporterType {
     AppendOnly,
     Ndjson,
     Silent,
+}
+
+/// Which CLI flag one entry in [`Config::filter_order`](crate::Config::filter_order)
+/// came from, preserving the relative order of interleaved `--filter` and
+/// `--filter-prod` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterSource {
+    Filter,
+    FilterProd,
 }
 
 impl<'de> Deserialize<'de> for ColorMode {
@@ -217,33 +238,6 @@ pub enum InitType {
     Commonjs,
 }
 
-/// What to do when a runtime declared through `devEngines.runtime` or
-/// `engines.runtime` does not match the current process.
-///
-/// The `runtimeOnFail` setting overrides the manifest-level `onFail` value.
-/// `download` reifies the runtime as a dependency; the other modes leave it
-/// as an engine constraint only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RuntimeOnFail {
-    Download,
-    Error,
-    Warn,
-    Ignore,
-}
-
-impl RuntimeOnFail {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Download => "download",
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Ignore => "ignore",
-        }
-    }
-}
-
 /// What `pnpm run` / `pnpm exec` do when `node_modules` is out of sync
 /// with the lockfile before running a script.
 ///
@@ -254,7 +248,7 @@ impl RuntimeOnFail {
 ///
 /// Every script pnpm spawns gets `pnpm_config_verify_deps_before_run=false`
 /// in its env, and that env var overrides every other source of this
-/// setting — otherwise a script invoking `pnpm run` would re-enter the
+/// setting; otherwise a script invoking `pnpm run` would re-enter the
 /// check and, under `install`, recurse through the spawned install's own
 /// lifecycle scripts (pnpm/pnpm#10060).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -310,7 +304,10 @@ impl<'de> serde::Deserialize<'de> for VerifyDepsBeforeRun {
     where
         De: serde::Deserializer<'de>,
     {
-        use serde::de::{self, Visitor};
+        use serde::de::{
+            self,
+            Visitor,
+        };
         use std::fmt;
 
         struct V;

@@ -1,9 +1,16 @@
 use super::{
-    FreshInputs, errors::InstallWithFreshLockfileError, on_disk::await_lockfile_gate,
-    plan::LockfileViews, resolution::Resolved, setup::pnpmfile_checksum, verify_repair_if_filtered,
+    FreshInputs,
+    errors::InstallWithFreshLockfileError,
+    on_disk::await_lockfile_gate,
+    plan::LockfileViews,
+    resolution::Resolved,
+    setup::pnpmfile_checksum,
+    verify_repair_if_filtered,
 };
 use crate::{
-    DependenciesGraphToLockfileError, GraphToLockfileOptions, ImporterLockfileInput,
+    DependenciesGraphToLockfileError,
+    GraphToLockfileOptions,
+    ImporterLockfileInput,
     dependencies_graph_to_lockfile,
 };
 use indexmap::IndexMap;
@@ -14,7 +21,11 @@ use pnpm_package_manifest::PackageManifest;
 use pnpm_reporter::Reporter;
 use pnpm_resolving_deps_resolver::ManifestHook;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
     path::Path,
     sync::Arc,
 };
@@ -30,7 +41,7 @@ use std::{
 /// alotta-files fixture, and it is what gets saved anyway.
 pub(super) async fn build_lockfile_phase<'a, Reporter: self::Reporter + 'static>(
     install: FreshInputs<'a>,
-    lockfile_verification_gate: &mut Option<crate::LockfileVerificationGate>,
+    lockfile_handles: &mut super::WantedLockfileHandles,
     resolved_time: BTreeMap<String, String>,
     resolved: &Resolved<'a, Reporter>,
     views: LockfileViews<'_, 'a>,
@@ -43,7 +54,7 @@ pub(super) async fn build_lockfile_phase<'a, Reporter: self::Reporter + 'static>
             .await
             .map_err(InstallWithFreshLockfileError::PnpmfileHook)?;
     if install.execution.lockfile_only() {
-        await_lockfile_gate(lockfile_verification_gate).await?;
+        await_lockfile_gate(&mut lockfile_handles.verification_gate).await?;
     }
     let phase_start = std::time::Instant::now();
     let built_lockfile = build_resolved_lockfile(
@@ -55,12 +66,13 @@ pub(super) async fn build_lockfile_phase<'a, Reporter: self::Reporter + 'static>
         untracked_pnpmfile_read_package_hook,
     )?;
     if verify_filtered_repair {
-        await_lockfile_gate(lockfile_verification_gate).await?;
+        await_lockfile_gate(&mut lockfile_handles.verification_gate).await?;
     }
     verify_repair_if_filtered::<Reporter>(
-        verify_filtered_repair,
+        verify_filtered_repair.then_some((&install, views.catalogs)),
         &built_lockfile,
-        install.resolution_verifiers,
+        lockfile_handles.exotic_subdeps.clone(),
+        resolved.hooks.after_all_resolved_hook.as_deref(),
     )
     .await?;
     tracing::info!(
@@ -364,13 +376,14 @@ pub(super) fn build_fresh_lockfile(
         .into_iter()
         .collect();
     let config = inputs.config;
-    dependencies_graph_to_lockfile(GraphToLockfileOptions {
+    let mut lockfile = dependencies_graph_to_lockfile(GraphToLockfileOptions {
         importers,
         graph: inputs.resolution.graph,
         catalogs: inputs.catalogs,
         time: merge_recorded_time(inputs.prior.lockfile, inputs.resolution.time),
         settings: crate::fast_update_settings::lockfile_settings_from_config(config),
         metadata_sources: crate::PackageMetadataSources {
+            lockfile_format: config.lockfile_format,
             registry_options_by_url: &config.registry_options_by_url,
             registries: &registries,
             registries_by_prefix: &registries_by_prefix,
@@ -384,7 +397,9 @@ pub(super) fn build_fresh_lockfile(
             inputs.resolution.overrides,
             inputs.resolution.include_peer_dependencies,
         ),
-    })
+    })?;
+    lockfile.lockfile_version = config.lockfile_format.version();
+    Ok(lockfile)
 }
 /// The `time:` section the rewritten lockfile carries: what the prior
 /// lockfile recorded, with this run's freshly resolved publish dates

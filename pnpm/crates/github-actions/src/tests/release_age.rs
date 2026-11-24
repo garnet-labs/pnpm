@@ -1,13 +1,29 @@
-use super::{FakeGitRunner, SHA_V4_1_0, SHA_V4_2_0, SilentReporter};
+use super::{
+    FakeGitRunner,
+    SHA_V4_1_0,
+    SHA_V4_2_0,
+    SilentReporter,
+};
 use crate::{
-    ReleaseAge, ReleaseAgeCheck, find_outdated_with_runner,
-    release_age::{TagDateReader, TagDates},
+    ReleaseAge,
+    ReleaseAgeCheck,
+    find_outdated_with_runner,
+    release_age::{
+        TagDateReader,
+        TagDates,
+    },
     update_with_runner,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use node_semver::Version;
 use pnpm_config::version_policy::create_package_version_policy;
-use std::{fs, future::Future, path::Path, pin::Pin, sync::Mutex};
+use std::{
+    fs,
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::Mutex,
+};
 
 const CUTOFF: i64 = 1_700_000_000;
 
@@ -59,7 +75,7 @@ impl TagDateReader for FailingTagDates {
 
 fn policy(exclude: &[&str]) -> ReleaseAge {
     ReleaseAge {
-        published_by: DateTime::<Utc>::from_timestamp(CUTOFF, 0).expect("cutoff"),
+        published_by: Timestamp::from_second(CUTOFF).expect("cutoff"),
         exclude: (!exclude.is_empty()).then(|| {
             create_package_version_policy(exclude).expect("exclude policy")
         }),

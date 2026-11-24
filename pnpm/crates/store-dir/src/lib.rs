@@ -7,11 +7,20 @@ pub use pkg_content_check::*;
 pub use private_install::*;
 pub use project_registry::*;
 pub use prune::*;
+pub use staging::staging_dir_name;
 pub use store_dir::*;
 pub use store_index::*;
 pub use store_loader_manifest::*;
-pub use store_lock::{StoreLockError, StoreOperationLock};
-pub use symlinks::{SYMLINK_MODE, SideEffectsOverlay, is_symlink_mode, normalize_symlink_target};
+pub use store_lock::{
+    StoreLockError,
+    StoreOperationLock,
+};
+pub use symlinks::{
+    SYMLINK_MODE,
+    SideEffectsOverlay,
+    is_symlink_mode,
+    normalize_symlink_target,
+};
 pub use upload::*;
 
 pub use loader_references::loader_blob_path;
@@ -26,6 +35,7 @@ mod project_registry;
 mod prune;
 mod prune_cached_metadata;
 mod prune_cas;
+mod staging;
 mod store_dir;
 mod store_lock;
 mod symlinks;

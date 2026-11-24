@@ -1,39 +1,64 @@
+pub(crate) mod applied_policies;
+
+pub(super) use allowed_picks::assert_allowed_picks;
+pub use applied_policies::AppliedPolicies;
+
+mod allowed_picks;
+
 use super::{
-    BTreeMap, Deserialize, HashSet, IndexMap, Lockfile, PnprClient, PnprClientError,
-    ResolveOptions, ResolveOutcome, ResolveProjectsOptions, ResolvedPackage, Stats,
-    TarballRevision, WireViolation, build_verify_error, hash_object_nullable_with_prefix,
+    BTreeMap,
+    Deserialize,
+    HashSet,
+    IndexMap,
+    Lockfile,
+    PnprClient,
+    PnprClientError,
+    ResolveOptions,
+    ResolveOutcome,
+    ResolveProjectsOptions,
+    ResolvedPackage,
+    Stats,
+    TarballRevision,
+    WireViolation,
+    build_verify_error,
+    hash_object_nullable_with_prefix,
+    lockfile_format::{
+        PNPM_LOCK_V9,
+        expect_lockfile_format,
+    },
 };
+use applied_policies::assert_applied_policies;
 use futures_util::StreamExt as _;
 
-/// Reject unsupported project transforms before consuming any package
-/// frame, so an older server cannot trigger downloads for this request.
-fn verify_transform_support(
-    response: &reqwest::Response,
-    requested: bool,
-) -> Result<(), PnprClientError> {
-    if requested
-        && response
-            .headers()
-            .get(PROJECT_TRANSFORMS_HEADER)
-            .and_then(|value| value.to_str().ok())
-            != Some(PROJECT_TRANSFORMS_VERSION)
-    {
-        return Err(PnprClientError::Protocol(
-            "pnpr server /-/pnpr/v0/resolve does not advertise project-transform support"
-                .to_string(),
-        ));
-    }
-    Ok(())
+/// Cap on one NDJSON line in a streaming resolve response. Matches the
+/// terminal lockfile frame limit (`32 MiB`) while preventing a server from
+/// growing the line buffer without bound by withholding `\n`.
+pub(super) const MAX_NDJSON_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Cap on NDJSON lines read from `/-/pnpr/v0/resolve` before a terminal frame
+/// settles the stream.
+const MAX_RESOLVE_LINES: usize = 100_000;
+
+#[derive(Clone, Copy)]
+pub(super) struct NdjsonLimits {
+    pub(super) max_line_bytes: usize,
+    pub(super) max_lines: usize,
 }
+
+const RESOLVE_NDJSON_LIMITS: NdjsonLimits =
+    NdjsonLimits { max_line_bytes: MAX_NDJSON_LINE_BYTES, max_lines: MAX_RESOLVE_LINES };
 
 /// Read the response body as NDJSON, handing each non-empty line to
 /// `on_line` until one of them settles the stream. `None` when the stream
 /// ended without a terminal frame.
 ///
 /// reqwest's `gzip` feature transparently inflates the byte stream if a
-/// proxy compressed it, so the frames arrive as plain JSON lines.
+/// proxy compressed it, so the frames arrive as plain JSON lines. Every
+/// line is bounded to `limits.max_line_bytes` before buffering, and the
+/// stream is bounded to `limits.max_lines` newline-delimited lines.
 pub(super) async fn read_ndjson_frames<Outcome, OnLine>(
     response: reqwest::Response,
+    limits: NdjsonLimits,
     mut on_line: OnLine,
 ) -> Result<Option<Outcome>, PnprClientError>
 where
@@ -41,23 +66,94 @@ where
 {
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
+    let mut lines_seen: usize = 0;
     while let Some(chunk) = stream.next().await {
-        buf.extend_from_slice(&chunk?);
-        while let Some(newline) = buf
+        let chunk = chunk?;
+        let mut rest = chunk.as_ref();
+        while let Some(newline) = rest
             .iter()
             .position(|&byte| byte == b'\n')
         {
-            let line: Vec<u8> = buf.drain(..=newline).collect();
-            let line = &line[..line.len() - 1];
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(outcome) = on_line(line)? {
+            ensure_ndjson_line_count(&mut lines_seen, limits.max_lines)?;
+            let segment = &rest[..newline];
+            rest = &rest[newline + 1..];
+            if let Some(outcome) =
+                consume_ndjson_line(&mut buf, segment, limits.max_line_bytes, &mut on_line)?
+            {
                 return Ok(Some(outcome));
             }
         }
+        append_ndjson_segment(&mut buf, rest, limits.max_line_bytes)?;
     }
     Ok(None)
+}
+
+fn ensure_ndjson_line_count(
+    lines_seen: &mut usize,
+    max_lines: usize,
+) -> Result<(), PnprClientError> {
+    *lines_seen = lines_seen.saturating_add(1);
+    if *lines_seen > max_lines {
+        return Err(PnprClientError::Protocol(format!(
+            "NDJSON stream exceeds the {max_lines}-line limit",
+        )));
+    }
+    Ok(())
+}
+
+fn consume_ndjson_line<Outcome, OnLine>(
+    buf: &mut Vec<u8>,
+    segment: &[u8],
+    max_line_bytes: usize,
+    on_line: &mut OnLine,
+) -> Result<Option<Outcome>, PnprClientError>
+where
+    OnLine: FnMut(&[u8]) -> Result<Option<Outcome>, PnprClientError>,
+{
+    if buf.is_empty() {
+        ensure_ndjson_line_fits(segment.len(), max_line_bytes)?;
+        deliver_ndjson_line(segment, on_line)
+    } else {
+        append_ndjson_segment(buf, segment, max_line_bytes)?;
+        let outcome = deliver_ndjson_line(buf, on_line);
+        buf.clear();
+        outcome
+    }
+}
+
+fn ensure_ndjson_line_fits(len: usize, max_line_bytes: usize) -> Result<(), PnprClientError> {
+    if len > max_line_bytes {
+        return Err(PnprClientError::Protocol(format!(
+            "NDJSON frame exceeds the {max_line_bytes}-byte limit",
+        )));
+    }
+    Ok(())
+}
+
+fn append_ndjson_segment(
+    buf: &mut Vec<u8>,
+    segment: &[u8],
+    max_line_bytes: usize,
+) -> Result<(), PnprClientError> {
+    if segment.is_empty() {
+        return Ok(());
+    }
+    ensure_ndjson_line_fits(buf.len().saturating_add(segment.len()), max_line_bytes)?;
+    buf.extend_from_slice(segment);
+    Ok(())
+}
+
+fn deliver_ndjson_line<Outcome, OnLine>(
+    line: &[u8],
+    on_line: &mut OnLine,
+) -> Result<Option<Outcome>, PnprClientError>
+where
+    OnLine: FnMut(&[u8]) -> Result<Option<Outcome>, PnprClientError>,
+{
+    if line.is_empty() {
+        return Ok(None);
+    }
+    on_line(line)
 }
 
 /// The request's own projects plus the importers its input lockfile already
@@ -75,7 +171,9 @@ fn permitted_importers(opts: &ResolveProjectsOptions) -> HashSet<String> {
 }
 
 fn resolve_request_body(opts: &ResolveProjectsOptions) -> serde_json::Value {
-    serde_json::to_value(opts).expect("resolution request serializes to JSON")
+    let mut body = serde_json::to_value(opts).expect("resolution request serializes to JSON");
+    body["acceptedLockfileFormats"] = serde_json::json!([PNPM_LOCK_V9]);
+    body
 }
 
 fn forward_package_frame(frame: Frame, on_package: &mut impl FnMut(ResolvedPackage)) {
@@ -116,12 +214,20 @@ fn handle_resolve_frame(
             forward_package_frame(frame, on_package);
             Ok(None)
         }
-        Frame::Done { lockfile, stats, applied_policies } => {
+        Frame::Done {
+            lockfile,
+            lockfile_format,
+            stats,
+            applied_policies,
+            allowed_picks,
+        } => {
+            expect_lockfile_format(lockfile_format.as_deref(), PNPM_LOCK_V9)?;
             assert_requested_importers(&lockfile, permitted_importers)?;
             assert_transform_metadata(&lockfile, opts)?;
             assert_publish_directories(&lockfile, opts)?;
             assert_applied_policies(applied_policies.as_ref(), opts)?;
-            Ok(Some(ResolveOutcome { lockfile: *lockfile, stats, applied_policies }))
+            assert_allowed_picks(&allowed_picks, &lockfile, opts)?;
+            Ok(Some(ResolveOutcome { lockfile: *lockfile, stats, applied_policies, allowed_picks }))
         }
         Frame::Error { message, code } => Err(PnprClientError::Server { message, code }),
         Frame::Violations { violations } => {
@@ -158,10 +264,6 @@ fn has_project_transforms(opts: &ResolveProjectsOptions) -> bool {
             .is_some_and(|extensions| !extensions.is_empty())
 }
 
-pub(super) const PROJECT_TRANSFORMS_HEADER: &str = "pnpr-project-transforms";
-
-pub(super) const PROJECT_TRANSFORMS_VERSION: &str = "1";
-
 fn assert_transform_metadata(
     lockfile: &Lockfile,
     opts: &ResolveProjectsOptions,
@@ -181,7 +283,8 @@ fn assert_transform_metadata(
         .filter(|extensions| !extensions.is_empty())
     {
         let value = serde_json::to_value(package_extensions)
-            .map_err(|err| PnprClientError::Protocol(err.to_string()))?;
+            .map_err(|err| err.to_string())
+            .map_err(PnprClientError::Protocol)?;
         let expected = hash_object_nullable_with_prefix(&value)
             .expect("a non-empty packageExtensions map has a checksum");
         if lockfile.package_extensions_checksum.as_deref() != Some(expected.as_str()) {
@@ -197,7 +300,7 @@ fn assert_transform_metadata(
 /// A project that publishes from a subdirectory must come back with that
 /// directory on its importer. The server rebuilds each project's manifest from
 /// the request, so a server that ignored `publishConfig` would have the caller
-/// link the project root — and install other code than a local install does.
+/// link the project root, and install other code than a local install does.
 fn assert_publish_directories(
     lockfile: &Lockfile,
     opts: &ResolveProjectsOptions,
@@ -235,119 +338,7 @@ fn equal_patch_hashes(
 }
 
 pub(super) fn parse_frame(line: &[u8]) -> Result<Frame, PnprClientError> {
-    serde_json::from_slice(line).map_err(|err| PnprClientError::Protocol(err.to_string()))
-}
-
-/// The policies the server applied to a resolution, echoed in the `done`
-/// frame so the client can verify that requested verification and resolution
-/// policies were actually enforced by the server.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppliedPolicies {
-    pub auto_install_peers: bool,
-    pub dedupe_peers: bool,
-    pub exclude_links_from_lockfile: bool,
-    pub add_missing_peer_types: bool,
-    pub frozen_lockfile: bool,
-    pub resolution_mode: String,
-    #[serde(default)]
-    pub minimum_release_age: Option<u64>,
-    #[serde(default)]
-    pub trust_policy: Option<String>,
-}
-
-fn assert_applied_policies(
-    applied: Option<&AppliedPolicies>,
-    opts: &ResolveProjectsOptions,
-) -> Result<(), PnprClientError> {
-    let Some(applied) = applied else {
-        return Ok(());
-    };
-    assert_verification_policies(applied, opts)?;
-    assert_resolution_settings(applied, opts)?;
-    assert_reuse_policies(applied, opts)?;
-    Ok(())
-}
-
-fn assert_verification_policies(
-    applied: &AppliedPolicies,
-    opts: &ResolveProjectsOptions,
-) -> Result<(), PnprClientError> {
-    if opts.verification.trust_policy == pnpm_config::TrustPolicy::NoDowngrade
-        && applied.trust_policy.as_deref() != Some("no-downgrade")
-    {
-        return Err(PnprClientError::Protocol(
-            "pnpr server ignored requested trustPolicy (expected no-downgrade)".to_string(),
-        ));
-    }
-    if opts.verification.minimum_release_age.is_some()
-        && opts.verification.minimum_release_age != applied.minimum_release_age
-    {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr server ignored requested minimumReleaseAge (expected {:?}, got {:?})",
-            opts.verification.minimum_release_age, applied.minimum_release_age,
-        )));
-    }
-    Ok(())
-}
-
-fn assert_resolution_settings(
-    applied: &AppliedPolicies,
-    opts: &ResolveProjectsOptions,
-) -> Result<(), PnprClientError> {
-    if opts.resolution.auto_install_peers.is_some_and(|val| val != applied.auto_install_peers) {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr server ignored requested autoInstallPeers (expected {:?}, got {})",
-            opts.resolution.auto_install_peers, applied.auto_install_peers,
-        )));
-    }
-    if opts.resolution.dedupe_peers.is_some_and(|val| val != applied.dedupe_peers) {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr server ignored requested dedupePeers (expected {:?}, got {})",
-            opts.resolution.dedupe_peers, applied.dedupe_peers,
-        )));
-    }
-    if opts.resolution.exclude_links_from_lockfile.is_some_and(|val| {
-        val != applied.exclude_links_from_lockfile
-    }) {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr server ignored requested excludeLinksFromLockfile (expected {:?}, got {})",
-            opts.resolution.exclude_links_from_lockfile, applied.exclude_links_from_lockfile,
-        )));
-    }
-    if opts.resolution.add_missing_peer_types.is_some_and(|val| {
-        val != applied.add_missing_peer_types
-    }) {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr server ignored requested addMissingPeerTypes (expected {:?}, got {})",
-            opts.resolution.add_missing_peer_types, applied.add_missing_peer_types,
-        )));
-    }
-    let expected_mode = match opts.resolution.resolution_mode {
-        pnpm_config::ResolutionMode::Highest => "highest",
-        pnpm_config::ResolutionMode::TimeBased => "time-based",
-        pnpm_config::ResolutionMode::LowestDirect => "lowest-direct",
-    };
-    if applied.resolution_mode != expected_mode {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr server ignored requested resolutionMode (expected {expected_mode}, got {})",
-            applied.resolution_mode,
-        )));
-    }
-    Ok(())
-}
-
-fn assert_reuse_policies(
-    applied: &AppliedPolicies,
-    opts: &ResolveProjectsOptions,
-) -> Result<(), PnprClientError> {
-    if opts.reuse.frozen_lockfile != applied.frozen_lockfile {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr server did not respect frozenLockfile (expected {}, got {})",
-            opts.reuse.frozen_lockfile, applied.frozen_lockfile,
-        )));
-    }
-    Ok(())
+    serde_json::from_slice(line).map_err(|err| err.to_string()).map_err(PnprClientError::Protocol)
 }
 
 /// One NDJSON frame from resolve endpoint. `package` frames stream as the
@@ -375,10 +366,14 @@ pub(super) enum Frame {
     /// behind a pointer keeps the enum small.
     Done {
         lockfile: Box<Lockfile>,
+        #[serde(rename = "lockfileFormat", default)]
+        lockfile_format: Option<String>,
         #[serde(default)]
         stats: Stats,
         #[serde(default, rename = "appliedPolicies")]
         applied_policies: Option<AppliedPolicies>,
+        #[serde(default, rename = "allowedPicks")]
+        allowed_picks: Vec<String>,
     },
     Error {
         message: String,
@@ -408,8 +403,8 @@ impl PnprClient {
     }
 
     /// Resolve a single project, invoking `on_package` once per resolved
-    /// tarball as its `package` frame streams in — *before* the full
-    /// lockfile arrives — so the caller can begin fetching each tarball
+    /// tarball as its `package` frame streams in (*before* the full
+    /// lockfile arrives) so the caller can begin fetching each tarball
     /// while the server is still resolving. Returns the resolved lockfile
     /// from the terminal `done` frame.
     pub async fn resolve_streaming(
@@ -418,6 +413,29 @@ impl PnprClient {
         on_package: impl FnMut(ResolvedPackage),
     ) -> Result<ResolveOutcome, PnprClientError> {
         self.resolve_projects_streaming(opts.into(), on_package).await
+    }
+
+    async fn handshake_project_transforms(
+        &self,
+        opts: &ResolveProjectsOptions,
+    ) -> Result<(), PnprClientError> {
+        let project_transforms_requested = has_project_transforms(opts);
+        if project_transforms_requested {
+            let capability = self.ensure_handshake().await?;
+            Self::require_resolver_protocol(capability)?;
+            if !capability
+                .protocol("resolver")
+                .features
+                .iter()
+                .any(|feature| feature == "projectTransforms")
+            {
+                return Err(PnprClientError::Protocol(
+                    "pnpr server /-/pnpr/v0/resolve does not advertise project-transform support"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Resolve workspace projects, invoking `on_package` once per resolved
@@ -437,25 +455,15 @@ impl PnprClient {
         // `{ specifiers: {} }`), and a genuinely missing importer is surfaced
         // downstream by the lockfile merge, not a way to inject dependencies.
         let permitted_importers = permitted_importers(&opts);
-        let project_transforms_requested = has_project_transforms(&opts);
-        let mut post = self.http
-            .post(format!("{}-/pnpr/v0/resolve", self.base_url))
+        self.handshake_project_transforms(&opts).await?;
+        let post = self
+            .resolution_post("-/pnpr/v0/resolve", opts.routing.authorization.as_deref())
+            .await?
             .json(&resolve_request_body(&opts));
-        if let Some(authorization) = opts.routing.authorization.as_deref() {
-            post = post.header("authorization", authorization);
-        }
         let response = post.send().await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(PnprClientError::server(format!(
-                "/-/pnpr/v0/resolve returned {status}: {body}",
-            )));
-        }
+        let response = super::check_status(response, "/-/pnpr/v0/resolve").await?;
 
-        verify_transform_support(&response, project_transforms_requested)?;
-
-        let outcome = read_ndjson_frames(response, |line| {
+        let outcome = read_ndjson_frames(response, RESOLVE_NDJSON_LIMITS, |line| {
             handle_resolve_frame(parse_frame(line)?, &mut on_package, &permitted_importers, &opts)
         })
         .await?;

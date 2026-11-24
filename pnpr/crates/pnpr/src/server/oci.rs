@@ -17,27 +17,56 @@
 
 pub(super) mod tokens;
 
-pub(super) use response::{Refusal, error};
+pub(super) use response::{
+    Refusal,
+    error,
+};
 
-pub(super) use publication::{OciPublication, authorize_publication};
+pub(super) use publication::{
+    OciPublication,
+    OciTarget,
+    authorize_publication,
+};
 
 mod response;
 use response::{
-    ResponseBody, accepted, api_version, created, hosted_manifest_response, insert_header, json,
-    method_not_allowed, no_content, range_not_satisfiable, ranged_blob_response, registry_error,
-    server_error, unknown_repository,
+    ResponseBody,
+    accepted,
+    api_version,
+    created,
+    hosted_manifest_response,
+    insert_header,
+    json,
+    method_not_allowed,
+    no_content,
+    range_not_satisfiable,
+    ranged_blob_response,
+    registry_error,
+    server_error,
+    unknown_repository,
 };
 
 mod upload_body;
 use upload_body::{
-    append_body, collect_body, hash_upload, now_millis, parse_content_range, read_manifest_bytes,
+    append_body,
+    collect_body,
+    hash_upload,
+    now_millis,
+    parse_content_range,
+    read_manifest_bytes,
     upload_lock_key,
 };
 
 mod referrer_page;
 use referrer_page::{
-    ReferrerDescriptor, ReferrerFilter, ReferrerPage, ReferrerStep, Referrers, indexed_referrer,
-    read_image_document, referrer_entry_step,
+    ReferrerDescriptor,
+    ReferrerFilter,
+    ReferrerPage,
+    ReferrerStep,
+    Referrers,
+    indexed_referrer,
+    read_image_document,
+    referrer_entry_step,
 };
 
 mod discovery;
@@ -53,34 +82,87 @@ mod proxy;
 mod publication;
 
 use super::{
-    Action, AppState, AuthedCaller, RegistrySource, TargetRegistry, authorize,
-    documents::read_hosted_document,
-    ecosystem::{addressed_registry, caller_scoped, hosted_sources, mount_bases},
-    hosted_read_namespace, private_no_cache, resolve_ecosystem_source,
+    Action,
+    AppState,
+    AuthedCaller,
+    Ownership,
+    RegistrySource,
+    TargetRegistry,
+    authorize,
+    authorize_package,
+    authorize_with_ownership,
+    documents::{
+        lookup_in_hosted_document,
+        read_hosted_document,
+    },
+    ecosystem::{
+        addressed_registry,
+        caller_scoped,
+        hosted_sources,
+        mount_bases,
+    },
+    hosted_read_namespace,
+    package_owners::owner_routes,
+    private_no_cache,
+    resolve_ecosystem_source,
 };
 use axum::{
     Router,
-    body::{Body, Bytes},
-    extract::{DefaultBodyLimit, OriginalUri, Path, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::{any, get},
+    body::{
+        Body,
+        Bytes,
+    },
+    extract::{
+        DefaultBodyLimit,
+        OriginalUri,
+        Path,
+        State,
+    },
+    http::{
+        HeaderMap,
+        HeaderValue,
+        Method,
+        StatusCode,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
+    routing::{
+        any,
+        get,
+    },
 };
 use pnpr_error::RegistryError;
 use pnpr_oci::{
-    API_SEGMENT, Digest, ErrorBody, ErrorCode, ImageDocument, Manifest, ManifestEntry,
-    ReferrerMetadata, media_type,
+    API_SEGMENT,
+    Digest,
+    ErrorBody,
+    ErrorCode,
+    ImageDocument,
+    Manifest,
+    ManifestEntry,
+    ReferrerMetadata,
+    media_type,
 };
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_policy::Identity;
 use pnpr_registry::Ecosystem;
-use pnpr_search::percent_decode;
-use pnpr_storage::{DOCUMENT_WRITE_RETRIES, DocumentUpdate, Storage, upload::BlobUpload};
+use pnpr_storage::{
+    DOCUMENT_WRITE_RETRIES,
+    DocumentUpdate,
+    Storage,
+    upload::BlobUpload,
+};
 use serde::Serialize;
 use sha2::Sha256;
 use std::{
     collections::HashMap,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 const ECOSYSTEM: Ecosystem = Ecosystem::Oci;
@@ -118,10 +200,16 @@ pub(super) fn routes() -> Router<AppState> {
             .route(&format!("{base}/{API_SEGMENT}/{{*path}}"), any(dispatch));
     }
     // Streaming handlers enforce the configured cumulative upload limit.
-    router.route_layer(DefaultBodyLimit::disable())
+    router = router.route_layer(DefaultBodyLimit::disable());
+    // Owner requests are a pnpr extension, so they stay off the root the
+    // OCI API needs.
+    for base in mount_bases(ECOSYSTEM) {
+        router = router.route(&format!("{base}/owners/{{*name}}"), owner_routes::<ImageDocument>());
+    }
+    router
 }
 
-/// `GET /v2/` — the version check every client makes first, and what
+/// `GET /v2/`: the version check every client makes first, and what
 /// `docker login` reads to decide whether its credentials were accepted.
 async fn get_version_check(
     State(state): State<AppState>,
@@ -141,7 +229,8 @@ async fn get_version_check(
     if identity == Identity::Anonymous
         && !headers
             .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
+            .map(HeaderValue::to_str)
+            .and_then(Result::ok)
             .and_then(super::authentication::token_credentials)
             .is_some_and(|token| token.starts_with(tokens::TOKEN_PREFIX))
     {
@@ -336,7 +425,8 @@ impl Request {
         }
         self.headers
             .get(header::RANGE)
-            .and_then(|value| value.to_str().ok())
+            .map(HeaderValue::to_str)
+            .and_then(Result::ok)
             .and_then(parse_download_range)
     }
 
@@ -357,25 +447,35 @@ impl Request {
 
     /// The hosted registry a write of `name` lands on, once the caller is
     /// allowed to publish it.
-    fn publish_target(&self, name: &str) -> Result<(CanonicalPackageName, String), Refusal> {
-        authorize_publication(&self.state, &self.identity, self.registry.as_deref(), name)
+    async fn publish_target(&self, name: &str) -> Result<OciTarget, Refusal> {
+        authorize_publication(&self.state, &self.identity, self.registry.as_deref(), name).await
     }
 
     /// The hosted repository `name` addresses, with the storage this caller
     /// may read it from.
     fn hosted_repo(&self, name: &str) -> Result<HostedRepo, Refusal> {
         let (key, source) = self.hosted_source(name)?;
-        let org = hosted_read_namespace(&self.state, &self.identity, &source, key.as_str())
+        let namespace = hosted_read_namespace(&self.state, &self.identity, &source, key.as_str())
             .map_err(Refusal::from)?;
-        let storage = self.state.inner.storage.for_hosted(&org, ECOSYSTEM);
-        Ok(HostedRepo { key, source, storage })
+        let storage = self.state.inner.storage.for_hosted(&namespace, ECOSYSTEM);
+        Ok(HostedRepo { key, source, namespace, storage })
+    }
+
+    /// Whether the caller may delete from `repo`. Called under the package
+    /// lock, so an owner removed meanwhile can no longer delete.
+    async fn authorize_unpublish(&self, repo: &HostedRepo) -> Result<(), RegistryError> {
+        let source = RegistrySource::Hosted(repo.source.clone());
+        let (key, namespace) = (repo.key.as_str(), Some(repo.namespace.as_str()));
+        authorize_package(&self.state, &self.identity, &source, key, Action::Delete, namespace)
+            .await
     }
 
     /// Whether a bearer token on the request denies pulling `source_key`.
     fn token_forbids_pull(&self, source_key: &str) -> Result<bool, RegistryError> {
         let Some(raw) = self.headers
             .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
+            .map(HeaderValue::to_str)
+            .and_then(Result::ok)
             .and_then(super::authentication::token_credentials)
         else {
             return Ok(false);
@@ -428,6 +528,7 @@ struct TagList<'listing> {
 struct HostedRepo {
     key: CanonicalPackageName,
     source: String,
+    namespace: String,
     storage: Storage,
 }
 
@@ -455,7 +556,9 @@ fn api_base(uri_path: &str, tail: &str) -> String {
     uri_path
         .trim_end_matches('/')
         .strip_suffix(tail.trim_end_matches('/'))
-        .map_or_else(|| format!("/{API_SEGMENT}"), |base| base.trim_end_matches('/').to_string())
+        .map(|base| base.trim_end_matches('/'))
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| format!("/{API_SEGMENT}"))
 }
 
 /// One named parameter of a raw query string.
@@ -464,7 +567,7 @@ fn query_param(query: Option<&str>, key: &str) -> Option<String> {
         .split('&')
         .find_map(|pair| {
             let (name, value) = pair.split_once('=')?;
-            (name == key).then(|| percent_decode(value))
+            (name == key).then(|| pnpm_network::percent_decode_str(value))
         })
 }
 

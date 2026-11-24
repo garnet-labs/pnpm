@@ -1,21 +1,36 @@
+pub(super) mod processing;
+
 use pnpr_config::PackageDocumentsConfig;
 
 use super::{
-    ABBREVIATED_CONTENT_TYPE, AppState, Body, CanonicalPackageName, DistView, HeaderMap, IndexMap,
-    Integrity, RegistryError, Response, StatusCode, Utc, Value, abbreviate_packument,
-    describe_tars, filter_osv_vulnerable_versions, header, rewrite_tarball_urls,
-    rewrite_upstream_tarball_urls, streaming, tarball_basename_for_package,
-    version_route_tarball_version,
+    ABBREVIATED_CONTENT_TYPE,
+    AppState,
+    Body,
+    CanonicalPackageName,
+    DistView,
+    HeaderMap,
+    IndexMap,
+    Integrity,
+    RegistryError,
+    Response,
+    StatusCode,
+    UpstreamTarballRoute,
+    Value,
+    abbreviate_packument,
+    conditional_requests::is_not_modified,
+    header,
+    streaming,
+    tarball_basename_for_package,
 };
 
 /// The version a tarball request resolves to, plus that version's declared
 /// `dist.integrity`. The version is found by matching `filename` against
 /// each version's `dist.tarball` basename rather than parsing it out of
-/// the filename, so a non-canonical name (see [`rewrite_tarball_urls`])
+/// the filename, so a non-canonical name (see [`super::rewrite_tarball_urls`])
 /// resolves to the right version, integrity, and OSV identity.
 pub(super) struct TarballDist {
     pub(super) version: String,
-    pub(super) version_route: Option<String>,
+    pub(super) route: UpstreamTarballRoute,
     pub(super) integrity: Integrity,
     pub(super) unpacked_size: Option<u64>,
 }
@@ -43,7 +58,7 @@ pub(super) struct DistBlock {
     pub(super) tarball: Option<String>,
     #[serde(default)]
     pub(super) integrity: Option<String>,
-    /// Legacy hex sha1 — the only hash pre-2017 npm publishes carry.
+    /// Legacy hex sha1, the only hash pre-2017 npm publishes carry.
     #[serde(default)]
     pub(super) shasum: Option<String>,
     #[serde(default, rename = "unpackedSize")]
@@ -75,19 +90,16 @@ pub(super) fn expected_tarball_dist(
     // legitimate registry, so fail closed rather than pick by iteration order.
     if matches.next().is_some() {
         return Err(tarball_integrity_error(
-            name.as_str(),
-            filename,
+            name.as_str().to_owned(),
+            filename.to_owned(),
             "packument declares the same dist.tarball basename for multiple versions".to_string(),
         ));
     }
     let integrity = declared_tarball_integrity(dist, name, filename, version)?;
-    let version_route = dist.tarball
-        .as_deref()
-        .and_then(|url| version_route_tarball_version(url, name))
-        .map(str::to_string);
+    let route = UpstreamTarballRoute::from_dist_tarball(dist.tarball.as_deref(), name);
     Ok(Some(TarballDist {
         version: version.clone(),
-        version_route,
+        route,
         integrity,
         unpacked_size: dist.unpacked_size,
     }))
@@ -104,8 +116,8 @@ pub(super) fn declared_tarball_integrity(
         streaming::parse_integrity(declared)
             .map_err(|err| {
                 tarball_integrity_error(
-                    name.as_str(),
-                    filename,
+                    name.as_str().to_owned(),
+                    filename.to_owned(),
                     format!("malformed dist.integrity: {err}"),
                 )
             })?
@@ -114,16 +126,16 @@ pub(super) fn declared_tarball_integrity(
             .as_deref()
             .ok_or_else(|| {
                 tarball_integrity_error(
-                    name.as_str(),
-                    filename,
+                    name.as_str().to_owned(),
+                    filename.to_owned(),
                     format!("packument has no dist.integrity or dist.shasum for {version:?}"),
                 )
             })?;
         Integrity::from_hex(shasum, ssri::Algorithm::Sha1)
             .map_err(|err| {
                 tarball_integrity_error(
-                    name.as_str(),
-                    filename,
+                    name.as_str().to_owned(),
+                    filename.to_owned(),
                     format!("malformed dist.shasum: {err}"),
                 )
             })?
@@ -150,89 +162,83 @@ pub(super) fn tarball_stream_error_for_package(
         }
         streaming::BlobStreamError::Io(err) => RegistryError::Io(err),
         streaming::BlobStreamError::Integrity(err) => tarball_integrity_error(
-            package,
-            filename,
+            package.to_owned(),
+            filename.to_owned(),
             format!("integrity verification failed: {err}"),
         ),
         streaming::BlobStreamError::TooLarge { limit, received } => tarball_integrity_error(
-            package,
-            filename,
+            package.to_owned(),
+            filename.to_owned(),
             format!("tarball body exceeds {limit} byte limit (received {received} bytes)"),
         ),
     }
 }
 
 pub(super) fn tarball_integrity_error(
-    package: &str,
-    filename: &str,
+    package: String,
+    filename: String,
     reason: String,
 ) -> RegistryError {
-    RegistryError::TarballIntegrity {
-        package: package.to_string(),
-        filename: filename.to_string(),
-        reason,
-    }
+    RegistryError::TarballIntegrity { package, filename, reason }
 }
 
 /// True when the client's `Accept` header offers the
 /// `application/vnd.npm.install-v1+json` abbreviated MIME. We do a
-/// substring match rather than full RFC-7231 q-value parsing — the
+/// substring match rather than full RFC-7231 q-value parsing, the
 /// npm client always sends it as the top-priority option and a
 /// substring presence is a reliable signal.
 pub(super) fn wants_abbreviated(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .is_some_and(|accept| accept.contains(ABBREVIATED_CONTENT_TYPE))
 }
 
-/// Parse the on-disk packument, rewrite `dist.tarball` URLs, and build the
-/// response. Honors conditional requests (`If-None-Match`, `If-Modified-Since`)
-/// with 304 Not Modified. When abbreviated MIME is requested, strip down to the
-/// npm spec's install-v1 field set and tag the response with the abbreviated
-/// content type.
-pub(super) fn packument_response(
+pub(super) async fn packument_response(
     name: &CanonicalPackageName,
-    bytes: &[u8],
+    bytes: axum::body::Bytes,
     tarball_base: &str,
     view: DistView<'_>,
     state: &AppState,
-    headers: &HeaderMap,
+    request: PackumentRequest<'_>,
     max_age: u64,
 ) -> Result<Response, RegistryError> {
-    let osv_index = state.inner.osv_index.as_ref();
-    let mut doc: Value = serde_json::from_slice(bytes)?;
-    filter_osv_vulnerable_versions(&mut doc, name, osv_index);
-    match view.revision_registry {
-        Some(source_registry) => {
-            rewrite_upstream_tarball_urls(&mut doc, name, source_registry, tarball_base);
-        }
-        None => rewrite_tarball_urls(&mut doc, name, tarball_base),
+    let (representation, validators) = match request {
+        PackumentRequest::Read(headers) => (Representation::requested(headers), Some(headers)),
+        PackumentRequest::Write => (Representation::Write, None),
+    };
+    let rendered =
+        processing::render(name, bytes, tarball_base, view, state, representation).await?;
+    if let Some(headers) = validators
+        && is_not_modified(headers, &rendered.etag, rendered.last_modified.as_deref())
+    {
+        return Ok(packument_not_modified_response(
+            &rendered.etag,
+            rendered.last_modified.clone(),
+            max_age,
+        ));
     }
-    if let Some(table) = view.tar_integrities {
-        describe_tars(&mut doc, table, view.tar_registry);
-    }
-    let representation = Representation::requested(headers);
-    let last_modified_source = packument_last_modified(&doc);
-    let documents = &state.inner.config.http.package_documents;
-    let (body, content_type) = representation.render(doc, documents)?;
-    let abbreviated = representation != Representation::Full;
-    let etag = format!(r#""{}""#, super::ecosystem::sha256_hex(&body));
-    // Per RFC 9110 Section 8.8.2, Last-Modified is omitted when the representation
-    // is dynamically generated or subject to content negotiation (such as OSV
-    // filtering or abbreviation) and can vary independently of modification time.
-    let last_modified =
-        if osv_index.is_some() || abbreviated { None } else { last_modified_source };
-    if is_not_modified(headers, &etag, last_modified.as_deref()) {
-        return Ok(packument_not_modified_response(&etag, last_modified, max_age));
-    }
-    Ok(packument_ok_response(body, content_type, &etag, last_modified, max_age))
+    Ok(packument_ok_response(
+        rendered.body.clone(),
+        rendered.content_type,
+        &rendered.etag,
+        rendered.last_modified.clone(),
+        max_age,
+    ))
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PackumentRequest<'a> {
+    Read(&'a HeaderMap),
+    Write,
 }
 
 /// The form of a package document a client asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Representation {
     Full,
+    Write,
     Abbreviated,
     /// pnpr's own format (see [`super::split_packuments`]).
     InstallV2,
@@ -256,74 +262,27 @@ impl Representation {
         self,
         mut doc: Value,
         documents: &PackageDocumentsConfig,
+        now: jiff::Timestamp,
+        view: DistView<'_>,
     ) -> Result<(Vec<u8>, &'static str), RegistryError> {
         if self == Representation::InstallV2 {
-            super::publishing::variants::describe_variants(&mut doc);
-            let anchor = super::split_packuments::document_anchor(&doc).unwrap_or_else(Utc::now);
+            let anchor = super::split_packuments::document_anchor(&doc).unwrap_or(now);
             let trimmed = abbreviate_packument(&doc, anchor);
-            let body = super::split_packuments::install_v2_body(&trimmed, documents)?;
+            // A hosted tar route's archive digest differs from its accepted record's.
+            let body = if view.hosted && view.tar_registry {
+                serde_json::to_vec(&super::split_packuments::install_v2(&trimmed, documents))?
+            } else {
+                super::split_packuments::install_v2_body(&trimmed, documents)?
+            };
             return Ok((body, super::split_packuments::INSTALL_V2_CONTENT_TYPE));
         }
         super::split_packuments::without_pnpr_facts_in(&mut doc);
         if self == Representation::Abbreviated {
-            let trimmed = abbreviate_packument(&doc, Utc::now());
+            let trimmed = abbreviate_packument(&doc, now);
             return Ok((serde_json::to_vec(&trimmed)?, ABBREVIATED_CONTENT_TYPE));
         }
         Ok((serde_json::to_vec(&doc)?, "application/json"))
     }
-}
-
-fn is_not_modified(headers: &HeaderMap, etag: &str, last_modified: Option<&str>) -> bool {
-    let mut has_inm = false;
-    for inm in headers.get_all(header::IF_NONE_MATCH) {
-        has_inm = true;
-        if inm.to_str().is_ok_and(|header_val| if_none_match_matches(header_val, etag)) {
-            return true;
-        }
-    }
-    if has_inm {
-        return false;
-    }
-    if let Some(ims) = headers
-        .get(header::IF_MODIFIED_SINCE)
-        .and_then(|val| val.to_str().ok())
-        && let Some(lm) = last_modified
-    {
-        return if_modified_since_matches(ims, lm);
-    }
-    false
-}
-
-fn if_none_match_matches(header_val: &str, etag: &str) -> bool {
-    let matches_candidate = |candidate: &str| {
-        let candidate = candidate.trim();
-        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
-    };
-    let mut in_quotes = false;
-    let mut start = 0;
-    for (idx, char_code) in header_val.char_indices() {
-        match char_code {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                if matches_candidate(&header_val[start..idx]) {
-                    return true;
-                }
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    matches_candidate(&header_val[start..])
-}
-
-fn if_modified_since_matches(if_modified_since: &str, last_modified: &str) -> bool {
-    let Ok(ims_time) = chrono::DateTime::parse_from_rfc2822(if_modified_since) else {
-        return false;
-    };
-    let Ok(lm_time) = chrono::DateTime::parse_from_rfc2822(last_modified) else {
-        return false;
-    };
-    lm_time <= ims_time
 }
 
 /// The response header that tells a client a package document comes from
@@ -352,7 +311,7 @@ fn packument_not_modified_response(
 }
 
 fn packument_ok_response(
-    body: Vec<u8>,
+    body: axum::body::Bytes,
     content_type: &'static str,
     etag: &str,
     last_modified: Option<String>,
@@ -391,11 +350,11 @@ pub(super) fn packument_bytes_response(
 /// `Last-Modified` value for a served packument: the document's
 /// `time.modified` in HTTP-date form. Lets a client's release-age check
 /// (pnpm's `minimumReleaseAge`) learn the package-level last-publish
-/// upper bound from response headers alone — a `HEAD` costs ~no bytes
+/// upper bound from response headers alone, a `HEAD` costs ~no bytes
 /// where the abbreviated body runs to hundreds of KB. Fractional
 /// seconds round *up* to the next whole second: the header must stay
 /// an upper bound on the publish time, and truncating would understate
-/// it by up to 999ms — exactly the window a release-age check guards.
+/// it by up to 999ms, exactly the window a release-age check guards.
 /// `None` when the document carries no parsable `time.modified`; the
 /// header is omitted then.
 pub(super) fn packument_last_modified(doc: &Value) -> Option<String> {
@@ -403,12 +362,11 @@ pub(super) fn packument_last_modified(doc: &Value) -> Option<String> {
         .get("time")?
         .get("modified")?
         .as_str()?;
-    let parsed = chrono::DateTime::parse_from_rfc3339(modified).ok()?;
-    let mut whole_seconds = parsed.with_timezone(&Utc);
-    if whole_seconds.timestamp_subsec_nanos() > 0 {
-        whole_seconds += chrono::Duration::seconds(1);
-    }
-    Some(whole_seconds.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+    let parsed = pnpm_time::parse_rfc3339(modified).ok()?;
+    let whole_seconds = parsed
+        .round(jiff::TimestampRound::new().smallest(jiff::Unit::Second).mode(jiff::RoundMode::Ceil))
+        .ok()?;
+    Some(whole_seconds.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string())
 }
 
 pub(super) fn tarball_response(body: Body, content_length: Option<u64>) -> Response {
@@ -424,7 +382,7 @@ pub(super) fn tarball_response(body: Body, content_length: Option<u64>) -> Respo
 /// `response` with the generation its package view was rendered from.
 pub(super) fn with_generation(
     mut response: Response,
-    generation: Option<&pnpr_storage::metadata::Generation>,
+    generation: Option<&pnpr_storage::database::Generation>,
 ) -> Response {
     let value = generation.and_then(|generation| {
         axum::http::HeaderValue::from_str(&generation.to_string()).ok()

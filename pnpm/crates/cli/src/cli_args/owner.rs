@@ -1,18 +1,37 @@
 use crate::cli_args::{
     registry_client::{
-        PACKAGE_DOCUMENT_BODY_LIMIT, apply_auth_and_otp, auth_header_for_package,
-        build_registry_client_with_otp_guard, join_registry_endpoint,
-        resolve_registries_with_override, resolve_target_registry_for_package,
+        PACKAGE_DOCUMENT_BODY_LIMIT,
+        apply_auth_and_otp,
+        auth_header_for_package,
+        build_registry_client_with_otp_guard,
+        join_registry_endpoint,
+        resolve_registries_with_override,
+        resolve_target_registry_for_package,
     },
-    sanitize::{DEFAULT_ERROR_BODY_LIMIT, read_sanitized_error_body},
+    sanitize::{
+        DEFAULT_ERROR_BODY_LIMIT,
+        read_sanitized_error_body,
+    },
 };
 use clap::Args;
-use derive_more::{Display, Error};
-use miette::{Diagnostic, IntoDiagnostic};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Diagnostic,
+    IntoDiagnostic,
+};
 use pnpm_config::Config;
 use pnpm_network::{
-    RetryOpts, ThrottledClient, encode_uri_component, escaped_package_name, normalize_registry_url,
-    read_limited_body, redact_url_credentials, send_with_retry,
+    RetryOpts,
+    ThrottledClient,
+    encode_uri_component,
+    escaped_package_name,
+    normalize_registry_url,
+    read_limited_body,
+    redact_url_credentials,
+    send_with_retry,
 };
 use reqwest::Response;
 use serde::Deserialize;
@@ -208,6 +227,7 @@ async fn owner_add(context: &OwnerContext<'_>, params: &[String]) -> miette::Res
             let builder = client
                 .put(&endpoint.url)
                 .header("content-type", "application/json")
+                .header("npm-command", "owner")
                 .body(body.clone());
             apply_auth_and_otp(builder, endpoint.auth_header.as_deref(), context.otp.as_deref())
         })
@@ -232,7 +252,7 @@ async fn owner_rm(context: &OwnerContext<'_>, params: &[String]) -> miette::Resu
 
     let (_guard, response) =
         send_with_retry(&context.http_client, &url, context.retry_opts, |client| {
-            let builder = client.delete(&url);
+            let builder = client.delete(&url).header("npm-command", "owner");
             apply_auth_and_otp(builder, endpoint.auth_header.as_deref(), context.otp.as_deref())
         })
         .await

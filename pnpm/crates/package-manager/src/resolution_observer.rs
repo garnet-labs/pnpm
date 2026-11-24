@@ -2,19 +2,28 @@
 //! tree walk yields it.
 //!
 //! Unlike [`crate::PrefetchingResolver`], which kicks off a background
-//! *download* per resolution, [`ObservingResolver`] does no I/O — it
+//! *download* per resolution, [`ObservingResolver`] does no I/O; it
 //! forwards a lightweight fetch hint to a [`ResolutionObserver`]. The
 //! pnpr server installs an observer that streams each hint to the client
 //! as an NDJSON `package` frame, so the client begins fetching tarballs
 //! while the server is still resolving.
 
 use crate::install_package_from_registry::{
-    extract_tarball, manifest_file_count, manifest_requires_build, manifest_unpacked_size,
+    extract_tarball,
+    manifest_file_count,
+    manifest_requires_build,
+    manifest_unpacked_size,
 };
 use dashmap::DashSet;
 use pnpm_resolving_resolver_base::{
-    LatestQuery, PackageVersionGuard, ResolveFuture, ResolveLatestFuture, ResolveOptions,
-    ResolveResult, Resolver, WantedDependency,
+    LatestQuery,
+    PackageVersionGuard,
+    ResolveFuture,
+    ResolveLatestFuture,
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
+    WantedDependency,
 };
 use pnpm_tarball::SharedReportedProgressKeys;
 use std::sync::Arc;
@@ -26,7 +35,7 @@ use std::sync::Arc;
 pub struct ResolvedPackageHint<'a> {
     /// Subresource-integrity string (`sha512-...`).
     pub integrity: &'a str,
-    /// The resolver's `dist.tarball` URL — the same string the install
+    /// The resolver's `dist.tarball` URL, the same string the install
     /// pass looks up in the shared mem cache.
     pub tarball_url: &'a str,
     /// `dist.unpackedSize` from the resolver-fetched manifest, when
@@ -47,7 +56,7 @@ pub struct ResolvedPackageHint<'a> {
     /// Whether the package resolved from a registry (npm / named / jsr), so
     /// [`Self::tarball_url`] is the registry packument's `dist.tarball`. A
     /// server router must classify such a package by its *registry* route, not
-    /// by the tarball host — which can differ for a split-domain registry —
+    /// by the tarball host (which can differ for a split-domain registry)
     /// to avoid emitting (and leaking) a private upstream tarball URL. `false`
     /// for a direct tarball/git/local dependency, whose tarball URL *is* its
     /// source.
@@ -56,7 +65,7 @@ pub struct ResolvedPackageHint<'a> {
 }
 
 pub struct ResolvedPackageIdentity<'a> {
-    /// Canonical `name@version` identifier — the store-index
+    /// Canonical `name@version` identifier, the store-index
     /// `package_id` the install pass keys downloads by.
     pub id: &'a str,
     pub name: &'a str,
@@ -67,6 +76,10 @@ pub struct ResolvedPackageIdentity<'a> {
 /// Implemented by the pnpr server to stream fetch frames to the client.
 pub trait ResolutionObserver: Send + Sync {
     fn on_resolved(&self, hint: ResolvedPackageHint<'_>);
+
+    /// Notified once per distinct [`pnpm_resolving_resolver_base::PkgResolutionId`]
+    /// resolved during this tree walk, regardless of artifact shape.
+    fn on_resolution_id(&self, _id: &str) {}
 
     fn package_version_guard(&self) -> Option<Arc<dyn PackageVersionGuard>> {
         None
@@ -91,6 +104,16 @@ pub trait ResolutionObserver: Send + Sync {
     /// settle, before `ImportingDone` and `Summary`. Called once on a
     /// successful fresh-resolution install.
     fn flush_progress(&self) {}
+
+    /// Maximum peer-resolved package snapshots allowed in a workspace graph.
+    fn max_snapshots(&self) -> Option<usize> {
+        None
+    }
+
+    /// Cooperative cancellation probe polled during synchronous resolution passes.
+    fn cancellation_check(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        None
+    }
 }
 
 /// Wraps an inner [`Resolver`], forwarding each tarball-shaped result to
@@ -98,7 +121,7 @@ pub trait ResolutionObserver: Send + Sync {
 ///
 /// Non-tarball resolutions (git, directory, registry-shape, binary,
 /// variations) and results missing a structured `name@version` are
-/// skipped — the client fetches those through their own protocol paths,
+/// skipped, the client fetches those through their own protocol paths,
 /// not a plain tarball download.
 pub struct ObservingResolver {
     inner: Box<dyn Resolver>,
@@ -111,15 +134,18 @@ pub struct ObservingResolver {
     /// apart, so the identity is what dedups here too. Mirrors
     /// `PrefetchingResolver::spawned_downloads`.
     seen: DashSet<String>,
+    /// Distinct [`pnpm_resolving_resolver_base::PkgResolutionId`]s claimed
+    /// during this walk, including non-tarball resolutions.
+    seen_ids: DashSet<String>,
 }
 
 impl ObservingResolver {
     pub fn new(inner: Box<dyn Resolver>, observer: Arc<dyn ResolutionObserver>) -> Self {
-        ObservingResolver { inner, observer, seen: DashSet::new() }
+        ObservingResolver { inner, observer, seen: DashSet::new(), seen_ids: DashSet::new() }
     }
 
     fn maybe_report(&self, result: &ResolveResult) {
-        // Gate on the same tarball shape `extract_tarball` accepts —
+        // Gate on the same tarball shape `extract_tarball` accepts,
         // other resolution shapes aren't fetched as plain tarballs.
         let Ok((tarball_url, integrity)) = extract_tarball(&result.resolution) else {
             return;
@@ -172,6 +198,9 @@ impl Resolver for ObservingResolver {
         Box::pin(async move {
             let result = self.inner.resolve(wanted_dependency, opts).await?;
             if let Some(result_ref) = result.as_ref() {
+                if self.seen_ids.insert(result_ref.id.as_str().to_string()) {
+                    self.observer.on_resolution_id(result_ref.id.as_str());
+                }
                 self.maybe_report(result_ref);
             }
             Ok(result)
@@ -184,5 +213,12 @@ impl Resolver for ObservingResolver {
         opts: &'a ResolveOptions,
     ) -> ResolveLatestFuture<'a> {
         self.inner.resolve_latest(query, opts)
+    }
+
+    fn on_reused(&self, result: &ResolveResult) {
+        if self.seen_ids.insert(result.id.as_str().to_string()) {
+            self.observer.on_resolution_id(result.id.as_str());
+        }
+        self.inner.on_reused(result);
     }
 }

@@ -1,10 +1,23 @@
 use super::{
-    Packument, UnpublishArgs, highest_version, rev_str, tarball_pathname, versions_matching_range,
+    Packument,
+    UnpublishArgs,
+    highest_version,
+    rev_str,
+    tarball_pathname,
+    versions_matching_range,
 };
 use mockito::Matcher;
 use pnpm_config::Config;
-use pnpm_network_web_auth_testing::{InputResponse, ok_token, web_auth_fake};
-use serde_json::{Map, Value, json};
+use pnpm_network_web_auth_testing::{
+    InputResponse,
+    ok_token,
+    web_auth_fake,
+};
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
 
 fn versions(keys: &[&str]) -> Map<String, Value> {
     keys.iter()
@@ -35,9 +48,10 @@ fn highest_version_picks_the_new_latest() {
         highest_version(&versions(&["1.0.0", "10.0.0", "9.0.0"])).as_deref(),
         Some("10.0.0"),
     );
+    assert_eq!(highest_version(&versions(&["1.0.0", "1.0.1-beta.1"])).as_deref(), Some("1.0.0"));
     assert_eq!(
-        highest_version(&versions(&["1.0.0", "1.0.1-beta.1"])).as_deref(),
-        Some("1.0.1-beta.1"),
+        highest_version(&versions(&["2.0.0-beta.2", "2.0.0-beta.10"])).as_deref(),
+        Some("2.0.0-beta.10"),
     );
     assert_eq!(highest_version(&versions(&[])), None);
 }
@@ -101,8 +115,8 @@ fn packument_round_trips_unknown_fields() {
     assert!(serialized.get("_attachments").is_none(), "couchdb metadata is dropped");
 }
 
-/// The version keys keep the packument's own order — `1.10.0` after `1.9.0`
-/// when the registry sent them that way — like the TypeScript CLI's
+/// The version keys keep the packument's own order (`1.10.0` after `1.9.0`
+/// when the registry sent them that way) like the TypeScript CLI's
 /// `Object.keys`, not lexicographic or semver order.
 #[test]
 fn version_keys_keep_the_packument_order() {
@@ -142,8 +156,8 @@ fn unpublish_args(registry: &str, otp: Option<&str>, params: &[&str]) -> Unpubli
 }
 
 /// A 401 carrying `authUrl` / `doneUrl` starts the web-auth flow, and the
-/// token it yields is sent as `npm-otp` on the retried `DELETE` — still
-/// under `npm-auth-type: web`.
+/// token it yields is sent as `npm-otp` on the retried `DELETE`, still
+/// under `npm-auth-type: web` and `npm-command: unpublish`.
 #[tokio::test]
 async fn a_web_auth_challenge_is_answered_and_the_delete_retried_with_the_token() {
     web_auth_fake!(FakeHost, RecordingReporter, set_fetch);
@@ -154,6 +168,7 @@ async fn a_web_auth_challenge_is_answered_and_the_delete_retried_with_the_token(
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(mockito::Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .create_async()
@@ -161,6 +176,7 @@ async fn a_web_auth_challenge_is_answered_and_the_delete_retried_with_the_token(
     let challenge_mock = server
         .mock("DELETE", "/test-pkg/-rev/3-abc")
         .match_header("npm-auth-type", "web")
+        .match_header("npm-command", "unpublish")
         .match_header("npm-otp", Matcher::Missing)
         .with_status(401)
         .with_body(
@@ -176,6 +192,7 @@ async fn a_web_auth_challenge_is_answered_and_the_delete_retried_with_the_token(
     let retry_mock = server
         .mock("DELETE", "/test-pkg/-rev/3-abc")
         .match_header("npm-auth-type", "web")
+        .match_header("npm-command", "unpublish")
         .match_header("npm-otp", "web-token")
         .with_status(200)
         .with_body("{}")
@@ -206,6 +223,7 @@ async fn a_partial_unpublish_shares_one_otp_across_the_put_and_the_tarball_delet
     let registry = format!("{}/", server.url());
     let get_mock = server
         .mock("GET", "/test-pkg")
+        .match_query(mockito::Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&server.url()))
         .expect(2)
@@ -256,6 +274,7 @@ async fn a_partial_unpublish_deletes_the_tarball_under_the_registry_path() {
     let registry = format!("{}/npm/", server.url());
     let get_mock = server
         .mock("GET", "/npm/test-pkg")
+        .match_query(mockito::Matcher::UrlEncoded("write".into(), "true".into()))
         .with_status(200)
         .with_body(two_version_packument(&format!("{}/npm", server.url())))
         .expect(2)

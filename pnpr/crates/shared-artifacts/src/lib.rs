@@ -1,17 +1,41 @@
-pub use artifact_identity::{OrgAccess, OrgGrant};
-pub use compiler_cache::{CompilerCacheKey, MAX_COMPILER_CACHE_ENTRY_SIZE};
+pub use artifact_identity::{
+    OwnerAccess,
+    OwnerGrant,
+};
+pub use compiler_cache::{
+    CompilerCacheKey,
+    MAX_COMPILER_CACHE_ENTRY_SIZE,
+};
 
 mod publication_quota;
 use publication_quota::{
-    PublicationQuota, expire_stranded_publications, finish_outcome, publication_charge,
-    quota_write_retry_delay, register_publication, registered_now,
+    PublicationQuota,
+    expire_stranded_publications,
+    finish_outcome,
+    publication_charge,
+    quota_write_retry_delay,
+    register_publication,
+    registered_now,
 };
 
 mod artifact_identity;
 use artifact_identity::{
-    artifact_matches_candidate, artifact_operation_id, compatibility_slot, digest_segment,
-    entry_digest, entry_owner, is_blob_path, is_variant_file, object_name, org_key, owner_key,
-    publisher_owner_key, scope_marker_path, scope_name, scopes_prefix, staged_blob_path,
+    artifact_matches_candidate,
+    artifact_operation_id,
+    compatibility_slot,
+    digest_segment,
+    entry_digest,
+    entry_owner,
+    is_blob_path,
+    is_variant_file,
+    object_name,
+    org_key,
+    owner_key,
+    publisher_owner_key,
+    scope_marker_path,
+    scope_name,
+    scopes_prefix,
+    staged_blob_path,
     staged_record_path,
 };
 
@@ -30,30 +54,82 @@ mod compiler_cache;
 mod blob_upload;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    fs::{File, OpenOptions, TryLockError},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashSet,
+    },
+    fs::{
+        File,
+        OpenOptions,
+        TryLockError,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{
+        Duration,
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 use bytes::Bytes;
-use futures_util::{StreamExt as _, stream::BoxStream};
+use futures_util::{
+    StreamExt as _,
+    stream::BoxStream,
+};
 use object_store::{
-    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
-    local::LocalFileSystem, path::Path as ObjectPath,
+    ObjectMeta,
+    ObjectStore,
+    ObjectStoreExt,
+    PutMode,
+    PutOptions,
+    PutPayload,
+    UpdateVersion,
+    local::LocalFileSystem,
+    path::Path as ObjectPath,
 };
 use pnpm_shared_artifact_protocol::{
-    ArtifactBlobRequest, ArtifactCandidate, ArtifactPayload, ArtifactProtocolError,
-    ArtifactSubject, ArtifactVariant, CompatibilityConstraints, CompatibilityScopes, MAX_BLOB_SIZE,
-    MAX_CANDIDATES, MAX_RESOLVE_RESPONSE_SIZE, MAX_VARIANTS_PER_CANDIDATE, OwnerScope,
-    PublishArtifactRequest, ResolveArtifactsRequest, ResolveArtifactsResponse, ResolvedArtifact,
-    SignedArtifactEnvelope, blob_id, compatibility_scopes, verify_blob,
+    ArtifactBlobRequest,
+    ArtifactCandidate,
+    ArtifactPayload,
+    ArtifactProtocolError,
+    ArtifactSubject,
+    ArtifactVariant,
+    CompatibilityConstraints,
+    CompatibilityScopes,
+    MAX_BLOB_SIZE,
+    MAX_CANDIDATES,
+    MAX_RESOLVE_RESPONSE_SIZE,
+    MAX_VARIANTS_PER_CANDIDATE,
+    OwnerScope,
+    PublishArtifactRequest,
+    ResolveArtifactsRequest,
+    ResolveArtifactsResponse,
+    ResolvedArtifact,
+    SignedArtifactEnvelope,
+    blob_id,
+    compatibility_scopes,
+    verify_blob,
 };
-use pnpr_config::{ArtifactQuota, HostedStoreConfig, build_s3_store, normalize_key_prefix};
-use pnpr_error::{RegistryError, Result};
+use pnpr_config::{
+    ArtifactQuota,
+    HostedStoreConfig,
+    build_s3_store,
+    normalize_key_prefix,
+};
+use pnpr_error::{
+    RegistryError,
+    Result,
+};
 use sha2::Sha256;
-use tokio::time::{interval, sleep};
+use tokio::time::{
+    interval,
+    sleep,
+};
 
 const ARTIFACT_CACHE_DIR: &str = "shared-artifacts";
 const ARTIFACT_OBJECT_PREFIX: &str = ".artifacts";
@@ -65,8 +141,8 @@ const PUBLICATION_FINISH_RETRIES: usize = 8;
 /// How long a publication may hold its registration before reclamation treats
 /// it as gone.
 ///
-/// A publication that cannot unregister itself — every retry of the write
-/// failing — would otherwise hold the gate forever, and reclamation is what
+/// A publication that cannot unregister itself (every retry of the write
+/// failing) would otherwise hold the gate forever, and reclamation is what
 /// gives back the scopes a failed publication claimed. The bound is far longer
 /// than a publication that is merely slow, since expiring a live one lets a
 /// collector run beside it.
@@ -235,7 +311,7 @@ impl SharedArtifactStore {
 
     pub async fn resolve(
         &self,
-        caller: &(impl OrgAccess + ?Sized),
+        caller: &(impl OwnerAccess + ?Sized),
         body: &[u8],
     ) -> Result<ResolveArtifactsResponse> {
         let request: ResolveArtifactsRequest = serde_json::from_slice(body)
@@ -267,20 +343,23 @@ impl SharedArtifactStore {
         Ok(ResolveArtifactsResponse { artifacts })
     }
 
+    /// The blob `integrity` names in `owner`'s namespace. `None` when it is
+    /// not stored or `caller` may not read it.
     pub async fn read_blob(
         &self,
-        caller: &(impl OrgAccess + ?Sized),
-        body: &[u8],
+        caller: &(impl OwnerAccess + ?Sized),
+        owner: &OwnerScope,
+        integrity: &str,
     ) -> Result<Option<ArtifactBlob>> {
-        let request: ArtifactBlobRequest = serde_json::from_slice(body)
-            .map_err(|err| bad_request(format!("invalid artifact blob request: {err}")))?;
+        let request =
+            ArtifactBlobRequest { owner: owner.clone(), integrity: integrity.to_string() };
         request.validate().map_err(|err| protocol_error(&err))?;
-        let owner = match owner_key(caller, &request.owner) {
+        let owner = match owner_key(caller, owner) {
             Ok(owner) => owner,
             Err(RegistryError::Forbidden { .. }) => return Ok(None),
             Err(err) => return Err(err),
         };
-        let id = blob_id(&request.integrity).map_err(|err| protocol_error(&err))?;
+        let id = blob_id(integrity).map_err(|err| protocol_error(&err))?;
         let path = self.object_path(&format!("{owner}/blobs/{id}"));
         let result = match self.store.get(&path).await {
             Ok(result) => result,
@@ -295,7 +374,7 @@ impl SharedArtifactStore {
 
     async fn resolve_candidate(
         &self,
-        caller: &(impl OrgAccess + ?Sized),
+        caller: &(impl OwnerAccess + ?Sized),
         candidate: &ArtifactCandidate,
         budget: &mut ResolveBudget,
     ) -> Result<Option<ResolvedArtifact>> {
@@ -350,7 +429,7 @@ pub fn parse_publish(body: &[u8]) -> Result<PublishArtifactRequest> {
 }
 
 fn prepare_publication(
-    caller: &(impl OrgAccess + ?Sized),
+    caller: &(impl OwnerAccess + ?Sized),
     request: &PublishArtifactRequest,
 ) -> Result<PreparedPublication> {
     let validated = request.validate().map_err(|err| protocol_error(&err))?;

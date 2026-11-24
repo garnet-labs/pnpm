@@ -1,7 +1,18 @@
 use super::{
-    AddMockedRegistry, CommandExtra, CommandTempCwd, Ecosystem, configure_pnpr_auth,
-    declare_pnpr_registries, fs, pacquet_at, point_npmrc_registry_at, revision_fixture_tarball,
-    revision_fixture_tarball_with_value, revision_packument, start_pnpr, start_pnpr_registry,
+    AddMockedRegistry,
+    CommandExtra,
+    CommandTempCwd,
+    Ecosystem,
+    configure_pnpr_auth,
+    declare_pnpr_registries,
+    fs,
+    pacquet_at,
+    point_npmrc_registry_at,
+    revision_fixture_tarball,
+    revision_fixture_tarball_with_value,
+    revision_packument,
+    start_pnpr,
+    start_pnpr_registry,
 };
 use assert_cmd::assert::OutputAssertExt;
 
@@ -34,6 +45,7 @@ fn revision_install_and_frozen_reinstall_work_through_pnpr() {
     let AddMockedRegistry {
         npmrc_path,
         store_dir,
+        cache_dir,
         mock_instance,
         ..
     } = npmrc_info;
@@ -56,6 +68,7 @@ fn revision_install_and_frozen_reinstall_work_through_pnpr() {
 
     fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
     fs::remove_dir_all(&store_dir).expect("remove client store");
+    fs::remove_dir_all(&cache_dir).expect("remove client cache");
     pacquet_at(&workspace)
         .with_args(["install", "--frozen-lockfile"])
         .assert()

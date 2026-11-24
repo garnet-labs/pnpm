@@ -1,39 +1,59 @@
 //! The per-importer half of the walk: [`TreeCtx`], its builders, and
-//! the per-edge [`ResolveOptions`] derivations — the depth-specific
+//! the per-edge [`ResolveOptions`] derivations, the depth-specific
 //! pick, the project-relative cache scope, and the `file:` and
 //! `workspace:` path specifiers resolved against their declaring
 //! manifest's directory.
 
-use chrono::{DateTime, Utc};
+pub(super) use child_spec::opts_for_child_spec;
+mod child_spec;
+
+use jiff::Timestamp;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_hooks::PnpmfileHooks;
 use pnpm_patching::PatchGroupRecord;
 use pnpm_resolving_resolver_base::{
-    LinkWorkspacePackages, ResolveOptions, VersionSelectorType, WantedDependency,
+    LinkWorkspacePackages,
+    ResolveOptions,
+    VersionSelectorType,
+    WantedDependency,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::{
-    borrow::Cow,
-    path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        OnceLock,
+    },
 };
 
 use crate::{
     peer_provider::ProviderTiers,
-    resolved_tree::{DirectDep, ResolvedTree},
+    resolved_tree::{
+        DirectDep,
+        ResolvedTree,
+    },
 };
 
 use super::{
-    ManifestHook, UpdateReuseScope, reuse::TargetDistances, update_scope::UpdateScope,
+    ManifestHook,
+    UpdateReuseScope,
+    reuse::TargetDistances,
+    update_scope::UpdateScope,
     workspace_ctx::WorkspaceTreeCtx,
 };
 
 /// Whether a wanted dep's resolution is computed relative to the
 /// consuming importer's directory rather than being
 /// importer-independent. True for the `link:` / `file:` / `workspace:`
-/// protocols, whose resolved path `resolve_from_local_package` derives
-/// from `project_dir`. Such resolutions must not be shared across
-/// importers in [`WantedKey`].
+/// protocols and for a bare local path, whose resolved path
+/// `resolve_from_local_package` derives from `project_dir`. Such
+/// resolutions must not be shared across importers in [`WantedKey`].
 ///
 /// [`WantedKey`]: super::workspace_ctx::WantedKey
 pub(super) fn project_relative_cache_scope(
@@ -43,7 +63,10 @@ pub(super) fn project_relative_cache_scope(
     (wanted.bare_specifier
         .as_deref()
         .is_some_and(|spec| {
-            spec.starts_with("link:") || spec.starts_with("file:") || spec.starts_with("workspace:")
+            spec.starts_with("link:")
+                || spec.starts_with("file:")
+                || spec.starts_with("workspace:")
+                || pnpm_local_spec::bare_path_is_unambiguous(spec)
         })
         || (opts.project.link_workspace_packages.enabled_at_depth(0)
             && opts.project.workspace_packages.is_some()))
@@ -51,7 +74,7 @@ pub(super) fn project_relative_cache_scope(
 }
 
 /// The directory the `file:` dependencies declared by a resolved
-/// package resolve against — pnpm's `parentPkg.rootDir`. A package
+/// package resolve against, pnpm's `parentPkg.rootDir`. A package
 /// copied from a local directory declares them relative to its own
 /// directory; every other resolution has no directory of its own, so
 /// its `file:` children stay on the consuming importer's.
@@ -73,42 +96,22 @@ pub(crate) fn declaring_manifest_dir(
     if !result.id.as_str().starts_with("file:") {
         return None;
     }
-    let directory = Path::new(&resolution.directory);
-    let absolute = if directory.is_absolute() {
-        pnpm_fs::lexical_normalize(directory)
-    } else {
-        pnpm_fs::lexical_normalize(&lockfile_dir.join(directory))
-    };
-    Some(Arc::from(absolute))
+    Some(Arc::from(directory_package_dir(lockfile_dir, &resolution.directory)))
 }
 
-/// Point a `file:` or `workspace:` path specifier at the directory of
-/// the manifest that declares it ([`declaring_manifest_dir`]) instead
-/// of the consuming importer's. Every other specifier keeps the
-/// caller's options.
-pub(super) fn opts_relative_to_declaring_manifest<'a>(
-    opts: &'a ResolveOptions,
-    wanted: &WantedDependency,
-    parent_dir: Option<&Path>,
-) -> Cow<'a, ResolveOptions> {
-    match parent_dir {
-        Some(parent_dir)
-            if wanted.bare_specifier
-                .as_deref()
-                .is_some_and(|spec| {
-                    spec.starts_with("file:") || spec.starts_with("workspace:.")
-                }) =>
-        {
-            Cow::Owned(ResolveOptions {
-                project: pnpm_resolving_resolver_base::ResolverProjectOptions {
-                    project_dir: parent_dir.to_path_buf(),
-                    ..opts.project.clone()
-                },
-                ..opts.clone()
-            })
-        }
-        _ => Cow::Borrowed(opts),
-    }
+/// The directory a `file:`-shaped directory resolution records, as an
+/// absolute path: `directory` is relative to `lockfile_dir`, or absolute
+/// under `preserveAbsolutePaths`.
+#[must_use]
+pub fn directory_package_dir(lockfile_dir: &Path, directory: &str) -> PathBuf {
+    pnpm_fs::lexical_normalize(&lockfile_dir.join(directory))
+}
+
+/// Whether `spec` is a `file:` or `workspace:` path, which resolves
+/// from the directory of the manifest that declares it
+/// ([`declaring_manifest_dir`]) instead of the consuming importer's.
+pub(crate) fn resolves_from_declaring_manifest(spec: &str) -> bool {
+    spec.starts_with("file:") || pnpm_workspace_spec::is_workspace_path_specifier(spec)
 }
 
 /// Mutable workspace for an in-flight tree walk. The orchestrator
@@ -150,13 +153,13 @@ pub struct TreeCtx {
 pub(super) struct ResolutionDepthOptions {
     pub(super) base: ResolveOptions,
     /// [`ResolveOptions`] handed to the resolver for importer-level
-    /// (direct) dependencies — `depth == 0`. Differs from `base_opts`
+    /// (direct) dependencies, `depth == 0`. Differs from `base_opts`
     /// only in `pick_lowest_version`, which is set under
     /// `resolutionMode: time-based` / `lowest-direct`. Built once per
     /// importer by [`TreeCtx::with_resolution_mode`].
     direct: ResolveOptions,
     /// [`ResolveOptions`] handed to the resolver for transitive
-    /// dependencies — `depth > 0`. Disables implicit workspace links
+    /// dependencies, `depth > 0`. Disables implicit workspace links
     /// unless deep linking is enabled. Always picks highest; carries the
     /// `time-based` publish-date cutoff in `published_by`. Built once
     /// per importer, then adjusted by [`TreeCtx::with_resolution_mode`].
@@ -173,17 +176,21 @@ pub(super) struct TreeImporterContext {
     pub(super) id: String,
     pub(super) order: usize,
     /// Importer anchor for re-rendering `link:` targets against
-    /// [`Self::lockfile_dir`], derived once here — the per-edge
+    /// [`Self::lockfile_dir`], derived once here, the per-edge
     /// `pkgIdWithPatchHash` fold reads it for every workspace edge.
     pub(super) link_anchor: crate::link_target::ImporterAnchor,
     /// Like [`Self::link_anchor`], but against `base_opts.lockfile_dir`
-    /// verbatim — the pair the per-edge canonical-resolution rendering
+    /// verbatim, the pair the per-edge canonical-resolution rendering
     /// computed from, kept separate so the cache changes no behavior
     /// even when the two lockfile-dir spellings differ.
     pub(super) base_link_anchor: crate::link_target::ImporterAnchor,
     /// The [`TargetDistances`] of this importer's update scope, fetched
     /// from the workspace on first use. See [`TreeCtx::target_distances`].
     target_distances: OnceLock<Arc<TargetDistances>>,
+    /// The directories of the workspace projects and the publish directories
+    /// they link, built on first use. See
+    /// `resolves_children_through_catalogs` in the walk.
+    pub(super) workspace_project_dirs: OnceLock<HashSet<PathBuf>>,
 }
 
 impl TreeCtx {
@@ -217,6 +224,7 @@ impl TreeCtx {
                     &base_opts.project.lockfile_dir,
                 ),
                 target_distances: OnceLock::new(),
+                workspace_project_dirs: OnceLock::new(),
                 lockfile_dir,
                 id: pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY.to_string(),
                 order: 0,
@@ -258,6 +266,7 @@ impl TreeCtx {
                     &base_opts.project.lockfile_dir,
                 ),
                 target_distances: OnceLock::new(),
+                workspace_project_dirs: OnceLock::new(),
                 lockfile_dir,
                 id: pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY.to_string(),
                 order: 0,
@@ -282,9 +291,9 @@ impl TreeCtx {
 
     /// Derive the depth-specific resolve options from `resolutionMode`.
     ///
-    /// - `pick_lowest_direct` — resolve direct dependencies to their
+    /// - `pick_lowest_direct`, resolve direct dependencies to their
     ///   lowest satisfying version (`time-based` / `lowest-direct`).
-    /// - `subdep_published_by` — the publish-date cutoff applied to
+    /// - `subdep_published_by`, the publish-date cutoff applied to
     ///   transitive dependencies. Under `time-based` this is the
     ///   workspace-wide cutoff computed from the resolved direct deps
     ///   (clamped by `minimumReleaseAge`); otherwise it is just
@@ -297,7 +306,7 @@ impl TreeCtx {
     pub fn with_resolution_mode(
         mut self,
         pick_lowest_direct: bool,
-        subdep_published_by: Option<DateTime<Utc>>,
+        subdep_published_by: Option<Timestamp>,
     ) -> Self {
         self.options.direct.version.pick_lowest_version = pick_lowest_direct;
         self.options.subdep.version.pick_lowest_version = false;
@@ -308,7 +317,7 @@ impl TreeCtx {
         self
     }
 
-    /// `catalogs_dir` is where `pnpm-workspace.yaml` sits — the
+    /// `catalogs_dir` is where `pnpm-workspace.yaml` sits, the
     /// directory a `file:` / `link:` catalog entry's relative path is
     /// measured from.
     #[must_use]
@@ -325,7 +334,7 @@ impl TreeCtx {
     /// direct deps have seeded: every later [`extend_tree`] on this ctx
     /// installs hoisted peers, which pnpm resolves like transitive deps
     /// (highest satisfying version, under the subdep publish-date
-    /// cutoff) even though they land at the importer level — a hoisted
+    /// cutoff) even though they land at the importer level, a hoisted
     /// peer is not a dependency the user declared, so the direct-dep
     /// pick of `resolutionMode: lowest-direct` / `time-based` must not
     /// apply to it.
@@ -381,8 +390,8 @@ impl TreeCtx {
     /// Set the importer this context walks for. See [`TreeCtx`]'s
     /// `importer_id` field.
     #[must_use]
-    pub fn with_importer_id(mut self, importer_id: &str) -> Self {
-        self.importer.id = importer_id.to_string();
+    pub fn with_importer_id(mut self, importer_id: String) -> Self {
+        self.importer.id = importer_id;
         self.importer.target_distances = OnceLock::new();
         self
     }
@@ -413,11 +422,11 @@ impl TreeCtx {
 
     /// Attach a `readPackageHook` to the underlying [`WorkspaceTreeCtx`].
     /// `manifest_hook` is workspace-wide (one hook per install), so this
-    /// passthrough relies on the workspace ctx being sole-owned —
+    /// passthrough relies on the workspace ctx being sole-owned.
     /// `TreeCtx::new` always satisfies that, and the multi-importer
     /// orchestrator [`fn@crate::resolve_workspace`] hands the hook in via
     /// [`WorkspaceTreeCtx::with_manifest_hook`] before sharing the
-    /// `Arc`. Panics if the workspace ctx has already been cloned —
+    /// `Arc`. Panics if the workspace ctx has already been cloned,
     /// callers must set the hook before sharing the context.
     #[must_use]
     pub fn with_manifest_hook(mut self, manifest_hook: Option<ManifestHook>) -> Self {
@@ -517,7 +526,7 @@ impl TreeCtx {
 
     /// The preferred-version buckets for `names`: the caller's seed
     /// entries merged with every version this run has resolved into the
-    /// settled reachable tree (seed entries win per selector) — see
+    /// settled reachable tree (seed entries win per selector); see
     /// [`WorkspaceTreeCtx::run_preferred_versions`]. The peer-hoist
     /// pickers look up only their missing-peer names, so this
     /// materializes a handful of buckets instead of a per-importer copy
@@ -584,7 +593,8 @@ impl TreeCtx {
                 let versions: HashSet<String> = run.versions
                     .get(name)
                     .into_iter()
-                    .flat_map(|bucket| bucket.keys().cloned())
+                    .map(std::collections::BTreeMap::keys)
+                    .flat_map(std::iter::Iterator::cloned)
                     .collect();
                 (!versions.is_empty()).then(|| (name.to_string(), versions))
             })

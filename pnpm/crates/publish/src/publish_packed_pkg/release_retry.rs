@@ -3,24 +3,39 @@
 //! answers that the version is already published. pnpm then reads the
 //! version's release record, its provenance statement, and its dist-tags,
 //! and reports the version as published only when they are the release this
-//! publish would have made
-//! ([platform variants](https://github.com/pnpm/rfcs/blob/e920906d80bfb372068eab901fca2bb43fb1b97f/pnpr/text/0000-platform-variants.md#dry-runs-provenance-and-retries)).
+//! publish would have made.
 
 use super::{
-    PackedPkg, PublishNetwork, PublishPackedPkgError, PublishPackedPkgOptions, PublishedPkg,
-    clean_version, escaped_package_name, finish_publish, publish_authorization,
-    request::PublishResponse, variants,
+    PackedPkg,
+    PublishNetwork,
+    PublishPackedPkgError,
+    PublishPackedPkgOptions,
+    PublishedPkg,
+    clean_version,
+    escaped_package_name,
+    finish_publish,
+    publish_authorization,
+    request::PublishResponse,
 };
 use crate::{
-    ResolvedPublishOptions, global_log::global_info, provenance_gen::ProvenanceSubject,
-    publish_summary::PublishSummary, registry_config_keys::NormalizedRegistryUrl,
+    ResolvedPublishOptions,
+    global_log::global_info,
+    provenance_gen::ProvenanceSubject,
+    publish_summary::PublishSummary,
+    registry_config_keys::NormalizedRegistryUrl,
 };
 use base64::Engine as _;
-use pnpm_diagnostics::miette::{self, Diagnostic};
-use pnpm_network::{ThrottledClient, read_limited_body};
+use pnpm_diagnostics::miette::{
+    self,
+    Diagnostic,
+};
+use pnpm_network::{
+    ThrottledClient,
+    read_limited_body,
+};
 use pnpm_reporter::Reporter;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// The largest record, statement, or dist-tags document read.
 const BODY_LIMIT: usize = 8 * 1024 * 1024;
@@ -30,13 +45,11 @@ pub(super) struct Release<'a> {
     pub(super) name: &'a str,
     /// The version without build metadata, as the registry names it.
     pub(super) version: &'a str,
-    /// The `.tgz` integrity of the `any` archive, when the version has one.
-    pub(super) primary: Option<String>,
-    /// Each platform variant's `.tgz` integrity, by its tag.
-    pub(super) variants: BTreeMap<String, String>,
-    /// The subjects of the provenance statement this publish signs, when it
+    /// The `.tgz` integrity of the version's archive.
+    pub(super) integrity: String,
+    /// The subject of the provenance statement this publish signs, when it
     /// signs one.
-    pub(super) subjects: Option<Vec<ProvenanceSubject>>,
+    pub(super) subject: Option<ProvenanceSubject>,
     /// The dist-tag the publish sets.
     pub(super) tag: &'a str,
 }
@@ -65,20 +78,12 @@ impl<'a> Release<'a> {
         (name, version): (&'a str, &'a str),
         tag: &'a str,
         signing: Signing,
-    ) -> Result<Self, PublishPackedPkgError> {
-        let primary = match pkg.any_staged {
-            Some(staged) => Some(staged.integrity.clone()),
-            None => pkg.has_any_archive().then(|| variants::sri_sha512(pkg.tarball_data)),
-        };
-        let variants = pkg.variants
-            .iter()
-            .map(|variant| (variant.tag.clone(), variant.archive.integrity()))
-            .collect();
-        let subjects = match signing {
-            Signing::Signs => Some(variants::provenance_subjects(pkg, (name, version))?),
+    ) -> Self {
+        let subject = match signing {
+            Signing::Signs => Some(ProvenanceSubject::of(name, version, pkg.tarball_data)),
             Signing::Unsigned => None,
         };
-        Ok(Release { name, version, primary, variants, subjects, tag })
+        Release { name, version, integrity: pkg.summary().integrity, subject, tag }
     }
 }
 
@@ -105,16 +110,10 @@ pub(super) async fn settle_publish<Reporter: self::Reporter>(
                 None => false,
             }
         }
-        // pnpr retires an archive staged by another job once the version it
-        // was published with is accepted, so a rerun of that publish finds
-        // it gone.
-        Err(PublishPackedPkgError::NotStaged { .. }) => {
-            published_release(pkg, context, (name, version)).await? == Some(true)
-        }
         _ => false,
     };
     if confirmed {
-        global_info::<Reporter>(&format!(
+        global_info::<Reporter>(format!(
             "✅ {name}@{version} is already published as this release",
         ));
         return Ok(());
@@ -136,7 +135,7 @@ async fn published_release(
         return Ok(None);
     }
     let version = clean_version(version)?;
-    let release = Release::of(pkg, (name, &version), &resolved.default_tag, Signing::of(resolved))?;
+    let release = Release::of(pkg, (name, &version), &resolved.default_tag, Signing::of(resolved));
     let authorization = publish_authorization(resolved, network, registry, name);
     confirm_published(network.client, registry, authorization.as_deref(), &release)
         .await
@@ -152,7 +151,7 @@ fn not_recorded(name: &str, version: &str) -> PublishPackedPkgError {
 }
 
 /// Confirm that the version pnpr reports as already published is `release`:
-/// its record names the same archives, it has the provenance statement this
+/// its record names the same archive, it has the provenance statement this
 /// publish signs, and its dist-tag points at it. `false` when pnpr has no
 /// release record of the version. Fails naming what differs.
 pub(super) async fn confirm_published(
@@ -177,12 +176,12 @@ pub(super) async fn confirm_published(
     if let Some(difference) = archive_difference(&record, release) {
         return Err(reader.differs(difference));
     }
-    if let Some(subjects) = &release.subjects {
+    if let Some(subject) = &release.subject {
         let spec = format!("{escaped}@{}", release.version);
         let attestations = reader.get(&format!("-/npm/v1/attestations/{spec}")).await?;
-        if !names_every_archive(attestations.as_ref(), subjects) {
+        if !names_the_archive(attestations.as_ref(), subject) {
             return Err(reader.differs(
-                "the version has no provenance statement naming every archive this publish signs for"
+                "the version has no provenance statement naming the archive this publish signs for"
                     .to_string(),
             ));
         }
@@ -202,76 +201,26 @@ pub(super) async fn confirm_published(
     Ok(true)
 }
 
-/// What a recorded release's archives differ by from `release`'s, if
-/// anything. A version without an `any` archive is compared by its variants
-/// only: its record names no primary input.
+/// What a recorded release's archive differs by from `release`'s, if
+/// anything.
 fn archive_difference(record: &Value, release: &Release<'_>) -> Option<String> {
-    if let Some(primary) = &release.primary {
-        let recorded = input_integrity(record);
-        if recorded != Some(primary.as_str()) {
-            return Some(archive_mismatch("the `any` archive", recorded, primary));
-        }
-    }
-    let recorded: BTreeMap<&str, Option<&str>> = record
-        .get("variants")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|variant| Some((variant.get("tag")?.as_str()?, input_integrity(variant))))
-        .collect();
-    let recorded_tags: BTreeSet<&str> = recorded.keys().copied().collect();
-    let tags: BTreeSet<&str> = release.variants
-        .keys()
-        .map(String::as_str)
-        .collect();
-    if recorded_tags != tags {
-        return Some(format!(
-            "the version is recorded with the variants [{}], and this publish has [{}]",
-            joined(&recorded_tags),
-            joined(&tags),
-        ));
-    }
-    release.variants
-        .iter()
-        .find_map(|(tag, integrity)| {
-            let recorded = recorded
-                .get(tag.as_str())
-                .copied()
-                .flatten();
-            (recorded != Some(integrity.as_str())).then(|| {
-                archive_mismatch(&format!("the variant `{tag}`"), recorded, integrity)
-            })
-        })
+    let recorded = record.pointer("/inputs/archive/integrity").and_then(Value::as_str);
+    (recorded != Some(release.integrity.as_str())).then(|| {
+        let recorded = match recorded {
+            Some(at) => format!("`{at}`"),
+            None => "no archive".to_string(),
+        };
+        format!(
+            "the archive is recorded as {recorded}, and this publish has `{}`",
+            release.integrity,
+        )
+    })
 }
 
-/// The `.tgz` integrity a record, or one of its variant entries, names as its
-/// input.
-fn input_integrity(entry: &Value) -> Option<&str> {
-    entry.pointer("/inputs/archive/integrity").and_then(Value::as_str)
-}
-
-fn archive_mismatch(archive: &str, recorded: Option<&str>, integrity: &str) -> String {
-    let recorded = match recorded {
-        Some(at) => format!("`{at}`"),
-        None => "no archive".to_string(),
-    };
-    format!("{archive} is recorded as {recorded}, and this publish has `{integrity}`")
-}
-
-fn joined(tags: &BTreeSet<&str>) -> String {
-    tags.iter()
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Whether one of the `attestations` is a statement whose subjects are
-/// exactly `subjects`.
-fn names_every_archive(attestations: Option<&Value>, subjects: &[ProvenanceSubject]) -> bool {
-    let expected: BTreeSet<(&str, &str)> = subjects
-        .iter()
-        .map(|subject| (subject.name.as_str(), subject.sha512_hex.as_str()))
-        .collect();
+/// Whether one of the `attestations` is a statement whose only subject is
+/// `subject`.
+fn names_the_archive(attestations: Option<&Value>, subject: &ProvenanceSubject) -> bool {
+    let expected = BTreeSet::from([(subject.name.as_str(), subject.sha512_hex.as_str())]);
     attestations
         .and_then(|response| response.get("attestations"))
         .and_then(Value::as_array)
@@ -314,7 +263,7 @@ impl Reader<'_> {
     async fn get(&self, path: &str) -> Result<Option<Value>, PublishedReleaseError> {
         let url = self.registry
             .join(path)
-            .map_err(|error| self.unread(&error.to_string()))?;
+            .map_err(|error| self.unread(error.to_string()))?;
         let guard = self.client.acquire_for_url(&url).await;
         let mut request = guard.get(&url).header("accept", "application/json");
         if let Some(authorization) = self.authorization {
@@ -323,20 +272,20 @@ impl Reader<'_> {
         let response = request
             .send()
             .await
-            .map_err(|error| self.unread(&error.to_string()))?;
+            .map_err(|error| self.unread(error.to_string()))?;
         match response.status().as_u16() {
             200 => {}
             404 => return Ok(None),
-            status => return Err(self.unread(&format!("GET {path} answered {status}"))),
+            status => return Err(self.unread(format!("GET {path} answered {status}"))),
         }
         let body = read_limited_body(response, BODY_LIMIT).await
-            .map_err(|error| self.unread(&error.to_string()))?;
+            .map_err(|error| self.unread(error.to_string()))?;
         if body.truncated {
-            return Err(self.unread(&format!("GET {path} answered more than {BODY_LIMIT} bytes")));
+            return Err(self.unread(format!("GET {path} answered more than {BODY_LIMIT} bytes")));
         }
         serde_json::from_slice(&body.bytes)
             .map(Some)
-            .map_err(|error| self.unread(&format!("GET {path} answered invalid JSON: {error}")))
+            .map_err(|error| self.unread(format!("GET {path} answered invalid JSON: {error}")))
     }
 
     fn differs(&self, difference: String) -> PublishedReleaseError {
@@ -346,11 +295,11 @@ impl Reader<'_> {
         }
     }
 
-    fn unread(&self, reason: &str) -> PublishedReleaseError {
+    fn unread(&self, reason: String) -> PublishedReleaseError {
         PublishedReleaseError::Unread {
             package: format!("{}@{}", self.release.name, self.release.version),
             registry: self.registry.for_display(),
-            reason: reason.to_string(),
+            reason,
         }
     }
 }

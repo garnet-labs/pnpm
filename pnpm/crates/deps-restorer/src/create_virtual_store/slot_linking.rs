@@ -1,23 +1,41 @@
 use super::{
-    ColdCapture, CreateVirtualStoreError, cache_keys::dir_clone_cacheable, removed_aliases_for,
+    ColdCapture,
+    CreateVirtualStoreError,
+    cache_keys::dir_clone_cacheable,
+    removed_aliases_for,
     snapshot_needs_build_marker,
+    warm::SlotBuilds,
 };
 use crate::InstallPackageBySnapshotError;
-use pnpm_lockfile::{PackageKey, PackageMetadata, PkgName, SnapshotEntry};
-use pnpm_reporter::{LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter};
-use pnpm_tarball::{SharedReportedProgressKeys, pending_progress_key};
+use pnpm_lockfile::{
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    SnapshotEntry,
+};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    ProgressLog,
+    ProgressMessage,
+    Reporter,
+};
+use pnpm_tarball::{
+    SharedReportedProgressKeys,
+    pending_progress_key,
+};
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 pub(super) struct SlotLink<'a> {
-    pub source: crate::SlotImportSource<'a>,
+    pub source: crate::SlotImportSource,
     pub(super) snapshot_key: &'a PackageKey,
     pub(super) snapshot: &'a SnapshotEntry,
     pub(super) cas_paths: &'a pnpm_fs::CasPaths,
     pub(super) warm_cache_key: Option<&'a str>,
-    /// Whether the directory-clone cache may serve this slot — see
+    /// Whether the directory-clone cache may serve this slot; see
     /// [`dir_clone_cacheable`].
     pub(super) dir_clone_cacheable: bool,
     /// Child aliases dropped since the previous install, threaded into
@@ -29,7 +47,7 @@ pub(super) struct SlotLink<'a> {
 /// it. Under the global virtual store, hash-equal peer variants share
 /// a slot path, and `stage_and_swap` in
 /// [`fn@crate::import_indexed_dir`] assumes an exclusive owner per
-/// directory — so the link pass runs one task per group, with the
+/// directory, so the link pass runs one task per group, with the
 /// `removed_aliases` of every member unioned for cleanup.
 pub(super) struct SlotDirGroup<'a> {
     representative: &'a SlotLink<'a>,
@@ -103,7 +121,7 @@ pub(super) fn merge_into_slot_group<'a>(group: &mut SlotDirGroup<'a>, slot: &'a 
 pub(super) fn link_cold_chunk<Reporter: self::Reporter>(
     chunk: &[ColdCapture<'_>],
     packages: &HashMap<PackageKey, PackageMetadata>,
-    marker_path: Option<&Path>,
+    slot_builds: Option<SlotBuilds<'_>>,
     removed_aliases_by_key: &HashMap<PackageKey, Vec<PkgName>>,
     template: &LinkSlotsParallel<'_>,
 ) -> Result<(), CreateVirtualStoreError> {
@@ -120,7 +138,9 @@ pub(super) fn link_cold_chunk<Reporter: self::Reporter>(
                     is_mutable: capture.installed.source_is_mutable,
                     source_exists: capture.installed.source_exists,
                     force: capture.force_import,
-                    build_marker: needs_build.then_some(marker_path).flatten(),
+                    awaits_build: slot_builds.is_some_and(|builds| {
+                        builds.places(capture.snapshot_key, capture.requires_build)
+                    }),
                     needs_build,
                 },
                 snapshot_key: capture.snapshot_key,

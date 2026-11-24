@@ -16,20 +16,38 @@
 pub(crate) use manifest::auto_installed_peer_deps;
 pub use manifest::satisfies_package_manifest;
 pub use recorded_settings::{
-    auto_install_peers_changed, exclude_links_from_lockfile_changed,
-    recorded_add_missing_peer_types, recorded_dedupe_peers, recorded_inject_workspace_packages,
+    auto_install_peers_changed,
+    exclude_links_from_lockfile_changed,
+    recorded_add_missing_peer_types,
+    recorded_dedupe_peers,
+    recorded_inject_workspace_packages,
     recorded_peers_suffix_max_length,
+    recorded_project_scoped_optional_peers,
 };
 pub use spec_diff::SpecDiff;
 
 use crate::{
-    Lockfile, ProjectSnapshot, RegistryContext, ResolvedDependencyMap, ResolvedDependencySpec,
+    Lockfile,
+    ProjectSnapshot,
+    RegistryContext,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
 };
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use pnpm_catalogs_types::Catalogs;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
 use pnpm_resolving_parse_wanted_dependency::git_specifiers_are_equivalent;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+    HashMap,
+};
 
 #[derive(Clone, Copy)]
 pub struct LockfileSettingsCheck<'a> {
@@ -39,6 +57,9 @@ pub struct LockfileSettingsCheck<'a> {
     pub ignored_optional_dependencies: Option<&'a [String]>,
     pub patched_dependencies: Option<&'a BTreeMap<String, String>>,
     pub integrity_target: crate::IntegrityTarget,
+    /// Whether `projectScopedOptionalPeers` takes effect, that is, whether
+    /// it and `dedupePeerDependents` are both on.
+    pub project_scoped_optional_peers: bool,
     pub resolution: ResolutionSettingsCheck<'a>,
 }
 
@@ -62,7 +83,7 @@ pub struct ResolutionSettingsCheck<'a> {
 /// The value is not a plain config read: pnpm records a checksum only
 /// when a loaded pnpmfile exports a `hooks` object, so computing it can
 /// mean evaluating the pnpmfile. Callers that already know the
-/// pnpmfiles are unchanged — or that have no pnpmfile to speak of —
+/// pnpmfiles are unchanged (or that have no pnpmfile to speak of)
 /// say so with [`PnpmfileChecksumCheck::Skip`] instead of inventing a
 /// value, since passing `Current(None)` would fail every install in a
 /// project whose lockfile legitimately records one.
@@ -86,7 +107,7 @@ pub enum StalenessReason {
     /// A catalog entry recorded in the lockfile's `catalogs:` snapshot
     /// no longer matches the current workspace catalog config. This is
     /// the first drift branch checked, surfaced when
-    /// `all_catalogs_are_up_to_date` fails.
+    /// the catalog check fails.
     #[display("`catalogs` in the lockfile don't match the current config")]
     CatalogsChanged { lockfile: Option<crate::CatalogSnapshots>, config: Catalogs },
 
@@ -103,8 +124,9 @@ pub enum StalenessReason {
 
     /// The lockfile records an importer whose project directory exists
     /// but holds no project manifest, so the project cannot be installed.
-    /// An absent directory is not reported: a build context may leave
-    /// unneeded projects out.
+    /// An absent or empty directory is not reported: a build context may
+    /// leave unneeded projects out, and git leaves an uninitialized
+    /// submodule's directory empty.
     #[display(
         r#"the lockfile records `importers["{importer_id}"]`, but that project's directory has no package.json"#
     )]
@@ -236,7 +258,7 @@ pub enum StalenessReason {
 
     /// The lockfile's `(patch_hash=...)` depPath suffixes disagree with its
     /// own `patchedDependencies` map. Unlike every other reason here this
-    /// one is not drift against the config — it is the lockfile
+    /// one is not drift against the config; it is the lockfile
     /// contradicting itself, which only a hand edit or an incorrectly
     /// resolved merge conflict produces. See
     /// [`check_patched_dep_paths`](crate::check_patched_dep_paths).
@@ -281,6 +303,14 @@ pub enum StalenessReason {
         "`addMissingPeerTypes` in the lockfile ({lockfile}) doesn't match the current config ({config})"
     )]
     AddMissingPeerTypesChanged { lockfile: bool, config: bool },
+
+    /// The lockfile's `settings.projectScopedOptionalPeers` differs from
+    /// whether the setting takes effect in the current install. Normalized
+    /// like [`Self::DedupePeersChanged`].
+    #[display(
+        "`projectScopedOptionalPeers` in the lockfile ({lockfile}) doesn't match the current config ({config})"
+    )]
+    ProjectScopedOptionalPeersChanged { lockfile: bool, config: bool },
 
     /// The lockfile's `settings.excludeLinksFromLockfile` differs from
     /// the current install's `Config::exclude_links_from_lockfile`. The
@@ -344,6 +374,7 @@ impl StalenessReason {
             StalenessReason::AutoInstallPeersChanged { .. }
             | StalenessReason::DedupePeersChanged { .. }
             | StalenessReason::AddMissingPeerTypesChanged { .. }
+            | StalenessReason::ProjectScopedOptionalPeersChanged { .. }
             | StalenessReason::ExcludeLinksFromLockfileChanged { .. }
             | StalenessReason::PeersSuffixMaxLengthChanged { .. }
             | StalenessReason::InjectWorkspacePackagesChanged { .. }
@@ -395,6 +426,7 @@ pub fn check_lockfile_settings(
     check_recorded_config(lockfile, &check)?;
     check_recorded_settings(lockfile, &check.resolution)?;
     check_integrity_target(lockfile, check.integrity_target)?;
+    check_project_scoped_optional_peers(lockfile, check.project_scoped_optional_peers)?;
     // Last, because every gate above reports a cause this one cannot: each
     // compares the lockfile against a configured value the user can act on,
     // while this compares the lockfile against itself. A lockfile that drifted
@@ -480,6 +512,16 @@ pub fn check_lockfile_patches(
 ) -> Result<(), StalenessReason> {
     check_recorded_patches(lockfile, patched_dependencies)?;
     check_patched_dep_paths(lockfile)
+}
+
+/// Settings that govern the content fetched from an already resolved lockfile.
+pub fn check_fetch_settings(
+    lockfile: &Lockfile,
+    patched_dependencies: Option<&BTreeMap<String, String>>,
+    integrity_target: crate::IntegrityTarget,
+) -> Result<(), StalenessReason> {
+    check_lockfile_patches(lockfile, patched_dependencies)?;
+    check_integrity_target(lockfile, integrity_target)
 }
 
 fn check_patched_dep_paths(lockfile: &Lockfile) -> Result<(), StalenessReason> {
@@ -600,4 +642,8 @@ mod recorded_settings;
 mod spec_diff;
 
 use manifest::dependency_specifiers_equal;
-use recorded_settings::{check_integrity_target, check_recorded_settings};
+use recorded_settings::{
+    check_integrity_target,
+    check_project_scoped_optional_peers,
+    check_recorded_settings,
+};

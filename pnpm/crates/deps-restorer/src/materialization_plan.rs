@@ -2,7 +2,7 @@
 //! are checked against, the set of snapshots it must not materialize,
 //! and the engine name its store slots are keyed by.
 //!
-//! Shared by both install paths. They agree on every step here — the
+//! Shared by both install paths. They agree on every step here, the
 //! skip set decides what lands in `node_modules`, so the two paths
 //! producing it differently would be a correctness bug rather than a
 //! stylistic difference. The two places they legitimately differ are
@@ -10,17 +10,95 @@
 //! [`SkipSetInputs::exclude_optional`].
 
 use crate::{
-    InstallabilityHost, SkippedSnapshots, add_direct_runtime_skips, compute_skipped_snapshots,
-    extend_skipped_with_dependency_closure, find_root_runtime_node_version,
-    install_frozen_lockfile::{find_runtime_node_major, parse_major_from_version},
+    InstallabilityHost,
+    NodeVersionSource,
+    SkippedSnapshots,
+    add_direct_runtime_skips,
+    compute_skipped_snapshots,
+    extend_skipped_with_dependency_closure,
+    find_root_runtime_node_version,
+    install_frozen_lockfile::{
+        find_runtime_node_major,
+        parse_major_from_version,
+    },
 };
 use pnpm_config::Config;
 use pnpm_lockfile::ProjectSnapshot;
-use pnpm_package_is_installable::{InstallabilityError, SupportedArchitectures};
+use pnpm_package_is_installable::{
+    InstallabilityError,
+    SupportedArchitectures,
+};
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc,
+        OnceLock,
+    },
 };
+
+/// What a project's target Node.js version decides. [`target_node_version`]
+/// applies the order for each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetNodeUse {
+    /// `engines.node` and installability checks: the `nodeVersion` setting,
+    /// then the root project's runtime pin, then the host.
+    Compatibility,
+    /// Global virtual store directory names and the side-effects cache key:
+    /// the root project's runtime pin, then the host. `nodeVersion` does not
+    /// apply, because dependency build scripts run on the pinned runtime or
+    /// the host.
+    Execution,
+}
+
+/// The Node.js version a project targets for `use_kind`.
+#[must_use]
+pub fn target_node_version<'a>(
+    use_kind: TargetNodeUse,
+    config_node_version: Option<&'a str>,
+    runtime_pin: Option<&'a str>,
+    host_node_version: Option<&'a str>,
+) -> Option<&'a str> {
+    match use_kind {
+        TargetNodeUse::Compatibility => config_node_version.or(runtime_pin).or(host_node_version),
+        TargetNodeUse::Execution => runtime_pin.or(host_node_version),
+    }
+}
+
+/// The major of [`target_node_version`].
+#[must_use]
+pub fn target_node_major(
+    use_kind: TargetNodeUse,
+    config_node_version: Option<&str>,
+    runtime_pin: Option<&str>,
+    host_node_version: Option<&str>,
+) -> Option<u32> {
+    target_node_version(use_kind, config_node_version, runtime_pin, host_node_version)
+        .and_then(parse_major_from_version)
+}
+
+/// The engine name an installed lockfile's store slots key on, by
+/// [`TargetNodeUse::Execution`]: the lockfile's root runtime pin, else the
+/// probed host.
+#[must_use]
+pub fn lockfile_engine_name(importers: &HashMap<String, ProjectSnapshot>) -> Option<String> {
+    let runtime_pin = find_root_runtime_node_version(importers);
+    target_node_major(TargetNodeUse::Execution, None, runtime_pin.as_deref(), None)
+        .or_else(pnpm_graph_hasher::detect_node_major)
+        .map(|major| pnpm_graph_hasher::engine_name(major, None, None))
+}
+
+/// The host Node that keys store slots under [`TargetNodeUse::Execution`].
+/// `None` unless `node --version` produced the host's version, so a
+/// `nodeVersion` setting or a runtime pin pnpm does not download leaves
+/// [`resolve_engine_name`] to probe the real host.
+#[must_use]
+pub fn execution_host_node(host: Option<&InstallabilityHost>) -> Option<HostNode> {
+    host.filter(|host| match host.node_source {
+        NodeVersionSource::Probed => true,
+        NodeVersionSource::Override | NodeVersionSource::Synthetic => false,
+    })
+    .map(HostNode::from)
+}
 
 /// The host Node, reduced to what the phases after the installability
 /// check still need.
@@ -35,7 +113,13 @@ pub struct HostNode {
 
 impl From<&InstallabilityHost> for HostNode {
     fn from(host: &InstallabilityHost) -> Self {
-        HostNode { version: host.node_version.clone(), detected: host.node_detected }
+        HostNode {
+            version: host.node_version.clone(),
+            detected: match host.node_source {
+                NodeVersionSource::Probed | NodeVersionSource::Override => true,
+                NodeVersionSource::Synthetic => false,
+            },
+        }
     }
 }
 
@@ -48,6 +132,8 @@ pub enum HostDetection {
     Resolved(Option<InstallabilityHost>),
     Pending {
         task: tokio::task::JoinHandle<Option<InstallabilityHost>>,
+        /// `false` when an override replaces the `node --version` probe.
+        probes_node: bool,
         /// Carried so a joined-task failure can synthesize the same
         /// fallback host [`detect_installability_host`] would have,
         /// CLI-merged `supportedArchitectures` accept lists included.
@@ -59,7 +145,7 @@ pub enum HostDetection {
 impl HostDetection {
     /// Spawn the detection so it runs under whatever the caller does
     /// next. The earlier this is called, the more of the probe's `node`
-    /// startup hides — the install entry point spawns one right after
+    /// startup hides, the install entry point spawns one right after
     /// the wanted lockfile parses, when the lockfile carries a
     /// constraint that will need the host.
     #[must_use]
@@ -69,6 +155,7 @@ impl HostDetection {
         supported_architectures: Option<SupportedArchitectures>,
     ) -> Self {
         HostDetection::Pending {
+            probes_node: node_version.is_none(),
             task: tokio::spawn({
                 let supported_architectures = supported_architectures.clone();
                 async move {
@@ -87,8 +174,8 @@ impl HostDetection {
     }
 
     /// Wait for the detection. A joined-task failure degrades to the
-    /// synthetic fallback host, so the installability checks still run
-    /// — the same degradation [`detect_installability_host`] applies
+    /// synthetic fallback host, so the installability checks still run,
+    /// the same degradation [`detect_installability_host`] applies
     /// when its own probe task fails.
     pub async fn resolve(self) -> Option<InstallabilityHost> {
         match self {
@@ -97,6 +184,7 @@ impl HostDetection {
                 task,
                 engine_strict,
                 supported_architectures,
+                ..
             } => task.await.unwrap_or_else(|error| {
                 tracing::warn!(
                     target: "pacquet::install",
@@ -112,13 +200,13 @@ impl HostDetection {
 }
 
 /// The stand-in host used when `node --version` cannot be probed. Its
-/// `node_detected: false` keeps the bogus version out of the store keys
+/// [`NodeVersionSource::Synthetic`] keeps the bogus version out of the store keys
 /// (see [`engine_name_from_host`]) while the `os` / `cpu` / `libc`
 /// platform checks still run against the real host triple.
 fn synthetic_installability_host(engine_strict: bool) -> InstallabilityHost {
     InstallabilityHost {
         node_version: "99999.0.0".to_string(),
-        node_detected: false,
+        node_source: NodeVersionSource::Synthetic,
         os: pnpm_graph_hasher::host_platform(),
         cpu: pnpm_graph_hasher::host_arch(),
         libc: pnpm_graph_hasher::host_libc(),
@@ -133,8 +221,8 @@ fn synthetic_installability_host(engine_strict: bool) -> InstallabilityHost {
 /// Whether detection is `needed` stays with the caller: the two install
 /// paths qualify it differently, and getting it wrong is not obvious
 /// from here. Passing `false` returns `None`, which is what keeps `node
-/// --version` off the critical path of the common unconstrained install
-/// — the probe would otherwise serialize against the extraction that
+/// --version` off the critical path of the common unconstrained install,
+/// the probe would otherwise serialize against the extraction that
 /// dominates a cold install.
 pub async fn detect_installability_host(
     needed: bool,
@@ -150,11 +238,9 @@ pub async fn detect_installability_host(
         // An explicit `nodeVersion` needs no `node --version` probe, so
         // build the host directly off the reactor thread.
         node_version @ Some(_) => InstallabilityHost::detect_with(engine_strict, node_version),
-        None => tokio::task::spawn_blocking(move || {
-            InstallabilityHost::detect_with(engine_strict, None)
-        })
-        .await
-        .unwrap_or_else(|_| synthetic_installability_host(engine_strict)),
+        None => spawn_node_probe(move || InstallabilityHost::detect_with(engine_strict, None))
+            .await
+            .unwrap_or_else(|_| synthetic_installability_host(engine_strict)),
     };
     // Plant the CLI-merged `supportedArchitectures` (yaml +
     // `--cpu`/`--os`/`--libc`) onto the host so `check_platform`'s
@@ -172,7 +258,7 @@ pub struct SkipSetInputs<'a> {
     pub requester: &'a str,
     /// Importers the installability pass evaluates against.
     pub importers: &'a HashMap<String, ProjectSnapshot>,
-    /// `None` when installability checks are bypassed — see
+    /// `None` when installability checks are bypassed; see
     /// [`detect_installability_host`].
     pub installability_host: Option<&'a InstallabilityHost>,
     /// Skips carried in from the previous install's
@@ -256,8 +342,9 @@ pub fn compute_skip_set<Reporter: pnpm_reporter::Reporter>(
     Ok(skipped)
 }
 
-/// `host` with its Node.js version set to the one the root project's
-/// runtime dependency is locked to, unless `nodeVersion` is configured.
+/// `host` with its Node.js version set by [`TargetNodeUse::Compatibility`].
+/// A configured `nodeVersion` is already the host's version, normalized by
+/// [`InstallabilityHost::detect_with`].
 #[must_use]
 pub fn with_locked_runtime_node(
     host: Option<&InstallabilityHost>,
@@ -265,14 +352,17 @@ pub fn with_locked_runtime_node(
     importers: &HashMap<String, ProjectSnapshot>,
 ) -> Option<InstallabilityHost> {
     let host = host?.clone();
-    let locked_node_version = config.node_version
-        .is_none()
-        .then(|| find_root_runtime_node_version(importers))
-        .flatten();
-    Some(match locked_node_version {
-        Some(node_version) => InstallabilityHost { node_version, ..host },
-        None => host,
-    })
+    let runtime_pin = find_root_runtime_node_version(importers);
+    let configured = config.node_version.is_some().then_some(host.node_version.as_str());
+    let node_version = target_node_version(
+        TargetNodeUse::Compatibility,
+        configured,
+        runtime_pin.as_deref(),
+        Some(&host.node_version),
+    )
+    .unwrap_or(&host.node_version)
+    .to_owned();
+    Some(InstallabilityHost { node_version, ..host })
 }
 
 /// A `node --version` probe still in flight or skipped at planning time.
@@ -281,12 +371,12 @@ pub fn with_locked_runtime_node(
 /// The result is delivered twice when running: [`Self::resolve_for_build`]
 /// for the async consumer (the side-effects-cache key in the build phase,
 /// awaited after linking), and a shared slot for a synchronous consumer that
-/// needs the name from a worker thread before the handle is awaited —
+/// needs the name from a worker thread before the handle is awaited,
 /// the directory-clone cache's lazily built layout (see
 /// [`crate::DirCloneCache`]).
 pub enum DeferredEngineName {
     Running {
-        handle: tokio::task::JoinHandle<Option<String>>,
+        handle: tokio::sync::oneshot::Receiver<Option<String>>,
         shared: Arc<OnceLock<Option<String>>>,
     },
     /// The upfront `node --version` probe was skipped because planning
@@ -300,11 +390,10 @@ impl DeferredEngineName {
     fn spawn() -> Self {
         /// Fills the slot with `None` when dropped: a synchronous
         /// consumer blocked in [`OnceLock::wait`] would otherwise sleep
-        /// forever if the probe panicked — or never ran at all, which
+        /// forever if the probe panicked, or never ran at all, which
         /// is why the guard is captured by the closure rather than
-        /// created inside it: a shutting-down runtime that discards the
-        /// still-queued closure drops its environment, and the guard
-        /// with it.
+        /// created inside it: a thread that fails to spawn drops the
+        /// closure, and the guard with it.
         struct FillOnDrop(Arc<OnceLock<Option<String>>>);
         impl Drop for FillOnDrop {
             fn drop(&mut self) {
@@ -313,7 +402,7 @@ impl DeferredEngineName {
         }
 
         let shared = Arc::new(OnceLock::new());
-        let handle = tokio::task::spawn_blocking({
+        let handle = spawn_node_probe({
             let guard = FillOnDrop(Arc::clone(&shared));
             let shared = Arc::clone(&shared);
             move || {
@@ -359,6 +448,30 @@ impl DeferredEngineName {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn spawn_node_probe<Output: Send + 'static>(
+    work: impl FnOnce() -> Output + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<Output> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let _ = std::thread::Builder::new()
+        .name("pnpm-node-probe".to_string())
+        .spawn(move || {
+            let _ = sender.send(work());
+        });
+    receiver
+}
+
+#[cfg(target_family = "wasm")]
+fn spawn_node_probe<Output: Send + 'static>(
+    work: impl FnOnce() -> Output + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<Output> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let _ = sender.send(work());
+    });
+    receiver
+}
+
 fn probe_engine_name() -> Option<String> {
     pnpm_graph_hasher::detect_node_major()
         .map(|major| pnpm_graph_hasher::engine_name(major, None, None))
@@ -377,8 +490,8 @@ pub fn engine_name_from_host(host_node: &HostNode) -> Option<String> {
 }
 
 /// The engine name the root project's `node@runtime:` pin implies, when one is
-/// present. Both engine-resolution paths — [`resolve_engine_name`] and
-/// the frozen path's deferred-host branch — apply this one rule, so
+/// present. Both engine-resolution paths ([`resolve_engine_name`] and
+/// the frozen path's deferred-host branch) apply this one rule, so
 /// they can't drift apart on how a pin keys the store.
 #[must_use]
 pub fn engine_name_from_runtime_pin(
@@ -389,15 +502,15 @@ pub fn engine_name_from_runtime_pin(
 }
 
 /// Resolve the engine name that keys the install's store slots and the
-/// side-effects-cache prefix.
+/// side-effects-cache prefix, by [`TargetNodeUse::Execution`].
 ///
 /// The root project's `node@runtime:` pin wins outright, so pinned and
 /// non-pinned installs on the same host share one store rather than
 /// splitting it under whatever `node --version` the shell reports. Then
-/// the already-detected host, then a probe.
+/// the already-detected host (see [`execution_host_node`]), then a probe.
 ///
 /// The probe comes back as a still-running [`DeferredEngineName`] so it
-/// overlaps the virtual-store I/O — except under the global virtual
+/// overlaps the virtual-store I/O, except under the global virtual
 /// store, whose layout needs the name synchronously, or when
 /// `needs_deferred_probe` is `false` (see [`needs_deferred_engine_probe`]).
 pub async fn resolve_engine_name(
@@ -452,8 +565,13 @@ pub fn needs_deferred_engine_probe(
     snapshots
         .keys()
         .any(|key| {
-            crate::lookup_known_requires_build(Some(known), key) != Some(false)
+            crate::lookup_known_requires_build(Some(known), key).unwrap_or(true)
                 || (dir_clone_eligible
-                    && allow_build_policy.check(&key.without_peer().to_string()) == Some(true))
+                    && allow_build_policy
+                        .check(&key.without_peer().to_string())
+                        .unwrap_or(false))
         })
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests;

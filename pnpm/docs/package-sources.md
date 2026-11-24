@@ -121,6 +121,8 @@ Exotic sources are useful for development but may pose supply chain risks when u
 
 ### Remote tarball
 
+pnpm sends registry credentials for tarball downloads over HTTPS or loopback HTTP. A redirect receives credentials only within the configured registry path on the same origin.
+
 The argument must be a fetchable URL starting with "http://" or "https://".
 
 Example:
@@ -227,6 +229,12 @@ pnpm add RexSkz/test-git-subdir-fetch.git#beta\&path:/packages/simple-react-app
 ```
 
 Installs from the `beta` branch and only the subdirectory at `/packages/simple-react-app`.
+
+pnpm also accepts npm's syntax, which separates the parameters with `::`:
+
+```sh
+pnpm add RexSkz/test-git-subdir-fetch.git#beta::path:packages/simple-react-app
+```
 
 #### How Git dependencies are resolved
 

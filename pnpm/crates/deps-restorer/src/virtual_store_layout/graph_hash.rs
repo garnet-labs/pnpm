@@ -1,17 +1,35 @@
-use super::{gvs_layout_cache, gvs_version_segment, local_directory_scope};
-use crate::{AllowBuildPolicy, install_frozen_lockfile::find_own_runtime_node_major};
+use super::{
+    gvs_layout_cache,
+    gvs_version_segment,
+    local_directory_scope,
+};
+use crate::{
+    AllowBuildPolicy,
+    install_frozen_lockfile::find_own_runtime_node_major,
+};
 use indexmap::IndexMap;
 use pnpm_deps_path::get_pkg_id_with_patch_hash;
 use pnpm_graph_hasher::{
-    DepsGraphNode, DepsStateCache, calc_graph_node_hash, engine_name,
+    DepsGraphNode,
+    DepsStateCache,
+    calc_graph_node_hash,
+    engine_name,
     format_global_virtual_store_path,
 };
 use pnpm_lockfile::{
-    LockfileResolution, PackageKey, PackageMetadata, PkgIdWithPatchHash, PlatformSelector,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgIdWithPatchHash,
+    PlatformSelector,
     SnapshotEntry,
+    select_platform_variant,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::Path,
 };
 
@@ -31,7 +49,7 @@ use std::{
 /// `integrity` (directory / git) are emitted with the bare
 /// `pkg_id_with_patch_hash` as their `full_pkg_id`. The frozen-
 /// lockfile install path rejects those resolutions before reaching the
-/// linker, so a stub `full_pkg_id` here is safe — the GVS hash for an
+/// linker, so a stub `full_pkg_id` here is safe, the GVS hash for an
 /// install that contains one of those snapshots is irrelevant because
 /// the install will error out before consulting it.
 pub(super) fn lockfile_to_dep_graph(
@@ -126,19 +144,32 @@ pub(super) struct GvsHasher<'h> {
     /// directory snapshot does, and so does a dependent, whose slot links
     /// to it.
     uncached_builds: HashSet<String>,
+    /// See [`BuildGating::runs_builds`].
+    runs_builds: bool,
     engine: Option<&'h str>,
     packages: Option<&'h HashMap<PackageKey, PackageMetadata>>,
 }
+/// Which snapshots an install builds, for the slot hash.
+#[derive(Clone, Copy)]
+pub struct BuildGating<'p> {
+    /// `None` gates nothing: every snapshot hashes with the engine.
+    pub policy: Option<&'p AllowBuildPolicy>,
+    /// `false` under `ignoreScripts`, whose install builds nothing, so
+    /// every snapshot takes the slot of its unbuilt package.
+    pub runs_builds: bool,
+}
+
 impl<'h> GvsHasher<'h> {
     pub(super) fn new(
         snapshots: &HashMap<PackageKey, SnapshotEntry>,
         packages: Option<&'h HashMap<PackageKey, PackageMetadata>>,
         engine: Option<&'h str>,
-        allow_build_policy: Option<&AllowBuildPolicy>,
+        gating: BuildGating<'_>,
         lockfile_dir: Option<&'h Path>,
         platform: &PlatformSelector,
     ) -> Self {
         let graph = lockfile_to_dep_graph(snapshots, packages, lockfile_dir, platform);
+        let allow_build_policy = gating.policy;
         let build_required_dep_paths =
             allow_build_policy.map(|policy| engine_gating_dep_paths(policy, snapshots, &graph));
         let uncached_builds = allow_build_policy
@@ -150,6 +181,7 @@ impl<'h> GvsHasher<'h> {
             cache: HashMap::new(),
             project_scope: lockfile_dir.map(|dir| dir.to_string_lossy()),
             uncached_builds,
+            runs_builds: gating.runs_builds,
             engine,
             packages,
         }
@@ -201,6 +233,7 @@ impl<'h> GvsHasher<'h> {
         }
         write_field(&mut hasher, self.project_scope.as_deref().unwrap_or(""));
         self.write_gating_set(&mut hasher);
+        hasher.update([u8::from(self.runs_builds)]);
         write_sorted(&mut hasher, &self.uncached_builds);
         self.write_graph(&mut hasher);
         self.write_snapshot_extras(&mut hasher, snapshots);
@@ -279,7 +312,10 @@ impl<'h> GvsHasher<'h> {
             &mut self.cache,
             &dep_path,
             own_engine.as_deref().or(self.engine),
-            self.build_required_dep_paths.as_ref(),
+            pnpm_graph_hasher::BuildRequired {
+                dep_paths: self.build_required_dep_paths.as_ref(),
+                builds_run: self.runs_builds,
+            },
             project_scope,
         );
         format_global_virtual_store_path(
@@ -321,7 +357,11 @@ pub(super) fn engine_gating_dep_paths(
 ) -> HashSet<String> {
     let built_dep_paths = snapshots
         .keys()
-        .filter(|key| policy.check(&key.without_peer().to_string()) == Some(true))
+        .filter(|key| {
+            policy
+                .check(&key.without_peer().to_string())
+                .unwrap_or(false)
+        })
         .map(ToString::to_string)
         .collect();
     pnpm_graph_hasher::build_required_dep_paths(graph, &built_dep_paths)
@@ -335,12 +375,11 @@ pub(super) fn create_full_pkg_id(
     platform: &PlatformSelector,
 ) -> String {
     let resolution = match resolution {
-        Some(LockfileResolution::Variations(variations)) => variations
-            .select(&crate::install_package_by_snapshot::variations_platform(variations, platform))
-            .ok()
-            .flatten()
-            .map(|variant| &variant.resolution)
-            .or(resolution),
+        Some(LockfileResolution::Variations(variations)) => {
+            select_platform_variant(&variations.variants, platform)
+                .map(|variant| &variant.resolution)
+                .or(resolution)
+        }
         resolution => resolution,
     };
     if let Some(integrity) = resolution.and_then(LockfileResolution::integrity) {

@@ -1,4 +1,4 @@
-//! `pacquet config` — manage the pnpm configuration files.
+//! `pacquet config`: manage the pnpm configuration files.
 //!
 //! Provides the `set` / `get` / `delete` / `list` subcommands, their file
 //! routing, key validation and value casting, and the read path.
@@ -14,21 +14,54 @@ mod ini;
 #[cfg(test)]
 mod tests;
 
-use clap::{Args, Subcommand, ValueEnum};
-use derive_more::{Display, Error};
+use clap::{
+    Args,
+    Subcommand,
+    ValueEnum,
+};
+use credentials::carries_global_credentials;
+use derive_more::{
+    Display,
+    Error,
+};
 use indexmap::IndexMap;
 use miette::Diagnostic;
 use pnpm_config::{
-    Config, DEFAULT_JSR_REGISTRY, GLOBAL_CONFIG_YAML_FILENAME, MacosBackupSettings,
-    WORKSPACE_MANIFEST_FILENAME, config_types, naming_cases, property_path, property_path::Segment,
-    protected_settings, refused_keys,
+    Config,
+    DEFAULT_JSR_REGISTRY,
+    GLOBAL_CONFIG_YAML_FILENAME,
+    WORKSPACE_MANIFEST_FILENAME,
+    YamlConfigTarget,
+    config_types,
+    naming_cases,
+    property_path,
+    property_path::Segment,
+    protected_settings,
+    refused_keys,
+    validate_structured_setting,
 };
-use pnpm_workspace_manifest_writer::{update_manifest_field, update_workspace_setting};
-use serde_json::{Map, Value};
-use std::path::{Path, PathBuf};
+use pnpm_workspace_manifest_writer::{
+    update_manifest_field,
+    update_private_manifest_field,
+    update_workspace_setting,
+};
+use serde_json::{
+    Map,
+    Value,
+};
+use std::path::{
+    Path,
+    PathBuf,
+};
 use values::{
-    cast_field, config_get, config_list, is_string_only_ini_key, validate_ini_config_key,
-    validate_simple_key, validate_workspace_key, validate_yaml_config_key,
+    cast_field,
+    config_get,
+    config_list,
+    is_string_only_ini_key,
+    validate_ini_config_key,
+    validate_simple_key,
+    validate_workspace_key,
+    validate_yaml_config_key,
 };
 
 /// Manage the pnpm configuration files.
@@ -54,7 +87,8 @@ impl ConfigArgs {
 pub enum ConfigSubcommand {
     /// Set the config key to the value provided.
     Set(ConfigSetArgs),
-    /// Print the config value for the provided key.
+    /// Print the config value at the provided property path, such as
+    /// `nodeVersion` or `catalog.react`.
     Get(ConfigGetArgs),
     /// Remove the config key from the config file.
     Delete(ConfigDeleteArgs),
@@ -145,6 +179,10 @@ pub enum ConfigError {
     #[diagnostic(code(ERR_PNPM_CONFIG_NO_PARAMS))]
     NoParams { subcommand: String },
 
+    #[display("This option is protected and cannot be retrieved with pnpm config get")]
+    #[diagnostic(code(ERR_PNPM_CONFIG_GET_PROTECTED))]
+    GetProtected,
+
     #[display("Cannot set {key} to a non-string value ({value})")]
     #[diagnostic(code(ERR_PNPM_CONFIG_SET_AUTH_NON_STRING))]
     SetAuthNonString { key: String, value: String },
@@ -168,12 +206,13 @@ pub enum ConfigError {
     #[diagnostic(code(ERR_PNPM_CONFIG_SET_UNSUPPORTED_WORKSPACE_KEY), help("Try {camel:?}"))]
     SetUnsupportedWorkspaceKey { key: String, camel: String },
 
+    #[display("The key {key:?} holds a per-invocation value, so no config file can carry it")]
+    #[diagnostic(code(ERR_PNPM_CONFIG_SET_NOT_A_FILE_SETTING), help("{hint}"))]
+    SetNotAFileSetting { key: String, hint: String },
+
     #[display("The key {key:?} isn't supported by the global config.yaml file")]
-    #[diagnostic(
-        code(ERR_PNPM_CONFIG_SET_UNSUPPORTED_YAML_CONFIG_KEY),
-        help("Try setting them instead to the local pnpm-workspace.yaml file")
-    )]
-    SetUnsupportedYamlConfigKey { key: String },
+    #[diagnostic(code(ERR_PNPM_CONFIG_SET_UNSUPPORTED_YAML_CONFIG_KEY), help("{hint}"))]
+    SetUnsupportedYamlConfigKey { key: String, hint: String },
 
     /// A project's `pnpm-workspace.yaml` carries no machine-level state, so
     /// writing such a key there would only leave behind one pnpm ignores.
@@ -200,7 +239,7 @@ pub enum ConfigError {
     #[diagnostic(code(ERR_PNPM_CONFIG_NO_GLOBAL_DIR))]
     NoGlobalConfigDir,
 
-    // The rejected value is deliberately not echoed — it may be a credential
+    // The rejected value is deliberately not echoed; it may be a credential
     // (e.g. a token with a stray newline pasted from an env var).
     #[display("Cannot write a value containing a control character to an INI config file")]
     #[diagnostic(code(ERR_PNPM_CLI_CONFIG_SET_INVALID_CONTROL_CHARACTER))]
@@ -213,13 +252,13 @@ impl ConfigArgs {
         match command {
             ConfigSubcommand::Set(args) => {
                 let (key, value) = split_set_params(args.key, args.value, "set")?;
-                config_set(config, dir, flags, &key, Some(value))?;
+                config_set(config, dir, flags, key, Some(value))?;
             }
             ConfigSubcommand::Delete(args) => {
                 let key = args.key
                     .filter(|key| !key.is_empty())
                     .ok_or_else(|| ConfigError::NoParams { subcommand: "delete".to_string() })?;
-                config_set(config, dir, flags, &key, None)?;
+                config_set(config, dir, flags, key, None)?;
             }
             ConfigSubcommand::Get(args) => {
                 let key = args.key
@@ -271,9 +310,7 @@ fn split_set_params(
     }
 }
 
-// ---------------------------------------------------------------------------
 // config set / delete
-// ---------------------------------------------------------------------------
 
 /// `pnpm config set` (when `value` is `Some`) / `pnpm config delete` (when
 /// `value` is `None`). Port of `configSet`.
@@ -281,11 +318,10 @@ fn config_set(
     config: &Config,
     dir: &Path,
     flags: ConfigFlags,
-    key: &str,
+    mut key: String,
     value: Option<String>,
 ) -> miette::Result<()> {
     let global = resolve_global(flags);
-    let mut key = key.to_string();
     let mut is_auth_setting = config_types::is_ini_config_key(&key);
     if !is_auth_setting {
         key = validate_simple_key(&key)?;
@@ -328,36 +364,66 @@ fn set_yaml_setting(
     key: &str,
     value: Value,
 ) -> miette::Result<()> {
+    let target = if config_file_name == WORKSPACE_MANIFEST_FILENAME {
+        YamlConfigTarget::Project
+    } else {
+        YamlConfigTarget::Global
+    };
     let write = |key: &str, value: &Value| {
-        if config_file_name == WORKSPACE_MANIFEST_FILENAME {
-            update_workspace_setting(config_dir, key, value)
-        } else {
-            update_manifest_field(&config_dir.join(config_file_name), key, value)
+        match target {
+            YamlConfigTarget::Project => update_workspace_setting(config_dir, key, value),
+            YamlConfigTarget::Global if carries_global_credentials(key, value) => {
+                update_private_manifest_field(&config_dir.join(config_file_name), key, value)
+            }
+            YamlConfigTarget::Global => {
+                update_manifest_field(&config_dir.join(config_file_name), key, value)
+            }
         }
         .map_err(miette::Report::new)
     };
     let given_key = key;
-    let key = if config_file_name == GLOBAL_CONFIG_YAML_FILENAME {
-        validate_yaml_config_key(key)?
-    } else {
-        key.to_string()
-    };
-    let key = validate_workspace_key(&key)?;
-    let cast = cast_field(value, &naming_cases::to_kebab_case(&key));
-    if config_file_name == WORKSPACE_MANIFEST_FILENAME
-        && !cast.is_null()
-        && refused_keys::is_refused_by_a_project_manifest(&key)
-    {
-        return Err(ConfigError::SetNotAProjectSetting {
-            belongs: refused_keys::where_refused_key_belongs(&key),
-            key,
-        }
-        .into());
-    }
-    validate_macos_backup_value(&key, &cast)?;
-    write(&key, &cast)?;
+    let cast = cast_field(value, &naming_cases::to_kebab_case(key));
     if cast.is_null() {
-        clear_other_spellings(&key, given_key, write)?;
+        let camel_key = naming_cases::to_camel_case(key);
+        write(&camel_key, &Value::Null)?;
+        return clear_other_spellings(&camel_key, given_key, write);
+    }
+    let key = validate_yaml_target_key(key, target)?;
+    validate_structured_setting(&key, &cast, target)
+        .map_err(|reason| ConfigError::SetStructuredValue { key: key.clone(), reason })?;
+    write(&key, &cast)
+}
+
+fn validate_yaml_target_key(key: &str, target: YamlConfigTarget) -> Result<String, ConfigError> {
+    reject_never_a_file_setting(key)?;
+    match target {
+        YamlConfigTarget::Project => {
+            let key = validate_workspace_key(key)?;
+            if refused_keys::is_refused_by_a_project_manifest(&key) {
+                return Err(ConfigError::SetNotAProjectSetting {
+                    belongs: refused_keys::where_refused_key_belongs(&key),
+                    key,
+                });
+            }
+            Ok(key)
+        }
+        YamlConfigTarget::Global => {
+            let kebab = validate_yaml_config_key(key)?;
+            validate_workspace_key(&kebab)
+        }
+    }
+}
+
+/// Refuse to write a key whose value lasts one invocation. Every loader
+/// ignores it in a file, so writing it would only mislead. Removing one stays
+/// allowed, since a hand-edited file may already carry it.
+fn reject_never_a_file_setting(key: &str) -> Result<(), ConfigError> {
+    let kebab = naming_cases::to_kebab_case(key);
+    if config_types::is_never_a_file_setting(&kebab) {
+        return Err(ConfigError::SetNotAFileSetting {
+            hint: refused_keys::where_refused_key_belongs(&naming_cases::to_camel_case(&kebab)),
+            key: kebab,
+        });
     }
     Ok(())
 }
@@ -379,31 +445,6 @@ fn clear_other_spellings(
     Ok(())
 }
 
-fn validate_macos_backup_value(key: &str, value: &Value) -> Result<(), ConfigError> {
-    if key != "macosBackup" || value.is_null() {
-        return Ok(());
-    }
-    if let Some(unknown) = value
-        .as_object()
-        .and_then(|object| {
-            object
-                .keys()
-                .find(|field| !matches!(field.as_str(), "excludeModulesDir" | "excludeStoreDir"))
-        })
-    {
-        return Err(ConfigError::SetStructuredValue {
-            key: key.to_string(),
-            reason: format!("unknown field {unknown:?}"),
-        });
-    }
-    serde_json::from_value::<MacosBackupSettings>(value.clone())
-        .map(|_| ())
-        .map_err(|error| ConfigError::SetStructuredValue {
-            key: key.to_string(),
-            reason: error.to_string(),
-        })
-}
-
 /// Write an auth setting to the global `auth.ini` or the directory's
 /// `.npmrc`.
 fn set_auth_setting(
@@ -413,6 +454,12 @@ fn set_auth_setting(
     key: String,
     value: &Value,
 ) -> miette::Result<()> {
+    if !global && !value.is_null() && (key == "tokenHelper" || key.ends_with(":tokenHelper")) {
+        return Err(pnpm_config::LoadWorkspaceYamlError::TokenHelperInProjectConfig {
+            key: pnpm_network::redact_npm_auth_key(&key),
+        }
+        .into());
+    }
     let config_path =
         if global { global_config_dir(config)?.join("auth.ini") } else { dir.join(".npmrc") };
     if !value.is_null() && !value.is_string() && is_string_only_ini_key(&key) {
@@ -516,5 +563,6 @@ fn global_config_dir(config: &Config) -> Result<PathBuf, ConfigError> {
     config.config_dir.clone().ok_or(ConfigError::NoGlobalConfigDir)
 }
 
+mod credentials;
 mod incomplete;
 mod values;

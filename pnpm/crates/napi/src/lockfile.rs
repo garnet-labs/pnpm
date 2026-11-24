@@ -1,7 +1,7 @@
 //! Reading, writing, and narrowing `pnpm-lock.yaml`.
 //!
 //! The lockfile format is byte-stable across pnpm's two stacks, so a host
-//! *can* read it with `@pnpm/lockfile.fs` — but then it carries a v11
+//! *can* read it with `@pnpm/lockfile.fs`, but then it carries a v11
 //! JavaScript parser that has to keep agreeing with a v12 engine's writer
 //! about a file both of them own. These exports hand the host the engine's
 //! own reader and writer instead.
@@ -13,17 +13,24 @@
 //! There is no in-memory-only variant to convert to or from.
 //!
 //! Top-level keys pnpm does not define round-trip untouched, so a host that
-//! records its own state beside the lockfile — Bit's `bit:` block — can
+//! records its own state beside the lockfile. Bit's `bit:` block, can
 //! read, edit, and write the file back without losing it.
 
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use napi_derive::napi;
 use pnpm_lockfile::{
-    FilterByImportersOptions, IncludedDependencies, Lockfile, PackageKey, PeerEdgeOptions,
+    FilterByImportersOptions,
+    IncludedDependencies,
+    Lockfile,
+    PackageKey,
+    PeerEdgeOptions,
     SymlinkedLockfile,
 };
 
@@ -32,9 +39,9 @@ use crate::error::to_napi_error;
 /// Which of the two lockfiles an operation addresses.
 #[derive(Debug)]
 enum LockfileKind {
-    /// `<dir>/pnpm-lock.yaml` — what the workspace asks for.
+    /// `<dir>/pnpm-lock.yaml`: what the workspace asks for.
     Wanted,
-    /// `<modulesDir>/.pnpm/lock.yaml` — what the last install actually
+    /// `<modulesDir>/.pnpm/lock.yaml`: what the last install actually
     /// materialized.
     Current,
 }
@@ -87,13 +94,13 @@ pub struct FilterLockfileOptions {
     pub include_dev_dependencies: Option<bool>,
     /// Whether they keep their `optionalDependencies`. Defaults to `true`.
     pub include_optional_dependencies: Option<bool>,
-    /// Dep paths to treat as already visited — the optional dependencies
+    /// Dep paths to treat as already visited, the optional dependencies
     /// this platform did not install. Neither they nor anything reachable
     /// only through them is kept.
     pub skipped: Option<Vec<String>>,
     /// Whether a dependency reference with no `snapshots` entry fails with
     /// `ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY`. Defaults to `false`, which
-    /// drops the reference and keeps walking — what a caller inspecting a
+    /// drops the reference and keeps walking, what a caller inspecting a
     /// possibly-stale lockfile wants.
     pub fail_on_missing_dependencies: Option<bool>,
     /// Whether a `devDependencies` entry of the root importer provides a peer to
@@ -110,12 +117,17 @@ pub async fn read_lockfile(
     pnpm_package_manager::configure_rayon_pool();
     let kind = LockfileKind::parse(options.kind.as_deref())?;
     let path = lockfile_path(&options.dir, options.modules_dir.as_deref(), &kind);
-    let loaded = tokio::task::spawn_blocking(move || Lockfile::load_from_path(&path))
-        .await
-        .map_err(|join_error| {
-            napi::Error::from_reason(format!("readLockfile task panicked: {join_error}"))
-        })?
-        .map_err(|error| to_napi_error(&error))?;
+    let loaded = tokio::task::spawn_blocking(move || match kind {
+        LockfileKind::Wanted => Lockfile::load_from_path(&path),
+        LockfileKind::Current => {
+            Lockfile::load_current_from_install_state_dir(install_state_dir(&path))
+        }
+    })
+    .await
+    .map_err(|join_error| {
+        napi::Error::from_reason(format!("readLockfile task panicked: {join_error}"))
+    })?
+    .map_err(|error| to_napi_error(&error))?;
     loaded
         .map(|lockfile| {
             serde_json::to_value(lockfile)
@@ -134,12 +146,17 @@ pub async fn write_lockfile(options: WriteLockfileOptions) -> napi::Result<()> {
         .map_err(|err| {
             napi::Error::from_reason(format!("the lockfile argument is not a lockfile: {err}"))
         })?;
-    tokio::task::spawn_blocking(move || lockfile.save_to_path(&path, SymlinkedLockfile::Refuse))
-        .await
-        .map_err(|join_error| {
-            napi::Error::from_reason(format!("writeLockfile task panicked: {join_error}"))
-        })?
-        .map_err(|error| to_napi_error(&error))
+    tokio::task::spawn_blocking(move || match kind {
+        LockfileKind::Wanted => lockfile.save_to_path(&path, SymlinkedLockfile::Refuse),
+        LockfileKind::Current => {
+            lockfile.save_current_to_install_state_dir(install_state_dir(&path))
+        }
+    })
+    .await
+    .map_err(|join_error| {
+        napi::Error::from_reason(format!("writeLockfile task panicked: {join_error}"))
+    })?
+    .map_err(|error| to_napi_error(&error))
 }
 
 fn into_filter_options(options: Option<FilterLockfileOptions>) -> FilterByImportersOptions {
@@ -150,7 +167,8 @@ fn into_filter_options(options: Option<FilterLockfileOptions>) -> FilterByImport
         // An unparsable dep path matches no snapshot key, so skipping it
         // is a no-op either way; dropping it keeps a stale entry in a
         // host's skip list from failing the whole call.
-        .filter_map(|dep_path| dep_path.parse().ok())
+        .map(|dep_path| dep_path.parse())
+        .filter_map(Result::ok)
         .collect();
     FilterByImportersOptions {
         include: IncludedDependencies {
@@ -173,7 +191,7 @@ fn into_filter_options(options: Option<FilterLockfileOptions>) -> FilterByImport
 /// are pruned to the transitive closure of what they still depend on.
 /// Every other importer entry is carried through untouched.
 ///
-/// Synchronous — it is a transform over data the caller already holds.
+/// Synchronous; it is a transform over data the caller already holds.
 #[napi]
 pub fn filter_lockfile_by_importers(
     lockfile: serde_json::Value,
@@ -213,6 +231,13 @@ pub async fn read_modules_manifest(modules_dir: String) -> napi::Result<Option<s
                 })
         })
         .transpose()
+}
+
+/// The install state directory a current lockfile path lies in. The
+/// current lockfile is read and written in the peer-suffixed shape an
+/// install keeps it in, whatever `lockfileVersion` it records.
+fn install_state_dir(current_lockfile: &Path) -> &Path {
+    current_lockfile.parent().expect("the current lockfile path has a parent")
 }
 
 fn lockfile_path(dir: &str, modules_dir: Option<&str>, kind: &LockfileKind) -> PathBuf {

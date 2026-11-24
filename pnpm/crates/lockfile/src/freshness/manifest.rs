@@ -1,8 +1,20 @@
 use super::{
-    BTreeMap, BTreeSet, DependencyGroup, PackageManifest, ProjectSnapshot, ResolvedDependencyMap,
-    ResolvedDependencySpec, SpecDiff, StalenessReason, git_specifiers_are_equivalent,
+    BTreeMap,
+    BTreeSet,
+    DependencyGroup,
+    PackageManifest,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SpecDiff,
+    StalenessReason,
+    git_specifiers_are_equivalent,
 };
-use pnpm_semver_include_prerelease::{ANY_VERSION_RANGE, is_any_version_range};
+use pnpm_semver_include_prerelease::{
+    ANY_VERSION_RANGE,
+    is_any_version_range,
+    parse_strict_semver_range,
+};
 use pnpm_tool_protocol::tool_specifiers_equal;
 
 /// Verify the on-disk `package.json` is still satisfied by the
@@ -29,7 +41,7 @@ use pnpm_tool_protocol::tool_specifiers_equal;
 /// into `dependencies` for the comparison, matching how pnpm
 /// materializes those peers into the importer's `dependencies` in the
 /// lockfile. Without this, a peer-only dependency would be misread as
-/// a lockfile entry the manifest removed (see `auto_installed_peer_deps`).
+/// a lockfile entry the manifest removed (see the auto-installed peer handling).
 ///
 /// Still unsupported: `excludeLinksFromLockfile` (`link:` resolutions
 /// aren't modeled yet). Non-semver resolutions such as file and
@@ -91,14 +103,14 @@ fn check_publish_directory(
         });
     }
     let lockfile_links_publish_directory =
-        importer.publish_directory.is_some() && importer.link_directory != Some(false);
+        importer.publish_directory.is_some() && importer.link_directory.unwrap_or(true);
     let manifest_links_publish_directory = manifest_publish_dir.is_some()
         && manifest
             .value()
             .get("publishConfig")
             .and_then(|publish_config| publish_config.get("linkDirectory"))
             .and_then(serde_json::Value::as_bool)
-            != Some(false);
+            .unwrap_or(true);
     if lockfile_links_publish_directory != manifest_links_publish_directory {
         return Err(StalenessReason::LinkDirectoryMismatch {
             lockfile: lockfile_links_publish_directory,
@@ -120,8 +132,12 @@ fn check_dependencies_meta(
         return Ok(());
     }
     Err(StalenessReason::DependenciesMetaMismatch {
-        lockfile: importer_meta.map_or_else(|| "{}".to_string(), std::string::ToString::to_string),
-        manifest: manifest_meta.map_or_else(|| "{}".to_string(), std::string::ToString::to_string),
+        lockfile: importer_meta
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| "{}".to_string()),
+        manifest: manifest_meta
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| "{}".to_string()),
     })
 }
 
@@ -233,12 +249,23 @@ fn check_field_specs(
 
 /// A specifier the importer's recorded resolution no longer satisfies means
 /// the range moved under the lockfile.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::needless_borrowed_parameters,
+        reason = "`name` is copied only on the stale path, after the early returns for satisfied ranges, and callers borrow it from the manifest, so an owned parameter would allocate for every dependency."
+    )
+)]
 fn check_resolution_satisfies(
     name: &str,
     manifest_spec: &str,
     importer_dep: Option<&ResolvedDependencySpec>,
 ) -> Result<(), StalenessReason> {
-    let (Some(dep), Ok(range)) = (importer_dep, manifest_spec.parse::<node_semver::Range>()) else {
+    // The resolver gives an any-version range the `latest` tag even when it is a prerelease.
+    if manifest_spec == ANY_VERSION_RANGE || is_any_version_range(manifest_spec) {
+        return Ok(());
+    }
+    let (Some(dep), Some(range)) = (importer_dep, parse_strict_semver_range(manifest_spec)) else {
         return Ok(());
     };
     let Some(version) = dep.version
@@ -251,11 +278,7 @@ fn check_resolution_satisfies(
     else {
         return Ok(());
     };
-    // The resolver gives an any-version range the `latest` tag even when it is a prerelease.
-    if manifest_spec == ANY_VERSION_RANGE
-        || is_any_version_range(manifest_spec)
-        || range.satisfies(version)
-    {
+    if range.satisfies(version) {
         return Ok(());
     }
     Err(StalenessReason::ResolutionDoesNotSatisfy {
@@ -343,7 +366,7 @@ pub(crate) fn auto_installed_peer_deps(
 /// optionalDependencies` flat-record. Manifest fields are read in
 /// dev → prod → optional order, but the order
 /// is irrelevant for the diff since duplicates resolve to the same
-/// specifier anyway — if two fields list the same name with different
+/// specifier anyway, if two fields list the same name with different
 /// specifiers the manifest is invalid and pacquet would have rejected
 /// it earlier.
 fn flat_manifest_specs(

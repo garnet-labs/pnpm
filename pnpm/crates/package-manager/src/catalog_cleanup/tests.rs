@@ -1,8 +1,13 @@
 use super::{
-    post_install_prune, prune_against_project_lockfiles, record_resolved_package_versions,
+    post_install_prune,
+    prune_against_project_lockfiles,
+    record_resolved_package_versions,
 };
 use pnpm_config::Config;
-use pnpm_lockfile::{EnvLockfile, Lockfile};
+use pnpm_lockfile::{
+    EnvLockfile,
+    Lockfile,
+};
 use pnpm_package_manifest::PackageManifest;
 use pnpm_workspace_manifest_writer::ResolvedPackageVersions;
 use std::path::Path;
@@ -67,7 +72,7 @@ fn registers_the_version_of_a_registry_qualified_key() {
 
 /// With `sharedWorkspaceLockfile: false` the install anchors the wanted
 /// lockfile at the active project, so it records that project's
-/// dependencies only — while `minimumReleaseAgeExclude` in
+/// dependencies only, while `minimumReleaseAgeExclude` in
 /// `pnpm-workspace.yaml` governs every project. `foo@1.0.0` may well be a
 /// sibling project's dependency, so the pass must not prune it off one
 /// project's lockfile.
@@ -102,7 +107,7 @@ fn skips_the_pass_when_the_workspace_lockfile_is_not_shared() {
 }
 
 /// The shared lockfile covers every project, so an entry no snapshot
-/// records is pruned — here down to an empty manifest, which is deleted.
+/// records is pruned; here down to an empty manifest, which is deleted.
 #[test]
 fn prunes_against_the_shared_workspace_lockfile() {
     let tmp = tempdir().expect("temp dir");
@@ -256,8 +261,12 @@ fn preserves_config_dependency_excludes_in_all_lockfile_layouts() {
         .expect("parse config dependency resolutions");
         env.snapshots = serde_saphyr::from_str("'@example/plugin@2.0.0':\n  dependencies:\n    foo: 2.0.0\nfoo@2.0.0: {}\nunused-plugin@1.0.0: {}\n")
             .expect("parse env snapshots");
-        env.write(lockfile_dir, pnpm_lockfile::SymlinkedLockfile::Refuse)
-            .expect("write env lockfile");
+        env.write(
+            lockfile_dir,
+            pnpm_lockfile::SymlinkedLockfile::Refuse,
+            pnpm_lockfile::EnvDocumentFormat::V9,
+        )
+        .expect("write env lockfile");
         let manifest =
             PackageManifest::from_path(workspace_dir.join("package.json")).expect("read manifest");
 

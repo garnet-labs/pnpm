@@ -1,13 +1,18 @@
-use super::{DEFAULT_REGISTRY_SCOPE, LoadWorkspaceYamlError, NpmrcAuth, split_inline_identity_key};
+use super::{
+    DEFAULT_REGISTRY_SCOPE,
+    LoadWorkspaceYamlError,
+    NpmrcAuth,
+    split_ssl_key,
+};
 
 /// Reject a `tokenHelper` that a workspace or project `.npmrc` contributed.
 ///
 /// `full` is the merged config including the project `.npmrc`; `trusted`
 /// is the same merge minus the project source (mirroring pnpm's
 /// `userConfig` vs `trustedConfig` split). A `tokenHelper` present in
-/// `full` but not reproducible verbatim from `trusted` — because the
+/// `full` but not reproducible verbatim from `trusted` (because the
 /// project source added it, or overrode a trusted one with a different
-/// command — is repository-controlled and rejected. A project value that
+/// command) is repository-controlled and rejected. A project value that
 /// exactly equals the trusted one is harmless and allowed, matching pnpm.
 pub(crate) fn enforce_token_helper_trust(
     full: &NpmrcAuth,
@@ -80,7 +85,7 @@ pub(super) fn parse_token_helper_field(
 ///
 /// `tokenHelper` is deliberately absent: it names an executable, so it
 /// is only ever honored from a trusted `.npmrc` / `auth.ini` file (see
-/// [`INI_CREDS_SUFFIXES`]), never from the environment — mirroring
+/// [`INI_CREDS_SUFFIXES`]), never from the environment, mirroring
 /// pnpm, which drops a `//host/:tokenHelper` env var outright.
 const CREDS_SUFFIXES: &[&str] = &["_authToken", "_auth", "_password", "username"];
 
@@ -93,9 +98,16 @@ const INI_CREDS_SUFFIXES: &[&str] =
 pub(super) fn is_auth_value_key(key: &str) -> bool {
     matches!(
         key,
-        "_authToken" | "_auth" | "_password" | "username" | "tokenHelper" | "cert" | "key",
+        "_authToken"
+            | "_auth"
+            | "_password"
+            | "username"
+            | "tokenHelper"
+            | "cert"
+            | "key"
+            | "cafile",
     ) || split_ini_creds_key(key).is_some()
-        || split_inline_identity_key(key).is_some()
+        || split_ssl_key(key).is_some_and(|(_, field, is_file)| is_file || field != "ca")
 }
 
 /// Match a `npm_config_//…` / `pnpm_config_//…` environment variable name.

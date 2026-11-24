@@ -8,17 +8,31 @@
 //! workspace-protocol rewrite.
 
 pub use create::{
-    CreateExportableManifestError, CreateExportableManifestOptions, create_exportable_manifest,
+    CreateExportableManifestError,
+    CreateExportableManifestOptions,
+    create_exportable_manifest,
+    finalize_exportable_manifest,
+    prepare_exportable_manifest,
     read_readme_file,
 };
+pub use private_dependency::{
+    PrivateWorkspaceDependencies,
+    PrivateWorkspaceDependencyError,
+    private_workspace_dependencies,
+};
 pub use replace::{
-    CannotResolveReason, CannotResolveWorkspaceProtocolError, ReplaceWorkspaceProtocolError,
-    WorkspacePackageManifest, replace_workspace_protocol,
+    CannotResolveReason,
+    CannotResolveWorkspaceProtocolError,
+    ReplaceWorkspaceProtocolError,
+    WorkspacePackageLookup,
+    WorkspacePackageManifest,
+    replace_workspace_protocol,
     replace_workspace_protocol_peer_dependency,
 };
 pub use transform::TransformError;
 
 mod create;
+mod private_dependency;
 mod replace;
 mod transform;
 

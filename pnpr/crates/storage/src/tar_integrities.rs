@@ -1,10 +1,28 @@
-use super::{CanonicalPackageName, DocumentWrite, RegistryError, Result, Storage};
+use super::{
+    CanonicalPackageName,
+    DocumentWrite,
+    RegistryError,
+    Result,
+    Storage,
+};
 use pnpm_package_manifest::PackageBin;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    sync::{
+        Arc,
+        Mutex,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 /// The tar integrity, build-trigger verdict, unpacked file statistics, and
@@ -62,8 +80,8 @@ impl DerivedTar {
     }
 }
 
-/// The hosted-backend namespace of the tar-integrity tables. A leading `.`
-/// keeps it apart from every organization and package name, and out of the
+/// The hosted-backend record directory of the tar-integrity tables. A leading
+/// `.` keeps it apart from every namespace and package name, and out of the
 /// hosted inventories.
 pub(super) const NAMESPACE: &str = ".tar-integrity";
 
@@ -150,8 +168,8 @@ impl Storage {
     /// `dist.integrity` of the `.tgz` each was derived from.
     ///
     /// The table lives in the hosted backend, so every replica shares it, and
-    /// it is shared by every organization: each value is a function of its
-    /// key, so it says nothing a reader of the version's metadata could not
+    /// it is shared by every namespace: each value is a function of its key,
+    /// so it says nothing a reader of the version's metadata could not
     /// compute. An unreadable table reads as empty.
     pub async fn read_tar_integrities(
         &self,
@@ -160,6 +178,14 @@ impl Storage {
         if let Some(table) = self.tar_integrity_cache.get(name) {
             return Ok(table);
         }
+        self.refresh_tar_integrities(name).await
+    }
+
+    /// Reload the archive metadata from the hosted backend for a package write.
+    pub async fn refresh_tar_integrities(
+        &self,
+        name: &CanonicalPackageName,
+    ) -> Result<Arc<BTreeMap<String, DerivedTar>>> {
         let read_at = Instant::now();
         let document = self.tar_integrities.read_document(name).await?;
         let table: Arc<BTreeMap<String, DerivedTar>> = Arc::new(

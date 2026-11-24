@@ -2,8 +2,16 @@
 
 use crate::installability::InstallabilityHost;
 use pnpm_lockfile::{
-    ImporterDepVersion, LockfileResolution, PackageKey, PackageMetadata, PkgName, PkgNameVerPeer,
-    ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec, SnapshotDepRef,
+    ImporterDepVersion,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgName,
+    PkgNameVerPeer,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
     TarballResolution,
 };
 use std::collections::HashMap;
@@ -55,10 +63,11 @@ fn synthetic_metadata(
     os: Option<&[&str]>,
     libc: Option<&[&str]>,
 ) -> PackageMetadata {
-    // Tarball resolution — the installability check ignores the
+    // Tarball resolution, the installability check ignores the
     // resolution shape entirely, but every `PackageMetadata` must
     // carry one.
     PackageMetadata {
+        specifiers: None,
         resolution: LockfileResolution::Tarball(TarballResolution {
             integrity: None,
             tarball: "https://example.test/pkg.tgz".to_string(),
@@ -153,7 +162,7 @@ fn snapshot_dep_map(entries: &[&str]) -> Option<HashMap<PkgName, SnapshotDepRef>
 fn host(node_version: &str, os: &'static str, cpu: &'static str) -> InstallabilityHost {
     InstallabilityHost {
         node_version: node_version.to_string(),
-        node_detected: true,
+        node_source: crate::NodeVersionSource::Probed,
         os,
         cpu,
         libc: "unknown",
@@ -166,4 +175,3 @@ mod optional_reachability;
 mod platform_checks;
 mod reporting;
 mod runtimes;
-mod variants;

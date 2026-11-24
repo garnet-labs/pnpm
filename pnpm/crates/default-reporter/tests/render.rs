@@ -4,20 +4,59 @@
 //! plain-text assertions and on for the ANSI-specific ones.
 
 use pnpm_default_reporter::{
-    MaxLogLevel, SummaryScope,
+    MaxLogLevel,
+    SummaryScope,
     colors::Colors,
     format::pretty_bytes,
-    state::{Output, ReporterOptions, ReporterState},
+    state::{
+        Output,
+        ReporterOptions,
+        ReporterState,
+    },
 };
 use pnpm_reporter::{
-    AddedRoot, ContextLog, DedupeCheckLog, DependencyType, DeprecationLog, ExecutionTimeLog,
-    FetchingProgressLog, FetchingProgressMessage, GlobalLog, HookLog, IgnoredScriptsLog,
-    LifecycleLog, LifecycleMessage, LifecycleStdio, LockfileVerificationLog,
-    LockfileVerificationMessage, LogEvent, LogLevel, NonDeprecatedAlternative, PackageImportMethod,
-    PackageImportMethodLog, PackageManifestLog, PackageManifestMessage, PnpmErrorLog, PnpmLog,
-    ProgressLog, ProgressMessage, RootLog, RootMessage, ScopeLog, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalParent, SkippedOptionalReason, Stage, StageLog,
-    StatsLog, StatsMessage, SummaryLog, UpdateCheckLog,
+    AddedRoot,
+    ContextLog,
+    DedupeCheckLog,
+    DependencyType,
+    DeprecationLog,
+    ExecutionTimeLog,
+    FetchingProgressLog,
+    FetchingProgressMessage,
+    GlobalLog,
+    HookLog,
+    IgnoredScriptsLog,
+    LifecycleLog,
+    LifecycleMessage,
+    LifecycleStdio,
+    LockfileVerificationLog,
+    LockfileVerificationMessage,
+    LogEvent,
+    LogLevel,
+    NonDeprecatedAlternative,
+    PackageImportMethod,
+    PackageImportMethodLog,
+    PackageManifestLog,
+    PackageManifestMessage,
+    PnpmErrorLog,
+    PnpmLog,
+    ProgressLog,
+    ProgressMessage,
+    RemovedRoot,
+    RootLog,
+    RootMessage,
+    ScopeLog,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalParent,
+    SkippedOptionalReason,
+    Stage,
+    StageLog,
+    StatsLog,
+    StatsMessage,
+    SummaryLog,
+    UnusedOverrideLog,
+    UpdateCheckLog,
 };
 
 const CWD: &str = "/repo";
@@ -38,6 +77,11 @@ fn state_without_summary_prefix_filter() -> ReporterState {
         false,
         SummaryScope::AllPrefixes,
     )
+}
+
+/// The checks footer a command that succeeded ends with.
+fn flush_checks(state: &mut ReporterState) -> Output {
+    state.flush_pending_checks(pnpm_default_reporter::state::CommandOutcome::Succeeded)
 }
 
 /// Feed events through the in-place renderer and return the last full frame.
@@ -132,6 +176,7 @@ fn added_root_with_latest_at(
                 id: None,
                 latest: latest.map(str::to_string),
                 linked_from: None,
+                registry_package: Some(name.to_string()),
             },
         },
     })
@@ -156,7 +201,12 @@ fn summary() -> LogEvent {
 }
 
 fn summary_at(prefix: &str) -> LogEvent {
-    LogEvent::Summary(SummaryLog { level: LogLevel::Debug, prefix: prefix.to_string() })
+    LogEvent::Summary(SummaryLog {
+        level: LogLevel::Debug,
+        prefix: prefix.to_string(),
+        new_projects: None,
+        project_names: None,
+    })
 }
 
 fn pnpm_log(level: LogLevel, message: &str) -> LogEvent {
@@ -182,7 +232,17 @@ fn deprecation_with_alternative(
         prefix: prefix.to_string(),
         depth,
         non_deprecated_alternative,
+        already_installed: false,
     })
+}
+
+/// A deprecation of a package the previous install already installed.
+fn installed_deprecation(name: &str, version: &str, depth: i32) -> LogEvent {
+    let LogEvent::Deprecation(mut log) = deprecation(name, version, depth, CWD) else {
+        unreachable!("deprecation() builds a deprecation event");
+    };
+    log.already_installed = true;
+    LogEvent::Deprecation(log)
 }
 
 fn resolution_done() -> LogEvent {
@@ -225,6 +285,40 @@ fn ignored_scripts(names: &[&str]) -> LogEvent {
     })
 }
 
+fn removed_root_at(prefix: &str, name: &str, version: &str) -> LogEvent {
+    LogEvent::Root(RootLog {
+        level: LogLevel::Debug,
+        message: RootMessage::Removed {
+            prefix: prefix.to_string(),
+            removed: RemovedRoot {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                dependency_type: Some(DependencyType::Prod),
+                registry_package: Some(name.to_string()),
+            },
+        },
+    })
+}
+
+fn aliased_root_at(prefix: &str, alias: &str, real_name: &str, version: &str) -> LogEvent {
+    LogEvent::Root(RootLog {
+        level: LogLevel::Debug,
+        message: RootMessage::Added {
+            prefix: prefix.to_string(),
+            added: AddedRoot {
+                name: alias.to_string(),
+                real_name: real_name.to_string(),
+                version: Some(version.to_string()),
+                dependency_type: Some(DependencyType::Prod),
+                id: None,
+                latest: None,
+                linked_from: None,
+                registry_package: Some(real_name.to_string()),
+            },
+        },
+    })
+}
+
 fn linked_root(name: &str, from: &str) -> LogEvent {
     LogEvent::Root(RootLog {
         level: LogLevel::Debug,
@@ -238,6 +332,7 @@ fn linked_root(name: &str, from: &str) -> LogEvent {
                 id: None,
                 latest: None,
                 linked_from: Some(from.to_string()),
+                registry_package: None,
             },
         },
     })
@@ -374,3 +469,12 @@ mod script_output;
 
 #[path = "render/peers.rs"]
 mod peers;
+
+#[path = "render/deprecations.rs"]
+mod deprecations;
+
+#[path = "render/workspace_summary.rs"]
+mod workspace_summary;
+
+#[path = "render/overrides.rs"]
+mod overrides;

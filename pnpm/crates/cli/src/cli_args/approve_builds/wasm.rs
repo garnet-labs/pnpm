@@ -1,4 +1,9 @@
-use crate::checkbox_prompt::{CheckboxAnswer, CheckboxChoice, CheckboxItem, CheckboxPrompt};
+use crate::checkbox_prompt::{
+    CheckboxAnswer,
+    CheckboxChoice,
+    CheckboxItem,
+    CheckboxPrompt,
+};
 use miette::IntoDiagnostic;
 
 pub(crate) fn prompt_for_choices(
@@ -25,8 +30,4 @@ pub(crate) fn prompt_for_choices(
 
 pub(crate) fn confirm(message: &str) -> miette::Result<bool> {
     crate::confirm_prompt::confirm(message, Some(false)).into_diagnostic()
-}
-
-pub(super) fn stdin_is_terminal() -> miette::Result<bool> {
-    crate::confirm_prompt::stdin_is_terminal().into_diagnostic()
 }

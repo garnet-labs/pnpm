@@ -3,9 +3,15 @@
 
 mod sequence;
 
-use super::segment::{LiteralCase, SegmentPattern};
+use super::segment::{
+    LiteralCase,
+    SegmentPattern,
+};
 use sequence::Sequence;
-use std::{collections::HashSet, iter};
+use std::{
+    collections::HashSet,
+    iter,
+};
 
 /// Brace expansion stops after this many alternatives, or once it has
 /// produced this many bytes, so a short rule of repeated `{a,b}` groups
@@ -43,7 +49,7 @@ impl IgnoreRule {
             .chars()
             .take_while(|&current| current == '!')
             .count();
-        let alternatives = expand_braces(&line[negations..])
+        let alternatives = expand_braces(line[negations..].to_owned())
             .iter()
             .map(|pattern| parse_segments(pattern, literal_case))
             .collect();
@@ -55,7 +61,8 @@ impl IgnoreRule {
     pub(super) fn reinclude_path(path: &str) -> Self {
         let segments = split_on_slash_runs(&format!("/{path}"))
             .into_iter()
-            .map(|segment| Segment::Pattern(SegmentPattern::exact(segment)))
+            .map(SegmentPattern::exact)
+            .map(Segment::Pattern)
             .collect();
         IgnoreRule { negate: true, alternatives: vec![segments] }
     }
@@ -110,7 +117,8 @@ fn split_on_slash_runs(path: &str) -> Vec<&str> {
     let preserve_unc = cfg!(windows)
         && path
             .strip_prefix("//")
-            .is_some_and(|suffix| !suffix.is_empty() && !suffix.starts_with('/'));
+            .filter(|suffix| !suffix.is_empty())
+            .is_some_and(|suffix| !suffix.starts_with('/'));
     let parts: Vec<&str> = path.split('/').collect();
     let last = parts.len() - 1;
     parts
@@ -178,8 +186,8 @@ fn match_globstar(
 
 /// Expands brace alternatives and sequences up to
 /// [`MAX_BRACE_ALTERNATIVES`] and [`MAX_BRACE_EXPANSION_BYTES`].
-fn expand_braces(pattern: &str) -> Vec<String> {
-    let mut pending = vec![pattern.to_string()];
+fn expand_braces(pattern: String) -> Vec<String> {
+    let mut pending = vec![pattern];
     let mut expanded = Vec::new();
     let mut produced_bytes = 0;
     while let Some(current) = pending.pop() {

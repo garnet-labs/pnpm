@@ -8,20 +8,48 @@
 //! File selection uses one per-directory ignore rule stack. Manifest `files`
 //! rules replace root ignore files; required paths and standard package files
 //! are appended at the root. Bundled dependencies use the same selection.
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
 
-pub use ignore_walk::files_field::{FilesMatcher, build_files_matcher};
-pub use pnpm_fs::{AdmittedSymlink, SymlinkTargetKind};
+pub use bundled::root_bundle_dep_names;
+pub use ignore_walk::files_field::{
+    FilesMatcher,
+    build_files_matcher,
+};
+pub use pnpm_fs::{
+    AdmittedSymlink,
+    SymlinkTargetKind,
+};
 
-use derive_more::{Display, Error};
-use ignore_walk::{PackageRules, walk_files};
-use pnpm_diagnostics::miette::{self, Diagnostic};
+use derive_more::{
+    Display,
+    Error,
+};
+use ignore_walk::{
+    Host,
+    PackageRules,
+    walk_files,
+};
+use pnpm_diagnostics::miette::{
+    self,
+    Diagnostic,
+};
 use pnpm_package_manifest::safe_read_package_json_from_dir;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+        VecDeque,
+    },
     ffi::OsStr,
     fs,
-    path::{Component, Path, PathBuf},
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
 };
 
 #[cfg(test)]
@@ -153,7 +181,7 @@ fn collect_own_files(
     options: PackageRules<'_>,
 ) -> Result<SelectedPackageFiles, PacklistError> {
     let mut out = SelectedPackageFiles::default();
-    walk_files(pkg_dir, options, &mut |path, file_type| {
+    walk_files::<Host>(pkg_dir, options, &mut |path, file_type| {
         if let Some(entry) = classify_entry(pkg_dir, path, file_type) {
             let rel = relative_forward_slash(pkg_dir, path);
             out.files.insert(rel.clone(), pkg_dir.join(&rel));
@@ -166,11 +194,24 @@ fn collect_own_files(
     Ok(out)
 }
 
-/// The normalized `main`, `browser`, and `bin` paths that stay inside the
-/// package, which the packlist always includes.
-/// A non-string value, such as a `browser` replacement map, is skipped.
+/// Whether `file_name` names a temporary lockfile staged by an atomic write.
 #[must_use]
-pub fn required_field_paths(manifest: &Value) -> Vec<String> {
+pub fn is_lockfile_staging_file(file_name: &str) -> bool {
+    let Some(suffix) = file_name.strip_prefix(".pnpm-lock.yaml.") else { return false };
+    let mut parts = suffix.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(id), Some("tmp"), None)
+            if !pid.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+                && !id.is_empty(),
+    )
+}
+
+/// The [`normalize_contained_field_path`]-ed `main`, `browser`, and `bin`
+/// paths that stay inside the package. A non-string value, such as a
+/// `browser` replacement map, is skipped.
+fn required_field_paths(manifest: &Value) -> Vec<String> {
     let bin_paths = match manifest.get("bin") {
         Some(Value::String(bin)) => vec![bin.as_str()],
         Some(Value::Object(map)) => map
@@ -246,4 +287,7 @@ mod ignore_walk;
 mod symlinks;
 use bundled::collect_bundled_files;
 use ignore_walk::files_field::normalize_field_path;
-use symlinks::{PackableEntry, classify_entry};
+use symlinks::{
+    PackableEntry,
+    classify_entry,
+};

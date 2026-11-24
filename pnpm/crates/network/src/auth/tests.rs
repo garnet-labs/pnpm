@@ -1,7 +1,15 @@
 use super::{
-    AuthHeaders, DEFAULT_REGISTRY_SCOPE, UpstreamRouteHook, base64_encode, hide_auth_information,
-    nerf_dart, redact_and_sanitize, redact_and_sanitize_multiline, redact_npm_auth_key,
-    redact_url_credentials, redact_url_for_display,
+    AuthHeaders,
+    DEFAULT_REGISTRY_SCOPE,
+    UpstreamRouteHook,
+    base64_encode,
+    hide_auth_information,
+    nerf_dart,
+    redact_and_sanitize,
+    redact_and_sanitize_multiline,
+    redact_npm_auth_key,
+    redact_url_credentials,
+    redact_url_for_display,
 };
 use crate::TokenHelperOutput;
 use pretty_assertions::assert_eq;
@@ -9,10 +17,17 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{
+            AtomicBool,
+            AtomicUsize,
+            Ordering,
+        },
     },
     thread,
-    time::{Duration, Instant},
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 #[test]
@@ -39,7 +54,7 @@ fn registry_alias_does_not_change_outbound_credential_scope() {
 #[test]
 fn secure_transport_restricts_all_credential_lookups_and_survives_cloning() {
     let mut headers = AuthHeaders::default().with_secure_transport();
-    for host in ["registry.example", "127.0.0.1", "localhost", "[::1]"] {
+    for host in ["registry.example", "127.0.0.1", "localhost", "[::1]", "[::ffff:127.0.0.2]"] {
         headers.insert_url_header(&format!("https://{host}/simple/"), "Basic secret".to_string());
     }
     for headers in [headers.clone(), headers] {
@@ -50,6 +65,7 @@ fn secure_transport_restricts_all_credential_lookups_and_survives_cloning() {
             ("http://127.0.0.1/simple/pkg.whl", true),
             ("http://localhost/simple/pkg.whl", true),
             ("http://[::1]/simple/pkg.whl", true),
+            ("http://[::ffff:127.0.0.2]/simple/pkg.whl", true),
         ] {
             eprintln!("url={url}, allowed={allowed}");
             assert_eq!(headers.for_url(url).is_some(), allowed);
@@ -111,7 +127,7 @@ fn a_slow_token_helper_does_not_block_a_second_registry_lookup() {
     // lookup has finished (or a generous deadline). If the resolution cache
     // lock were held across the subprocess, the fast lookup would block on
     // that lock, the flag would never flip, and the slow helper would run
-    // for the full deadline — so the fast lookup completing promptly proves
+    // for the full deadline, so the fast lookup completing promptly proves
     // the lock is released while a helper runs.
     static FAST_DONE: AtomicBool = AtomicBool::new(false);
     fn runner(command: &[String]) -> std::io::Result<TokenHelperOutput> {
@@ -160,7 +176,7 @@ fn a_failing_token_helper_sends_no_credential_and_does_not_fall_back() {
     }
 
     // A static token sits at the host root; a failing helper at the deeper
-    // path prefix must NOT fall back to it — the most-specific key owns the
+    // path prefix must NOT fall back to it, the most-specific key owns the
     // decision, exactly as a resolved helper would.
     let auth = AuthHeaders::from_parts_with_token_helpers(
         std::iter::once(("//reg.com/".to_owned(), "Bearer root-token".to_owned())).collect(),
@@ -190,8 +206,8 @@ fn a_url_header_overlays_only_its_request_route() {
 }
 
 /// Records every `(url, package)` it is asked about and answers with a
-/// fixed header, so a test can assert the hook — not the client
-/// credentials — drove the lookup.
+/// fixed header, so a test can assert the hook (not the client
+/// credentials) drove the lookup.
 #[derive(Default)]
 struct RecordingHook {
     calls: AtomicUsize,
@@ -249,7 +265,7 @@ fn record_route_is_a_noop_without_a_hook() {
 fn route_hook_suppresses_inline_url_basic_auth() {
     // A bare `AuthHeaders` would synthesize a `Basic` header from inline
     // `user:pass@`; with a hook attached the inline credential must not
-    // leak through — the hook (returning None here) owns the decision.
+    // leak through, the hook (returning None here) owns the decision.
     let hook = Arc::new(RecordingHook::default());
     let hooked = AuthHeaders::default().with_route_hook(hook as Arc<dyn UpstreamRouteHook>);
     assert_eq!(hooked.for_url("https://user:pass@reg.com/pkg"), None);
@@ -350,7 +366,7 @@ fn hide_auth_information_keeps_the_scheme_and_masks_the_credential() {
     // A short token could be guessed from a prefix, so none of it survives.
     assert_eq!(hide_auth_information("Bearer short-token"), "Bearer [hidden]");
     assert_eq!(hide_auth_information("Basic Zm9vOmJhcg=="), "Basic [hidden]");
-    // No scheme to report — the whole value is a credential.
+    // No scheme to report, the whole value is a credential.
     assert_eq!(hide_auth_information("bare-token"), "[hidden]");
 }
 
@@ -620,7 +636,7 @@ fn basic_auth_in_url_wins_over_package_scope_auth() {
 
 /// A credential with no URI has no registry it was authored for, so it
 /// is dropped rather than attached to whichever registry the config
-/// happens to resolve to — repository config can move that registry.
+/// happens to resolve to, repository config can move that registry.
 #[test]
 fn unkeyed_creds_are_dropped_rather_than_bound_to_the_default_registry() {
     let headers = build(&[("", "Bearer default-token"), ("//reg.com/", "Bearer scoped-token")]);
@@ -751,4 +767,32 @@ fn redact_and_sanitize_multiline_collapses_when_a_newline_splits_credentials() {
     dbg!(&redacted);
     assert!(!redacted.contains("user:pass"), "{redacted}");
     assert_eq!(redacted, redact_and_sanitize("url: https://user:pass\n@host/x.git\nfailed"));
+}
+
+#[test]
+fn package_request_auth_respects_path_and_origin() {
+    let headers = AuthHeaders::from_creds_map([(
+        "//registry.example/team/".to_owned(),
+        "Bearer fixture".to_owned(),
+    )]);
+    let url = "https://registry.example/team/archive";
+    let authorize = crate::scoped_redirect_auth(url, |target| headers.for_url(target));
+    assert_eq!(authorize("https://registry.example/team/file").as_deref(), Some("Bearer fixture"));
+    assert_eq!(authorize("https://registry.example/files/archive"), None);
+    assert_eq!(authorize("http://registry.example/team/archive"), None);
+    assert_eq!(authorize("https://registry.example:8080/team/archive"), None);
+}
+
+#[test]
+fn insecure_userinfo_is_removed_before_building_requests() {
+    for (input, expected) in [
+        ("http://user:fixture@registry.example/pkg?x=1", "http://registry.example/pkg?x=1"),
+        ("https://user:fixture@registry.example/pkg", "https://user:fixture@registry.example/pkg"),
+        ("http://user:fixture@localhost/pkg", "http://user:fixture@localhost/pkg"),
+        ("http://registry.example/@scope/pkg", "http://registry.example/@scope/pkg"),
+    ] {
+        let mut url = input.to_string();
+        super::strip_insecure_url_credentials(&mut url);
+        assert_eq!(url, expected);
+    }
 }

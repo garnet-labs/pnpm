@@ -1,8 +1,17 @@
-use super::{PipelineRunStore, PublishPipelineRun};
+use super::{
+    PipelineRunStore,
+    PublishPipelineRun,
+};
 use pnpr_config::HostedStoreConfig;
-use pnpr_storage::{PipelineRunKey, Storage};
+use pnpr_storage::{
+    PipelineRunKey,
+    Storage,
+};
 use serde_json::json;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 use tempfile::TempDir;
 
 const ORG: &str = "acme";
@@ -27,7 +36,7 @@ fn storage_in(hosted: &HostedStoreConfig, root: &TempDir) -> Storage {
         hosted,
         root.path().join("storage"),
         root.path().join("cache"),
-        &pnpr_config::MetadataBackend::Sqlite(root.path().join("metadata.sqlite")),
+        &pnpr_config::DatabaseBackend::Sqlite(root.path().join("metadata.sqlite")),
     )
     .expect("open storage")
 }

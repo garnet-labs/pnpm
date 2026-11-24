@@ -1,9 +1,34 @@
 use super::{
-    BlockPlacement, DepKind, PackageDiff, PackageManifestMessage, ReporterState, SUMMARY_ORDER,
-    SummaryScope, SummaryState, Value, added_diff, diff_key, is_strictly_newer,
-    manifest_dep_versions, normalized_prefix, record_missing, relative, remove_optional_from_prod,
+    BlockPlacement,
+    DepKind,
+    DiffBuckets,
+    HashMap,
+    PackageDiff,
+    PackageManifestMessage,
+    ReporterState,
+    SUMMARY_ORDER,
+    SummaryLog,
+    SummaryScope,
+    Value,
+    WorkspaceSummary,
+    added_diff,
+    diff_key,
+    empty_diff_buckets,
+    is_strictly_newer,
+    manifest_dep_versions,
+    normalized_prefix,
+    record_missing,
+    relative,
+    remove_optional_from_prod,
     removed_diff,
 };
+use node_semver::Version;
+use pnpm_semver_include_prerelease::{
+    VersionChange,
+    classify_version_change,
+    split_at_changed_field,
+};
+use pnpm_text_sanitize::sanitize_inline;
 use std::fmt::Write as _;
 
 impl ReporterState {
@@ -14,26 +39,18 @@ impl ReporterState {
         let prefix = match message {
             RootMessage::Added { prefix, .. } | RootMessage::Removed { prefix, .. } => prefix,
         };
-        if !self.is_current_prefix(prefix) {
-            return;
-        }
+        let buckets = if self.is_current_prefix(prefix) {
+            &mut self.summary.diff
+        } else {
+            self.summary.other_projects
+                .entry(normalized_prefix(&self.rendering.cwd, prefix))
+                .or_insert_with(empty_diff_buckets)
+        };
         let (kind, entry) = match message {
             RootMessage::Added { added, .. } => added_diff(added),
             RootMessage::Removed { removed, .. } => removed_diff(removed),
         };
-        let key = diff_key(kind);
-        let Some(bucket) = self.summary.diff.get_mut(key) else {
-            return;
-        };
-        let opposite_key = format!("{}{}", if entry.added { '-' } else { '+' }, entry.name);
-        if let Some(prev) = bucket.get(&opposite_key)
-            && prev.version == entry.version
-        {
-            bucket.remove(&opposite_key);
-            return;
-        }
-        let entry_key = format!("{}{}", if entry.added { '+' } else { '-' }, entry.name);
-        bucket.insert(entry_key, entry);
+        record_root_change(buckets, kind, entry);
     }
 
     pub(super) fn on_manifest(&mut self, message: &PackageManifestMessage) {
@@ -41,19 +58,19 @@ impl ReporterState {
             PackageManifestMessage::Initial { prefix, .. }
             | PackageManifestMessage::Updated { prefix, .. } => prefix,
         };
-        if !self.is_current_prefix(prefix) {
-            return;
-        }
         let should_render_after_update = matches!(message, PackageManifestMessage::Updated { .. })
             && self.summary.seen;
         {
-            let diff = self.summary.manifest_diffs.entry(prefix.clone()).or_default();
+            let diff = self.summary.manifest_diffs
+                .entry(normalized_prefix(&self.rendering.cwd, prefix))
+                .or_default();
             match message {
                 PackageManifestMessage::Initial { initial, .. } => {
                     diff.initial.get_or_insert_with(|| initial.clone());
                 }
                 PackageManifestMessage::Updated { updated, .. } => {
                     diff.updated = Some(updated.clone());
+                    diff.applied = false;
                 }
             }
         }
@@ -62,22 +79,30 @@ impl ReporterState {
         }
     }
 
-    pub(super) fn on_summary(&mut self, prefix: &str) {
-        if prefix == self.rendering.cwd
-            && (self.install.stats_added.is_some() || self.install.stats_removed.is_some())
+    pub(super) fn on_summary(&mut self, log: &SummaryLog) {
+        if !self.install.stats.is_empty()
+            && (log.prefix == self.rendering.cwd || self.install.stats.contains_key(&log.prefix))
         {
+            self.install.complete_stats();
             self.render_stats();
+        }
+        if let Some(new_projects) = &log.new_projects
+            && self.options.scope.summary == SummaryScope::CurrentPrefix
+        {
+            self.summary.workspace =
+                Some(WorkspaceSummary::new(&self.rendering.cwd, log, new_projects));
         }
         self.summary.seen = true;
         self.try_render_summary();
+        self.render_up_to_date();
     }
 
     pub(super) fn try_render_summary(&mut self) {
         if self.summary.rendered {
             return;
         }
-        self.summary.apply_manifest_diff();
-        let msg = self.render_summary();
+        self.apply_manifest_diffs();
+        let msg = self.render_summary_sections();
         if msg.is_empty() {
             return;
         }
@@ -94,36 +119,45 @@ impl ReporterState {
                 == normalized_prefix(&self.rendering.cwd, &self.rendering.cwd)
     }
 
-    pub(super) fn render_summary(&self) -> String {
+    fn render_summary_sections(&self) -> String {
         let mut msg = String::new();
-        for kind in SUMMARY_ORDER {
-            let bucket = &self.summary.diff[diff_key(kind)];
-            if bucket.is_empty() {
+        let workspace = self.summary.workspace
+            .as_ref()
+            .map(|workspace| (workspace, self.new_project_requests(workspace)));
+        let sections = match &workspace {
+            Some((workspace, requests)) => self.workspace_summary_lines(workspace, requests),
+            None => SUMMARY_ORDER
+                .into_iter()
+                .map(|kind| (kind, self.current_project_summary_lines(kind)))
+                .collect(),
+        };
+        for (kind, lines) in sections {
+            if lines.is_empty() {
                 continue;
             }
-            let mut diffs: Vec<&PackageDiff> = bucket
-                .values()
-                .filter(|diff| !self.is_hidden_linked(diff))
-                .collect();
-            if diffs.is_empty() {
-                continue;
-            }
-            diffs.sort_by(|a, b| {
-                a.name
-                    .cmp(&b.name)
-                    .then(u8::from(a.added).cmp(&u8::from(b.added)))
-            });
             msg.push('\n');
             msg.push_str(&self.rendering.colors.cyan_bright(&format!("{}:", kind.header())));
             msg.push('\n');
-            let lines: Vec<String> = diffs
-                .iter()
-                .map(|diff| self.diff_line(diff))
-                .collect();
             msg.push_str(&lines.join("\n"));
             msg.push('\n');
         }
         msg
+    }
+
+    fn current_project_summary_lines(&self, kind: DepKind) -> Vec<String> {
+        let mut changes: Vec<Change<'_>> = bucket_changes(&self.summary.diff[diff_key(kind)])
+            .into_iter()
+            .filter(|change| !self.is_hidden_linked(change.diff))
+            .collect();
+        changes.sort_by(|a, b| {
+            a.diff.name
+                .cmp(&b.diff.name)
+                .then(u8::from(a.diff.added).cmp(&u8::from(b.diff.added)))
+        });
+        changes
+            .into_iter()
+            .map(|change| self.diff_line(&change))
+            .collect()
     }
 
     /// Whether this summary entry is a linked instance of a package the
@@ -134,77 +168,197 @@ impl ReporterState {
         pkg.from.is_some() && self.rendering.hidden_linked_pkgs.matches(&pkg.name)
     }
 
-    pub(super) fn diff_line(&self, pkg: &PackageDiff) -> String {
-        let mut result = if pkg.added {
-            self.rendering.colors.green("+")
-        } else {
-            self.rendering.colors.red("-")
-        };
+    /// One summary line. Names, versions and paths come from the lockfile,
+    /// which a contributor can edit, so each is sanitized.
+    pub(super) fn diff_line(&self, change: &Change<'_>) -> String {
+        let pkg = change.diff;
+        let mut result = self.change_sign(change);
+        let name = sanitize_inline(&pkg.name);
         match &pkg.real_name {
             Some(real) if *real != pkg.name => {
-                let _ = write!(result, " {} <- {real}", pkg.name);
+                let _ = write!(result, " {name} <- {}", sanitize_inline(real));
             }
             _ => {
-                let _ = write!(result, " {}", pkg.name);
+                let _ = write!(result, " {name}");
             }
         }
         if let Some(version) = &pkg.version {
+            let previous = change.replaced_version().map(sanitize_inline);
             result.push(' ');
-            result.push_str(&self.rendering.colors.grey(version));
-            result.push_str(&self.upgrade_hint(pkg, version));
+            result.push_str(&self.version_change(previous.as_deref(), &sanitize_inline(version)));
         }
         if let Some(from) = &pkg.from {
             let rel = relative(&self.rendering.cwd, from);
             let shown = if rel.is_empty() { from.clone() } else { rel };
             result.push(' ');
-            result.push_str(&self.rendering.colors.grey(&format!("<- {shown}")));
+            result.push_str(&self.rendering.colors.grey(&format!(
+                "<- {}",
+                sanitize_inline(&shown),
+            )));
         }
         result
     }
 
-    /// The trailing "is available" note, when the registry's latest is
-    /// strictly newer than the installed version.
-    ///
-    /// A bare `!=` would also fire when the user has pinned a newer version
-    /// than the registry's latest tag (e.g. a beta), wrongly suggesting a
-    /// downgrade.
-    pub(super) fn upgrade_hint(&self, pkg: &PackageDiff, version: &str) -> String {
-        let Some(latest) = &pkg.latest else {
-            return String::new();
-        };
-        if latest == version || !is_strictly_newer(latest, version) {
-            return String::new();
-        }
-        format!(" {}", self.rendering.colors.grey(&format!("({latest} is available)")))
-    }
-}
-
-impl SummaryState {
-    pub(super) fn apply_manifest_diff(&mut self) {
-        let manifest_diffs: Vec<(Value, Value)> = self.manifest_diffs
-            .values()
-            .filter_map(|diff| {
-                Some((diff.initial.as_ref()?.clone(), diff.updated.as_ref()?.clone()))
-            })
-            .collect();
-        for (initial, updated) in manifest_diffs {
-            self.apply_manifest_pair_diff(&initial, &updated);
-        }
-    }
-}
-
-impl SummaryState {
-    pub(super) fn apply_manifest_pair_diff(&mut self, initial: &Value, updated: &Value) {
-        let initial = remove_optional_from_prod(initial);
-        let updated = remove_optional_from_prod(updated);
-        for kind in [DepKind::Peer, DepKind::Prod, DepKind::Optional, DepKind::Dev] {
-            let prop = kind.header();
-            let initial_deps = manifest_dep_versions(&initial, prop);
-            let updated_deps = manifest_dep_versions(&updated, prop);
-            if let Some(bucket) = self.diff.get_mut(diff_key(kind)) {
-                record_missing(bucket, &initial_deps, &updated_deps, false);
-                record_missing(bucket, &updated_deps, &initial_deps, true);
+    fn change_sign(&self, change: &Change<'_>) -> String {
+        match change.replaced_version() {
+            Some(previous) => {
+                self.update_sign(previous, change.diff.version.as_deref().unwrap_or_default())
             }
+            None if change.diff.added => self.rendering.colors.green("+"),
+            None => self.rendering.colors.red("-"),
+        }
+    }
+
+    /// `version`, after the version it replaced when there is one.
+    fn version_change(&self, previous: Option<&str>, version: &str) -> String {
+        let colors = &self.rendering.colors;
+        match previous {
+            Some(previous) => {
+                format!(
+                    "{}{}",
+                    colors.grey(&format!("{previous} → ")),
+                    self.version_diff(previous, version),
+                )
+            }
+            None => colors.grey(version),
+        }
+    }
+
+    /// `version`, with the field bumped from `previous` and the fields
+    /// after it colored the way `pnpm outdated` colors them.
+    fn version_diff(&self, previous: &str, version: &str) -> String {
+        let colors = &self.rendering.colors;
+        let change = match (Version::parse(previous), Version::parse(version)) {
+            (Ok(previous), Ok(version)) => classify_version_change(&previous, &version),
+            _ => VersionChange::Unknown,
+        };
+        let Some((head, tail)) = split_at_changed_field(version, change) else {
+            return colors.grey(version);
+        };
+        let tail = match change {
+            VersionChange::Breaking => colors.red(tail),
+            VersionChange::Feature => colors.yellow(tail),
+            VersionChange::Fix | VersionChange::None | VersionChange::Unknown => colors.green(tail),
+        };
+        if head.is_empty() {
+            return tail;
+        }
+        format!("{}{tail}", colors.grey(head))
+    }
+
+    /// `↑` for an upgrade, `↓` for a downgrade, and `~` for a change
+    /// between versions that do not compare.
+    fn update_sign(&self, previous: &str, version: &str) -> String {
+        let sign = if is_strictly_newer(version, previous) {
+            "↑"
+        } else if is_strictly_newer(previous, version) {
+            "↓"
+        } else {
+            "~"
+        };
+        self.rendering.colors.yellow(sign)
+    }
+
+    /// Fold each manifest edit not folded yet into the changes of its
+    /// project. Without a workspace summary only the current project's edits
+    /// render.
+    fn apply_manifest_diffs(&mut self) {
+        let current_project = normalized_prefix(&self.rendering.cwd, &self.rendering.cwd);
+        let every_prefix_is_current = self.options.scope.summary == SummaryScope::AllPrefixes;
+        let summary = &mut self.summary;
+        for (prefix, edit) in &mut summary.manifest_diffs {
+            let (false, Some(initial), Some(updated)) =
+                (edit.applied, &edit.initial, &edit.updated)
+            else {
+                continue;
+            };
+            let buckets = if every_prefix_is_current || *prefix == current_project {
+                &mut summary.diff
+            } else if summary.workspace.is_some() {
+                summary.other_projects.entry(prefix.clone()).or_insert_with(empty_diff_buckets)
+            } else {
+                continue;
+            };
+            apply_manifest_pair_diff(buckets, initial, updated);
+            edit.applied = true;
+        }
+    }
+}
+
+/// One summary line: an addition, a removal, or an addition that
+/// replaced a removed version of the same dependency.
+pub(super) struct Change<'a> {
+    /// The added side of an update.
+    pub(super) diff: &'a PackageDiff,
+    replaced: Option<&'a PackageDiff>,
+}
+
+impl<'a> Change<'a> {
+    pub(super) fn replaced_version(&self) -> Option<&'a str> {
+        self.replaced.and_then(|replaced| replaced.version.as_deref())
+    }
+}
+
+/// The changes of one bucket. A removal and an addition of the same
+/// dependency fold into one update when both name the same registry
+/// package, so a switch to or from a link, or an alias that now names
+/// another package, stays two lines.
+pub(super) fn bucket_changes(bucket: &HashMap<String, PackageDiff>) -> Vec<Change<'_>> {
+    let counterpart = |diff: &PackageDiff| {
+        let sign = if diff.added { '-' } else { '+' };
+        bucket
+            .get(&format!("{sign}{}", diff.name))
+            .filter(|other| {
+                registry_package(diff).is_some()
+                    && registry_package(diff) == registry_package(other)
+            })
+    };
+    bucket
+        .values()
+        .filter_map(|diff| match (diff.added, counterpart(diff)) {
+            (false, Some(_)) => None,
+            (true, replaced) => Some(Change { diff, replaced }),
+            (false, None) => Some(Change { diff, replaced: None }),
+        })
+        .collect()
+}
+
+/// The registry package behind a change with a version, when its emitter
+/// knew the dependency came from the registry.
+fn registry_package(diff: &PackageDiff) -> Option<&str> {
+    if diff.version.is_none() || diff.from.is_some() {
+        return None;
+    }
+    diff.registry_package.as_deref()
+}
+
+/// Record one `pnpm:root` change. A change that undoes an earlier one of
+/// the same version cancels it.
+fn record_root_change(buckets: &mut DiffBuckets, kind: DepKind, entry: PackageDiff) {
+    let Some(bucket) = buckets.get_mut(diff_key(kind)) else {
+        return;
+    };
+    let opposite_key = format!("{}{}", if entry.added { '-' } else { '+' }, entry.name);
+    if let Some(prev) = bucket.get(&opposite_key)
+        && prev.version == entry.version
+    {
+        bucket.remove(&opposite_key);
+        return;
+    }
+    let entry_key = format!("{}{}", if entry.added { '+' } else { '-' }, entry.name);
+    bucket.insert(entry_key, entry);
+}
+
+fn apply_manifest_pair_diff(buckets: &mut DiffBuckets, initial: &Value, updated: &Value) {
+    let initial = remove_optional_from_prod(initial);
+    let updated = remove_optional_from_prod(updated);
+    for kind in [DepKind::Peer, DepKind::Prod, DepKind::Optional, DepKind::Dev] {
+        let prop = kind.header();
+        let initial_deps = manifest_dep_versions(&initial, prop);
+        let updated_deps = manifest_dep_versions(&updated, prop);
+        if let Some(bucket) = buckets.get_mut(diff_key(kind)) {
+            record_missing(bucket, &initial_deps, &updated_deps, false);
+            record_missing(bucket, &updated_deps, &initial_deps, true);
         }
     }
 }

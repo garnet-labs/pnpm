@@ -1,19 +1,36 @@
 use super::{
-    FreshInputs, ManifestSlots, OwnedInputs,
+    FreshInputs,
+    ManifestSlots,
+    OwnedInputs,
     errors::InstallWithFreshLockfileError,
-    fix_lockfile_copy, hook_log_fn, include_transitive_optional_dependencies,
-    is_partial_workspace_selection, manifest_transforms, resolver_setup,
-    seed_policy::{UpdateSeedPolicy, update_reuse_scopes},
+    fix_lockfile_copy,
+    hook_log_fn,
+    include_transitive_optional_dependencies,
+    is_partial_workspace_selection,
+    manifest_transforms,
+    resolver_setup,
+    seed_policy::{
+        UpdateSeedPolicy,
+        update_reuse_scopes,
+    },
     start_early_materialization,
 };
 
 mod stores;
 use crate::store_init::init_store_dir_best_effort;
-use pnpm_config::{Config, NodeLinker, TrustPolicy};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+    TrustPolicy,
+};
 use pnpm_lockfile::Lockfile;
 use pnpm_network::AuthHeaders;
 use pnpm_reporter::Reporter;
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::Arc,
+};
 use stores::open_stores;
 
 /// What the setup phase hands the resolve phase: the registries, the
@@ -73,6 +90,8 @@ pub(super) struct ObserverSettings {
         Option<Arc<dyn pnpm_resolving_resolver_base::PackageVersionGuard>>,
     minimum_release_age_exclude_override: Option<Vec<String>>,
     pub(super) can_fast_update_overrides: bool,
+    pub(super) max_snapshots: Option<usize>,
+    pub(super) cancel: pnpm_resolving_deps_resolver::ResolutionCancel,
 }
 impl ObserverSettings {
     fn of(observer: Option<&Arc<dyn crate::ResolutionObserver>>) -> Self {
@@ -82,6 +101,10 @@ impl ObserverSettings {
                 observer.minimum_release_age_exclude_override()
             }),
             can_fast_update_overrides: observer.is_none(),
+            max_snapshots: observer.and_then(|observer| observer.max_snapshots()),
+            cancel: pnpm_resolving_deps_resolver::ResolutionCancel::from_option(observer.and_then(
+                |observer| observer.cancellation_check(),
+            )),
         }
     }
 }
@@ -117,7 +140,7 @@ pub(super) async fn set_up_resolvers<Reporter: self::Reporter + 'static>(
     let (resolution_observer, observer, progress_reported) =
         take_resolution_observer(&mut owned.resolution.observer);
 
-    let store_dir: &'static _ = &install.drivers.config.store_dir;
+    let store_dir = &install.drivers.config.store_dir;
     // Eagerly create `files/00..ff` under the v11 store root so per-
     // tarball CAFS writes never pay a `create_dir_all` syscall on the
     // hot path.
@@ -202,6 +225,7 @@ pub(super) async fn build_fresh_resolver_chain<Reporter: self::Reporter + 'stati
             requester: install.projects.requester,
             supported_architectures: install.projects.supported_architectures,
             lockfile: install.lockfiles.wanted,
+            local_filesystem_policy: owned.resolution.local_filesystem_policy,
         },
         registry: crate::install_with_fresh_lockfile::resolution_inputs::ResolverRegistryContext {
             named: &registries.by_scope,
@@ -346,6 +370,7 @@ pub(super) async fn prepare_resolution<'a, Reporter: self::Reporter + 'static>(
         &owned.projects.catalogs,
         lockfile_dir,
         install.manifests.deploy_hook,
+        install.manifests.overrides_root_dir,
     )?;
 
     let fixed_wanted_lockfile =

@@ -1,10 +1,25 @@
-use super::{AddArgs, AddDependencyOptions, AddError, apply_allow_build, workspace_selectors};
+use super::{
+    AddArgs,
+    AddDependencyOptions,
+    AddError,
+    AllowBuildSelector,
+    apply_allow_build,
+    parse_allow_build_selectors,
+    workspace_selectors,
+};
 use crate::{
     boolean_negations::with_boolean_negations,
     cargo_manifest::CargoDependencyKind,
-    cli_args::{CliArgs, cli_command::CliCommand},
+    cli_args::{
+        CliArgs,
+        approve_builds::ApprovalStore,
+        cli_command::CliCommand,
+    },
 };
-use clap::{CommandFactory, Parser};
+use clap::{
+    CommandFactory,
+    Parser,
+};
 use pnpm_config::Config;
 use pnpm_package_manifest::DependencyGroup;
 use pretty_assertions::assert_eq;
@@ -14,7 +29,7 @@ use std::path::Path;
 fn allow_build_merges_into_config_and_persists_to_workspace_yaml() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut config = Config::default();
-    apply_allow_build(&mut config, &["esbuild".to_string()], dir.path())
+    apply_allow_build(&mut config, &["esbuild".to_string()], ApprovalStore::Workspace(dir.path()))
         .expect("allow-build applies");
 
     assert_eq!(config.allow_builds.get("esbuild"), Some(&true), "enabled for this install");
@@ -28,7 +43,7 @@ fn allow_build_merges_into_config_and_persists_to_workspace_yaml() {
 fn allow_build_negation_sets_false_in_config_and_workspace_yaml() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut config = Config::default();
-    apply_allow_build(&mut config, &["!core-js".to_string()], dir.path())
+    apply_allow_build(&mut config, &["!core-js".to_string()], ApprovalStore::Workspace(dir.path()))
         .expect("allow-build negation applies");
 
     assert_eq!(config.allow_builds.get("core-js"), Some(&false), "disabled for this install");
@@ -43,7 +58,7 @@ fn allow_build_rejects_an_argument_that_names_no_package() {
     for allow_build in [&["!".to_string()][..], &[String::new()][..]] {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut config = Config::default();
-        let err = apply_allow_build(&mut config, allow_build, dir.path())
+        let err = apply_allow_build(&mut config, allow_build, ApprovalStore::Workspace(dir.path()))
             .expect_err("an empty package name is rejected");
         assert_eq!(
             err.code()
@@ -67,8 +82,12 @@ fn allow_build_rejects_a_package_the_root_disallows() {
     let mut config = Config::default();
     config.allow_builds.insert("esbuild".to_string(), false);
 
-    let err = apply_allow_build(&mut config, &["esbuild".to_string()], dir.path())
-        .expect_err("disallowed package is rejected");
+    let err = apply_allow_build(
+        &mut config,
+        &["esbuild".to_string()],
+        ApprovalStore::Workspace(dir.path()),
+    )
+    .expect_err("disallowed package is rejected");
     assert_eq!(
         err.code()
             .map(|code| code.to_string())
@@ -87,7 +106,8 @@ fn allow_build_rejects_a_package_the_root_disallows() {
 fn allow_build_is_a_noop_when_empty() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut config = Config::default();
-    apply_allow_build(&mut config, &[], dir.path()).expect("empty allow-build is a no-op");
+    apply_allow_build(&mut config, &[], ApprovalStore::Workspace(dir.path()))
+        .expect("empty allow-build is a no-op");
     assert!(config.allow_builds.is_empty());
     assert!(
         !dir.path()
@@ -190,7 +210,12 @@ fn add_help_lists_only_the_long_options() {
 
 #[test]
 fn dependency_options_to_dependency_groups() {
-    use DependencyGroup::{Dev, Optional, Peer, Prod};
+    use DependencyGroup::{
+        Dev,
+        Optional,
+        Peer,
+        Prod,
+    };
     let create_list = |opts: AddDependencyOptions| opts.dependency_groups().collect::<Vec<_>>();
 
     assert_eq!(
@@ -401,4 +426,55 @@ fn the_dependency_group_filter_honors_the_optional_setting() {
     args.apply_cli_config(&mut config);
 
     assert_eq!(args.included_groups(&config), [DependencyGroup::Prod, DependencyGroup::Dev]);
+}
+
+fn parsed_allow_build(values: &[&str]) -> Vec<(String, bool)> {
+    let values: Vec<String> = values
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    parse_allow_build_selectors(&values)
+        .expect("selectors parse")
+        .into_iter()
+        .map(|AllowBuildSelector { name, allowed }| (name.to_string(), allowed))
+        .collect()
+}
+
+#[test]
+fn allow_build_splits_a_comma_separated_list_of_packages() {
+    assert_eq!(
+        parsed_allow_build(&["esbuild,!@scope/core-js@1.0.0", "sharp"]),
+        [
+            ("esbuild".to_string(), true),
+            ("@scope/core-js@1.0.0".to_string(), false),
+            ("sharp".to_string(), true),
+        ],
+    );
+}
+
+#[test]
+fn allow_build_keeps_a_value_with_a_url_key_whole() {
+    for value in [
+        "!foo@git+https://example.com/org/repo,variant.git",
+        "foo@https://example.com/foo.tgz?a=1,2",
+        "esbuild,foo@git+ssh://git@example.com/org/foo.git",
+        "foo@git+ssh://git@example.com/org/foo.git#a,b",
+        "foo@file:./dir,with,comma",
+        "foo@link:../a,b",
+        "foo@npm:other@1,sharp",
+        "esbuild,local@file:./packages/local",
+    ] {
+        let (name, _) = parsed_allow_build(&[value])
+            .into_iter()
+            .next()
+            .expect("one selector");
+        assert_eq!(name, value.trim_start_matches('!'), "{value} must stay one selector");
+    }
+}
+
+#[test]
+fn allow_build_rejects_an_empty_item_in_a_comma_separated_list() {
+    let err = parse_allow_build_selectors(&["esbuild,".to_string()])
+        .expect_err("an empty list item is rejected");
+    assert!(matches!(err, super::allow_build::AllowBuildError::MissingPackage));
 }

@@ -1,26 +1,65 @@
-use super::{Endpoint, ErrorCode, Request, error, json, parse_endpoint};
+use super::{
+    Endpoint,
+    ErrorCode,
+    Request,
+    error,
+    json,
+    parse_endpoint,
+};
 use crate::server::{
-    Action, AppState, AuthedCaller, Identity, TargetRegistry,
+    AppState,
+    AuthedCaller,
+    Identity,
+    TargetRegistry,
     authentication::token_credentials,
-    authorize,
-    ecosystem::{addressed_registry, sha256_hex},
-    resolve_ecosystem_source,
+    ecosystem::{
+        addressed_registry,
+        sha256_hex,
+    },
 };
 use axum::{
-    extract::{OriginalUri, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    extract::{
+        OriginalUri,
+        State,
+    },
+    http::{
+        HeaderMap,
+        Method,
+        StatusCode,
+        header,
+    },
     response::Response,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::URL_SAFE_NO_PAD,
+};
+use grants::{
+    GrantQuery,
+    granted_scopes,
+};
 use p256::ecdsa::{
-    Signature, SigningKey,
-    signature::{Signer as _, Verifier as _},
+    Signature,
+    SigningKey,
+    signature::{
+        Signer as _,
+        Verifier as _,
+    },
 };
 use pnpr_error::RegistryError;
 use pnpr_registry::Ecosystem;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeMap, fmt::Write as _};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use sha2::{
+    Digest as _,
+    Sha256,
+};
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+};
 
 pub(super) const TOKEN_PREFIX: &str = "pnpr_oci_";
 const TTL: u64 = 300;
@@ -71,7 +110,7 @@ fn verify_claims(key: &SigningKey, token: &str, now: u64) -> Result<Claims, Regi
 
 impl Claims {
     pub(in crate::server) fn permits(&self, path: &str, method: &Method) -> bool {
-        let decoded = pnpr_search::percent_decode(path);
+        let decoded = pnpm_network::percent_decode_str(path);
         let Some(tail) = decoded
             .strip_prefix(&self.audience)
             .and_then(|tail| tail.strip_prefix("/v2"))
@@ -141,35 +180,6 @@ pub(super) async fn issue(
     }
 }
 
-/// The scope request a token issue carries.
-struct GrantQuery<'a> {
-    uri: &'a axum::http::Uri,
-    /// Whether the parent token is read-only, which caps every scope at pull.
-    readonly: bool,
-}
-
-/// One `repository:<name>:<actions>` scope of the query.
-struct GrantOne<'a> {
-    scope: &'a str,
-    readonly: bool,
-    scopes: &'a mut BTreeMap<String, Vec<String>>,
-}
-
-/// The actions of one scope, and what the caller has been granted so far.
-struct GrantActions<'a> {
-    name: &'a str,
-    actions: &'a str,
-    readonly: bool,
-    allowed: &'a mut Vec<String>,
-}
-
-/// One action of one scope.
-struct GrantAction<'a> {
-    name: &'a str,
-    action: &'a str,
-    readonly: bool,
-}
-
 async fn issue_token(
     state: &AppState,
     identity: &Identity,
@@ -184,19 +194,23 @@ async fn issue_token(
         addressed_registry(state, registry, Ecosystem::Oci).ok_or(RegistryError::NotFound)?;
     let raw = headers
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
+        .map(reqwest::header::HeaderValue::to_str)
+        .and_then(Result::ok)
         .and_then(token_credentials);
     if raw.is_some() && *identity == Identity::Anonymous {
         return Ok(error(ErrorCode::Unauthorized, "invalid credentials"));
     }
-    let parent = raw.as_ref().map(|raw| sha256_hex(raw.as_bytes()));
+    let parent = raw
+        .as_ref()
+        .map(String::as_bytes)
+        .map(sha256_hex);
     let record = match &parent {
         Some(parent) => state.inner.identity.auth.tokens.find_by_key(parent).await?,
         None => None,
     };
     let readonly = record.is_some_and(|record| record.readonly);
-    let scopes = granted_scopes(state, identity, &target, &GrantQuery { uri, readonly })?;
-    let audience = pnpr_search::percent_decode(
+    let scopes = granted_scopes(state, identity, &target, &GrantQuery { uri, readonly }).await?;
+    let audience = pnpm_network::percent_decode_str(
         uri.path()
             .strip_suffix("/v2/token")
             .ok_or(RegistryError::NotFound)?,
@@ -213,123 +227,6 @@ async fn issue_token(
         StatusCode::OK,
         &serde_json::json!({ "token": token, "expires_in": TTL }),
     )))
-}
-
-/// The repository scopes this caller is granted out of the ones the query asks
-/// for. A scope naming a repository the caller cannot even read is dropped,
-/// not refused: the registry protocol answers an unauthorized pull with an
-/// empty grant.
-fn granted_scopes(
-    state: &AppState,
-    identity: &Identity,
-    target: &str,
-    query: &GrantQuery<'_>,
-) -> Result<BTreeMap<String, Vec<String>>, RegistryError> {
-    let mut scopes = BTreeMap::new();
-    let pairs = url::form_urlencoded::parse(
-        query.uri
-            .query()
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    for (key, value) in pairs {
-        if key == "service" && value != "pnpr" {
-            return Err(RegistryError::BadRequest {
-                reason: "invalid OCI token service".to_string(),
-            });
-        }
-        if key != "scope" {
-            continue;
-        }
-        for scope in value.split_whitespace() {
-            grant_one_scope(
-                state,
-                identity,
-                target,
-                &mut GrantOne { scope, readonly: query.readonly, scopes: &mut scopes },
-            )?;
-        }
-    }
-    Ok(scopes)
-}
-
-fn grant_one_scope(
-    state: &AppState,
-    identity: &Identity,
-    target: &str,
-    grant: &mut GrantOne<'_>,
-) -> Result<(), RegistryError> {
-    let invalid = || RegistryError::BadRequest { reason: "invalid OCI token scope".to_string() };
-    let Some((resource, remainder)) = grant.scope.split_once(':') else {
-        return Err(invalid());
-    };
-    let Some((name, actions)) = remainder.rsplit_once(':') else {
-        return Err(invalid());
-    };
-    if resource != "repository" && resource != "repository(plugin)" {
-        return Ok(());
-    }
-    let Ok(name) =
-        pnpr_package_name::CanonicalPackageName::parse(name, pnpr_registry::Ecosystem::Oci)
-    else {
-        return Ok(());
-    };
-    if grant.scopes.len() >= 32 && !grant.scopes.contains_key(name.as_str()) {
-        return Err(RegistryError::BadRequest { reason: "too many OCI token scopes".to_string() });
-    }
-    let source =
-        resolve_ecosystem_source(state, target, pnpr_registry::Ecosystem::Oci, name.as_str());
-    let allowed: &mut Vec<String> = grant.scopes
-        .entry(name.as_str().to_string())
-        .or_default();
-    extend_granted_actions(
-        state,
-        identity,
-        &source,
-        &mut GrantActions { name: name.as_str(), actions, readonly: grant.readonly, allowed },
-    );
-    Ok(())
-}
-
-fn extend_granted_actions(
-    state: &AppState,
-    identity: &Identity,
-    source: &crate::server::RegistrySource,
-    grant: &mut GrantActions<'_>,
-) {
-    for action in grant.actions.split(',') {
-        if grant.allowed
-            .iter()
-            .any(|held| held == action)
-        {
-            continue;
-        }
-        let granted = GrantAction { name: grant.name, action, readonly: grant.readonly };
-        if grant_action(state, identity, source, &granted) {
-            grant.allowed.push(action.to_string());
-        }
-    }
-}
-
-/// Whether the caller may perform `action` on the repository. Reading it is
-/// required for every action, so an unreadable repository grants nothing.
-fn grant_action(
-    state: &AppState,
-    identity: &Identity,
-    source: &crate::server::RegistrySource,
-    grant: &GrantAction<'_>,
-) -> bool {
-    let operation = match grant.action {
-        "pull" => Action::Access,
-        "push" => Action::Publish,
-        "delete" => Action::Unpublish,
-        _ => return false,
-    };
-    if grant.action != "pull" && grant.readonly {
-        return false;
-    }
-    authorize(state, identity, source, grant.name, Action::Access).is_ok()
-        && authorize(state, identity, source, grant.name, operation).is_ok()
 }
 
 pub(super) fn challenge(
@@ -371,7 +268,7 @@ impl Request {
 }
 
 pub(in crate::server) fn rejected(state: &AppState, path: &str, method: &Method) -> Response {
-    let decoded = pnpr_search::percent_decode(path);
+    let decoded = pnpm_network::percent_decode_str(path);
     let response =
         error(ErrorCode::Unauthorized, "OCI token is expired, revoked, or outside its scope");
     let Some((prefix, tail)) = decoded.split_once("/v2") else { return response };
@@ -394,6 +291,8 @@ pub(in crate::server) fn rejected(state: &AppState, path: &str, method: &Method)
     };
     challenge(state, &format!("{prefix}/v2"), name.map(|name| (name, actions)), response)
 }
+
+mod grants;
 
 #[cfg(test)]
 mod tests;

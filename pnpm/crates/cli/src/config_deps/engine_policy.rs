@@ -2,9 +2,17 @@
 //! a package manager for itself.
 
 use super::{
-    Config, EnvInstallerContext, PNPM_VERSION, ResolveOptions, Result, resolve_engine_with,
+    Config,
+    EnvInstallerContext,
+    PNPM_VERSION,
+    ResolveOptions,
+    Result,
+    resolve_engine_with,
 };
-use miette::{IntoDiagnostic, WrapErr};
+use miette::{
+    IntoDiagnostic,
+    WrapErr,
+};
 
 /// The pnpm version to record for a range pin that `running_version`
 /// satisfies.
@@ -85,7 +93,7 @@ pub(super) fn engine_resolve_options(
 ) -> Result<ResolveOptions> {
     let published_by = if ignore_maturity { None } else { engine_release_cutoff(config)? };
     // The running version is already on this machine, so hiding it behind the
-    // maturity cutoff protects nothing — it only makes a dist-tag that points
+    // maturity cutoff protects nothing; it only makes a dist-tag that points
     // at it fall back to an older release, downgrading the user
     // (pnpm/pnpm#13883).
     let published_by_exclude =
@@ -112,7 +120,12 @@ pub(super) fn engine_resolve_options(
             published_by_exclude,
             trust_policy,
             trust_policy_exclude,
-            trust_policy_ignore_after: config.trust_policy_ignore_after,
+            trust_policy_ignore_after: config.trust_policy_ignore_after.map(|minutes| {
+                pnpm_resolving_resolver_base::TrustIgnoreAfter {
+                    minutes,
+                    now: config.reference_time,
+                }
+            }),
             ..Default::default()
         },
         ..ResolveOptions::default()
@@ -120,17 +133,19 @@ pub(super) fn engine_resolve_options(
 }
 
 /// Fail closed when the configured maturity cutoff cannot be represented.
-fn engine_release_cutoff(config: &Config) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+fn engine_release_cutoff(config: &Config) -> Result<Option<jiff::Timestamp>> {
     Ok(match config.resolved_minimum_release_age() {
         Some(minutes) => {
             let minutes = i64::try_from(minutes)
                 .into_diagnostic()
                 .wrap_err("convert minimumReleaseAge to minutes")?;
-            let duration = chrono::Duration::try_minutes(minutes)
+            let duration = pnpm_time::duration_minutes(minutes)
                 .ok_or_else(|| miette::miette!("minimumReleaseAge is too large"))?;
             Some(
-                chrono::Utc::now()
-                    .checked_sub_signed(duration)
+                config
+                    .resolved_reference_time()
+                    .checked_sub(duration)
+                    .ok()
                     .ok_or_else(|| miette::miette!("minimumReleaseAge cutoff is out of range"))?,
             )
         }

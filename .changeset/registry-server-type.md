@@ -1,12 +1,4 @@
 ---
-"@pnpm/config.normalize-registries": minor
-"@pnpm/lockfile.utils": major
-"@pnpm/resolving.tarball-url": major
-"@pnpm/installing.deps-resolver": minor
-"@pnpm/installing.deps-installer": minor
-"@pnpm/config.reader": minor
-"@pnpm/types": minor
-"pacquet": minor
 "pnpm": minor
 ---
 

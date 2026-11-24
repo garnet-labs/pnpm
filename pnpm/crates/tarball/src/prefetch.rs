@@ -5,20 +5,38 @@
 //! store-index lookups entirely.
 
 pub use cached_rows::CachedCasPaths;
-pub(crate) use cached_rows::{load_cached_cas_paths, load_legacy_synthesized_cas_paths};
+pub(crate) use cached_rows::{
+    load_cached_cas_paths,
+    load_legacy_synthesized_cas_paths,
+};
 
 use super::{
-    Arc, ArchiveStoreProjection, HashMap, IntoParallelIterator, PackageContentCheck,
-    ParallelIterator, TarballError,
+    Arc,
+    ArchiveStoreProjection,
+    HashMap,
+    IntoParallelIterator,
+    PackageContentCheck,
+    ParallelIterator,
+    TarballError,
 };
 use pnpm_package_manifest::{
-    requires_build_from_cas_paths, requires_build_from_files,
+    requires_build_from_cas_paths,
+    requires_build_from_files,
     stored_requires_build_needs_manifest_check,
 };
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+};
 use pnpm_store_dir::{
-    PackageFilesIndex, PendingFilesCheck, PkgContentMismatch, SharedReadonlyStoreIndex,
-    SharedVerifiedFilesCache, StoreDir, files_maps,
+    PackageFilesIndex,
+    PendingFilesCheck,
+    PkgContentMismatch,
+    SharedReadonlyStoreIndex,
+    SharedVerifiedFilesCache,
+    StoreDir,
+    files_maps,
 };
 
 /// Pre-fetched cas-paths map shared across all per-snapshot futures.
@@ -38,7 +56,7 @@ pub type PrefetchedCasPaths = HashMap<String, Arc<pnpm_fs::CasPaths>>;
 /// Each value is `Arc`-wrapped so multiple bin-link consumers can hold the
 /// same parsed manifest without deep-cloning.
 ///
-/// Only keys whose row carried a manifest blob appear in the map —
+/// Only keys whose row carried a manifest blob appear in the map,
 /// a missing key means either "row exists but has no manifest" (old
 /// pacquet write, or a tarball whose `package.json` failed to
 /// parse) or "package wasn't prefetched at all". Callers that need
@@ -54,7 +72,7 @@ pub type PrefetchedManifests = HashMap<String, Arc<serde_json::Value>>;
 /// against the base files). Carries the same per-package side-effects
 /// maps pnpm threads through its package-files response.
 ///
-/// Pacquet hands these off to `BuildModules`'s `is_built` gate —
+/// Pacquet hands these off to `BuildModules`'s `is_built` gate,
 /// the build-phase skips a snapshot when its computed
 /// `calc_dep_state` cache key has a matching entry here.
 ///
@@ -83,7 +101,7 @@ pub(crate) struct DecodedPrefetchRow {
     stored_requires_build: Option<bool>,
     stored_requires_prepare: Option<bool>,
     verify_result: pnpm_store_dir::VerifyResult,
-    /// The row's files check when it was deferred — see
+    /// The row's files check when it was deferred; see
     /// [`PrefetchIntegrityCheck::Deferred`].
     pending_check: Option<PendingFilesCheck>,
 }
@@ -164,7 +182,10 @@ impl PrefetchResult {
             .into_par_iter()
             .filter_map(|(cache_key, check)| {
                 let no_files = pnpm_store_dir::FilesMap::new();
-                let files = self.cas_paths.get(&cache_key).map_or(&no_files, |files| &**files);
+                let files = self.cas_paths
+                    .get(&cache_key)
+                    .map(|files| &**files)
+                    .unwrap_or(&no_files);
                 let overlays = self.side_effects_maps.get(&cache_key).map(|maps| &**maps);
                 let passed =
                     check.verify(store_dir, verified_files_cache, &files_maps(files, overlays));
@@ -220,7 +241,7 @@ impl PrefetchResult {
 /// [#292]: https://github.com/pnpm/pacquet/pull/292
 pub async fn prefetch_cas_paths(
     index: Option<SharedReadonlyStoreIndex>,
-    store_dir: &'static StoreDir,
+    store_dir: &StoreDir,
     cache_keys: Vec<String>,
     integrity_check: PrefetchIntegrityCheck,
     verified_files_cache: SharedVerifiedFilesCache,
@@ -229,10 +250,11 @@ pub async fn prefetch_cas_paths(
     if cache_keys.is_empty() {
         return PrefetchResult::default();
     }
+    let store_dir = store_dir.clone();
     let result = tokio::task::spawn_blocking(move || -> PrefetchResult {
         prefetch_cas_paths_blocking(
             &index,
-            store_dir,
+            &store_dir,
             &cache_keys,
             integrity_check,
             &verified_files_cache,
@@ -251,7 +273,7 @@ pub async fn prefetch_cas_paths(
 
 fn prefetch_cas_paths_blocking(
     index: &SharedReadonlyStoreIndex,
-    store_dir: &'static StoreDir,
+    store_dir: &StoreDir,
     cache_keys: &[String],
     integrity_check: PrefetchIntegrityCheck,
     verified_files_cache: &SharedVerifiedFilesCache,
@@ -286,12 +308,12 @@ fn prefetch_cas_paths_blocking(
 ///
 /// The bundled manifest is split off the decoded entry via `Option::take` so
 /// it travels back to the caller without an intermediate `Value::clone` of
-/// the JSON tree — the verify function only inspects `files`, never
+/// the JSON tree, the verify function only inspects `files`, never
 /// `manifest`.
 fn decode_prefetch_row(
     cache_key: String,
     bytes: &[u8],
-    store_dir: &'static StoreDir,
+    store_dir: &StoreDir,
     integrity_check: PrefetchIntegrityCheck,
     verified_files_cache: &SharedVerifiedFilesCache,
 ) -> Option<DecodedPrefetchRow> {
@@ -370,6 +392,7 @@ fn resolve_row_requires_build(
             requires_build_from_cas_paths(cas_paths)
         }
         Some(stored) => stored,
+        None if manifest.is_none() => requires_build_from_cas_paths(cas_paths),
         None => requires_build_from_files(manifest, cas_paths.keys()),
     }
 }

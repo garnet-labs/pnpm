@@ -4,10 +4,24 @@
 //! dependency to any package, so the check reads them from the record, not
 //! from the manifests.
 
-use super::{FileDigest, FileDigests, FileSignature, Path, PathBuf, Validation};
-use pnpm_lockfile::{Lockfile, LockfileResolution};
+use super::{
+    FileDigest,
+    FileDigests,
+    FileSignature,
+    Path,
+    PathBuf,
+    Validation,
+};
+use pnpm_lockfile::{
+    Lockfile,
+    LockfileResolution,
+};
 use pnpm_workspace_state::LocalDependencies;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+    HashSet,
+};
 
 /// Record the local dependencies of the lockfile at `lockfile_path`, and carry
 /// the entries of the other lockfiles `carried` records projects against.
@@ -151,13 +165,11 @@ pub(crate) fn changed(validation: &Validation, workspace_dirs: &HashSet<PathBuf>
         return true;
     }
     let digests = FileDigests::new(Some(validation));
-    validation.local_dependencies
-        .values()
-        .any(|local| {
-            local.directories
-                .iter()
-                .any(|dir| !workspace_dirs.contains(Path::new(dir)))
-                || local.tarballs
+    records_local_directory(validation, workspace_dirs)
+        || validation.local_dependencies
+            .values()
+            .any(|local| {
+                local.tarballs
                     .iter()
                     .any(|tarball| {
                         let recorded = validation.files
@@ -165,7 +177,19 @@ pub(crate) fn changed(validation: &Validation, workspace_dirs: &HashSet<PathBuf>
                             .map(|signature| signature.digest.as_str());
                         recorded.is_none() || digests.of(Path::new(tarball)).digest() != recorded
                     })
-        })
+            })
+}
+
+/// Whether `validation` records a local directory dependency other than
+/// `workspace_dirs`.
+pub(crate) fn records_local_directory(
+    validation: &Validation,
+    workspace_dirs: &HashSet<PathBuf>,
+) -> bool {
+    validation.local_dependencies
+        .values()
+        .flat_map(|local| &local.directories)
+        .any(|dir| !workspace_dirs.contains(Path::new(dir)))
 }
 
 #[cfg(test)]

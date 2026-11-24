@@ -1,8 +1,4 @@
 ---
-"@pnpm/workspace.package-patterns": patch
-"@pnpm/workspace.projects-reader": patch
-"@pnpm/workspace.root-finder": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

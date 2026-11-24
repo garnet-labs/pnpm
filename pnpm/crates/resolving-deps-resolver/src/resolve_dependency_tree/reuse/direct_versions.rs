@@ -1,6 +1,16 @@
 use super::{
-    Arc, BTreeMap, DependencySpec, DirectDepVersion, DirectDepVersions, PkgName, PkgNameVerPeer,
-    ProjectSnapshot, ResolvedDependencyMap, SnapshotDepRef, SnapshotEntry, TreeCtx,
+    Arc,
+    BTreeMap,
+    DependencySpec,
+    DirectDepVersion,
+    DirectDepVersions,
+    PkgName,
+    PkgNameVerPeer,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    SnapshotDepRef,
+    SnapshotEntry,
+    TreeCtx,
     lock_recoverable,
 };
 
@@ -35,7 +45,7 @@ pub(crate) fn record_changed_direct_deps(
     }
 }
 
-fn direct_dep_specifier_unchanged(
+pub(crate) fn direct_dep_specifier_unchanged(
     lockfile: &pnpm_lockfile::Lockfile,
     prior: Option<&ProjectSnapshot>,
     alias: &str,
@@ -53,7 +63,7 @@ fn direct_dep_specifier_unchanged(
 /// [`fn@record_changed_direct_deps`] have their `catalog:` protocol
 /// already replaced by the catalog's range
 /// ([`fn@resolve_catalog_specifiers`]), while the importer snapshot
-/// records the literal `catalog:` / `catalog:<name>` form — comparing
+/// records the literal `catalog:` / `catalog:<name>` form, comparing
 /// those directly would mark every catalog-managed dep as changed on
 /// every install, and the changed-direct-dep reuse gate would then
 /// re-resolve (and drift) every subtree depending on one. The edge is
@@ -100,13 +110,13 @@ pub(super) fn importer_dep_specifier<'a>(
 /// [`crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::direct_dep_versions`]: crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::direct_dep_versions
 pub(in super::super) fn record_direct_dep_versions(
     ctx: &TreeCtx,
-    importer_id: &str,
+    importer_id: String,
     level: &BTreeMap<String, Vec<String>>,
 ) {
     let changed_versions =
         Arc::clone(&lock_recoverable(&ctx.workspace.versions.changed_direct_dep_versions));
     let mut versions = lock_recoverable(&ctx.workspace.versions.direct_dep_versions);
-    let by_name = Arc::make_mut(versions.entry(importer_id.to_string()).or_default());
+    let by_name = Arc::make_mut(versions.entry(importer_id).or_default());
     extend_parsed_versions(by_name, level, &ctx.workspace.cache.registry_context);
     for (name, candidates) in changed_versions.iter() {
         by_name.entry(name.clone()).or_insert_with(|| candidates.clone());
@@ -323,18 +333,122 @@ async fn preseed_one_changed_direct<Chain>(
 where
     Chain: super::Resolver + ?Sized,
 {
+    let resolved = resolve_direct_dependency(
+        ctx,
+        resolver,
+        spec,
+        importer_id,
+        parent_pkg_aliases,
+        DirectResolution::ChangedDirectPreseed,
+    )
+    .await?;
+    Ok(resolved.and_then(|resolved| {
+        resolved.package.name_ver
+            .as_ref()
+            .map(|name_ver| (name_ver.name.to_string(), name_ver.suffix.to_string()))
+    }))
+}
+
+/// What a direct dependency of the importer resolves to, the way
+/// [`super::super::extend_tree`] resolves it, without adding it to the tree.
+/// `None` when it fails to resolve the way a dropped optional dependency
+/// does. The failure is not reported.
+pub(crate) async fn resolve_direct_dependency_detached<Chain>(
+    ctx: &TreeCtx,
+    resolver: &Chain,
+    spec: DependencySpec,
+    importer_id: &str,
+    parent_pkg_aliases: &Arc<super::ParentPkgAliases>,
+) -> Result<
+    Option<Arc<pnpm_resolving_resolver_base::ResolveResult>>,
+    super::ResolveDependencyTreeError,
+>
+where
+    Chain: super::Resolver + ?Sized,
+{
+    resolve_direct_dependency(
+        ctx,
+        resolver,
+        spec,
+        importer_id,
+        parent_pkg_aliases,
+        DirectResolution::Detached,
+    )
+    .await
+}
+
+/// Why a direct dependency is resolved without being added to the tree.
+#[derive(Debug, Clone, Copy)]
+enum DirectResolution {
+    /// To pre-seed the versions of the importer's changed direct
+    /// dependencies.
+    ChangedDirectPreseed,
+    /// To read its manifest, the way [`super::super::extend_tree`] would
+    /// resolve it.
+    Detached,
+}
+
+impl DirectResolution {
+    fn changed_direct_scope(self) -> ChangedDirectScope {
+        match self {
+            DirectResolution::ChangedDirectPreseed => ChangedDirectScope::OwnImporter,
+            DirectResolution::Detached => ChangedDirectScope::EveryImporter,
+        }
+    }
+
+    async fn try_resolve_edge<Chain>(
+        self,
+        ctx: &TreeCtx,
+        resolver: &Chain,
+        wanted: &mut super::WantedDependency,
+        edge: &super::ChildEdge<'_>,
+        prior_key: Option<&PkgNameVerPeer>,
+    ) -> Result<
+        Option<Arc<pnpm_resolving_resolver_base::ResolveResult>>,
+        super::ResolveDependencyTreeError,
+    >
+    where
+        Chain: super::Resolver + ?Sized,
+    {
+        match self {
+            DirectResolution::ChangedDirectPreseed => {
+                super::super::walk::try_resolve_edge_cached(ctx, resolver, wanted, edge, prior_key)
+                    .await
+            }
+            DirectResolution::Detached => {
+                super::super::walk::try_resolve_edge_detached(
+                    ctx, resolver, wanted, edge, prior_key,
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn resolve_direct_dependency<Chain>(
+    ctx: &TreeCtx,
+    resolver: &Chain,
+    spec: DependencySpec,
+    importer_id: &str,
+    parent_pkg_aliases: &Arc<super::ParentPkgAliases>,
+    purpose: DirectResolution,
+) -> Result<
+    Option<Arc<pnpm_resolving_resolver_base::ResolveResult>>,
+    super::ResolveDependencyTreeError,
+>
+where
+    Chain: super::Resolver + ?Sized,
+{
     let mut wanted_dep = super::super::wanted_from_spec(spec);
     let reuse = super::ReuseSource::Importer { importer_id: importer_id.to_string() };
     let prior_key = reuse.prior_key(ctx, &wanted_dep);
-    let scope = ChangedDirectScope::OwnImporter;
+    let scope = purpose.changed_direct_scope();
     if ctx.workspace.reuse.subtrees
         && reuse.allows_reuse()
         && !node_depends_on_changed_direct_dep_with(ctx, prior_key.as_ref(), scope)
         && let Some(reused) = super::try_reuse_node(ctx, &wanted_dep, prior_key.as_ref(), 0)
     {
-        return Ok(reused.result.package.name_ver
-            .as_ref()
-            .map(|name_ver| (name_ver.name.to_string(), name_ver.suffix.to_string())));
+        return Ok(Some(Arc::new(reused.result)));
     }
     let ancestors = Arc::new(Vec::new());
     let edge = super::ChildEdge {
@@ -345,22 +459,9 @@ where
         pick_overlay: ctx.options.base.version.preferred_versions_overlay.clone(),
         parent_dir: None,
         parent_pkg_aliases,
-        parent_is_workspace: false,
+        parent_origin: super::ParentOrigin::RootOrLocal,
     };
-    let Some(resolved) = super::super::walk::try_resolve_edge_cached(
-        ctx,
-        resolver,
-        &mut wanted_dep,
-        &edge,
-        prior_key.as_ref(),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    Ok(resolved.package.name_ver
-        .as_ref()
-        .map(|name_ver| (name_ver.name.to_string(), name_ver.suffix.to_string())))
+    purpose.try_resolve_edge(ctx, resolver, &mut wanted_dep, &edge, prior_key.as_ref()).await
 }
 
 #[cfg(test)]

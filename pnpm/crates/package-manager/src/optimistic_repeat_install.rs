@@ -16,24 +16,51 @@ pub(crate) mod deps_status;
 pub(crate) mod freshness;
 pub(crate) mod manifest_agreement;
 pub(crate) use conflict_markers::{
-    LockfileConflictCheckFailure, first_lockfile_requiring_conflict_safe_install,
+    LockfileConflictCheckFailure,
+    first_lockfile_requiring_conflict_safe_install,
 };
-pub use deps_status::{RunDepsStatus, check_deps_status_before_run};
-pub(crate) use manifest_agreement::{ManifestStat, held_projects_match_lockfile};
+pub use deps_status::{
+    RunDepsStatus,
+    check_deps_status_before_run,
+};
+pub(crate) use manifest_agreement::{
+    ManifestStat,
+    held_projects_match_lockfile,
+};
 pub(crate) use modules_dirs::project_id;
 pub use up_to_date::{
-    GateWorkspace, UpToDateFastPathCheck, UpToDateWorkspace, check_deps_status_before_run_at,
-    deps_install_root, install_already_up_to_date, install_already_up_to_date_from_records,
+    GateWorkspace,
+    UpToDateFastPathCheck,
+    UpToDateWorkspace,
+    check_deps_status_before_run_at,
+    deps_install_root,
+    install_already_up_to_date,
+    install_already_up_to_date_from_records,
     install_already_up_to_date_per_project,
 };
 
 use crate::install_state::{
-    Decision, OptimisticRepeatInstallCheck, Scope, catalogs_cache_matches, current_pnpmfiles,
-    file_mtime, file_mtime_from_metadata, filesystem_now_ms_in_modules, first_setting_drift,
-    has_local_file_dep_requiring_install, has_local_file_override,
-    has_local_file_package_extension, hoisted_project_modules_dir, local_file_deps,
-    lockfile_modified_since, manifest_has_required_peers, manifest_has_runtime_deps,
-    materialized_shape_matches, modified_at_or_after, recorded_elsewhere, records_registry_keys_of,
+    Decision,
+    LocalFileDependencyStatus,
+    OptimisticRepeatInstallCheck,
+    Scope,
+    catalogs_cache_matches,
+    current_pnpmfiles,
+    file_mtime,
+    file_mtime_from_metadata,
+    filesystem_now_ms_in_modules,
+    first_setting_drift,
+    has_local_file_override,
+    has_local_file_package_extension,
+    local_file_dependency_status,
+    local_file_deps,
+    lockfile_modified_since,
+    manifest_has_required_peers,
+    manifest_has_runtime_deps,
+    materialized_shape_matches,
+    modified_at_or_after,
+    recorded_elsewhere,
+    records_registry_keys_of,
     validation,
 };
 
@@ -44,31 +71,66 @@ mod relocation;
 mod settle;
 mod up_to_date;
 use freshness::{
-    Gate, GatePolicy, MissingWantedLockfile, NewerPatch, RecordedGroups, Stale, check_freshness,
+    Gate,
+    GatePolicy,
+    MissingWantedLockfile,
+    NewerPatch,
+    RecordedGroups,
+    Stale,
+    check_freshness,
 };
 use modules_dirs::{
-    SelectedReach, direct_dependency_link_dangling, first_project_missing_modules_dir,
-    first_selected_project_missing_modules_dir, reached_project_dirs,
+    SelectedReach,
+    direct_dependency_link_dangling,
+    first_project_missing_modules_dir,
+    first_selected_project_missing_modules_dir,
+    reached_project_dirs,
 };
 use project_structure::project_structure_matches;
-use settle::{current_lockfile_file_has_content, wanted_lockfile_file_has_content};
+use settle::{
+    current_lockfile_file_has_content,
+    wanted_lockfile_file_has_content,
+};
 
 use std::{
     collections::HashSet,
     fs,
-    io::{ErrorKind, Read},
-    path::{Path, PathBuf},
+    io::{
+        ErrorKind,
+        Read,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use pnpm_catalogs_resolver::{
-    CatalogAnchor, CatalogResolutionResult, WantedDependency, resolve_from_catalog,
+    CatalogAnchor,
+    CatalogResolutionResult,
+    WantedDependency,
+    resolve_from_catalog,
 };
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{Config, LinkWorkspacePackages, NodeLinker};
-use pnpm_lockfile::{ImporterDepVersion, Lockfile, ProjectSnapshot};
+use pnpm_config::{
+    Config,
+    LinkWorkspacePackages,
+    NodeLinker,
+};
+use pnpm_lockfile::{
+    ImporterDepVersion,
+    Lockfile,
+    ProjectSnapshot,
+};
 use pnpm_modules_yaml::Host;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_workspace_state::{WorkspaceState, load_workspace_state};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_workspace_state::{
+    WorkspaceState,
+    load_workspace_state,
+};
 
 /// Run the workspace-state freshness fast path. Returns
 /// [`Decision::UpToDate`] when the install can short-circuit.
@@ -89,7 +151,7 @@ pub(crate) fn check_optimistic_repeat_install_in(
         return Decision::Skipped { reason };
     }
     // No workspace state means no previous install has completed
-    // (or the file was deleted) — there's no `lastValidatedTimestamp`
+    // (or the file was deleted); there's no `lastValidatedTimestamp`
     // to compare against.
     let Ok(Some(state)) = load_workspace_state(check.workspace_root) else {
         return Decision::Skipped { reason: "no workspace state on disk" };
@@ -164,7 +226,7 @@ pub(crate) fn config_blocks_fast_path(config: &Config) -> Option<&'static str> {
         return Some("prune_direct_dependencies enabled");
     }
     // The merge has to run, and it rewrites the wanted lockfile and
-    // deletes the per-branch ones — neither of which any fast path does.
+    // deletes the per-branch ones; neither of which any fast path does.
     if config.merge_git_branch_lockfiles {
         return Some("the git branch lockfiles have to be merged");
     }
@@ -196,9 +258,11 @@ fn local_file_blocks_fast_path(
     let overrides = parsed_overrides
         .as_deref()
         .unwrap_or(&[]);
-    match has_local_file_dep_requiring_install(check, overrides) {
-        Ok(true) => return Some(LOCAL_FILE_DEPENDENCY),
-        Ok(false) => {}
+    match local_file_dependency_status(check, overrides) {
+        Ok(LocalFileDependencyStatus::Current) => {}
+        Ok(LocalFileDependencyStatus::UnvouchedInjected)
+            if manifest_agreement::recorded_directories_are_current(check) => {}
+        Ok(_) => return Some(LOCAL_FILE_DEPENDENCY),
         Err(reason) => return Some(reason),
     }
     if has_local_file_override(overrides) {
@@ -220,14 +284,32 @@ fn recorded_local_dependency_changed(
     check: &OptimisticRepeatInstallCheck<'_>,
     state: &WorkspaceState,
 ) -> bool {
-    let workspace_dirs: std::collections::HashSet<PathBuf> = check
+    state.validation
+        .as_ref()
+        .is_some_and(|validation| {
+            validation::local_dependency_changed(validation, &workspace_dirs(check))
+        })
+}
+
+/// Whether the last validation recorded a local directory dependency that is
+/// no workspace project.
+fn records_local_directory(
+    check: &OptimisticRepeatInstallCheck<'_>,
+    state: &WorkspaceState,
+) -> bool {
+    state.validation
+        .as_ref()
+        .is_some_and(|validation| {
+            validation::records_local_directory(validation, &workspace_dirs(check))
+        })
+}
+
+fn workspace_dirs(check: &OptimisticRepeatInstallCheck<'_>) -> std::collections::HashSet<PathBuf> {
+    check
         .bin_projects()
         .iter()
         .map(|(dir, _)| pnpm_fs::lexical_normalize(dir))
-        .collect();
-    state.validation
-        .as_ref()
-        .is_some_and(|validation| validation::local_dependency_changed(validation, &workspace_dirs))
+        .collect()
 }
 
 fn manifest_string_field(manifest: &PackageManifest, key: &str) -> Option<String> {
@@ -312,7 +394,9 @@ fn pnpmfiles_drift(
             let then = recorded.and_then(|recorded| recorded.files.get(path));
             let Some(then) = then else {
                 // A state without validation records has no digests.
-                let mtime = file_mtime(Path::new(path)).map_or_else(|| Err(removed()), Ok);
+                let mtime = file_mtime(Path::new(path))
+                    .map(Ok)
+                    .unwrap_or_else(|| Err(removed()));
                 return match mtime {
                     Err(removed) => Some(removed),
                     Ok(mtime) => {

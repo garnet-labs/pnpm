@@ -1,25 +1,47 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
+use std::collections::{
+    HashMap,
+    HashSet,
 };
 
-use node_semver::{Range, Version};
+use node_semver::{
+    Range,
+    Version,
+};
+use pnpm_catalogs_types::Catalogs;
 use pnpm_lockfile::{
-    PackageMetadata, PkgName, PkgNameVerPeer, PkgVerPeer, SnapshotDepRef, SnapshotEntry,
+    LockfileResolution,
+    PackageMetadata,
+    PkgName,
+    PkgNameVerPeer,
+    PkgVerPeer,
+    SnapshotDepRef,
+    SnapshotEntry,
 };
 use pnpm_resolving_resolver_base::get_peer_version_range;
 
 use crate::{
-    ParentPkg, PeerIssues,
-    linked::{record_bad_peer, record_missing_peer, resolve_link_version},
-    ranges::{parse_range_to_intervals, preprocess_hyphen_ranges},
+    ParentPkg,
+    PeerIssues,
+    linked::{
+        LinkRoots,
+        locked_package_version,
+        record_bad_peer,
+        record_missing_peer,
+        resolve_link_version,
+        resolve_peer_range,
+    },
+    ranges::{
+        parse_range_to_intervals,
+        preprocess_hyphen_ranges,
+    },
 };
 
 pub(super) fn walk_snapshot(
     initial_keys: Vec<PkgNameVerPeer>,
     snapshots: &HashMap<PkgNameVerPeer, SnapshotEntry>,
     packages: &HashMap<PkgNameVerPeer, PackageMetadata>,
-    lockfile_dir: &Path,
+    roots: &LinkRoots<'_>,
+    catalogs: Option<&Catalogs>,
     visited: &mut HashSet<PkgNameVerPeer>,
     issues: &mut PeerIssues,
 ) {
@@ -35,7 +57,7 @@ pub(super) fn walk_snapshot(
         let mut current_parents = parents;
         current_parents.push(ParentPkg {
             name: key.name.to_string(),
-            version: get_pkg_version(&key, packages),
+            version: get_pkg_version(&key, packages, roots),
         });
 
         let snapshot = snapshots.get(&key);
@@ -43,7 +65,8 @@ pub(super) fn walk_snapshot(
             key: &key,
             snapshot,
             packages,
-            lockfile_dir,
+            roots,
+            catalogs,
             parents: &current_parents,
             issues,
         });
@@ -58,7 +81,8 @@ struct SnapshotPeers<'a> {
     key: &'a PkgNameVerPeer,
     snapshot: Option<&'a SnapshotEntry>,
     packages: &'a HashMap<PkgNameVerPeer, PackageMetadata>,
-    lockfile_dir: &'a Path,
+    roots: &'a LinkRoots<'a>,
+    catalogs: Option<&'a Catalogs>,
     parents: &'a [ParentPkg],
     issues: &'a mut PeerIssues,
 }
@@ -71,7 +95,7 @@ fn check_snapshot_peers(inputs: SnapshotPeers<'_>) {
     let Some(peers) = &meta.peer_dependencies else { return };
 
     for (peer_name, peer_range) in peers {
-        let peer_range = get_peer_version_range(peer_range);
+        let peer_range = wanted_peer_range(meta, peer_name, peer_range, inputs.catalogs);
         let optional = meta.peer_dependencies_meta
             .as_ref()
             .and_then(|meta_map| meta_map.get(peer_name))
@@ -84,16 +108,29 @@ fn check_snapshot_peers(inputs: SnapshotPeers<'_>) {
             continue;
         };
 
-        let Some(found_version) = resolved_snapshot_version(
-            dep_ref,
-            &peer_pkg_name,
-            inputs.packages,
-            inputs.lockfile_dir,
-        ) else {
+        let Some(found_version) =
+            resolved_snapshot_version(dep_ref, &peer_pkg_name, inputs.packages, inputs.roots)
+        else {
             continue;
         };
         record_bad_peer(issues, peer_name, inputs.parents, optional, &peer_range, found_version);
     }
+}
+
+fn wanted_peer_range(
+    meta: &PackageMetadata,
+    peer_name: &str,
+    peer_range: &str,
+    catalogs: Option<&Catalogs>,
+) -> String {
+    // The lockfile records a directory package's peers as written. A range
+    // the catalogs cannot resolve is kept, and so reported as unmet.
+    if !matches!(meta.resolution, LockfileResolution::Directory(_)) {
+        return get_peer_version_range(peer_range);
+    }
+    let resolved = resolve_peer_range(peer_name, peer_range, catalogs)
+        .unwrap_or_else(|_| peer_range.to_string());
+    get_peer_version_range(&resolved)
 }
 
 pub(super) fn snapshot_dependency<'a>(
@@ -115,14 +152,14 @@ pub(crate) fn resolved_snapshot_version(
     dep_ref: &SnapshotDepRef,
     peer_name: &PkgName,
     packages: &HashMap<PkgNameVerPeer, PackageMetadata>,
-    lockfile_dir: &Path,
+    roots: &LinkRoots<'_>,
 ) -> Option<String> {
     if let Some(key) = dep_ref.resolve(peer_name) {
-        return Some(get_pkg_version(&key, packages));
+        return Some(get_pkg_version(&key, packages, roots));
     }
     let link_target = dep_ref.as_link_target()?;
     Some(
-        resolve_link_version(lockfile_dir, lockfile_dir, link_target)
+        resolve_link_version(roots.lockfile, roots, link_target)
             .unwrap_or_else(|| format!("link:{link_target}")),
     )
 }
@@ -144,18 +181,19 @@ pub(super) fn child_keys(
 fn get_pkg_version(
     key: &PkgNameVerPeer,
     packages: &HashMap<PkgNameVerPeer, PackageMetadata>,
+    roots: &LinkRoots<'_>,
 ) -> String {
-    let base_key = key.without_peer();
     packages
-        .get(&base_key)
-        .and_then(|meta| meta.version.clone())
+        .get(&key.without_peer())
+        .and_then(|meta| locked_package_version(meta, roots.lockfile, roots))
         .unwrap_or_else(|| extract_peer_version(&key.suffix))
 }
 
 pub(super) fn extract_peer_version(ver_peer: &PkgVerPeer) -> String {
     ver_peer
         .registry_qualified()
-        .map_or_else(|| ver_peer.version().to_string(), |(_, version)| version.to_string())
+        .map(|(_, version)| version.to_string())
+        .unwrap_or_else(|| ver_peer.version().to_string())
 }
 
 pub(super) fn satisfies(version: &str, range: &str) -> bool {
@@ -176,7 +214,7 @@ pub(super) fn satisfies(version: &str, range: &str) -> bool {
     }
     // pnpm asks semver for `includePrerelease`, which drops the rule
     // that a prerelease only satisfies a comparator carrying a
-    // prerelease of its own `major.minor.patch` — `node-semver`'s Rust
+    // prerelease of its own `major.minor.patch`, `node-semver`'s Rust
     // port applies that rule unconditionally. What is left is the plain
     // bound check, and ordering still holds: `18.3.0-canary` satisfies
     // `^18.0.0`, while `2.0.0-beta.1` stays below `>=2.0.0`.

@@ -1,14 +1,26 @@
 use crate::{
-    DependencyOverrider, ResolveDependencyTreeError, ResolvePeersResult, ResolvedTree,
-    resolve_dependency_tree::{TreeCtx, WorkspaceTreeCtx},
+    DependencyOverrider,
+    ResolveDependencyTreeError,
+    ResolvePeersResult,
+    ResolvedTree,
+    resolve_dependency_tree::{
+        TreeCtx,
+        WorkspaceTreeCtx,
+    },
 };
-use chrono::{DateTime, Utc};
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
+use jiff::Timestamp;
 use miette::Diagnostic;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_package_manifest::PackageManifestError;
 use pnpm_patching::PatchGroupRecord;
-use pnpm_resolving_resolver_base::{PreferredVersions, ResolveOptions};
+use pnpm_resolving_resolver_base::{
+    PreferredVersions,
+    ResolveOptions,
+};
 use std::sync::Arc;
 
 /// Options threaded into [`fn@crate::resolve_importer`].
@@ -27,6 +39,8 @@ pub struct ResolveImporterOptions {
 
 #[derive(Debug, Clone)]
 pub struct ImporterPeerOptions {
+    /// Direct aliases explicitly named by the command, including unchanged specifiers.
+    pub explicitly_requested_direct_dependencies: rustc_hash::FxHashSet<String>,
     /// When true, missing required peers get installed at the importer
     /// even if no preferred version is in scope (the picker uses the
     /// peer's declared range as the specifier).
@@ -43,14 +57,14 @@ pub struct ImporterPeerOptions {
     /// Threaded into [`crate::ResolvePeersOptions::dedupe_peers`] on every
     /// `resolve_peers` invocation inside the auto-install-peers loop.
     pub dedupe_peers: bool,
-    /// The `dedupePeerDependents` setting (default `true`). Together
-    /// with [`Self::auto_install_peers`] it decides whether the hoist
-    /// rounds run at all — a peer nothing asked to install is still
+    /// Together with [`Self::auto_install_peers`] it decides whether the
+    /// hoist rounds run at all, a peer nothing asked to install is still
     /// hoisted to collapse peer-suffixed variants, so turning both off
-    /// leaves every missing peer missing. The cross-importer collapse
+    /// leaves every missing peer missing. It also decides which versions
+    /// may supply a missing optional peer. The cross-importer collapse
     /// itself lives in [`fn@crate::resolve_peers_workspace`] and reads
     /// the setting separately.
-    pub dedupe_peer_dependents: bool,
+    pub dedupe_peer_dependents: crate::PeerDependentsDedupe,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -79,7 +93,7 @@ pub struct ImporterResolutionInputs {
     /// version a sibling already brought is reused instead of adding a
     /// second instance. Versions resolved into the settled tree are
     /// derived once, workspace-wide, on the tree context and merged
-    /// with these seed buckets per lookup (seed entries win) — see
+    /// with these seed buckets per lookup (seed entries win); see
     /// `TreeCtx::preferred_versions_for_names`. Pass the result of
     /// `get_preferred_versions_from_lockfile_and_manifests` from the
     /// `lockfile-preferred-versions` crate, or an empty map when no
@@ -106,9 +120,10 @@ pub struct ImporterResolutionInputs {
     /// `base_opts.published_by` (the `minimumReleaseAge` cutoff) so
     /// subdep resolution is unchanged. Direct deps always use
     /// `base_opts.published_by`, never this value.
-    pub subdep_published_by: Option<DateTime<Utc>>,
+    pub subdep_published_by: Option<Timestamp>,
     /// Catalogs parsed from `pnpm-workspace.yaml`. Applied to importer
-    /// dependencies and to children of injected workspace packages.
+    /// dependencies, to children of injected workspace packages, and to the
+    /// peers of `file:` directory packages.
     pub catalogs: Catalogs,
     /// Directory `pnpm-workspace.yaml` sits in, which a `file:` /
     /// `link:` catalog entry's relative path is measured from. `None`
@@ -203,7 +218,7 @@ pub(crate) struct HoistSettings {
 impl ResolveImporterOptions {
     pub(crate) fn into_tree_ctx(
         self,
-        importer_id: &str,
+        importer_id: String,
         importer_order: usize,
         workspace: Arc<WorkspaceTreeCtx>,
     ) -> (TreeCtx, HoistSettings) {
@@ -232,7 +247,7 @@ impl ResolveImporterOptions {
     }
 }
 
-/// Result of [`fn@crate::resolve_importer`] — the fully-walked tree plus the
+/// Result of [`fn@crate::resolve_importer`], the fully-walked tree plus the
 /// peer-resolution output the install layer consumes.
 #[derive(Debug)]
 pub struct ResolveImporterResult {

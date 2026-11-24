@@ -1,13 +1,32 @@
 use super::{
-    FetchShasumsFileError, NodeResolver, NodeResolverError,
-    assets::{bin_spec_for_platform, parse_node_file_name},
-    exact_release_version, normalize_node_runtime_version_specifier, parse_node_specifier,
-    read_musl_assets, read_node_assets_from_mirror,
+    FetchShasumsFileError,
+    NodeResolver,
+    NodeResolverError,
+    assets::{
+        bin_spec_for_platform,
+        parse_node_file_name,
+    },
+    exact_release_version,
+    normalize_node_runtime_version_specifier,
+    parse_node_specifier,
+    read_musl_assets,
+    read_node_assets_from_mirror,
 };
-use pnpm_lockfile::{LockfileResolution, PlatformAssetResolution, VariationsResolution};
-use pnpm_network::{AuthHeaders, ThrottledClient};
+use pnpm_lockfile::{
+    LockfileResolution,
+    PlatformAssetResolution,
+    VariationsResolution,
+};
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+};
 use pnpm_resolving_resolver_base::{
-    CurrentPkg, ResolutionRefreshOptions, ResolveOptions, Resolver, UpdateBehavior,
+    CurrentPkg,
+    ResolutionRefreshOptions,
+    ResolveOptions,
+    Resolver,
+    UpdateBehavior,
     WantedDependency,
 };
 use pretty_assertions::assert_eq;
@@ -31,7 +50,7 @@ async fn declines_non_node_alias() {
     assert!(outcome.is_none());
 }
 
-/// `node` alias without a `runtime:` prefix is declined — that shape
+/// `node` alias without a `runtime:` prefix is declined, that shape
 /// is owned by the npm resolver (`node` could be a package name too).
 #[tokio::test]
 async fn declines_node_without_runtime_prefix() {
@@ -77,7 +96,9 @@ fn locked_node_opts(update: UpdateBehavior, update_checksums: bool) -> ResolveOp
                 id: "node@runtime:26.10.0".into(),
                 name: Some("node".to_string()),
                 version: Some("26.10.0".to_string()),
-                resolution: LockfileResolution::Variations(VariationsResolution::new(Vec::new())),
+                resolution: LockfileResolution::Variations(VariationsResolution {
+                    variants: Vec::new(),
+                }),
                 published_at: None,
                 manifest: None,
             }),
@@ -105,6 +126,39 @@ async fn keeps_the_locked_runtime_without_network() {
         .expect("node resolver claims the runtime dependency");
     assert_eq!(result.id.as_str(), "node@runtime:26.10.0");
     assert_eq!(result.normalized_bare_specifier, None);
+}
+
+#[tokio::test]
+async fn a_locked_runtime_from_another_release_channel_is_resolved_again() {
+    let mut resolver = resolver();
+    resolver.offline = true;
+    let mut opts = locked_node_opts(UpdateBehavior::Off, false);
+    let current = opts.refresh.current_pkg.as_mut().expect("locked runtime");
+    current.id = "node@runtime:26.0.0-nightly20260101abcdef".into();
+    current.version = Some("26.0.0-nightly20260101abcdef".to_string());
+    let wanted = |bare_specifier: &str| WantedDependency {
+        alias: Some("node".to_string()),
+        bare_specifier: Some(bare_specifier.to_string()),
+        ..WantedDependency::default()
+    };
+
+    let kept = resolver
+        .resolve(&wanted("runtime:nightly/^26"), &opts)
+        .await
+        .unwrap()
+        .expect("node resolver claims the runtime dependency");
+    assert_eq!(kept.id.as_str(), "node@runtime:26.0.0-nightly20260101abcdef");
+
+    for other_channel in ["runtime:rc/^26", "runtime:^26"] {
+        let err = resolver
+            .resolve(&wanted(other_channel), &opts)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<super::NodeResolverError>(),
+            Some(super::NodeResolverError::Offline),
+        ));
+    }
 }
 
 #[tokio::test]
@@ -213,7 +267,7 @@ fn normalized_runtime_spec_preserves_version_prefix() {
 }
 
 /// `add node@runtime:<spec>` saves the picked version, not the requested
-/// range — `runtime:26` must reach the manifest as `runtime:26.5.0`.
+/// range, `runtime:26` must reach the manifest as `runtime:26.5.0`.
 #[tokio::test]
 async fn resolve_save_specifier_pins_the_picked_version() {
     let mut server = mockito::Server::new_async().await;
@@ -338,10 +392,11 @@ fn exact_release_versions_are_their_own_resolution() {
         exact_release_version(&parse_node_specifier(specifier).expect("valid specifier"))
     };
     assert_eq!(exact("22.11.0").as_deref(), Some("22.11.0"));
+    assert_eq!(exact("v22.11.0").as_deref(), Some("22.11.0"));
     assert_eq!(exact("release/22.11.0").as_deref(), Some("22.11.0"));
+    assert_eq!(exact("release/v22.11.0").as_deref(), Some("22.11.0"));
     assert_eq!(exact("^22.11.0"), None);
     assert_eq!(exact("22.11"), None);
-    assert_eq!(exact("v22.11.0"), None);
     assert_eq!(exact("22.11.0-rc.1"), None);
     assert_eq!(exact("rc/22.11.0"), None);
     assert_eq!(exact("latest"), None);

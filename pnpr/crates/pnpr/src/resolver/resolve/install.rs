@@ -1,6 +1,15 @@
 use super::{
-    Arc, AuthHeaders, Config, DependencyGroup, Install, PackageManifest, Path, ResolutionObserver,
-    ResolveRequest, ResolvedPackages, ThrottledClient,
+    Arc,
+    AuthHeaders,
+    Config,
+    DependencyGroup,
+    Install,
+    PackageManifest,
+    Path,
+    ResolutionObserver,
+    ResolveRequest,
+    ResolvedPackages,
+    ThrottledClient,
 };
 use pnpm_config::NodeLinker;
 use pnpm_tarball::MemCache;
@@ -27,7 +36,7 @@ fn update_seed_policy(request: &ResolveRequest) -> pnpm_package_manager::UpdateS
 /// Resolve using the caller's credentials and catalogs, streaming observations
 /// when requested. The input lockfile must already have passed policy verification.
 pub(super) struct ResolutionInstall<'a> {
-    pub(super) config: &'static Config,
+    pub(super) config: &'a Config,
     pub(super) client: &'a Arc<ThrottledClient>,
     pub(super) request: &'a ResolveRequest,
     pub(super) auth_headers: &'a Arc<AuthHeaders>,
@@ -57,15 +66,19 @@ impl<'a> ResolutionInstall<'a> {
             pnpm_lockfile::MaybeLazyLockfile::Loaded(request.lockfile.as_ref()),
             [DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional],
         );
+        install.lockfile_policy.excludes = pnpm_package_manager::PolicyExcludes::Persist;
         install.lockfile_policy.frozen = request.frozen_lockfile;
         install.lockfile_policy.prefer_frozen = prefer_frozen_lockfile(request);
         install.lockfile_policy.ignore_manifest_check = request.ignore_manifest_check;
         install.lockfile_policy.trust = true;
-        install.lockfile_policy.update_checksums = request.update_patches;
+        install.lockfile_policy.update_checksums =
+            request.update_patches || request.update_checksums;
         install.execution.skip_runtimes = false;
         install.execution.node_linker = NodeLinker::Isolated;
         install.execution.lockfile_only = true;
         install.resolution.update_seed_policy = update_seed_policy(request);
+        install.resolution.local_filesystem_policy =
+            pnpm_package_manager::LocalFilesystemPolicy::WorkspaceOnly;
         install.resolution.auth_override = Some(Arc::clone(auth_headers));
         install.resolution.observer = observer;
         install.context.lockfile_path = request.lockfile.as_ref().map(|_| lockfile_path);

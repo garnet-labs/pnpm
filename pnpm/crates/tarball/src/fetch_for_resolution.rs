@@ -2,25 +2,54 @@
 //! through the in-memory cache.
 
 use crate::{
-    ArchiveIntegrity, CacheHeaders, CacheValue, CachedTarball, MemCache, RetryOpts, TarballError,
-    TarballPackage, apply_placeholder_manifest,
-    archive_integrity::{ArchiveVerification, IntegrityKind},
+    ArchiveIntegrity,
+    CacheClaimGuard,
+    CacheHeaders,
+    CacheSlotClaim,
+    CacheValue,
+    CachedTarball,
+    MemCache,
+    RetryOpts,
+    TarballError,
+    TarballPackage,
+    apply_placeholder_manifest,
+    archive_integrity::{
+        ArchiveVerification,
+        IntegrityKind,
+    },
     claim_cache_entry,
-    download::{AttemptedFetch, fetch_and_extract_conditional},
-    package_mem_cache_key, publish_cache_failure, publish_cached_tarball, read_cas_package_json,
-    read_subdir_manifest, wait_for_cached_tarball,
+    download::{
+        AttemptedFetch,
+        fetch_and_extract_conditional,
+    },
+    package_mem_cache_key,
+    read_cas_package_json,
+    read_subdir_manifest,
+    wait_for_cached_tarball,
 };
-use pnpm_network::{AuthHeaders, ThrottledClient, UNPRIORITIZED};
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+    UNPRIORITIZED,
+};
 use pnpm_package_manifest::PackageBin;
 use pnpm_reporter::Reporter;
-use pnpm_store_dir::{PackageFilesIndex, StoreDir, StoreIndexWriter, store_index_key};
+use pnpm_store_dir::{
+    PackageFilesIndex,
+    StoreDir,
+    StoreIndexWriter,
+    store_index_key,
+};
 use ssri::Integrity;
-use std::{collections::BTreeMap, sync::Arc};
-use tokio::sync::{Notify, RwLock};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
+use tokio::sync::RwLock;
 
 /// Outcome of [`FetchTarballForResolution::run`]: the sha512 integrity
 /// computed from the downloaded tarball and the bundled manifest read
-/// from its `package.json`. The extracted CAFS paths are not returned —
+/// from its `package.json`. The extracted CAFS paths are not returned;
 /// they are stashed in the shared [`MemCache`] under the archive's
 /// computed integrity so the install pass, which records that same hash
 /// in the lockfile, reuses them without re-downloading.
@@ -59,20 +88,20 @@ pub struct NotModifiedResponse {
 /// caller pins), extract it to the store, and read its bundled manifest.
 ///
 /// Remote (non-registry) https-tarball direct dependencies carry no
-/// name/version/integrity at resolve time — those live in the tarball's
+/// name/version/integrity at resolve time; those live in the tarball's
 /// `package.json`, learned only after the fetch. pacquet builds the
 /// lockfile before the install pass, so the `TarballResolver` must
 /// fetch here to fill `manifest` + `integrity` into its
 /// `ResolveResult`.
 pub struct FetchTarballForResolution<'a> {
     pub http_client: &'a ThrottledClient,
-    pub store: ResolutionStore,
+    pub store: ResolutionStore<'a>,
     /// The archive to read and what is already known about it.
     ///
     /// `id` is used for scoped auth lookup and for the store-index row
     /// this fetch writes; it must be the `pkg_id` the install pass
-    /// derives from the lockfile entry — the bare URL for a remote
-    /// tarball — or the two passes file the same content under two rows.
+    /// derives from the lockfile entry (the bare URL for a remote
+    /// tarball) or the two passes file the same content under two rows.
     ///
     /// `integrity` is `None` when this fetch is what discovers the hash,
     /// and `Some` when the resolution already pins one and the fetch
@@ -86,7 +115,7 @@ pub struct FetchTarballForResolution<'a> {
     /// Directory *within* the archive holding the package, for a
     /// git-hosted dep that points at one directory of a repo
     /// (`#path:/packages/foo`). The archive spans the whole repo, so
-    /// the root `package.json` describes the repo, not the package —
+    /// the root `package.json` describes the repo, not the package,
     /// read the manifest from here instead. `None` reads the root.
     ///
     /// Matches the resolution's `path` field verbatim, leading slash
@@ -105,8 +134,8 @@ pub struct FetchTarballForResolution<'a> {
 }
 
 /// The store a resolution-time read extracts into.
-pub struct ResolutionStore {
-    pub dir: &'static StoreDir,
+pub struct ResolutionStore<'a> {
+    pub dir: &'a StoreDir,
     /// Receives the store-index row of the archive, when there is one to write.
     pub index_writer: Option<Arc<StoreIndexWriter>>,
 }
@@ -195,44 +224,60 @@ impl FetchTarballForResolution<'_> {
             self.package.integrity,
             self.revision_addressed,
         );
-        let (cache_lock, owner_notify) = claim_cache_entry(mem_cache, mem_cache_key.clone());
-        match owner_notify {
-            // A settled slot holds no hash, so it cannot say whether the pin
-            // names the resource or the tar.
-            None if self.kind() == IntegrityKind::ResourceOrTar => {
-                drop(cache_lock);
-                match self.fetch_extracted::<Reporter>(None).await? {
-                    FetchedBody::Extracted(extracted) => extracted.into_resolved(self.kind()),
-                    FetchedBody::NotModified(_) => {
-                        Err(TarballError::HttpStatus(crate::HttpStatusError {
-                            url: self.package.url.to_string(),
-                            status: 304,
-                        }))
+        loop {
+            match claim_cache_entry(mem_cache, &mem_cache_key) {
+                // A settled slot holds no hash, so it cannot say whether the pin
+                // names the resource or the tar.
+                CacheSlotClaim::Existing(cache_lock)
+                    if self.kind() == IntegrityKind::ResourceOrTar =>
+                {
+                    drop(cache_lock);
+                    let url = self.package.url.to_string();
+                    return match self.fetch_and_publish::<Reporter>(Some(mem_cache), None).await? {
+                        TarballResolutionFetch::Resolved(resolved) => Ok(resolved),
+                        TarballResolutionFetch::NotModified(_) => {
+                            Err(TarballError::HttpStatus(crate::HttpStatusError {
+                                url,
+                                status: 304,
+                            }))
+                        }
+                    };
+                }
+                CacheSlotClaim::Existing(cache_lock) => {
+                    if let Some(resolved) =
+                        self.take_cached(mem_cache, &mem_cache_key, &cache_lock).await?
+                    {
+                        return Ok(resolved);
                     }
                 }
-            }
-            None => self.take_cached(&cache_lock).await,
-            Some(notify) => {
-                self.fetch_as_owner::<Reporter>(mem_cache, mem_cache_key, cache_lock, notify).await
+                CacheSlotClaim::Claimed(claim) => {
+                    return self.fetch_as_owner::<Reporter>(claim).await;
+                }
             }
         }
     }
 
     async fn take_cached(
         &self,
-        cache_lock: &RwLock<CacheValue>,
-    ) -> Result<ResolvedTarball, TarballError> {
-        let cached = wait_for_cached_tarball(cache_lock, self.package.url).await?;
+        mem_cache: &MemCache,
+        mem_cache_key: &str,
+        cache_lock: &Arc<RwLock<CacheValue>>,
+    ) -> Result<Option<ResolvedTarball>, TarballError> {
+        let Some(cached) =
+            wait_for_cached_tarball(mem_cache, mem_cache_key, cache_lock, self.package.url).await?
+        else {
+            return Ok(None);
+        };
         let integrity =
             self.package.integrity.cloned().expect("a pinned read claims a hashed cache identity");
         let manifest = self.manifest_from_cached(&cached).await?;
-        Ok(ResolvedTarball {
+        Ok(Some(ResolvedTarball {
             integrity,
             tar_integrity: None,
             manifest,
             cache_headers: CacheHeaders::default(),
             final_url: self.package.url.to_owned(),
-        })
+        }))
     }
 
     async fn manifest_from_cached(
@@ -248,41 +293,37 @@ impl FetchTarballForResolution<'_> {
 
     async fn fetch_as_owner<Reporter: self::Reporter>(
         self,
-        mem_cache: &MemCache,
-        mem_cache_key: String,
-        cache_lock: Arc<RwLock<CacheValue>>,
-        notify: Arc<Notify>,
+        claim: CacheClaimGuard<'_>,
     ) -> Result<ResolvedTarball, TarballError> {
         match self.fetch_extracted::<Reporter>(None).await {
             Ok(FetchedBody::Extracted(extracted)) => {
-                publish_cached_tarball(
-                    &cache_lock,
-                    &notify,
-                    CachedTarball {
-                        files: Arc::clone(&extracted.body.files),
-                        manifest: extracted.body.root_manifest.clone(),
-                        requires_build: None,
-                        bins: extracted.body.bins.clone(),
-                    },
-                )
-                .await;
-                extracted.into_resolved(self.kind())
+                let cached = CachedTarball {
+                    files: Arc::clone(&extracted.body.files),
+                    manifest: extracted.body.root_manifest.clone(),
+                    requires_build: None,
+                    bins: extracted.body.bins.clone(),
+                };
+                match extracted.into_resolved(self.kind()) {
+                    Ok(resolved) => {
+                        claim.publish_available(cached).await;
+                        Ok(resolved)
+                    }
+                    Err(err) => {
+                        claim.publish_failed(&err).await;
+                        Err(err)
+                    }
+                }
             }
             Ok(FetchedBody::NotModified(_)) => {
-                Err(TarballError::HttpStatus(crate::HttpStatusError {
+                let err = TarballError::HttpStatus(crate::HttpStatusError {
                     url: self.package.url.to_string(),
                     status: 304,
-                }))
+                });
+                claim.publish_failed(&err).await;
+                Err(err)
             }
             Err(err) => {
-                publish_cache_failure(
-                    mem_cache,
-                    &mem_cache_key,
-                    &cache_lock,
-                    &notify,
-                    self.revision_addressed,
-                )
-                .await;
+                claim.publish_failed(&err).await;
                 Err(err)
             }
         }
@@ -293,7 +334,20 @@ impl FetchTarballForResolution<'_> {
         mem_cache: Option<&MemCache>,
         if_none_match: Option<&str>,
     ) -> Result<TarballResolutionFetch, TarballError> {
-        match self.fetch_extracted::<Reporter>(if_none_match).await? {
+        let prepared = match mem_cache {
+            Some(cache) if if_none_match.is_none() && self.can_reuse_add_archive() => {
+                cache.take_add_archive(self.package.url).await
+            }
+            _ => None,
+        };
+        let fetched = match prepared {
+            Some(archive) => {
+                self.check_add_archive_access()?;
+                FetchedBody::Extracted(Box::new(self.process_extracted(*archive).await?))
+            }
+            None => self.fetch_extracted::<Reporter>(if_none_match).await?,
+        };
+        match fetched {
             FetchedBody::NotModified(response) => Ok(TarballResolutionFetch::NotModified(response)),
             FetchedBody::Extracted(extracted) => {
                 if let Some(mem_cache) = mem_cache {
@@ -317,18 +371,64 @@ impl FetchTarballForResolution<'_> {
         }
     }
 
+    fn can_reuse_add_archive(&self) -> bool {
+        self.package.integrity.is_none()
+            && !self.revision_addressed
+            && self.manifest_subdir.is_none()
+            && self.package.id == self.package.url
+    }
+
     fn kind(&self) -> IntegrityKind {
         if self.revision_addressed { IntegrityKind::Tar } else { self.package.integrity_kind }
     }
 
-    /// Resolve-time tarball fetches compute integrity from bytes and
-    /// gate the dependency walk, so they use the same priority class as
-    /// packument requests instead of queuing behind sized downloads.
-    async fn fetch_extracted<Reporter: self::Reporter>(
+    /// Read the manifest needed to name a remote add selector. The install takes
+    /// the extraction and writes its index row using the install's writer.
+    pub async fn prepare_add(
+        &self,
+        cache: &MemCache,
+    ) -> Result<Option<serde_json::Value>, TarballError> {
+        self.check_add_archive_access()?;
+        let archives = cache.add_archives.get_or_init(Default::default);
+        let slot = Arc::clone(
+            archives
+                .entry(self.package.url.to_owned())
+                .or_default()
+                .value(),
+        );
+        let mut prepared = slot.lock().await;
+        if let Some(entry) = prepared.as_ref() {
+            return Ok(entry.index.manifest.clone());
+        }
+        match self.fetch_archive::<pnpm_reporter::SilentReporter>(None).await? {
+            AttemptedFetch::Extracted(archive) => {
+                let entry = prepared.insert(archive);
+                Ok(entry.index.manifest.clone())
+            }
+            AttemptedFetch::NotModified(_) => {
+                Err(TarballError::HttpStatus(crate::HttpStatusError {
+                    url: self.package.url.to_owned(),
+                    status: 304,
+                }))
+            }
+        }
+    }
+
+    fn check_add_archive_access(&self) -> Result<(), TarballError> {
+        if !self.auth_headers.allows_fetch(self.package.url) {
+            return Err(TarballError::OffAllowlist {
+                url: pnpm_network::redact_url_credentials(self.package.url),
+            });
+        }
+        self.auth_headers.record_route(self.package.url, Some(self.package.id));
+        Ok(())
+    }
+
+    async fn fetch_archive<Reporter: self::Reporter>(
         &self,
         if_none_match: Option<&str>,
-    ) -> Result<FetchedBody, TarballError> {
-        let fetched = fetch_and_extract_conditional::<Reporter>(
+    ) -> Result<AttemptedFetch, TarballError> {
+        fetch_and_extract_conditional::<Reporter>(
             self.http_client,
             self.package.url,
             &ArchiveVerification::new(self.package.integrity, self.kind()),
@@ -345,7 +445,17 @@ impl FetchTarballForResolution<'_> {
             self.revision_addressed,
             if_none_match,
         )
-        .await?;
+        .await
+    }
+
+    /// Resolve-time tarball fetches compute integrity from bytes and
+    /// gate the dependency walk, so they use the same priority class as
+    /// packument requests instead of queuing behind sized downloads.
+    async fn fetch_extracted<Reporter: self::Reporter>(
+        &self,
+        if_none_match: Option<&str>,
+    ) -> Result<FetchedBody, TarballError> {
+        let fetched = self.fetch_archive::<Reporter>(if_none_match).await?;
         match fetched {
             AttemptedFetch::NotModified(meta) => {
                 Ok(FetchedBody::NotModified(NotModifiedResponse {
@@ -355,7 +465,8 @@ impl FetchTarballForResolution<'_> {
             }
             AttemptedFetch::Extracted(extracted) => {
                 self.process_extracted(*extracted).await
-                    .map(|validated| FetchedBody::Extracted(Box::new(validated)))
+                    .map(Box::new)
+                    .map(FetchedBody::Extracted)
             }
         }
     }
@@ -387,7 +498,7 @@ impl FetchTarballForResolution<'_> {
         })
     }
 
-    /// File this extraction under the caller's `package_id` — the same
+    /// File this extraction under the caller's `package_id`, the same
     /// `pkg_id` the install pass derives from the lockfile entry. Deriving
     /// a `name@version` from the bundled manifest instead would file a
     /// remote tarball under a key nothing ever reads, leaving the install
@@ -395,7 +506,7 @@ impl FetchTarballForResolution<'_> {
     ///
     /// A subdirectory package gets no row. Its key would name the
     /// subpackage while `pkg_files_idx` describes the whole archive
-    /// — the repo's manifest and every repo file — and a row whose
+    /// (the repo's manifest and every repo file) and a row whose
     /// key and payload disagree is worse than none: consumers that
     /// trust `PackageFilesIndex.manifest` / `files` to match the key
     /// (bin linking, file materialization) would read the repo.

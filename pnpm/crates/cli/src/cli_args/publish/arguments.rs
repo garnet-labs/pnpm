@@ -23,6 +23,10 @@ pub struct PublishRegistryArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct PublishManifestArgs {
+    /// Set the version in the package manifest to this value before
+    /// publishing.
+    #[clap(long = "new-version", value_name = "VERSION")]
+    pub new_version: Option<String>,
     /// Embed the README contents in the published manifest.
     #[clap(long = "embed-readme", overrides_with = "no_embed_readme")]
     pub embed_readme: bool,
@@ -42,28 +46,6 @@ pub struct PublishManifestArgs {
     pub no_skip_manifest_obfuscation: bool,
     #[clap(flatten)]
     pub notes: PublishNotesArgs,
-}
-
-/// How the archives a package's `publishConfig.variants` declares are
-/// published.
-#[derive(Debug, Default, Clone, clap::Args)]
-pub struct PublishVariantArgs {
-    /// Publish only the archive that targets `any` of a package that declares
-    /// `publishConfig.variants`, such as to a registry that does not serve
-    /// platform variants.
-    #[clap(long)]
-    pub no_variants: bool,
-    /// Pack the archive of the `publishConfig.variants` entry this target
-    /// names, such as `linux-x64-musl` or `any`, upload it to the registry's
-    /// staging area, and print `<target>=<integrity>`. Publishes nothing. Can
-    /// be repeated.
-    #[clap(long = "upload-variant", value_name = "TARGET")]
-    pub upload_variant: Vec<String>,
-    /// Publish the archive another job uploaded with `--upload-variant`, as
-    /// `<target>=<integrity>`, or `<name>~<target>=<integrity>` with
-    /// `--recursive`. Repeated once per archive.
-    #[clap(long = "variant-integrity", value_name = "TARGET=INTEGRITY")]
-    pub variant_integrity: Vec<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -94,7 +76,7 @@ pub struct PublishNotesArgs {
     /// `serverType: pnpr`. Publishing one package, they are its version
     /// notes. Publishing several with `--batch`, they are the notes of the
     /// whole release.
-    #[clap(long = "release-notes", value_name = "FILE")]
+    #[clap(long = "release-notes", value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     pub release_notes: Option<String>,
     /// Send no release notes, not even those read from `CHANGELOG.md` or
     /// change intents.

@@ -7,16 +7,40 @@ use crate::npm::publish_doc;
 
 use axum::{
     Router,
-    body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    body::{
+        Body,
+        to_bytes,
+    },
+    http::{
+        Request,
+        StatusCode,
+        header,
+    },
 };
-use pnpr::{Config, MaxUsers, router};
-use pnpr_config::{LibsqlSettings, MetadataBackend};
+use pnpr::{
+    Config,
+    MaxUsers,
+    router,
+};
+use pnpr_config::{
+    DatabaseBackend,
+    LibsqlSettings,
+};
 use pnpr_fixtures::MockConfigPresets;
-use pnpr_libsql::testing::{Primary, serve_primary};
-use serde_json::{Value, json};
+use pnpr_libsql::testing::{
+    Primary,
+    serve_primary,
+};
+use serde_json::{
+    Value,
+    json,
+};
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
     path::Path,
     sync::Arc,
 };
@@ -27,8 +51,8 @@ fn libsql_config(storage: &Path, primary: SocketAddr) -> Config {
     let listen = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4873));
     let mut config = Config::static_serve(listen, storage.to_path_buf());
     config.http.public_url = "http://example.test".to_string();
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
-    config.storage.metadata = MetadataBackend::Libsql(LibsqlSettings {
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
+    config.storage.database = DatabaseBackend::Libsql(LibsqlSettings {
         url: format!("http://{primary}"),
         auth_token: None,
         replica_path: None,
@@ -39,7 +63,10 @@ fn libsql_config(storage: &Path, primary: SocketAddr) -> Config {
 }
 
 fn request(method: &str, path: &str, token: &str, body: Option<&Value>) -> Request<Body> {
-    let body = body.map_or_else(Body::empty, |body| Body::from(serde_json::to_vec(body).unwrap()));
+    let body = body
+        .map(serde_json::to_vec)
+        .map(Result::unwrap)
+        .map_or_else(Body::empty, Body::from);
     Request::builder()
         .method(method)
         .uri(path)
@@ -63,7 +90,7 @@ impl Registry {
         let storage = TempDir::new().unwrap();
         let (primary, address, server) = serve_primary(storage.path().join("primary.db")).await;
         let app = router(libsql_config(&storage.path().join("registry"), address));
-        let body = json!({ "name": "alice", "password": "secret", "type": "user", "roles": [] });
+        let body = json!({ "name": "alice", "password": "secret123", "type": "user", "roles": [] });
         let (status, bytes) =
             send_to(&app, request("PUT", "/-/user/org.couchdb.user:alice", "-", Some(&body))).await;
         assert_eq!(status, StatusCode::CREATED);
@@ -155,7 +182,7 @@ async fn npm_operations_make_few_round_trips_to_a_libsql_primary() {
     assert_eq!(status, StatusCode::OK);
     operations.push(("a view read the cache answers", round_trips));
 
-    let (status, round_trips) = registry.send("DELETE", "/npm/sql-pkg/-rev/1", None).await;
+    let (status, round_trips) = registry.send("DELETE", "/npm/sql-pkg", None).await;
     assert_eq!(status, StatusCode::CREATED);
     operations.push(("an unpublish", round_trips));
 
@@ -167,23 +194,29 @@ async fn npm_operations_make_few_round_trips_to_a_libsql_primary() {
     // current document, each in one round trip, and fetches fragments the
     // cache lacks in one more, before its write: the round trip that takes
     // the write lock with every read the write compares with, and the one
-    // that sends every change with the commit.
+    // that sends every change with the commit. The rows of the blobs a
+    // publish stores are read with its document. The early authorization
+    // and staging checks each read package ownership from the database;
+    // those reads replace the hosted-record reads. An unpublish removes the
+    // package in its write's two round trips, then reclaims the archives
+    // nothing maps any more: two round trips move them to `reclaiming`, and
+    // one more records them gone once their keys are removed.
     let expected = vec![
-        ("the first publish", 4),
-        ("a publish of another version", 5),
+        ("the first publish", 7),
+        ("a publish of another version", 8),
         ("a dist-tag move", 2),
         ("a view read that renders a version", 2),
         ("a view read the cache answers", 1),
-        ("an unpublish", 3),
+        ("an unpublish", 5),
     ];
     assert_eq!(counts, expected, "\n{}", listing(&operations));
 }
 
 /// Replicas sharing a libSQL primary hold no package lock in common, so a
-/// publish refused at its commit leaves the archives it wrote: another
-/// replica may have found one in place and committed it.
+/// publish refused at its commit removes the incarnation it stored, fenced
+/// off first so that no commit still on its way can make it live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_publish_on_libsql_leaves_its_archives() {
+async fn a_refused_publish_on_libsql_removes_its_archives() {
     let registry = Registry::start().await;
     let batch = json!({ "packages": [publish_doc("first", "1.0.0", b"first")] });
     let committed = keyed(&registry, &batch).await;
@@ -193,14 +226,13 @@ async fn a_refused_publish_on_libsql_leaves_its_archives() {
     // commit, after its archive is in place.
     let other = json!({ "packages": [publish_doc("second", "1.0.0", b"second")] });
     assert_eq!(keyed(&registry, &other).await, StatusCode::CONFLICT);
-    let archive = pnpr_storage::layout::local_blob_path(
-        &registry.storage.path().join("registry"),
-        "",
-        pnpr_storage::Ecosystem::Npm,
-        "second",
-        "second-1.0.0.tgz",
+    let store = registry.storage.path().join("registry");
+    let npm = pnpr_storage::Ecosystem::Npm;
+    assert_eq!(
+        crate::storage::stored_archives(&store, "", npm).len(),
+        1,
+        "only the committed archive",
     );
-    assert!(archive.is_file(), "{}", archive.display());
 }
 
 /// Send `batch` as a batch publish under the idempotency key `k1`.
@@ -210,4 +242,27 @@ async fn keyed(registry: &Registry, batch: &Value) -> StatusCode {
         .headers_mut()
         .insert("idempotency-key", header::HeaderValue::from_static("k1"));
     send_to(&registry.app, request).await.0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staged_page_reads_all_its_metadata_in_one_round_trip() {
+    let registry = Registry::start().await;
+    let document = publish_doc("example-package", "1.0.0", b"archive");
+    for _ in 0..3 {
+        let (status, _) =
+            registry.send("POST", "/npm/-/stage/package/example-package", Some(&document)).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    registry.round_trips();
+    let (status, body) = send_to(
+        &registry.app,
+        request("GET", "/npm/-/stage?page=0&perPage=1", &registry.token, None),
+    )
+    .await;
+    let trips = registry.round_trips();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(trips.len(), 1, "{}", listing(&[("staged list", trips)]));
 }

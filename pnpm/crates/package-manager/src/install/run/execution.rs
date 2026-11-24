@@ -1,15 +1,32 @@
 use super::{
     super::{
-        ApplyMaterializationInputs, AtomicU8, InstallError, MaterializationInputs, PackageManifest,
-        PathBuf, Reporter, apply_materialization_result, materialize,
+        ApplyMaterializationInputs,
+        AtomicU8,
+        InstallError,
+        MaterializationInputs,
+        PackageManifest,
+        PathBuf,
+        Reporter,
+        apply_materialization_result,
+        materialize,
     },
-    Dispatched, InstallRunOutcome, InstallScope, Loaded, Lockfiles, RepeatInstallVerdict,
-    RunExecution, Verification,
-    dispatch::{announce_import, dispatch},
+    Dispatched,
+    InstallRunOutcome,
+    InstallScope,
+    Loaded,
+    Lockfiles,
+    RepeatInstallVerdict,
+    RunExecution,
+    Verification,
+    dispatch::{
+        announce_import,
+        dispatch,
+    },
     load_lockfiles,
     materialization_inputs::materialization_lockfiles,
-    pre_resolution::run_pre_resolution_hook,
-    report_already_up_to_date, settle_wanted_lockfile,
+    pre_resolution::apply_or_run_pre_resolution_hook,
+    report_already_up_to_date,
+    settle_wanted_lockfile,
     settled::Settled,
     time_machine_capture::capture_time_machine_exclusions,
     workspace_projects,
@@ -17,7 +34,7 @@ use super::{
 use tracing::Instrument as _;
 
 impl<'a> RunExecution<'a> {
-    fn select_scope(&self) -> InstallScope<'a> {
+    pub(super) fn select_scope(&self) -> InstallScope<'a> {
         InstallScope::select(
             self.install,
             &self.workspace.dirs.workspace_root,
@@ -66,7 +83,7 @@ impl<'a> RunExecution<'a> {
             &self.workspace,
             &scope,
             self.options.selection.as_ref(),
-            (&self.options.manifests.hooked_paths, self.loaded_workspace_projects),
+            (&mut self.options.manifests, self.loaded_workspace_projects),
         )
         .await?;
         let manifests = std::mem::take(&mut loaded.manifests);
@@ -104,15 +121,9 @@ impl<'a> RunExecution<'a> {
         project_manifests: &[(PathBuf, &PackageManifest)],
         lockfiles: &mut Lockfiles<'_>,
     ) -> Result<InstallRunOutcome, InstallError> {
-        let (verification, root_preinstall_ran) =
+        let (mut verification, root_preinstall_ran) =
             self.announce::<Reporter>((scope, project_manifests), loaded, lockfiles)?;
-        run_pre_resolution_hook::<Reporter>(
-            self.install,
-            &self.workspace,
-            loaded,
-            &mut lockfiles.wanted,
-        )
-        .await?;
+        self.settle_pre_resolution::<Reporter>(loaded, lockfiles, &mut verification).await?;
         let lockfiles = &*lockfiles;
         let settled = Settled::new(
             (self.install, &self.owned, &self.mode, &self.workspace),
@@ -148,13 +159,33 @@ impl<'a> RunExecution<'a> {
     /// the install, and run `pnpm:devPreinstall`, which pnpm runs before the
     /// `preResolution` hook. Also returns whether the root's `preinstall` is
     /// taken care of.
+    async fn settle_pre_resolution<Reporter: self::Reporter>(
+        &mut self,
+        loaded: &mut Loaded<'_>,
+        lockfiles: &mut Lockfiles<'_>,
+        verification: &mut Verification,
+    ) -> Result<(), InstallError> {
+        apply_or_run_pre_resolution_hook::<Reporter>(
+            self.install,
+            &self.workspace,
+            loaded,
+            &mut lockfiles.wanted,
+            self.options.manifests.prepared_frozen.as_mut(),
+            verification,
+        )
+        .await?;
+        verification.sync_derived_lockfile_path(&lockfiles.wanted, loaded);
+        Ok(())
+    }
+
     fn announce<Reporter: self::Reporter>(
         &self,
         (scope, project_manifests): (&InstallScope<'_>, &[(PathBuf, &PackageManifest)]),
         loaded: &Loaded<'_>,
         lockfiles: &Lockfiles<'_>,
     ) -> Result<(Verification, bool), InstallError> {
-        let verification = Verification::set_up(self, lockfiles, (scope, project_manifests))?;
+        let verification =
+            Verification::set_up(self, loaded, lockfiles, (scope, project_manifests))?;
         if let Some(message) = self.install.context.config.bypassed_home_store_warning() {
             pnpm_reporter::emit_global_warning::<Reporter>(&message);
         }
@@ -237,6 +268,7 @@ impl<'a> RunExecution<'a> {
             .as_ref();
         MaterializationInputs {
             install: self.install,
+            overrides_root_dir: self.options.manifests.overrides_root_dir,
             resolution,
             lockfiles,
             workspace: self.workspace.materialization_workspace(
@@ -291,7 +323,9 @@ impl<'a> RunExecution<'a> {
         }
     }
 
-    fn take_completion_context(&mut self) -> crate::install::state_options::ApplyCompletionContext {
+    fn take_completion_context(
+        &mut self,
+    ) -> crate::install::state_options::ApplyCompletionContext<'a> {
         crate::install::state_options::ApplyCompletionContext {
             prefix: std::mem::take(&mut self.workspace.prefix),
             workspace_manifest_dir: std::mem::take(&mut self.workspace.dirs.workspace_manifest_dir),
@@ -367,6 +401,9 @@ impl<'a> RunExecution<'a> {
                 existing_wanted: lockfiles.wanted.loaded,
                 loaded: lockfiles.wanted.get(),
                 frozen: dispatched.take_frozen_path,
+                trust_lockfile: self.options.save.recorded_trust_lockfile.unwrap_or(
+                    self.install.lockfile_policy.trust,
+                ),
                 locked_registry_routes: self.workspace.loaded_workspace
                     .locked_registry_routes
                     .take(),

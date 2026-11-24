@@ -1,19 +1,30 @@
 use crate::{
-    LoadLockfileError, LoadedRepairLockfile, LoadedWantedLockfile, Lockfile, ProjectSnapshot,
+    LoadLockfileError,
+    LoadedRepairLockfile,
+    LoadedWantedLockfile,
+    Lockfile,
+    ProjectSnapshot,
     WantedLockfileSelection,
 };
 use std::{
     collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        Mutex,
+        OnceLock,
+    },
 };
 
 /// Wanted lockfile (`pnpm-lock.yaml`) whose read + parse are deferred
 /// until a consumer actually needs the contents.
 ///
 /// The optimistic repeat-install fast path decides "Already up to
-/// date" from manifest mtimes alone — upstream's `checkDepsStatus`
-/// never reads the wanted lockfile on that path — so parsing a
+/// date" from manifest mtimes alone (upstream's `checkDepsStatus`
+/// never reads the wanted lockfile on that path) so parsing a
 /// multi-megabyte YAML document up front is pure overhead for the
 /// repeat-install case. Commands that always need the lockfile call
 /// [`LazyLockfile::get`] immediately and behave as if it were loaded
@@ -40,7 +51,7 @@ impl LazyLockfile {
         }
     }
 
-    /// A lockfile that is never loaded — [`Self::get`] yields `None`
+    /// A lockfile that is never loaded. [`Self::get`] yields `None`
     /// without touching the filesystem. Mirrors `lockfile: false`
     /// config.
     #[must_use]
@@ -60,6 +71,8 @@ impl LazyLockfile {
         let cell = OnceLock::new();
         cell.set(LoadedWantedLockfile {
             lockfile: lockfile.map(Arc::new),
+            loaded_path: None,
+            loaded_metadata: None,
             pre_merge_importers: None,
             merged_conflict_files: 0,
         })
@@ -94,7 +107,7 @@ impl LazyLockfile {
     /// The parsed wanted lockfile, loading it on first call. `None`
     /// when the file is absent, empty, or loading is disabled. A load
     /// error is returned without being cached, so a subsequent call
-    /// retries — callers abort on the first error in practice.
+    /// retries, callers abort on the first error in practice.
     pub fn get(&self) -> Result<Option<&Lockfile>, LoadLockfileError> {
         Ok(self.load()?.lockfile.as_deref())
     }
@@ -121,6 +134,21 @@ impl LazyLockfile {
         &self,
     ) -> Result<Option<&HashMap<String, ProjectSnapshot>>, LoadLockfileError> {
         Ok(self.load_for_fix()?.pre_merge_importers())
+    }
+
+    /// Single on-disk file that produced the loaded lockfile, or `None` when
+    /// absent, preloaded in memory, or folded across branch lockfiles.
+    pub fn loaded_path(&self) -> Result<Option<&Path>, LoadLockfileError> {
+        Ok(self.load()?.loaded_path.as_deref())
+    }
+
+    /// Open-handle metadata captured when [`Self::loaded_path`] was read.
+    pub fn loaded_metadata(&self) -> Result<Option<&std::fs::Metadata>, LoadLockfileError> {
+        Ok(self.load()?.loaded_metadata.as_ref())
+    }
+
+    fn loaded_path_for_fix(&self) -> Result<Option<&Path>, LoadLockfileError> {
+        Ok(self.load_for_fix()?.loaded_path())
     }
 
     fn merged_conflict_files(&self) -> Result<usize, LoadLockfileError> {
@@ -174,7 +202,7 @@ impl LazyLockfile {
 
     /// Whether a wanted lockfile is known to be available: the parsed
     /// document when already loaded, otherwise
-    /// [`Lockfile::wanted_exists`]'s semantic-presence probe —
+    /// [`Lockfile::wanted_exists`]'s semantic-presence probe,
     /// the same absence rules as the loader (an empty or env-only
     /// file counts as absent), without paying for the YAML parse on
     /// the repeat-install fast path.
@@ -223,8 +251,8 @@ impl<'a> MaybeLazyLockfile<'a> {
     }
 
     /// An `Arc` handle to the parsed wanted lockfile, for a consumer
-    /// that shares the document with long-lived machinery — the
-    /// resolver's lockfile-reuse seed above all — without deep-copying
+    /// that shares the document with long-lived machinery (the
+    /// resolver's lockfile-reuse seed above all) without deep-copying
     /// a workspace-scale lockfile. `None` when no lockfile exists *or*
     /// for the borrowed and repair variants, which hold no `Arc`;
     /// callers fall back to cloning [`Self::get`]'s reference.
@@ -275,6 +303,23 @@ impl<'a> MaybeLazyLockfile<'a> {
             MaybeLazyLockfile::Loaded(_) => Ok(0),
             MaybeLazyLockfile::Lazy(lazy) => lazy.merged_conflict_files(),
             MaybeLazyLockfile::Repair(lazy) => lazy.merged_conflict_files_for_fix(),
+        }
+    }
+
+    /// Single on-disk file that produced the loaded lockfile, if any.
+    pub fn loaded_path(self) -> Result<Option<&'a Path>, LoadLockfileError> {
+        match self {
+            MaybeLazyLockfile::Loaded(_) => Ok(None),
+            MaybeLazyLockfile::Lazy(lazy) => lazy.loaded_path(),
+            MaybeLazyLockfile::Repair(lazy) => lazy.loaded_path_for_fix(),
+        }
+    }
+
+    /// Open-handle metadata captured when [`Self::loaded_path`] was read.
+    pub fn loaded_metadata(self) -> Result<Option<&'a std::fs::Metadata>, LoadLockfileError> {
+        match self {
+            MaybeLazyLockfile::Loaded(_) | MaybeLazyLockfile::Repair(_) => Ok(None),
+            MaybeLazyLockfile::Lazy(lazy) => lazy.loaded_metadata(),
         }
     }
 }

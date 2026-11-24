@@ -1,25 +1,44 @@
 //! Running one package's build scripts.
 
 mod dependency_bins;
+mod global_slot;
 mod lifecycle_scripts;
 mod linked_copies;
 mod patched_engines;
 mod side_effects;
 mod slot_to_build;
-use lifecycle_scripts::{ScriptRun, run_scripts_in_every_copy};
+use lifecycle_scripts::{
+    ScriptRun,
+    run_scripts_in_every_copy,
+};
 use patched_engines::skip_incompatible_optional;
 use side_effects::{
-    FrozenStoreWrites, SideEffectsUpload, already_built, side_effects_cache_key,
+    FrozenStoreWrites,
+    SideEffectsUpload,
+    already_built,
+    side_effects_cache_key,
     upload_side_effects_cache,
 };
 use slot_to_build::slot_to_build;
 
 use super::{
-    AllowBuildPolicy, BuildModulesError, LogEvent, LogLevel, NEEDS_BUILD_MARKER, PackageKey, Path,
-    PathBuf, PkgRoots, RebuildOptions, Reporter, SkippedOptionalDependencyLog,
-    SkippedOptionalPackage, SkippedOptionalReason, allow_build_key_from_ignored_build,
-    apply_patch_to_dir, discard_skipped_optional_dependency, get_pkg_id_with_patch_hash,
-    parse_name_version_from_key, slot_carries_overlay,
+    AllowBuildPolicy,
+    BuildModulesError,
+    LogEvent,
+    LogLevel,
+    PackageKey,
+    Path,
+    PathBuf,
+    PkgRoots,
+    RebuildOptions,
+    Reporter,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
+    SkippedOptionalReason,
+    apply_patch_to_dir,
+    discard_skipped_optional_dependency,
+    get_pkg_id_with_patch_hash,
+    parse_name_version_from_key,
 };
 
 /// Everything one snapshot's build reads: the lockfile shape it belongs to,
@@ -53,6 +72,14 @@ pub(crate) fn build_one_snapshot<Reporter: self::Reporter>(
     // scripts / apply patches when they themselves are candidates.
     let Some(candidate) = BuildCandidate::of(context, snapshot_key) else { return Ok(()) };
     let cache_key = side_effects_cache_key(context, snapshot_key, &candidate);
+    if global_slot::applies(context) {
+        return global_slot::build::<Reporter>(
+            context,
+            snapshot_key,
+            &candidate,
+            cache_key.as_deref(),
+        );
+    }
     if already_built::<Reporter>(context, snapshot_key, &candidate, cache_key.as_deref())? {
         skip_incompatible_optional::<Reporter>(context, snapshot_key, &candidate)?;
         return dependency_bins::refresh_private_hoisted_for(context, snapshot_key);
@@ -83,7 +110,7 @@ fn build_candidate<Reporter: self::Reporter>(
     cache_key: Option<&str>,
     optional: bool,
 ) -> Result<(), BuildModulesError> {
-    let Some((pkg_dir, slot_lock)) = slot_to_build(context, snapshot_key, candidate)? else {
+    let Some(pkg_dir) = slot_to_build(context, snapshot_key)? else {
         return Ok(());
     };
 
@@ -101,7 +128,6 @@ fn build_candidate<Reporter: self::Reporter>(
         context,
         snapshot_key,
         &pkg_dir,
-        slot_lock.as_ref(),
         &candidate.script_run(optional),
     )?
     else {
@@ -111,12 +137,6 @@ fn build_candidate<Reporter: self::Reporter>(
     if is_patched || candidate.should_run_scripts {
         dependency_bins::refresh_private_hoisted_for(context, snapshot_key)?;
     }
-
-    clear_global_virtual_store_build_markers(
-        context,
-        snapshot_key,
-        (candidate.patch.is_some() || candidate.should_run_scripts) && !candidate.build_pending,
-    );
 
     upload_side_effects_cache(
         context,
@@ -144,18 +164,8 @@ struct BuildCandidate<'c> {
     patch: Option<&'c pnpm_patching::ExtendedPatchInfo>,
     name: String,
     version: String,
-    /// An explicit `pacquet rebuild` re-runs the build scripts of the
-    /// selected packages even when the side-effects cache reports them
-    /// already built; this marks those so they bypass the `is_built`
-    /// gate. The selection holds allow-build keys (the package name for
-    /// registry deps, the full pkgId for git/tarball artifacts), so
-    /// either form matches — a selected non-registry artifact is forced
-    /// past the gate too.
     force_rebuild: bool,
     should_run_scripts: bool,
-    /// `--ignore-scripts` left the build scripts for a later install to run
-    /// in the same global-virtual-store slot, so its marker has to stay.
-    build_pending: bool,
 }
 
 impl<'c> BuildCandidate<'c> {
@@ -169,7 +179,11 @@ impl<'c> BuildCandidate<'c> {
     }
 
     fn of(context: &BuildOneSnapshot<'c>, snapshot_key: &PackageKey) -> Option<Self> {
-        if !crate::build_scope::in_build_scope(context.graph.build_scope, snapshot_key) {
+        if !crate::build_scope::in_build_scope(context.graph.build_scope, snapshot_key)
+            || context.rebuild.is_some_and(|rebuild| {
+                rebuild.selected_snapshots.is_some() && !rebuild.selects_snapshot(snapshot_key)
+            })
+        {
             return None;
         }
         let metadata_key = snapshot_key.without_peer();
@@ -183,23 +197,15 @@ impl<'c> BuildCandidate<'c> {
         }
         let dep_path = metadata_key.to_string();
         let (name, version) = parse_name_version_from_key(&dep_path);
-        let force_rebuild = rebuild_forces_build(context.rebuild, &name, &dep_path);
+        let force_rebuild =
+            context.rebuild.is_some_and(|rebuild| rebuild.selects_snapshot(snapshot_key));
         let should_run_scripts = snapshot_runs_scripts(
             context,
             snapshot_key,
             &dep_path,
             (requires_build, force_rebuild),
         );
-        let build_pending = requires_build && context.scripts.ignore;
-        Some(Self {
-            metadata_key,
-            patch,
-            name,
-            version,
-            force_rebuild,
-            should_run_scripts,
-            build_pending,
-        })
+        Some(Self { metadata_key, patch, name, version, force_rebuild, should_run_scripts })
     }
 }
 
@@ -235,7 +241,7 @@ fn report_broken_slot<Reporter: self::Reporter>(
 /// lives inside the read-only store, so applying a patch or running an
 /// approved lifecycle script would fail with a raw `EROFS`; this refuses up
 /// front with guidance. The caller is past the `is_built` gate, so a cached
-/// build has already returned — reaching here means the seed is genuinely
+/// build has already returned, reaching here means the seed is genuinely
 /// missing this package's build output. Bin-linking (the other write) reuses
 /// existing symlinks write-free on a complete seed, so only patch/script
 /// writes gate.
@@ -255,6 +261,7 @@ fn reject_frozen_store_build<Reporter: self::Reporter>(
     } = writes;
     if !context.cache.frozen_store
         || !context.directories.layout.enable_global_virtual_store()
+        || context.directories.pkg_roots_by_key.is_some()
         || !(has_patch || should_run_scripts)
     {
         return Ok(false);
@@ -276,7 +283,8 @@ fn reject_frozen_store_build<Reporter: self::Reporter>(
             id: context
                 .pkg_roots()
                 .canonical(snapshot_key)
-                .map_or_else(|| snapshot_key.to_string(), |dir| dir.to_string_lossy().into_owned()),
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or_else(|| snapshot_key.to_string()),
             name: name.to_string(),
             version: version.to_string(),
         },
@@ -318,71 +326,19 @@ fn apply_configured_patch<Reporter: self::Reporter>(
     Ok(Some(true))
 }
 
-// A removed GVS slot may have been imported pristine while its cached build row survived.
-fn global_slot_carries_overlay(
-    context: &BuildOneSnapshot<'_>,
-    snapshot_key: &PackageKey,
-    overlay: &pnpm_store_dir::SideEffectsOverlay,
-) -> bool {
-    context.directories.layout.enable_global_virtual_store()
-        && context
-            .pkg_roots()
-            .canonical(snapshot_key)
-            .is_some_and(|pkg_dir| slot_carries_overlay(&pkg_dir, overlay))
-}
-
-/// A slot the isolated global virtual store just built no longer needs its
-/// `.pnpm-needs-build` marker.
-fn clear_global_virtual_store_build_markers(
-    context: &BuildOneSnapshot<'_>,
-    snapshot_key: &PackageKey,
-    built: bool,
-) {
-    if !built
-        || !context.directories.layout.enable_global_virtual_store()
-        || context.directories.pkg_roots_by_key.is_some()
-    {
-        return;
-    }
-    for built_dir in context.pkg_roots().all(snapshot_key) {
-        if let Err(error) = std::fs::remove_file(built_dir.join(NEEDS_BUILD_MARKER))
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                target: "pacquet::build",
-                ?error,
-                dep_path = %snapshot_key,
-                "failed to remove the global virtual store build marker",
-            );
-        }
-    }
-}
-
 fn is_build_candidate(requires_build: bool, has_patch: bool) -> bool {
     requires_build || has_patch
 }
 
-/// An explicit `pacquet rebuild` re-runs the build scripts of the selected
-/// packages even when the side-effects cache reports them already built. The
-/// selection holds allow-build keys (the package name for registry deps, the
-/// full pkgId for git/tarball artifacts), so either form matches — a selected
-/// non-registry artifact is forced past the `is_built` gate too.
-fn rebuild_forces_build(rebuild: Option<&RebuildOptions>, name: &str, dep_path: &str) -> bool {
-    rebuild.is_some_and(|rebuild| {
-        rebuild.is_selected(name)
-            || rebuild.is_selected(&allow_build_key_from_ignored_build(dep_path))
-    })
-}
-
 /// Whether this snapshot's lifecycle scripts run at all.
 ///
-/// The allow-policy gate still applies — a rebuild never builds a disallowed
+/// The allow-policy gate still applies, a rebuild never builds a disallowed
 /// package. And a `pacquet rebuild <pkg>` runs scripts only for the selected
 /// packages: non-selected ones are still evaluated by the policy gate (so
 /// their `.modules.yaml` ignored-builds record stays intact), but their
 /// scripts are suppressed here. The side-effects `is_built` gate is only an
-/// optimization and is disabled by default, so this gate — not that
-/// short-circuit — is what bounds script execution to the selection.
+/// optimization and is disabled by default, so this gate (not that
+/// short-circuit) is what bounds script execution to the selection.
 fn snapshot_runs_scripts(
     context: &BuildOneSnapshot<'_>,
     snapshot_key: &PackageKey,

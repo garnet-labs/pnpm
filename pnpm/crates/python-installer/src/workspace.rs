@@ -1,15 +1,46 @@
 pub(crate) mod members;
 
-use super::manifest::{Manifest, SourceDeclaration};
+use super::manifest::{
+    Manifest,
+    SourceDeclaration,
+};
 use members::members_of;
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use pep440_rs::Version;
-use pep508_rs::{ExtraName, MarkerEnvironment, MarkerTree, PackageName, VerbatimUrl};
-use pnpm_python_resolver::{LockedDirectory, Lockfile, Packages, WheelMetadata, parse_requirement};
-use source::{Declared, path_target, reject_unresolvable, sole_source};
+use pep508_rs::{
+    ExtraName,
+    MarkerEnvironment,
+    MarkerTree,
+    PackageName,
+    VerbatimUrl,
+};
+use pnpm_python_resolver::{
+    LockedDirectory,
+    Lockfile,
+    Packages,
+    WheelMetadata,
+    parse_requirement,
+};
+use source::{
+    Declared,
+    path_target,
+    reject_unresolvable,
+    sole_source,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -72,13 +103,15 @@ pub(super) fn describes(lock: &Lockfile, local: &[LocalProject]) -> Result<()> {
                 }
             }
             (Some(_), None) => {
-                bail!("the Python project `{}` is no longer a workspace source", package.name)
+                bail!("the Python project `{}` is no longer a workspace source", package.name);
             }
-            (None, Some(project)) => bail!(
-                "the Python distribution `{}` is now the workspace project at {}",
-                package.name,
-                project.root.display(),
-            ),
+            (None, Some(project)) => {
+                bail!(
+                    "the Python distribution `{}` is now the workspace project at {}",
+                    package.name,
+                    project.root.display(),
+                );
+            }
             (None, None) => {}
         }
     }
@@ -110,6 +143,7 @@ pub(super) fn offer(packages: &mut Packages, local: &[LocalProject]) {
 /// `[tool.uv.sources]`. Without that declaration the requirement is
 /// refused: resolving it from the index would install different code
 /// under the same name.
+#[derive(Clone)]
 pub(super) struct Workspace {
     declared: BTreeMap<PathBuf, BTreeSet<PackageName>>,
     /// Where each distribution is declared. Two projects may declare one
@@ -119,7 +153,7 @@ pub(super) struct Workspace {
     manifests: BTreeMap<PathBuf, Arc<Manifest>>,
     inherited: BTreeMap<PathBuf, (PathBuf, Arc<Manifest>)>,
     /// The workspace root whose environment each project shares, for the
-    /// members of a workspace that asks for one — see [`members`].
+    /// members of a workspace that asks for one; see [`members`].
     shared: BTreeMap<PathBuf, PathBuf>,
     selection: Option<Selection>,
 }
@@ -221,11 +255,13 @@ impl Workspace {
         match self.roots.get(name).map(Vec::as_slice) {
             None | Some([]) => Ok(None),
             Some([only]) => Ok(Some(only)),
-            Some([first, second, ..]) => bail!(
-                "two Python projects in this workspace declare `{name}`: {} and {}",
-                first.display(),
-                second.display(),
-            ),
+            Some([first, second, ..]) => {
+                bail!(
+                    "two Python projects in this workspace declare `{name}`: {} and {}",
+                    first.display(),
+                    second.display(),
+                );
+            }
         }
     }
 
@@ -340,7 +376,7 @@ impl Workspace {
              workspace declares from the index, because that installs different code under it.",
             member.display(),
             root.join("pyproject.toml").display(),
-        )
+        );
     }
 
     fn target(
@@ -375,6 +411,7 @@ impl Workspace {
     }
 }
 
+#[derive(Clone)]
 struct Selection {
     config: &'static pnpm_config::Config,
     environments: Vec<MarkerEnvironment>,
@@ -401,7 +438,7 @@ fn read_project(
     if manifest.distribution() != Some(name) {
         bail!("the Python project at {} does not declare `{name}`", path.display());
     }
-    if manifest.tool.uv.package == Some(false) {
+    if !manifest.tool.uv.package.unwrap_or(true) {
         bail!(
             "the Python project at {} sets `tool.uv.package = false`, so it builds no package for \
              `{name}` to install",

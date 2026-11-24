@@ -1,41 +1,79 @@
 pub(super) use version_documents::serve_version_manifest;
 
 use super::{
-    Action, AppState, CanonicalPackageName, ConcreteKind, DistView, Ecosystem, HeaderMap, Identity,
-    RegistryError, Resolved, Response, Value, addressed_registry, authorize, caller_scoped,
-    dist_view, ensure_osv_allowed, extract_upstream_version_manifest, extract_version_manifest,
-    is_osv_vulnerable_packument_version, is_tar_registry, not_found, packument_response,
-    read_source_packument, registry_endpoint, resolve_version_or_tag, serve_packument_via_upstream,
-    serve_tarball_via_upstream, tar_integrities_of, tarball_response,
+    Action,
+    AppState,
+    CanonicalPackageName,
+    ConcreteKind,
+    DistView,
+    Ecosystem,
+    HeaderMap,
+    Identity,
+    RegistryError,
+    Resolved,
+    Response,
+    Value,
+    addressed_registry,
+    authorize,
+    caller_scoped,
+    dist_view,
+    ensure_osv_allowed,
+    extract_upstream_version_manifest,
+    extract_version_manifest,
+    is_osv_vulnerable_packument_version,
+    is_tar_registry,
+    not_found,
+    package_responses::{
+        PackumentRequest,
+        processing::admission::DocumentSource,
+    },
+    packument_response,
+    read_source_packument,
+    registry_endpoint,
+    reload_source_packument_lacking_version,
+    resolve_version_or_tag,
+    serve_packument_via_upstream,
+    serve_tarball_via_upstream,
+    tar_integrities_of,
+    tarball_response,
 };
 use axum::response::IntoResponse;
 
 mod version_documents;
 
-// --------------------------------------------------------------------
 // Handler bodies.
-// --------------------------------------------------------------------
 
 pub(super) async fn serve_packument(
     state: &AppState,
     identity: &Identity,
-    headers: &HeaderMap,
+    headers: HeaderMap,
     registry: Option<&str>,
     raw_name: &str,
+    query: Option<&str>,
 ) -> Response {
     let Some(target) = addressed_registry(state, registry, Ecosystem::Npm) else {
         return not_found();
     };
     let base = registry_endpoint(state, Ecosystem::Npm, registry);
+    let for_write = query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "write" && value == "true")
+    });
+    let request =
+        if for_write { PackumentRequest::Write } else { PackumentRequest::Read(&headers) };
     let response =
-        serve_registry_packument(state, identity, headers, &target, raw_name, &base).await;
-    caller_scoped(state, Ecosystem::Npm, registry, Some(raw_name), response)
+        serve_registry_packument(state, identity, request, &target, raw_name, &base).await;
+    match request {
+        PackumentRequest::Write => super::private_no_cache(response),
+        PackumentRequest::Read(_) => {
+            caller_scoped(state, Ecosystem::Npm, registry, Some(raw_name), response)
+        }
+    }
 }
 
-// --------------------------------------------------------------------
 // Registry dispatch. A `/~<name>/` request resolves the package to
 // exactly one concrete origin through the validated registry graph
-// ([`pnpr_registry`]) and serves it there — authoritatively. Every concrete
+// ([`pnpr_registry`]) and serves it there, authoritatively. Every concrete
 // registry's declared `patterns:` are enforced here, before storage or any
 // upstream is consulted, on the direct address and through a router alike; a
 // router selects the first source whose patterns claim the name. An unclaimed
@@ -44,7 +82,6 @@ pub(super) async fn serve_packument(
 // (the via-upstream path returns `UpstreamUnavailable`), so a down private
 // source can never be reported as "not found" and pushed onto a public origin
 // one layer out.
-// --------------------------------------------------------------------
 
 /// The concrete origin a `/~<name>/` request resolved to, owned so it can be
 /// held across an `await` without borrowing the config.
@@ -54,21 +91,25 @@ pub(super) enum RegistrySource {
     Upstream(String),
     /// A hosted registry, served from the hosted store.
     Hosted(String),
-    /// No declared namespace claims the package — the addressed registry's
+    /// No declared namespace claims the package, the addressed registry's
     /// patterns don't cover it, or none of a router's sources claim it. A
     /// definitive 404 on reads; writes reject it with a reason instead, so a
     /// typo'd scope fails loudly rather than 404-ing later.
     Unclaimed,
-    /// The registry id is unknown — a definitive not-found with no fall-through.
+    /// The registry id is unknown, a definitive not-found with no fall-through.
     NotFound,
 }
 
 /// The registry the path-less base (`https://<pnpr>/`) aliases, owned so it can be
-/// held across an `await`. `None` disables the path-less base entirely — the
+/// held across an `await`. `None` disables the path-less base entirely, the
 /// bare host has no registry and every request is a not-found, so clients must
 /// address a `/~<name>/`.
 pub(super) fn default_registry_target(state: &AppState, ecosystem: Ecosystem) -> Option<String> {
-    state.inner.config.routing.registries.default_for(ecosystem).map(str::to_string)
+    state
+        .routing()
+        .registries
+        .default_for(ecosystem)
+        .map(str::to_string)
 }
 
 /// Resolve an npm request; see [`resolve_ecosystem_source`].
@@ -88,7 +129,7 @@ pub(super) fn resolve_ecosystem_source(
     ecosystem: Ecosystem,
     package: &str,
 ) -> RegistrySource {
-    match state.inner.config.routing.registries.resolve(registry, ecosystem, package) {
+    match state.routing().registries.resolve(registry, ecosystem, package) {
         Resolved::Concrete {
             registry,
             kind: ConcreteKind::Upstream,
@@ -97,20 +138,20 @@ pub(super) fn resolve_ecosystem_source(
             registry,
             kind: ConcreteKind::Hosted,
         } => RegistrySource::Hosted(registry.to_string()),
-        // An unclaimed name is definitive — never a fall-through to another
+        // An unclaimed name is definitive, never a fall-through to another
         // origin, and never a storage or upstream consultation.
         Resolved::Unclaimed => RegistrySource::Unclaimed,
         // The graph is the only dispatch table: server construction folds
         // every configured upstream into it (`ensure_valid_registry_graph`), so
-        // a name it doesn't know is a definitive not-found — there is no
+        // a name it doesn't know is a definitive not-found; there is no
         // upstream-table side door that would skip namespace enforcement.
         Resolved::UnknownRegistry => RegistrySource::NotFound,
     }
 }
 
 /// Whether the concrete origin `package` resolves to through `registry` serves
-/// caller-gated content: a hosted registry whose access list denies anonymous
-/// callers, or an upstream registry that declares `access:`. Responses from such
+/// caller-gated content: a hosted package anonymous callers may not read, or
+/// an upstream registry that sends a credential. Responses from such
 /// an origin vary by `Authorization` and must never land in a shared HTTP
 /// cache, whichever URL surface (path-less or `/~<name>/`) served them.
 pub(super) fn resolves_to_private_source(
@@ -120,7 +161,9 @@ pub(super) fn resolves_to_private_source(
     package: &str,
 ) -> bool {
     match resolve_ecosystem_source(state, registry, ecosystem, package) {
-        RegistrySource::Hosted(source) => state.inner.config.routing.hosted
+        RegistrySource::Hosted(source) => state
+            .routing()
+            .hosted
             .get(&source)
             .is_some_and(|hosted| {
                 !hosted.rules
@@ -129,18 +172,14 @@ pub(super) fn resolves_to_private_source(
                     .access
                     .admits_every_identity()
             }),
-        // A private upstream (registry-level `access:`) is caller-gated for
-        // *every* name — unlike a hosted registry, its registry-level gate is
-        // enforced independently at serving (`authorized_upstream` runs
-        // before per-package rules on every upstream read), so a per-package
-        // `access: $all` entry cannot open a name on it and `access.is_some()`
-        // alone already means the response varies by caller. A public
-        // upstream can still gate individual names through a per-package
-        // `access` rule.
-        RegistrySource::Upstream(source) => state.inner.config.routing.upstreams
+        // A private upstream sends a credential, so what it answers is never
+        // shared between callers. A public one can still gate a name by grant.
+        RegistrySource::Upstream(source) => state
+            .routing()
+            .upstreams
             .get(&source)
             .is_some_and(|upstream| {
-                upstream.access.is_some()
+                !upstream.public
                     || !upstream.rules
                         .snapshot()
                         .for_package(package)
@@ -152,10 +191,10 @@ pub(super) fn resolves_to_private_source(
 }
 
 /// Serve a packument addressed to `/~<name>/<pkg>` through the registry graph.
-pub(super) async fn serve_registry_packument(
+async fn serve_registry_packument(
     state: &AppState,
     identity: &Identity,
-    headers: &HeaderMap,
+    request: PackumentRequest<'_>,
     registry: &str,
     raw_name: &str,
     tarball_base: &str,
@@ -167,14 +206,11 @@ pub(super) async fn serve_registry_packument(
     // `tarball_base` is the URL the *client* addressed (the path-less host or a
     // `/~<name>/`), not the resolved source's `/~<source>/`. The served
     // packument's `dist.tarball` URLs must stay canonical for that base so a
-    // client's lockfile drops them — persisting the resolved source path would
+    // client's lockfile drops them, persisting the resolved source path would
     // bake the registry name in and break lockfile portability.
     let resolved_source = resolve_registry_source(state, registry, name.as_str());
-    let tar_integrities = match tar_integrities_of(state, &resolved_source, &name).await {
-        Ok(table) => table,
-        Err(err) => return err.into_response(),
-    };
-    let view = dist_view(state, registry, &resolved_source, tar_integrities.as_deref());
+    let routing = state.routing();
+    let view = dist_view(state, &routing, registry, &resolved_source, None);
     match &resolved_source {
         RegistrySource::Upstream(source) => {
             // The upstream registry's per-package rules gate every served
@@ -182,10 +218,14 @@ pub(super) async fn serve_registry_packument(
             // public upstream. Checked before serving so the decision
             // precedes any existence-revealing signal like an OSV 403.
             if let Err(err) =
-                authorize(state, identity, &resolved_source, name.as_str(), Action::Access)
+                authorize(state, identity, &resolved_source, name.as_str(), Action::Read)
             {
                 return err.into_response();
             }
+            let headers = match request {
+                PackumentRequest::Read(headers) => headers,
+                PackumentRequest::Write => &HeaderMap::new(),
+            };
             serve_packument_via_upstream(
                 state,
                 identity,
@@ -197,11 +237,11 @@ pub(super) async fn serve_registry_packument(
             )
             .await
         }
-        // A hosted denial answers per its gate tier (see `hosted_gate`): a
-        // registry-default denial is a not-found mask, an explicit
-        // `packages:` entry denies loudly so clients can prompt for auth.
+        // A hosted denial answers as `hosted_gate` decides: a not-found mask
+        // for a caller who reads nothing in the registry, a loud denial
+        // otherwise, so clients can prompt for auth.
         RegistrySource::Hosted(source) => {
-            serve_hosted_packument(state, identity, headers, source, &name, tarball_base, view)
+            serve_hosted_packument(state, identity, request, source, &name, tarball_base, view)
                 .await
         }
         RegistrySource::Unclaimed | RegistrySource::NotFound => not_found(),
@@ -225,16 +265,16 @@ pub(super) async fn serve_registry_tarball(
     let resolved_source = resolve_registry_source(state, registry, name.as_str());
     match &resolved_source {
         RegistrySource::Upstream(source) => {
-            // Per-package rules before serving — see `serve_registry_packument`.
+            // Per-package rules before serving; see `serve_registry_packument`.
             if let Err(err) =
-                authorize(state, identity, &resolved_source, name.as_str(), Action::Access)
+                authorize(state, identity, &resolved_source, name.as_str(), Action::Read)
             {
                 return err.into_response();
             }
             serve_tarball_via_upstream(state, identity, source, name.as_str(), filename).await
         }
-        // A hosted denial is a not-found mask, inside `serve_hosted_tarball`
-        // — see `serve_registry_packument`.
+        // A hosted denial is a not-found mask, inside `serve_hosted_tarball`;
+        // see `serve_registry_packument`.
         RegistrySource::Hosted(source) => {
             serve_hosted_tarball(state, identity, source, &name, filename).await
         }
@@ -246,8 +286,8 @@ pub(super) async fn serve_registry_tarball(
 /// admitted with the storage namespace to read from, or denied one of two
 /// ways. The two denial shapes preserve the two authorization tiers the
 /// merged `packages:` map folds together: an **explicit** entry's `access`
-/// is declared, discoverable config — deny loudly (401/403, so a client can
-/// prompt for credentials, the registry-mock `needs-auth` contract) — while
+/// is declared, discoverable config (deny loudly (401/403, so a client can
+/// prompt for credentials, the registry-mock `needs-auth` contract)) while
 /// the registry-level **default** masks as not-found, so a blanket-private
 /// registry never reveals which names exist.
 pub(super) enum HostedGate {
@@ -255,15 +295,14 @@ pub(super) enum HostedGate {
     /// The registry default denies the caller: indistinguishable from an
     /// absent package.
     MaskNotFound,
-    /// An explicit `packages:` entry denies the caller: 401 for an
+    /// The caller may read the registry but not this package: 401 for an
     /// anonymous caller (authenticate and retry), 403 for an authenticated
     /// one outside the allowed set.
     Denied(RegistryError),
 }
 
-/// Evaluate the hosted read gate: the effective per-package `access` (most
-/// specific `packages:` entry, falling back to the registry-level default)
-/// gates reads and the write routing alike — a caller who may not read a
+/// Evaluate the hosted read gate: whether a grant lets the caller read the
+/// package gates reads and the write routing alike, a caller who may not read a
 /// hosted package may not publish, tag, or unpublish it either.
 pub(super) fn hosted_gate(
     state: &AppState,
@@ -271,20 +310,19 @@ pub(super) fn hosted_gate(
     source: &str,
     package: &str,
 ) -> HostedGate {
-    let Some(hosted) = state.inner.config.routing.hosted.get(source) else {
+    let routing = state.routing();
+    let Some(hosted) = routing.hosted.get(source) else {
         return HostedGate::MaskNotFound;
     };
     let rules = hosted.rules.snapshot();
     let effective = rules.for_package(package);
     if effective.access.allows(identity) {
-        return HostedGate::Allowed(hosted.org.clone());
+        return HostedGate::Allowed(hosted.namespace.clone());
     }
-    // Loud denial only inside a registry the caller may see: the explicit
-    // entry gates this name, but the registry-level default admits the
-    // caller to the registry itself. When the default denies them too, the
-    // mask below wins — an explicit rule on a blanket-private registry must
-    // not become an existence probe.
-    if effective.access_is_explicit && rules.default_access().allows(identity) {
+    // Loud denial only inside a registry the caller may see: it may read
+    // something there, though not this name. A caller who may read nothing in
+    // the registry gets the mask below, so a name is not an existence probe.
+    if rules.any_access_admits(identity) {
         return HostedGate::Denied(match identity {
             Identity::Anonymous => {
                 RegistryError::Unauthenticated { resource: format!("package {package:?}") }
@@ -300,7 +338,7 @@ pub(super) fn hosted_gate(
     HostedGate::MaskNotFound
 }
 
-/// [`hosted_gate`] flattened to a `Result` for the readers: the org to read
+/// [`hosted_gate`] flattened to a `Result` for the readers: the namespace to read
 /// from, or the response to answer with.
 pub(super) fn hosted_read_namespace(
     state: &AppState,
@@ -309,48 +347,73 @@ pub(super) fn hosted_read_namespace(
     package: &str,
 ) -> Result<String, RegistryError> {
     match hosted_gate(state, identity, source, package) {
-        HostedGate::Allowed(org) => Ok(org),
+        HostedGate::Allowed(namespace) => Ok(namespace),
         HostedGate::MaskNotFound => Err(RegistryError::NotFound),
         HostedGate::Denied(err) => Err(err),
     }
 }
 
-pub(super) async fn serve_hosted_packument(
+async fn serve_hosted_packument(
     state: &AppState,
     identity: &Identity,
-    headers: &HeaderMap,
+    request: PackumentRequest<'_>,
     source: &str,
     name: &CanonicalPackageName,
     tarball_base: &str,
     view_options: DistView<'_>,
 ) -> Response {
-    let org = match hosted_read_namespace(state, identity, source, name.as_str()) {
-        Ok(org) => org,
+    let namespace = match hosted_read_namespace(state, identity, source, name.as_str()) {
+        Ok(namespace) => namespace,
         Err(err) => return err.into_response(),
     };
     let max_age = state.inner.config.http.packument_ttl.as_secs();
-    // A hosted org has no upstream fallback: a package it does not host is a
-    // definitive not-found. Reads come from the org's own storage namespace.
-    let view = state.inner.storage
-        .for_hosted(&org, pnpr_registry::Ecosystem::Npm)
-        .read_hosted_package_view(name)
-        .await;
-    match view {
-        Ok(Some(view)) => match packument_response(
+    // A hosted registry has no upstream fallback: a package it does not host is a
+    // definitive not-found. Reads come from its storage namespace.
+    let response = async {
+        let storage = state.inner.storage.for_hosted(&namespace, pnpr_registry::Ecosystem::Npm);
+        let view = match request {
+            PackumentRequest::Write => {
+                let target = RegistrySource::Hosted(source.to_owned());
+                authorize_write_read(state, identity, &target, name, &namespace).await?;
+                storage.read_current_hosted_package_view(name).await?
+            }
+            PackumentRequest::Read(_) => storage.read_hosted_package_view(name).await?,
+        };
+        let Some(view) = view else { return Ok(not_found()) };
+        let table = match request {
+            PackumentRequest::Write => storage.refresh_tar_integrities(name).await?,
+            PackumentRequest::Read(_) => storage.read_tar_integrities(name).await?,
+        };
+        let view_options = DistView { tar_integrities: Some(&table), ..view_options };
+        let response = packument_response(
             name,
-            &view.bytes,
+            axum::body::Bytes::from_owner(view.bytes),
             tarball_base,
             view_options,
             state,
-            headers,
+            request,
             max_age,
-        ) {
-            Ok(response) => super::with_generation(response, Some(&view.generation)),
-            Err(err) => err.into_response(),
-        },
-        Ok(None) => not_found(),
-        Err(err) => err.into_response(),
+        )
+        .await?;
+        Ok::<_, RegistryError>(super::with_generation(response, Some(&view.generation)))
+    };
+    state.inner.packuments.admissions
+        .serve(DocumentSource::Stored, response)
+        .await
+        .unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn authorize_write_read(
+    state: &AppState,
+    identity: &Identity,
+    source: &RegistrySource,
+    name: &CanonicalPackageName,
+    namespace: &str,
+) -> Result<(), RegistryError> {
+    if matches!(identity, Identity::Anonymous) {
+        return Err(RegistryError::Unauthenticated { resource: name.as_str().to_owned() });
     }
+    super::authorize_package_write(state, identity, source, name.as_str(), Some(namespace)).await
 }
 
 pub(super) async fn serve_hosted_tarball(
@@ -360,21 +423,21 @@ pub(super) async fn serve_hosted_tarball(
     name: &CanonicalPackageName,
     filename: &str,
 ) -> Response {
-    let org = match hosted_read_namespace(state, identity, source, name.as_str()) {
-        Ok(org) => org,
+    let namespace = match hosted_read_namespace(state, identity, source, name.as_str()) {
+        Ok(namespace) => namespace,
         Err(err) => return err.into_response(),
     };
     let (filename, name_version) = match name.parse_tarball_name(filename) {
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
     };
-    serve_hosted_version_blob(state, &org, name, &name_version, &filename).await
+    serve_hosted_version_blob(state, &namespace, name, &name_version, &filename).await
 }
 
-/// The blob `filename` of `version` in the hosted namespace `org`.
+/// The blob `filename` of `version` in the hosted `namespace`.
 pub(super) async fn serve_hosted_version_blob(
     state: &AppState,
-    org: &str,
+    namespace: &str,
     name: &CanonicalPackageName,
     version: &str,
     filename: &str,
@@ -383,7 +446,7 @@ pub(super) async fn serve_hosted_version_blob(
         return err.into_response();
     }
     match state.inner.storage
-        .for_hosted(org, pnpr_registry::Ecosystem::Npm)
+        .for_hosted(namespace, pnpr_registry::Ecosystem::Npm)
         .open_hosted_blob(name, filename)
         .await
     {

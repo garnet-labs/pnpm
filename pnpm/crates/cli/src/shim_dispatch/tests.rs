@@ -3,19 +3,38 @@ use super::runtime_env::managed_runtime_bin;
 #[cfg(windows)]
 use super::validate_candidate;
 use super::{
-    Candidate, ShimLaunch, find_candidate,
+    Candidate,
+    ShimLaunch,
+    find_candidate,
     identity::{
-        MAX_HASHED_BIN_SIZE, local_bin_identity, package_dir_of_target, provider_of_target,
-        read_shim_target_from_content, small_file_hash,
+        MAX_HASHED_BIN_SIZE,
+        local_bin_identity,
+        package_dir_of_target,
+        provider_of_target,
+        read_shim_target_from_content,
+        small_file_hash,
     },
-    is_automatic_runtime, local_bin_path, local_bin_unchanged,
+    is_automatic_runtime,
+    local_bin_path,
+    local_bin_unchanged,
     runtime_env::hardened_install_config,
     runtime_pin,
-    trust::{append_trust_decision, read_trust_decision},
+    trust::{
+        append_trust_decision,
+        read_trust_decision,
+    },
 };
 use crate::shim_dispatch::settings::apply_state_dir_setting;
-use pnpm_config::{Config, NodeLinker, ShimPolicy};
-use std::{ffi::OsString, fs, path::Path};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+    ShimPolicy,
+};
+use std::{
+    ffi::OsString,
+    fs,
+    path::Path,
+};
 
 fn strings(items: &[&str]) -> Vec<OsString> {
     items
@@ -428,6 +447,26 @@ fn a_runtime_install_keeps_its_release_age_approvals_out_of_the_caller_workspace
 
     assert_eq!(install_config.workspace_dir, Some(environment_dir));
     assert_eq!(install_config.target_workspace_dir, None);
+}
+
+/// A parent pnpm exports its settings as `PNPM_CONFIG_*` variables, which
+/// the dispatcher's own configuration reads back.
+#[test]
+fn a_runtime_install_keeps_its_lockfile_and_links_in_the_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let environment_dir = root.path().join("environment");
+    let config = Config {
+        lockfile_dir: Some(root.path().join("elsewhere")),
+        virtual_store_only: true,
+        symlink: false,
+        ..Config::default()
+    };
+
+    let install_config = hardened_install_config(config, &environment_dir, None);
+
+    assert_eq!(install_config.lockfile_dir, Some(environment_dir));
+    assert!(!install_config.virtual_store_only);
+    assert!(install_config.symlink);
 }
 
 #[test]

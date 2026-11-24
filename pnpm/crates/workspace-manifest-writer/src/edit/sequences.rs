@@ -1,13 +1,29 @@
 use super::{
-    HashMap, Inline, Line, Range, VecDeque, blank_run_start, flow, insertion_offset,
-    is_sequence_item_line, is_top_level_block_boundary, is_top_level_key, leading_comment_start,
-    lines, locate, locate_mapping, locate_sequence, render, splice, structural_indent,
+    HashMap,
+    Inline,
+    Line,
+    Range,
+    VecDeque,
+    blank_run_start,
+    flow,
+    insertion_offset,
+    is_sequence_item_line,
+    is_top_level_block_boundary,
+    is_top_level_key,
+    leading_comment_start,
+    lines,
+    locate,
+    locate_mapping,
+    locate_sequence,
+    render,
+    splice,
+    structural_indent,
     top_level_key_line,
 };
 
 /// Line-level reconciliation of the block sequence `key` toward `items`,
 /// mirroring the TypeScript writer's node reuse: an entry whose value the
-/// list already holds keeps its lines verbatim — comments included — a value
+/// list already holds keeps its lines verbatim (comments included) a value
 /// new to the list is rendered as a fresh line, and lines no entry claims are
 /// dropped, where a whole-block re-render would drop every comment in the
 /// block. `None` when the block is not a plain block sequence matching
@@ -19,10 +35,9 @@ pub(super) fn reconcile_sequence_items(
     key: &str,
     current: &[String],
     items: &[String],
-    quote_style: render::QuoteStyle,
 ) -> Option<String> {
     let layout = item_layout(text, key, current)?;
-    let body = rebuild_items(text, &layout, current, items, quote_style);
+    let body = rebuild_items(text, &layout, current, items);
     let mut out = text.to_string();
     out.replace_range(layout.spans.first()?.0..layout.spans.last()?.1, &body);
     Some(out)
@@ -32,8 +47,8 @@ pub(super) fn reconcile_sequence_items(
 /// to it has to be written to match them.
 struct ItemLayout {
     /// One span per item, in document order. A span opens at the comment and
-    /// blank lines ahead of its item — the TypeScript writer attaches those
-    /// to the entry below, so pruning the entry above must leave them be —
+    /// blank lines ahead of its item (the TypeScript writer attaches those
+    /// to the entry below, so pruning the entry above must leave them be)
     /// and closes where the next span opens. The first span opens at its own
     /// line, since comments between the key and the list belong to no entry,
     /// and the last closes before the blank run that separates the block from
@@ -58,7 +73,8 @@ fn item_layout(text: &str, key: &str, current: &[String]) -> Option<ItemLayout> 
     let block_items_end = blank_run_start(
         text,
         all.get(leading_comment_start(&all, key_idx + 1, block_end_idx))
-            .map_or(text.len(), |line| line.start),
+            .map(|line| line.start)
+            .unwrap_or(text.len()),
     );
     let starts: Vec<usize> =
         item_idxs
@@ -83,12 +99,12 @@ fn item_layout(text: &str, key: &str, current: &[String]) -> Option<ItemLayout> 
             })
             .collect(),
         indent,
-        newline: if text[all[key_idx].start..block_items_end].contains("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        },
+        newline: newline_of(&text[all[key_idx].start..block_items_end]),
     })
+}
+
+fn newline_of(block: &str) -> &'static str {
+    if block.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
 /// The indentation of `body`'s block-sequence item lines and their indices,
@@ -122,13 +138,7 @@ fn item_lines(
 /// The item lines of `layout` rebuilt as `items`: an entry whose value
 /// `current` already holds is copied out of `text` with the comments its span
 /// carries, and every other entry is rendered afresh.
-fn rebuild_items(
-    text: &str,
-    layout: &ItemLayout,
-    current: &[String],
-    items: &[String],
-    quote_style: render::QuoteStyle,
-) -> String {
+fn rebuild_items(text: &str, layout: &ItemLayout, current: &[String], items: &[String]) -> String {
     // First-come claim of each surviving entry's lines, like the TypeScript
     // writer's node reuse: duplicate values claim their lines in order.
     let mut unclaimed: HashMap<&str, VecDeque<usize>> = HashMap::with_capacity(current.len());
@@ -146,7 +156,7 @@ fn rebuild_items(
         } else {
             body.push_str(&indent);
             body.push_str("- ");
-            body.push_str(&render::render_value_with_quotes(item, quote_style));
+            body.push_str(&render::render_value(item));
         }
         // A document that ends without a newline leaves its last span without
         // one, which would splice the entry after it onto that same line.
@@ -159,8 +169,8 @@ fn rebuild_items(
 
 /// Whether the sequence-item line `content` carries the whole of `entry`.
 ///
-/// A value that runs past its item line — a block scalar's body, a quoted
-/// scalar broken across lines — can hold blank and `#`-leading lines, which
+/// A value that runs past its item line (a block scalar's body, a quoted
+/// scalar broken across lines) can hold blank and `#`-leading lines, which
 /// the span logic would take for the comments of the entry below and drop
 /// with it, silently rewriting this entry's value. A `trustPolicyExclude`
 /// entry truncated that way can widen into the bare `*` that excludes every
@@ -175,7 +185,7 @@ fn holds_whole_value(content: &str, entry: &str) -> bool {
 
 /// The first line of the run of comment and blank lines immediately ahead of
 /// the item line at `idx`: the run belongs to the entry below it, so it opens
-/// that entry's span. Only valid while a structural line sits above the run —
+/// that entry's span. Only valid while a structural line sits above the run,
 /// the previous item, in the one caller.
 fn comment_run_start(all: &[Line<'_>], idx: usize) -> usize {
     let mut start = idx;
@@ -219,12 +229,7 @@ fn block_sequence_indent(all: &[Line<'_>], key_idx: usize) -> Option<usize> {
 
 /// Render a top-level block whose value is a block sequence (`key:` then
 /// sequence item lines matching `indent`).
-pub(super) fn render_top_level_sequence(
-    key: &str,
-    items: &[String],
-    quote_style: render::QuoteStyle,
-    indent: usize,
-) -> String {
+pub(super) fn render_top_level_sequence(key: &str, items: &[String], indent: usize) -> String {
     let indent_str = " ".repeat(indent);
     let mut block = String::new();
     block.push_str(key);
@@ -232,7 +237,7 @@ pub(super) fn render_top_level_sequence(
     for item in items {
         block.push_str(&indent_str);
         block.push_str("- ");
-        block.push_str(&render::render_value_with_quotes(item, quote_style));
+        block.push_str(&render::render_value(item));
         block.push('\n');
     }
     block
@@ -253,7 +258,7 @@ pub(super) fn upsert_sequence_entry(
         .map(|item| render::render_value(item))
         .collect();
     if let Inline::Flow(collection) = locate_sequence(text, &[block_name, key]) {
-        return flow::set_items(text, &collection, &rendered_items);
+        return flow::set_items(text.to_owned(), &collection, &rendered_items);
     }
     if let Inline::Flow(collection) = locate_mapping(text, &[block_name]) {
         return flow::upsert(text, &collection, key, &flow::render_sequence(&rendered_items));

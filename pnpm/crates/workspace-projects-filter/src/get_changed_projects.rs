@@ -1,16 +1,29 @@
-use crate::{filter::FilterError, process::Command};
+use crate::{
+    filter::FilterError,
+    process::Command,
+};
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::OnceLock,
 };
 
 use indexmap::IndexMap;
-use wax::{Glob, Program};
+use wax::{
+    Glob,
+    Program,
+};
 
 mod catalogs;
 #[cfg(test)]
 mod tests;
+
+/// Each project's `(name, specifier)` dependency pairs, keyed by root
+/// directory.
+pub type ProjectDependencies = HashMap<PathBuf, Vec<(String, String)>>;
 
 /// Options for [`get_changed_projects`].
 pub struct GetChangedProjectsOptions<'a> {
@@ -21,8 +34,9 @@ pub struct GetChangedProjectsOptions<'a> {
     pub working_dir: Option<&'a Path>,
     pub test_pattern: &'a [String],
     pub changed_files_ignore_pattern: &'a [String],
-    pub project_dependencies: Option<&'a HashMap<PathBuf, Vec<(String, String)>>>,
+    pub project_dependencies: Option<&'a ProjectDependencies>,
     pub use_glob_dir_filtering: bool,
+    pub include_untracked: bool,
 }
 
 /// The two selection groups a `[<since>]` diff produces.
@@ -112,7 +126,7 @@ struct DiffFilterContext<'a> {
     workspace_manifests: &'a [PathBuf],
     working_dir: &'a Path,
     workspace_dir: &'a Path,
-    ignore_globs: &'a [Glob<'a>],
+    ignore_globs: &'a IgnoreGlobs<'a>,
     test_globs: &'a [Glob<'a>],
 }
 
@@ -147,10 +161,7 @@ fn process_diff_path(
             return;
         }
     }
-    if ctx.ignore_globs
-        .iter()
-        .any(|glob| glob.is_match(file))
-    {
+    if ctx.ignore_globs.matches(file) {
         return;
     }
     let (dir, change_type) = classify_changed_path(file, ctx.test_globs);
@@ -166,7 +177,11 @@ fn get_changed_dirs_since_commit(
     let working_dir = opts.working_dir.unwrap_or(opts.workspace_dir);
     let manifest_paths = workspace_manifest_paths(opts.workspace_dir, repo_root);
 
-    let diff = git_diff_names(commit, opts.workspace_dir, working_dir, &manifest_paths, repo_root)?;
+    let mut diff =
+        git_diff_names(commit, opts.workspace_dir, working_dir, &manifest_paths, repo_root)?;
+    if opts.include_untracked {
+        diff.push_str(&git_untracked_names(working_dir, &manifest_paths, repo_root)?);
+    }
     if diff.is_empty() {
         return Ok(ChangedDirsResult {
             changed_dirs: IndexMap::new(),
@@ -174,7 +189,7 @@ fn get_changed_dirs_since_commit(
         });
     }
 
-    let ignore_globs = compile_globs(opts.changed_files_ignore_pattern)?;
+    let ignore_globs = IgnoreGlobs::new(opts.changed_files_ignore_pattern)?;
     let test_globs = compile_globs(opts.test_pattern)?;
     let ctx = DiffFilterContext {
         repo_root,
@@ -261,7 +276,8 @@ fn symlinked_ancestors(repo_root: &Path, path: &Path) -> Vec<PathBuf> {
         .filter(|ancestor| {
             ancestor
                 .symlink_metadata()
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                .map(|metadata| metadata.file_type())
+                .is_ok_and(|file_type| file_type.is_symlink())
                 && is_inside_repo(ancestor, repo_root)
         })
         .map(Path::to_path_buf)
@@ -271,7 +287,8 @@ fn symlinked_ancestors(repo_root: &Path, path: &Path) -> Vec<PathBuf> {
 fn is_inside_repo(path: &Path, repo_root: &Path) -> bool {
     let canonical_dir = path
         .parent()
-        .and_then(|dir| std::fs::canonicalize(dir).ok());
+        .map(std::fs::canonicalize)
+        .and_then(Result::ok);
     let canonical_root = std::fs::canonicalize(repo_root).ok();
     matches!((canonical_dir, canonical_root), (Some(dir), Some(root)) if dir.starts_with(&root))
 }
@@ -321,6 +338,26 @@ fn git_diff_names(
         });
     }
 
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn git_untracked_names(
+    working_dir: &Path,
+    manifest_paths: &[PathBuf],
+    repo_root: &Path,
+) -> Result<String, FilterError> {
+    let output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "--full-name", "-z", "--"])
+        .arg(working_dir)
+        .args(manifest_paths.iter().filter(|path| is_inside_repo(path, repo_root)))
+        .current_dir(repo_root)
+        .output()
+        .map_err(|error| FilterError::FilterChanged { stderr: error.to_string() })?;
+    if !output.status.success() {
+        return Err(FilterError::FilterChanged {
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -374,17 +411,62 @@ pub(crate) fn strip_final_newline(text: &str) -> &str {
     text.strip_suffix('\r').unwrap_or(text)
 }
 
+enum FilePattern<'a> {
+    Ignore(Glob<'a>),
+    Keep(Glob<'a>),
+}
+
+struct IgnoreGlobs<'a> {
+    patterns: Vec<FilePattern<'a>>,
+    only_negations: bool,
+}
+
+impl<'a> IgnoreGlobs<'a> {
+    fn new(patterns: &'a [String]) -> Result<Self, FilterError> {
+        let mut compiled = Vec::new();
+        let mut any_positive = false;
+        for pattern in patterns
+            .iter()
+            .filter(|pattern| !pattern.is_empty())
+        {
+            let body = pattern.trim_start_matches('!');
+            let glob = compile_glob(body)?;
+            compiled.push(if (pattern.len() - body.len()).is_multiple_of(2) {
+                any_positive = true;
+                FilePattern::Ignore(glob)
+            } else {
+                FilePattern::Keep(glob)
+            });
+        }
+        Ok(Self { only_negations: !compiled.is_empty() && !any_positive, patterns: compiled })
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        self.patterns
+            .iter()
+            .rev()
+            .find_map(|pattern| match pattern {
+                FilePattern::Ignore(glob) if glob.is_match(path) => Some(true),
+                FilePattern::Keep(glob) if glob.is_match(path) => Some(false),
+                _ => None,
+            })
+            .unwrap_or(self.only_negations)
+    }
+}
+
+fn compile_glob(pattern: &str) -> Result<Glob<'_>, FilterError> {
+    Glob::new(pattern)
+        .map_err(|err| FilterError::InvalidPattern {
+            pattern: pattern.to_owned(),
+            message: err.to_string(),
+        })
+}
+
 fn compile_globs(patterns: &[String]) -> Result<Vec<Glob<'_>>, FilterError> {
     patterns
         .iter()
         .filter(|pattern| !pattern.is_empty())
-        .map(|pattern| {
-            Glob::new(pattern)
-                .map_err(|err| FilterError::InvalidPattern {
-                    pattern: pattern.clone(),
-                    message: err.to_string(),
-                })
-        })
+        .map(|pattern| compile_glob(pattern))
         .collect()
 }
 

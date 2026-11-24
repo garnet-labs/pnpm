@@ -1,34 +1,59 @@
-//! `pnpm list` / `ls` / `ll` / `la` — list installed packages.
+//! `pnpm list` / `ls` / `ll` / `la`: list installed packages.
 
+pub(in crate::cli_args) mod global;
 pub(in crate::cli_args) mod recursive;
 pub(crate) mod render;
+
+pub(in crate::cli_args) use global::global_install_dir_config;
 
 mod linked_projects;
 
 use crate::cli_args::{
     deps_tree::{
         build::{
-            BuildTreeOptions, DependenciesHierarchy, LoadedState, build_dependencies_tree,
+            BuildTreeOptions,
+            DependenciesHierarchy,
+            LoadedState,
+            build_dependencies_tree,
             importer_root_ids,
         },
         get_tree::MaxDepth,
-        graph::{BuildGraphOptions, build_dependency_graph},
+        graph::{
+            BoundPeerEdges,
+            BuildGraphOptions,
+            build_dependency_graph,
+        },
         search::Searcher,
     },
-    deps_tree_finders::{evaluate_finders, finder_candidates, resolve_finders},
+    deps_tree_finders::{
+        evaluate_finders,
+        finder_candidates,
+        resolve_finders,
+    },
     install::resolve_bool_override,
 };
 use clap::Args;
 use linked_projects::SharedLinkedProjects;
-use miette::IntoDiagnostic;
 use pnpm_config::Config;
-use pnpm_global::{ListReportAs, find_global_install_dirs, list_global_packages};
 use pnpm_modules_yaml::IncludedDependencies;
-use render::{ProjectHierarchy, RenderParseableOptions, RenderTreeOptions};
+use render::{
+    ProjectHierarchy,
+    RenderParseableOptions,
+    RenderTreeOptions,
+};
 use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        OnceLock,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,96 +171,7 @@ impl ListArgs {
         Ok(())
     }
 
-    async fn run_global(&self, config: &Config) -> miette::Result<String> {
-        let global_pkg_dir = config.global_pkg_dir
-            .clone()
-            .ok_or_else(|| {
-                miette::miette!(
-                    code = "ERR_PNPM_NO_GLOBAL_BIN_DIR",
-                    "Unable to find the global packages directory"
-                )
-            })?;
-
-        let tools = crate::cli_args::global::rust::global_tools(config);
-        let selects_tool =
-            !crate::cli_args::global::rust::selected_tools(&tools, &self.packages).is_empty();
-        let report_as = self.report_as();
-        if (matches!(self.graph.depth, RecursionLimit::Levels(n) if n > 0)
-            || self.graph.depth == RecursionLimit::Unlimited)
-            && let Some(output) =
-                self.render_global_tree(config, &global_pkg_dir, selects_tool).await?
-        {
-            return Ok(crate::cli_args::global::rust::with_tools(
-                output,
-                &tools,
-                &self.packages,
-                global_report_as(report_as),
-            ));
-        }
-
-        list_global_packages(
-            &global_pkg_dir,
-            &self.packages,
-            tools,
-            global_report_as(report_as),
-            self.output.long,
-        )
-        .into_diagnostic()
-    }
-
-    async fn render_global_tree(
-        &self,
-        config: &Config,
-        global_pkg_dir: &Path,
-        selects_tool: bool,
-    ) -> miette::Result<Option<String>> {
-        let all_install_dirs = find_global_install_dirs(global_pkg_dir, &[]).into_diagnostic()?;
-        if all_install_dirs.len() == 1 {
-            // Single global install: keep params so the search can
-            // cover the whole tree, matching regular `pnpm ls`.
-            let install_dir = all_install_dirs[0].clone();
-            return self
-                .render_projects(
-                    config,
-                    std::slice::from_ref(&install_dir),
-                    &self.packages,
-                    &install_dir,
-                    true,
-                )
-                .await
-                .map(Some);
-        }
-        // Multiple installs — try to narrow to a single one via
-        // params, matching against top-level aliases of each
-        // install group.
-        let matching_install_dirs =
-            find_global_install_dirs(global_pkg_dir, &self.packages).into_diagnostic()?;
-        // Params that select only a tool, such as `rust`, are served by the
-        // flat listing.
-        if matching_install_dirs.len() > 1
-            || (matching_install_dirs.is_empty() && !all_install_dirs.is_empty() && !selects_tool)
-        {
-            return Err(miette::miette!(
-                code = "ERR_PNPM_GLOBAL_LS_DEPTH_NOT_SUPPORTED",
-                "Cannot list a merged dependency tree across multiple global packages. \
-                     Each global package is installed in an isolated directory with its own lockfile, \
-                     so transitive dependencies cannot be coherently merged. \
-                     Filter to a single global package by its top-level name, or omit --depth."
-            ));
-        }
-        if let [install_dir] = matching_install_dirs.as_slice() {
-            // Params served their purpose of narrowing to a single
-            // install group; passing them on would activate search
-            // semantics, which prune the matched package's children.
-            return self
-                .render_projects(config, std::slice::from_ref(install_dir), &[], install_dir, true)
-                .await
-                .map(Some);
-        }
-        Ok(None)
-    }
-
-    fn report_as(&self) -> ReportAs {
+    pub(super) fn report_as(&self) -> ReportAs {
         if self.output.parseable {
             ReportAs::Parseable
         } else if self.output.json {
@@ -258,7 +194,7 @@ impl ListArgs {
         }
     }
 
-    async fn render_projects(
+    pub(super) async fn render_projects(
         &self,
         config: &Config,
         project_dirs: &[PathBuf],
@@ -359,12 +295,13 @@ impl ListArgs {
         let include = self.include(config.optional);
         let root_ids = importer_root_ids(env.current_lockfile, lockfile_dir, project_dirs);
         let graph = build_dependency_graph(
-            &root_ids,
+            root_ids,
             &BuildGraphOptions {
                 lockfile: env.current_lockfile,
                 include,
                 only_projects: self.graph.only_projects,
                 peer_edges: config.peer_edge_options(),
+                bound_peer_edges: BoundPeerEdges::Follow,
             },
         );
         let searcher = self.build_searcher(config, env, &graph, lockfile_dir, params).await?;
@@ -381,7 +318,7 @@ impl ListArgs {
                 only_projects: self.graph.only_projects,
                 search: searcher.as_ref(),
                 show_deduped_search_matches: searcher.is_some(),
-                modules_dir_opt: Some(config.modules_dir.as_path()),
+                unsaved_modules_dir_name: Some(Path::new(config.modules_dir_name())),
             },
         )?;
         if self.graph.only_projects {
@@ -406,9 +343,14 @@ impl ListArgs {
         }
         let mut searcher = Searcher::from_queries(params)?;
         if !self.find_by.is_empty() {
-            let finders = resolve_finders(config, lockfile_dir, &self.find_by).await?;
+            let finder_dir = if self.global {
+                config.global_pkg_dir.as_deref().unwrap_or(lockfile_dir)
+            } else {
+                lockfile_dir
+            };
+            let finders = resolve_finders(config, finder_dir, &self.find_by).await?;
             let candidates = finder_candidates(env, graph);
-            let results = evaluate_finders(env, &finders, candidates).await?;
+            let results = evaluate_finders(env, config.frozen_store, &finders, candidates).await?;
             searcher.set_finder_results(results);
         }
         Ok(Some(searcher))
@@ -436,18 +378,10 @@ impl<'a> TreeRequest<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReportAs {
+pub(super) enum ReportAs {
     Tree,
     Json,
     Parseable,
-}
-
-fn global_report_as(report_as: ReportAs) -> ListReportAs {
-    match report_as {
-        ReportAs::Tree => ListReportAs::Tree,
-        ReportAs::Json => ListReportAs::Json,
-        ReportAs::Parseable => ListReportAs::Parseable,
-    }
 }
 
 /// The directory the lockfile is read from for a non-recursive `list`.

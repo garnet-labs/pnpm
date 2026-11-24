@@ -1,5 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+        HashSet,
+    },
     fs,
     path::Path,
 };
@@ -7,23 +12,49 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-    changelog::{compose_changelog_section, prepend_changelog_section},
+    changelog::{
+        compose_changelog_section,
+        prepend_changelog_section,
+    },
     error::VersioningError,
-    intents::{ChangeIntent, IntentBumpType},
+    intents::{
+        ChangeIntent,
+        IntentBumpType,
+    },
     ledger::{
-        Ledger, PackageConsumption, append_to_ledger, build_consumption_index,
+        Ledger,
+        PackageConsumption,
+        append_to_ledger,
+        build_consumption_index,
         normalize_project_dir,
     },
-    notes::{ComposedNotes, compose_release_notes},
-    parked_publication::{
-        read_parked_publications, remove_parked_publication, write_parked_publication,
+    notes::{
+        ComposedNotes,
+        compose_release_notes,
     },
-    pending::{pending_changelog_path, remove_pending_changelog, write_pending_changelog},
+    parked_publication::{
+        read_parked_publications,
+        remove_parked_publication,
+        write_parked_publication,
+    },
+    pending::{
+        pending_changelog_path,
+        remove_pending_changelog,
+        write_pending_changelog,
+    },
     plan::{
-        PlannedRelease, ProjectRefIndex, ReleasePlan, WorkspaceProject, index_project_refs,
+        PlannedRelease,
+        ProjectRefIndex,
+        ReleasePlan,
+        WorkspaceProject,
+        index_project_refs,
         private_project_dirs,
     },
-    settings::{ChangelogStorage, VersioningSettings, changelog_storage},
+    settings::{
+        ChangelogStorage,
+        VersioningSettings,
+        changelog_storage,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -94,8 +125,8 @@ pub fn apply_release_plan(
         &consumed_ledger(ledger, &storage, confirmed_published),
     )?;
 
-    // A confirmed release's parked section has served its purpose — its prose
-    // is now in the published tarball — so collect it regardless of whether
+    // A confirmed release's parked section has served its purpose (its prose
+    // is now in the published tarball) so collect it regardless of whether
     // the intents behind it were also collected.
     if storage.configured == ChangelogStorage::Registry {
         for key in confirmed_published {
@@ -195,12 +226,17 @@ fn collect_parked_publications(
 
 /// Stamp every released manifest with its new version.
 fn write_new_versions(plan: &ReleasePlan) -> Result<Vec<AppliedRelease>, VersioningError> {
+    let versions = plan.releases
+        .iter()
+        .map(|release| (release.name.as_str(), release.version.next.as_str()))
+        .collect();
     let mut applied = Vec::with_capacity(plan.releases.len());
     for release in &plan.releases {
         let manifest_path = pnpm_package_manifest::project_manifest_path(&release.root_dir);
         let mut manifest = pnpm_package_manifest::PackageManifest::from_path(manifest_path)
             .map_err(VersioningError::Manifest)?;
         manifest.value_mut()["version"] = serde_json::Value::String(release.version.next.clone());
+        update_dependency_ranges(manifest.value_mut(), &versions);
         manifest.save().map_err(VersioningError::Manifest)?;
         applied.push(AppliedRelease {
             name: release.name.clone(),
@@ -209,6 +245,23 @@ fn write_new_versions(plan: &ReleasePlan) -> Result<Vec<AppliedRelease>, Version
         });
     }
     Ok(applied)
+}
+
+fn update_dependency_ranges(manifest: &mut serde_json::Value, versions: &HashMap<&str, &str>) {
+    for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
+        let Some(entries) = manifest.get_mut(field).and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        for (alias, value) in entries {
+            if let Some(updated) = value
+                .as_str()
+                .and_then(|spec| crate::plan::updated_workspace_spec(alias, spec, versions))
+            {
+                *value = updated.into();
+            }
+        }
+    }
 }
 
 /// In `repository` storage the section is committed to CHANGELOG.md now. In
@@ -263,7 +316,8 @@ fn consumed_ledger(
         .filter(|(key, entry)| {
             let entry_storage = entry
                 .dir()
-                .map_or(storage.configured, |dir| storage.of(&normalize_project_dir(dir)));
+                .map(|dir| storage.of(&normalize_project_dir(dir)))
+                .unwrap_or(storage.configured);
             entry_storage == ChangelogStorage::Repository || confirmed_published.contains(key)
         })
         .collect()
@@ -307,7 +361,7 @@ fn remove_consumed_intents(
 ///
 /// A project needs a consumed ledger entry for the intent, with one
 /// exemption: while a project is still on a lane, entries against prerelease
-/// versions alone keep the file alive — its prose is still needed to compose
+/// versions alone keep the file alive; its prose is still needed to compose
 /// the stable changelog section at graduation. Declined (`none`) entries
 /// demand no release and never block deletion. References here were already
 /// validated by the plan assembly, so an unresolvable one just keeps its file

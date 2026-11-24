@@ -1,6 +1,13 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::Path,
+};
 
-use super::{super::map_frozen_lockfile_error, InstallError, settled::Settled};
+use super::{
+    super::map_frozen_lockfile_error,
+    InstallError,
+    settled::Settled,
+};
 
 async fn detect_host(
     settled: &Settled<'_, '_>,
@@ -125,6 +132,10 @@ async fn local_tarballs_changed(settled: Settled<'_, '_>) -> bool {
     if !has_local_tarball(lockfile) {
         return false;
     }
+    match settled.owned.resolution.local_filesystem_policy {
+        pnpm_resolving_local_resolver::LocalFilesystemPolicy::HostFilesystem(_) => {}
+        pnpm_resolving_local_resolver::LocalFilesystemPolicy::WorkspaceOnly => return true,
+    }
     let workspace_root = settled.projects.workspace.dirs.workspace_root.clone();
     let kind = lockfile.integrity_target().into();
     let groups = crate::GroupSelection::classify(
@@ -195,7 +206,12 @@ fn installed_importer_ids(
     let hoisted_prior = settled.loaded.current
         .as_ref()
         .filter(|_| settled.install.execution.node_linker == pnpm_config::NodeLinker::Hoisted);
-    crate::install::materialize::initial_materialization_ids(lockfile, requested, hoisted_prior)
+    crate::install::materialize::initial_materialization_ids(
+        lockfile,
+        requested,
+        Some(&settled.projects.scope.importers.real_importer_ids),
+        hoisted_prior,
+    )
 }
 
 /// Whether any package resolves to a tarball on the local filesystem, the
@@ -213,7 +229,7 @@ fn is_local_file_tarball(resolution: &pnpm_lockfile::LockfileResolution) -> bool
         resolution,
         pnpm_lockfile::LockfileResolution::Tarball(resolution)
             if resolution.tarball.starts_with("file:")
-                && pnpm_lockfile::is_local_tarball_path(&resolution.tarball),
+                && pnpm_local_spec::is_tarball_filename(&resolution.tarball),
     )
 }
 

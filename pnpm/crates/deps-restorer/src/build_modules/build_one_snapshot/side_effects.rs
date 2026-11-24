@@ -1,15 +1,21 @@
 use super::{
     super::{
-        BuildModulesError, NEEDS_BUILD_MARKER, PackageKey, Path, Reporter,
-        materialize_side_effects, store_index_key_for_resolution,
+        BuildModulesError,
+        PackageKey,
+        Path,
+        Reporter,
+        materialize_side_effects,
+        store_index_key_for_resolution,
     },
-    BuildCandidate, BuildOneSnapshot, global_slot_carries_overlay, report_broken_slot,
+    BuildCandidate,
+    BuildOneSnapshot,
+    report_broken_slot,
 };
 
 /// The side-effects cache key, computed once per snapshot before the
 /// `is_built` gate. The same value is later consumed by the WRITE-path
 /// upload after `run_postinstall_hooks` succeeds, so recomputing it
-/// there would just duplicate work — `deps_state_cache` makes the second
+/// there would just duplicate work, `deps_state_cache` makes the second
 /// call free anyway, but routing through one value keeps the gate-side
 /// and write-side keys provably identical.
 ///
@@ -18,7 +24,7 @@ use super::{
 /// consumers short-circuit on `None`.
 ///
 /// The `deps_state_cache` is shared across all scheduled nodes via
-/// `Mutex` because `calc_dep_state` is recursive and memoizes — a
+/// `Mutex` because `calc_dep_state` is recursive and memoizes, a
 /// per-task cache would defeat the memoization for diamond-shaped
 /// subgraphs.
 pub(super) fn side_effects_cache_key(
@@ -33,7 +39,7 @@ pub(super) fn side_effects_cache_key(
     // Poison-recover: `calc_dep_state` mutates the cache by
     // inserting one entry per recursive walk node, each
     // insert atomic from `HashMap`'s POV. A panic mid-walk
-    // leaves the map in a usable state — the worst case is
+    // leaves the map in a usable state, the worst case is
     // an unfinished sub-walk that the next caller will redo.
     let mut cache_guard =
         context.progress.deps_state_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -55,7 +61,7 @@ pub(super) fn side_effects_cache_key(
     ))
 }
 /// Side-effects-cache `is_built` gate. Past the policy gate, this
-/// snapshot would otherwise run its scripts — but if the prefetch
+/// snapshot would otherwise run its scripts, but if the prefetch
 /// surfaced a matching side-effects-cache entry, the build is already
 /// represented on disk (seeded on a previous install) and can be
 /// skipped. An explicit `pacquet rebuild` (`force_rebuild`) re-runs the
@@ -83,29 +89,36 @@ pub(super) fn already_built<Reporter: self::Reporter>(
     }
     Ok(rebuild_found_empty_row(context, snapshot_key, cache_key))
 }
+/// The side-effects cache row that holds this snapshot's build, when the
+/// install may restore it instead of building. See [`already_built`].
+pub(super) fn cached_overlay<'c>(
+    context: &BuildOneSnapshot<'c>,
+    snapshot_key: &PackageKey,
+    candidate: &BuildCandidate<'_>,
+    cache_key: Option<&str>,
+) -> Option<&'c pnpm_store_dir::SideEffectsOverlay> {
+    if bypasses_side_effects_cache(context, candidate) || !context.cache.read {
+        return None;
+    }
+    context.cache.side_effects.overlay(snapshot_key, cache_key?)
+}
 /// A rebuild with [`RebuildOptions::skip_if_has_side_effects_cache`]
 /// skips a package whose side-effects row for this cache key is empty.
 /// The build ran before and changed nothing inside the package, so there
 /// is nothing to restore, and running it again would only repeat that.
-/// pnpm v11's `rebuild` takes any row as a hit the same way, unless the
-/// package directory carries [`NEEDS_BUILD_MARKER`]: that slot has not
-/// been built yet. An install still runs such a build, because its effect
-/// may lie outside the package directory (pnpm/pnpm#14717).
+/// pnpm v11's `rebuild` takes any row as a hit the same way. An install
+/// still runs such a build, because its effect may lie outside the package
+/// directory (pnpm/pnpm#14717).
 ///
 /// [`RebuildOptions::skip_if_has_side_effects_cache`]: crate::RebuildOptions::skip_if_has_side_effects_cache
-fn rebuild_found_empty_row(
+pub(super) fn rebuild_found_empty_row(
     context: &BuildOneSnapshot<'_>,
     snapshot_key: &PackageKey,
     cache_key: Option<&str>,
 ) -> bool {
     let hit = context.rebuild.is_some_and(|rebuild| rebuild.skip_if_has_side_effects_cache)
         && context.cache.read
-        && cache_key.is_some_and(|key| context.cache.side_effects.has_empty_row(snapshot_key, key))
-        && !context
-            .pkg_roots()
-            .all_recorded(snapshot_key)
-            .iter()
-            .any(|pkg_dir| pkg_dir.join(NEEDS_BUILD_MARKER).exists());
+        && cache_key.is_some_and(|key| context.cache.side_effects.has_empty_row(snapshot_key, key));
     if hit {
         tracing::debug!(
             target: "pacquet::build",
@@ -129,7 +142,7 @@ fn bypasses_side_effects_cache(
 /// The warm link placed only the pristine tarball files in the project-local
 /// slot. The cached build's output (the side-effects `added` / `deleted`
 /// overlay) still has to land on disk before the build is skipped, or the
-/// package is left in its pre-build state — e.g. a postinstall that downloads
+/// package is left in its pre-build state, e.g. a postinstall that downloads
 /// a binary leaves nothing behind on the warm reinstall. The side-effects diff
 /// is applied at import time.
 pub(super) fn satisfy_from_side_effects_cache<Reporter: self::Reporter>(
@@ -145,14 +158,11 @@ pub(super) fn satisfy_from_side_effects_cache<Reporter: self::Reporter>(
         cache_key = key,
         "side-effects cache hit; skipping build",
     );
-    let Some(_slot_lock) = lock_slot_missing_overlay(context, snapshot_key, overlay) else {
-        return Ok(true);
-    };
     // The overlay carries the patched / built contents, so it has to reach
     // every hoisted copy for the same reason patch application does.
     super::dependency_bins::record_mutation(context, snapshot_key)?;
     for pkg_dir in context.pkg_roots().all(snapshot_key) {
-        // No slot to materialize into (skipped / never linked) — nothing for
+        // No slot to materialize into (skipped / never linked); nothing for
         // the build phase to do either.
         if !pkg_dir.exists() {
             continue;
@@ -198,31 +208,6 @@ pub(super) enum OverlayOutcome {
     /// (or skip them when the manifest is gone) and let the install finish
     /// with a broken package.
     Broken(BuildModulesError),
-}
-/// The lock to hold while the overlay is re-imported into the slot, or `None`
-/// when the slot already carries it. Another install may be building the
-/// shared slot, which the forced re-import would overwrite; once that build
-/// finishes, its output is the overlay.
-fn lock_slot_missing_overlay(
-    context: &BuildOneSnapshot<'_>,
-    snapshot_key: &PackageKey,
-    overlay: &pnpm_store_dir::SideEffectsOverlay,
-) -> Option<Option<pnpm_fs::DirLock>> {
-    if global_slot_carries_overlay(context, snapshot_key, overlay) {
-        return None;
-    }
-    let lock = context.directories.pkg_roots_by_key
-        .is_none()
-        .then(|| {
-            crate::gvs_slot_lock::lock_global_virtual_store_slot(
-                context.directories.layout,
-                snapshot_key,
-            )
-        });
-    if global_slot_carries_overlay(context, snapshot_key, overlay) {
-        return None;
-    }
-    Some(lock.flatten())
 }
 pub(super) fn materialize_overlay_into_slot<Reporter: self::Reporter>(
     context: &BuildOneSnapshot<'_>,
@@ -274,12 +259,12 @@ pub(super) fn upload_side_effects_cache(
     if (!upload.is_patched && !upload.has_side_effects) || context.cache.frozen_store {
         return;
     }
-    let (Some(writer), Some(store), Some(cache_key), Some(packages)) = (
-        context.cache.store_index_writer,
-        context.cache.store_dir,
-        upload.cache_key,
-        context.graph.packages,
-    ) else {
+    let (
+        Some(crate::BuildCacheStore { directory: store, writer }),
+        Some(cache_key),
+        Some(packages),
+    ) = (context.cache.store, upload.cache_key, context.graph.packages)
+    else {
         return;
     };
     let Some(metadata) = packages.get(upload.metadata_key) else { return };
@@ -324,9 +309,9 @@ pub(super) fn upload_and_publish(
 ) -> Result<(), pnpm_store_dir::UploadError> {
     let (store, writer, files_index_file, cache_key) = store;
     let (upload, metadata) = uploaded;
-    let Some(publisher) = context.cache.publisher else {
+    if context.cache.publisher.is_none() && context.cache.captured.is_none() {
         return pnpm_store_dir::upload(store, upload.pkg_dir, files_index_file, cache_key, writer);
-    };
+    }
     let diff = pnpm_store_dir::upload_with_diff(
         store,
         upload.pkg_dir,
@@ -334,9 +319,11 @@ pub(super) fn upload_and_publish(
         cache_key,
         writer,
     )?;
+    capture(context.cache.captured, snapshot_key, cache_key, diff.as_ref());
     if upload.has_side_effects
         && let Some(diff) = diff
         && let Some(graph) = context.progress.dep_graph
+        && let Some(publisher) = context.cache.publisher
         && let Err(error) = publisher.publish(
             snapshot_key,
             metadata,
@@ -354,4 +341,24 @@ pub(super) fn upload_and_publish(
         );
     }
     Ok(())
+}
+
+fn capture(
+    captured: Option<&crate::CapturedBuildSideEffects>,
+    snapshot_key: &PackageKey,
+    cache_key: &str,
+    diff: Option<&pnpm_store_dir::SideEffectsDiff>,
+) {
+    if let Some(captured) = captured {
+        captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                snapshot_key.clone(),
+                crate::build_options::BuiltSideEffects {
+                    cache_key: cache_key.to_string(),
+                    diff: diff.cloned(),
+                },
+            );
+    }
 }

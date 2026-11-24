@@ -4,9 +4,7 @@ See also [`CODE_STYLE_GUIDE.md`](./CODE_STYLE_GUIDE.md) for the code style guide
 
 ## Scope and Version Policy
 
-pacquet is pnpm v12 and the target for new feature development. New commands, settings, and other user-visible features are implemented here and are not backported to the TypeScript pnpm v11 CLI under `../pnpm11/`.
-
-For bug fixes, determine which supported versions contain the bug. A bug present in both v11 and v12 must be fixed and tested in both implementations. A bug present in only one version is fixed only in that version. See [`AGENTS.md`](./AGENTS.md) for the full version policy.
+pacquet is the newest pnpm major.
 
 Opening an issue first is optional for a clearly scoped change. Open one when the intended user-visible behavior or design is not obvious, or when coordination is needed for work already in progress.
 
@@ -76,7 +74,7 @@ Install the project's task tools and the git pre-push hook:
 just init
 ```
 
-`just init` invokes `cargo-binstall` to install `cargo-nextest`, `cargo-watch`, `cargo-insta`, `typos-cli`, `taplo-cli`, `wasm-pack`, and `cargo-llvm-cov`, then installs `cargo-fixit@0.1.15` from source with `cargo install ... --locked` (it has no prebuilt binaries). `cargo-fixit` backs the `just fix` task. It also installs the [pinned formatter](../CONTRIBUTING.md#rust-formatting). The repo-wide `pnpm install` wires up husky, whose `pre-commit` hook formats the Rust files being committed and whose `pre-push` hook runs `pnpm/scripts/pre-push-rust.sh` (format, doc, dylint, typos) alongside the TypeScript compile and lint checks.
+`just init` invokes `cargo-binstall` to install `cargo-nextest`, `cargo-watch`, `cargo-insta`, `typos-cli`, `taplo-cli`, `wasm-pack`, and `cargo-llvm-cov`, then installs `cargo-fixit@0.1.15` from source with `cargo install ... --locked` (it has no prebuilt binaries). `cargo-fixit` backs the `just fix` task. It also installs the [pinned formatter](../CONTRIBUTING.md#rust-formatting). The repo-wide `pnpm install` wires up the git hooks in `.config/githooks/` (via `core.hooksPath`): the `pre-commit` hook formats the Rust files being committed and the `pre-push` hook runs `pnpm/scripts/pre-push-rust.sh` (format, doc, dylint, typos) alongside the TypeScript checks.
 
 `just init` does not install the dylint tools. To run the `Dylint` job's checks locally, install `cargo-dylint` and `dylint-link` as described under [Rust toolchain and git hooks](../CONTRIBUTING.md#rust-toolchain-and-git-hooks) in the root guide.
 
@@ -180,6 +178,24 @@ expected layout for not-yet-implemented behavior (`known_failures` modules
 guarded by `pnpm_testing_utils::allow_known_failure!`), and the
 verification step of temporarily breaking the implementation to confirm a
 ported test actually fails for the right reason before committing.
+
+### Generated peer-resolution oracles
+
+The [Peer Resolution Oracles workflow](../.github/workflows/peer-resolution-oracles.yml)
+runs larger generated-workspace suites daily. Its run ID is the random seed;
+the `peer-resolution-oracles` artifact retains that seed and failure output.
+Reproduce a run with the values from its log:
+
+```sh
+PROPTEST_CASES=1024 PROPTEST_RNG_SEED=143 PROPTEST_MAX_SHRINK_ITERS=256 pnpm test:rust -p pnpm-package-manager -E 'test(peer_proptest::)'
+```
+
+Keep a minimized failure as a fixed regression test when fixing its cause.
+The moving-provider property checks frozen acceptance and stability of the
+installed dependency graph after additions, version changes, and removals.
+It keeps published manifests unchanged and uses the production version picker
+with manifest and lockfile preferences. Valid locked peer choices may differ
+from fresh resolution.
 
 ## Benchmarking
 

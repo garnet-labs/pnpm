@@ -1,19 +1,32 @@
 //! Writing a hoist plan: the private and public hoisted symlinks and the
 //! bins of the privately hoisted packages.
 
-use super::{LinkPhaseError, LinkPhaseInputs};
+use super::{
+    LinkPhaseError,
+    LinkPhaseInputs,
+};
 use crate::{
-    SkippedSnapshots, VirtualStoreLayout,
+    SkippedSnapshots,
+    VirtualStoreLayout,
     install_frozen_lockfile::{
-        HoistPlan, collect_public_hoist_targets, compute_hoist_plan, workspace_packages_for_hoist,
+        HoistPlan,
+        collect_public_hoist_targets,
+        compute_hoist_plan,
+        workspace_packages_for_hoist,
     },
-    link_bins::link_direct_dep_bins_resolved_with_sources,
     symlink_hoisted_dependencies,
 };
-use pnpm_cmd_shim::{LinkBinsOptions, PackageBinSource};
+use pnpm_cmd_shim::{
+    LinkBinsOptions,
+    PackageBinSource,
+};
 use pnpm_config::Config;
 use pnpm_lockfile::PackageKey;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+};
 
 /// Planned before the links are written, not with them: an importer's
 /// dep that public-hoist lands at root has to be in
@@ -63,7 +76,7 @@ pub(super) fn plan_hoist(inputs: &LinkPhaseInputs<'_>, skipped: &SkippedSnapshot
 /// bins nothing else shims: every importer's direct-dep bins were
 /// written by `SymlinkDirectDependencies`, and publicly hoisted regular
 /// packages go through the post-build top-level pass
-/// (`publicly_hoisted_for_post_build`) — but that pass resolves bins out
+/// (`publicly_hoisted_for_post_build`), but that pass resolves bins out
 /// of virtual-store slots, which a workspace project doesn't have.
 /// Collected before [`write_hoist_links`] consumes the plan; shimmed after
 /// the hoist symlinks land.
@@ -125,19 +138,22 @@ pub(super) fn write_hoist_links(
         &skipped,
     )
     .map_err(LinkPhaseError::HoistSymlink)?;
-    let (private_claimed, private_bin_sources) = link_direct_dep_bins_resolved_with_sources(
+    let private_bins = crate::link_bins_dir(
         &private_hoist_dir,
-        &crate::resolve_hoisted_bin_deps(layout, &result.hoisted_aliases_with_bins),
-        link_options,
+        crate::BinCandidates::Resolved(&crate::resolve_hoisted_bin_deps(
+            layout,
+            &result.hoisted_aliases_with_bins,
+        )),
+        crate::BinsDirPass::new(link_options),
     )
     .map_err(LinkPhaseError::HoistLinkBins)?;
-    pnpm_cmd_shim::prune_stale_bins(&private_hoist_dir.join(".bin"), &private_claimed)
+    pnpm_cmd_shim::prune_stale_bins(&private_hoist_dir.join(".bin"), &private_bins.linked_commands)
         .map_err(LinkPhaseError::HoistLinkBins)?;
     Ok(HoistLinks {
         hoisted_dependencies: result.hoisted_dependencies,
         publicly_hoisted_with_bins: result.publicly_hoisted_aliases_with_bins,
         privately_hoisted_with_bins: result.hoisted_aliases_with_bins,
-        private_bin_sources: private_bin_sources.into(),
+        private_bin_sources: private_bins.sources.into(),
     })
 }
 

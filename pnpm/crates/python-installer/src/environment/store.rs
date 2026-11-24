@@ -1,10 +1,19 @@
 //! Where a project's environment generations live, and the link that
 //! makes one the project's own.
 
-use miette::{IntoDiagnostic, Result, WrapErr, bail};
+use miette::{
+    IntoDiagnostic,
+    Result,
+    WrapErr,
+    bail,
+};
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// The environments pnpm manages, kept in the store rather than beside
@@ -20,6 +29,19 @@ use std::{
 pub(crate) struct EnvironmentStore {
     root: PathBuf,
     frozen: bool,
+}
+
+/// What a project's `.venv` is to pnpm.
+pub(crate) enum EnvironmentLink {
+    /// There is no `.venv`, or it links to an environment that no longer
+    /// exists.
+    Absent,
+    /// A link to this generation of pnpm's. A link into the store from
+    /// another project's directory is still pnpm's: a project that has
+    /// moved keeps its environment.
+    Managed(PathBuf),
+    /// A directory, or a link to anything but a generation of pnpm's.
+    Unmanaged,
 }
 
 impl EnvironmentStore {
@@ -57,7 +79,7 @@ impl EnvironmentStore {
     /// keeps its generations beside it, where 12.4 kept them.
     fn project_directory(&self, root: &Path) -> Result<PathBuf> {
         if self.frozen {
-            return ensure_beside_project(root);
+            return ensure_beside_project(root.to_path_buf());
         }
         let root = dunce::canonicalize(root)
             .into_diagnostic()
@@ -66,34 +88,35 @@ impl EnvironmentStore {
     }
 
     /// The generation the project's `.venv` currently links to, or `None`
-    /// when it has no environment, or links to one that no longer exists.
-    ///
-    /// pnpm replaces only a link it made, so a `.venv` that is a directory,
-    /// or a link to anything but a generation of pnpm's, is refused. A link
-    /// into this store from another project's directory is still pnpm's: a
-    /// project that has moved keeps its environment.
+    /// when it has no environment. pnpm replaces only a link it made, so
+    /// an [`EnvironmentLink::Unmanaged`] one is refused.
     pub(crate) fn validate_link(&self, root: &Path) -> Result<Option<PathBuf>> {
+        match self.link(root)? {
+            EnvironmentLink::Absent => Ok(None),
+            EnvironmentLink::Managed(generation) => Ok(Some(generation)),
+            EnvironmentLink::Unmanaged => {
+                let link = root.join(".venv");
+                bail!("pnpm will not replace an unmanaged Python environment: {}", link.display());
+            }
+        }
+    }
+
+    pub(crate) fn link(&self, root: &Path) -> Result<EnvironmentLink> {
         let link = root.join(".venv");
         match fs::symlink_metadata(&link) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(EnvironmentLink::Absent),
             Err(error) => Err(error).into_diagnostic(),
             Ok(_) => {
                 if !pnpm_fs::is_symlink_or_junction(&link).into_diagnostic()? {
-                    bail!(
-                        "pnpm will not replace an unmanaged Python environment: {}",
-                        link.display(),
-                    );
+                    return Ok(EnvironmentLink::Unmanaged);
                 }
                 let Some(target) = link_target(root, &link)? else {
-                    return Ok(None);
+                    return Ok(EnvironmentLink::Absent);
                 };
-                if !self.holds(&target)? && !holds_beside_project(root, &target)? {
-                    bail!(
-                        "pnpm will not replace an unmanaged Python environment: {}",
-                        link.display(),
-                    );
+                if !self.holds(&target)? && !holds_beside_project(root.to_path_buf(), &target)? {
+                    return Ok(EnvironmentLink::Unmanaged);
                 }
-                Ok(Some(target))
+                Ok(EnvironmentLink::Managed(target))
             }
         }
     }
@@ -139,7 +162,7 @@ fn link_target(root: &Path, link: &Path) -> Result<Option<PathBuf>> {
 /// Whether `generation` is in the project's own `.pnpm/python-envs`, where
 /// pnpm 12.4 published environments and a frozen store still does. One
 /// published there is pnpm's to replace as much as one in the store.
-fn holds_beside_project(root: &Path, generation: &Path) -> Result<bool> {
+fn holds_beside_project(root: PathBuf, generation: &Path) -> Result<bool> {
     let Some(beside) = existing_beside_project(root)? else {
         return Ok(false);
     };
@@ -149,8 +172,8 @@ fn holds_beside_project(root: &Path, generation: &Path) -> Result<bool> {
 
 /// The project's own `.pnpm/python-envs`, created. A checkout can carry a
 /// `.pnpm` that is a symlink, and pnpm writes nothing through one.
-fn ensure_beside_project(root: &Path) -> Result<PathBuf> {
-    let mut path = root.to_path_buf();
+fn ensure_beside_project(root: PathBuf) -> Result<PathBuf> {
+    let mut path = root;
     for component in [".pnpm", "python-envs"] {
         path.push(component);
         match fs::create_dir(&path) {
@@ -168,8 +191,8 @@ fn ensure_beside_project(root: &Path) -> Result<PathBuf> {
 /// The project's own `.pnpm/python-envs` when it exists, reached through
 /// no symlink: 12.4 published nothing through one, so a generation reached
 /// that way is not its.
-fn existing_beside_project(root: &Path) -> Result<Option<PathBuf>> {
-    let mut path = root.to_path_buf();
+fn existing_beside_project(root: PathBuf) -> Result<Option<PathBuf>> {
+    let mut path = root;
     for component in [".pnpm", "python-envs"] {
         path.push(component);
         if !is_real_directory(&path)? {

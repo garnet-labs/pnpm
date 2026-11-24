@@ -1,3 +1,18 @@
+/// Redact credentials in a database target, hiding malformed URLs entirely.
+#[must_use]
+pub fn redact_connection_url(raw: &str) -> String {
+    if numeric_port_authority_end(raw).is_some_and(|end| raw[end..].contains('@')) {
+        return "[redacted]".to_string();
+    }
+    let Ok(mut parsed) = url::Url::parse(raw) else {
+        return "[redacted]".to_string();
+    };
+    redact_url_userinfo(&mut parsed);
+    redact_url_query(&mut parsed);
+    redact_url_fragment(&mut parsed);
+    parsed.to_string()
+}
+
 /// Rewrite every URL in `message` so its `user:pass@` userinfo and any
 /// sensitive query parameter render as `<redacted>`. Shared with the config
 /// layer, whose operator-supplied endpoints can carry either.
@@ -78,11 +93,48 @@ pub(super) fn split_trailing_punctuation(candidate: &str) -> (&str, &str) {
 }
 
 pub(super) fn redact_url_candidate(candidate: &str) -> Option<String> {
-    redact_parseable_url_candidate(candidate).or_else(|| redact_unparsable_url_candidate(candidate))
+    let Ok(url) = url::Url::parse(candidate) else {
+        return redact_unparsable_url_candidate(candidate.to_owned());
+    };
+    let Some(userinfo_end) = find_password_parsed_as_port(candidate) else {
+        return redact_parsed_url(url);
+    };
+    let redacted = redact_userinfo_ending_at(candidate, userinfo_end)?;
+    Some(redact_url_candidate(&redacted).unwrap_or(redacted))
 }
 
-pub(super) fn redact_parseable_url_candidate(candidate: &str) -> Option<String> {
-    let mut url = url::Url::parse(candidate).ok()?;
+/// Returns the userinfo `@` of a URL such as `postgres://admin:123/secret@db/x`,
+/// which parses with port `123` and the rest of the password after it.
+/// An `@` that starts a path segment is taken for a scoped package name, so
+/// `http://localhost:4873/@scope/pkg` keeps its host.
+pub(super) fn find_password_parsed_as_port(candidate: &str) -> Option<usize> {
+    let authority_end = numeric_port_authority_end(candidate)?;
+    find_last_at_outside_segment_start(candidate, authority_end, candidate.len())
+}
+
+fn numeric_port_authority_end(candidate: &str) -> Option<usize> {
+    let authority_start = candidate.find("://")? + 3;
+    let authority_end = authority_start + candidate[authority_start..].find(['/', '?', '#'])?;
+    let authority = &candidate[authority_start..authority_end];
+    let (_, port) = authority.rsplit_once(':')?;
+    if authority.contains('@') || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(authority_end)
+}
+
+pub(super) fn find_last_at_outside_segment_start(
+    candidate: &str,
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    candidate[start..end]
+        .rmatch_indices('@')
+        .map(|(offset, _)| start + offset)
+        .find(|&at| candidate.as_bytes()[at - 1] != b'/')
+}
+
+pub(super) fn redact_parsed_url(mut url: url::Url) -> Option<String> {
     let mut changed = redact_url_userinfo(&mut url);
     changed |= redact_url_query(&mut url);
     changed |= redact_url_fragment(&mut url);
@@ -134,8 +186,8 @@ pub(super) fn redact_url_fragment(url: &mut url::Url) -> bool {
     true
 }
 
-pub(super) fn redact_unparsable_url_candidate(candidate: &str) -> Option<String> {
-    let mut redacted = candidate.to_string();
+pub(super) fn redact_unparsable_url_candidate(candidate: String) -> Option<String> {
+    let mut redacted = candidate;
     let mut changed = false;
     if let Some(safe_url) = redact_unparsable_url_userinfo(&redacted) {
         redacted = safe_url;
@@ -154,10 +206,24 @@ pub(super) fn redact_unparsable_url_candidate(candidate: &str) -> Option<String>
 
 pub(super) fn redact_unparsable_url_userinfo(candidate: &str) -> Option<String> {
     let authority_start = candidate.find("://")? + 3;
-    let scan_end = candidate[authority_start..]
-        .find('?')
-        .map_or(candidate.len(), |offset| authority_start + offset);
-    let userinfo_end = candidate[authority_start..scan_end].rfind('@')? + authority_start;
+    // Any `@` is accepted when none qualifies, so a password ending in `/` stays hidden.
+    let userinfo_end =
+        find_last_at_outside_segment_start(candidate, authority_start, candidate.len())
+            .or_else(|| {
+                candidate[authority_start..]
+                    .rfind('@')
+                    .map(|offset| authority_start + offset)
+            })?;
+    redact_userinfo_ending_at(candidate, userinfo_end)
+}
+
+pub(super) fn redact_userinfo_ending_at(candidate: &str, userinfo_end: usize) -> Option<String> {
+    let authority_start = candidate.find("://")? + 3;
+    // A `?` or `#` before the `@` belongs to either the password or a query or fragment
+    // that holds a secret, so neither side of the `@` is safe to log.
+    if candidate[authority_start..userinfo_end].contains(['?', '#']) {
+        return Some(format!("{}redacted", &candidate[..authority_start]));
+    }
     let mut redacted = String::with_capacity(candidate.len());
     redacted.push_str(&candidate[..authority_start]);
     redacted.push_str("redacted@");
@@ -169,7 +235,8 @@ pub(super) fn redact_sensitive_query_values(candidate: &str) -> Option<String> {
     let query_start = candidate.find('?')?;
     let fragment_start = candidate[query_start + 1..]
         .find('#')
-        .map_or(candidate.len(), |offset| query_start + 1 + offset);
+        .map(|offset| query_start + 1 + offset)
+        .unwrap_or(candidate.len());
     let query = &candidate[query_start + 1..fragment_start];
     let mut redacted = String::with_capacity(candidate.len());
     redacted.push_str(&candidate[..=query_start]);
@@ -177,7 +244,8 @@ pub(super) fn redact_sensitive_query_values(candidate: &str) -> Option<String> {
     for segment in query.split_inclusive('&') {
         let (pair, separator) = segment
             .strip_suffix('&')
-            .map_or((segment, ""), |pair| (pair, "&"));
+            .map(|pair| (pair, "&"))
+            .unwrap_or((segment, ""));
         if let Some(value_start) = pair.find('=') {
             let key = &pair[..value_start];
             if is_sensitive_query_key(key) {
@@ -208,6 +276,9 @@ pub(super) fn is_sensitive_query_key(key: &str) -> bool {
     matches!(
         normalized.as_str(),
         "auth"
+            | "user"
+            | "username"
+            | "sslpassword"
             | "authtoken"
             | "password"
             | "passwd"
@@ -215,6 +286,16 @@ pub(super) fn is_sensitive_query_key(key: &str) -> bool {
             | "secret"
             | "token"
             | "accesstoken"
-            | "apikey",
+            | "apikey"
+            | "signature"
+            | "sig"
+            | "credential"
+            | "accesskeyid"
+            | "awsaccesskeyid"
+            | "xamzsignature"
+            | "xamzcredential"
+            | "xamzsecuritytoken"
+            | "xgoogsignature"
+            | "xgoogcredential",
     )
 }

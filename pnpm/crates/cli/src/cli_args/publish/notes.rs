@@ -8,25 +8,53 @@
 
 pub(super) use parked::check_packed_members;
 
-use super::{PackedDirectory, PublishArgs, PublishScope};
+use super::{
+    PackedDirectory,
+    PublishArgs,
+    PublishScope,
+};
 use crate::cli_args::{
     changelog::published_name,
-    release_notes::{notes_registries, notes_registry_of_manifest, read_release_notes_arg},
+    release_notes::{
+        notes_registries,
+        notes_registry_of_manifest,
+        read_release_notes_arg,
+    },
 };
 use derive_more::Display;
 use miette::Context;
-use parked::{parked_publication, publication_registry};
-use pnpm_config::Config;
-use pnpm_publish::{PublicationNotes, ReleaseNotesTarget};
-use pnpm_release_notes::{
-    find_changelog_section, is_publication_name, normalize_line_endings, validate_note,
+use parked::{
+    parked_publication,
+    publication_registry,
 };
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
-use pnpm_versioning::{ChangelogStorage, changelog_storage};
+use pnpm_config::Config;
+use pnpm_publish::{
+    PublicationNotes,
+    ReleaseNotesTarget,
+};
+use pnpm_release_notes::{
+    find_changelog_section,
+    is_publication_name,
+    normalize_line_endings,
+    validate_note,
+};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+};
+use pnpm_versioning::{
+    ChangelogStorage,
+    changelog_storage,
+};
 use serde_json::Value;
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Where a note came from, as `pnpm publish` reports it.
@@ -73,7 +101,7 @@ impl PublishArgs {
         if !self.flags.batch {
             if self.flags.manifest.notes.release_notes.is_some() {
                 emit_warning::<Reporter>(
-                    "--release-notes is not sent when packages are published one by one. Use --batch to publish them as one release with these notes.",
+                    "--release-notes is not sent when packages are published one by one. Use --batch to publish them as one release with these notes.".to_owned(),
                 );
             }
             return Ok(());
@@ -193,7 +221,7 @@ impl PublishArgs {
             // so the composed publication goes nowhere rather than to every
             // such registry of the batch.
             emit_warning::<Reporter>(
-                r#"The packages of the release that "pnpm version -r" composed release notes for no longer publish to a registry declared with serverType: pnpr. Its publication notes are not sent."#,
+                r#"The packages of the release that "pnpm version -r" composed release notes for no longer publish to a registry declared with serverType: pnpr. Its publication notes are not sent."#.to_owned(),
             );
             let name = self.publication_name(None)?;
             return Ok(PublicationNotes { name, ..PublicationNotes::default() });
@@ -375,11 +403,8 @@ fn validate_publication_name(name: &str) -> miette::Result<()> {
     ))
 }
 
-fn emit_warning<Reporter: self::Reporter>(message: &str) {
-    Reporter::emit(&LogEvent::Global(GlobalLog {
-        level: LogLevel::Warn,
-        message: message.to_owned(),
-    }));
+fn emit_warning<Reporter: self::Reporter>(message: String) {
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }));
 }
 
 mod parked;

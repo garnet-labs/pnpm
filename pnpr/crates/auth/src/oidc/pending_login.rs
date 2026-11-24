@@ -2,11 +2,23 @@
 //! cookie, and the checks that let a callback spend it exactly once.
 
 use super::{
-    BASE64_URL_SAFE_NO_PAD, Deserialize, LoginReturn, MAX_ENTRIES, OidcState, Result, Serialize,
-    Signature, Utc, rejected, unavailable,
+    BASE64_URL_SAFE_NO_PAD,
+    Deserialize,
+    LoginReturn,
+    MAX_ENTRIES,
+    OidcState,
+    Result,
+    Serialize,
+    Signature,
+    rejected,
+    unavailable,
 };
 use base64::Engine as _;
-use p256::ecdsa::signature::{Signer as _, Verifier as _};
+use jiff::Timestamp;
+use p256::ecdsa::signature::{
+    Signer as _,
+    Verifier as _,
+};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct PendingLogin {
@@ -52,7 +64,7 @@ impl OidcState {
         state: &str,
         code: &str,
     ) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
         if login.provider != provider_name
             || login.expires <= now
             || login.state_hash != super::super::sha256_hex(state.as_bytes())

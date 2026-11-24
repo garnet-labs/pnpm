@@ -6,10 +6,20 @@
 //! round-trips as `npm:<real name>@<range>`, or how a prerelease pick
 //! is pinned.
 
-use node_semver::{Range, Version};
-use pnpm_registry::{PackageVersion, RangeSpecStyle};
+use node_semver::Version;
+use pnpm_registry::{
+    PackageVersion,
+    RangeSpecStyle,
+};
+use pnpm_resolving_resolver_base::{
+    is_valid_semver_range,
+    parse_strict_semver_range,
+};
 
-use crate::infer_range_spec_style::{infer_range_spec_style, range_of_specifier};
+use crate::infer_range_spec_style::{
+    infer_range_spec_style,
+    range_of_specifier,
+};
 
 /// The manifest range that pins `version` for a dependency whose existing
 /// manifest entry, if it already had one, read `prev_specifier`, and that
@@ -33,10 +43,10 @@ pub fn calc_version_range(
     let prev_style = prev_specifier.and_then(infer_range_spec_style);
     if prev_style.is_none()
         && requested.is_none_or(|requested| Some(requested) == prev_specifier)
-        && let Some(prev_range) = prev_specifier.and_then(range_of_specifier)
-        && prev_range
-            .parse::<Range>()
-            .is_ok_and(|range| range.satisfies(version))
+        && let Some(prev_range) = prev_specifier
+            .and_then(range_of_specifier)
+            .filter(|prev_range| !prev_range.trim().is_empty())
+        && parse_strict_semver_range(prev_range).is_some_and(|range| range.satisfies(version))
     {
         return prev_range.to_string();
     }
@@ -58,8 +68,8 @@ pub fn calc_version_range(
 /// The specifier to write for `picked` when the dependency currently
 /// declares `bare_specifier` under the install name `alias`.
 ///
-/// Keeps the range operator the dependency already declared — `^` stays
-/// `^`, `~` stays `~`, an exact pin stays exact — preferring
+/// Keeps the range operator the dependency already declared (`^` stays
+/// `^`, `~` stays `~`, an exact pin stays exact) preferring
 /// `prev_specifier` over `bare_specifier`, and falling back to
 /// `default_pin` when neither declares a recoverable pin. An npm alias is
 /// re-wrapped so the entry keeps pointing at the same real package.
@@ -83,7 +93,7 @@ pub fn calc_specifier(
 }
 
 /// The specifier to write for `picked` when the dependency is declared
-/// through a protocol prefix that is not `npm:` — `jsr:` for a JSR
+/// through a protocol prefix that is not `npm:`, `jsr:` for a JSR
 /// package, or a named registry's alias.
 ///
 /// Keeps the declared range operator the same way [`calc_specifier`]
@@ -114,12 +124,12 @@ pub fn calc_prefixed_specifier(
 }
 
 /// The real package name behind an `npm:` alias, or `None` when the
-/// specifier is not an alias — a plain `npm:<range>`, or an
+/// specifier is not an alias, a plain `npm:<range>`, or an
 /// `npm:<name>@<range>` whose name is the install name anyway, both
 /// round-trip as a bare range.
 fn npm_alias_target<'a>(bare_specifier: &'a str, alias: Option<&str>) -> Option<&'a str> {
     let rest = bare_specifier.strip_prefix("npm:")?;
-    if rest.parse::<Range>().is_ok() {
+    if is_valid_semver_range(rest) {
         return None;
     }
     let name = match rest.rfind('@') {

@@ -6,14 +6,17 @@ title: Container images
 Added in: v0.1.0-alpha.11
 
 pnpr serves the OCI distribution API, so `docker`, `podman`, and `skopeo` can
-push to and pull from the same server that hosts your packages.
+push to and pull from the same server that hosts your packages. Declare an
+image registry in the
+[stored registries](configuration.md#registries-in-the-database) and store it
+with [`pnpr registries import`](cli.md#registries):
 
-```yaml title="pnpr.yaml"
+```yaml title="registries.yaml"
 registries:
   images:
     type: hosted
     ecosystem: oci
-    org: images
+    namespace: images
     packages:
       'acme/*': {}
 
@@ -28,7 +31,8 @@ skopeo copy docker://pnpr.example.com/acme/app:1.0 oci:./app:1.0
 ```
 
 Use a pnpr token as the password. The username is not checked, as on every
-registry that takes a personal access token.
+registry that takes a personal access token. The account that first pushes to
+a repository becomes its [owner](ecosystems.md#package-owners).
 
 ## Why `/v2/` is at the root
 
@@ -44,9 +48,9 @@ same declared-provenance rules every other surface uses.
 `containerd`, whose `registries.conf` `location` and `hosts.toml` `server` both
 accept a path.
 
-A `packages:` key is either one repository name or `<namespace>/*`, which claims
-every repository under one leading path component. The namespace is a single
-component, so two namespace claims are either identical or disjoint. Repository
+A `packages:` key is either one repository name or `<prefix>/*`, which claims
+every repository under one leading path component. The prefix is a single
+component, so two prefix claims are either identical or disjoint. Repository
 names follow the distribution spec's grammar and are folded to lowercase, so
 `ACME/App` and `acme/app` are one repository rather than two directories on a
 case-insensitive filesystem.
@@ -65,7 +69,7 @@ exchange their pnpr credential at `/v2/token` for a five-minute token scoped to
 actions the caller already has; the parent credential's revocation, read-only
 flag, and network restrictions all still apply. Anonymous tokens can pull public
 repositories. Scoped tokens reach neither the other pnpr APIs nor the whole
-catalog. Use the same [`secret:`](configuration.md#secret-and-secrets) and registry
+catalog. Use the same [`secret:`](configuration.md#secret) and registry
 configuration on every replica so their tokens interoperate.
 
 ## Uploads and limits
@@ -76,8 +80,8 @@ anything is stored.
 
 ```yaml title="pnpr.yaml"
 oci:
-  maxBlobBytes: 10737418240   # 10 GiB, the default
-  maxManifestBytes: 4194304   # 4 MiB, the default
+  maxBlobSize: 10GiB     # the default
+  maxManifestSize: 4MiB  # the default
 ```
 
 The blob limit applies to a whole resumable upload, mounted layers included, and
@@ -101,9 +105,11 @@ collected.
   scratch for digest verification rather than asking the client to resend.
 * `GET /v2/<name>/referrers/<digest>`, returning an image index of the manifests
   and indexes attached to that subject, with the `artifactType` filter and
-  annotations. A push acknowledges its subject with `OCI-Subject`. Follow the
-  `Link` header to collect every page, even when a filtered page is empty. Each
-  page reads at most 32 manifests and 8 MiB of manifest content.
+  annotations. The filter accepts media types such as `application/spdx+json`
+  with either a literal `+` or `%2B`. A push acknowledges its subject with
+  `OCI-Subject`. Follow the `Link` header to collect every page, even when a
+  filtered page is empty. Each page reads at most 32 manifests and 8 MiB of
+  manifest content.
 * Pagination on `tags/list` and `_catalog` through `n` and `last`, with a `Link`
   header when another page follows. `last` is an exclusive lexical cursor, and
   `n=0` returns an empty list with no continuation link.
@@ -133,39 +139,48 @@ must reach the same instance.
 
 ## Reclaiming space
 
-To collect blobs that no retained manifest references, stop **every writer**
-sharing the store and run:
+To collect blobs that no retained manifest references, run:
 
 ```sh
-pnpr -c config.yaml oci-gc --registry images --dry-run
-pnpr -c config.yaml oci-gc --registry images
+pnpr -c config.yaml gc --registry images --dry-run
+pnpr -c config.yaml gc --registry images
 ```
 
-`--registry` takes the concrete hosted OCI registry's config name. Keep writers
-stopped for the whole scan and deletion. `--dry-run` reports candidates without
-deleting them. `--min-age` defaults to `1d`, which preserves recent
-uploads so an interrupted push can resume; set it to zero to collect every
-unreferenced blob.
+[`pnpr gc`](cli.md#gc) runs while the registry serves and other replicas push.
+`--registry` takes the hosted OCI registry's config name; without it, `gc`
+collects every hosted registry. `--dry-run` reports candidates without deleting
+them. `--min-age` defaults to `1d`, which keeps blobs uploaded more recently so
+an interrupted push can still name them in a manifest; set it to zero to
+collect every unreferenced blob.
+
+A registry stores the bytes of a blob once per namespace, however many
+repositories hold it: a finished upload of a layer the namespace already stores
+maps it into the repository without storing it again, and so does a
+cross-repository mount.
+Collecting a blob a repository no longer reaches unmaps it from that
+repository, and removes its bytes only when no other repository maps them.
 
 Collection keeps untagged manifests, the children of retained indexes, and their
 config and layer blobs, so removing a tag alone does not make its image
-collectible. A missing or corrupt retained manifest stops collection before any
-blob is deleted. The inventory covers unpublished repositories and nested
-repository names, and is streamed into a temporary SQLite database, so local
-temporary storage needs room for it.
+collectible. A missing or corrupt retained manifest keeps every blob of its
+repository. The scan covers unpublished repositories and nested repository
+names.
 
 `DELETE /v2/<name>/blobs/<digest>` removes an unreferenced blob for a caller with
-`unpublish` permission, which the registry default denies. A blob reachable from
-any retained manifest or index is refused. A stored deletion marker blocks
-concurrent manifest publication, and a generation counter rejects publishes
-staged before the deletion. If a deletion is interrupted, stop all writers and
-run `oci-gc` without `--dry-run` to finish it and unblock the repository;
-recovering an explicit deletion ignores `--min-age`. Every replica sharing a
-store must run this version before online deletion is used.
+`delete`, which no [default grant](configuration.md#default-grants) gives. A blob reachable from
+a retained manifest or index of that repository is refused, as is
+`DELETE /v2/<name>/manifests/<digest>` when a retained index still references the
+manifest. The blob deletion unmaps
+the blob from the repository, while the repository is still as the deletion
+found it, and the
+database fences the removal of its bytes the same way it fences `gc`:
+a manifest push that read the blob before it was deleted is refused with `409`
+when it commits, and a push that starts afterwards does not find the blob. If a
+deletion is interrupted after the blob was unmapped, `gc` removes its bytes.
 
 ## Caching Docker Hub and GHCR
 
-```yaml title="pnpr.yaml"
+```yaml title="registries.yaml"
 registries:
   dockerhub:
     type: upstream

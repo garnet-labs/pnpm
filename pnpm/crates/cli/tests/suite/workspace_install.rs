@@ -8,16 +8,31 @@
 
 use crate::_utils;
 
-use _utils::{importer, importer_version, read_lockfile, snapshot_entries};
+use _utils::{
+    importer,
+    importer_version,
+    read_lockfile,
+    snapshot_entries,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_lockfile::PkgName;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
-    fs::{bump_mtime, is_symlink_or_junction},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
+    fs::{
+        bump_mtime,
+        is_symlink_or_junction,
+    },
 };
 use pretty_assertions::assert_eq;
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
 fn pacquet_at(workspace: &Path) -> Command {
     Command::cargo_bin("pnpm").expect("find the pnpm binary").with_current_dir(workspace)
@@ -110,7 +125,11 @@ fn workspace_links_above_root_resolve() {
 }
 
 fn assert_workspace_links_above_root_resolve(workspace_depth: &str, node_linker: &str) {
-    use _utils::{ManifestDeps, pacquet_in, write_project_manifest};
+    use _utils::{
+        ManifestDeps,
+        pacquet_in,
+        write_project_manifest,
+    };
 
     let fixture = CommandTempCwd::init();
     let workspace = fixture.workspace.join(workspace_depth);
@@ -445,12 +464,12 @@ fn fresh_resolve_walks_every_workspace_importer() {
     let a_dep = workspace.join("packages/a/node_modules/@pnpm.e2e/hello-world-js-bin-parent");
     assert!(
         is_symlink_or_junction(&a_dep).expect("query packages/a symlink"),
-        "packages/a/node_modules direct-dep symlink missing — sibling importer's deps weren't walked",
+        "packages/a/node_modules direct-dep symlink missing, sibling importer's deps weren't walked",
     );
     let b_dep = workspace.join("packages/b/node_modules/@pnpm.e2e/hello-world-js-bin");
     assert!(
         is_symlink_or_junction(&b_dep).expect("query packages/b symlink"),
-        "packages/b/node_modules direct-dep symlink missing — sibling importer's deps weren't walked",
+        "packages/b/node_modules direct-dep symlink missing, sibling importer's deps weren't walked",
     );
 
     // Shared virtual store: both packages land under
@@ -475,7 +494,7 @@ fn fresh_resolve_walks_every_workspace_importer() {
         "pnpm-lock.yaml missing importers entry for packages/b:\n{lockfile}",
     );
     // hello-world-js-bin-parent is a direct dep of packages/a, so it
-    // should appear in that importer's section — not just in
+    // should appear in that importer's section, not just in
     // `packages:` where any transitive could also surface the name.
     // Slice the lockfile to packages/a's importer block and check
     // there.
@@ -492,11 +511,43 @@ fn fresh_resolve_walks_every_workspace_importer() {
     drop((root, mock_instance));
 }
 
+/// A `workspace:^` branch admits every workspace version, so a union with
+/// it links the sibling whatever the other branches say.
+#[test]
+fn workspace_caret_union_links_the_sibling() {
+    for field in ["dependencies", "peerDependencies"] {
+        let CommandTempCwd { root, workspace, npmrc_info, .. } = two_project_workspace(
+            &serde_json::json!({ "name": "pkg-a", "version": "1.2.3" }),
+            &serde_json::json!({
+                "name": "pkg-b",
+                "version": "1.0.0",
+                field: { "pkg-a": "workspace:^ || ^2.0.0" },
+            }),
+        );
+        let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+        pacquet_at(&workspace)
+            .with_arg("install")
+            .assert()
+            .success();
+        assert!(
+            is_symlink_or_junction(&workspace.join("pkg-b/node_modules/pkg-a")).unwrap(),
+            "{field}: pkg-a is not linked",
+        );
+        pacquet_at(&workspace)
+            .with_args(["install", "--frozen-lockfile"])
+            .assert()
+            .success();
+
+        drop((root, mock_instance));
+    }
+}
+
 /// A workspace member that declares a `peerDependencies` entry gets
 /// that peer auto-installed (pnpm's default) and materialized into its
 /// lockfile importer `dependencies`. A subsequent `--frozen-lockfile`
 /// install must accept that lockfile instead of misreading the
-/// materialized peer as a removed dependency — the alpha.14
+/// materialized peer as a removed dependency, the alpha.14
 /// workspace-importer freshness regression.
 #[test]
 fn frozen_install_accepts_auto_installed_workspace_peer() {
@@ -746,6 +797,256 @@ fn optional_peer_is_supplied_by_a_sibling_whose_peers_the_importer_accepts() {
     );
 }
 
+/// Returns `pkg-a`'s resolved version of the optional peer's dependent.
+fn install_optional_peer_carrier_next_to_sibling(pkg_a_y: &str) -> String {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } = two_project_workspace(
+        &serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/has-optional-y-v2-peer-user-carrier": "1.0.0",
+                "@pnpm/y": pkg_a_y,
+            },
+        }),
+        &serde_json::json!({
+            "name": "pkg-b",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/y-v2-peer-user-carrier": "1.0.0",
+                "@pnpm.e2e/y-v2-peer-user": "1.0.0",
+                "@pnpm/y": "2.0.0",
+            },
+        }),
+    );
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    let version =
+        importer_version(&lockfile, "pkg-a", "@pnpm.e2e/has-optional-y-v2-peer-user-carrier");
+    drop((root, mock_instance));
+    version
+}
+
+/// <https://github.com/orgs/pnpm/discussions/17718>
+#[test]
+fn optional_peer_is_not_supplied_when_a_required_peer_it_brings_in_rejects_the_importers_version() {
+    assert_eq!(install_optional_peer_carrier_next_to_sibling("1.0.0"), "1.0.0");
+}
+
+#[test]
+fn optional_peer_is_supplied_when_the_required_peers_it_brings_in_accept_the_importers_versions() {
+    assert!(
+        install_optional_peer_carrier_next_to_sibling("2.0.0")
+            .starts_with("1.0.0(@pnpm.e2e/y-v2-peer-user-carrier@1.0.0"),
+    );
+}
+
+/// <https://github.com/pnpm/pnpm/issues/17781>
+#[test]
+fn variant_that_left_a_rejected_optional_peer_unbound_does_not_collapse_into_a_sibling_variant() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } = two_project_workspace(
+        &serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/has-optional-y-v2-peer-user-carrier": "1.0.0",
+                "@pnpm/y": "1.0.0",
+            },
+        }),
+        &serde_json::json!({
+            "name": "pkg-b",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/has-optional-y-v2-peer-user-carrier": "1.0.0",
+                "@pnpm.e2e/y-v2-peer-user-carrier": "1.0.0",
+                "@pnpm.e2e/y-v2-peer-user": "1.0.0",
+                "@pnpm/y": "2.0.0",
+            },
+        }),
+    );
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    let carrier = "@pnpm.e2e/has-optional-y-v2-peer-user-carrier";
+    let pkg_a_version = importer_version(&lockfile, "pkg-a", carrier);
+    let pkg_b_version = importer_version(&lockfile, "pkg-b", carrier);
+    drop((root, mock_instance));
+    assert_eq!(pkg_a_version, "1.0.0");
+    assert!(
+        pkg_b_version.starts_with("1.0.0(@pnpm.e2e/y-v2-peer-user-carrier@1.0.0"),
+        "{pkg_b_version}",
+    );
+}
+
+/// <https://github.com/pnpm/pnpm/issues/17781>
+#[test]
+fn injected_package_keeps_an_optional_peer_its_consumer_rejected_unbound() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } = three_project_workspace(
+        &serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "dependencies": { "@pnpm.e2e/has-optional-y-v2-peer-user-carrier": "1.0.0" },
+        }),
+        &serde_json::json!({
+            "name": "pkg-b",
+            "version": "1.0.0",
+            "dependencies": { "pkg-a": "workspace:1.0.0", "@pnpm/y": "1.0.0" },
+            "dependenciesMeta": { "pkg-a": { "injected": true } },
+        }),
+        &serde_json::json!({
+            "name": "pkg-c",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/y-v2-peer-user-carrier": "1.0.0",
+                "@pnpm.e2e/y-v2-peer-user": "1.0.0",
+                "@pnpm/y": "2.0.0",
+            },
+        }),
+    );
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    let pkg_a_carrier =
+        importer_version(&lockfile, "pkg-a", "@pnpm.e2e/has-optional-y-v2-peer-user-carrier");
+    let pkg_b_pkg_a = importer_version(&lockfile, "pkg-b", "pkg-a");
+    drop((root, mock_instance));
+    assert!(
+        pkg_a_carrier.starts_with("1.0.0(@pnpm.e2e/y-v2-peer-user-carrier@1.0.0"),
+        "{pkg_a_carrier}",
+    );
+    assert!(pkg_b_pkg_a.starts_with("file:pkg-a"), "{pkg_b_pkg_a}");
+}
+
+#[test]
+fn optional_peer_is_supplied_when_the_required_peers_it_brings_in_agree_on_a_shared_peer_version() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } = three_project_workspace(
+        &serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "dependencies": { "@pnpm.e2e/has-optional-peer-wave-a": "1.0.0" },
+        }),
+        &serde_json::json!({
+            "name": "pkg-b",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/peer-wave-a": "1.0.0",
+                "@pnpm.e2e/peer-wave-b": "1.0.0",
+                "@pnpm.e2e/peer-wave-c": "1.0.0",
+                "@pnpm/y": "1.0.0",
+            },
+        }),
+        &serde_json::json!({
+            "name": "pkg-c",
+            "version": "1.0.0",
+            "dependencies": { "@pnpm/y": "2.0.0" },
+        }),
+    );
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    let version = importer_version(&lockfile, "pkg-a", "@pnpm.e2e/has-optional-peer-wave-a");
+    drop((root, mock_instance));
+    assert!(version.starts_with("1.0.0(@pnpm.e2e/peer-wave-a@1.0.0"), "{version}");
+}
+
+#[test]
+fn optional_peer_is_not_supplied_when_the_required_peers_it_brings_in_conflict_on_a_shared_peer() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } = two_project_workspace(
+        &serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "dependencies": { "@pnpm.e2e/has-optional-peer-wave-conflict": "1.0.0" },
+        }),
+        &serde_json::json!({
+            "name": "pkg-b",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/peer-wave-conflict": "1.0.0",
+                "@pnpm.e2e/peer-wave-b": "1.0.0",
+                "@pnpm.e2e/peer-wave-d": "1.0.0",
+                "@pnpm/y": "2.0.0",
+            },
+        }),
+    );
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    let version = importer_version(&lockfile, "pkg-a", "@pnpm.e2e/has-optional-peer-wave-conflict");
+    drop((root, mock_instance));
+    assert_eq!(version, "1.0.0");
+}
+
+/// Returns `pkg-a`'s resolved version of the optional peer's dependent.
+fn install_optional_range_peer_carrier_next_to_sibling(carrier: &str, pkg_a_y: &str) -> String {
+    let optional_parent = format!("@pnpm.e2e/has-optional-{carrier}");
+    let CommandTempCwd { root, workspace, npmrc_info, .. } = two_project_workspace(
+        &serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "dependencies": { &optional_parent: "1.0.0", "@pnpm/y": pkg_a_y },
+        }),
+        &serde_json::json!({
+            "name": "pkg-b",
+            "version": "1.0.0",
+            "dependencies": {
+                format!("@pnpm.e2e/{carrier}"): "1.0.0",
+                "@pnpm.e2e/range-peer-user": "1.0.0",
+            },
+        }),
+    );
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    let version = importer_version(&lockfile, "pkg-a", &optional_parent);
+    drop((root, mock_instance));
+    version
+}
+
+#[test]
+fn optional_peer_is_not_supplied_when_a_required_peer_it_brings_in_from_the_registry_rejects_the_importers_version()
+ {
+    assert_eq!(
+        install_optional_range_peer_carrier_next_to_sibling("range-peer-carrier", "1.0.0"),
+        "1.0.0",
+    );
+}
+
+#[test]
+fn optional_peer_is_supplied_when_a_required_peer_it_brings_in_from_the_registry_accepts_the_importers_versions()
+ {
+    assert_eq!(
+        install_optional_range_peer_carrier_next_to_sibling("range-peer-carrier", "2.0.0"),
+        "1.0.0(@pnpm.e2e/range-peer-carrier@1.0.0(@pnpm.e2e/range-peer-user@2.0.0(@pnpm/y@2.0.0)))",
+    );
+}
+
+#[test]
+fn optional_peer_is_not_supplied_when_a_required_peer_it_brings_in_does_not_resolve() {
+    assert_eq!(
+        install_optional_range_peer_carrier_next_to_sibling("unresolvable-peer-carrier", "2.0.0"),
+        "1.0.0",
+    );
+}
+
 /// The provider is left only in the wanted lockfile, so the lockfile is
 /// what describes its peers.
 #[test]
@@ -858,7 +1159,7 @@ fn optional_peer_stays_out_of_the_importer_without_auto_install_peers() {
         "optional peer linked into pkg-a under `autoInstallPeers: false`",
     );
     // The optional peer is still deduplicated into the dependent's peer
-    // context — the same entry the TypeScript CLI writes for this
+    // context, the same entry the TypeScript CLI writes for this
     // workspace. Its counterpart lives in `peerDependencies.ts`, in
     // `an optional peer declared by a workspace project is not added to
     // its own importer, when auto-install-peers is off`.
@@ -927,7 +1228,7 @@ fn no_peer_is_hoisted_when_auto_install_peers_and_dedupe_peer_dependents_are_off
 
 /// When the workspace root and a non-root importer both depend on the
 /// same workspace package via `workspace:*`, each importer's resolved
-/// `link:` target is relative to *its own* directory — pnpm writes
+/// `link:` target is relative to *its own* directory, pnpm writes
 /// `link:packages/lib` for the root and `link:../lib` for
 /// `packages/app`.
 #[test]
@@ -1168,7 +1469,7 @@ fn workspace_specs_do_not_resolve_a_non_string_version_as_zero() {
 }
 
 /// A workspace root defined by `pnpm-workspace.yaml` alone is legal without a
-/// root `package.json`, and installing must not scaffold one — pnpm never
+/// root `package.json`, and installing must not scaffold one, pnpm never
 /// does, and a scaffolded root manifest (with the init template's failing
 /// `test` script) would become a selectable project for recursive commands.
 #[test]
@@ -1213,12 +1514,17 @@ fn install_does_not_scaffold_a_root_manifest_in_a_workspace() {
 
 /// With `preferSymlinkedExecutables`, the isolated linker also
 /// materializes `.bin` entries as symlinks to executable bin files instead of
-/// shell shims — pnpm's `deps-installer` "prefer-symlinked-executables"
+/// shell shims, pnpm's `deps-installer` "prefer-symlinked-executables"
 /// install coverage.
 #[test]
 #[cfg_attr(target_os = "windows", ignore = "preferSymlinkedExecutables is inert on Windows")]
 fn prefer_symlinked_executables_symlinks_workspace_bins() {
-    use _utils::{ManifestDeps, WorkspaceFixture, read_manifest, write_manifest_value};
+    use _utils::{
+        ManifestDeps,
+        WorkspaceFixture,
+        read_manifest,
+        write_manifest_value,
+    };
     let fixture = WorkspaceFixture::new();
     fixture.append_workspace_yaml("preferSymlinkedExecutables: true\n");
     let consumer = fixture.project(

@@ -2,13 +2,18 @@
 //! steps run in order: required-field validation, `bin` normalization,
 //! `peerDependenciesMeta` defaulting, then `repository` normalization.
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use miette::Diagnostic;
 use pnpm_package_manifest::is_truthy;
-use serde_json::{Map, Value};
+use serde_json::{
+    Map,
+    Value,
+};
 
-/// Failures raised while transforming a publish manifest. Both carry
-/// the pnpm error codes published for these conditions.
+/// Failures raised while transforming a publish manifest.
 #[derive(Debug, Display, Error, Diagnostic, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransformError {
@@ -16,6 +21,10 @@ pub enum TransformError {
     #[display("Missing required field \"{field}\"")]
     #[diagnostic(code(ERR_PNPM_MISSING_REQUIRED_FIELD))]
     MissingRequiredField { field: &'static str },
+
+    #[display("Invalid package name \"{name}\".")]
+    #[diagnostic(code(ERR_PNPM_INVALID_PACKAGE_NAME))]
+    InvalidPackageName { name: String },
 
     /// A string `bin` was declared on a package whose scoped name has
     /// no `/` segment to derive the command name from.
@@ -35,8 +44,8 @@ pub fn transform(manifest: &mut Map<String, Value>) -> Result<(), TransformError
 
 /// Reject a manifest missing the registry-required `name` / `version`.
 /// A field counts as missing only when it is absent or JS-falsy
-/// (`null`, `false`, `0`, or `""`), so any other present value —
-/// including a non-string — passes.
+/// (`null`, `false`, `0`, or `""`), so any other present value
+/// (including a non-string) passes.
 fn transform_required_fields(manifest: &Map<String, Value>) -> Result<(), TransformError> {
     for field in ["name", "version"] {
         if !manifest.get(field).is_some_and(is_truthy) {
@@ -53,11 +62,10 @@ fn transform_bin(manifest: &mut Map<String, Value>) -> Result<(), TransformError
         return Ok(());
     };
     let bin = bin.clone();
-    // `transformRequiredFields` already guaranteed a string `name`.
-    let pkg_name = manifest
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let name = &manifest["name"];
+    let pkg_name = name
+        .as_str()
+        .ok_or_else(|| TransformError::InvalidPackageName { name: name.to_string() })?;
     let command_name = normalize_bin_name(pkg_name)?;
     let mut bin_object = Map::new();
     bin_object.insert(command_name, Value::String(bin));

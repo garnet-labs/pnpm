@@ -1,15 +1,33 @@
 use indexmap::IndexMap;
-use pnpm_config::{Config, NeedsFullMetadataFor};
-use pnpm_lockfile::Lockfile;
-use pnpm_network::{AuthHeaders, ThrottledClient};
-use pnpm_resolving_npm_resolver::InMemoryPackageMetaCache;
-use pnpm_resolving_resolver_base::{PreferredVersions, PreferredVersionsOverlay};
-use pnpm_store_dir::{
-    SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreDir, StoreIndexWriter,
+use pnpm_config::{
+    Config,
+    NeedsFullMetadataFor,
 };
-use pnpm_tarball::{MemCache, SharedReportedProgressKeys};
+use pnpm_lockfile::Lockfile;
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+};
+use pnpm_resolving_npm_resolver::InMemoryPackageMetaCache;
+use pnpm_resolving_resolver_base::{
+    PreferredVersions,
+    PreferredVersionsOverlay,
+};
+use pnpm_store_dir::{
+    SharedReadonlyStoreIndex,
+    SharedVerifiedFilesCache,
+    StoreDir,
+    StoreIndexWriter,
+};
+use pnpm_tarball::{
+    MemCache,
+    SharedReportedProgressKeys,
+};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     path::Path,
     sync::Arc,
 };
@@ -20,6 +38,9 @@ pub(crate) struct WorkspaceLifecycleHooks {
     pub pnpmfile: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     pub read_package_log: Option<pnpm_hooks::LogFn>,
     pub finalized_package: Option<pnpm_resolving_deps_resolver::FinalizedPackageFn>,
+    pub resolved_package: Option<pnpm_resolving_deps_resolver::ResolvedPackageFn>,
+    pub max_snapshots: Option<usize>,
+    pub cancel: pnpm_resolving_deps_resolver::ResolutionCancel,
 }
 
 /// Each importer's root preference layer of the specifiers its manifest
@@ -27,6 +48,8 @@ pub(crate) struct WorkspaceLifecycleHooks {
 pub(crate) type OwnManifestSpecifiers = BTreeMap<String, Arc<PreferredVersionsOverlay>>;
 
 pub(crate) struct ImporterVersionSeeds<'a> {
+    pub requested_direct_dependencies:
+        Option<&'a BTreeMap<String, std::collections::BTreeSet<String>>>,
     pub shared: &'a Arc<PreferredVersions>,
     pub by_importer: &'a BTreeMap<String, Arc<PreferredVersions>>,
     /// Each importer's own manifest specifiers, when the seeds leave out other
@@ -34,11 +57,11 @@ pub(crate) struct ImporterVersionSeeds<'a> {
     pub own_manifest_specifiers: Option<&'a OwnManifestSpecifiers>,
     /// See [`crate::resolution_policy::PickPolicy`].
     pub pick_lowest: bool,
-    pub published_by: Option<chrono::DateTime<chrono::Utc>>,
+    pub published_by: Option<jiff::Timestamp>,
 }
 
 pub(crate) struct ResolverStoreContext<'a> {
-    pub dir: &'static StoreDir,
+    pub dir: &'a StoreDir,
     pub index: Option<&'a SharedReadonlyStoreIndex>,
     pub index_writer: &'a Arc<StoreIndexWriter>,
     pub verified_files_cache: &'a SharedVerifiedFilesCache,
@@ -50,7 +73,7 @@ pub(crate) struct ResolverFetchContext<'a> {
     pub tarballs: &'a Arc<MemCache>,
     pub auth_headers: &'a Arc<AuthHeaders>,
     pub progress_reported: &'a SharedReportedProgressKeys,
-    /// Whether a resolved tarball is prefetched — `false` for a run
+    /// Whether a resolved tarball is prefetched, `false` for a run
     /// whose install pass will never ask for those bytes.
     pub prefetch: bool,
     /// Where a run that fetches into the store keeps the download tasks
@@ -63,11 +86,11 @@ pub(crate) struct ResolverRegistryContext<'a> {
     pub by_prefix: &'a HashMap<String, String>,
     pub declared: &'a pnpm_lockfile::DeclaredRegistryPrefixes,
     pub cache: &'a Arc<InMemoryPackageMetaCache>,
-    /// See `NpmResolver::full_metadata` — forced on when `time-based`
+    /// See `NpmResolver::full_metadata`, forced on when `time-based`
     /// resolution or the `no-downgrade` trust policy needs the
     /// per-version `time` field.
     pub full_metadata: bool,
-    /// See `NpmResolver::needs_full_metadata_for` — the same question asked
+    /// See `NpmResolver::needs_full_metadata_for`, the same question asked
     /// of one registry.
     pub needs_full_metadata: NeedsFullMetadataFor,
 }
@@ -84,6 +107,7 @@ pub(crate) struct ResolverChainProject<'a> {
     pub requester: &'a str,
     pub supported_architectures: Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
     pub lockfile: Option<&'a Lockfile>,
+    pub local_filesystem_policy: pnpm_resolving_local_resolver::LocalFilesystemPolicy,
 }
 
 pub(crate) struct ReuseLockfileInputs<'a> {
@@ -108,6 +132,15 @@ pub(crate) struct ReuseLockfileInputs<'a> {
 }
 
 impl<'a> ImporterVersionSeeds<'a> {
+    pub(super) fn requested_for_importer(&self, id: &str) -> rustc_hash::FxHashSet<String> {
+        self.requested_direct_dependencies
+            .and_then(|requests| requests.get(id))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn for_importer(&self, id: &str) -> &'a Arc<PreferredVersions> {
         self.by_importer.get(id).unwrap_or(self.shared)
     }

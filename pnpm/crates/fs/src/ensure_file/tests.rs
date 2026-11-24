@@ -1,12 +1,29 @@
 use super::{
-    EnsureFileError, TempFile, create_exclusive_temp_file, ensure_file, ensure_file_atomically,
-    file_equals_bytes, strip_dash_suffix, temp_path_in,
+    EnsureFileError,
+    TempFile,
+    create_exclusive_temp_file,
+    ensure_file,
+    ensure_file_atomically,
+    file_equals_bytes,
+    strip_dash_suffix,
+    temp_path_in,
 };
-use std::{fs, io, path::Path};
+use std::{
+    fs,
+    io,
+    path::Path,
+};
 use tempfile::tempdir;
 
 #[cfg(unix)]
-use super::{EMFILE, ENFILE, ensure_cas_file, retry_on_fd_pressure};
+use super::{
+    EMFILE,
+    ENFILE,
+    ensure_cas_file,
+    retry_on_fd_pressure,
+};
+#[cfg(unix)]
+use pnpm_ffi_fs::FileMode;
 
 #[test]
 fn writes_a_new_file() {
@@ -28,7 +45,8 @@ fn atomic_variant_publishes_a_new_file_without_leaving_temp_files() {
     assert_eq!(fs::read(&path).unwrap(), b"{}");
     let siblings: Vec<_> = fs::read_dir(tmp.path())
         .unwrap()
-        .map(|entry| entry.unwrap().file_name())
+        .map(Result::unwrap)
+        .map(|value| value.file_name())
         .collect();
     assert_eq!(siblings, vec![std::ffi::OsString::from("published.json")]);
 }
@@ -84,15 +102,16 @@ fn existing_target_with_wrong_content_is_overwritten_atomically() {
     assert_eq!(fs::read(&path).unwrap(), b"fresh");
     let siblings: Vec<_> = fs::read_dir(tmp.path())
         .unwrap()
-        .map(|entry| entry.unwrap().file_name())
+        .map(Result::unwrap)
+        .map(|value| value.file_name())
         .collect();
     assert_eq!(siblings, vec![std::ffi::OsString::from("torn.txt")]);
 }
 
 /// Repairing a corrupt CAS blob with `ensure_cas_file` must keep the
-/// inode so hard-linked copies — other projects' `node_modules`
-/// entries importing the same blob — are healed by the same write
-/// (pnpm/pnpm#3445). `ensure_file`'s rename repair would swap the
+/// inode so hard-linked copies (other projects' `node_modules`
+/// entries importing the same blob) are healed by the same write
+/// (pnpm/pnpm#3445). A rename repair would swap the
 /// inode and leave the linked copy corrupt.
 #[cfg(unix)]
 #[test]
@@ -107,7 +126,7 @@ fn cas_repair_preserves_inode_and_heals_hard_links() {
     let ino_before = fs::metadata(&path).unwrap().ino();
 
     // Editing through the hard link corrupts the store blob in place,
-    // changing its size (an appended line) — the size-mismatch branch.
+    // changing its size (an appended line), the size-mismatch branch.
     fs::write(&linked, b"hacked from another project").unwrap();
 
     ensure_cas_file(&path, b"original", None).expect("in-place repair");
@@ -190,7 +209,8 @@ fn unix_mode_is_applied_on_new_files() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("exec.sh");
 
-    ensure_file(&path, b"#!/bin/sh\n", Some(0o755)).expect("mode-honouring write");
+    ensure_file(&path, b"#!/bin/sh\n", Some(FileMode::from_mode(0o755)))
+        .expect("mode-honouring write");
 
     let mode = fs::metadata(&path)
         .unwrap()
@@ -244,8 +264,8 @@ fn create_exclusive_temp_file_yields_distinct_open_files() {
     assert_eq!(fs::read(&path_a).unwrap(), b"payload");
 }
 
-/// A symlink at the target path — which on Unix returns `EEXIST`
-/// from `open(O_CREAT|O_EXCL)` just like a regular file would —
+/// A symlink at the target path (which on Unix returns `EEXIST`
+/// from `open(O_CREAT|O_EXCL)` just like a regular file would)
 /// must be scrubbed and replaced with a real regular file even
 /// when its target's bytes match what we were about to write.
 /// Leaving the symlink in place would fool downstream
@@ -351,12 +371,12 @@ fn retry_on_fd_pressure_retries_emfile_and_enfile_until_success() {
 /// `O_CREAT|O_EXCL`; the rest take `verify_or_rewrite`. With the
 /// per-path mutex, the late-comers see the winner's fully-written
 /// file and take the byte-match fast path, so the inode never
-/// changes. Without it, a late-comer can race into `write_atomic`
+/// changes. Without it, a late-comer can race into the atomic write
 /// on a partial size, swap the inode, and the per-writer
 /// observations below can diverge under a multi-rename race.
 ///
 /// Note this is a smoke test, not a strict regression test: any
-/// observation taken *after* `ensure_file` returns has already
+/// observation taken *after* the write returns has already
 /// missed the rename window, so a single-rename race typically
 /// converges on one final inode and slips past. It catches the
 /// multi-rename case and validates the "no deadlock, all writers
@@ -364,9 +384,15 @@ fn retry_on_fd_pressure_retries_emfile_and_enfile_until_success() {
 #[cfg(unix)]
 #[test]
 fn concurrent_writers_of_same_path_do_not_swap_the_inode() {
-    use std::os::unix::fs::MetadataExt;
-    use std::sync::{Arc, Barrier, Mutex};
-    use std::thread;
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::{
+            Arc,
+            Barrier,
+            Mutex,
+        },
+        thread,
+    };
 
     let tmp = tempdir().unwrap();
     let path = Arc::new(tmp.path().join("shared"));
@@ -422,7 +448,10 @@ fn retry_on_fd_pressure_propagates_non_fd_errors() {
 #[cfg(unix)]
 #[test]
 fn new_files_in_a_group_writable_directory_keep_group_write() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{
+        MetadataExt,
+        PermissionsExt,
+    };
 
     let tmp = tempdir().unwrap();
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
@@ -435,7 +464,7 @@ fn new_files_in_a_group_writable_directory_keep_group_write() {
     assert_eq!(meta.gid(), parent_gid);
 
     let exec = tmp.path().join("exec.sh");
-    ensure_file(&exec, b"#!/bin/sh\n", Some(0o755)).unwrap();
+    ensure_file(&exec, b"#!/bin/sh\n", Some(FileMode::from_mode(0o755))).unwrap();
     assert_eq!(
         fs::metadata(&exec)
             .unwrap()
@@ -449,7 +478,10 @@ fn new_files_in_a_group_writable_directory_keep_group_write() {
 #[cfg(unix)]
 #[test]
 fn existing_file_keeps_its_mode_owner_and_inode() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{
+        MetadataExt,
+        PermissionsExt,
+    };
 
     let tmp = tempdir().unwrap();
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
@@ -459,7 +491,7 @@ fn existing_file_keeps_its_mode_owner_and_inode() {
     let before = fs::metadata(&path).unwrap();
 
     ensure_file(&path, b"same", None).unwrap();
-    ensure_cas_file(&path, b"same", Some(0o755)).unwrap();
+    ensure_cas_file(&path, b"same", Some(FileMode::from_mode(0o755))).unwrap();
 
     let after = fs::metadata(&path).unwrap();
     assert_eq!(after.uid(), before.uid());
@@ -476,7 +508,7 @@ fn private_mode_is_not_widened_in_a_group_writable_directory() {
     let tmp = tempdir().unwrap();
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
     let path = tmp.path().join("secret");
-    ensure_file(&path, b"x", Some(0o600)).unwrap();
+    ensure_file(&path, b"x", Some(FileMode::from_mode(0o600))).unwrap();
     assert_eq!(
         fs::metadata(&path)
             .unwrap()

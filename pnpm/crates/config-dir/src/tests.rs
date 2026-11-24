@@ -1,5 +1,8 @@
 use super::config_dir;
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 fn home(path: &str) -> impl FnOnce() -> Option<PathBuf> + use<'_> {
     move || Some(PathBuf::from(path))
@@ -17,6 +20,12 @@ fn prefers_xdg_config_home_on_every_os_without_consulting_home() {
         });
         assert_eq!(dir, Some(PathBuf::from("/srv/xdg").join("pnpm")), "{os}");
     }
+}
+
+#[test]
+fn empty_env_values_count_as_unset() {
+    let dir = config_dir("pnpr", "windows", Some(""), Some(""), home(r"C:\Users\u"));
+    assert_eq!(dir, Some(Path::new(r"C:\Users\u").join(".config").join("pnpr")));
 }
 
 #[test]

@@ -1,9 +1,23 @@
 use super::{
-    BASE64_URL_SAFE_NO_PAD, ClientId, CoreIdToken, CoreIdTokenVerifier, CoreJsonWebKeySet,
-    CoreJwsSigningAlgorithm, IssuerUrl, Nonce, OidcBinding, OidcProvider, OidcWorkload, Provider,
-    Result, SessionUser, Utc, Value, rejected,
+    BASE64_URL_SAFE_NO_PAD,
+    ClientId,
+    CoreIdToken,
+    CoreIdTokenVerifier,
+    CoreJsonWebKeySet,
+    CoreJwsSigningAlgorithm,
+    IssuerUrl,
+    Nonce,
+    OidcBinding,
+    OidcProvider,
+    OidcWorkload,
+    Provider,
+    Result,
+    SessionUser,
+    Value,
+    rejected,
 };
 use base64::Engine as _;
+use jiff::Timestamp;
 
 pub(super) fn verify_workload(
     config: &OidcProvider,
@@ -18,16 +32,38 @@ pub(super) fn verify_workload(
     validate_claims(config, &token_payload(raw)?)
 }
 
-/// The one configured user the token's claims bind to.
-/// The user of the one login binding the ID token satisfies, with the team
-/// grants its groups claim earns.
-pub(super) fn bound_user(config: &OidcProvider, token: &CoreIdToken) -> Result<SessionUser> {
+/// Bind verified login claims to an account and its session team grants.
+pub(super) fn bound_user<SubjectBinding: AsRef<str>>(
+    config: &OidcProvider,
+    token: &CoreIdToken,
+    resolve_subject: impl FnOnce(&str) -> Result<SubjectBinding>,
+) -> Result<(SessionUser, Option<SubjectBinding>)> {
     let payload = token_payload(&token.to_string())?;
     validate_claims(config, &payload)?;
     let login = config.login.as_ref().ok_or_else(rejected)?;
-    let binding = unique_binding(login.users.iter(), &payload)?;
+    let subject_binding = if login.scim {
+        let subject = payload
+            .get("sub")
+            .and_then(Value::as_str)
+            .filter(|subject| !subject.is_empty())
+            .ok_or_else(rejected)?;
+        if config.workloads
+            .iter()
+            .any(|workload| workload.identity.subject == subject)
+        {
+            return Err(rejected());
+        }
+        Some(resolve_subject(subject)?)
+    } else {
+        None
+    };
+    let user_id = if let Some(binding) = &subject_binding {
+        binding.as_ref().to_string()
+    } else {
+        unique_binding(login.users.iter(), &payload)?.user_id.clone()
+    };
     let teams = super::groups::granted_teams(login, &payload);
-    Ok(SessionUser { username: binding.username.clone(), teams })
+    Ok((SessionUser { user_id, teams }, subject_binding))
 }
 
 pub(super) fn token_verifier(
@@ -74,7 +110,7 @@ pub(super) fn token_payload(raw: &str) -> Result<Value> {
 }
 
 pub(super) fn validate_times(payload: &Value) -> Result<()> {
-    let now = Utc::now().timestamp();
+    let now = Timestamp::now().as_second();
     let issued = payload
         .get("iat")
         .and_then(Value::as_i64)

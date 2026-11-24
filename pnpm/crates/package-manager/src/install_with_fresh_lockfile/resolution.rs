@@ -1,5 +1,8 @@
 pub(super) use early_materializer::{
-    FastOverrideFit, fast_override_eligible, interactive_policy, start_early_materialization,
+    FastOverrideFit,
+    fast_override_eligible,
+    interactive_policy,
+    start_early_materialization,
 };
 
 mod automatic_dedupe;
@@ -9,22 +12,40 @@ mod preferred_seeds;
 use completion::collect_resolution;
 
 use super::{
-    FreshInputs, OwnedInputs, PatchUsageScope, check_patch_usage,
+    FreshInputs,
+    OwnedInputs,
     errors::InstallWithFreshLockfileError,
-    importers_consuming_linked_peers, manifest_transforms, report_peer_issues, resolve,
+    importers_consuming_linked_peers,
+    manifest_transforms,
+    report_peer_issues,
+    resolve,
     resolver_setup,
     seed_policy::full_resolution_required,
-    setup::{ResolutionPrep, ResolverSetup, prepare_resolution, resolver_update_behavior},
+    setup::{
+        ResolutionPrep,
+        ResolverSetup,
+        prepare_resolution,
+        resolver_update_behavior,
+    },
 };
 use indexmap::IndexMap;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::PackageManifest;
-use pnpm_reporter::{LogEvent, LogLevel, Reporter, Stage, StageLog};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    Reporter,
+    Stage,
+    StageLog,
+};
 use pnpm_resolving_deps_resolver::UpdateTargets;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashSet,
+    },
     path::Path,
     sync::Arc,
 };
@@ -91,6 +112,7 @@ impl<'a> ManifestSlots<'a> {
         catalogs: &Catalogs,
         lockfile_dir: &Path,
         deploy_manifest_hook: bool,
+        overrides_root_dir: Option<&Path>,
     ) -> Result<manifest_transforms::ManifestTransforms, InstallWithFreshLockfileError> {
         let mut transforms = manifest_transforms::build_manifest_transforms(
             config,
@@ -98,6 +120,7 @@ impl<'a> ManifestSlots<'a> {
             lockfile_dir,
             &self.declared,
             deploy_manifest_hook,
+            overrides_root_dir,
         )?;
         self.effective = std::mem::take(&mut transforms.effective_importer_manifests);
         Ok(transforms)
@@ -129,8 +152,20 @@ pub(super) async fn resolve_graph<'a: 'm, 'm, Reporter: self::Reporter + 'static
     let registries = std::mem::take(&mut setup.registries);
     let prep = prepare_resolution::<Reporter>(install, owned, setup, manifests).await?;
     let importer_manifests = manifests.view();
+    // `pnpm dedupe` reports each package through its resolution observer.
+    let resolved_progress = (install.execution.reports_resolved_packages()
+        && setup.completion_observer.is_none())
+    .then(|| super::resolved_progress_fn::<Reporter>(install.projects.requester.to_owned()));
     let pass = run_prepared_resolve(
-        ResolutionContext { install, owned, setup, prep: &prep, registries },
+        ResolutionContext {
+            install,
+            owned,
+            setup,
+            prep: &prep,
+            registries,
+            deprecations: super::DeprecationCollector::default(),
+            resolved_progress,
+        },
         importer_manifests,
     )
     .await?;
@@ -143,6 +178,11 @@ pub(super) struct ResolutionContext<'a, Reporter> {
     setup: &'a ResolverSetup,
     prep: &'a ResolutionPrep<Reporter>,
     registries: resolver_setup::Registries,
+    /// Every pass and the peer resolution report into it; it is emitted
+    /// once resolution ends.
+    deprecations: super::DeprecationCollector,
+    /// See [`super::resolved_progress_fn`].
+    resolved_progress: Option<pnpm_resolving_deps_resolver::ResolvedPackageFn>,
 }
 impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
     fn wanted_lockfile(&self) -> Option<&Lockfile> {
@@ -166,11 +206,20 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
             workspace_packages: self.setup.workspace_packages.clone(),
             update_checksums: self.install.update_checksums,
             update_behavior: resolver_update_behavior(&self.owned.resolution.update_seed_policy),
-            refresh_metadata: matches!(
-                self.owned.resolution.update_seed_policy,
-                super::UpdateSeedPolicy::KeepAllResolveAll,
-            ),
+            refresh_metadata: self.refreshes_metadata(),
         }
+    }
+
+    /// Whether the resolve revalidates the cached metadata of locked
+    /// versions: a deduplication that writes a lockfile recording
+    /// `deprecated` notices. A check run writes none, and its caller ignores
+    /// a difference in registry metadata.
+    fn refreshes_metadata(&self) -> bool {
+        matches!(
+            self.owned.resolution.update_seed_policy,
+            super::UpdateSeedPolicy::KeepAllResolveAll,
+        ) && self.owned.lockfile.check_sink.is_none()
+            && self.install.drivers.config.lockfile_format.records_deprecations()
     }
 
     /// The `pnpmfileChecksum` this install would record, for the reuse
@@ -265,6 +314,9 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
                 finalized_package: self.prep.early_materializer
                     .as_ref()
                     .map(crate::early_materializer::EarlyMaterializer::hook),
+                resolved_package: self.resolved_progress.clone(),
+                max_snapshots: self.setup.observer.max_snapshots,
+                cancel: self.setup.observer.cancel.clone(),
             },
             reuse: pnpm_resolving_deps_resolver::WorkspaceLockfileReuse {
                 lockfile: lockfile_reuse_seed
@@ -282,14 +334,25 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
                 scopes_by_importer: self.prep.reuse.by_importer.clone(),
                 depth: self.owned.resolution.update_seed_policy.max_depth(),
                 dedupe,
+                runtimes: self.owned.resolution.update_seed_policy.locked_runtime_reuse(),
             },
             share_workspace_resolutions: self.setup.chain.custom_resolvers.is_empty(),
 
             time_based: self.setup.policy.time_based,
 
-            registries_by_prefix: self.registries.named.clone(),
+            registry_context: self.registry_context(),
+            parsed_overrides: self.prep.transforms.override_entries.clone(),
+        }
+    }
+
+    fn registry_context(&self) -> pnpm_lockfile::RegistryContext {
+        pnpm_lockfile::RegistryContext {
             registries: self.registries.by_scope.clone(),
+            registries_by_prefix: self.registries.named.clone(),
             declared_prefixes: self.registries.declared.clone(),
+            registry_options_by_url: self.install.drivers.config
+                .registry_options_by_url
+                .clone(),
             locked_registries: self.registries.locked.clone(),
         }
     }
@@ -305,6 +368,7 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
             result: workspace_result,
             full_resolution: full_resolution_required(
                 has_reusable_seed,
+                self.owned.resolution.update_seed_policy.max_depth(),
                 importer_manifests.keys().map(String::as_str),
                 &self.prep.reuse.scope,
                 &self.prep.reuse.by_importer,
@@ -333,6 +397,10 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
         resolve::ImporterInputs {
             hooks: self.prep.transforms.hooks.with_pnpmfile(None),
             versions: crate::install_with_fresh_lockfile::resolution_inputs::ImporterVersionSeeds {
+                requested_direct_dependencies: self.owned.resolution
+                    .preferred_versions_override
+                    .as_ref()
+                    .map(|overrides| &overrides.requested_direct_dependencies),
                 shared: preferred_versions_seed,
                 by_importer: preferred_versions_seeds_by_importer,
                 own_manifest_specifiers,
@@ -378,9 +446,10 @@ pub(super) async fn run_prepared_resolve<'m, Reporter: self::Reporter + 'static>
         preferred_versions_seeds_by_importer,
         stale_override_targets,
     )
-    .await?;
+    .await;
+    context.deprecations.emit::<Reporter>(context.install.prior.lockfile);
     Ok(context.completed_pass(
-        workspace_result,
+        workspace_result?,
         lockfile_reuse_seed.is_some(),
         phase_start,
         importer_manifests,

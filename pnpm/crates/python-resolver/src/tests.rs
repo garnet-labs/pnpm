@@ -1,13 +1,37 @@
 use crate::{
-    candidates::{candidates_from_page, source_version, wheel_identity},
-    lockfile::{Inputs, LockedSdist, Lockfile, Metadata, Solved, Target},
+    candidates::{
+        candidates_from_page,
+        source_version,
+        wheel_identity,
+    },
+    lockfile::{
+        Inputs,
+        LockedSdist,
+        Lockfile,
+        Metadata,
+        Solved,
+        Target,
+    },
     metadata::WheelMetadata,
-    packages::{Excluded, Packages},
-    resolve::{Step, step},
+    packages::{
+        Excluded,
+        Packages,
+    },
+    resolve::{
+        Step,
+        step,
+    },
 };
 use pep440_rs::Version;
-use pep508_rs::{MarkerEnvironment, PackageName, Requirement};
-use std::{collections::BTreeMap, str::FromStr};
+use pep508_rs::{
+    MarkerEnvironment,
+    PackageName,
+    Requirement,
+};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+};
 use url::Url;
 
 /// A `CPython` 3.12 target that takes a pure-Python wheel, preferring a
@@ -491,7 +515,7 @@ fn solved_project(
 fn lockfile_for(requirement: &str, requires_dist: &str) -> Lockfile {
     let target = target();
     let (packages, requirements, solution) = solved_project(requirement, requires_dist);
-    let inputs = Inputs::new(&requirements, &target, index_url().as_str());
+    let inputs = Inputs::new(&requirements, &target, index_url().as_str().to_owned());
     Lockfile::new(&packages, &target, &requirements, solution, inputs, Some(">=3.10".to_string()))
         .expect("lockfile builds")
 }
@@ -522,7 +546,7 @@ fn a_lockfile_names_the_interpreter_version_and_the_markers_its_graph_reads() {
 fn a_lockfile_applies_wherever_its_wheels_install() {
     let lockfile = lockfile_for("demo", "");
     let requirements = [Requirement::from_str("demo").unwrap()];
-    let inputs = Inputs::new(&requirements, &target(), index_url().as_str());
+    let inputs = Inputs::new(&requirements, &target(), index_url().as_str().to_owned());
 
     let mut other_kernel = target();
     other_kernel.environment = serde_json::from_value(serde_json::json!({
@@ -554,14 +578,15 @@ fn a_lockfile_applies_wherever_its_wheels_install() {
     let other_requirements = [Requirement::from_str("demo>=1").unwrap()];
     let error = lockfile
         .applies_to(
-            &Inputs::new(&other_requirements, &target(), index_url().as_str()),
+            &Inputs::new(&other_requirements, &target(), index_url().as_str().to_owned()),
             Some(">=3.10"),
             &target(),
         )
         .expect_err("other requirements");
     assert!(error.to_string().contains("requirements changed"), "{error}");
 
-    let other_index = Inputs::new(&requirements, &target(), "https://other.test/simple/");
+    let other_index =
+        Inputs::new(&requirements, &target(), "https://other.test/simple/".to_owned());
     let error = lockfile
         .applies_to(&other_index, Some(">=3.10"), &target())
         .expect_err("index");
@@ -577,7 +602,7 @@ fn a_lockfile_applies_wherever_its_wheels_install() {
 fn a_lockfile_pinning_another_distribution_under_a_package_is_refused() {
     let mut lockfile = lockfile_for("demo", "");
     let requirements = [Requirement::from_str("demo").unwrap()];
-    let inputs = Inputs::new(&requirements, &target(), index_url().as_str());
+    let inputs = Inputs::new(&requirements, &target(), index_url().as_str().to_owned());
     lockfile.packages[0].wheels[0].name = "other-1.0.0-py3-none-any.whl".to_string();
 
     let error = lockfile
@@ -727,9 +752,9 @@ fn platform_project() -> (Metadata, Vec<Requirement>, Vec<Solved>) {
 fn declared_inputs(requirements: &[Requirement]) -> Inputs {
     Inputs::declared(
         requirements,
-        &["x86_64-manylinux_2_17".to_string(), "x86_64-pc-windows-msvc".to_string()],
-        &[],
-        index_url().as_str(),
+        vec!["x86_64-manylinux_2_17".to_string(), "x86_64-pc-windows-msvc".to_string()],
+        Vec::new(),
+        index_url().as_str().to_owned(),
     )
 }
 
@@ -1147,7 +1172,7 @@ fn environments_that_take_different_archives_of_one_release_are_refused() {
         &metadata,
         &requirements,
         &solved,
-        Inputs::new(&requirements, &target, index_url().as_str()),
+        Inputs::new(&requirements, &target, index_url().as_str().to_owned()),
         None,
     )
     .expect_err("one entry cannot pin both archives");
@@ -1177,7 +1202,7 @@ fn a_lockfile_pins_the_source_distribution_a_release_is_built_from() {
     else {
         panic!("the source distribution is the only candidate the project needs");
     };
-    let inputs = || Inputs::new(&requirements, &target, index_url().as_str());
+    let inputs = || Inputs::new(&requirements, &target, index_url().as_str().to_owned());
     let locked = || {
         Lockfile::new(&packages, &target, &requirements, solution.clone(), inputs(), None)
             .expect("lockfile builds")

@@ -1,14 +1,25 @@
-use super::{CustomFetchOutcome, CustomFetcherSession, LockfileResolution};
+use super::{
+    CustomFetchOutcome,
+    CustomFetcherSession,
+    LockfileResolution,
+};
 use pnpm_tarball::{
-    ArchiveFetchOptions, ArchiveStoreContext, ArchiveStoreProjection, IngestTarballToStore,
-    RetryOpts, TarballPackage,
+    ArchiveFetchOptions,
+    ArchiveStoreContext,
+    ArchiveStoreProjection,
+    IngestTarballToStore,
+    RetryOpts,
+    TarballPackage,
 };
 use serde_json::Value;
 use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
     },
 };
 
@@ -76,7 +87,7 @@ fn ingest<'a>(
             id,
         },
         store: ArchiveStoreContext {
-            dir: &config.store_dir,
+            dir: std::borrow::Cow::Borrowed(&config.store_dir),
             index: None,
             index_writer: None,
             verify_integrity: config.verify_store_integrity,

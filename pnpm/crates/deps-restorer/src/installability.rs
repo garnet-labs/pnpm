@@ -15,31 +15,61 @@
 
 pub(crate) use patched::snapshot_is_patched;
 pub use platform::{
-    InstallabilityHost, any_installability_constraint, any_optional_installability_constraint,
-    check_installability, manifest_with_inferred_platform, platform_manifest_from_resolve_result,
+    InstallabilityHost,
+    NodeVersionSource,
+    any_installability_constraint,
+    any_optional_installability_constraint,
+    check_installability,
+    manifest_with_inferred_platform,
+    platform_manifest_from_resolve_result,
+};
+pub use project::{
+    ProjectHostRequirements,
+    project_host_requirements,
 };
 pub use skipped_snapshots::SkippedSnapshots;
 
 mod reachability;
 mod skipped_snapshots;
-use reachability::{LockfileEdgeReach, walk_lockfile_edges};
+use reachability::{
+    LockfileEdgeReach,
+    walk_lockfile_edges,
+};
 
 mod patched;
 mod platform;
-mod variants;
+mod project;
 use patched::without_published_engines;
 use platform::manifest_from_metadata;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 
 use pnpm_lockfile::{
-    Lockfile, LockfileResolution, PackageKey, PackageMetadata, PkgVerPeer, Prefix, ProjectSnapshot,
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgVerPeer,
+    Prefix,
+    ProjectSnapshot,
     SnapshotEntry,
 };
-use pnpm_package_is_installable::{InstallabilityError, InstallabilityOptions, SkipReason};
+use pnpm_package_is_installable::{
+    InstallabilityError,
+    InstallabilityOptions,
+    SkipReason,
+};
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_reporter::{
-    LogEvent, LogLevel, Reporter, SkippedOptionalDependencyLog, SkippedOptionalPackage,
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+    SkippedOptionalDependencyLog,
+    SkippedOptionalPackage,
     SkippedOptionalReason,
 };
 
@@ -55,9 +85,8 @@ use pnpm_reporter::{
 /// - An incompatible snapshot with at least one non-optional inbound
 ///   edge from an installed (non-skipped) importer or snapshot is the
 ///   install error when `engine_strict` is set, and otherwise emits
-///   `tracing::warn!` and proceeds — even when the snapshot is also
-///   optionally reachable. (The warn should emit `pnpm:install-check`,
-///   which pacquet's reporter does not expose.)
+///   `pnpm:install-check` and proceeds, even when the snapshot is also
+///   optionally reachable.
 /// - A snapshot the walk cannot reach from any importer applies the
 ///   same dispatch to its lockfile-propagated
 ///   [`SnapshotEntry::optional`] flag instead.
@@ -67,7 +96,7 @@ use pnpm_reporter::{
 /// this pass records it.
 ///
 /// Snapshots without a matching `PackageMetadata` row are skipped
-/// over — `CreateVirtualStore` errors on them separately. An invalid
+/// over. `CreateVirtualStore` errors on them separately. An invalid
 /// `nodeVersion` surfaces as `ERR_PNPM_INVALID_NODE_VERSION`
 /// regardless of edges and strictness.
 pub fn compute_skipped_snapshots<Reporter: self::Reporter>(
@@ -97,8 +126,8 @@ pub fn compute_skipped_snapshots<Reporter: self::Reporter>(
     // Concretely on the integrated benchmark (1352 packages with no
     // platform / engine constraints): drops ~1352 `String` and
     // `PackageKey` allocations and the matching number of
-    // `check_package` calls. The scan is O(N) on `packages` — same
-    // shape as the loop it short-circuits — but does at most four
+    // `check_package` calls. The scan is O(N) on `packages` (same
+    // shape as the loop it short-circuits) but does at most four
     // `Option::is_some` checks per row and short-circuits on the
     // first declared constraint.
     if !any_installability_constraint(snapshots, packages) {
@@ -107,8 +136,8 @@ pub fn compute_skipped_snapshots<Reporter: self::Reporter>(
 
     // Build the host-derived part of the options once. Only the
     // (`engine_strict`-irrelevant) `optional` flag varies per
-    // dispatch, but the result of [`check_package`] — "does this
-    // manifest satisfy the host?" — does not. The check verdict is
+    // dispatch, but the result of [`check_package`] ("does this
+    // manifest satisfy the host?") does not. The check verdict is
     // cached per peer-stripped `metadata_key` (see [`cached_check`]);
     // the per-snapshot loop then only needs to apply the
     // optional / engine-strict dispatch.
@@ -135,7 +164,7 @@ pub fn compute_skipped_snapshots<Reporter: self::Reporter>(
         base_options,
         check_cache,
         reach,
-        seen_emit: HashSet::new(),
+        reported: ReportedPackages::default(),
         skipped: seed,
     };
 
@@ -155,10 +184,16 @@ struct SkipScan<'a, 'lock> {
     base_options: InstallabilityOptions<'a>,
     check_cache: CheckCache,
     reach: LockfileEdgeReach<'lock>,
-    /// Metadata keys already reported, so peer variants of one package
-    /// emit a single skip log.
-    seen_emit: HashSet<PackageKey>,
+    reported: ReportedPackages,
     skipped: SkippedSnapshots,
+}
+
+/// Metadata keys already reported, so peer variants of one package emit
+/// a single log of each kind.
+#[derive(Default)]
+struct ReportedPackages {
+    skips: HashSet<PackageKey>,
+    warnings: HashSet<PackageKey>,
 }
 
 impl SkipScan<'_, '_> {
@@ -167,7 +202,7 @@ impl SkipScan<'_, '_> {
         snapshot_key: &PackageKey,
         snapshot: &SnapshotEntry,
     ) -> Result<(), Box<InstallabilityError>> {
-        // A seeded installability skip is re-evaluated here — the host,
+        // A seeded installability skip is re-evaluated here, the host,
         // `supportedArchitectures`, or the package's constraints may
         // have changed since the skip was recorded, and pnpm recomputes
         // installability fresh on every install. The other categories
@@ -201,7 +236,7 @@ impl SkipScan<'_, '_> {
             self.record_skip::<Reporter>(snapshot_key, &metadata_key, &warn);
             return Ok(());
         }
-        self.report_incompatible_required(
+        self.report_incompatible_required::<Reporter>(
             &metadata_key,
             metadata,
             warn,
@@ -230,12 +265,12 @@ impl SkipScan<'_, '_> {
         warn: &InstallabilityError,
     ) {
         self.skipped.insert_installability(snapshot_key.clone());
-        if self.seen_emit.insert(metadata_key.clone()) {
+        if self.reported.skips.insert(metadata_key.clone()) {
             emit_skipped::<Reporter>(
                 &metadata_key.to_string(),
                 warn.skip_reason(),
                 warn.to_string(),
-                self.prefix,
+                self.prefix.to_owned(),
             );
         }
     }
@@ -243,7 +278,7 @@ impl SkipScan<'_, '_> {
     /// A package that an installed non-optional edge reaches cannot be
     /// skipped: under `engine-strict` it fails the install, otherwise
     /// it warns.
-    fn report_incompatible_required(
+    fn report_incompatible_required<Reporter: self::Reporter>(
         &mut self,
         metadata_key: &PackageKey,
         metadata: &PackageMetadata,
@@ -267,17 +302,13 @@ impl SkipScan<'_, '_> {
             return Err(Box::new(warn));
         }
 
-        // Required, non-strict: this should emit a
-        // `pnpm:install-check` warn (TODO: add channel to the
-        // reporter). For now the tracing-level warning is the
-        // user-visible signal that an incompatible required dep slipped
-        // through.
-        tracing::warn!(
-            target: "pacquet::install",
-            package = %metadata_key,
-            "{}",
-            warn,
-        );
+        if self.reported.warnings.insert(metadata_key.clone()) {
+            Reporter::emit(&LogEvent::InstallCheck(PnpmLog {
+                level: LogLevel::Warn,
+                message: warn.to_string(),
+                prefix: self.prefix.to_string(),
+            }));
+        }
         Ok(())
     }
 }
@@ -290,8 +321,8 @@ impl SkipScan<'_, '_> {
 /// right before the dependency-closure extension.
 ///
 /// The skips reuse the transient bucket of
-/// [`SkippedSnapshots::add_optional_excluded`], so — like
-/// `--no-optional` — the exclusion is never persisted into
+/// [`SkippedSnapshots::add_optional_excluded`], so (like
+/// `--no-optional`) the exclusion is never persisted into
 /// `.modules.yaml.skipped`.
 pub fn add_direct_runtime_skips(
     skipped: &mut SkippedSnapshots,
@@ -342,7 +373,38 @@ fn add_runtime_skips_from(
 pub fn find_root_runtime_node_version(
     importers: &HashMap<String, ProjectSnapshot>,
 ) -> Option<String> {
-    root_runtime_node_ver_peer(importers)?.version_semver().map(ToString::to_string)
+    let importer = importers.get(Lockfile::ROOT_IMPORTER_KEY)?;
+    find_project_runtime_node_version(
+        importer,
+        &[DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional],
+    )
+}
+
+#[must_use]
+pub fn find_project_runtime_node_version(
+    importer: &ProjectSnapshot,
+    dependency_groups: &[DependencyGroup],
+) -> Option<String> {
+    project_runtime_node_ver_peer(importer, dependency_groups)?
+        .version_semver()
+        .map(ToString::to_string)
+}
+
+#[must_use]
+pub fn find_project_runtime_node_version_for_specifier(
+    importer: &ProjectSnapshot,
+    dependency_groups: &[DependencyGroup],
+    expected_specifier: &str,
+) -> Option<String> {
+    importer
+        .dependencies_by_groups(dependency_groups.iter().copied())
+        .filter(|(alias, spec)| {
+            alias.scope.is_none() && alias.bare == "node" && spec.specifier == expected_specifier
+        })
+        .filter_map(|(_, spec)| spec.version.ver_peer())
+        .find(|ver_peer| ver_peer.prefix() == Prefix::Runtime)?
+        .version_semver()
+        .map(ToString::to_string)
 }
 
 /// The snapshot of the root project's `node` runtime dependency, the one
@@ -357,19 +419,26 @@ pub fn find_root_runtime_node_key<'a>(
     let ver_peer = root_runtime_node_ver_peer(importers)?;
     snapshots
         .keys()
-        .find(|key| key.name.scope.is_none() && key.name.bare == "node" && key.suffix == *ver_peer)
+        .filter(|key| key.name.scope.is_none())
+        .filter(|key| key.name.bare == "node")
+        .find(|key| key.suffix == *ver_peer)
 }
 
 pub(crate) fn root_runtime_node_ver_peer(
     importers: &HashMap<String, ProjectSnapshot>,
 ) -> Option<&PkgVerPeer> {
-    importers
-        .get(Lockfile::ROOT_IMPORTER_KEY)?
-        .dependencies_by_groups([
-            DependencyGroup::Prod,
-            DependencyGroup::Dev,
-            DependencyGroup::Optional,
-        ])
+    project_runtime_node_ver_peer(
+        importers.get(Lockfile::ROOT_IMPORTER_KEY)?,
+        &[DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional],
+    )
+}
+
+fn project_runtime_node_ver_peer<'a>(
+    importer: &'a ProjectSnapshot,
+    dependency_groups: &[DependencyGroup],
+) -> Option<&'a PkgVerPeer> {
+    importer
+        .dependencies_by_groups(dependency_groups.iter().copied())
         .filter(|(alias, _)| alias.scope.is_none() && alias.bare == "node")
         .filter_map(|(_, spec)| spec.version.ver_peer())
         .find(|ver_peer| ver_peer.prefix() == Prefix::Runtime)
@@ -403,8 +472,7 @@ fn cached_check(
     let manifest = manifest_from_metadata(metadata_key, metadata);
     let pkg_id = metadata_key.to_string();
     let options = InstallabilityOptions { optional, ..*base_options };
-    let verdict = check_installability(&pkg_id, &manifest, &options)?
-        .or_else(|| variants::variants_installability(&pkg_id, metadata, &options));
+    let verdict = check_installability(&pkg_id, &manifest, &options)?;
     check_cache.insert(cache_key, verdict.clone());
     Ok(verdict)
 }
@@ -430,16 +498,14 @@ pub fn package_metadata_is_installable(
         current_libc: host.libc,
         supported_architectures: host.supported_architectures.as_ref(),
     };
-    let package_id = metadata_key.to_string();
-    Ok(check_installability(&package_id, &manifest, &options)?.is_none()
-        && variants::variants_installability(&package_id, metadata, &options).is_none())
+    Ok(check_installability(&metadata_key.to_string(), &manifest, &options)?.is_none())
 }
 
 fn emit_skipped<Reporter: self::Reporter>(
     pkg_id: &str,
     reason: SkipReason,
     details: String,
-    prefix: &str,
+    prefix: String,
 ) {
     let (name, version) = split_name_version(pkg_id);
     let wire_reason = match reason {
@@ -451,7 +517,7 @@ fn emit_skipped<Reporter: self::Reporter>(
         details: Some(details),
         package: SkippedOptionalPackage::Installed { id: pkg_id.to_string(), name, version },
         parents: None,
-        prefix: prefix.to_string(),
+        prefix,
         reason: wire_reason,
     }));
 }

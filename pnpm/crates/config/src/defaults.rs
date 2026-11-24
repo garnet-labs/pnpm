@@ -1,11 +1,18 @@
 use crate::{
-    api::{EnvVar, GetCurrentDir, GetHomeDir},
+    api::{
+        EnvVar,
+        GetCurrentDir,
+        GetHomeDir,
+    },
     windows_path_env::read_dir_env,
 };
 use pnpm_store_dir::StoreDir;
 use std::{
     env,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 #[cfg(windows)]
@@ -46,10 +53,18 @@ fn get_drive_letter(current_dir: &Path) -> Option<char> {
 
 #[cfg(windows)]
 fn default_store_dir_windows(home_dir: &Path, current_dir: &Path) -> PathBuf {
-    let current_drive =
-        get_drive_letter(current_dir).expect("current dir is an absolute path with drive letter");
-    let home_drive =
-        get_drive_letter(home_dir).expect("home dir is an absolute path with drive letter");
+    // A cwd on a network share that no drive maps keeps the store at the root
+    // of the share, just as a cwd on another drive keeps it at that drive's root.
+    let Some(current_drive) = get_drive_letter(current_dir) else {
+        let share_root = current_dir
+            .ancestors()
+            .last()
+            .unwrap_or(current_dir);
+        return share_root.join(".pnpm-store");
+    };
+    let Some(home_drive) = get_drive_letter(home_dir) else {
+        return PathBuf::from(format!(r"{current_drive}:\.pnpm-store"));
+    };
 
     if current_drive == home_drive {
         return home_dir
@@ -143,7 +158,9 @@ where
     Some(match env::consts::OS {
         "macos" => home_dir.join("Library/pnpm"),
         "windows" => read_dir_env::<Sys>("LOCALAPPDATA")
-            .map_or_else(|| home_dir.join(".pnpm"), |local| PathBuf::from(local).join("pnpm")),
+            .map(PathBuf::from)
+            .map(|joined| joined.join("pnpm"))
+            .unwrap_or_else(|| home_dir.join(".pnpm")),
         // pnpm treats every non-Windows platform as Unix here.
         _ => home_dir.join(".local/share/pnpm"),
     })
@@ -156,12 +173,15 @@ pub fn default_modules_dir() -> PathBuf {
 
 /// Resolve the directory pnpm reads `config.yaml` (the global config
 /// file) from. Threads this crate's [`EnvVar`] / [`GetHomeDir`] seam
-/// into [`pnpm_config_dir::config_dir`] — the shared resolver, also
-/// used by the registry server — under the `pnpm` leaf.
+/// into [`pnpm_config_dir::config_dir`] (the shared resolver, also
+/// used by the registry server) under the `pnpm` leaf.
 pub fn default_config_dir<Sys>() -> Option<PathBuf>
 where
     Sys: EnvVar + GetHomeDir,
 {
+    if let Some(config_home) = read_dir_env::<Sys>("PNPM_CONFIG_HOME") {
+        return Some(PathBuf::from(config_home));
+    }
     let xdg_config_home = read_dir_env::<Sys>("XDG_CONFIG_HOME");
     let local_app_data = read_dir_env::<Sys>("LOCALAPPDATA");
     pnpm_config_dir::config_dir(
@@ -306,13 +326,13 @@ pub fn default_fetch_retry_maxtimeout() -> u64 {
     60_000
 }
 
-/// The CLI's user-facing release version — the same value
+/// The CLI's user-facing release version, the same value
 /// `pnpm --version` prints. Single source of truth so the CLI
-/// version string and the default `User-Agent` (`default_user_agent`)
+/// version string and the default `User-Agent`
 /// can't drift apart. `pnpm bump` keeps this constant in sync with the
 /// version of the npm wrapper package (`pnpm/npm/pnpm/package.json`);
 /// the release workflow verifies the two match before building.
-pub const PNPM_VERSION: &str = "12.17.0";
+pub const PNPM_VERSION: &str = "12.23.0";
 
 /// The command that installs pnpm with the standalone script, as documented
 /// at <https://pnpm.io/installation>: the PowerShell form on Windows, the
@@ -354,9 +374,9 @@ pub fn default_fetch_min_speed_ki_bps() -> u64 {
 
 /// Returns the shared `maxTarballUnpackedSize` default in bytes.
 ///
-/// See [`pnpm_tarball::DEFAULT_MAX_TARBALL_UNPACKED_SIZE`].
+/// See [`pnpm_network::DEFAULT_MAX_TARBALL_UNPACKED_SIZE`].
 pub fn default_max_tarball_unpacked_size() -> u64 {
-    pnpm_tarball::DEFAULT_MAX_TARBALL_UNPACKED_SIZE
+    pnpm_network::DEFAULT_MAX_TARBALL_UNPACKED_SIZE
 }
 
 /// Default `User-Agent`, in the format
@@ -419,7 +439,7 @@ pub fn resolve_child_concurrency_with_parallelism(option: Option<i32>, paralleli
     match option {
         None => default_workspace_concurrency_with_parallelism(parallelism),
         Some(n) if n > 0 => n as u32,
-        // `unsigned_abs` instead of `(-n) as u32` — the latter
+        // `unsigned_abs` instead of `(-n) as u32`, the latter
         // panics in debug builds on `n == i32::MIN` (negation
         // overflow); the former returns `i32::MAX as u32 + 1`
         // safely.
@@ -448,7 +468,7 @@ fn platform_unsafe_perm_default() -> bool {
 
 #[cfg(all(unix, not(target_os = "cygwin")))]
 fn platform_unsafe_perm_default() -> bool {
-    is_unsafe_perm_posix(posix_getuid())
+    is_unsafe_perm_posix(pnpm_ffi_process::real_user_id())
 }
 
 /// Targets that are neither Windows, Cygwin, nor POSIX
@@ -468,16 +488,6 @@ pub fn is_unsafe_perm_posix(uid: u32) -> bool {
     // `unsafe_perm = true` means "do NOT drop privileges". Drop
     // only when we *are* root (uid == 0).
     uid != 0
-}
-
-/// Safe wrapper around `libc::getuid` — contains the `unsafe`
-/// FFI block internally so the caller doesn't need to propagate
-/// `unsafe`.
-#[cfg(all(unix, not(target_os = "cygwin")))]
-fn posix_getuid() -> u32 {
-    // SAFETY: `libc::getuid` has no preconditions; it reads a
-    // kernel-owned uid field and cannot fail.
-    unsafe { libc::getuid() as u32 }
 }
 
 #[cfg(test)]

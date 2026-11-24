@@ -2,17 +2,37 @@
 //! graph plus one hosted and one upstream registry of the ecosystem under
 //! test, all fronted by the `main` router, and small response helpers.
 
-use axum::body::{Body, to_bytes};
+use axum::body::{
+    Body,
+    to_bytes,
+};
 use pnpr::{
-    AccessList, Config, Ecosystem, HostedConfig, PackagePattern, PackageRules, Registries,
-    Registry, UpstreamConfig,
+    AccessList,
+    Config,
+    Ecosystem,
+    HostedConfig,
+    PackagePattern,
+    PackageRules,
+    Registries,
+    Registry,
+    UpstreamConfig,
 };
 use pnpr_fixtures::MockConfigPresets;
 use reqwest::header::HeaderMap;
-use sha2::{Digest, Sha256};
+use sha2::{
+    Digest,
+    Sha256,
+};
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::{Path, PathBuf},
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
     time::Duration,
 };
 
@@ -22,7 +42,7 @@ pub const PUBLIC_URL: &str = "http://pnpr.test";
 #[derive(Clone, Copy)]
 pub struct HostedSource<'spec> {
     pub name: &'spec str,
-    pub org: &'spec str,
+    pub namespace: &'spec str,
     /// The registry-level default `access:`.
     pub access: &'spec str,
     /// The exact names the registry claims.
@@ -33,6 +53,7 @@ pub struct HostedSource<'spec> {
 /// `upstream.0` at `upstream.1`, both of `ecosystem`, added to the stock
 /// `main` router beside the npm registries. `/<ecosystem>/...` is then the
 /// default-target form and `/<ecosystem>/~<name>/...` the named form.
+/// Loopback is an allowed network, for the mock upstreams.
 pub fn mixed_router_config(
     storage: PathBuf,
     ecosystem: Ecosystem,
@@ -43,10 +64,11 @@ pub fn mixed_router_config(
     let mut config = Config::proxy(listen, storage);
     config.http.public_url = PUBLIC_URL.to_string();
     config.http.packument_ttl = Duration::from_mins(1);
+    config.routing.route_policy.allowed_private_networks = crate::network::loopback_networks();
     config.routing.hosted.insert(
         hosted.name.to_string(),
         HostedConfig::new(
-            hosted.org,
+            hosted.namespace,
             PackageRules::new(Vec::new(), Some(AccessList::from_tokens([hosted.access]))),
         ),
     );
@@ -82,8 +104,8 @@ pub fn mixed_router_config(
         },
     );
     let registries = Registries::new(graph, Some("main".to_string()))
-        .with_ecosystem(hosted.name, ecosystem)
-        .with_ecosystem(upstream.0, ecosystem);
+        .with_ecosystem(hosted.name.to_owned(), ecosystem)
+        .with_ecosystem(upstream.0.to_owned(), ecosystem);
     registries.validate().expect("mixed graph is valid");
     config.routing.registries = registries;
     config
@@ -113,8 +135,14 @@ pub fn find_file(root: &Path, filename: &str) -> Option<PathBuf> {
 }
 
 pub async fn assert_cache_tracks_metadata(ecosystem: Ecosystem) {
-    use axum::http::{Request, StatusCode};
-    use pnpr::{AuthState, router_with_auth};
+    use axum::http::{
+        Request,
+        StatusCode,
+    };
+    use pnpr::{
+        AuthState,
+        router_with_auth,
+    };
     use serde_json::json;
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -151,7 +179,7 @@ pub async fn assert_cache_tracks_metadata(ecosystem: Ecosystem) {
     let mut config = mixed_router_config(
         tmp.path().to_path_buf(),
         ecosystem,
-        HostedSource { name: "hosted", org: "hosted", access: "$all", packages: &["demo"] },
+        HostedSource { name: "hosted", namespace: "hosted", access: "$all", packages: &["demo"] },
         ("upstream", &upstream.url()),
     );
     config.http.packument_ttl = Duration::ZERO;
@@ -211,4 +239,44 @@ pub async fn assert_cache_tracks_metadata(ecosystem: Ecosystem) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     index.assert_async().await;
+}
+
+/// A wheel carrying the distribution identity used by upload tests.
+pub fn python_wheel(name: &str, version: &str) -> Vec<u8> {
+    python_wheel_with_metadata(
+        name,
+        version,
+        &format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+    )
+}
+
+pub fn python_wheel_with_metadata(name: &str, version: &str, metadata: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive
+        .start_file::<_, ()>(
+            format!("{}-{version}.dist-info/METADATA", name.replace('-', "_")),
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    archive.write_all(metadata.as_bytes()).unwrap();
+    archive.finish().unwrap().into_inner()
+}
+
+pub fn python_sdist(name: &str, version: &str) -> Vec<u8> {
+    let metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(metadata.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, format!("{name}-{version}/PKG-INFO"), metadata.as_bytes())
+        .unwrap();
+    archive
+        .into_inner()
+        .unwrap()
+        .finish()
+        .unwrap()
 }

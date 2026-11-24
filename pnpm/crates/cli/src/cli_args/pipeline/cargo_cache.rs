@@ -1,16 +1,35 @@
 mod restore;
-use restore::{clone_file, invalidate_fingerprints};
+use restore::{
+    clone_file,
+    invalidate_fingerprints,
+};
 
-use super::paths::{check_ancestors, validate_relative_path};
+use super::paths::{
+    check_ancestors,
+    validate_relative_path,
+};
 use crate::process::Command;
-use pnpm_crypto_hash::{create_hex_hash, create_hex_hash_from_file};
-use serde::{Deserialize, Serialize};
+use pnpm_crypto_hash::{
+    create_hex_hash,
+    create_hex_hash_from_file,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::{
     collections::BTreeMap,
-    env, fs,
-    fs::{File, OpenOptions},
+    env,
+    fs,
+    fs::{
+        File,
+        OpenOptions,
+    },
     io,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 const INPUT_RECORD: &str = ".pnpm-cargo-inputs-v1";
@@ -199,7 +218,7 @@ impl CargoCache {
 pub(super) fn snapshot_entry(
     cache_dir: &Path,
     project: &Path,
-    task_key: &str,
+    task_key: String,
     environment: &BTreeMap<String, String>,
 ) -> io::Result<(PathBuf, String, Vec<String>)> {
     let cache_dir = pnpm_fs::realpath_missing(cache_dir)?;
@@ -210,7 +229,7 @@ pub(super) fn snapshot_entry(
         &project,
         environment,
     )?;
-    let mut inputs = vec!["pnpm-cargo-state:v1".to_string(), task_key.to_string()];
+    let mut inputs = vec!["pnpm-cargo-state:v1".to_string(), task_key];
     inputs.push(command_output("rustc", &["-vV"], &project, environment)?);
     inputs.push(command_output("cargo", &["-vV"], &project, environment)?);
     let metadata: serde_json::Value = serde_json::from_str(&command_output(
@@ -283,7 +302,7 @@ fn add_config_inputs(
 }
 
 /// The workspace's own packages, and the guarantee that each one's
-/// manifest lives inside the repository — a path dependency outside it
+/// manifest lives inside the repository, a path dependency outside it
 /// is an input the cache key cannot cover.
 fn local_packages_in_repo(metadata: &serde_json::Value, repo: &Path) -> io::Result<Vec<String>> {
     let canonical_repo = dunce::canonicalize(repo)?;
@@ -342,7 +361,8 @@ pub(super) fn prepend_path(environment: &mut BTreeMap<String, String>, dir: Path
     let dirs = std::iter::once(dir).chain(env::split_paths(path));
     if let Some(joined) = env::join_paths(dirs)
         .ok()
-        .and_then(|joined| joined.into_string().ok())
+        .map(std::ffi::OsString::into_string)
+        .and_then(Result::ok)
     {
         environment.insert("PATH".to_string(), joined);
     }

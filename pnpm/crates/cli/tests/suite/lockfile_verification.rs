@@ -1,10 +1,10 @@
 //! End-to-end CLI integration test for the lockfile-verification
 //! gate. Spawns the `pacquet` binary against a
 //! pnpm-workspace.yaml that activates the verifier and confirms the
-//! gate fires through the real install path — non-zero exit, the
+//! gate fires through the real install path, non-zero exit, the
 //! upstream-canonical diagnostic code in stderr.
 //!
-//! Doesn't try to exercise every branch — the unit tests in
+//! Doesn't try to exercise every branch, the unit tests in
 //! `pnpm-lockfile-verification` and `pnpm-resolving-npm-resolver`
 //! already do that. This file pins the user-visible contract: the
 //! gate runs from the CLI, the install fails when policy is
@@ -16,8 +16,14 @@ pub use _utils::*;
 use crate::_utils;
 
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
-use std::{fs, path::Path};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
+use std::{
+    fs,
+    path::Path,
+};
 
 /// A project whose only dependency every policy rejects. The mocked
 /// registry's packument times are real-world (years old), so a
@@ -86,7 +92,7 @@ fn install_fails_under_huge_minimum_release_age() {
     );
 
     // No `node_modules/.pnpm/...` slot must materialize for the
-    // gated package — proves the failure short-circuits before
+    // gated package, proves the failure short-circuits before
     // tarball fetch.
     assert!(
         !workspace.join("node_modules/.pnpm/@pnpm.e2e+hello-world-js-bin@1.0.0").exists(),
@@ -100,7 +106,7 @@ fn install_fails_under_huge_minimum_release_age() {
 /// version satisfies the range (non-strict mode)` (`minimumReleaseAge.ts:68`).
 /// A 100-year cutoff makes every `@pnpm.e2e/bravo-dep` version immature.
 /// Non-strict mode must fall back to the *lowest* version matching the `1.0`
-/// range — normal resolution would pick the highest, `1.0.1` — and complete
+/// range (normal resolution would pick the highest, `1.0.1`) and complete
 /// the install instead of aborting. An explicit cutoff turns strict mode on
 /// by default, so reaching non-strict mode takes an explicit opt-out.
 #[test]
@@ -154,7 +160,7 @@ fn non_strict_minimum_release_age_falls_back_when_no_mature_version_matches() {
 /// (`minimumReleaseAge: 100 years` rejects every published version)
 /// bypasses the verification step. Confirms the opt-out path runs
 /// end-to-end through the CLI and that no
-/// `MINIMUM_RELEASE_AGE_VIOLATION` error leaks into stderr — the test
+/// `MINIMUM_RELEASE_AGE_VIOLATION` error leaks into stderr, the test
 /// stops short of asserting full install success, see the inline
 /// comment above the assertion below.
 #[test]
@@ -182,7 +188,7 @@ fn trust_lockfile_skips_verification() {
     // `output.status.success()`: the test fixture's `pnpm-lock.yaml`
     // is hand-rolled with a placeholder integrity hash, so the
     // install fails the tarball integrity check downstream of the
-    // verification pass. That's irrelevant to what's being tested —
+    // verification pass. That's irrelevant to what's being tested,
     // the contract here is "the supply-chain gate doesn't fire",
     // not "the install completes". Asserting success would require a
     // real lockfile generated against the mocked registry first
@@ -200,7 +206,7 @@ fn trust_lockfile_skips_verification() {
 /// `--trust-lockfile` CLI flag short-circuits the verification gate
 /// the same way `trustLockfile: true` in `pnpm-workspace.yaml` does.
 /// Same provocation as the yaml-based test above, with the yaml
-/// override removed so the gate would normally fire — the flag is
+/// override removed so the gate would normally fire, the flag is
 /// what makes the verification gate skip. Like that test, this only
 /// asserts the absence of `MINIMUM_RELEASE_AGE_VIOLATION` (not full
 /// install success); see the inline comment above the assertion.
@@ -362,7 +368,7 @@ fn read_manifest(workspace: &Path) -> serde_json::Value {
 
 /// Regression test for the crafted-lockfile path-traversal advisory
 /// (GHSA-2rx9-3g3h-c2jv). A dependency name/alias that isn't a valid npm
-/// package name — here a `../../escaped-link` snapshot key — would be
+/// package name (here a `../../escaped-link` snapshot key) would be
 /// joined into a filesystem path at install time and escape the project.
 /// The dependency-name check must run **even under `--trust-lockfile`**,
 /// which disables the resolution-policy verification fan-out: the two
@@ -428,7 +434,7 @@ fn trust_lockfile_still_rejects_traversal_dependency_name() {
         "stderr must name the invalid-dependency-name code; got:\n{stderr}",
     );
     // The rejection happens before materialization, so nothing is
-    // extracted — neither the legit slot nor any escaped directory.
+    // extracted; neither the legit slot nor any escaped directory.
     assert!(
         !workspace.join("node_modules/.pnpm").exists(),
         "the check must fail before any virtual-store materialization",
@@ -447,7 +453,7 @@ fn trust_lockfile_still_rejects_traversal_dependency_name() {
 
 /// A lockfile containing a path traversal in a package's explicit version
 /// must fail the slot containment check before any directory is created in
-/// the global virtual store — even under `--trust-lockfile`.
+/// the global virtual store, even under `--trust-lockfile`.
 #[test]
 fn install_rejects_a_traversal_version_under_global_virtual_store() {
     let CommandTempCwd {
@@ -509,6 +515,132 @@ fn install_rejects_a_traversal_version_under_global_virtual_store() {
         !gvs_root.join("escaped").exists(),
         "escaped directory must not be created under GVS root",
     );
+
+    drop((root, mock_instance));
+}
+
+fn acme_packument(registry_url: &str, name: &str, integrity: &str, published_at: &str) -> String {
+    let bare = name.rsplit('/').next().unwrap_or(name);
+    serde_json::json!({
+        "name": name,
+        "modified": published_at,
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": published_at },
+        "versions": {
+            "1.0.0": {
+                "name": name,
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": integrity,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{registry_url}/{name}/-/{bare}-1.0.0.tgz"),
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Switching `--registry` or `@scope:registry` must miss
+/// `<cacheDir>/lockfile-verified.jsonl` and re-verify against the new
+/// registry rather than reusing a verdict recorded for the previous one.
+#[test]
+fn changing_default_or_scoped_registry_invalidates_lockfile_verified_cache() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let mut registry_a = mockito::Server::new();
+    let mut registry_b = mockito::Server::new();
+    let tarball =
+        gzipped_tarball(&[("package/package.json", r#"{"name":"@corp/acme","version":"1.0.0"}"#)]);
+    let integrity = ssri::Integrity::from(&tarball).to_string();
+    let mature = "2020-01-01T00:00:00.000Z";
+    let immature = pnpm_time::format_rfc3339(jiff::Timestamp::now());
+
+    let meta_a = registry_a
+        .mock("GET", "/@corp%2Facme")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(acme_packument(&registry_a.url(), "@corp/acme", &integrity, mature))
+        .expect(1)
+        .create();
+    let _tarball_a = registry_a
+        .mock("GET", "/@corp/acme/-/acme-1.0.0.tgz")
+        .with_status(200)
+        .with_body(tarball)
+        .expect(1)
+        .create();
+    let meta_b = registry_b
+        .mock("GET", "/@corp%2Facme")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(acme_packument(&registry_b.url(), "@corp/acme", &integrity, &immature))
+        .expect_at_least(2)
+        .create();
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@corp/acme": "1.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    set_minimum_release_age(&workspace, 1440);
+    let lockfile = format!(
+        "lockfileVersion: '9.0'\n\
+         importers:\n  \
+           .:\n    \
+             dependencies:\n      \
+               '@corp/acme':\n        \
+                 specifier: 1.0.0\n        \
+                 version: 1.0.0\n\
+         packages:\n  \
+           '@corp/acme@1.0.0':\n    \
+             resolution: {{integrity: {integrity}}}\n\
+         snapshots:\n  \
+           '@corp/acme@1.0.0': {{}}\n",
+    );
+    fs::write(workspace.join("pnpm-lock.yaml"), lockfile).expect("write lockfile");
+
+    let reg_a_arg = format!("--registry={}/", registry_a.url());
+    let first = pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile", &reg_a_arg])
+        .output()
+        .expect("first install");
+    assert_success(&first);
+
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    let cached = pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile", &reg_a_arg])
+        .output()
+        .expect("cached install");
+    assert_success(&cached);
+    meta_a.assert();
+
+    let reg_b_arg = format!("--registry={}/", registry_b.url());
+    let changed_default = pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile", &reg_b_arg])
+        .output()
+        .expect("install with changed default registry");
+    let default_stderr = String::from_utf8_lossy(&changed_default.stderr);
+    assert!(
+        !changed_default.status.success()
+            && default_stderr.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION"),
+        "changing default registry must invalidate lockfile-verified.jsonl; got:\n{default_stderr}",
+    );
+
+    fs::write(workspace.join(".npmrc"), format!("@corp:registry={}/\n", registry_b.url()))
+        .expect("write .npmrc");
+    let changed_scope = pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile", &reg_a_arg])
+        .output()
+        .expect("install with changed @corp scope registry");
+    let scope_stderr = String::from_utf8_lossy(&changed_scope.stderr);
+    assert!(
+        !changed_scope.status.success()
+            && scope_stderr.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION"),
+        "changing @scope:registry must invalidate lockfile-verified.jsonl; got:\n{scope_stderr}",
+    );
+    meta_b.assert();
 
     drop((root, mock_instance));
 }

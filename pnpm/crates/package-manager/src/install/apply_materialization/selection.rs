@@ -1,11 +1,22 @@
 use super::super::{
-    Config, HashSet, IncludedDependencies, InstallError, InstallWithFreshLockfileError, Lockfile,
-    NodeLinker, PackageManifest, Path, PathBuf, Reporter,
+    Config,
+    HashSet,
+    IncludedDependencies,
+    InstallError,
+    InstallWithFreshLockfileError,
+    Lockfile,
+    NodeLinker,
+    PackageManifest,
+    Path,
+    PathBuf,
+    Reporter,
 };
 
 pub(super) struct SelectMaterializedStateInputs<'a> {
     pub(crate) lockfiles: crate::install::state_options::SelectedLockfiles<'a>,
     pub(crate) projects: crate::install::state_options::SelectedImporters<'a>,
+    pub(super) node_linker: NodeLinker,
+    pub(super) virtual_store_only: bool,
     pub(super) workspace_root: &'a Path,
     pub(super) groups: crate::GroupSelection,
     pub(super) install_skipped: &'a crate::SkippedSnapshots,
@@ -76,8 +87,27 @@ pub(super) fn materialized_current_lockfile(
     inputs: &SelectMaterializedStateInputs<'_>,
     wanted: &Lockfile,
 ) -> Lockfile {
-    if inputs.projects.requested_ids.is_none() && inputs.projects.ignore_manifest_check {
+    if inputs.virtual_store_only
+        && inputs.node_linker == NodeLinker::Hoisted
+        && !inputs.is_inconsistent
+        && let Some(current) = inputs.lockfiles.current
+    {
+        current.clone()
+    } else if inputs.projects.requested_ids.is_none() && inputs.projects.ignore_manifest_check {
         crate::filter_lockfile_for_current(wanted, &inputs.groups, inputs.install_skipped)
+    } else if inputs.node_linker == NodeLinker::Hoisted
+        && let Some(requested_ids) = inputs.projects.requested_ids
+    {
+        crate::selected_materialization_closure(
+            wanted,
+            inputs.workspace_root,
+            requested_ids,
+            Some(inputs.projects.real_ids),
+            (!inputs.is_inconsistent).then_some(inputs.lockfiles.current).flatten(),
+            &inputs.groups,
+            &inputs.install_skipped.transient_only(),
+        )
+        .lockfile
     } else {
         crate::merge_filtered_current_lockfile(
             (inputs.projects.requested_ids.is_some() && !inputs.is_inconsistent)
@@ -94,7 +124,7 @@ pub(super) fn materialized_current_lockfile(
 pub(super) struct LinkMaterializedProjectsInputs<'a> {
     pub(super) filtered_install: bool,
     pub(super) node_linker: NodeLinker,
-    pub(super) config: &'static Config,
+    pub(super) config: &'a Config,
     pub(super) lockfiles: LinkMaterializedLockfiles<'a>,
     pub(super) workspace_root: &'a Path,
     pub(super) manifest_links: LinkMaterializedManifestLinks<'a>,
@@ -123,14 +153,16 @@ pub(super) async fn link_materialized_projects<Reporter: self::Reporter + 'stati
     // These are importer symlinks, so `virtualStoreOnly` skips them too.
     if !inputs.config.virtual_store_only {
         crate::link_manifest_link_deps::<Reporter>(
-            inputs.workspace_root,
+            &pnpm_deps_restorer::ImporterModulesDirs::from_config(
+                inputs.config,
+                inputs.workspace_root,
+            ),
             inputs.materialized_project_manifests,
             inputs.lockfiles.wanted.and_then(|lockfile| {
                 (!lockfile.importers.is_empty()).then_some(&lockfile.importers)
             }),
             inputs.manifest_links.workspace_links,
             inputs.manifest_links.included,
-            inputs.config.modules_dir_name(),
             &crate::shim_link_options(inputs.config, inputs.node_linker),
         )
         .map_err(InstallError::LinkManifestLinkDeps)?;
@@ -167,15 +199,15 @@ pub(super) async fn write_filtered_package_map(
     .map_err(InstallError::WritePackageMap)?;
     Ok(())
 }
-pub(super) async fn package_map_engine_name(
-    config: &'static Config,
-    current: &Lockfile,
-) -> Option<String> {
-    let runtime_major = crate::install_frozen_lockfile::find_runtime_node_major(&current.importers);
-    let configured_major = config.node_version
-        .as_deref()
-        .and_then(crate::install_frozen_lockfile::parse_major_from_version);
-    match runtime_major.or(configured_major) {
+pub(super) async fn package_map_engine_name(config: &Config, current: &Lockfile) -> Option<String> {
+    let runtime_pin = pnpm_deps_restorer::find_root_runtime_node_version(&current.importers);
+    let target_major = pnpm_deps_restorer::materialization_plan::target_node_major(
+        pnpm_deps_restorer::materialization_plan::TargetNodeUse::Execution,
+        config.node_version.as_deref(),
+        runtime_pin.as_deref(),
+        None,
+    );
+    match target_major {
         Some(major) => Some(pnpm_graph_hasher::engine_name(major, None, None)),
         None if config.enable_global_virtual_store => tokio::task::spawn_blocking(|| {
             pnpm_graph_hasher::detect_node_major()

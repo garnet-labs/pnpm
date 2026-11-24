@@ -1,13 +1,29 @@
 //! How the mock primary runs a Hrana request: the steps of a batch, with
 //! their conditions, and the values and errors they carry.
 
-use crate::{is_transaction_conflict, is_unique_violation};
-use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD as BASE64};
-use libsql::{Connection, Value};
-use serde_json::{Value as JsonValue, json};
+use crate::{
+    is_transaction_conflict,
+    is_unique_violation,
+};
+use base64::{
+    Engine as _,
+    engine::general_purpose::STANDARD_NO_PAD as BASE64,
+};
+use libsql::{
+    Connection,
+    Value,
+};
+use serde_json::{
+    Value as JsonValue,
+    json,
+};
 use std::sync::{
     Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{
+        AtomicBool,
+        AtomicUsize,
+        Ordering,
+    },
 };
 
 /// The Hrana pipeline and cursor requests a primary has answered: the round
@@ -18,6 +34,12 @@ pub struct RoundTrips {
     /// The statements of each request, in order, for a test to report what a
     /// round trip carried.
     statements: Mutex<Vec<Vec<String>>>,
+    pause_next_write: AtomicBool,
+    /// Signalled when a `BEGIN IMMEDIATE` round trip pauses after
+    /// [`Self::pause_next_write`].
+    pub write_paused: tokio::sync::Notify,
+    /// Releases a paused `BEGIN IMMEDIATE` round trip.
+    pub write_resume: tokio::sync::Notify,
 }
 
 impl RoundTrips {
@@ -32,8 +54,15 @@ impl RoundTrips {
         std::mem::take(&mut *self.statements.lock().unwrap())
     }
 
-    pub(super) fn record(&self, steps: impl IntoIterator<Item = JsonValue>) {
-        let statements = steps
+    /// Pause the next `BEGIN IMMEDIATE` round trip before it runs on the
+    /// primary, signalling [`Self::write_paused`] until [`Self::write_resume`]
+    /// is notified.
+    pub fn pause_next_write(&self) {
+        self.pause_next_write.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) async fn record(&self, steps: impl IntoIterator<Item = JsonValue>) {
+        let statements: Vec<String> = steps
             .into_iter()
             .map(|step| {
                 let sql = step["stmt"]["sql"].as_str().unwrap_or_default();
@@ -44,11 +73,18 @@ impl RoundTrips {
                 sql.chars().take(120).collect()
             })
             .collect();
+        let is_write = statements
+            .iter()
+            .any(|sql| sql == "BEGIN IMMEDIATE");
         self.statements
             .lock()
             .unwrap()
             .push(statements);
         self.count.fetch_add(1, Ordering::SeqCst);
+        if is_write && self.pause_next_write.swap(false, Ordering::SeqCst) {
+            self.write_paused.notify_one();
+            self.write_resume.notified().await;
+        }
     }
 }
 
@@ -69,6 +105,12 @@ pub(super) async fn answer(conn: &Connection, request: &JsonValue) -> JsonValue 
                 "result": { "params": [], "cols": [], "is_explain": false, "is_readonly": false },
             },
         }),
+        Some("execute") => match run(conn, &request["stmt"]).await {
+            Ok(result) => {
+                json!({ "type": "ok", "response": { "type": "execute", "result": result } })
+            }
+            Err(error) => json!({ "type": "error", "error": hrana_error(&error) }),
+        },
         Some("close") => json!({ "type": "ok", "response": { "type": "close" } }),
         other => json!({
             "type": "error",
@@ -181,7 +223,8 @@ fn condition_holds(
     let step = || {
         condition["step"]
             .as_u64()
-            .and_then(|step| usize::try_from(step).ok())
+            .map(usize::try_from)
+            .and_then(Result::ok)
             .unwrap()
     };
     let each = |conds: &JsonValue| {

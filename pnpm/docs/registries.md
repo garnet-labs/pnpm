@@ -102,9 +102,7 @@ Values for common servers:
 
 A registry declared `serverType: pnpr` is also asked for pnpr's own package document, which is smaller than npm's and carries what only pnpr records: the selected [registry revision](./registry-revisions.md) of each version and the facts pnpr verified about each archive, such as whether it needs a build. A large document leaves out the manifests of the versions a resolution rarely picks, and pnpm fetches the manifest of such a version when it picks one. pnpm keeps these documents in `v12/metadata-pnpr` in the cache directory, apart from npm's documents.
 
-A version in pnpr's package document can carry platform variants: archives built for particular platforms, published with the version. pnpm records every variant in `pnpm-lock.yaml`, so the lockfile is the same on every machine, and links the variant that fits the host as the package itself. A host that no variant fits gets the version's own archive. A version published with variants only has no such archive: on a host that none of its variants fits, pnpm skips it as an optional dependency and otherwise fails, listing the platforms it is published for. Each variant's dependencies are recorded under `<name>@<version>/variants/<tag>` in `snapshots` when they differ from the version's, and pnpm installs only those of the variant it links.
-
-pnpr's package document supports a [`minimumReleaseAge`](./settings/dependency-resolution.md#minimumreleaseage) of at most 43200 minutes (30 days). A longer one fails the resolution with `ERR_PNPM_UNSUPPORTED_MINIMUM_RELEASE_AGE` when pnpm reads a package from a registry declared `serverType: pnpr`.
+pnpr's package document supports a [`minimumReleaseAge`](./settings/dependency-resolution.md#minimumreleaseage) of at most 43200 minutes (30 days). A longer one fails the resolution with `ERR_PNPM_UNSUPPORTED_MINIMUM_RELEASE_AGE` when pnpm reads a package from a registry declared `serverType: pnpr`. The window counts back from the current time, so a [`referenceTime`](./settings/dependency-resolution.md#referencetime) in the past adds how far it lags. With `referenceTime` set and `trustPolicy: no-downgrade`, a [`trustPolicyIgnoreAfter`](./settings/dependency-resolution.md#trustpolicyignoreafter) window is counted the same way, and one that reaches 43200 minutes fails the resolution with `ERR_PNPM_UNSUPPORTED_TRUST_POLICY_IGNORE_AFTER`.
 
 A pnpr server identifies itself in its responses. When a registry that is not declared `serverType: pnpr` turns out to be pnpr, pnpm warns once and installs from npm's documents, without revisions or pnpr's facts about the archives.
 
@@ -225,7 +223,7 @@ names its registry explicitly.
 
 An npm entry that declares no routes describes a registry configured elsewhere. For example, the default registry set in `.npmrc`. Such an entry only takes effect when its URL is one the project actually resolves from; pnpm warns about entries that match no configured registry, since they would otherwise sit there inert (a stale URL, a scope that moved).
 
-Environment variables are **not** expanded in the URL keys of this setting, for the same reason they are not expanded in other [registry URLs in `pnpm-workspace.yaml`](./settings.md): the file is committed, and expanding env variables into a request destination could leak secrets to an attacker-controlled host. A key containing a `${...}` placeholder is ignored.
+Environment variables are **not** expanded in the URL keys of this setting, for the same reason they are not expanded in other [registry URLs in `pnpm-workspace.yaml`](./settings.md): the file is committed, and expanding env variables into a request destination could leak secrets to an attacker-controlled host. A key containing a `${...}` placeholder fails the command.
 
 ## The older shapes
 

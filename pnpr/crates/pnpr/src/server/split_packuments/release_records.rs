@@ -3,15 +3,25 @@
 //! and the npm-format views from which pnpr's facts are removed.
 
 use super::{
-    super::{describe_tar, has_settled_tar_facts, publishing::variants::SHARED_MANIFEST_FIELD},
-    DIST_FIELDS, PNPR_FIELDS,
+    super::describe_tar,
+    DIST_FIELDS,
+    PNPR_FIELDS,
 };
 use axum::{
-    http::{HeaderValue, header},
-    response::{IntoResponse, Response},
+    http::{
+        HeaderValue,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use pnpr_storage::DerivedTar;
-use serde_json::{Map, Value};
+use serde_json::{
+    Map,
+    Value,
+};
 use std::collections::BTreeMap;
 
 /// A version document's address: `<version>+r<revision>` names one release
@@ -21,7 +31,8 @@ pub(in super::super) fn record_address(version_or_tag: &str) -> (&str, Option<u6
     version_or_tag
         .rsplit_once("+r")
         .and_then(|(version, revision)| Some((version, parse_revision(revision)?)))
-        .map_or((version_or_tag, None), |(version, revision)| (version, Some(revision)))
+        .map(|(version, revision)| (version, Some(revision)))
+        .unwrap_or((version_or_tag, None))
 }
 
 /// A revision number in its canonical form: digits without a leading zero.
@@ -54,53 +65,22 @@ pub(in super::super) fn version_document_response(
     json_response(&manifest)
 }
 
-/// The release record of `revision`. It is cached forever only once pnpr
-/// has derived every fact about its archive: until then, a later read could
-/// add one.
+/// A synthesized record's URL can later name a literal upstream version or tag.
 fn release_record_response(manifest: &Value, revision: u64, tars: TarFacts<'_>) -> Response {
     let Some(mut source) = revision_source(manifest, revision) else {
         return super::super::not_found();
     };
-    let settled = tars.is_some_and(|(table, _)| has_settled_tar_facts(&source, table));
     if let Some((table, tar_registry)) = tars {
         describe_tar(&mut source, table, tar_registry);
     }
-    // A release record is part of pnpr's own format, so it describes the
-    // variants; npm's version document does not.
-    super::super::publishing::variants::describe_version_variants(&mut source);
-    let response = json_response(&named_record(manifest, &source));
-    if settled { immutable(response) } else { response }
+    json_response(&named_record(manifest, &source))
 }
 
 /// The response for the release record a version was accepted with,
 /// `bytes` as the metadata store keeps them. They never change, so they are
 /// served as they are and cached forever.
-///
-/// `tars` is the tar-integrity table of a registry that serves tars: the
-/// record is described by its tar's integrity instead of the `.tgz`'s it was
-/// accepted with, and is cached forever only once that integrity is known.
-/// Those are not the bytes the record was accepted with.
-pub(in super::super) fn accepted_record_response(
-    bytes: Vec<u8>,
-    tars: Option<&BTreeMap<String, DerivedTar>>,
-) -> Response {
-    let Some(table) = tars else { return immutable(json_bytes_response(bytes)) };
-    let mut record: Value = match serde_json::from_slice(&bytes) {
-        Ok(record) => record,
-        Err(err) => return super::super::RegistryError::Json(err).into_response(),
-    };
-    let tar_integrity = record
-        .pointer("/inputs/archive/integrity")
-        .and_then(Value::as_str)
-        .and_then(|tgz| table.get(tgz))
-        .map(|derived| derived.tar_integrity.clone());
-    let Some(fields) = record.as_object_mut() else { return json_response(&record) };
-    let Some(integrity) = tar_integrity else {
-        fields.remove("integrity");
-        return json_response(&record);
-    };
-    fields.insert("integrity".into(), Value::String(integrity));
-    immutable(json_response(&record))
+pub(in super::super) fn accepted_record_response(bytes: Vec<u8>) -> Response {
+    immutable(json_bytes_response(bytes))
 }
 
 /// `response`, marked to be cached forever when it succeeded.
@@ -157,7 +137,7 @@ fn revision_source(manifest: &Value, revision: u64) -> Option<Value> {
 
 /// The revision a version's manifest is projected from: `0`, the original,
 /// unless the registry selected a replacement.
-pub(in super::super) fn selected_revision(manifest: &Value) -> u64 {
+fn selected_revision(manifest: &Value) -> u64 {
     manifest
         .pointer("/dist/revision")
         .and_then(Value::as_u64)
@@ -198,9 +178,6 @@ pub(in super::super) fn release_record(manifest: &Value) -> Map<String, Value> {
         _ => Map::new(),
     };
     let pnpr = dist.get("pnpr").and_then(Value::as_object);
-    if let Some(record) = pnpr.and_then(record_without_any_archive) {
-        return record;
-    }
     let mut record = Map::new();
     for field in DIST_FIELDS {
         if let Some(value) = dist.get(field) {
@@ -216,29 +193,11 @@ pub(in super::super) fn release_record(manifest: &Value) -> Map<String, Value> {
     record
 }
 
-/// The record of a version without an `any` archive, from its `dist.pnpr`:
-/// its variants and the manifest they share, with no facts of its own, since
-/// the archive pnpr generated for npm's documents is not one of its
-/// archives. `None` for any other version.
-fn record_without_any_archive(pnpr: &Map<String, Value>) -> Option<Map<String, Value>> {
-    let shared = pnpr.get(SHARED_MANIFEST_FIELD)?;
-    let mut record = Map::new();
-    if let Some(variants) = pnpr.get("variants") {
-        record.insert("variants".into(), variants.clone());
-    }
-    record.insert("manifest".into(), shared.clone());
-    Some(record)
-}
-
 /// Remove pnpr's extensions from a version manifest served in npm's format:
-/// pnpr's facts about the archives, the variants it stores with a hosted
-/// version, and the revision protocol's marker and history. The selected
-/// revision's `tarball` and `integrity` stay, so npm clients install it.
+/// pnpr's facts about the archives, and the revision protocol's marker and
+/// history. The selected revision's `tarball` and `integrity` stay, so npm
+/// clients install it.
 fn without_pnpr_facts(manifest: &mut Value) {
-    if let Some(fields) = manifest.as_object_mut() {
-        fields.remove(super::super::publishing::variants::STORED_FIELD);
-        fields.remove(super::super::publishing::variants::GENERATED_ARCHIVE_FIELD);
-    }
     let dist = manifest.get_mut("dist").and_then(Value::as_object_mut);
     if let Some(dist) = dist {
         for field in ["pnpr", "revision", "revisions"] {
@@ -247,9 +206,14 @@ fn without_pnpr_facts(manifest: &mut Value) {
     }
 }
 
-/// Remove pnpr's facts from every version of a document served in npm's
-/// format.
+/// Remove storage metadata and archive facts from a document served in npm's format.
 pub(in super::super) fn without_pnpr_facts_in(doc: &mut Value) {
+    if let Some(document) = doc.as_object_mut() {
+        document.remove("formatVersion");
+        if document.get("access").is_some_and(Value::is_null) {
+            document.remove("access");
+        }
+    }
     let versions = doc.get_mut("versions").and_then(Value::as_object_mut);
     versions
         .into_iter()

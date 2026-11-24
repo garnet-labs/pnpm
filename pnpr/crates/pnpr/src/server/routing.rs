@@ -1,25 +1,78 @@
+pub(super) mod npm_errors;
+
 pub(super) use super::{
-    Action, AppInner, AppState, AuthedCaller, CanonicalPackageName, MAX_PUBLISH_BODY_BYTES,
-    MAX_TEAM_BODY_BYTES, RegistrySource, TargetRegistry, authenticate, authorize_package, batch,
-    caller_scoped, cargo, check_publish_tombstone, delete_package, delete_tarball, get_dist_tags,
-    get_org_teams, get_team_members,
-    health::{serve_live, serve_ping, serve_ready},
-    hosted_storage, not_found, oci, pnpr_protocols_disabled, private_no_cache, publish_package,
-    pypi, remove_dist_tag, resolve_write_target, serve_metrics, serve_org_packages,
-    serve_package_tarball, serve_packument, serve_pnpr_handshake, serve_search, serve_tarball,
-    serve_version_manifest, set_dist_tag, split_package_identifier, staged,
-    team_access::{grant_team_access, list_team_packages, revoke_team_access},
-    team_mutations::{TeamScope, add_team_member, create_team, destroy_team, remove_team_member},
+    Action,
+    AppInner,
+    AppState,
+    AuthedCaller,
+    CanonicalPackageName,
+    MAX_LOGIN_BODY_BYTES,
+    MAX_PUBLISH_BODY_BYTES,
+    MAX_TEAM_BODY_BYTES,
+    RegistrySource,
+    TargetRegistry,
+    authenticate,
+    authorize_package,
+    authorize_package_write,
+    batch,
+    caller_scoped,
+    cargo,
+    check_publish_tombstone,
+    delete_package,
+    delete_tarball,
+    get_dist_tags,
+    get_org_teams,
+    get_team_members,
+    health::{
+        serve_live,
+        serve_ping,
+        serve_ready,
+    },
+    hosted_storage,
+    not_found,
+    oci,
+    pnpr_protocols_disabled,
+    private_no_cache,
+    publish_package,
+    pypi,
+    remove_dist_tag,
+    resolve_write_target,
+    serve_metrics,
+    serve_org_packages,
+    serve_package_tarball,
+    serve_packument,
+    serve_pnpr_handshake,
+    serve_search,
+    serve_tarball,
+    serve_version_manifest,
+    set_dist_tag,
+    split_package_identifier,
+    staged,
+    team_access::{
+        grant_team_access,
+        list_team_packages,
+        revoke_team_access,
+    },
+    team_mutations::{
+        TeamScope,
+        add_team_member,
+        create_team,
+        destroy_team,
+        remove_team_member,
+    },
     update_packument,
 };
+pub(crate) use request_timeout::RequestDeadline;
 
 mod account_handlers;
 use account_handlers::account_routes;
 
 mod protocol_routes;
 use protocol_routes::{
-    artifacts_routes, pipeline_routes, resolver_routes, staged_archive_routes,
-    staged_archive_routes_under,
+    artifacts_routes,
+    pipeline_routes,
+    resolver_routes,
+    staged_archive_routes,
 };
 
 mod team_handlers;
@@ -27,34 +80,75 @@ use team_handlers::team_routes;
 
 mod note_handlers;
 mod npm_handlers;
+mod npm_paths;
+mod owner_handlers;
+mod star_handlers;
 use npm_handlers::{
-    delete_package_dist_tag, delete_scoped_package, get_package_dist_tags, get_packument,
-    get_packument_or_version_manifest, get_scoped_tarball, get_search, get_tarball, put_package,
-    put_package_dist_tag, put_packument_revision, put_scoped_package,
-    put_scoped_packument_revision, unpublish_package, unpublish_scoped_package,
-    unpublish_scoped_tarball, unpublish_tarball,
+    delete_package_dist_tag,
+    delete_scoped_package,
+    get_package_dist_tags,
+    get_packument,
+    get_packument_or_version_manifest,
+    get_scoped_tarball,
+    get_search,
+    get_tarball,
+    put_package,
+    put_package_dist_tag,
+    put_packument_revision,
+    put_scoped_package,
+    put_scoped_packument_revision,
+    unpublish_package,
+    unpublish_scoped_package,
+    unpublish_scoped_tarball,
+    unpublish_tarball,
 };
-
-mod variant_handlers;
-use variant_handlers::get_scoped_variant_tarball;
 
 mod observability;
 use observability::with_observability_layers;
+
+mod request_timeout;
+use request_timeout::apply_request_timeout;
 
 use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Path, RawQuery, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::{any, delete, get, post, put},
+    extract::{
+        DefaultBodyLimit,
+        Path,
+        RawQuery,
+        State,
+    },
+    http::{
+        HeaderMap,
+        HeaderValue,
+        Method,
+        StatusCode,
+        header,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
+    routing::{
+        any,
+        delete,
+        get,
+        post,
+        put,
+    },
 };
-use pnpr_storage::metadata::MAX_NOTE_BYTES;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use pnpr_storage::database::MAX_NOTE_BYTES;
+use tower_http::cors::{
+    AllowOrigin,
+    CorsLayer,
+};
 
 use pnpr_auth::AuthState;
-use pnpr_config::Config;
+use pnpr_config::{
+    Config,
+    RoutingConfig,
+};
 use pnpr_registry::Ecosystem;
 use serde::Deserialize;
 
@@ -68,7 +162,7 @@ pub(super) fn router_with_auth_and_osv(
 
 /// The main router and the state it serves, which [`metrics_listener_router`]
 /// shares.
-pub(super) fn state_and_router(
+pub(crate) fn state_and_router(
     config: Config,
     auth: AuthState,
     osv_index: Option<Arc<pnpr_osv::OsvIndex>>,
@@ -86,6 +180,7 @@ pub(super) fn state_and_router(
     // Every router, also one an embedder builds directly, picks up what an
     // interrupted integration of the release record logs left.
     super::release_record_logs::integrate_sequenced_logs(&state);
+    super::cdn::start(&state)?;
     Ok((state, router))
 }
 
@@ -109,7 +204,9 @@ fn finish_router(
         // Inside the trace layer below, so a rejection is still one record.
         .layer(axum::middleware::from_fn_with_state(state.clone(), authenticate))
         .merge(main_listener_metrics_routes(&state));
-    let mut router = apply_request_timeout(router, state.inner.config.http.request_timeout);
+    let mut router =
+        apply_request_timeout(router, surfaces, state.inner.config.http.request_timeout)
+            .layer(axum::middleware::from_fn(npm_errors::render));
     if !cors_origins.is_empty() {
         router = router.layer(
             CorsLayer::new()
@@ -175,28 +272,6 @@ pub(super) fn metrics_listener_router(state: AppState) -> Router {
     with_observability_layers(router, state.clone()).with_state(state)
 }
 
-fn apply_request_timeout(
-    router: Router<AppState>,
-    timeout_duration: Option<std::time::Duration>,
-) -> Router<AppState> {
-    let Some(timeout_duration) = timeout_duration else {
-        return router;
-    };
-    router.layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
-            match tokio::time::timeout(timeout_duration, next.run(request)).await {
-                Ok(response) => response,
-                Err(_) => (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    r#"{"error":"request timed out"}"#,
-                )
-                    .into_response(),
-            }
-        },
-    ))
-}
-
 fn cors_origins(config: &Config) -> pnpr_error::Result<Vec<HeaderValue>> {
     config.http.cors
         .allowed_origins()
@@ -214,7 +289,7 @@ fn cors_origins(config: &Config) -> pnpr_error::Result<Vec<HeaderValue>> {
 
 /// Which of the configurable surfaces this server mounts.
 #[derive(Clone, Copy)]
-struct EnabledSurfaces {
+pub(super) struct EnabledSurfaces {
     resolver: bool,
     registry: bool,
     artifacts: bool,
@@ -235,7 +310,8 @@ fn surface_routes(
         .merge(super::oidc::routes(ui_served))
         .merge(account_routes())
         .merge(super::user_admin::user_admin_routes())
-        .merge(super::rule_admin::rule_admin_routes());
+        .merge(super::registry_graph::registry_admin_routes())
+        .merge(super::grant_admin::grant_admin_routes());
     if state.inner.config.identity.auth.scim.is_some() {
         router = router.merge(super::scim::scim_routes());
     }
@@ -260,51 +336,43 @@ fn surface_routes(
     }
     if surfaces.artifacts {
         router = artifacts_routes(state, router);
-    } else if surfaces.registry {
-        router = staged_archive_routes(router);
     }
     if surfaces.pipeline {
         router = pipeline_routes(state, router);
     }
     if surfaces.registry {
-        router = registry_routes(state, router);
+        router = registry_routes(router);
     }
 
     router
 }
 
-/// Mount the npm-compatible registry surface and every other ecosystem the
-/// configuration declares.
-fn registry_routes(state: &AppState, router: Router<AppState>) -> Router<AppState> {
-    let registries = &state.inner.config.routing.registries;
+/// Mount the npm-compatible registry surface and every other ecosystem. The
+/// stored graph can gain an ecosystem at any time, so all are mounted.
+fn registry_routes(router: Router<AppState>) -> Router<AppState> {
     let npm = npm_registry_routes();
     // One publish transaction for packages of any ecosystem. It answers here
     // rather than inside the npm surface.
-    let mut router = router
+    let router = staged_archive_routes(router, "")
         .route("/-/pnpr/v0/publish", put(batch::serve_ecosystem_publish))
         .route("/-/pnpr/v0/registries", get(super::registry_directory::serve))
-        .route("/-/publications/{org}", get(super::publications::serve_member_publication))
-        .route("/-/publications/{org}/{publication}", get(super::publications::serve_publication))
+        .route("/-/publications/{namespace}", get(super::publications::serve_member_publication))
         .route(
-            "/-/publications/{org}/{publication}/notes",
+            "/-/publications/{namespace}/{publication}",
+            get(super::publications::serve_publication),
+        )
+        .route(
+            "/-/publications/{namespace}/{publication}/notes",
             get(super::publications::serve_publication_note)
                 .put(super::publications::serve_publication_note)
                 .delete(super::publications::serve_publication_note)
                 .route_layer(DefaultBodyLimit::max(MAX_NOTE_BYTES)),
         );
-    if registries.has_ecosystem(Ecosystem::Npm) {
-        router = router.nest(&Ecosystem::Npm.base_path(), account_routes().merge(npm));
-    }
-    if registries.has_ecosystem(Ecosystem::Cargo) {
-        router = router.merge(cargo::routes());
-    }
-    if registries.has_ecosystem(Ecosystem::Pypi) {
-        router = router.merge(pypi::routes());
-    }
-    if registries.has_ecosystem(Ecosystem::Oci) {
-        router = router.merge(oci::routes());
-    }
     router
+        .nest(&Ecosystem::Npm.base_path(), account_routes().merge(npm))
+        .merge(cargo::routes())
+        .merge(pypi::routes())
+        .merge(oci::routes())
 }
 
 /// The npm-registry surface: every packument/tarball read, publish,
@@ -324,23 +392,37 @@ fn npm_registry_routes() -> Router<AppState> {
     // registry URL; under a named registry, its npm entries are addressed
     // through that registry. The archives a publish references are staged
     // beside it, under the same base.
-    let mut router = staged_archive_routes(
-        Router::new()
-            .route("/-/pnpr/v0/publish", put(batch::serve_ecosystem_publish))
-            .route("/~{registry}/-/pnpr/v0/publish", put(batch::serve_registry_publish)),
-    );
-    router = staged_archive_routes_under(router, "/~{registry}");
+    let mut router = Router::new()
+        .route("/-/pnpr/v0/publish", put(batch::serve_ecosystem_publish))
+        .route("/~{registry}/-/pnpr/v0/publish", put(batch::serve_registry_publish));
+    router = staged_archive_routes(router, "");
+    router = staged_archive_routes(router, "/~{registry}");
     for base in ["", "/~{registry}"] {
         let path = |tail: &str| format!("{base}{tail}");
         let with_teams = team_routes(staged_routes(ping_route(router, base), base), base);
         let with_audit = super::security_audit::routes(with_teams, base)
+            .route(&path("/-/pnpr"), get(super::serve_npm_handshake))
             .route(&path("/-/v1/search"), get(get_search))
             .route(&path("/-/npm/v1/keys"), get(super::attestations::get_keys))
             .route(&path("/-/log/{*resource}"), get(super::log_routes::get_log_resource))
             .route(
-                &path("/-/npm/v1/attestations/{*spec}"),
-                get(super::attestations::get_attestations),
+                &path("/-/user/v1/star"),
+                get(star_handlers::own_stars)
+                    .put(star_handlers::set)
+                    .delete(star_handlers::set)
+                    .route_layer(DefaultBodyLimit::max(
+                        super::package_owners::MAX_OWNER_BODY_BYTES,
+                    )),
             )
+            .route(&path("/-/user/{user}/stars"), get(star_handlers::user_stars))
+            .route(
+                &path("/-/package/{name}/owners"),
+                put(owner_handlers::add_owner)
+                    .route_layer(DefaultBodyLimit::max(
+                        super::package_owners::MAX_OWNER_BODY_BYTES,
+                    )),
+            )
+            .route(&path("/-/package/{name}/owners/{user}"), delete(owner_handlers::remove_owner))
             .route(&path("/-/package/{name}/dist-tags"), get(get_package_dist_tags))
             .route(
                 &path("/-/package/{name}/dist-tags/{tag}"),
@@ -380,7 +462,6 @@ fn npm_package_routes(router: Router<AppState>, base: &str) -> Router<AppState> 
         )
         .route(&path("/{name}/-/notes"), get(note_handlers::package_notes))
         .route(&path("/{scope}/{name}/-/notes"), get(note_handlers::scoped_package_notes))
-        .route(&path("/{scope}/{name}/variants/{tag}"), get(get_scoped_variant_tarball))
         .route(
             &path("/{scope}/{name}/-/{filename}"),
             get(get_scoped_tarball).delete(unpublish_scoped_tarball),
@@ -394,6 +475,15 @@ fn npm_package_routes(router: Router<AppState>, base: &str) -> Router<AppState> 
 fn npm_version_routes(router: Router<AppState>, base: &str) -> Router<AppState> {
     let path = |tail: &str| format!("{base}{tail}");
     router
+        .route(&path("/-/npm/v1/attestations/{*spec}"), get(super::attestations::get_attestations))
+        .route(
+            &path("/-/package/{name}/visibility"),
+            axum::routing::any(note_handlers::unsupported_npm_route),
+        )
+        .route(
+            &path("/-/package/{name}/collaborators"),
+            axum::routing::any(note_handlers::unsupported_npm_route),
+        )
         .route(
             &path("/{scope}/{name}/{version}/evidence"),
             get(note_handlers::scoped_record_evidence),
@@ -418,6 +508,25 @@ fn staged_routes(router: Router<AppState>, base: &str) -> Router<AppState> {
         .route(&path("/-/stage"), get(staged::list_staged))
         .route(&path("/-/stage/package/{name}"), post(staged::post_staged_publish))
         .route(&path("/-/stage/{id}"), get(staged::get_staged).delete(staged::reject_staged))
-        .route(&path("/-/stage/{id}/approve"), post(staged::approve_staged))
+        .route(
+            &path("/-/stage/{id}/approve"),
+            post(staged::approve_staged).route_layer(DefaultBodyLimit::max(MAX_LOGIN_BODY_BYTES)),
+        )
         .route(&path("/-/stage/{id}/tarball"), get(staged::get_staged_tarball))
+}
+
+pub(super) fn local_registry_router(config: &Config, routing: &RoutingConfig) -> Router<AppState> {
+    if !config.features.registry.enabled {
+        return Router::new();
+    }
+    let router = cargo::resolver_routes().merge(pypi::resolver_routes());
+    if routing.registries.has_ecosystem(Ecosystem::Npm) {
+        let mut packages = Router::new();
+        for base in ["", "/~{registry}"] {
+            packages = npm_package_routes(packages, base);
+        }
+        router.nest(&Ecosystem::Npm.base_path(), packages)
+    } else {
+        router
+    }
 }

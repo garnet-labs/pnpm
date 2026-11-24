@@ -8,11 +8,14 @@ use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::CommandTempCwd;
 use pretty_assertions::assert_eq;
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::Command,
+};
 
 /// Every setting flag, the value it is given, and what `pnpm config get`
 /// reports back for it.
-const SETTING_FLAGS: [(&[&str], &str, &str); 18] = [
+const SETTING_FLAGS: [(&[&str], &str, &str); 20] = [
     (&["--cache-dir", "/custom/cache"], "cache-dir", "/custom/cache"),
     (&["--package-import-method", "hardlink"], "package-import-method", "hardlink"),
     (&["--hoist-pattern=eslint"], "hoist-pattern", "[\n  \"eslint\"\n]"),
@@ -29,6 +32,12 @@ const SETTING_FLAGS: [(&[&str], &str, &str); 18] = [
     (&["--trust-policy", "no-downgrade"], "trust-policy", "no-downgrade"),
     (&["--trust-policy-exclude=lodash"], "trust-policy-exclude", "[\n  \"lodash\"\n]"),
     (&["--trust-policy-ignore-after=5"], "trust-policy-ignore-after", "5"),
+    (&["--minimum-release-age", "1440"], "minimum-release-age", "1440"),
+    (
+        &["--minimum-release-age-exclude", "is-odd", "--minimum-release-age-exclude=is-even"],
+        "minimum-release-age-exclude",
+        "[\n  \"is-odd\",\n  \"is-even\"\n]",
+    ),
     (&["--optimistic-repeat-install"], "optimistic-repeat-install", "true"),
     (&["--shamefully-hoist"], "shamefully-hoist", "true"),
 ];

@@ -1,8 +1,17 @@
+mod builds;
+
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
 use serde_json::Value;
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+};
 
 fn assert_no_installed_packages(root: &Path) {
     for entry in walkdir::WalkDir::new(root) {
@@ -96,7 +105,7 @@ fn cas_install_runs_scripts_bins_and_children_without_installed_packages() {
     #[cfg(unix)]
     Command::new(workspace.join("node_modules/.bin/hello-world-js-bin"))
         .with_current_dir(&workspace)
-        .env_remove("NODE_OPTIONS")
+        .without_env("NODE_OPTIONS")
         .assert()
         .success();
     assert!(workspace.join("node_modules/.pnpm-workspace-state-v1.json").is_file());
@@ -115,7 +124,7 @@ fn cas_install_runs_scripts_bins_and_children_without_installed_packages() {
             .with_current_dir(&workspace)
             .with_arg("--config.verify-deps-before-run=error")
             .with_args(args)
-            .env_remove("NODE_OPTIONS")
+            .without_env("NODE_OPTIONS")
             .assert()
             .success();
         assert!(String::from_utf8_lossy(&output.get_output().stdout).contains("CAS works"));
@@ -206,6 +215,20 @@ fn cas_opt_out_materializes_complete_dependency_tree_in_gvs() {
     Command::cargo_bin("pnpm")
         .unwrap()
         .with_current_dir(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+    let warm_manifest: Value = serde_json::from_slice(
+        &fs::read(workspace.join("node_modules/.pnpm/.store-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let excluded = &warm_manifest["packages"]["@pnpm.e2e/pkg-with-1-dep@100.0.0"];
+    assert_eq!(excluded["resolution"], "node");
+    assert!(excluded["files"].is_null());
+    assert!(Path::new(excluded["root"].as_str().unwrap()).is_dir());
+    Command::cargo_bin("pnpm")
+        .unwrap()
+        .with_current_dir(&workspace)
         .with_args(["store", "prune"])
         .assert()
         .success();
@@ -240,15 +263,16 @@ fn cas_workspace_preserves_workspace_and_alias_dependency_contexts() {
         ..
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
-    fs::create_dir_all(workspace.join("packages/child")).unwrap();
+    let child = workspace.join("packages/child#1");
+    fs::create_dir_all(&child).unwrap();
     fs::write(
         workspace.join("package.json"),
         r#"{"name":"root","dependencies":{"child":"workspace:*"}}"#,
     )
     .unwrap();
-    fs::write(workspace.join("packages/child/package.json"), r#"{"name":"child","version":"1.0.0","main":"index.cjs","bin":{"nested":"bin.cjs"},"scripts":{"test":"node index.cjs"},"dependencies":{"aliased":"npm:@pnpm.e2e/pkg-with-1-dep@100.0.0"}}"#).unwrap();
-    fs::write(workspace.join("packages/child/index.cjs"), "require('node:assert/strict').equal(require('aliased')().name, '@pnpm.e2e/dep-of-pkg-with-1-dep'); module.exports = 42;").unwrap();
-    fs::write(workspace.join("packages/child/bin.cjs"), r"const assert = require('node:assert/strict'); const options = process.env.NODE_OPTIONS; assert.equal(options.split(/\s+/).filter(option => option.includes('.store-loader.mjs')).length, 1); if (!process.env.NESTED_SHIM) require('node:child_process').execFileSync('nested', [], {env: {...process.env, NESTED_SHIM: 'true'}, stdio: 'inherit', shell: process.platform === 'win32'});").unwrap();
+    fs::write(child.join("package.json"), r#"{"name":"child","version":"1.0.0","main":"index.cjs","bin":{"nested":"bin.cjs"},"scripts":{"test":"node index.cjs"},"dependencies":{"aliased":"npm:@pnpm.e2e/pkg-with-1-dep@100.0.0"}}"#).unwrap();
+    fs::write(child.join("index.cjs"), "require('node:assert/strict').equal(require('aliased')().name, '@pnpm.e2e/dep-of-pkg-with-1-dep'); module.exports = 42;").unwrap();
+    fs::write(child.join("bin.cjs"), r"const assert = require('node:assert/strict'); const options = process.env.NODE_OPTIONS; assert.equal(options.split(/\s+/).filter(option => option.includes('.store-loader.mjs')).length, 1); if (!process.env.NESTED_SHIM) require('node:child_process').execFileSync('nested', [], {env: {...process.env, NESTED_SHIM: 'true'}, stdio: 'inherit', shell: process.platform === 'win32'});").unwrap();
     let yaml_path = workspace.join("pnpm-workspace.yaml");
     let mut yaml = fs::read_to_string(&yaml_path).unwrap();
     yaml.push_str("nodeLinker:\n  type: loaded\npackages:\n  - packages/*\n");
@@ -278,7 +302,7 @@ fn cas_workspace_preserves_workspace_and_alias_dependency_contexts() {
         .unwrap()
         .with_current_dir(&workspace)
         .with_args(["--config.verify-deps-before-run=error", "exec", "nested"])
-        .env_remove("NODE_OPTIONS")
+        .without_env("NODE_OPTIONS")
         .assert()
         .success();
     assert_no_installed_packages(&workspace);
@@ -343,7 +367,7 @@ fn frozen_cas_install_applies_opt_out_changes_and_repairs_missing_manifest() {
             .unwrap()
             .with_current_dir(&workspace)
             .with_args(["exec", "node", "-e", "require('@pnpm.e2e/pkg-with-1-dep')()"])
-            .env_remove("NODE_OPTIONS")
+            .without_env("NODE_OPTIONS")
             .assert()
             .success();
         assert!(
@@ -358,7 +382,7 @@ fn frozen_cas_install_applies_opt_out_changes_and_repairs_missing_manifest() {
 }
 
 #[test]
-fn cas_requires_opt_out_for_builds_and_links_generated_bins_after_building() {
+fn cas_build_cache_miss_materializes_and_links_generated_bins_after_building() {
     let CommandTempCwd {
         pacquet,
         root,
@@ -369,23 +393,32 @@ fn cas_requires_opt_out_for_builds_and_links_generated_bins_after_building() {
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
     fs::write(
         workspace.join("package.json"),
-        r#"{"dependencies":{"@pnpm.e2e/has-bin-and-needs-build":"1.0.0"}}"#,
+        r#"{"dependencies":{"@pnpm.e2e/has-bin-and-needs-build":"1.0.0","@pnpm.e2e/hello-world-js-bin":"1.0.0"}}"#,
     )
     .unwrap();
     let yaml_path = workspace.join("pnpm-workspace.yaml");
     let mut yaml = fs::read_to_string(&yaml_path).unwrap();
-    yaml.push_str("allowBuilds:\n  '@pnpm.e2e/has-bin-and-needs-build': true\n  '@pnpm.e2e/pre-and-postinstall-scripts-example': true\n  '@pnpm.e2e/install-script-example': true\nnodeLinker:\n  type: loaded\n");
+    yaml.push_str("allowBuilds:\n  '@pnpm.e2e/has-bin-and-needs-build': true\n  '@pnpm.e2e/pre-and-postinstall-scripts-example': true\n  '@pnpm.e2e/install-script-example': true\nsideEffectsCache: true\nnodeLinker:\n  type: loaded\n");
     fs::write(&yaml_path, &yaml).unwrap();
-    let failure = pacquet
+    pacquet
         .with_arg("install")
         .assert()
-        .failure();
-    assert!(String::from_utf8_lossy(&failure.get_output().stderr).contains("nodeLinker.excluded"));
-    fs::write(
-        &yaml_path,
-        format!("{yaml}  excluded:\n    - '@pnpm.e2e/has-bin-and-needs-build'\n"),
-    )
-    .unwrap();
+        .success();
+    let manifest_path = workspace.join("node_modules/.pnpm/.store-manifest.json");
+    let first_manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let package = &first_manifest["packages"]["@pnpm.e2e/has-bin-and-needs-build@1.0.0"];
+    assert!(Path::new(package["root"].as_str().unwrap()).is_dir());
+    assert!(package["files"].is_null());
+    Command::cargo_bin("pnpm")
+        .unwrap()
+        .with_current_dir(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let package = &manifest["packages"]["@pnpm.e2e/has-bin-and-needs-build@1.0.0"];
+    assert!(Path::new(package["root"].as_str().unwrap()).is_dir());
+    assert!(package["files"].is_null());
     Command::cargo_bin("pnpm")
         .unwrap()
         .with_current_dir(&workspace)
@@ -571,7 +604,7 @@ fn cas_loader_starts_when_a_package_ships_node_modules_files() {
         .unwrap()
         .with_current_dir(&workspace)
         .with_args(["exec", "node", "-e", "console.log(require('fixtures-in-node-modules'))"])
-        .env_remove("NODE_OPTIONS")
+        .without_env("NODE_OPTIONS")
         .assert()
         .success();
     assert_eq!(String::from_utf8_lossy(&output.get_output().stdout).trim(), "loaded");

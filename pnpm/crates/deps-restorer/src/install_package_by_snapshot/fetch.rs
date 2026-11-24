@@ -1,21 +1,51 @@
 mod sources;
 
 use super::{
-    InstallPackageBySnapshot, InstallPackageBySnapshotError, InstalledPackage,
-    variant_fetch::{ArchiveSource, VariantFetch, variant_for_host},
+    InstallPackageBySnapshot,
+    InstallPackageBySnapshotError,
+    InstalledPackage,
+    runtime::binary_variant_for_host,
 };
-use crate::{CreateVirtualDirBySnapshot, create_virtual_store::requires_build_from_cas_paths};
+use crate::{
+    CreateVirtualDirBySnapshot,
+    create_virtual_store::requires_build_from_cas_paths,
+};
 use pnpm_config::NodeLinker;
-use pnpm_directory_fetcher::{CopyFiles, DirectoryFetchOutput, DirectoryFetcherError};
+use pnpm_directory_fetcher::{
+    CopyFiles,
+    DirectoryFetchOutput,
+    DirectoryFetcherError,
+};
 use pnpm_fs::lexical_normalize;
 use pnpm_lockfile::{
-    DirectoryResolution, LockfileResolution, PackageKey, PackageMetadata, SnapshotEntry,
-    VariationsResolution,
+    DirectoryResolution,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    SnapshotEntry,
 };
 use pnpm_package_manifest::PackageBin;
-use pnpm_reporter::{LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter};
-use pnpm_tarball::{CachedCasPaths, IngestTarballToStore, MemCache, TarballError};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    ProgressLog,
+    ProgressMessage,
+    Reporter,
+};
+use pnpm_tarball::{
+    CachedCasPaths,
+    IngestTarballToStore,
+    MemCache,
+    TarballError,
+};
+use std::{
+    collections::BTreeMap,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::Arc,
+};
 
 /// The per-call inputs of [`InstallPackageBySnapshot::tarball_cas_paths`],
 /// alongside the install-scoped ones it reads off `self`.
@@ -55,10 +85,6 @@ pub(super) struct TarballFetch<'a, AllowBuild> {
     package_key: &'a PackageKey,
     package_id: &'a str,
     allow_build: &'a AllowBuild,
-    /// Which archive of the version this is: a platform variant is served
-    /// like a revision, verified against its tar's digest, without
-    /// redirects.
-    source: ArchiveSource,
 }
 
 #[derive(Debug, Default)]
@@ -108,25 +134,16 @@ pub(super) async fn download_tarball<Reporter: self::Reporter>(
             .await
             .map(ExtractedPackageMetadata::from_cached_cas_paths);
     };
-    // `clone()` is cheap (refs + `Arc`s) and lets us retry through
-    // `run_cached_without_mem_cache` below if the shared download failed.
-    let result =
-        download.clone().run_cached_with_mem_cache::<Reporter>(mem_cache, revision_addressed).await;
-    match result {
-        Ok(cached) => Ok((
-            Arc::clone(&cached.files),
-            ExtractedPackageMetadata {
-                manifest: cached.manifest.clone().map(Arc::new),
-                requires_build: cached.requires_build,
-                bins: cached.bins.clone(),
-            },
-        )),
-        Err(TarballError::SiblingFetchFailed { .. }) if !revision_addressed => download
-            .run_cached_without_mem_cache::<Reporter>(false)
-            .await
-            .map(ExtractedPackageMetadata::from_cached_cas_paths),
-        Err(err) => Err(err),
-    }
+    let cached =
+        download.run_cached_with_mem_cache::<Reporter>(mem_cache, revision_addressed).await?;
+    Ok((
+        Arc::clone(&cached.files),
+        ExtractedPackageMetadata {
+            manifest: cached.manifest.clone().map(Arc::new),
+            requires_build: cached.requires_build,
+            bins: cached.bins.clone(),
+        },
+    ))
 }
 /// Returns the file map alongside whether the source directory existed to
 /// walk. See [`crate::SlotImportSource::source_exists`] for why the caller
@@ -137,14 +154,14 @@ pub(super) fn fetch_directory_resolution(
     files: CopyFiles,
 ) -> Result<(pnpm_fs::CasPaths, bool), InstallPackageBySnapshotError> {
     let output =
-        walk_directory(&lexical_normalize(&workspace_root.join(&dir_resolution.directory)), files)
+        walk_directory(lexical_normalize(&workspace_root.join(&dir_resolution.directory)), files)
             .map_err(InstallPackageBySnapshotError::DirectoryFetch)?;
     Ok((pnpm_fs::cas_paths_from_paths(output.files_map), output.exists))
 }
 
 /// The directory fetch every directory resolution goes through.
 pub(crate) fn walk_directory(
-    directory: &Path,
+    directory: PathBuf,
     files: CopyFiles,
 ) -> Result<DirectoryFetchOutput, DirectoryFetcherError> {
     files.fetcher(directory).run()
@@ -159,22 +176,22 @@ pub(crate) fn walk_directory(
 /// event-construction code is unit-testable; the call site itself
 /// only fires when a non-empty cold-batch lockfile install runs,
 /// which the existing test suite doesn't cover.
-pub(super) fn emit_progress_resolved<Reporter: self::Reporter>(package_id: &str, requester: &str) {
+pub(super) fn emit_progress_resolved<Reporter: self::Reporter>(
+    package_id: String,
+    requester: String,
+) {
     Reporter::emit(&LogEvent::Progress(ProgressLog {
         level: LogLevel::Debug,
-        message: ProgressMessage::Resolved {
-            package_id: package_id.to_owned(),
-            requester: requester.to_owned(),
-        },
+        message: ProgressMessage::Resolved { package_id, requester },
     }));
 }
 
 impl InstallPackageBySnapshot<'_> {
     /// Execute the subroutine. Returns the fetched package's CAS file
-    /// index — the map relative-archive-path → absolute-store-path
+    /// index, the map relative-archive-path → absolute-store-path
     /// that downstream consumers use to either populate a
     /// virtual-store slot (isolated) or import into a hoisted
-    /// `node_modules/<alias>/` directly (hoisted) — together with
+    /// `node_modules/<alias>/` directly (hoisted), together with
     /// whether that map points at mutable local source, which only
     /// this function can tell because a custom fetcher's `delegate`
     /// can replace the lockfile's resolution.
@@ -185,7 +202,7 @@ impl InstallPackageBySnapshot<'_> {
     /// useful to the caller for assembling the
     /// [`crate::CasPathsByPkgId`] index when a workspace mixes
     /// linkers in the future. Under [`NodeLinker::Hoisted`] no slot
-    /// is created — the returned map is the only output the caller
+    /// is created, the returned map is the only output the caller
     /// gets, and it's threaded into [`crate::link_hoisted_modules()`].
     pub async fn run<Reporter: self::Reporter>(
         &self,
@@ -195,7 +212,7 @@ impl InstallPackageBySnapshot<'_> {
     ) -> Result<InstalledPackage, InstallPackageBySnapshotError> {
         // TODO: skip when already exists in store?
         let package_id = package_key.pkg_id();
-        emit_progress_resolved::<Reporter>(&package_id, self.ctx.requester);
+        emit_progress_resolved::<Reporter>(package_id.clone(), self.ctx.requester.to_owned());
 
         let download = self.ingest(metadata, &package_id);
         let custom =
@@ -259,7 +276,7 @@ impl InstallPackageBySnapshot<'_> {
                 auth_headers: &config.auth_headers,
                 retry_opts: config.retry_opts(),
                 offline: config.offline,
-                tar_limits: config.tar_limits(),
+                tar_limits: pnpm_tarball::TarLimits::new(config.max_tarball_unpacked_size),
             },
             package: pnpm_tarball::TarballPackage {
                 integrity_kind: pnpm_tarball::IntegrityKind::Resource,
@@ -270,7 +287,7 @@ impl InstallPackageBySnapshot<'_> {
                 id: package_id,
             },
             store: pnpm_tarball::ArchiveStoreContext {
-                dir: &config.store_dir,
+                dir: std::borrow::Cow::Borrowed(&config.store_dir),
                 index: self.fetching.store_index.cloned(),
                 index_writer: self.fetching.store_index_writer.cloned(),
                 verify_integrity: config.verify_store_integrity,
@@ -288,38 +305,6 @@ impl InstallPackageBySnapshot<'_> {
                 append_manifest: None,
             },
         }
-    }
-
-    /// Fetch the archive a `variations` resolution selects for this
-    /// install's platform: a runtime's binary archive, or a registry
-    /// package's platform variant or its variant that targets `any`.
-    async fn fetch_variations<Reporter: self::Reporter>(
-        &self,
-        fetch: &SnapshotFetch<'_>,
-        variations: &VariationsResolution,
-        allow_build: &(impl Fn(&str) -> Option<bool> + Send + Sync),
-    ) -> Result<(Arc<pnpm_fs::CasPaths>, ExtractedPackageMetadata), InstallPackageBySnapshotError>
-    {
-        let platform = super::variations_platform(variations, self.runtime_platform_selector);
-        let selected = variant_for_host(variations, fetch.package_key, &platform, self.ctx.config)?;
-        let (resolution, source) = match selected {
-            VariantFetch::Binary(binary) => {
-                return self
-                    .fetch_binary::<Reporter>(binary, fetch.package_key)
-                    .await
-                    .map(|cas_paths| (Arc::new(cas_paths), ExtractedPackageMetadata::default()));
-            }
-            VariantFetch::Tarball { resolution, source } => (resolution, source),
-        };
-        self.tarball_cas_paths::<Reporter>(TarballFetch {
-            download: fetch.download,
-            resolution: &resolution,
-            package_key: fetch.package_key,
-            package_id: fetch.package_id,
-            allow_build,
-            source,
-        })
-        .await
     }
 
     /// Returns the fetched CAS paths alongside extracted package metadata and
@@ -358,7 +343,7 @@ impl InstallPackageBySnapshot<'_> {
                 )
                 .map(|(cas_paths, exists)| without_metadata(cas_paths, exists))
             }
-            // Runtime artifacts (Node.js / Bun / Deno) — `Binary`
+            // Runtime artifacts (Node.js / Bun / Deno). `Binary`
             // and `Variations` carry a `BinaryResolution` describing
             // the archive to fetch. `Variations` is the multi-
             // platform wrapper: pick the variant whose `targets`
@@ -369,9 +354,16 @@ impl InstallPackageBySnapshot<'_> {
                     .map(|cas_paths| without_metadata(cas_paths, true))
             }
             LockfileResolution::Variations(variations) => self
-                .fetch_variations::<Reporter>(&fetch, variations, &allow_build)
+                .fetch_binary::<Reporter>(
+                    binary_variant_for_host(
+                        variations,
+                        fetch.package_key,
+                        self.runtime_platform_selector,
+                    )?,
+                    fetch.package_key,
+                )
                 .await
-                .map(|(cas_paths, extracted)| (cas_paths, extracted, true)),
+                .map(|cas_paths| without_metadata(cas_paths, true)),
             LockfileResolution::Git(git_resolution) => self
                 .fetch_git::<Reporter>(&fetch, git_resolution, &allow_build)
                 .await
@@ -398,7 +390,6 @@ impl InstallPackageBySnapshot<'_> {
             package_key: fetch.package_key,
             package_id: fetch.package_id,
             allow_build,
-            source: ArchiveSource::Any,
         })
         .await
     }
@@ -408,7 +399,7 @@ impl InstallPackageBySnapshot<'_> {
         move |dep_path: &str| policy.check(dep_path)
     }
 
-    /// Under hoisted, the virtual-store slot would be unused —
+    /// Under hoisted, the virtual-store slot would be unused,
     /// [`crate::link_hoisted_modules()`] consumes the CAS paths
     /// directly to materialize project-tree `node_modules/`
     /// directories, so any slot written here would only waste disk.
@@ -445,7 +436,7 @@ impl InstallPackageBySnapshot<'_> {
                 is_mutable: slot.source_is_mutable,
                 source_exists: slot.source_exists,
                 force: false,
-                build_marker: None,
+                awaits_build: false,
                 needs_build: slot.requires_build.unwrap_or_else(|| {
                     requires_build_from_cas_paths(cas_paths)
                 }) || crate::snapshot_has_patch(slot.package_key),

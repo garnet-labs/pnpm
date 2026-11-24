@@ -1,12 +1,42 @@
 use super::{
-    Arc, ArchiveStoreProjection, AuthHeaders, CafsFileInfo, Duration, FASTIFY_ERROR_INTEGRITY,
-    FASTIFY_ERROR_TARBALL, HashMap, HttpStatusError, IngestTarballToStore, Integrity, MemCache,
-    NetworkError, PackageFilesIndex, RetryOpts, SharedVerifiedFilesCache, SilentReporter,
-    StoreIndex, StoreIndexWriter, TarballError, ThrottledClient, UNREACHABLE_URL,
-    VerifyChecksumError, assert_eq, fast_fail_client, fast_fail_client_with_connect_timeout,
-    fast_retry_opts, fetch_and_extract_with_retry, gzipped_tar, integrity, is_transient_error,
-    seed_row_holding_another_package, store_index_cache_key, store_index_key, store_paths, tempdir,
-    tempdir_with_leaked_path, test_retry_opts,
+    Arc,
+    ArchiveStoreProjection,
+    AuthHeaders,
+    CafsFileInfo,
+    Duration,
+    FASTIFY_ERROR_INTEGRITY,
+    FASTIFY_ERROR_TARBALL,
+    HashMap,
+    HttpStatusError,
+    IngestTarballToStore,
+    Integrity,
+    MemCache,
+    NetworkError,
+    PackageFilesIndex,
+    RetryOpts,
+    SharedVerifiedFilesCache,
+    SilentReporter,
+    StoreIndex,
+    StoreIndexWriter,
+    TarballError,
+    ThrottledClient,
+    UNREACHABLE_URL,
+    VerifyChecksumError,
+    assert_eq,
+    fast_fail_client,
+    fast_fail_client_with_connect_timeout,
+    fast_retry_opts,
+    fetch_and_extract_with_retry,
+    gzipped_tar,
+    integrity,
+    is_transient_error,
+    seed_row_holding_another_package,
+    store_index_cache_key,
+    store_index_key,
+    store_paths,
+    tempdir,
+    tempdir_with_leaked_path,
+    test_retry_opts,
 };
 
 /// Pin `walk_reqwest_chain`'s contract: a `NetworkError` formed
@@ -40,7 +70,7 @@ async fn network_error_display_includes_reqwest_inner_chain() {
 
     // Reqwest's wrapper already includes the URL in `(...)`; the
     // leaf reason appears after the wrapper, separated by `: `.
-    // Assert there *is* a non-empty frame after that — without
+    // Assert there *is* a non-empty frame after that, without
     // `walk_reqwest_chain`, this is exactly what got dropped.
     let leaf_section = rendered
         .split_once("error sending request for url (")
@@ -56,7 +86,7 @@ async fn network_error_display_includes_reqwest_inner_chain() {
         "leaf should be joined with `: ` per walk_reqwest_chain, got: {rendered:?}",
     );
 
-    // Structural form for completeness — `#[error(source)]` should
+    // Structural form for completeness, `#[error(source)]` should
     // expose the reqwest::Error so miette / `Error::source` can
     // walk into it independently of our flattened Display.
     assert!(
@@ -75,7 +105,7 @@ async fn packages_under_orgs_should_work() {
     let cas_files = IngestTarballToStore {
 fetching: crate::ArchiveFetchOptions {http_client: &ThrottledClient::default(),auth_headers: &AuthHeaders::default(),retry_opts: test_retry_opts(),offline: false, tar_limits: crate::TarLimits::default()},
 package: crate::TarballPackage {integrity_kind: crate::IntegrityKind::Resource,integrity: Some(&integrity("sha512-dj7vjIn1Ar8sVXj2yAXiMNCJDmS9MQ9XMlIecX2dIzzhjSHCyKo4DdXjXMs7wKW2kj6yvVRSpuQjOZ3YLrh56w==")),unpacked_size: Some(16697),file_count: None,url: "https://registry.npmjs.org/@fastify/error/-/error-3.3.0.tgz",id: "@fastify/error@3.3.0"},
-store: crate::ArchiveStoreContext {dir: store_path,index: None,index_writer: None,verify_integrity: true,strict_pkg_content_check: true,verified_files_cache: SharedVerifiedFilesCache::default(),prefetched_cas_paths: None},
+store: crate::ArchiveStoreContext {dir: std::borrow::Cow::Borrowed(store_path),index: None,index_writer: None,verify_integrity: true,strict_pkg_content_check: true,verified_files_cache: SharedVerifiedFilesCache::default(),prefetched_cas_paths: None},
 
 
 
@@ -130,7 +160,7 @@ store: crate::ArchiveStoreContext {dir: store_path,index: None,index_writer: Non
 /// registry serving a tarball that isn't what its metadata says, leaves
 /// a store row whose `package.json` names another package. Reusing it
 /// would install that other package under this name, so the read fails
-/// instead — pnpm's `ERR_PNPM_UNEXPECTED_PKG_CONTENT_IN_STORE`.
+/// instead, pnpm's `ERR_PNPM_UNEXPECTED_PKG_CONTENT_IN_STORE`.
 #[tokio::test]
 async fn store_row_holding_another_package_fails_the_read() {
     let (store_dir, store_path) = tempdir_with_leaked_path();
@@ -159,7 +189,7 @@ async fn store_row_holding_another_package_fails_the_read() {
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: StoreIndex::shared_readonly_in(store_path),
             index_writer: None,
             verify_integrity: true,
@@ -317,7 +347,7 @@ async fn mem_cache_partitions_raw_and_package_projections_in_both_orders() {
                 id: "artifact@1.0.0",
             },
             store: crate::ArchiveStoreContext {
-                dir: store_path,
+                dir: std::borrow::Cow::Borrowed(store_path),
                 index: None,
                 index_writer: None,
                 verify_integrity: true,
@@ -445,7 +475,7 @@ async fn synthesized_projection_reuses_only_a_matching_legacy_row_offline() {
             id: package_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: store_index.clone(),
             index_writer: None,
             verify_integrity: true,
@@ -535,7 +565,7 @@ async fn raw_archive_projection_skips_npm_identity_checks_on_store_hits() {
             id: package_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: StoreIndex::shared_readonly_in(store_path),
             index_writer: None,
             verify_integrity: true,
@@ -591,7 +621,7 @@ async fn run_without_mem_cache_fetches_unverified_and_writes_no_index_row() {
             id: "@fastify/error@3.3.0",
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: None,
             index_writer: Some(Arc::clone(&writer)),
             verify_integrity: true,
@@ -708,7 +738,7 @@ async fn revision_addressed_mem_cache_does_not_retry_a_failed_prefetch() {
             id: "test-pkg",
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: None,
             index_writer: None,
             verify_integrity: true,
@@ -746,6 +776,76 @@ async fn revision_addressed_mem_cache_does_not_retry_a_failed_prefetch() {
         .expect_err("a later consumer must inherit the terminal failure");
     assert!(matches!(later, TarballError::SiblingFetchFailed { .. }), "got {later:?}");
 
+    mock.assert_async().await;
+    drop(store_dir_keep);
+}
+
+#[tokio::test]
+async fn mem_cache_spends_one_retry_budget_on_a_failing_archive() {
+    let (store_dir_keep, store_path) = tempdir_with_leaked_path();
+    let mut server = mockito::Server::new_async().await;
+    let path = "/test-pkg-1.0.0.tgz";
+    let retry_opts = fast_retry_opts();
+    let mock = server
+        .mock("GET", path)
+        .with_status(503)
+        .expect(usize::try_from(retry_opts.retries).unwrap() + 1)
+        .create_async()
+        .await;
+    let url = format!("{}{path}", server.url());
+    let expected = integrity(FASTIFY_ERROR_INTEGRITY);
+    let client = ThrottledClient::default();
+    let mem_cache = MemCache::default();
+    let auth_headers = AuthHeaders::default();
+    let verified_files_cache = SharedVerifiedFilesCache::default();
+    let download = || IngestTarballToStore {
+        fetching: crate::ArchiveFetchOptions {
+            http_client: &client,
+            auth_headers: &auth_headers,
+            retry_opts,
+            offline: false,
+            tar_limits: crate::TarLimits::default(),
+        },
+        package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
+            integrity: Some(&expected),
+            unpacked_size: None,
+            file_count: None,
+            url: &url,
+            id: "test-pkg@1.0.0",
+        },
+        store: crate::ArchiveStoreContext {
+            dir: std::borrow::Cow::Borrowed(store_path),
+            index: None,
+            index_writer: None,
+            verify_integrity: true,
+            strict_pkg_content_check: true,
+            verified_files_cache: SharedVerifiedFilesCache::clone(&verified_files_cache),
+            prefetched_cas_paths: None,
+        },
+
+        requester: "",
+
+        ignore_file_pattern: None,
+
+        progress_reported: None,
+        store_projection: ArchiveStoreProjection::Package { append_manifest: None },
+    };
+
+    let (first, second) = futures_util::future::join(
+        download().run_with_mem_cache::<SilentReporter>(&mem_cache),
+        download().run_with_mem_cache::<SilentReporter>(&mem_cache),
+    )
+    .await;
+    let later = download().run_with_mem_cache::<SilentReporter>(&mem_cache).await;
+
+    for result in [first, second, later] {
+        let error = result.expect_err("every consumer must fail");
+        assert!(
+            error.to_string().contains("HTTP 503"),
+            "the owner's error must be reported; got {error}",
+        );
+    }
     mock.assert_async().await;
     drop(store_dir_keep);
 }
@@ -791,7 +891,7 @@ async fn revision_addressed_mem_cache_does_not_reuse_a_redirect_permitting_fetch
             id: "test-pkg",
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: None,
             index_writer: None,
             verify_integrity: true,
@@ -824,7 +924,7 @@ async fn revision_addressed_mem_cache_does_not_reuse_a_redirect_permitting_fetch
 }
 
 /// 404 is in pnpm's no-retry set. `expect(1)` makes the test fail if
-/// the retry loop fires a second request — that would mean we're
+/// the retry loop fires a second request, that would mean we're
 /// spinning on a permanently-missing tarball.
 #[tokio::test]
 async fn fails_fast_on_404() {

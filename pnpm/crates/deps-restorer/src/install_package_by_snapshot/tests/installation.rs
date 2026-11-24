@@ -1,17 +1,32 @@
 use super::{
     super::{
-        InstallPackageBySnapshotError, host_platform_selector, tarball_url_and_integrity,
+        InstallPackageBySnapshotError,
+        host_platform_selector,
+        tarball_url_and_integrity,
         unverified_fetch_is_allowed,
     },
-    DUMMY_SHA512, custom_resolution_metadata, leaked_offline_config, registry_metadata,
-    run_snapshot_install_with_session, scripted_session,
+    DUMMY_SHA512,
+    custom_resolution_metadata,
+    leaked_offline_config,
+    registry_metadata,
+    run_snapshot_install_with_session,
+    scripted_session,
 };
 use crate::install_package_by_snapshot::runtime::render_variant_targets;
 use pnpm_config::Config;
-use pnpm_graph_hasher::{host_arch, host_libc, host_platform};
+use pnpm_graph_hasher::{
+    host_arch,
+    host_libc,
+    host_platform,
+};
 use pnpm_lockfile::{
-    LockfileResolution, PackageKey, PlatformAssetResolution, PlatformAssetTarget,
-    RegistryResolution, TarballResolution, TarballRevision,
+    LockfileResolution,
+    PackageKey,
+    PlatformAssetResolution,
+    PlatformAssetTarget,
+    RegistryResolution,
+    TarballResolution,
+    TarballRevision,
 };
 use pretty_assertions::assert_eq;
 
@@ -78,7 +93,7 @@ fn tarball_revision_rejects_non_registry_tarballs() {
     }
 }
 /// The exemption follows the URL, not the lockfile's `gitHosted`
-/// marker — the same call pnpm's `classifyResolution` makes.
+/// marker, the same call pnpm's `classifyResolution` makes.
 #[test]
 fn only_git_hosted_and_local_tarballs_may_be_fetched_unverified() {
     assert!(unverified_fetch_is_allowed(
@@ -91,7 +106,7 @@ fn only_git_hosted_and_local_tarballs_may_be_fetched_unverified() {
 }
 /// Asserting platform-specific shape directly would mean four
 /// `cfg`-gated tests; instead, run the live `host_*` functions and
-/// pin the *relationship* — `host_libc() == "unknown"` iff the
+/// pin the *relationship*, `host_libc() == "unknown"` iff the
 /// selector's `libc` field is `None`. The relationship covers both
 /// the macOS / Windows / BSD non-Linux case (`libc` always `None`)
 /// and the Linux case (`libc` always `Some("glibc")` /
@@ -123,17 +138,11 @@ fn render_variant_targets_formats_each_triple_with_optional_libc() {
                 directory: "fixture".into(),
             }),
             targets: vec![
-                PlatformAssetTarget {
-                    os: "darwin".into(),
-                    cpu: "arm64".into(),
-                    libc: None,
-                    ..PlatformAssetTarget::default()
-                },
+                PlatformAssetTarget { os: "darwin".into(), cpu: "arm64".into(), libc: None },
                 PlatformAssetTarget {
                     os: "linux".into(),
                     cpu: "x64".into(),
                     libc: Some("musl".into()),
-                    ..PlatformAssetTarget::default()
                 },
             ],
         },
@@ -145,7 +154,6 @@ fn render_variant_targets_formats_each_triple_with_optional_libc() {
                 os: "win32".into(),
                 cpu: "x64".into(),
                 libc: None,
-                ..PlatformAssetTarget::default()
             }],
         },
     ];
@@ -153,18 +161,23 @@ fn render_variant_targets_formats_each_triple_with_optional_libc() {
     let rendered = render_variant_targets(&variants);
     assert_eq!(rendered, "darwin/arm64, linux/x64+musl, win32/x64");
 }
-/// The resolve-time prefetch is best-effort: if it failed (its mem-cache
-/// slot is [`CacheValue::Failed`]), the cold batch must not inherit the
-/// failure — it falls back to its own retried download. Proven here by
-/// seeding a `Failed` slot under `offline: true`: the only way to reach
-/// the offline gate (`NoOfflineTarball`) instead of surfacing
-/// `SiblingFetchFailed` is for the fallback to `run_without_mem_cache` to
-/// have run.
+/// A prefetch that failed has already spent the archive's retry budget, so
+/// the cold batch reports its error instead of downloading again. The slot
+/// is seeded under `offline: true`, where a second download would fail at
+/// the offline gate (`NoOfflineTarball`) instead.
 #[tokio::test]
-async fn cold_batch_falls_back_when_prefetch_failed() {
+async fn cold_batch_reports_a_failed_prefetch_without_downloading_again() {
     use crate::InstallPackageBySnapshotError;
-    use pnpm_tarball::{CacheValue, MemCache, TarballError, package_mem_cache_key};
-    use std::sync::{Arc, atomic::AtomicU8};
+    use pnpm_tarball::{
+        CacheValue,
+        MemCache,
+        TarballError,
+        package_mem_cache_key,
+    };
+    use std::sync::{
+        Arc,
+        atomic::AtomicU8,
+    };
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
     let config = leaked_offline_config("https://registry.test", store_tmp.path());
@@ -178,7 +191,7 @@ async fn cold_batch_falls_back_when_prefetch_failed() {
             Some(&DUMMY_SHA512.parse().expect("parse integrity")),
             false,
         ),
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Failed)),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Failed("prefetch failed".into()))),
     );
 
     let layout = crate::VirtualStoreLayout::legacy(store_tmp.path().join("vstore"), 120);
@@ -234,14 +247,15 @@ async fn cold_batch_falls_back_when_prefetch_failed() {
     }
     .run::<pnpm_reporter::SilentReporter>(&package_key, &metadata, &snapshot)
     .await
-    .expect_err("a failed prefetch must fall back to a real download, here offline-gated");
+    .expect_err("the failed prefetch must fail the install");
 
     assert!(
         matches!(
-            err,
-            InstallPackageBySnapshotError::DownloadTarball(TarballError::NoOfflineTarball { .. }),
+            &err,
+            InstallPackageBySnapshotError::DownloadTarball(TarballError::SiblingFetchFailed { cause })
+                if &**cause == "prefetch failed",
         ),
-        "fallback must reach the offline download gate, not inherit SiblingFetchFailed; got {err:?}",
+        "the prefetch's error must be reported without another download; got {err:?}",
     );
 
     drop(store_tmp);
@@ -254,8 +268,16 @@ async fn cold_batch_falls_back_when_prefetch_failed() {
 /// original URL was never seeded).
 #[tokio::test]
 async fn custom_fetcher_delegate_rewrites_the_resolution() {
-    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
-    use std::{collections::HashMap, sync::Arc};
+    use pnpm_tarball::{
+        CacheValue,
+        CachedTarball,
+        MemCache,
+        package_mem_cache_key,
+    };
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+    };
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
     let config = leaked_offline_config("https://registry.test", store_tmp.path());
@@ -308,8 +330,16 @@ async fn custom_fetcher_delegate_rewrites_the_resolution() {
 /// `fetch` ran (`can_fetch = false` must short-circuit it).
 #[tokio::test]
 async fn custom_fetcher_declining_falls_through_to_the_original_resolution() {
-    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
-    use std::{collections::HashMap, sync::Arc};
+    use pnpm_tarball::{
+        CacheValue,
+        CachedTarball,
+        MemCache,
+        package_mem_cache_key,
+    };
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+    };
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
     let config = leaked_offline_config("https://registry.test", store_tmp.path());
@@ -404,7 +434,7 @@ async fn custom_fetcher_invalid_delegate_fails_the_install() {
 
     drop(store_tmp);
 }
-/// A delegate that is itself custom-typed is rejected — delegation is
+/// A delegate that is itself custom-typed is rejected, delegation is
 /// single-step, mirroring the TypeScript `pickFetcher`, which throws
 /// `ERR_PNPM_UNSUPPORTED_RESOLUTION_TYPE` for a custom-typed delegate.
 #[tokio::test]
@@ -439,8 +469,16 @@ async fn custom_fetcher_custom_typed_delegate_is_rejected() {
 /// the custom `type` tag exactly as the lockfile spells it.
 #[tokio::test]
 async fn custom_typed_resolution_installs_via_delegating_fetcher() {
-    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
-    use std::{collections::HashMap, sync::Arc};
+    use pnpm_tarball::{
+        CacheValue,
+        CachedTarball,
+        MemCache,
+        package_mem_cache_key,
+    };
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+    };
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
     let config = leaked_offline_config("https://registry.test", store_tmp.path());
@@ -552,7 +590,7 @@ async fn an_unpinned_delegate_to_a_directory_keeps_its_resolution() {
                     id: "pkg@1.0.0",
                 },
                 store: pnpm_tarball::ArchiveStoreContext {
-                    dir: &config.store_dir,
+                    dir: std::borrow::Cow::Borrowed(&config.store_dir),
                     index: None,
                     index_writer: None,
                     verify_integrity: config.verify_store_integrity,
@@ -587,8 +625,16 @@ async fn an_unpinned_delegate_to_a_directory_keeps_its_resolution() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn git_subdirectory_install_reuses_raw_archive_cache() {
-    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
-    use std::{collections::HashMap, sync::Arc};
+    use pnpm_tarball::{
+        CacheValue,
+        CachedTarball,
+        MemCache,
+        package_mem_cache_key,
+    };
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+    };
     let dir = tempfile::tempdir().unwrap();
     let url =
         "https://codeload.github.com/example/repo/tar.gz/0123456789abcdef0123456789abcdef01234567";

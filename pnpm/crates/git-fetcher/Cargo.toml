@@ -10,6 +10,10 @@ keywords.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["shell-emulator"]
+shell-emulator = ["pnpm-executor/shell-emulator"]
+
 [dependencies]
 pnpm-cmd-shim = { workspace = true }
 pnpm-diagnostics = { workspace = true }
@@ -19,6 +23,7 @@ pnpm-fs-packlist = { workspace = true }
 pnpm-git-utils = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-package-manifest = { workspace = true }
+pnpm-process = { path = "../process" }
 pnpm-reporter = { workspace = true }
 pnpm-store-dir = { workspace = true }
 
@@ -42,7 +47,6 @@ tokio = { workspace = true, features = ["net", "signal"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 pnpm-which = { workspace = true }
-pnpm-process = { path = "../process" }
 
 [lints]
 workspace = true

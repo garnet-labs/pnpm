@@ -3,16 +3,39 @@ mod registry;
 mod tests;
 
 use crate::{
-    cli_args::{registry_client::build_registry_client_with_guard, sanitize::sanitize_inline},
+    cli_args::{
+        registry_client::build_registry_client_with_guard,
+        sanitize::sanitize_inline,
+    },
     confirm_prompt::stdin_is_terminal,
 };
 use clap::Args;
-use derive_more::{Display, Error};
-use miette::{Diagnostic, IntoDiagnostic};
-use pnpm_auth_commands::login::{Host, PromptPassword};
+use derive_more::{
+    Display,
+    Error,
+};
+use miette::{
+    Diagnostic,
+    IntoDiagnostic,
+};
+use pnpm_auth_commands::login::{
+    Host,
+    PromptPassword,
+};
 use pnpm_config::Config;
-use pnpm_network::{RetryOpts, ThrottledClient, normalize_registry_url, origins_redirect_guard};
-use registry::{CreateTokenRequest, TokenItem, create_token, delete_token, fetch_token_list};
+use pnpm_network::{
+    RetryOpts,
+    ThrottledClient,
+    normalize_registry_url,
+    origins_redirect_guard,
+};
+use registry::{
+    CreateTokenRequest,
+    TokenItem,
+    create_token,
+    delete_token,
+    fetch_token_list,
+};
 use std::fmt::Write as _;
 
 pub(crate) const TOKEN_BODY_LIMIT: usize = 1024 * 1024;
@@ -185,19 +208,25 @@ fn format_token_list(tokens: &[TokenItem]) -> String {
 fn format_token_list_parseable(tokens: &[TokenItem]) -> String {
     let mut lines = Vec::new();
     lines.push("key\ttoken\tid\tname\tcreated\treadonly\tCIDR whitelist".to_string());
-    for token in tokens {
-        let id = token.id.as_deref().unwrap_or(&token.key);
-        let name = token.name.as_deref().unwrap_or("");
-        let created = token.created.as_deref().unwrap_or("");
-        let readonly = if token.readonly { "true" } else { "false" };
-        let cidrs = token.cidr_whitelist
+    for TokenItem {
+        key,
+        token,
+        id,
+        name,
+        created,
+        readonly,
+        cidr_whitelist,
+    } in tokens
+    {
+        let id = id.as_deref().unwrap_or(key);
+        let name = name.as_deref().unwrap_or("");
+        let created = created.as_deref().unwrap_or("");
+        let readonly = if *readonly { "true" } else { "false" };
+        let cidrs = cidr_whitelist
             .as_ref()
             .map(|whitelist| whitelist.join(","))
             .unwrap_or_default();
-        lines.push(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            token.key, token.token, id, name, created, readonly, cidrs,
-        ));
+        lines.push(format!("{key}\t{token}\t{id}\t{name}\t{created}\t{readonly}\t{cidrs}"));
     }
     lines.join("\n")
 }

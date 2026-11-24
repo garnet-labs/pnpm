@@ -3,6 +3,8 @@
     reason = "struct-literal test fixtures; field types are evident from the literal and naming each would force ~20 imports"
 )]
 
+pub(crate) use super::lockfile_freshness::tests::check_frozen_fixture;
+
 mod catalogs;
 
 mod store;
@@ -43,22 +45,47 @@ mod hooks;
 
 mod external_importers;
 
-use super::{Install, InstallError, ProjectMutation};
+use super::{
+    Install,
+    InstallError,
+    ProjectMutation,
+};
 use crate::{
-    PolicyExcludes, install::apply_materialization::completion::report_verified_file_integrity,
+    PolicyExcludes,
+    install::apply_materialization::completion::report_verified_file_integrity,
 };
 use pnpm_config::Config;
-use pnpm_lockfile::{ComVer, Lockfile, LockfileVersion, MaybeLazyLockfile};
+use pnpm_lockfile::{
+    ComVer,
+    Lockfile,
+    LockfileVersion,
+    MaybeLazyLockfile,
+};
 use pnpm_modules_yaml::Host;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::{HookLog, LogEvent, LogLevel, Reporter, SilentReporter};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_reporter::{
+    HookLog,
+    LogEvent,
+    LogLevel,
+    Reporter,
+    SilentReporter,
+};
 use pnpm_store_dir::VerifiedFileIntegrity;
 use pnpm_testing_utils::registry::TestRegistry;
 use std::{
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Mutex,
 };
-use tempfile::{TempDir, tempdir};
+use tempfile::{
+    TempDir,
+    tempdir,
+};
 use text_block_macros::text_block;
 
 /// The temp directories one install test runs against: a store beside a
@@ -122,7 +149,7 @@ fn is_modules_yaml_consistent(
         })
 }
 
-/// Reading wrapper over [`super::modules_layout_consistent_with`] — the
+/// Reading wrapper over [`super::modules_layout_consistent_with`], the
 /// purge-gate consistency check, which (unlike [`is_modules_yaml_consistent`])
 /// ignores `included`.
 fn is_modules_yaml_layout_consistent(
@@ -168,7 +195,7 @@ mod build_workspace_state_tests;
 /// A v9 lockfile fixture pinned to a placeholder package whose
 /// integrity is bogus on purpose. Pacquet enforces tarball integrity
 /// on the install path, so any test that lets the install reach the
-/// fetch site would fail — meaning a successful install with this
+/// fetch site would fail, meaning a successful install with this
 /// fixture is *proof* that the per-snapshot skip path
 /// short-circuited the fetch entirely. The tarball URL fails
 /// the connect at once on every OS, with no name to resolve.
@@ -190,7 +217,7 @@ const PARTIAL_INSTALL_LOCKFILE: &str = text_block! {
 /// Pre-populate the virtual-store slot that [`PARTIAL_INSTALL_LOCKFILE`]
 /// describes so the skip path has a directory to point at. Just the
 /// `<virtual_store_dir>/placeholder@1.0.0/node_modules/placeholder`
-/// dirent is enough — the skip check only stats the directory, it
+/// dirent is enough, the skip check only stats the directory, it
 /// doesn't read CAS contents.
 fn seed_placeholder_virtual_store_slot(virtual_store_dir: &std::path::Path) {
     let slot = virtual_store_dir
@@ -200,11 +227,7 @@ fn seed_placeholder_virtual_store_slot(virtual_store_dir: &std::path::Path) {
     std::fs::create_dir_all(&slot).expect("create placeholder virtual-store slot");
 }
 
-/// Run one install against `modules_dir` for the purge regression below: a
-/// fresh leaked config per call (the install path needs `&'static Config`),
-/// `included` driven by `dependency_groups`, and `virtual_store_dir_max_length`
-/// surfaced so the test can force a layout drift. `disable_optimistic_repeat_install`
-/// keeps every call on the full path so the purge branch is actually evaluated.
+/// Bypass repeat installs to exercise the purge check on each run.
 async fn run_purge_regression_install(
     dirs: &InstallDirs,
     registry: &str,
@@ -252,6 +275,7 @@ async fn run_purge_regression_install_with_lockfile(
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -267,6 +291,7 @@ async fn run_purge_regression_install_with_lockfile(
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -304,8 +329,8 @@ async fn run_purge_regression_install_with_lockfile(
 /// Shared setup for the offline repeat-install regression tests below:
 /// a real install against the mock registry, after which the registry
 /// is dropped and the packument cache is wiped. Any code path that
-/// falls off the optimistic fast path — the resolver, the
-/// lockfile-verification fan-out, a tarball fetch — would have to
+/// falls off the optimistic fast path (the resolver, the
+/// lockfile-verification fan-out, a tarball fetch) would have to
 /// reach the dead `127.0.0.1:9` registry and fail the install, so the
 /// `expect` on the second run is the regression tripwire for the
 /// repeat-install optimizations (the benchmarks don't run in CI; these
@@ -341,6 +366,7 @@ async fn install_then_go_offline() -> (tempfile::TempDir, &'static Config, Packa
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -356,6 +382,7 @@ async fn install_then_go_offline() -> (tempfile::TempDir, &'static Config, Packa
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -407,7 +434,7 @@ async fn install_then_go_offline() -> (tempfile::TempDir, &'static Config, Packa
 }
 
 /// Rewrite `package.json` with identical content but a strictly newer
-/// mtime — the shape the vlt.sh benchmark prepare step (`npm pkg
+/// mtime, the shape the vlt.sh benchmark prepare step (`npm pkg
 /// delete`, `touch`) produces before every timed run.
 fn touch_manifest(manifest: &PackageManifest) -> PackageManifest {
     let manifest_path = manifest.path().to_path_buf();
@@ -421,6 +448,21 @@ async fn fresh_lockfile_only_with_overrides(
     dependencies: &[(&str, &str)],
     overrides: &[(&str, &str)],
     workspace_yaml: Option<&str>,
+) -> (tempfile::TempDir, Lockfile) {
+    fresh_lockfile_only_with_overrides_reporting::<SilentReporter>(
+        dependencies,
+        overrides,
+        workspace_yaml,
+        |_| {},
+    )
+    .await
+}
+
+async fn fresh_lockfile_only_with_overrides_reporting<ReporterT: Reporter + 'static>(
+    dependencies: &[(&str, &str)],
+    overrides: &[(&str, &str)],
+    workspace_yaml: Option<&str>,
+    configure: fn(&mut Config),
 ) -> (tempfile::TempDir, Lockfile) {
     let mock_instance = TestRegistry::start();
 
@@ -451,6 +493,7 @@ async fn fresh_lockfile_only_with_overrides(
         }
         config.overrides = Some(map);
     }
+    configure(&mut config);
     let config = config.leak();
 
     Install {
@@ -458,6 +501,7 @@ async fn fresh_lockfile_only_with_overrides(
             frozen: false,
             prefer_frozen: Some(false),
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -473,6 +517,7 @@ async fn fresh_lockfile_only_with_overrides(
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -502,7 +547,7 @@ async fn fresh_lockfile_only_with_overrides(
             discovered_workspace: None,
         },
     }
-    .run::<SilentReporter>()
+    .run::<ReporterT>()
     .await
     .expect("lockfile-only install should succeed");
 
@@ -560,6 +605,7 @@ async fn fresh_lockfile_only_with_compatibility_db(
             frozen: false,
             prefer_frozen: Some(false),
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -575,6 +621,7 @@ async fn fresh_lockfile_only_with_compatibility_db(
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -661,6 +708,7 @@ async fn install_with_pnpmfile_reporter<Reporter: self::Reporter + 'static>(
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -676,6 +724,7 @@ async fn install_with_pnpmfile_reporter<Reporter: self::Reporter + 'static>(
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -764,6 +813,7 @@ async fn install_workspace_member_with_pnpmfile(
             frozen: false,
             prefer_frozen: None,
             ignore_manifest_check: false,
+            ignore_settings_check: false,
             trust: false,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
@@ -779,6 +829,7 @@ async fn install_workspace_member_with_pnpmfile(
         },
         resolution: crate::ResolutionInputs {
             update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            local_filesystem_policy: Default::default(),
             preferred_versions_override: None,
             auth_override: None,
             observer: None,
@@ -827,7 +878,7 @@ fn first_hook_log(events: &[LogEvent]) -> &HookLog {
         .expect("a pnpm:hook event must be emitted")
 }
 
-/// The `pnpm:global` messages one report emits, at `info` — the only
+/// The `pnpm:global` messages one report emits, at `info`, the only
 /// level these carry.
 fn recorded_verified_file_integrity_report(verified: VerifiedFileIntegrity) -> Vec<String> {
     static MESSAGES: Mutex<Vec<String>> = Mutex::new(Vec::new());

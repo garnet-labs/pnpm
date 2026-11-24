@@ -2,23 +2,43 @@
 //! document, newest version first.
 
 use super::{
-    NotesTarget, notes_target,
-    responses::{PublicationLink, with_cache_rules},
+    NotesTarget,
+    notes_target,
+    responses::{
+        PublicationLink,
+        with_cache_rules,
+    },
 };
 use crate::server::{
-    AppState, Identity, PublishTarget,
-    publications::{PublicationNoteLink, readable_publication_note},
-    resolve_publish_target_for, routes_to_upstream,
+    AppState,
+    Identity,
+    PublishTarget,
+    publications::{
+        PublicationNoteLink,
+        readable_publication_note,
+    },
+    resolve_publish_target_for,
+    routes_to_upstream,
 };
 use axum::{
     Json,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use pnpr_error::RegistryError;
 use pnpr_registry::Ecosystem;
-use pnpr_storage::metadata::Note;
-use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use pnpr_storage::database::Note;
+use serde_json::{
+    Map,
+    Value,
+    json,
+};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
 /// Most entries the document lists.
 const MAX_ENTRIES: usize = 100;
@@ -104,8 +124,8 @@ struct Candidates {
 impl Candidates {
     async fn load(notes: &NotesTarget) -> Result<Self, RegistryError> {
         let NotesTarget { database, name, target } = notes;
-        let noted = database.noted_versions(name, &target.org).await?;
-        let published = database.noted_publications(name, &target.org).await?;
+        let noted = database.noted_versions(name, &target.namespace).await?;
+        let published = database.noted_publications(name, &target.namespace).await?;
         Ok(Self { noted: noted.into_iter().collect(), published: published.into_iter().collect() })
     }
 
@@ -147,7 +167,7 @@ impl Candidates {
         version: &str,
     ) -> Result<Option<(Value, bool)>, RegistryError> {
         let note = if self.noted.contains(version) {
-            notes.database.version_note(&notes.name, &notes.target.org, version).await?
+            notes.database.version_note(&notes.name, &notes.target.namespace, version).await?
         } else {
             None
         };
@@ -179,7 +199,7 @@ async fn publication_link(
     if let Some(link) = links.get(&id) {
         return Ok(link.clone());
     }
-    let link = match notes.database.publication(&notes.target.org, &id.to_string()).await? {
+    let link = match notes.database.publication(&notes.target.namespace, &id.to_string()).await? {
         Some(publication) => {
             readable_publication_note(state, identity, &notes.database, publication).await?
         }
@@ -241,9 +261,9 @@ fn entry_json(
         }
     }
     if let Some(link) = link {
-        let org = if link.org.is_empty() { "-" } else { &link.org };
+        let namespace = if link.namespace.is_empty() { "-" } else { &link.namespace };
         let reference = json!({
-            "org": org,
+            "namespace": namespace,
             "id": link.id.to_string(),
             "name": link.name,
             "initialDigest": link.initial_digest,

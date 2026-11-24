@@ -14,14 +14,41 @@ sidebar_label: "node_modules & hoisting"
 The directory in which dependencies will be installed (instead of
 `node_modules`).
 
+In a workspace, a relative path is used inside every project. An absolute path,
+or one that starts with `..`, is the root project's directory only. Every other
+project uses a directory named after its last part, such as `vendor` for
+`../vendor`.
+
 ### nodeLinker
 
 * Default: **isolated**
-* Type: **isolated**, **hoisted**, **pnp**, **loaded**, or a loaded-linker object
+* Type: **isolated**, **hoisted**, **pnp**, **loaded**, or a linker object
 
-Defines what linker should be used for installing Node packages. The existing scalar values remain supported. The experimental loaded linker also accepts an object with `type: loaded` and an optional `excluded` list. Other linker object forms are not supported yet.
+Defines what linker should be used for installing Node packages. Scalar values remain supported. Object values select a linker with `type` and group linker-specific options with it.
 
-Configuration sources replace the whole `nodeLinker` value. A higher-priority scalar or an object without `excluded` clears exclusions from lower-priority sources. The environment variable `PNPM_CONFIG_NODE_LINKER` and `--config.node-linker` accept the object as JSON.
+Configuration sources replace the selected linker. Options provided by a higher-priority object override the same options from lower-priority sources. Flat settings such as `hoistPattern`, `publicHoistPattern`, and `hoistingLimits` remain supported as aliases. When a source sets both a flat setting and its object form, the object form wins. The environment variable `PNPM_CONFIG_NODE_LINKER` and `--config.node-linker` accept the object as JSON.
+
+An omitted or `null` `hoist`, `public`, `private`, or `hoistingLimits` keeps the value from lower-priority sources. An explicit `shamefullyHoist` replaces the public patterns, whichever source sets it. An empty pattern list disables hoisting to that destination. If both `public` and `private` patterns match a package, the public pattern takes precedence.
+
+The isolated linker accepts `hoist` as a boolean or as an object with `public` and `private` pattern lists. `true` selects the defaults, `public: []` and `private: ['*']`. `false` disables both. Public patterns take precedence when both lists match. Negations apply within each list, and packages matching neither list are not hoisted.
+
+```yaml title="pnpm-workspace.yaml"
+nodeLinker:
+  type: isolated
+  hoist:
+    public: []
+    private: ['*']
+```
+
+The hoisted linker accepts `hoistingLimits`:
+
+```yaml title="pnpm-workspace.yaml"
+nodeLinker:
+  type: hoisted
+  hoistingLimits: workspaces
+```
+
+The loaded linker accepts an `excluded` list. The list replaces lower-priority exclusions, and an omitted list clears them. Other linker types reject options they do not support.
 
 * **isolated** - dependencies are symlinked from a virtual store at `node_modules/.pnpm`.
 * **hoisted** - a flat `node_modules` without symlinks is created. Same as the `node_modules` created by npm or Yarn Classic. pnpm hoists with Yarn's hoisting algorithm. Legitimate reasons to use this setting:
@@ -33,6 +60,8 @@ Configuration sources replace the whole `nodeLinker` value. A higher-priority sc
 your linker.
 
 * **loaded** - experimental loading directly from the content-addressable store. pnpm preloads its Node.js loader for scripts and commands. Selected compatibility packages and their dependency trees use the global virtual store. See [Experimental store loader](../store-loader.md).
+
+With `nodeLinker: pnp`, pnpm writes `.pnp.cjs` beside the lockfile, including when [`lockfileDir`](./store.md#lockfiledir) is configured. `pnpm run` and `pnpm exec` load it automatically. `pnpm install` recreates a missing loader. CommonJS resolution respects package `exports` and `require.resolve()` lookup paths.
 
 [pnp]: https://yarnpkg.com/features/pnp
 [--preserve-symlinks]: https://nodejs.org/api/cli.html#cli_preserve_symlinks
@@ -173,8 +202,8 @@ When set to `true`, pnpm populates the virtual store without creating importer s
 Controls the way packages are imported from the store (if you want to disable symlinks inside `node_modules`, then you need to change the [nodeLinker] setting, not this one).
 
 * **auto** - try the platform's cheap link tiers in order, falling back to
-copying when none of them is possible. On Linux it tries hardlinking before
-cloning; on macOS and Windows it tries cloning before hardlinking.
+copying when none of them is possible. On Linux and Windows it tries hardlinking
+before cloning; on macOS it tries cloning before hardlinking.
 * **hardlink** - hard link packages from the store
 * **clone-or-copy** - try to clone packages from the store. If cloning is not supported then fall back to copying
 * **copy** - copy packages from the store
@@ -184,7 +213,7 @@ A package that a lifecycle script or a patch will still write must not share fil
 
 Cloning, like copying, keeps `node_modules` separate from the store. You may edit files in your `node_modules` and they will not be modified in the central content-addressable store. Unlike a copy, a clone shares its data with the store file until one of them is written, so its contents take no extra disk space.
 
-Not all file systems support cloning. To clone on Linux, use a copy-on-write (CoW) file system, for instance btrfs instead of ext4, and set `packageImportMethod` to `clone`. On Linux, [`auto` tries hardlinking first](#what-auto-tries-first).
+Not all file systems support cloning. To clone on Linux, use a copy-on-write (CoW) file system, for instance btrfs instead of ext4, and set `packageImportMethod` to `clone`. On Linux and Windows, [`auto` tries hardlinking first](#what-auto-tries-first).
 
 #### What `auto` tries first
 
@@ -194,15 +223,17 @@ Not all file systems support cloning. To clone on Linux, use a copy-on-write (Co
 |---|---|
 | Linux | hardlink → clone → copy |
 | macOS | clone → hardlink → copy |
-| Windows | clone → hardlink → copy |
+| Windows | hardlink → clone → copy |
 
 A reflink materializes a new inode and copies extent bookkeeping inside the
 filesystem's metadata trees, where a hardlink is one directory entry. On btrfs
 that difference roughly halves the time an install spends materializing
 `node_modules` from a warm store, which is why pnpm reaches for the hardlink
 first there. ext4 is unaffected. It never supported cloning, so `auto` already
-hardlinked. macOS keeps clone-first, since APFS `clonefile` is that
-platform's cheap primitive.
+hardlinked. On a Windows Dev Drive (ReFS), a block clone takes several calls
+per file where a hardlink takes one, so Windows hardlinks first as well.
+macOS keeps clone-first, since APFS `clonefile` is that platform's cheap
+primitive.
 
 If you edit files inside `node_modules`, ask for `clone` explicitly. Under a
 hardlink, the file in `node_modules` *is* the file in the store, so editing it
@@ -352,7 +383,7 @@ Using a global virtual store can speed up installations when a warm cache is ava
 
 To support hoisted dependencies when using a global virtual store, pnpm relies on the `NODE_PATH` environment variable. This allows Node.js to resolve packages from the hoisted `node_modules` directory. Node.js does not respect `NODE_PATH` for ESM imports, so every process pnpm spawns for the project (`pnpm run`, `pnpm exec`, lifecycle scripts, and the tools `pnpm dlx` runs) receives both `NODE_PATH` and a `NODE_OPTIONS` `--import` flag that registers a resolve hook restoring `NODE_PATH` lookups for ESM. A dependency that imports a package **not declared in its own `package.json`** (which is considered bad practice) resolves for CommonJS and ESM alike.
 
-Two things fall outside that: a `node` process you start yourself rather than through pnpm, and a project that sets [`extendNodePath`](./other.md#extendnodepath) to `false`, which turns the whole `NODE_PATH` mechanism off and takes the resolve hook with it. Use [packageExtensions] to declare the missing dependencies if you need them to resolve in either case.
+When you start `node` outside pnpm, or set [`extendNodePath`](./other.md#extendnodepath) to `false`, pnpm does not add the global virtual store's `NODE_PATH` entries or ESM resolve hook to the process environment. Use [packageExtensions] to declare missing dependencies in either case. This also helps [TypeScript resolve undeclared imports](../global-virtual-store.md#limitations).
 
 :::
 
@@ -385,6 +416,8 @@ Tells pnpm which packages should be hoisted to `node_modules/.pnpm/node_modules`
 default, all packages are hoisted - however, if you know that only some flawed
 packages have phantom dependencies, you can use this option to exclusively hoist
 the phantom dependencies (recommended).
+
+With the default virtual store, adding a direct dependency to the workspace root removes its hidden hoist link on the next full install. An external virtual store can keep the link to resolve that dependency.
 
 For instance:
 

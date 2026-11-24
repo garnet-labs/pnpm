@@ -1,9 +1,27 @@
-use pnpr::{Config, Ecosystem};
-use pnpr_fixtures::{MockConfigPresets, RemovedVersionField};
+use crate::registry_activity;
+use pnpr::{
+    Config,
+    Ecosystem,
+};
+use pnpr_fixtures::{
+    MockConfigPresets,
+    RemovedVersionField,
+};
 use std::{
-    net::{Ipv4Addr, TcpListener},
-    path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, PoisonError},
+    net::{
+        Ipv4Addr,
+        TcpListener,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::{
+        Arc,
+        LazyLock,
+        Mutex,
+        PoisonError,
+    },
     thread,
 };
 
@@ -123,6 +141,18 @@ impl TestRegistry {
         Self::new(instance.server_url, Some(storage.to_path_buf()), None)
     }
 
+    /// Start a registry on its own origin whose metadata names `public_url`
+    /// in tarball URLs, like a mirror of another registry.
+    pub fn start_with_public_url(public_url: &str) -> Self {
+        let instance = TestRegistryInstance::start_with_options(
+            pnpr_fixtures::ensure_storage().to_path_buf(),
+            RegistryMode::Proxy,
+            Some(public_url),
+            None,
+        );
+        Self::new(instance.server_url, None, None)
+    }
+
     fn new(server_url: String, storage: Option<PathBuf>, requests: Option<RequestLog>) -> Self {
         let url = format!("{}{}/", server_url.trim_end_matches('/'), Ecosystem::Npm.base_path());
         Self { server_url, url, storage, requests }
@@ -144,14 +174,14 @@ impl TestRegistry {
     /// Move `tag` to `version`, the way the JS harness's `addDistTag` does.
     /// A fixture package's `latest` is otherwise its highest published
     /// version, which cannot express "the newer version was published after
-    /// the install" — the setup every upstream `--latest` test relies on.
+    /// the install", the setup every upstream `--latest` test relies on.
     ///
     /// Only a registry started over storage of the test's own can be
-    /// re-tagged — see `CommandTempCwd::add_mocked_registry_with_own_storage`;
+    /// re-tagged; see `CommandTempCwd::add_mocked_registry_with_own_storage`;
     /// the process-global instance is shared.
     pub fn set_dist_tag(&self, package: &str, version: &str, tag: &str) {
         let storage = self.storage.as_deref().expect(
-            "re-tagging needs a registry of the test's own — start it with add_mocked_registry_with_own_storage",
+            "re-tagging needs a registry of the test's own, start it with add_mocked_registry_with_own_storage",
         );
         pnpr_fixtures::set_dist_tag(storage, package, version, tag);
     }
@@ -160,7 +190,7 @@ impl TestRegistry {
     /// test's own, as [`Self::set_dist_tag`] does.
     pub fn deprecate_version(&self, package: &str, version: &str, message: &str) {
         let storage = self.storage.as_deref().expect(
-            "editing metadata needs a registry of the test's own — start it with add_mocked_registry_with_own_storage",
+            "editing metadata needs a registry of the test's own, start it with add_mocked_registry_with_own_storage",
         );
         pnpr_fixtures::deprecate_version(storage, package, version, message);
     }
@@ -169,7 +199,7 @@ impl TestRegistry {
     /// own, as [`Self::set_dist_tag`] does.
     pub fn remove_version(&self, package: &str, version: &str) {
         let storage = self.storage.as_deref().expect(
-            "editing metadata needs a registry of the test's own — start it with add_mocked_registry_with_own_storage",
+            "editing metadata needs a registry of the test's own, start it with add_mocked_registry_with_own_storage",
         );
         pnpr_fixtures::remove_version(storage, package, version);
     }
@@ -202,6 +232,15 @@ impl TestRegistryInstance {
     }
 
     fn start_with_log(storage: PathBuf, mode: RegistryMode, requests: Option<RequestLog>) -> Self {
+        Self::start_with_options(storage, mode, None, requests)
+    }
+
+    fn start_with_options(
+        storage: PathBuf,
+        mode: RegistryMode,
+        public_url: Option<&str>,
+        requests: Option<RequestLog>,
+    ) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .expect("bind test registry to an unused localhost port");
         listener.set_nonblocking(true).expect("set test registry listener to nonblocking");
@@ -210,7 +249,7 @@ impl TestRegistryInstance {
         let server_url = format!("http://{listen}/");
         // Proxy mode: `@pnpm.e2e` fixtures are served from local storage, while
         // real npm packages (`is-positive`, `is-negative`, etc.) fall through to
-        // the npm upstream — matching how registry-mock served pacquet's tests.
+        // the npm upstream, matching how registry-mock served pacquet's tests.
         let mut config = match mode {
             RegistryMode::Proxy => {
                 let mut config = Config::proxy(listen, storage);
@@ -219,23 +258,32 @@ impl TestRegistryInstance {
             }
             RegistryMode::Static => Config::static_serve(listen, storage),
         };
-        config.http.public_url = server_url.trim_end_matches('/').to_string();
+        config.http.public_url = public_url
+            .unwrap_or(&server_url)
+            .trim_end_matches('/')
+            .to_string();
         // Registration is opt-in; tests that forward credentials create
         // accounts via adduser against this registry.
-        config.identity.auth.htpasswd.max_users = pnpr::MaxUsers::Unlimited;
+        config.identity.auth.users.max_users = pnpr::MaxUsers::Unlimited;
         // A long TTL keeps the fixture packuments (whose `time` values are static)
         // from being treated as stale and refetched from the upstream.
         config.http.packument_ttl = std::time::Duration::from_hours(8760);
+        let tracked_url = server_url.trim_end_matches('/').to_string();
         thread::Builder::new()
             .name("pacquet-test-registry".to_string())
-            .spawn(move || run_registry(config, listener, requests))
+            .spawn(move || run_registry(config, listener, tracked_url, requests))
             .expect("spawn test registry thread");
 
         Self { server_url }
     }
 }
 
-fn run_registry(config: Config, listener: TcpListener, requests: Option<RequestLog>) {
+fn run_registry(
+    config: Config,
+    listener: TcpListener,
+    registry: String,
+    requests: Option<RequestLog>,
+) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -243,11 +291,15 @@ fn run_registry(config: Config, listener: TcpListener, requests: Option<RequestL
 
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).expect("create tokio listener");
+        let tracked = |app: axum::Router| {
+            app.layer(axum::middleware::from_fn_with_state(registry, registry_activity::track))
+        };
         let Some(requests) = requests else {
-            pnpr::serve_listener(config, listener).await.expect("serve test registry");
+            pnpr::serve_listener_with(config, listener, tracked).await
+                .expect("serve test registry");
             return;
         };
-        let app = pnpr::router(config)
+        let app = tracked(pnpr::router(config))
             .layer(axum::middleware::from_fn_with_state(requests, record_request));
         axum::serve(listener, app).await.expect("serve test registry");
     });
@@ -285,6 +337,7 @@ async fn record_request(
 fn header_text(headers: &axum::http::HeaderMap, name: &axum::http::HeaderName) -> Option<String> {
     headers
         .get(name)
-        .and_then(|value| value.to_str().ok())
+        .map(axum::http::HeaderValue::to_str)
+        .and_then(Result::ok)
         .map(str::to_string)
 }

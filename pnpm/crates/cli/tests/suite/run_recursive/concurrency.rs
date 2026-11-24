@@ -1,8 +1,26 @@
 //! The scripts a `/pattern/` selector matches in one package run
 //! concurrently when the run's concurrency allows it, as they do in
-//! pnpm 11 — <https://github.com/pnpm/pnpm/issues/14933>.
+//! pnpm 11, <https://github.com/pnpm/pnpm/issues/14933>.
 
-use super::{CommandExtra, CommandTempCwd, Duration, fs, json, write_workspace};
+use super::{
+    CommandExtra,
+    CommandTempCwd,
+    Duration,
+    Stdio,
+    fs,
+    json,
+    write_workspace,
+};
+use crate::_utils::{
+    exit_when_marked_script,
+    hold_until_cancelled_script,
+    wait_for_child,
+};
+#[cfg(unix)]
+use crate::_utils::{
+    is_running,
+    read_pid,
+};
 use assert_cmd::assert::OutputAssertExt;
 
 /// A pair of scripts that record whether they ever ran simultaneously:
@@ -46,8 +64,8 @@ fn overlapping_scripts() -> serde_json::Value {
     })
 }
 
-/// `--parallel` implies `--recursive`, so this bare invocation — the one
-/// the issue reported — is a recursive run.
+/// `--parallel` implies `--recursive`, so this bare invocation (the one
+/// the issue reported) is a recursive run.
 #[test]
 fn parallel_run_runs_regexp_scripts_of_one_package_concurrently() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -141,38 +159,40 @@ fn bail_cancels_the_sibling_script_of_the_same_package() {
                 "name": "project-1",
                 "version": "1.0.0",
                 "scripts": {
-                    "dev:slow": r#"node -e "const fs = require('fs'); fs.writeFileSync('slow-started', ''); setTimeout(() => fs.writeFileSync('slow-finished', ''), 30000)""#,
-                    "dev:fail": r#"node -e "const fs = require('fs'); const wait = () => fs.existsSync('slow-started') ? process.exit(17) : setTimeout(wait, 10); wait()""#,
+                    "dev:slow": hold_until_cancelled_script(&workspace.join("project-1"), "slow-started"),
+                    "dev:fail": exit_when_marked_script(&workspace.join("project-1"), "slow-started", 17),
                 },
             }),
         )],
     );
 
-    let output = assert_cmd::Command::from_std(pacquet)
-        .args(["--workspace-concurrency=2", "-r", "run", "/^dev:/"])
-        .timeout(Duration::from_mins(1))
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
+    // pnpm waits for the scripts it started, so a run that ends at all is
+    // a run that cancelled `dev:slow`. `hold_until_cancelled_script` has
+    // the hold that makes it so.
+    let stderr_path = workspace.join("run.stderr");
+    let mut run = pacquet
+        .with_args(["--workspace-concurrency=2", "-r", "run", "/^dev:/"])
+        .with_stdout(Stdio::null())
+        .with_stderr(fs::File::create(&stderr_path).expect("create the run output").into())
+        .spawn()
+        .expect("spawn pacquet");
+    let status = wait_for_child(&mut run);
+    assert!(!status.success(), "the failing script must fail the run");
 
     // The cancelled sibling must not take the failing script's place as
     // the task's verdict, which is what names the project in the error.
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = fs::read_to_string(&stderr_path).expect("read the run output");
     eprintln!("STDERR:\n{stderr}\n");
     assert!(stderr.contains("ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL"), "stderr: {stderr}");
 
-    let slow_started = workspace
-        .join("project-1")
-        .join("slow-started")
-        .exists();
-    let slow_finished = workspace
-        .join("project-1")
-        .join("slow-finished")
-        .exists();
-    eprintln!("slow-started exists: {slow_started}, slow-finished exists: {slow_finished}");
-    assert!(slow_started, "the slow script must have started beside the failing one");
-    assert!(!slow_finished, "the slow script must be cancelled before its watchdog completes");
+    let started = workspace.join("project-1").join("slow-started");
+    eprintln!("slow-started exists: {}", started.exists());
+    assert!(started.exists(), "the slow script must have started beside the failing one");
+    #[cfg(unix)]
+    assert!(
+        !is_running(read_pid(&started)),
+        "the cancelled script must be gone, not left running without pnpm",
+    );
 
     drop(root);
 }
@@ -280,10 +300,12 @@ fn recursive_run_keeps_the_matched_scripts_within_workspace_concurrency() {
 
     let peaks: Vec<usize> = fs::read_dir(workspace.join(PEAK_DIR))
         .expect("read the peak-probe directory")
-        .map(|entry| entry.expect("read a peak-probe entry").path())
+        .map(|entry| entry.expect("read a peak-probe entry"))
+        .map(|value| value.path())
         .filter(|path| {
             path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("peak-"))
+                .map(std::ffi::OsStr::to_string_lossy)
+                .is_some_and(|text| text.starts_with("peak-"))
         })
         .map(|path| {
             fs::read_to_string(&path)

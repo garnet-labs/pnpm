@@ -1,12 +1,23 @@
-use super::{PublishArgs, PublishFlags, configured_publish_branch, run_publish_scripts};
+use super::{
+    PublishArgs,
+    PublishFlags,
+    configured_publish_branch,
+    run_publish_scripts,
+};
 use crate::{
     boolean_values::resolve_boolean_values,
-    cli_args::{CliArgs, cli_command::CliCommand},
+    cli_args::{
+        CliArgs,
+        cli_command::CliCommand,
+    },
 };
 use clap::Parser;
 use pnpm_config::Config;
-use pnpm_network::{AuthHeaders, ThrottledClient};
-use pnpm_publish::{Access, PublishNetwork};
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+};
+use pnpm_publish::PublishNetwork;
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -14,15 +25,15 @@ use std::ffi::OsString;
 
 /// A `PublishArgs` with every flag at its default; a test overrides only the
 /// field it exercises.
-fn publish_args() -> PublishArgs {
+pub(super) fn publish_args() -> PublishArgs {
     PublishArgs { package: None, flags: publish_flags() }
 }
 
-fn publish_args_with(flags: PublishFlags) -> PublishArgs {
+pub(super) fn publish_args_with(flags: PublishFlags) -> PublishArgs {
     PublishArgs { package: None, flags }
 }
 
-fn publish_flags() -> PublishFlags {
+pub(super) fn publish_flags() -> PublishFlags {
     PublishFlags {
         dry_run: false,
         ignore_scripts: false,
@@ -37,6 +48,7 @@ fn publish_flags() -> PublishFlags {
             publish_wait_timeout: None,
         },
         manifest: crate::cli_args::publish::PublishManifestArgs {
+            new_version: None,
             embed_readme: false,
             no_embed_readme: false,
             skip_manifest_obfuscation: false,
@@ -52,7 +64,6 @@ fn publish_flags() -> PublishFlags {
             no_git_checks: false,
         },
         output: crate::cli_args::publish::PublishOutputArgs { json: false, report_summary: false },
-        variants: crate::cli_args::publish::PublishVariantArgs::default(),
     }
 }
 
@@ -73,6 +84,57 @@ fn publish_branch_flag_overrides_the_workspace_setting() {
     let config = Config { publish_branch: Some("production".to_owned()), ..Config::default() };
     assert_eq!(configured_publish_branch(None, &config), Some("production"));
     assert_eq!(configured_publish_branch(Some("release"), &config), Some("release"));
+}
+
+#[test]
+fn an_empty_publish_branch_leaves_the_built_in_pair() {
+    let empty = Config { publish_branch: Some(String::new()), ..Config::default() };
+    assert_eq!(configured_publish_branch(None, &empty), None);
+    let blank = Config { publish_branch: Some("  ".to_owned()), ..Config::default() };
+    assert_eq!(configured_publish_branch(None, &blank), Some("  "));
+}
+
+#[test]
+fn publish_options_falls_back_to_the_configured_access_and_tag() {
+    let config = Config {
+        access: Some("restricted".to_owned()),
+        tag: Some("next".to_owned()),
+        ..Config::default()
+    };
+    let options = publish_args().publish_options(&config, None, false);
+    assert_eq!(options.registry.access.as_deref(), Some("restricted"));
+    assert_eq!(options.registry.tag, "next");
+}
+
+#[test]
+fn publish_flags_outrank_the_configured_access_and_tag() {
+    let config = Config {
+        access: Some("restricted".to_owned()),
+        tag: Some("next".to_owned()),
+        ..Config::default()
+    };
+    let args = publish_args_with(PublishFlags {
+        registry: crate::cli_args::publish::PublishRegistryArgs {
+            tag: Some("from-flag".to_owned()),
+            access: Some("public".to_owned()),
+            ..publish_flags().registry
+        },
+        ..publish_flags()
+    });
+    let options = args.publish_options(&config, None, false);
+    assert_eq!(options.registry.access.as_deref(), Some("public"));
+    assert_eq!(options.registry.tag, "from-flag");
+}
+
+/// See [`pnpm_publish::resolve_access`] for why an unrecognized value is
+/// not dropped.
+#[test]
+fn an_unrecognized_configured_access_is_kept_verbatim() {
+    let config = Config { access: Some("everyone".to_owned()), ..Config::default() };
+    assert_eq!(
+        publish_args().publish_options(&config, None, false).registry.access.as_deref(),
+        Some("everyone"),
+    );
 }
 
 #[test]
@@ -101,7 +163,7 @@ fn publish_options_applies_tag_access_provenance_and_dry_run() {
     });
     let options = args.publish_options(&Config::default(), None, false);
     assert_eq!(options.registry.tag, "next");
-    assert_eq!(options.registry.access, Some(Access::Restricted));
+    assert_eq!(options.registry.access.as_deref(), Some("restricted"));
     assert_eq!(options.registry.provenance, Some(true));
     assert!(options.dry_run);
     assert_eq!(options.registry.otp, None);
@@ -168,12 +230,12 @@ async fn pack_for_publish_writes_a_tarball_and_returns_the_manifest() {
             &Config::default(),
             dest.path(),
             &[],
-            (None, &[]),
+            super::PublishScope::Single { summary: None, bumped: None },
         )
         .await
         .expect("packing succeeds");
 
-    assert_eq!(result.archives[0].result.published_manifest["name"], "pkg");
+    assert_eq!(result.published_manifest["name"], "pkg");
     let wrote_tarball = std::fs::read_dir(dest.path())
         .expect("read the destination")
         .flatten()
@@ -224,7 +286,7 @@ fn run_publish_scripts_is_a_noop_when_no_script_is_declared() {
 }
 
 /// Publishing a directory that has no `package.json` fails with
-/// `ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND` before any packing or network work —
+/// `ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND` before any packing or network work,
 /// the only branch of `publish_directory` reachable without a live registry.
 #[tokio::test]
 async fn publish_directory_errors_when_no_manifest_is_present() {
@@ -243,7 +305,7 @@ async fn publish_directory_errors_when_no_manifest_is_present() {
             &opts,
             &network,
             &[],
-            super::PublishScope::Single { summary: None },
+            super::PublishScope::Single { summary: None, bumped: None },
         )
         .await
         .expect_err("an empty directory has no package.json")

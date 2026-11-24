@@ -5,7 +5,7 @@
 //! not at the project-local
 //! `<project>/node_modules/.pnpm/<flat-name>/node_modules/<name>`. The
 //! shape of `<flat-name>` versus `<scope>/<name>/<version>/<hash>` is
-//! also different — flat name uses [`PkgNameVerPeer::to_virtual_store_name`]
+//! also different, flat name uses [`PkgNameVerPeer::to_virtual_store_name`]
 //! while the GVS layout uses
 //! [`pnpm_graph_hasher::format_global_virtual_store_path`] over a
 //! `calc_graph_node_hash`-computed digest.
@@ -19,25 +19,35 @@
 //! [`PkgNameVerPeer::to_virtual_store_name`]: pnpm_lockfile::PkgNameVerPeer::to_virtual_store_name
 //! [`pnpm_graph_hasher::format_global_virtual_store_path`]: pnpm_graph_hasher::format_global_virtual_store_path
 
-mod graph_hash;
-use graph_hash::GvsHasher;
+pub use graph_hash::BuildGating;
 
-use crate::{
-    AllowBuildPolicy,
-    install_frozen_lockfile::{find_runtime_node_major, parse_major_from_version},
-};
+mod graph_hash;
+mod staging;
+use graph_hash::GvsHasher;
+use staging::new_staging_token;
+
+use crate::AllowBuildPolicy;
 use pnpm_config::Config;
 use pnpm_graph_hasher::{
-    detect_node_major, engine_name, format_global_virtual_store_path,
+    format_global_virtual_store_path,
     join_global_virtual_store_path,
 };
 use pnpm_lockfile::{
-    Lockfile, LockfileResolution, PackageKey, PackageMetadata, PkgVerPeer, PlatformSelector,
-    SnapshotEntry, VersionPart,
+    Lockfile,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    PkgVerPeer,
+    PlatformSelector,
+    SnapshotEntry,
+    VersionPart,
 };
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Precomputed mapping from each snapshot key to the directory where
@@ -47,9 +57,11 @@ use std::{
 /// particular snapshot is materialised.
 ///
 /// [`Self::slot_dir`] is the only call site every consumer has to
-/// touch — it returns an absolute directory whose `node_modules/<name>`
+/// touch; it returns an absolute directory whose `node_modules/<name>`
 /// subdirectory holds the unpacked package.
+#[derive(Clone)]
 pub struct VirtualStoreLayout {
+    engine_name: Option<String>,
     /// Root containing every per-snapshot subdirectory:
     /// [`Config::virtual_store_dir`].
     ///
@@ -61,7 +73,7 @@ pub struct VirtualStoreLayout {
     /// `Some` only when the global virtual store is enabled. For each
     /// snapshot, holds the precomputed
     /// `[<scope>/]<name>/<version>/<hash>` suffix that goes after
-    /// `package_store_dir`. `None` when GVS is off — callers fall back
+    /// `package_store_dir`. `None` when GVS is off, callers fall back
     /// to [`PkgNameVerPeer::to_virtual_store_name`] computed on demand
     /// from the snapshot key.
     ///
@@ -88,21 +100,35 @@ pub struct VirtualStoreLayout {
     /// lockfile context, in which case `link:` dependencies inside a
     /// slot are left unlinked exactly as before.
     lockfile_dir: Option<PathBuf>,
+
+    /// Names this install's staging directories, so they never collide
+    /// with another install's. See [`Self::staging_package_dir`].
+    staging_token: String,
 }
 
 impl VirtualStoreLayout {
+    pub(crate) fn relocated(&self, root: PathBuf) -> Self {
+        Self { package_store_dir: root, ..self.clone() }
+    }
+
+    pub(crate) fn engine_name(&self) -> Option<&str> {
+        self.engine_name.as_deref()
+    }
+
     /// Construct a layout that always uses the legacy
     /// `<root>/<flat-name>` shape, regardless of any
     /// `enable_global_virtual_store` setting on `Config`. Reserved
     /// for callers that must stay on the project-local flat layout
-    /// even under GVS — today no production install path uses this
+    /// even under GVS, today no production install path uses this
     /// directly.
     pub fn legacy(root: impl Into<PathBuf>, virtual_store_dir_max_length: usize) -> Self {
         VirtualStoreLayout {
+            engine_name: None,
             package_store_dir: root.into(),
             gvs_suffixes: None,
             virtual_store_dir_max_length,
             lockfile_dir: None,
+            staging_token: new_staging_token(),
         }
     }
 
@@ -135,13 +161,13 @@ impl VirtualStoreLayout {
     /// cache key) uses. Snapshots that themselves pin Node via
     /// `engines.runtime` (carried in the lockfile as
     /// `dependencies.node: runtime:<version>`) override the fallback
-    /// per-snapshot through `find_own_runtime_node_major` — the
+    /// per-snapshot through `find_own_runtime_node_major`, the
     /// engine portion of the hash then tracks the Node that the
     /// bin linker would spawn for that pinning package's lifecycle
     /// scripts.
     ///
     /// `None` propagates straight into
-    /// [`calc_graph_node_hash`](pnpm_graph_hasher::calc_graph_node_hash)'s `engine` parameter — `None` and
+    /// [`calc_graph_node_hash`](pnpm_graph_hasher::calc_graph_node_hash)'s `engine` parameter. `None` and
     /// `Some("")` produce *different* GVS hashes (the former omits
     /// the `engine` contribution, the latter hashes the empty string),
     /// so the call site must keep the `Option` shape rather than
@@ -176,10 +202,12 @@ impl VirtualStoreLayout {
         let virtual_store_dir_max_length = config.virtual_store_dir_max_length as usize;
         if !config.enable_global_virtual_store {
             return VirtualStoreLayout {
+                engine_name: engine.map(str::to_owned),
                 package_store_dir,
                 gvs_suffixes: None,
                 virtual_store_dir_max_length,
                 lockfile_dir: lockfile_dir.map(Path::to_path_buf),
+                staging_token: new_staging_token(),
             };
         }
         Self::global(
@@ -188,7 +216,7 @@ impl VirtualStoreLayout {
             engine,
             snapshots,
             packages,
-            allow_build_policy,
+            BuildGating { policy: allow_build_policy, runs_builds: !config.ignore_scripts },
             lockfile_dir,
             &selected_platform(config),
         )
@@ -226,7 +254,7 @@ impl VirtualStoreLayout {
             snapshots,
             packages,
             engine,
-            allow_build_policy,
+            BuildGating { policy: allow_build_policy, runs_builds: !config.ignore_scripts },
             lockfile_dir,
             &platform,
         );
@@ -238,25 +266,28 @@ impl VirtualStoreLayout {
         });
         let expected = gvs_layout_cache::Expected { snapshots, packages };
         if let Some(gvs_suffixes) = load_cached_suffixes(cache_file, expected) {
-            return Self::with_cached_suffixes(config, gvs_suffixes, lockfile_dir);
+            return Self::with_cached_suffixes(config, engine, gvs_suffixes, lockfile_dir);
         }
         let gvs_suffixes = hasher.suffixes(snapshots);
         if let Some(cache_file) = cache_file {
             gvs_layout_cache::store(cache_file, &gvs_suffixes);
         }
-        Self::with_cached_suffixes(config, gvs_suffixes, lockfile_dir)
+        Self::with_cached_suffixes(config, engine, gvs_suffixes, lockfile_dir)
     }
 
     fn with_cached_suffixes(
         config: &Config,
+        engine: Option<&str>,
         gvs_suffixes: HashMap<PackageKey, String>,
         lockfile_dir: Option<&Path>,
     ) -> Self {
         VirtualStoreLayout {
+            engine_name: engine.map(str::to_owned),
             package_store_dir: config.global_virtual_store_dir.clone(),
             gvs_suffixes: Some(gvs_suffixes),
             virtual_store_dir_max_length: config.virtual_store_dir_max_length as usize,
             lockfile_dir: lockfile_dir.map(Path::to_path_buf),
+            staging_token: new_staging_token(),
         }
     }
 
@@ -282,29 +313,33 @@ impl VirtualStoreLayout {
         engine: Option<&str>,
         snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
         packages: Option<&HashMap<PackageKey, PackageMetadata>>,
-        allow_build_policy: Option<&AllowBuildPolicy>,
+        gating: BuildGating<'_>,
         lockfile_dir: Option<&Path>,
         platform: &PlatformSelector,
     ) -> Self {
         let Some(snapshots) = snapshots else {
             return VirtualStoreLayout {
+                engine_name: engine.map(str::to_owned),
                 package_store_dir,
                 gvs_suffixes: Some(HashMap::new()),
                 virtual_store_dir_max_length,
                 lockfile_dir: lockfile_dir.map(Path::to_path_buf),
+                staging_token: new_staging_token(),
             };
         };
         let mut hasher =
-            GvsHasher::new(snapshots, packages, engine, allow_build_policy, lockfile_dir, platform);
+            GvsHasher::new(snapshots, packages, engine, gating, lockfile_dir, platform);
         VirtualStoreLayout {
+            engine_name: engine.map(str::to_owned),
             package_store_dir,
             gvs_suffixes: Some(hasher.suffixes(snapshots)),
             virtual_store_dir_max_length,
             lockfile_dir: lockfile_dir.map(Path::to_path_buf),
+            staging_token: new_staging_token(),
         }
     }
 
-    /// Root of the layout — the directory that contains every per-
+    /// Root of the layout, the directory that contains every per-
     /// snapshot subdirectory. Exposed so callers that need to pass a
     /// path to existing helpers (e.g. the
     /// [`pnpm_modules_yaml::Modules`] writer, which records
@@ -315,7 +350,7 @@ impl VirtualStoreLayout {
     }
 
     /// Whether this install is running in global-virtual-store mode.
-    /// Mirrors `config.enable_global_virtual_store` — captured here so
+    /// Mirrors `config.enable_global_virtual_store`, captured here so
     /// callers can ask the layout itself instead of having to keep a
     /// separate `&Config` reference for the boolean.
     #[must_use]
@@ -323,25 +358,19 @@ impl VirtualStoreLayout {
         self.gvs_suffixes.is_some()
     }
 
-    /// Like [`Self::slot_dir`], but only for a snapshot with a
-    /// precomputed GVS suffix — `None` instead of the flat-name
-    /// fallback. The directory-clone cache requires this: a GVS suffix
-    /// is content-addressed through the graph hash's
-    /// `full_pkg_id = <pkg_id>:<integrity>` input, while the flat name
-    /// is keyed by the snapshot key alone, so a flat-named canonical
-    /// slot would keep serving stale content after the same version is
-    /// re-published with different integrity.
+    /// Whether the snapshot has a precomputed global virtual store suffix.
     #[must_use]
-    pub fn hashed_slot_dir(&self, key: &PackageKey) -> Option<PathBuf> {
-        let suffix = self.gvs_suffixes.as_ref()?.get(key)?;
-        Some(join_global_virtual_store_path(&self.package_store_dir, suffix))
+    pub(crate) fn has_hashed_slot(&self, key: &PackageKey) -> bool {
+        self.gvs_suffixes
+            .as_ref()
+            .is_some_and(|suffixes| suffixes.contains_key(key))
     }
 
     /// Absolute directory that holds `node_modules/<name>` for one
     /// snapshot. Falls back to
     /// [`PkgNameVerPeer::to_virtual_store_name`](pnpm_lockfile::PkgNameVerPeer::to_virtual_store_name)
     /// when GVS is off, or when GVS is on but the key isn't in the
-    /// precomputed map (which would indicate a bug — every snapshot
+    /// precomputed map (which would indicate a bug; every snapshot
     /// the install touches must have been visited in
     /// [`Self::new`]; the fallback is defensive rather than expected
     /// to fire).
@@ -357,7 +386,7 @@ impl VirtualStoreLayout {
         // The flat non-GVS `to_virtual_store_name` fallback carries no
         // `/`, so it too can route through the GVS join (which then just
         // pushes it as a single component).
-        join_global_virtual_store_path(&self.package_store_dir, &suffix)
+        join_global_virtual_store_path(self.package_store_dir.clone(), &suffix)
     }
 
     /// Whether `key`'s virtual-store slot is lexically contained within the store
@@ -369,13 +398,13 @@ impl VirtualStoreLayout {
             return false;
         }
         if self.enable_global_virtual_store() {
-            return is_gvs_slot_contained(&self.package_store_dir, key, &slot_dir);
+            return is_gvs_slot_contained(self.package_store_dir.clone(), key, &slot_dir);
         }
         true
     }
 }
 
-fn is_gvs_slot_contained(store_dir: &Path, key: &PackageKey, slot_dir: &Path) -> bool {
+fn is_gvs_slot_contained(store_dir: PathBuf, key: &PackageKey, slot_dir: &Path) -> bool {
     let name = key.name.to_string();
     let prefix = if name.starts_with('@') { "" } else { "@/" };
     let package_dir = pnpm_fs::join_slash_separated_path(store_dir, &format!("{prefix}{name}"));
@@ -399,24 +428,18 @@ fn is_gvs_slot_contained(store_dir: &Path, key: &PackageKey, slot_dir: &Path) ->
     is_single_gvs_path_component(&version.to_string_lossy())
 }
 
-/// Build a lockfile's layout using the root project's runtime pin, effective
-/// Node version, then host.
+/// Build a lockfile's layout keyed by
+/// [`lockfile_engine_name`](crate::materialization_plan::lockfile_engine_name).
 #[must_use]
 pub fn virtual_store_layout_for_lockfile(
     config: &Config,
-    effective_node_version: Option<&str>,
     lockfile: &Lockfile,
     allow_build_policy: Option<&AllowBuildPolicy>,
     lockfile_dir: Option<&Path>,
 ) -> VirtualStoreLayout {
-    let engine = if config.enable_global_virtual_store {
-        find_runtime_node_major(&lockfile.importers)
-            .or_else(|| effective_node_version.and_then(parse_major_from_version))
-            .or_else(detect_node_major)
-            .map(|major| engine_name(major, None, None))
-    } else {
-        None
-    };
+    let engine = config.enable_global_virtual_store
+        .then(|| crate::materialization_plan::lockfile_engine_name(&lockfile.importers))
+        .flatten();
     VirtualStoreLayout::new(
         config,
         engine.as_deref(),
@@ -445,7 +468,7 @@ pub fn global_virtual_store_version_dir(
         return None;
     }
     let candidate_slot = join_global_virtual_store_path(
-        package_store_dir,
+        package_store_dir.to_path_buf(),
         &format_global_virtual_store_path(&name, &version, "candidate"),
     );
     if !pnpm_fs::is_subdir(package_store_dir, &candidate_slot) {
@@ -457,7 +480,7 @@ pub fn global_virtual_store_version_dir(
 /// Map each injected `file:` project to the virtual-store package
 /// directories its copies were materialized at.
 ///
-/// Key: the `file:` path from the snapshot key — lockfile-relative,
+/// Key: the `file:` path from the snapshot key, lockfile-relative,
 /// which for an injected workspace project is exactly its importer id
 /// (`comp2`, `packages/foo`, ...). Value: every peer-variant slot's
 /// package directory (`node_modules/.pnpm/<slot>/node_modules/<name>`),
@@ -467,18 +490,18 @@ pub fn global_virtual_store_version_dir(
 /// This is the `.modules.yaml` `injectedDeps` payload pnpm v11 wrote
 /// from `projectsWithTargetDirs`. Consumers use it to propagate
 /// post-install changes of an injected project into every materialized
-/// copy — Bit's build task, for one, hard-links compiled artifacts
+/// copy. Bit's build task, for one, hard-links compiled artifacts
 /// into each copy via this map and silently links nothing when the
 /// field is missing.
 ///
 /// Skipped snapshots have no slot on disk, so they are left out. Only
 /// **directory**-resolution `file:` snapshots participate: v11's map
 /// came from `projectsWithTargetDirs` (injected workspace projects),
-/// so a `file:` *tarball* dep — whose extracted copy is not a mirror
-/// of any source directory — is excluded to keep the field's meaning
+/// so a `file:` *tarball* dep (whose extracted copy is not a mirror
+/// of any source directory) is excluded to keep the field's meaning
 /// identical.
 ///
-/// Under `nodeLinker: hoisted` there is no virtual store — the
+/// Under `nodeLinker: hoisted` there is no virtual store, the
 /// injected copies live wherever the hoisted walker placed them.
 /// Pass the walker's `hoisted_locations` (depPath → lockfile-relative
 /// package dirs) as `hoisted_locations` and the targets are read from
@@ -518,7 +541,7 @@ pub fn collect_injected_deps(
     // (e.g. hoisted entries the walker never placed) would round-trip
     // as an empty list; drop those.
     injected.retain(|_, targets| !targets.is_empty());
-    // Sort each target list — `snapshots` is a `HashMap`, so insertion
+    // Sort each target list, `snapshots` is a `HashMap`, so insertion
     // order is nondeterministic and the manifest must be byte-stable
     // across installs.
     for targets in injected.values_mut() {
@@ -547,7 +570,7 @@ fn injected_targets(
     // separator normalization matches the `hoistedLocations` entries the
     // hoisted branch reuses (see `path_relative_to_lockfile_dir`).
     let target = pnpm_fs::join_slash_separated_path(
-        &layout.slot_dir(key).join("node_modules"),
+        layout.slot_dir(key).join("node_modules"),
         &key.name.to_string(),
     );
     let target = match target.strip_prefix(lockfile_dir) {
@@ -568,7 +591,7 @@ fn injected_targets(
 /// for one, and the install path that resolves from manifests does know
 /// the version, so anchoring the segment is what keeps a re-install on
 /// the slot the first install created. Emitting the raw `file:<path>`
-/// here would put a `:` (and embedded `/`) into the slot path —
+/// here would put a `:` (and embedded `/`) into the slot path,
 /// rejected on Windows with `ERROR_INVALID_NAME`.
 fn gvs_version_segment(metadata: Option<&PackageMetadata>, suffix: &PkgVerPeer) -> String {
     if is_local_directory(metadata, suffix) {
@@ -578,7 +601,8 @@ fn gvs_version_segment(metadata: Option<&PackageMetadata>, suffix: &PkgVerPeer) 
         Some(version) => version.to_string(),
         None => suffix
             .registry_version()
-            .map_or_else(|| suffix.version().to_string(), ToString::to_string),
+            .map(ToString::to_string)
+            .unwrap_or_else(|| suffix.version().to_string()),
     }
 }
 
@@ -587,10 +611,10 @@ fn is_single_gvs_path_component(value: &str) -> bool {
 }
 
 /// Stands in for the version of a snapshot resolved from a local
-/// directory — see [`gvs_version_segment`].
+/// directory; see [`gvs_version_segment`].
 const LOCAL_DIRECTORY_SEGMENT: &str = "directory";
 
-/// Whether the snapshot is a package taken from a local directory — a
+/// Whether the snapshot is a package taken from a local directory, a
 /// `file:` directory dependency or an injected workspace package.
 ///
 /// Both the version segment and the project scope below are derived
@@ -624,7 +648,7 @@ fn is_local_directory(metadata: Option<&PackageMetadata>, suffix: &PkgVerPeer) -
 /// in every project that happens to depend on a directory of that name.
 /// Sharing the slot would hand one project the files of whichever
 /// project installed first, and because the source directory is mutable
-/// the install re-imports it every time — so the projects would go on
+/// the install re-imports it every time, so the projects would go on
 /// overwriting each other's dependency.
 fn local_directory_scope<'a>(
     metadata: Option<&PackageMetadata>,
@@ -639,8 +663,8 @@ mod tests;
 
 /// On-disk cache for the derived global-virtual-store suffix map.
 ///
-/// The map — every snapshot's `<scope>/<name>/<version>/<hash>` slot
-/// suffix — is a pure function of its inputs, so a run whose inputs are
+/// The map (every snapshot's `<scope>/<name>/<version>/<hash>` slot
+/// suffix) is a pure function of its inputs, so a run whose inputs are
 /// unchanged loads it instead of deriving it. What that skips is the
 /// recursive hash per snapshot; the dep graph is built either way,
 /// because the key is derived from it.
@@ -650,7 +674,7 @@ mod tests;
 /// `cache_dir`: derived state a run may always recompute, never
 /// something an install depends on being there.
 ///
-/// The key is [`GvsHasher::fingerprint`] — a digest of the dep graph
+/// The key is [`GvsHasher::fingerprint`], a digest of the dep graph
 /// the suffixes are derived from, plus the engine string, the
 /// allow-build gating set, the project scope and a format version.
 /// Deriving the key and the suffixes from the same in-hand values is
@@ -658,10 +682,8 @@ mod tests;
 /// could describe a revision the suffixes did not come from.
 mod gvs_layout_cache;
 
-/// The platform a runtime's `variations` resolution selects an archive for:
-/// the one `supportedArchitectures` names, or the host's. A registry
-/// package's variants follow the host; see
-/// [`variations_platform`](crate::install_package_by_snapshot::variations_platform).
+/// The platform a `variations` resolution selects an archive for: the one
+/// `supportedArchitectures` names, or the host's.
 pub(crate) fn selected_platform(config: &Config) -> PlatformSelector {
     crate::install_package_by_snapshot::runtime_platform_selector(
         config.supported_architectures.as_ref(),

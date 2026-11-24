@@ -1,4 +1,12 @@
-use super::{BTreeMap, BTreeSet, HashMap, HashSet, MissingPeer, MissingPeerInfo};
+use super::{
+    BTreeMap,
+    BTreeSet,
+    HashMap,
+    HashSet,
+    MissingPeer,
+    MissingPeerInfo,
+};
+use crate::peer_provider::is_registry_peer_specifier;
 use node_semver::Range;
 use std::borrow::Cow;
 
@@ -129,7 +137,8 @@ fn merge_workspace_peer_ranges(
     }
     if versioned
         .iter()
-        .any(|body| Range::parse(body).is_err())
+        .map(Range::parse)
+        .any(|parsed| parsed.is_err())
     {
         return MissingPeerKind::Unhoistable;
     }
@@ -184,9 +193,9 @@ pub(super) fn distinct_wanted_ranges(entries: &[MissingPeer]) -> Vec<String> {
 /// Combine multiple consumers' wanted ranges into a single specifier,
 /// the upstream `mergePkgsDeps` policy: a single (or single unique)
 /// range passes through unchanged, distinct compatible ranges reduce to
-/// their semver intersection, and an empty intersection falls back to a
-/// `||`-join under `auto_install_peers_from_highest_match` — or `None`,
-/// dropping the peer on an unresolvable conflict.
+/// their semver intersection, and disjoint semver ranges fall back to a
+/// `||`-join under `auto_install_peers_from_highest_match`. Conflicting
+/// non-semver specifiers return `None`, leaving the peer missing.
 ///
 /// Only the unique ranges reach [`intersect_ranges`]: folding a range in
 /// a second time cannot narrow the result, and every pass costs another
@@ -207,10 +216,18 @@ pub(super) fn merge_ranges(
     if unique.len() == 1 {
         return Some(ranges[0].to_string());
     }
+    if !unique.iter().all(|range| is_registry_peer_specifier(range)) {
+        return None;
+    }
     if let Some(intersection) = intersect_ranges(&unique) {
         return Some(intersection);
     }
-    if auto_install_peers_from_highest_match {
+    if auto_install_peers_from_highest_match
+        && unique
+            .iter()
+            .map(Range::parse)
+            .all(|parsed| parsed.is_ok())
+    {
         return Some(ranges.join(" || "));
     }
     None
@@ -249,7 +266,8 @@ pub(super) fn collapse_covered_alternatives(range: &Range) -> Range {
     }
     let Some(parsed) = alternatives
         .iter()
-        .map(|alternative| Range::parse(alternative).ok())
+        .map(Range::parse)
+        .map(Result::ok)
         .collect::<Option<Vec<Range>>>()
     else {
         return range.clone();

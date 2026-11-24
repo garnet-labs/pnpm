@@ -1,7 +1,4 @@
 ---
-"@pnpm/installing.deps-installer": patch
-"@pnpm/patching.config": minor
-"pacquet": patch
 "pnpm": patch
 ---
 

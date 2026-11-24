@@ -189,6 +189,42 @@ describe('readProjectPin', () => {
     assert.equal(pinOf(path.join(everything, 'node_modules', 'dep'))?.spec, '12.1.0')
   })
 
+  for (const [included, excluded, spec, manifestDir] of [
+    ['**/.dev/**', '!packages/**', '12.1.0', 'packages/.dev/tool'],
+    ['packages/.dev/*', '!packages/*/tool', '12.1.0', 'packages/.dev/tool'],
+    ['packages/.dev/*', '!packages/*/other', '11.20.0', '.'],
+    ['packages/*/tool', '!other/**', '12.1.0', 'packages/.dev/tool'],
+  ]) {
+    test(`applies ${excluded} to an explicitly included hidden directory`, () => {
+      const dir = project({
+        'pnpm-workspace.yaml': `packages:\n  - '${included}'\n  - '${excluded}'\n`,
+        'package.json': manifest({ packageManager: 'pnpm@11.20.0' }),
+        'packages/.dev/tool/package.json': manifest({ packageManager: 'pnpm@12.1.0' }),
+      })
+      assert.deepEqual(pinOf(path.join(dir, 'packages', '.dev', 'tool')), {
+        spec,
+        field: 'packageManager',
+        manifestPath: path.join(dir, manifestDir, 'package.json'),
+      })
+    })
+  }
+
+  // Unpatched picomatch takes seconds to match this path.
+  test('rejects a long path in linear time under a packages pattern that repeats a wildcard', () => {
+    const excluded = `packages/${'a'.repeat(28)}`
+    const dir = project({
+      'pnpm-workspace.yaml': 'packages:\n  - packages/+(*)z\n',
+      'package.json': manifest({ packageManager: 'pnpm@11.20.0' }),
+      'packages/included-z/package.json': manifest({ packageManager: 'pnpm@12.2.0' }),
+      [`${excluded}/package.json`]: manifest({ packageManager: 'pnpm@12.1.0' }),
+    })
+
+    assert.equal(pinOf(path.join(dir, 'packages', 'included-z'))?.spec, '11.20.0')
+    const start = performance.now()
+    assert.equal(pinOf(path.join(dir, excluded))?.spec, '12.1.0')
+    assert.ok(performance.now() - start < 1000, 'matching the pattern took longer than a second')
+  })
+
   test('includes no project but the root in a workspace without packages', () => {
     const dir = project({
       'pnpm-workspace.yaml': 'nodeLinker: isolated\n',
@@ -213,6 +249,25 @@ describe('readProjectPin', () => {
       field: 'devEngines.packageManager',
       manifestPath: path.join(dir, 'package.json'),
     })
+  })
+
+  test('reads a pnpm-workspace.yaml of only blank lines, comments, and a document end marker as no settings', () => {
+    for (const content of ['', '\n', '# a workspace root\n', '# a workspace root\n...\n']) {
+      const dir = project({
+        'pnpm-workspace.yaml': content,
+        'package.json': manifest({ packageManager: 'pnpm@12.1.0' }),
+        'packages/member/package.json': manifest({ packageManager: 'pnpm@11.20.0' }),
+      })
+
+      assert.equal(pinOf(dir)?.spec, '12.1.0', JSON.stringify(content))
+      assert.equal(pinOf(path.join(dir, 'packages', 'member'))?.spec, '11.20.0', JSON.stringify(content))
+    }
+  })
+
+  test('reads a package.yaml of only comments as a manifest that pins nothing', () => {
+    const dir = project({ 'package.yaml': '# nothing yet\n' })
+
+    assert.equal(pinOf(dir), undefined)
   })
 
   test('names the pnpm-workspace.yaml that is not valid YAML', () => {
@@ -253,6 +308,34 @@ describe('readProjectPin', () => {
 
     assert.equal(pinOf(noEnvDocument)?.lockedVersion, undefined)
     assert.equal(pinOf(exact)?.lockedVersion, undefined)
+  })
+
+  test('reads the locked version of a boot document in lockfile format 13', () => {
+    const pinned = (entry: string): string | undefined => pinOf(project({
+      'package.json': manifest({ devEngines: { packageManager: { name: 'pnpm', version: '^14.0.0' } } }),
+      'pnpm-lock.yaml': `---
+{
+  "lockfileVersion": "13.0",
+  "projects": {
+    ".": {
+      "configDependencies": {},
+      "packageManagerDependencies": {
+        "pnpm": ${entry},
+      },
+    },
+  },
+}
+---
+{
+  "lockfileVersion": "13.0",
+  "projects": {".": {}},
+}
+`,
+    }))?.lockedVersion
+
+    assert.equal(pinned('{"specifier": "^14.0.0", "version": "14.2.0"}'), '14.2.0')
+    assert.equal(pinned('"14.2.0"'), '14.2.0')
+    assert.equal(pinned('{"specifier": "^14.0.0", "version": "13.0.0"}'), undefined)
   })
 
   test('reads no pin where there is no manifest at all', () => {

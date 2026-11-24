@@ -20,7 +20,10 @@
 
 use std::{
     borrow::Cow,
-    io::{self, Read},
+    io::{
+        self,
+        Read,
+    },
 };
 
 /// Document-stream marker that ends one YAML document and starts the
@@ -76,7 +79,9 @@ pub fn extract_main_document(content: &str) -> Cow<'_, str> {
 pub fn extract_env_document(content: &str) -> Option<Cow<'_, str>> {
     match normalize_lockfile_content(content) {
         Cow::Borrowed(content) => env_document_of(content).map(Cow::Borrowed),
-        Cow::Owned(content) => env_document_of(&content).map(|doc| Cow::Owned(doc.to_string())),
+        Cow::Owned(content) => {
+            env_document_of(&content).map(std::string::ToString::to_string).map(Cow::Owned)
+        }
     }
 }
 
@@ -258,11 +263,16 @@ fn env_only_document(rest: &str) -> Option<&str> {
         .strip_suffix("\n---")
         .or_else(|| rest.strip_suffix('\n'))
         .unwrap_or(rest);
-    document.contains(ROOT_IMPORTER_CONFIG_DEPENDENCIES).then_some(document)
+    (document.contains(ROOT_IMPORTER_CONFIG_DEPENDENCIES)
+        || document.contains(ROOT_IMPORTER_CONFIG_DEPENDENCIES_JSON))
+    .then_some(document)
 }
 
-/// How an env document lays out the start of its root importer.
+/// How an env document lays out the start of its root importer, in
+/// today's format and in the next format's JSON.
 const ROOT_IMPORTER_CONFIG_DEPENDENCIES: &str = "\n  .:\n    configDependencies:";
+const ROOT_IMPORTER_CONFIG_DEPENDENCIES_JSON: &str =
+    "\n\t\t\".\": {\n\t\t\t\"configDependencies\":";
 
 #[cfg(test)]
 mod tests;

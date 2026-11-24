@@ -1,6 +1,4 @@
 ---
-"@pnpm/error": patch
-"pacquet": patch
 "pnpm": patch
 ---
 

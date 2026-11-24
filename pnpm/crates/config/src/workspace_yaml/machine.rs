@@ -1,13 +1,40 @@
 //! The settings only the machine's own configuration sets.
 
 use super::{
-    BTreeMap, Config, Deserialize, EnvVar, GetHomeDir, LoadWorkspaceYamlError, MacosBackupSettings,
-    Path, Tool, ToolSettings, WorkspaceSettings, expand_home_prefix, overlay, overlay_some,
-    overlay_tools, parse_settings, read_readable_settings, read_workspace_document, resolve,
+    BTreeMap,
+    Config,
+    Deserialize,
+    EnvVar,
+    GetHomeDir,
+    LoadWorkspaceYamlError,
+    MacosBackupSettings,
+    Path,
+    Tool,
+    ToolSettings,
+    UnresolvedPlaceholders,
+    WorkspaceSettings,
+    expand_home_prefix,
+    overlay,
+    overlay_some,
+    overlay_tools,
+    parse_settings,
+    parse_settings_file,
+    read_readable_settings,
+    read_workspace_document,
+    resolve,
     substitute_optional_string,
 };
-use crate::{GlobalShimsSetting, SettingsRead};
-use std::{collections::HashSet, sync::OnceLock};
+use crate::{
+    GlobalShimsSetting,
+    SettingsRead,
+};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        OnceLock,
+    },
+};
 
 /// The settings a repository must not control, because they choose what
 /// runs on the machine or where the machine keeps its own state.
@@ -60,6 +87,25 @@ pub struct MachineSettings {
     /// points. Letting it also allow the write would let it overwrite any
     /// file the user can write.
     pub symlinked_lockfile_target_dirs: Option<Vec<String>>,
+    /// The settings of the global packages, which only `-g` commands apply.
+    /// See [`Config::global_packages_config`](crate::settings::Config::global_packages_config).
+    #[serde(serialize_with = "serialize_set_settings")]
+    pub global_packages_config: Option<Box<WorkspaceSettings>>,
+}
+
+/// The settings `settings` sets, leaving out the ones it leaves unset, so
+/// `pnpm config get` prints the section as it is written.
+#[expect(clippy::ref_option, reason = "serde's `serialize_with` passes the field by reference")]
+fn serialize_set_settings<Ser: serde::Serializer>(
+    settings: &Option<Box<WorkspaceSettings>>,
+    serializer: Ser,
+) -> Result<Ser::Ok, Ser::Error> {
+    let Some(settings) = settings else { return serializer.serialize_none() };
+    let mut value = serde_json::to_value(settings).map_err(serde::ser::Error::custom)?;
+    if let serde_json::Value::Object(map) = &mut value {
+        map.retain(|_, setting| !setting.is_null());
+    }
+    serde::Serialize::serialize(&value, serializer)
 }
 
 impl MachineSettings {
@@ -87,22 +133,33 @@ impl MachineSettings {
         if !may_name(&document.text, "globalShims") {
             return Ok(None);
         }
-        let read = parse_settings::<Sys, Self>;
         let settings = if settings_read.skips_unreadable() {
-            read_readable_settings(&document.text, read)
+            read_readable_settings(&document.text, parse_settings::<Sys, Self>)
+                .map_err(|source| LoadWorkspaceYamlError::ParseYaml {
+                    path: document.path,
+                    source,
+                })?
         } else {
-            read(&document.text)
-        }
-        .map_err(|source| LoadWorkspaceYamlError::ParseYaml { path: document.path, source })?;
+            parse_settings_file::<Sys, Self>(&document.text, &document.path)?
+        };
         Ok(settings.global_shims)
     }
 
-    /// Expand `${VAR}` in the string settings.
-    pub fn substitute_env<Sys: EnvVar>(&mut self) {
-        substitute_optional_string::<Sys>(&mut self.scope);
-        substitute_optional_string::<Sys>(&mut self.state_dir);
-        substitute_optional_string::<Sys>(&mut self.global_dir);
-        substitute_optional_string::<Sys>(&mut self.global_bin_dir);
+    /// Expand `${VAR}` in the string settings, expanding a placeholder the
+    /// environment cannot resolve to an empty string. For the settings read
+    /// from `PNPM_CONFIG_*` variables.
+    pub fn substitute_env_lossy<Sys: EnvVar>(&mut self) {
+        self.substitute_values::<Sys>(&mut UnresolvedPlaceholders::expand_empty());
+    }
+
+    fn substitute_values<Sys: EnvVar>(&mut self, unresolved: &mut UnresolvedPlaceholders) {
+        substitute_optional_string::<Sys>(&mut self.scope, unresolved);
+        substitute_optional_string::<Sys>(&mut self.state_dir, unresolved);
+        substitute_optional_string::<Sys>(&mut self.global_dir, unresolved);
+        substitute_optional_string::<Sys>(&mut self.global_bin_dir, unresolved);
+        if let Some(global_packages_config) = self.global_packages_config.as_mut() {
+            global_packages_config.substitute_trusted_values::<Sys>(unresolved);
+        }
     }
 
     /// See [`WorkspaceSettings::expand_home_prefixes`].
@@ -117,6 +174,9 @@ impl MachineSettings {
             if let Some(expanded) = expand_home_prefix::<Sys>(dir) {
                 *dir = expanded;
             }
+        }
+        if let Some(global_packages_config) = self.global_packages_config.as_mut() {
+            global_packages_config.expand_home_prefixes::<Sys>();
         }
     }
 
@@ -133,6 +193,7 @@ impl MachineSettings {
             global_shims,
             tools,
             symlinked_lockfile_target_dirs,
+            global_packages_config,
         } = self;
         overlay(&mut config.ci, ci);
         overlay_some(&mut config.scope, scope);
@@ -155,6 +216,9 @@ impl MachineSettings {
         if let Some(dirs) = symlinked_lockfile_target_dirs {
             config.symlinked_lockfile_target_dirs = absolute_dirs(dirs);
         }
+        if let Some(global_packages_config) = global_packages_config {
+            config.global_packages_config = Some(Arc::new(*global_packages_config));
+        }
     }
 }
 
@@ -170,9 +234,29 @@ pub struct TrustedSettings {
 impl TrustedSettings {
     /// Expand `${VAR}` in every string setting, request destinations
     /// included. See [`WorkspaceSettings::substitute_env_trusted`].
-    pub fn substitute_env_trusted<Sys: EnvVar>(&mut self) {
-        self.settings.substitute_env_trusted::<Sys>();
-        self.machine.substitute_env::<Sys>();
+    pub fn substitute_env_trusted<Sys: EnvVar>(&mut self) -> Result<(), LoadWorkspaceYamlError> {
+        let mut unresolved = UnresolvedPlaceholders::fail();
+        self.substitute_values::<Sys>(&mut unresolved);
+        unresolved.into_result()
+    }
+
+    /// [`Self::substitute_env_trusted`] for the settings read from
+    /// `PNPM_CONFIG_*` variables, which expands a placeholder the environment
+    /// cannot resolve to an empty string.
+    pub fn substitute_env_trusted_lossy<Sys: EnvVar>(&mut self) {
+        self.substitute_values::<Sys>(&mut UnresolvedPlaceholders::expand_empty());
+    }
+
+    /// [`Self::substitute_env_trusted`] for a load that leaves out what this
+    /// pnpm cannot read, which leaves out a setting with a placeholder that
+    /// has no value and no fallback.
+    pub fn substitute_env_trusted_readable<Sys: EnvVar>(&mut self) {
+        self.substitute_values::<Sys>(&mut UnresolvedPlaceholders::leave_out());
+    }
+
+    fn substitute_values<Sys: EnvVar>(&mut self, unresolved: &mut UnresolvedPlaceholders) {
+        self.settings.substitute_trusted_values::<Sys>(unresolved);
+        self.machine.substitute_values::<Sys>(unresolved);
     }
 
     /// See [`WorkspaceSettings::expand_home_prefixes`].

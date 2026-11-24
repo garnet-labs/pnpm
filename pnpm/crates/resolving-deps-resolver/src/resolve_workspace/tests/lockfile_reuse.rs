@@ -1,17 +1,36 @@
 use super::{
-    Arc, DependencyGroup, FailureShape, HashMap, Mutex, RecordingResolver, Utc,
-    WarmupProbeResolver, WorkspaceImporter, assert_eq, caret_entry, deps, fake_manifest,
-    fake_result, graph_versions_of, importer_opts, importer_scoped_update_lockfile,
-    lockfile_recording_time, lockfile_with_package, optional_failure_fixture,
-    optional_failure_fixture_with_specifier, recorded_time, resolve_pinned_versus_fresh,
-    resolve_single_importer, resolve_workspace, reuse_graph_lockfile, reuse_steal_lockfile,
+    Arc,
+    DependencyGroup,
+    FailureShape,
+    HashMap,
+    Mutex,
+    RecordingResolver,
+    WarmupProbeResolver,
+    WorkspaceImporter,
+    assert_eq,
+    caret_entry,
+    deps,
+    fake_manifest,
+    fake_result,
+    graph_versions_of,
+    importer_opts,
+    importer_scoped_update_lockfile,
+    lockfile_recording_time,
+    lockfile_with_package,
+    optional_failure_fixture,
+    optional_failure_fixture_with_specifier,
+    recorded_time,
+    resolve_pinned_versus_fresh,
+    resolve_single_importer,
+    resolve_workspace,
+    reuse_graph_lockfile,
+    reuse_steal_lockfile,
     workspace_opts,
 };
-use chrono::TimeZone;
 
 /// Against a registry whose abbreviated metadata omits publish times,
 /// the dates the lockfile already recorded are what the cutoff is
-/// derived from — otherwise a re-resolve would compute a different
+/// derived from; otherwise a re-resolve would compute a different
 /// cutoff and could pick different subdependency versions.
 #[tokio::test]
 async fn time_based_cutoff_falls_back_to_the_lockfiles_recorded_time() {
@@ -45,7 +64,7 @@ async fn time_based_cutoff_falls_back_to_the_lockfiles_recorded_time() {
 
     assert_eq!(
         resolver.opts_for("sub"),
-        (false, Some(Utc.with_ymd_and_hms(2024, 5, 20, 9, 0, 0).unwrap())),
+        (false, Some("2024-05-20T09:00:00Z".parse::<jiff::Timestamp>().unwrap())),
         "the recorded publish date stands in for the missing one",
     );
     assert_eq!(
@@ -321,7 +340,7 @@ async fn reused_lockfile_entries_still_notify_the_deprecation_sink() {
 /// A parent whose subtree contains a dependency cycle re-resolves
 /// fresh (the conservative cycle guard), but when it lands back on its
 /// recorded version its child edges keep their prior refs and re-enter
-/// the reuse gate — so `stable`'s cycle-free subtree is reused and its
+/// the reuse gate, so `stable`'s cycle-free subtree is reused and its
 /// open `open: *` edge keeps the recorded 1.0.0 pin instead of
 /// re-picking the registry's newest 2.0.0.
 #[tokio::test]
@@ -345,7 +364,7 @@ async fn fresh_resolved_parent_on_recorded_version_reuses_child_subtrees() {
             ),
             // The cycle-membered subtree is denied reuse, so its edges
             // resolve freshly with their recorded versions pinned as
-            // exact specs — the table serves the pinned form.
+            // exact specs, the table serves the pinned form.
             (
                 ("cyclic".to_string(), "1.0.0".to_string()),
                 fake_result(
@@ -430,7 +449,7 @@ async fn fresh_resolved_parent_on_recorded_version_reuses_child_subtrees() {
 /// `mid2` (for `needyC`) then claims `mid2`'s children ownership at
 /// depth 0 with the same (empty) peer-shadow set. Rewriting the
 /// displaced owner's occurrences to lazy on such a handover would
-/// re-resolve the reused subtree's open ranges — churning the locked
+/// re-resolve the reused subtree's open ranges, churning the locked
 /// `leaf2@1.0.0` to the registry's newer `1.5.0` even though nothing
 /// about `mid2`'s child resolution context changed.
 #[tokio::test]

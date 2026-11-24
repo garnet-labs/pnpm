@@ -1,16 +1,28 @@
-use crate::_utils::{importer_version, read_lockfile};
+use crate::_utils::{
+    importer_version,
+    read_lockfile,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
     command_env::CommandTestExt,
 };
 use pnpr_fixtures::RemovedVersionField;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
     process::Command,
-    time::{Duration, SystemTime},
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
 
 fn pacquet_at(workspace: &Path) -> Command {
@@ -255,6 +267,91 @@ fn dedupe_refreshes_cached_registry_metadata_for_locked_versions() {
     let deduped_lockfile = fs::read_to_string(&lockfile_path).expect("read deduped lockfile");
     eprintln!("{deduped_lockfile}");
     assert!(deduped_lockfile.contains("deprecated: This package is deprecated."));
+    drop((root, mock_instance));
+}
+
+/// The registry requests of `dedupe_args` run on the metadata cache that
+/// locking a pinned dependency left behind.
+fn warm_cache_dedupe_requests(
+    workspace_yaml: &str,
+    dedupe_args: &[&str],
+) -> Vec<pnpm_testing_utils::registry::RecordedRequest> {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_recording_mocked_registry_without_fields(&[]);
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(workspace.join("pnpm-workspace.yaml"), workspace_yaml)
+        .expect("write pnpm-workspace.yaml");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": {
+                "@pnpm.e2e/deprecated": "1.0.0",
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    assert!(!mock_instance.take_requests().is_empty(), "the install must fill the cache");
+
+    pacquet_at(&workspace)
+        .with_args(dedupe_args)
+        .assert()
+        .success();
+
+    let requests = mock_instance.take_requests();
+    drop((root, mock_instance));
+    requests
+}
+
+#[test]
+fn dedupe_check_reads_cached_registry_metadata_for_locked_versions() {
+    assert_eq!(warm_cache_dedupe_requests("", &["dedupe", "--check"]), []);
+}
+
+#[test]
+fn dedupe_reads_cached_registry_metadata_when_the_lockfile_records_no_deprecations() {
+    assert_eq!(
+        warm_cache_dedupe_requests("lockfile:\n  format: v13\n", &["dedupe", "--lockfile-only"]),
+        [],
+    );
+}
+
+#[test]
+fn dedupe_reuses_the_verification_of_a_lockfile_saved_in_a_format_that_omits_fields() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_recording_mocked_registry_without_fields(&[]);
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(workspace.join("pnpm-workspace.yaml"), "lockfile:\n  format: v13\n")
+        .expect("write pnpm-workspace.yaml");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/deprecated": "1.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let output = pacquet_at(&workspace)
+        .with_args(["dedupe", "--lockfile-only", "--reporter=ndjson"])
+        .output()
+        .expect("run dedupe");
+    let ndjson = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{ndjson}");
+    assert!(
+        ndjson
+            .lines()
+            .any(|line| {
+                line.contains(r#""name":"pnpm:lockfile-verification""#)
+                    && line.contains(r#""status":"cached""#)
+            }),
+        "{ndjson}",
+    );
     drop((root, mock_instance));
 }
 
@@ -556,6 +653,51 @@ fn dedupe_check_ignores_a_deprecation_the_lockfile_does_not_record() {
     drop((root, mock_instance));
 }
 
+/// The lockfile was written when the registry only reported the `sha1`
+/// shasum of a locked version, and it now reports its `sha512` integrity.
+#[test]
+fn dedupe_check_ignores_an_integrity_the_registry_now_reports_with_another_algorithm() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": {
+                "@pnpm.e2e/dep-of-pkg-with-1-dep": "100.0.0",
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    let recorded = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
+    let integrity_start =
+        recorded.find("integrity: sha512-").expect("the lockfile records a sha512 integrity")
+            + "integrity: ".len();
+    let integrity_end = integrity_start
+        + recorded[integrity_start..]
+            .find([',', '}'])
+            .expect("the resolution goes on after its integrity");
+    let stale = format!(
+        "{}sha1-896/ULXBYCvzkqy0Er0z/W1+T5g={}",
+        &recorded[..integrity_start],
+        &recorded[integrity_end..],
+    );
+    fs::write(&lockfile_path, &stale).expect("write the sha1 lockfile");
+    backdate_lockfile(&lockfile_path);
+
+    assert_dedupe_check_leaves_lockfiles_untouched(&workspace, &[lockfile_path], 0);
+
+    drop((root, mock_instance));
+}
+
 #[test]
 fn dedupe_check_rejects_a_malformed_modules_manifest() {
     let CommandTempCwd {
@@ -686,9 +828,7 @@ fn dedupe_warns_about_peer_dependency_issues() {
     assert!(output.status.success(), "dedupe must succeed: {output:?}");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
     assert!(
-        stdout.contains(
-            r#"Issues with peer dependencies found. Run "pnpm peers check" to list them."#
-        ),
+        stdout.contains(r#"has issues: @pnpm.e2e/foo (see "pnpm peers check")"#),
         "stdout:\n{stdout}",
     );
 
@@ -876,7 +1016,8 @@ fn dedupe_check_reports_the_lockfile_diff() {
     let ndjson_stderr = String::from_utf8(ndjson_output.stderr).expect("stderr is UTF-8");
     let ndjson_records = ndjson_stderr
         .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid NDJSON"))
+        .map(serde_json::from_str::<serde_json::Value>)
+        .map(|value| value.expect("valid NDJSON"))
         .collect::<Vec<_>>();
     assert!(
         ndjson_records
@@ -918,7 +1059,7 @@ fn dedupe_check_reports_the_lockfile_diff() {
 }
 
 /// `--check` must not write loose-mode `minimumReleaseAge` picks to
-/// `minimumReleaseAgeExclude` — the check contract is "mutate nothing"
+/// `minimumReleaseAgeExclude`, the check contract is "mutate nothing"
 /// (see the lockfile guard in `DedupeArgs::run`).
 #[test]
 fn dedupe_check_does_not_persist_minimum_release_age_excludes() {
@@ -977,12 +1118,12 @@ fn dedupe_check_does_not_persist_minimum_release_age_excludes() {
 }
 
 /// A lockfile whose snapshot keys carry no `(peer)` segment for an
-/// optional peer that only a sibling's subtree provides — the shape
-/// pnpm 11 writes for this graph — must be re-keyed completely.
+/// optional peer that only a sibling's subtree provides (the shape
+/// pnpm 11 writes for this graph) must be re-keyed completely.
 /// The graph mirrors pnpm/pnpm#14455: `optional-peer-c-consumer` and its
 /// auto-installed peer both reach `optional-peer-c-host`, whose optional
 /// `peer-c` is provided by `abc-regular-deps`. One `dedupe` pass must
-/// re-key every affected snapshot — the consumer's own key included —
+/// re-key every affected snapshot (the consumer's own key included)
 /// and a second pass must change nothing.
 #[test]
 fn dedupe_re_keys_a_hoisted_optional_peer_in_one_pass() {
@@ -1128,7 +1269,8 @@ fn dedupe_filters_workspace_projects_and_checks_without_writing() {
         };
         let snapshots: Vec<_> = lockfiles
             .iter()
-            .map(|path| fs::read(path).unwrap())
+            .map(fs::read)
+            .map(Result::unwrap)
             .collect();
         pacquet_at(&workspace)
             .with_args(["dedupe", "--check", "-F", "pkg-a"])
@@ -1192,7 +1334,8 @@ fn dedupe_check_detects_config_dependency_changes_when_root_is_unselected() {
         [".", "packages/a", "packages/b"].map(|dir| workspace.join(dir).join("pnpm-lock.yaml"));
     let snapshots: Vec<_> = lockfiles
         .iter()
-        .map(|path| fs::read(path).unwrap())
+        .map(fs::read)
+        .map(Result::unwrap)
         .collect();
     let workspace_path = workspace.join("pnpm-workspace.yaml");
     let mut yaml = fs::read_to_string(&workspace_path).unwrap();
@@ -1287,12 +1430,14 @@ fn dedupe_warm_full_run_counts_each_reused_package_once() {
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     let records = stderr
         .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid NDJSON"))
+        .map(serde_json::from_str::<serde_json::Value>)
+        .map(|value| value.expect("valid NDJSON"))
         .collect::<Vec<_>>();
     let package_ids = |status: &str| {
         records
             .iter()
-            .filter(|record| record["name"] == "pnpm:progress" && record["status"] == status)
+            .filter(|record| record["name"] == "pnpm:progress")
+            .filter(|record| record["status"] == status)
             .map(|record| {
                 record["packageId"]
                     .as_str()

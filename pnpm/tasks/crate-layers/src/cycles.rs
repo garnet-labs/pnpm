@@ -1,5 +1,8 @@
-use crate::{layers::Problem, modules::TopLevelGraph};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::modules::TopLevelGraph;
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
 /// The largest group of a crate's top-level modules that all reach each
 /// other through references.
@@ -14,7 +17,7 @@ pub struct CycleReport {
 }
 
 impl CycleReport {
-    pub fn new(crate_name: &str, graph: &TopLevelGraph) -> Self {
+    pub fn new(crate_name: String, graph: &TopLevelGraph) -> Self {
         let biggest = components(graph)
             .into_iter()
             .max_by_key(Vec::len)
@@ -28,7 +31,7 @@ impl CycleReport {
         let mut largest = if biggest.len() > 1 { biggest } else { Vec::new() };
         largest.sort_by_key(|module| (std::cmp::Reverse(lines(module)), module.clone()));
         Self {
-            crate_name: crate_name.to_owned(),
+            crate_name,
             module_count: graph.code_lines.len(),
             total_lines: graph.code_lines.values().sum(),
             largest_lines: largest.iter().map(lines).sum(),
@@ -125,33 +128,12 @@ impl<'graph> Tarjan<'graph> {
     }
 }
 
-/// Compares each crate's largest module cycle with its accepted size. A
-/// crate without an entry accepts no cycle. A cycle that shrank fails too, so
-/// the accepted size only goes down.
-pub fn check_baseline(reports: &[CycleReport], baseline: &BTreeMap<String, usize>) -> Vec<Problem> {
-    let mut problems = Vec::new();
-    for report in reports {
-        let accepted = baseline
-            .get(&report.crate_name)
-            .copied()
-            .unwrap_or_default();
-        let crate_name = report.crate_name.clone();
-        let (size, baseline) = (report.size(), accepted);
-        if size > accepted {
-            problems.push(Problem::ModuleCycleGrew { crate_name, size, baseline });
-        } else if size < accepted {
-            problems.push(Problem::ModuleCycleShrank { crate_name, size, baseline });
-        }
-    }
-    let measured = reports
-        .iter()
-        .map(|report| report.crate_name.as_str())
-        .collect::<BTreeSet<_>>();
-    for (crate_name, accepted) in baseline {
-        if !measured.contains(crate_name.as_str()) {
-            let (crate_name, baseline) = (crate_name.clone(), *accepted);
-            problems.push(Problem::ModuleCycleShrank { crate_name, size: 0, baseline });
-        }
-    }
-    problems
+/// Each crate's largest cycle size, for [`crate::ratchet::check`].
+pub fn sizes<'report>(
+    reports: impl IntoIterator<Item = &'report CycleReport>,
+) -> BTreeMap<String, usize> {
+    reports
+        .into_iter()
+        .map(|report| (report.crate_name.clone(), report.size()))
+        .collect()
 }

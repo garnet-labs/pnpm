@@ -1,9 +1,30 @@
 use super::{
-    Context, ConvertCtx, DirectoryResolution, HashMap, ImporterDepVersion, IntoDiagnostic,
-    LockfileResolution, PackageKey, PackageMetadata, Path, PathBuf, PkgName, PkgNameVerPeer,
-    ProjectInfo, ProjectPathKey, ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec,
-    SnapshotDepRef, SnapshotEntry, TarballResolution, VersionPart, lexical_normalize,
-    relative_path, same_path,
+    Context,
+    ConvertCtx,
+    DirectoryResolution,
+    HashMap,
+    ImporterDepVersion,
+    IntoDiagnostic,
+    LockfileResolution,
+    PackageKey,
+    PackageMetadata,
+    Path,
+    PathBuf,
+    PkgName,
+    PkgNameVerPeer,
+    ProjectInfo,
+    ProjectPathKey,
+    ProjectSnapshot,
+    ResolvedDependencyMap,
+    ResolvedDependencySpec,
+    SnapshotDepRef,
+    SnapshotEntry,
+    TarballResolution,
+    VersionPart,
+    lexical_normalize,
+    lockfile::ReferenceLocation,
+    relative_path,
+    same_path,
 };
 
 pub(super) struct ResolveBases<'a> {
@@ -11,8 +32,8 @@ pub(super) struct ResolveBases<'a> {
     pub(super) link_base: &'a Path,
 }
 
-struct LocalResolve {
-    resolved_path: PathBuf,
+pub(super) struct LocalResolve {
+    pub(super) resolved_path: PathBuf,
     suffix: String,
 }
 
@@ -140,12 +161,16 @@ fn convert_snapshot_dep_map(
     Ok((!output.is_empty()).then_some(output))
 }
 
-fn convert_importer_dep_version(
+pub(super) fn convert_importer_dep_version(
     alias: &PkgName,
     version: &ImporterDepVersion,
     ctx: &ConvertCtx,
     bases: &ResolveBases,
 ) -> miette::Result<ImporterDepVersion> {
+    match ctx.references {
+        ReferenceLocation::Deploy => return Ok(version.clone()),
+        ReferenceLocation::Workspace => {}
+    }
     if let Some(local) = resolve_importer_dep_version(version, bases) {
         return local_to_importer_dep_version(alias, &local, ctx);
     }
@@ -158,8 +183,13 @@ pub(super) fn convert_importer_version_to_snapshot_ref(
     ctx: &ConvertCtx,
     bases: &ResolveBases,
 ) -> miette::Result<SnapshotDepRef> {
-    if let Some(local) = resolve_importer_dep_version(version, bases) {
-        return local_to_snapshot_dep_ref(alias, &local, ctx);
+    match ctx.references {
+        ReferenceLocation::Workspace => {
+            if let Some(local) = resolve_importer_dep_version(version, bases) {
+                return local_to_snapshot_dep_ref(alias, &local, ctx);
+            }
+        }
+        ReferenceLocation::Deploy => {}
     }
     Ok(match version {
         ImporterDepVersion::Regular(version) => SnapshotDepRef::Plain(version.clone()),
@@ -172,19 +202,23 @@ pub(super) fn convert_importer_version_to_snapshot_ref(
     })
 }
 
-fn convert_snapshot_dep_ref(
+pub(super) fn convert_snapshot_dep_ref(
     alias: &PkgName,
     dep_ref: &SnapshotDepRef,
     ctx: &ConvertCtx,
     bases: &ResolveBases,
 ) -> miette::Result<SnapshotDepRef> {
+    match ctx.references {
+        ReferenceLocation::Deploy => return Ok(dep_ref.clone()),
+        ReferenceLocation::Workspace => {}
+    }
     if let Some(local) = resolve_snapshot_dep_ref(alias, dep_ref, bases) {
         return local_to_snapshot_dep_ref(alias, &local, ctx);
     }
     Ok(dep_ref.clone())
 }
 
-fn resolve_importer_dep_version(
+pub(super) fn resolve_importer_dep_version(
     version: &ImporterDepVersion,
     bases: &ResolveBases,
 ) -> Option<LocalResolve> {
@@ -285,6 +319,10 @@ pub(super) fn convert_package_key(
     key: &PackageKey,
     ctx: &ConvertCtx,
 ) -> miette::Result<PackageKey> {
+    match ctx.references {
+        ReferenceLocation::Deploy => return Ok(key.clone()),
+        ReferenceLocation::Workspace => {}
+    }
     let VersionPart::File(path) = key.suffix.version() else { return Ok(key.clone()) };
     let resolved = lexical_normalize(&ctx.lockfile_dir.join(path));
     create_file_url_key(&resolved, key.suffix.peer(), ctx.projects_by_path, Some(&key.name))
@@ -298,18 +336,27 @@ pub(super) fn create_file_url_key(
 ) -> miette::Result<PkgNameVerPeer> {
     let normalized = lexical_normalize(resolved_path);
     let normalized_display = normalized.display();
+    // Parentheses delimit peer contexts in dependency keys.
     let dep_file_url = url::Url::from_file_path(&normalized)
         .map_err(|()| miette::miette!("could not convert {} to a file URL", normalized_display))?
-        .to_string();
+        .to_string()
+        .replace('(', "%28")
+        .replace(')', "%29");
     let name = projects_by_path
         .get(&ProjectPathKey::new(&normalized))
+        .or_else(|| {
+            projects_by_path
+                .values()
+                .find(|project| project.linked_publish_dir.as_deref() == Some(&*normalized))
+        })
         .and_then(|project| project.name.as_deref())
         .map(str::to_string)
         .or_else(|| package_name.map(PkgName::to_string))
         .or_else(|| {
             normalized
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
+                .map(std::ffi::OsStr::to_string_lossy)
+                .map(std::borrow::Cow::into_owned)
         })
         .unwrap_or_else(|| normalized.display().to_string());
     format!("{name}@{dep_file_url}{suffix}")

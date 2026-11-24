@@ -7,6 +7,7 @@ pub mod bugs;
 pub mod cache;
 pub mod cat_file;
 pub mod cat_index;
+pub mod catalog;
 pub(crate) mod catalogs;
 pub mod change;
 pub mod changelog;
@@ -27,11 +28,13 @@ pub mod dlx;
 pub mod docs;
 pub mod doctor;
 pub(crate) mod ecosystem_deps;
+pub mod edit;
 pub(crate) mod engine_deps;
 pub mod env;
 pub mod exec;
 pub mod fetch;
 pub mod find_hash;
+pub mod fund;
 pub mod global;
 pub(crate) mod global_bin_lock;
 pub mod ignored_builds;
@@ -45,10 +48,10 @@ pub(crate) mod legacy_pnpm_field;
 pub mod licenses;
 pub mod link;
 pub mod list;
+pub(crate) mod listed_projects;
 pub mod lockfile_dir;
 pub mod login;
 pub mod logout;
-pub mod not_implemented;
 pub mod outdated;
 pub(crate) mod override_version_references;
 pub mod owner;
@@ -90,6 +93,7 @@ pub mod search;
 pub mod self_update;
 pub mod set_script;
 pub mod setup;
+pub(crate) mod shadowing_pnpm;
 pub mod shim;
 pub mod stage;
 pub mod star;
@@ -129,7 +133,7 @@ mod workspace_option;
 
 /// The CLI grammar, built once per process. Constructing it walks every
 /// subcommand, and the passes that run before the parse each need the same
-/// view of it — argument arity, aliases, and which positionals name a
+/// view of it, argument arity, aliases, and which positionals name a
 /// subcommand.
 pub(crate) fn grammar() -> &'static clap::Command {
     static GRAMMAR: std::sync::OnceLock<clap::Command> = std::sync::OnceLock::new();
@@ -148,3 +152,5 @@ pub(crate) fn parse_depth_limit(text: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests;
+
+mod stored_package;

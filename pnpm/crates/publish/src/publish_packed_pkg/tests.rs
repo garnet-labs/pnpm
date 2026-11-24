@@ -1,29 +1,71 @@
 use super::{
-    DistHashes, PackedPkg, PublishHttpError, PublishNetwork, PublishPackedPkgError,
-    PublishPackedPkgOptions, build_publish_document,
+    DistHashes,
+    PackedPkg,
+    PublishHttpError,
+    PublishNetwork,
+    PublishPackedPkgError,
+    PublishPackedPkgOptions,
+    build_publish_document,
     document::clean_version,
-    publish_packed_pkg, publish_with_otp_handling, registry_for_display,
-    request::{is_otp_challenge, parse_otp_challenge, put_publish},
+    publish_packed_pkg,
+    publish_with_otp_handling,
+    registry_for_display,
+    request::{
+        is_otp_challenge,
+        parse_otp_challenge,
+        put_publish,
+    },
     web_auth_fetch_options,
 };
 use crate::{
-    capabilities::{Clock, EnvVar, OidcFetch, OidcFetchError, OidcRequest, OidcResponse},
+    capabilities::{
+        Clock,
+        EnvVar,
+        OidcFetch,
+        OidcFetchError,
+        OidcRequest,
+        OidcResponse,
+    },
     oidc::OidcHttpOptions,
-    provenance_gen::{ProvenanceGenError, SignProvenance, SignedProvenance},
-    publish_options::{CreatePublishOptionsError, PublishUnsupportedRegistryProtocolError},
+    provenance_gen::{
+        ProvenanceGenError,
+        SignProvenance,
+        SignedProvenance,
+    },
+    publish_options::{
+        CreatePublishOptionsError,
+        PublishUnsupportedRegistryProtocolError,
+    },
     registry_config_keys::parse_supported_registry_url,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use pnpm_network::{AuthHeaders, ThrottledClient};
+use base64::{
+    Engine,
+    engine::general_purpose::URL_SAFE_NO_PAD,
+};
+use pnpm_network::{
+    AuthHeaders,
+    ThrottledClient,
+};
 use pnpm_network_web_auth::{
-    Host as WebAuthHost, OtpChallenge, OtpError, WebAuthFetchOptions, WithOtpError,
+    Host as WebAuthHost,
+    OtpChallenge,
+    OtpError,
+    WebAuthFetchOptions,
+    WithOtpError,
 };
 use pnpm_network_web_auth_testing::{
-    InputResponse, SleepBehavior, ok_202, ok_token, web_auth_fake,
+    InputResponse,
+    SleepBehavior,
+    ok_202,
+    ok_token,
+    web_auth_fake,
 };
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use std::time::Duration;
 
 /// A `WebAuthFetchOptions` the success paths never reach: when the PUT
@@ -108,7 +150,7 @@ fn rejects_restricted_access_for_unscoped_package() {
         &manifest,
         b"x",
         &registry(),
-        Some(super::Access::Restricted),
+        Some("restricted"),
         "latest",
         &hashes(),
     )
@@ -188,7 +230,7 @@ async fn put_publish_reports_a_non_success_status_without_erroring() {
     let client = ThrottledClient::default();
     let url = format!("{}/pkg", server.url());
 
-    // A 5xx is a completed response (`ok: false`), not a transport error — the
+    // A 5xx is a completed response (`ok: false`), not a transport error, the
     // caller inspects `ok` and raises `FailedToPublishError`, matching pnpm.
     let response = put_publish(&client, &url, None, "publish", body(), None, false)
         .await
@@ -650,7 +692,7 @@ fn publish_packed_pkg_error_wraps_option_and_otp_failures() {
 
 /// A host outside CI: no `NPM_ID_TOKEN`, not GitHub Actions, so the OIDC probe
 /// in `create_publish_options` resolves to "not applicable" without touching
-/// the network — and the token exchange (clock) and any registry fetch stay
+/// the network, and the token exchange (clock) and any registry fetch stay
 /// unreachable.
 struct OfflineSys;
 impl Clock for OfflineSys {
@@ -692,8 +734,6 @@ async fn publish_packed_pkg_dry_run_returns_the_summary_without_publishing() {
         contents: &contents,
         unpacked_size: 42,
         notes: None,
-        variants: &[],
-        any_staged: None,
     };
     let opts = PublishPackedPkgOptions {
         dry_run: true,
@@ -785,47 +825,24 @@ impl SignProvenance for ProvenanceSys {
     }
 }
 
-/// [`ProvenanceSys`] that also records each statement it signs, so only the
-/// one test that reads the recording shares it.
-struct RecordingProvenanceSys;
-
-/// The statements [`RecordingProvenanceSys`] signed, in order.
-static RECORDED_STATEMENTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
-
-impl Clock for RecordingProvenanceSys {
-    fn now_ms() -> u64 {
-        ProvenanceSys::now_ms()
-    }
-}
-impl EnvVar for RecordingProvenanceSys {
-    fn var(name: &str) -> Option<String> {
-        ProvenanceSys::var(name)
-    }
-}
-impl OidcFetch for RecordingProvenanceSys {
-    async fn fetch(request: OidcRequest<'_>) -> Result<OidcResponse, OidcFetchError> {
-        ProvenanceSys::fetch(request).await
-    }
-}
-impl SignProvenance for RecordingProvenanceSys {
-    async fn sign_statement(
-        jwt: &str,
-        statement: &[u8],
-        timeout: Option<Duration>,
-    ) -> Result<SignedProvenance, ProvenanceGenError> {
-        RECORDED_STATEMENTS
-            .lock()
-            .unwrap()
-            .push(serde_json::from_slice(statement).expect("a statement is JSON"));
-        ProvenanceSys::sign_statement(jwt, statement, timeout).await
-    }
-}
-
 /// The `--provenance` flow: `publish_packed_pkg` runs the *real*
 /// `generate_provenance` (only the signer is faked) and splices the signed
 /// `.sigstore` bundle into the document's `_attachments` before the `PUT`.
 #[tokio::test]
 async fn publish_packed_pkg_attaches_signed_provenance_to_the_document() {
+    publish_with_provenance("1.0.0").await;
+}
+
+/// The statement and its attachment name the version as the document keys
+/// it, without build metadata.
+#[tokio::test]
+async fn provenance_names_the_version_without_build_metadata() {
+    publish_with_provenance("1.0.0+build").await;
+}
+
+/// Publish `pkg` at `version` with provenance to a registry that accepts
+/// only a document carrying `pkg-1.0.0.sigstore`.
+async fn publish_with_provenance(version: &str) {
     let mut server = mockito::Server::new_async().await;
     let exchange = server
         .mock("POST", "/npm/private/-/npm/v1/oidc/token/exchange/package/pkg")
@@ -834,7 +851,7 @@ async fn publish_packed_pkg_attaches_signed_provenance_to_the_document() {
         .with_body(r#"{"token":"registry-token"}"#)
         .create_async()
         .await;
-    let manifest = json!({ "name": "pkg", "version": "1.0.0" });
+    let manifest = json!({ "name": "pkg", "version": version });
     let tarball = b"tarball-bytes";
     let pkg = PackedPkg {
         published_manifest: &manifest,
@@ -843,8 +860,6 @@ async fn publish_packed_pkg_attaches_signed_provenance_to_the_document() {
         contents: &[],
         unpacked_size: 0,
         notes: None,
-        variants: &[],
-        any_staged: None,
     };
     let opts = PublishPackedPkgOptions {
         dry_run: false,
@@ -905,7 +920,7 @@ fn registry_for_display_strips_userinfo_and_leaves_a_plain_registry_untouched() 
 fn rejects_a_package_name_that_could_redirect_the_publish_url() {
     // A crafted tarball name that would parse as an absolute (or protocol-relative)
     // URL under `Url::join` must be rejected before it reaches the authenticated
-    // PUT URL — mirroring libnpmpublish's `npa.resolve` name validation.
+    // PUT URL, mirroring libnpmpublish's `npa.resolve` name validation.
     for bad in ["https://evil.com", r"\\evil.com\pkg", "pnpm:evil", "foo/bar", "//evil.com"] {
         let manifest = json!({ "name": bad, "version": "1.0.0" });
         let err = build_publish_document(&manifest, b"x", &registry(), None, "latest", &hashes())
@@ -921,210 +936,4 @@ fn rejects_a_package_name_that_could_redirect_the_publish_url() {
     assert!(
         build_publish_document(&manifest, b"x", &registry(), None, "latest", &hashes()).is_ok(),
     );
-}
-
-/// The subjects of the statement a provenance publish of `pkg` to a pnpr
-/// registry signs.
-async fn signed_subjects(pkg: &PackedPkg<'_>) -> Vec<(String, String)> {
-    let mut server = mockito::Server::new_async().await;
-    let registry = format!("{}/npm/private", server.url());
-    server
-        .mock("POST", mockito::Matcher::Regex("/oidc/token/exchange/".to_owned()))
-        .with_status(200)
-        .with_body(r#"{"token":"registry-token"}"#)
-        .create_async()
-        .await;
-    let blob = mockito::Matcher::Regex("/-/pnpr/v0/artifacts/blob".to_owned());
-    server
-        .mock("HEAD", blob.clone())
-        .with_status(404)
-        .create_async()
-        .await;
-    server
-        .mock("PUT", blob)
-        .with_status(201)
-        .create_async()
-        .await;
-    let publish = server
-        .mock("PUT", mockito::Matcher::Regex("/npm/private/example-cli$".to_owned()))
-        .with_status(200)
-        .with_body("{}")
-        .expect(1)
-        .create_async()
-        .await;
-    let opts = PublishPackedPkgOptions {
-        dry_run: false,
-        stage: false,
-        wait_timeout: Duration::ZERO,
-        registry: crate::PublishRegistryOptions {
-            default: registry.clone(),
-            scoped: std::collections::BTreeMap::new(),
-            access: None,
-            tag: "latest".to_owned(),
-            otp: None,
-            provenance: Some(true),
-            http: OidcHttpOptions::default(),
-        },
-        release_notes: crate::ReleaseNotesTarget::default(),
-        pnpr_registries: std::collections::HashSet::from([format!("{registry}/")]),
-    };
-    let client = ThrottledClient::default();
-    let auth_headers = AuthHeaders::default();
-    let network = PublishNetwork { client: &client, auth_headers: &auth_headers };
-    RECORDED_STATEMENTS
-        .lock()
-        .unwrap()
-        .clear();
-    publish_packed_pkg::<RecordingProvenanceSys, SilentReporter>(pkg, &opts, &network)
-        .await
-        .expect("a provenance publish of variants succeeds");
-    publish.assert_async().await;
-    let statement = RECORDED_STATEMENTS
-        .lock()
-        .unwrap()
-        .pop()
-        .expect("a signed statement");
-    statement["subject"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|subject| {
-            (
-                subject["name"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-                subject["digest"]["sha512"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            )
-        })
-        .collect()
-}
-
-fn sha512_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    use std::fmt::Write as _;
-    sha2::Sha512::digest(bytes)
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
-}
-
-#[tokio::test]
-async fn a_provenance_publish_of_variants_signs_one_statement_naming_every_archive() {
-    let manifest = json!({ "name": "example-cli", "version": "1.0.0+build" });
-    let variants = [super::PackedVariant {
-        tag: "linux-x64".into(),
-        archive: super::VariantArchive::Packed(b"linux".to_vec()),
-    }];
-    let mut pkg = PackedPkg {
-        published_manifest: &manifest,
-        tarball_data: b"any",
-        tarball_path: "example-cli-1.0.0.tgz",
-        contents: &[],
-        unpacked_size: 0,
-        notes: None,
-        variants: &variants,
-        any_staged: None,
-    };
-    assert_eq!(
-        signed_subjects(&pkg).await,
-        [
-            ("pkg:npm/example-cli@1.0.0".to_owned(), sha512_hex(b"any")),
-            ("pkg:npm/example-cli@1.0.0?variant=linux-x64".to_owned(), sha512_hex(b"linux")),
-        ],
-    );
-    pkg.tarball_data = b"";
-    assert_eq!(
-        signed_subjects(&pkg).await,
-        [("pkg:npm/example-cli@1.0.0?variant=linux-x64".to_owned(), sha512_hex(b"linux"))],
-        "a version without an any archive names only its variants",
-    );
-}
-
-/// Publish `@acme/cli@1.0.0` from a `linux-x64` variant another job staged
-/// to a pnpr that no longer holds it staged, recording `record` (when it
-/// has one) and pointing `latest` at the version.
-async fn rerun_from_staged_variant(record: Option<Value>) -> Result<(), PublishPackedPkgError> {
-    let mut server = mockito::Server::new_async().await;
-    let registry = format!("{}/", server.url());
-    server
-        .mock("HEAD", mockito::Matcher::Regex("^/-/pnpr/v0/artifacts/blob".to_owned()))
-        .with_status(404)
-        .create_async()
-        .await;
-    let record_mock = server.mock("GET", "/@acme%2fcli/1.0.0+r0");
-    match &record {
-        Some(record) => record_mock.with_body(record.to_string()),
-        None => record_mock.with_status(404),
-    }
-    .create_async()
-    .await;
-    server
-        .mock("GET", "/-/package/@acme%2fcli/dist-tags")
-        .with_body(json!({ "latest": "1.0.0" }).to_string())
-        .create_async()
-        .await;
-    let manifest = json!({ "name": "@acme/cli", "version": "1.0.0" });
-    let variants = [crate::PackedVariant {
-        tag: "linux-x64".to_owned(),
-        archive: crate::VariantArchive::Staged(crate::StagedReference {
-            integrity: "sha512-bGludXg=".to_owned(),
-            label: "linux-x64".to_owned(),
-        }),
-    }];
-    let pkg = PackedPkg {
-        published_manifest: &manifest,
-        tarball_data: b"",
-        tarball_path: "cli-1.0.0.tgz",
-        contents: &[],
-        unpacked_size: 0,
-        notes: None,
-        variants: &variants,
-        any_staged: None,
-    };
-    let opts = PublishPackedPkgOptions {
-        dry_run: false,
-        stage: false,
-        wait_timeout: Duration::ZERO,
-        registry: crate::PublishRegistryOptions {
-            default: registry.clone(),
-            scoped: std::collections::BTreeMap::new(),
-            access: None,
-            tag: "latest".to_owned(),
-            otp: None,
-            provenance: None,
-            http: OidcHttpOptions::default(),
-        },
-        release_notes: crate::ReleaseNotesTarget::default(),
-        pnpr_registries: std::collections::HashSet::from([registry]),
-    };
-    let client = ThrottledClient::default();
-    let auth_headers = AuthHeaders::default();
-    let network = PublishNetwork { client: &client, auth_headers: &auth_headers };
-    publish_packed_pkg::<OfflineSys, SilentReporter>(&pkg, &opts, &network)
-        .await
-        .map(drop)
-        .map_err(|failure| failure.error)
-}
-
-/// pnpr retires the archives another job staged once the version they were
-/// published with is accepted, so rerunning that publish confirms the
-/// recorded release instead of failing on the archive it no longer holds.
-#[tokio::test]
-async fn rerunning_a_publish_from_staged_archives_confirms_the_recorded_release() {
-    let record = json!({
-        "schema": pnpm_release_record::RECORD_SCHEMA,
-        "variants": [
-            { "tag": "linux-x64", "inputs": { "archive": { "integrity": "sha512-bGludXg=" } } },
-        ],
-    });
-    let rerun = rerun_from_staged_variant(Some(record)).await;
-    assert!(rerun.is_ok(), "{rerun:?}");
-    let unrecorded = rerun_from_staged_variant(None).await;
-    assert!(matches!(unrecorded, Err(PublishPackedPkgError::NotStaged { .. })), "{unrecorded:?}");
 }

@@ -1,24 +1,43 @@
-//! Split the snapshots this install materializes into the warm batch —
-//! already in the CAFS, so the prefetch covered them — and the cold
+//! Split the snapshots this install materializes into the warm batch
+//! (already in the CAFS, so the prefetch covered them) and the cold
 //! batch that still needs downloading, and collect the store-index rows
 //! later phases read.
 //!
 //! Runs immediately after the prefetch, whose results it consumes.
 
 use super::{
-    PackageBins, PackageManifests, RemoteSideEffectsQuarantineBySnapshot, RequiresBuildBySnapshot,
-    SideEffectsBySnapshot, SideEffectsMapsBySnapshot, SnapshotWithCacheKey,
-    StoreIndexKeysBySnapshot, WantedEntries, snapshot_needs_build_marker,
+    PackageBins,
+    PackageManifests,
+    RemoteSideEffectsQuarantineBySnapshot,
+    RequiresBuildBySnapshot,
+    SideEffectsBySnapshot,
+    SideEffectsMapsBySnapshot,
+    SnapshotWithCacheKey,
+    StoreIndexKeysBySnapshot,
+    WantedEntries,
+    snapshot_needs_build_marker,
 };
 use crate::AllowBuildPolicy;
-use pnpm_config::{Config, NodeLinker};
-use pnpm_lockfile::{PackageKey, ProjectSnapshot, SnapshotEntry};
+use pnpm_config::{
+    Config,
+    NodeLinker,
+};
+use pnpm_lockfile::{
+    PackageKey,
+    ProjectSnapshot,
+    SnapshotEntry,
+};
 use pnpm_store_dir::StoreIndexWriter;
 use pnpm_tarball::PrefetchResult;
-use std::collections::{HashMap, HashSet};
+use std::collections::{
+    HashMap,
+    HashSet,
+};
+
+mod empty_builds;
 
 /// One warm entry: the snapshot, its prefetched CAS paths, the cache key
-/// that found them, and whether its slot needs a build marker.
+/// that found them, and whether a build or a patch writes the package.
 pub(super) type WarmEntry<'a> =
     (&'a PackageKey, &'a SnapshotEntry, &'a std::sync::Arc<pnpm_fs::CasPaths>, &'a str, bool);
 
@@ -42,11 +61,13 @@ pub(super) struct PartitionSideEffects {
 
 #[derive(Clone, Copy)]
 pub(super) struct PartitionSideEffectsContext<'a> {
-    pub config: &'static Config,
+    pub config: &'a Config,
     pub wanted: WantedEntries<'a>,
     pub allow_build_policy: &'a AllowBuildPolicy,
     pub store_index_writer: &'a std::sync::Arc<StoreIndexWriter>,
     pub importers: &'a HashMap<String, ProjectSnapshot>,
+    /// The platforms the install links, with the CLI's overrides.
+    pub supported_architectures: Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
 }
 
 impl PartitionSideEffects {
@@ -70,9 +91,9 @@ impl PartitionSideEffects {
         // Peer-variants of the same package share the same store-index
         // row → the same `Arc<_>`. Cheap to share.
         if !rebuilds.requires(snapshot_key)
-            && let Some(maps) = prefetch.side_effects_maps.get(cache_key)
+            && let Some(maps) = empty_builds::restorable_overlays(cache_key, prefetch, rebuilds)
         {
-            self.maps.insert(snapshot_key.clone(), std::sync::Arc::clone(maps));
+            self.maps.insert(snapshot_key.clone(), maps);
         }
         if let Some(diffs) = prefetch.side_effects.get(cache_key) {
             self.diffs.insert(snapshot_key.clone(), std::sync::Arc::clone(diffs));
@@ -102,12 +123,12 @@ impl Partition<'_> {
                 store_index_keys_by_snapshot: &self.side_effects.store_index_keys,
             },
             config: ctx.config,
-            snapshots: ctx.wanted.snapshots,
-            packages: ctx.wanted.packages,
+            wanted: (ctx.wanted.snapshots, ctx.wanted.packages),
             requires_build_by_snapshot: &self.requires_build_by_snapshot,
             allow_build_policy: ctx.allow_build_policy,
             side_effects_maps_by_snapshot: &mut self.side_effects.maps,
             store_index_writer: ctx.store_index_writer,
+            supported_architectures: ctx.supported_architectures,
         };
         crate::shared_side_effects::prepare_shared_side_effects(&mut options, ctx.importers).await
     }
@@ -127,12 +148,12 @@ impl Partition<'_> {
                     store_index_keys_by_snapshot: &self.side_effects.store_index_keys,
                 },
                 config: ctx.config,
-                snapshots: ctx.wanted.snapshots,
-                packages: ctx.wanted.packages,
+                wanted: (ctx.wanted.snapshots, ctx.wanted.packages),
                 requires_build_by_snapshot: &self.requires_build_by_snapshot,
                 allow_build_policy: ctx.allow_build_policy,
                 side_effects_maps_by_snapshot: &mut self.side_effects.maps,
                 store_index_writer: ctx.store_index_writer,
+                supported_architectures: ctx.supported_architectures,
             },
             ctx.importers,
         )
@@ -166,7 +187,7 @@ impl Partition<'_> {
 /// scripts on every warm reinstall.
 ///
 /// `rebuilds` withholds the side-effects row of a snapshot that must be
-/// built afresh — keeping the row would let the `is_built` gate skip the
+/// built afresh, keeping the row would let the `is_built` gate skip the
 /// very build that is asked for.
 pub(super) fn partition_snapshots<'a>(
     snapshot_entries: &'a [SnapshotWithCacheKey<'a>],
@@ -178,7 +199,7 @@ pub(super) fn partition_snapshots<'a>(
     // The warm batch runs on rayon rather than per-snapshot tokio
     // futures. Profiled at 1352 prefetched / 0 cold on a 10-core Mac:
     // each future's sync `rayon::join` pinned a tokio worker and
-    // saturated the pool, so `sum-of-link ~= wall` — effectively 1x
+    // saturated the pool, so `sum-of-link ~= wall`, effectively 1x
     // parallelism. One `par_iter` over every snapshot lets the pool
     // work-steal across all of them; wall dropped ~10 s to ~6.5 s.
     //
@@ -220,20 +241,31 @@ pub(super) fn partition_snapshots<'a>(
 
 /// The snapshots whose cached build output the partition withholds.
 pub(super) struct Rebuilds<'a> {
-    /// The slots whose global-virtual-store build marker says they must
-    /// be rebuilt.
-    pub markers: &'a HashSet<PackageKey>,
     /// Consulted for the packages `sideEffectsCache.exclude` names.
     pub allow_build_policy: &'a AllowBuildPolicy,
     /// Pre-verified `requiresBuild` answers from resolution metadata.
     pub known_requires_build: Option<&'a RequiresBuildBySnapshot>,
     /// Precalculated bin commands and shebang runtimes from resolution metadata.
     pub known_bins: Option<&'a PackageBins>,
+    pub empty_builds: EmptyBuilds,
+}
+
+/// What to do with a side-effects cache row whose build changed no files in
+/// its package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyBuilds {
+    /// Run the build again, so a script whose effect lands outside its
+    /// package runs in every project (pnpm/pnpm#14717).
+    Rerun,
+    /// Restore the package from its own files without running the build.
+    /// The loaded linker uses this and leaves scripts with outside effects
+    /// to `sideEffectsCache.exclude`.
+    Restore,
 }
 
 impl Rebuilds<'_> {
     fn requires(&self, snapshot_key: &PackageKey) -> bool {
-        self.markers.contains(snapshot_key) || !self.allow_build_policy.caches_build(snapshot_key)
+        !self.allow_build_policy.caches_build(snapshot_key)
     }
 }
 
@@ -295,7 +327,10 @@ impl IndexRows {
         rebuilds: &Rebuilds<'_>,
         seed_known_requires_build: bool,
     ) {
-        if self.requires_build_by_snapshot.get(snapshot_key) != Some(&false)
+        if self.requires_build_by_snapshot
+            .get(snapshot_key)
+            .copied()
+            .unwrap_or(true)
             || (!seed_known_requires_build && rebuilds.known_bins.is_none())
         {
             return;

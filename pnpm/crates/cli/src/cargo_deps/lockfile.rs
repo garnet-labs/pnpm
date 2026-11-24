@@ -1,10 +1,32 @@
 use super::{
-    Arc, BTreeMap, BTreeSet, CargoLockfilePolicy, CargoResolveOptions, CargoWorkspaceMetadata,
-    Command, Config, FromStr, GitPackage, GitSource, IntoDiagnostic, Path, PathBuf, PnprClient,
-    Result, StreamExt, ThrottledClient, TryStreamExt, WORKSPACE_INSTALL_CONCURRENCY,
-    fetch_sparse_index, fs, stream,
+    Arc,
+    BTreeMap,
+    BTreeSet,
+    CargoLockfilePolicy,
+    CargoResolveOptions,
+    CargoWorkspaceMetadata,
+    Command,
+    Config,
+    FromStr,
+    GitPackage,
+    GitSource,
+    IntoDiagnostic,
+    Path,
+    PathBuf,
+    PnprClient,
+    Result,
+    StreamExt,
+    ThrottledClient,
+    TryStreamExt,
+    WORKSPACE_INSTALL_CONCURRENCY,
+    fetch_sparse_index,
+    fs,
+    stream,
 };
 use miette::WrapErr;
+use path_packages::with_path_packages;
+
+mod path_packages;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LockedCrate {
@@ -141,7 +163,10 @@ pub(super) async fn discover_workspace_roots(
 /// Fail a frozen install when an existing `Cargo.lock` does not satisfy the
 /// dependencies its workspace declares. An absent lockfile is left to
 /// [`read_or_resolve_lockfile`].
-pub(super) fn verify_existing_lockfile(workspace: &DiscoveredWorkspace) -> Result<()> {
+pub(super) async fn verify_existing_lockfile(
+    workspace: &DiscoveredWorkspace,
+    checkout: Option<&Path>,
+) -> Result<()> {
     let path = workspace.root.join("Cargo.lock");
     let lockfile = match fs::read_to_string(&path) {
         Ok(lockfile) => lockfile,
@@ -152,7 +177,9 @@ pub(super) fn verify_existing_lockfile(workspace: &DiscoveredWorkspace) -> Resul
                 .wrap_err_with(|| format!("read {}", path.display()));
         }
     };
-    pnpm_cargo_resolver::verify_lockfile(&workspace.metadata, &lockfile)
+    let cargo = super::toolchain::program("cargo", &workspace.root, checkout);
+    let metadata = with_path_packages(&workspace.metadata, &cargo).await?;
+    pnpm_cargo_resolver::verify_lockfile(&metadata, &lockfile)
         .wrap_err_with(|| {
             format!("{} is out of date, but --frozen-lockfile forbids updating it", path.display())
         })
@@ -189,19 +216,29 @@ pub(super) async fn read_or_resolve_lockfile(
             "Cargo.lock is absent, but --frozen-lockfile forbids generating it"
         ));
     }
+    let preferred_versions = read_cargo_lock_preferences(config, cargo_lock_path, lockfile_policy)?;
     let metadata = read_cargo_metadata(root_dir, checkout).await?;
     let source_overrides = super::resolution::has_source_overrides(root_dir)?;
     let git_dependencies = super::resolution::has_git_dependencies(&metadata)?;
     if source_overrides || git_dependencies {
-        return super::resolution::resolve_with_cargo(config, root_dir, checkout).await;
+        return super::resolution::resolve_with_cargo(config, root_dir, checkout, lockfile_policy)
+            .await;
     }
-    if let Some(lockfile) = resolve_via_pnpr(config, &metadata).await? {
+    if let Some(lockfile) =
+        resolve_via_pnpr_with_preferences(config, &metadata, &preferred_versions).await?
+    {
         return Ok(lockfile);
     }
-    let index_files = fetch_sparse_index(config, &metadata, http_client).await?;
+    let index_files =
+        fetch_sparse_index(config, &metadata, &preferred_versions, http_client).await?;
     let source = pnpm_cargo_resolver::registry_source(config.cargo_index_url());
-    let lockfile = pnpm_cargo_resolver::resolve_lockfile(&metadata, &index_files, &source)
-        .wrap_err("resolve Cargo dependencies")?;
+    let lockfile = pnpm_cargo_resolver::resolve_lockfile_with_preferences(
+        &metadata,
+        &index_files,
+        &source,
+        &preferred_versions,
+    )
+    .wrap_err("resolve Cargo dependencies")?;
     Ok(lockfile)
 }
 
@@ -209,10 +246,15 @@ pub(super) async fn read_or_resolve_lockfile(
 /// index server-side instead of making this client fetch one index file
 /// per crate in the graph.
 ///
-/// `None` when there is no server to ask, or when the one configured
-/// resolves npm alone: a server that does not serve Cargo resolution
-/// means a local resolve, not a failed install.
-pub(super) async fn resolve_via_pnpr(config: &Config, metadata: &str) -> Result<Option<String>> {
+/// `None` when there is no server to ask, when the one configured
+/// resolves npm alone, or when it refuses the request as one it cannot
+/// handle: a server that does not serve this Cargo resolution means a
+/// local resolve, not a failed install.
+pub(super) async fn resolve_via_pnpr_with_preferences(
+    config: &Config,
+    metadata: &str,
+    preferred_versions: &BTreeMap<String, Vec<String>>,
+) -> Result<Option<String>> {
     let Some(pnpr_server) = config.pnpr_server.as_deref().filter(|_| !config.offline) else {
         return Ok(None);
     };
@@ -227,20 +269,68 @@ pub(super) async fn resolve_via_pnpr(config: &Config, metadata: &str) -> Result<
     // use for.
     let metadata = pnpm_cargo_resolver::resolve_inputs(metadata)
         .wrap_err("reduce cargo metadata for the pnpr server")?;
-    client
-        .resolve_cargo(CargoResolveOptions {
-            metadata,
-            registry: config.cargo_index_url().to_string(),
-            authorization: config.auth_headers.for_url(pnpr_server),
-        })
-        .await
+    let resolved = client.resolve_cargo(CargoResolveOptions {
+        metadata,
+        preferred_versions: preferred_versions.clone(),
+        registry: config.cargo_index_url().to_string(),
+        authorization: config.auth_headers.for_secure_url(pnpr_server),
+    })
+    .await;
+    match resolved {
+        Err(error) if error.is_unsupported_request() => Ok(None),
+        resolved => resolved
+            .into_diagnostic()
+            .wrap_err("resolve Cargo dependencies through the pnpr server")
+            .map(Some),
+    }
+}
+
+/// The registry versions `Cargo.lock` records, by crate name, for the
+/// resolver to keep, from the registries the configured Cargo index serves.
+/// Empty when `lockfile_policy` resolves afresh.
+fn read_cargo_lock_preferences(
+    config: &Config,
+    path: &Path,
+    lockfile_policy: CargoLockfilePolicy,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    if lockfile_policy == CargoLockfilePolicy::Resolve {
+        return Ok(BTreeMap::new());
+    }
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("read {}", path.display()));
+        }
+    };
+    let lockfile = cargo_lock::Lockfile::from_str(&contents)
         .into_diagnostic()
-        .wrap_err("resolve Cargo dependencies through the pnpr server")
-        .map(Some)
+        .wrap_err_with(|| format!("parse {}", path.display()))?;
+    let source = pnpm_cargo_resolver::registry_source(config.cargo_index_url());
+    let mut preferences = BTreeMap::<String, Vec<String>>::new();
+    for package in lockfile.packages {
+        if package.source
+            .as_ref()
+            .is_some_and(|locked| {
+                locked.is_registry()
+                    && pnpm_cargo_resolver::serves_registry(&source, &locked.to_string())
+            })
+        {
+            preferences
+                .entry(package.name.as_str().to_string())
+                .or_default()
+                .push(package.version.to_string());
+        }
+    }
+    Ok(preferences)
 }
 
 async fn read_cargo_metadata(root_dir: &Path, checkout: Option<&Path>) -> Result<String> {
-    read_cargo_metadata_for_manifest(&root_dir.join("Cargo.toml"), checkout).await
+    let document = read_cargo_metadata_for_manifest(&root_dir.join("Cargo.toml"), checkout).await?;
+    let cargo = super::toolchain::program("cargo", root_dir, checkout);
+    with_path_packages(&document, &cargo).await
 }
 
 async fn read_cargo_metadata_for_manifest(
@@ -252,6 +342,11 @@ async fn read_cargo_metadata_for_manifest(
         manifest_path.parent().unwrap_or(manifest_path),
         checkout,
     );
+    run_cargo_metadata(cargo, manifest_path).await
+}
+
+/// `cargo metadata --no-deps` for `manifest_path`, run with `cargo`.
+async fn run_cargo_metadata(cargo: PathBuf, manifest_path: &Path) -> Result<String> {
     let manifest_path = manifest_path.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(cargo)

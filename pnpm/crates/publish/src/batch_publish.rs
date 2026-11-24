@@ -1,27 +1,52 @@
 //! Publish several packed packages through pnpr's atomic batch endpoint.
 
-use pnpm_diagnostics::miette::{self, Diagnostic};
-use pnpm_network_web_auth::{Host as WebAuthHost, WithOtpError};
+use pnpm_diagnostics::miette::{
+    self,
+    Diagnostic,
+};
+use pnpm_network_web_auth::{
+    Host as WebAuthHost,
+    WithOtpError,
+};
 use pnpm_reporter::Reporter;
 use serde_json::Value;
 
 use crate::{
     PublishFailure,
     failed_to_publish_error::FailedToPublishError,
-    global_log::{global_info, global_warn},
+    global_log::{
+        global_info,
+        global_warn,
+    },
     publish_options::{
-        PublishUnsupportedRegistryProtocolError, find_registry_info, resolve_access,
+        PublishUnsupportedRegistryProtocolError,
+        find_registry_info,
+        resolve_access,
     },
     publish_packed_pkg::{
-        DistHashes, PackedPkg, PublishHttpError, PublishNetwork, PublishPackedPkgError,
-        PublishPackedPkgOptions, build_publish_document, join_registry, publish_with_otp_handling,
-        registry_for_display, web_auth_fetch_options,
+        DistHashes,
+        PackedPkg,
+        PublishHttpError,
+        PublishNetwork,
+        PublishPackedPkgError,
+        PublishPackedPkgOptions,
+        build_publish_document,
+        join_registry,
+        publish_with_otp_handling,
+        registry_for_display,
+        web_auth_fetch_options,
     },
     publish_summary::PublishSummary,
-    publish_wait::{PublishWaitError, wait_for_published_packages},
+    publish_wait::{
+        PublishWaitError,
+        wait_for_published_packages,
+    },
     registry_config_keys::NormalizedRegistryUrl,
     staged_archives::{
-        MAX_STAGED_ARCHIVES_PER_PUBLISH, StagedArchive, StagingError, reference_staged_archive,
+        MAX_STAGED_ARCHIVES_PER_PUBLISH,
+        StagedArchive,
+        StagingError,
+        reference_staged_archive,
         stage_archives,
     },
 };
@@ -65,7 +90,7 @@ pub fn validate_batch_publish_options(
     if opts.stage {
         return Err(BatchPublishError::Stage);
     }
-    if opts.registry.provenance == Some(true) {
+    if opts.registry.provenance.unwrap_or(false) {
         return Err(BatchPublishError::Provenance);
     }
     Ok(())
@@ -140,10 +165,10 @@ async fn publish_group<Reporter: self::Reporter>(
 ) -> Result<(), BatchPublishError> {
     let registry = registry_for_display(&group.registry);
     for &summary_index in &group.summary_indexes {
-        global_info::<Reporter>(&format!("📦 {} → {registry}", summaries[summary_index].id));
+        global_info::<Reporter>(format!("📦 {} → {registry}", summaries[summary_index].id));
     }
     if opts.dry_run {
-        global_warn::<Reporter>(&format!(
+        global_warn::<Reporter>(format!(
             "Skip publishing {} package(s) to {registry} (dry run)",
             group.documents.len(),
         ));
@@ -152,13 +177,13 @@ async fn publish_group<Reporter: self::Reporter>(
     if let Some(archives) = &group.staged {
         let uploaded =
             stage_archives(network.client, &group.registry, authorization, archives).await?;
-        global_info::<Reporter>(&format!(
+        global_info::<Reporter>(format!(
             "Uploaded {uploaded} of {} archive(s) to {registry} ahead of the publish",
             archives.len(),
         ));
     }
     put_batch::<Reporter>(group, authorization, opts, network, &registry).await?;
-    global_info::<Reporter>(&format!(
+    global_info::<Reporter>(format!(
         "✅ Published {} package(s) to {registry} in a single request",
         group.summary_indexes.len(),
     ));
@@ -184,16 +209,6 @@ async fn wait_for_group<Reporter: self::Reporter>(
 
 /// Summarize one packed package and fold it into the group of everything
 /// bound for the same registry.
-/// Refuse a package a batch cannot send yet: one with platform variants,
-/// without an `any` archive, or with an `any` archive another job staged,
-/// whose bytes the batch does not have.
-fn check_single_archive(package: &PackedPkg<'_>) -> Result<(), BatchPublishError> {
-    if package.publishes_staged_archives() || !package.has_any_archive() {
-        return Err(BatchPublishError::Variants);
-    }
-    Ok(())
-}
-
 fn group_packed_pkg<'a>(
     package: &PackedPkg<'a>,
     opts: &PublishPackedPkgOptions,
@@ -211,13 +226,12 @@ fn group_packed_pkg<'a>(
         &opts.registry.scoped,
         crate::publish_options::publish_config_registry(manifest, name),
     )?;
-    check_single_archive(package)?;
     let summary = package.summary();
     let mut document = build_publish_document(
         manifest,
         package.tarball_data,
         &registry,
-        resolve_access(opts.registry.access, manifest),
+        resolve_access(opts.registry.access.as_deref(), manifest).as_deref(),
         &opts.registry.tag,
         &DistHashes { integrity: &summary.integrity, shasum: &summary.shasum },
     )?;
@@ -332,13 +346,6 @@ pub enum BatchPublishError {
     #[display("Staged publishing cannot be combined with --batch")]
     #[diagnostic(code(ERR_PNPM_BATCH_PUBLISH_NO_STAGE))]
     Stage,
-
-    #[display("pnpm cannot publish platform variants with --batch yet")]
-    #[diagnostic(
-        code(ERR_PNPM_BATCH_PUBLISH_NO_VARIANTS),
-        help("Publish a package that declares publishConfig.variants without --batch.")
-    )]
-    Variants,
 
     #[display("Provenance statements cannot be generated when publishing with --batch")]
     #[diagnostic(

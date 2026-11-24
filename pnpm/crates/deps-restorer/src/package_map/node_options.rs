@@ -1,6 +1,9 @@
 use super::PACKAGE_MAP_FILENAME;
 use pnpm_config::Config;
-use std::path::{Path, PathBuf};
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 pub fn make_node_package_map_option(package_map_path: &Path, node_options: Option<&str>) -> String {
     let node_options = node_options
@@ -32,20 +35,35 @@ pub fn package_map_path_for_execution(config: &Config, dir: &Path) -> Option<Pat
     if !config.node_package_map_mode.loads() {
         return None;
     }
-    // Installs write the map under the configured modules dir, so detect it
-    // by that dir's basename rather than the hard-coded `node_modules`.
+    if config.lockfile_dir.is_some() {
+        let path = config.modules_dir.join(PACKAGE_MAP_FILENAME);
+        return path.is_file().then_some(path);
+    }
     let modules_dir_name = config.modules_dir_name();
+    find_execution_file(config, dir, &Path::new(modules_dir_name).join(PACKAGE_MAP_FILENAME))
+}
+
+pub(crate) fn find_execution_file(
+    config: &Config,
+    dir: &Path,
+    relative_path: &Path,
+) -> Option<PathBuf> {
+    if let Some(lockfile_dir) = &config.lockfile_dir {
+        let path = lockfile_dir.join(relative_path);
+        return path.is_file().then_some(path);
+    }
     let workspace_path = config.workspace_dir
         .as_ref()
-        .map(|dir| dir.join(modules_dir_name).join(PACKAGE_MAP_FILENAME));
+        .map(|dir| dir.join(relative_path));
     if let Some(path) = workspace_path
-        && path.exists()
+        && path.is_file()
     {
         return Some(path);
     }
-    let path = dir.join(modules_dir_name).join(PACKAGE_MAP_FILENAME);
-    path.exists().then_some(path)
+    let path = dir.join(relative_path);
+    path.is_file().then_some(path)
 }
+
 pub(super) fn remove_node_package_map_option(node_options: &str) -> Vec<String> {
     let tokens = split_node_options(node_options);
     let mut retained = Vec::new();
@@ -74,7 +92,7 @@ pub(super) fn split_node_options(node_options: &str) -> Vec<String> {
     tokenizer.finish()
 }
 /// Node's `NODE_OPTIONS` tokenizer: whitespace separates tokens, `'`
-/// and `"` quote, and `\` escapes the next character anywhere — so an
+/// and `"` quote, and `\` escapes the next character anywhere, so an
 /// escaped quote does not end a token. The literal text (backslash
 /// included) is preserved so retained tokens round-trip verbatim.
 #[derive(Default)]

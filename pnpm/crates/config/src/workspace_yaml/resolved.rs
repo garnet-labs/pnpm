@@ -1,7 +1,20 @@
 use super::{
-    AllowBuild, Config, MachineSettings, MacosBackupSettings, NodePackageMapSettings,
-    PackageConfigsSetting, PackagePermissions, PnpmfileSetting, SkillsSettings, TrustedSettings,
-    WorkspaceSettings, as_set, global_shims_setting, opt_path, path, side_effects_cache_setting,
+    AllowBuild,
+    Config,
+    MachineSettings,
+    MacosBackupSettings,
+    NodePackageMapSettings,
+    PackageConfigsSetting,
+    PackagePermissions,
+    PnpmfileSetting,
+    SkillsSettings,
+    TrustedSettings,
+    WorkspaceSettings,
+    as_set,
+    global_shims_setting,
+    opt_path,
+    path,
+    side_effects_cache_setting,
 };
 use indexmap::IndexMap;
 
@@ -41,6 +54,10 @@ impl MachineSettings {
                     .map(|dir| path(dir))
                     .collect(),
             ),
+            global_packages_config: config.global_packages_config
+                .as_deref()
+                .cloned()
+                .map(Box::new),
         }
     }
 }
@@ -52,7 +69,7 @@ impl WorkspaceSettings {
     ///
     /// The inverse of [`Self::apply_to`]: applying the result to a default
     /// [`Config`] reproduces `config`'s settings. Defaults are therefore
-    /// present as values, not as `None` — `None` here means "pnpm has no
+    /// present as values, not as `None`. `None` here means "pnpm has no
     /// such setting to report", which is true of exactly two groups:
     ///
     /// - Keys that name a shape only a file has, whose resolved form
@@ -147,6 +164,7 @@ impl WorkspaceSettings {
 
             frozen_lockfile: config.frozen_lockfile,
             provenance: config.provenance,
+            access: config.access.clone(),
             git_branch_lockfile: Some(config.use_git_branch_lockfile),
             registry: Some(config.registry.clone()),
             pnpr_server: config.pnpr_server.clone(),
@@ -201,6 +219,7 @@ impl WorkspaceSettings {
             minimum_release_age_ignore_missing_time: Some(
                 config.minimum_release_age_ignore_missing_time,
             ),
+            reference_time: config.reference_time.map(|time| time.to_string()),
             minimum_release_age_strict: config.minimum_release_age_strict,
             trust_lockfile: Some(config.trust_lockfile),
             trust_policy: Some(config.trust_policy),

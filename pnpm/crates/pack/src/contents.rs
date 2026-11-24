@@ -1,6 +1,14 @@
 use super::{
-    FsFileLen, HashSet, PackError, PackOptions, Path, PathBuf, Value, collation::en_collator,
-    get_bins_from_package_manifest, is_manifest_entry,
+    FsFileLen,
+    HashSet,
+    PackError,
+    PackOptions,
+    Path,
+    PathBuf,
+    Value,
+    collation::en_collator,
+    get_bins_from_package_manifest,
+    is_manifest_entry,
 };
 
 /// Map each packed path to `package/<path>` → absolute source, in
@@ -47,7 +55,7 @@ pub(super) fn inject_workspace_license(
     files_map: &mut indexmap::IndexMap<String, PathBuf>,
 ) {
     let Some(workspace_dir) = &opts.workspace_dir else { return };
-    if dir == workspace_dir || files_map.values().any(|file| contains_license(file)) {
+    if dir == workspace_dir || files_map.keys().any(|entry| is_package_license(entry)) {
         return;
     }
     let Ok(entries) = std::fs::read_dir(workspace_dir) else { return };
@@ -63,7 +71,7 @@ pub(super) fn inject_workspace_license(
         // fail the later read/size pass with "Is a directory", and a
         // symlink could point outside the workspace and leak its target's
         // bytes into the published tarball. `DirEntry::file_type` does not
-        // follow symlinks, so `is_file()` rejects both — matching the
+        // follow symlinks, so `is_file()` rejects both, matching the
         // symlink-skipping `read_readme_file` does in `exportable-manifest`.
         if entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
             files_map.insert(format!("package/{name}"), workspace_dir.join(&name));
@@ -77,6 +85,7 @@ pub(super) fn inject_workspace_license(
 pub(super) fn unpacked_size<Sys: FsFileLen>(
     files_map: &indexmap::IndexMap<String, PathBuf>,
     manifest_json_len: u64,
+    injected_files: &[(String, Vec<u8>)],
 ) -> Result<u64, PackError> {
     let mut total = 0u64;
     for (name, source) in files_map {
@@ -89,6 +98,9 @@ pub(super) fn unpacked_size<Sys: FsFileLen>(
                     source: source_err,
                 })?
         };
+    }
+    for (_, bytes) in injected_files {
+        total += bytes.len() as u64;
     }
     Ok(total)
 }
@@ -142,18 +154,27 @@ pub fn sort_paths_en_locale(paths: &mut [String]) {
     paths.sort_by(|left, right| collator.compare(left, right));
 }
 
-/// Whether a packed path looks like a license file, matching upstream's
-/// anchored `/(?:^|[\\/])LICEN[CS]E(?:\..+)?$/i` presence test.
-fn contains_license(path: &Path) -> bool {
-    if let Some(file_name) = path.file_name() {
-        return is_license_filename(&file_name.to_string_lossy());
+/// Whether a `package/<path>` entry is the package's own license. A
+/// `LICENSE` or `LICENCE` name counts at any depth. A `COPYING` name counts
+/// only at the package root, since nested names such as `src/copying.c` are
+/// often source files.
+fn is_package_license(entry: &str) -> bool {
+    let path = entry.strip_prefix("package/").unwrap_or(entry);
+    match path.rsplit_once('/') {
+        Some((_, name)) => is_licence_or_license_filename(name),
+        None => is_license_filename(path),
     }
-    false
 }
 
-/// Whether a root filename matches the `LICEN{S,C}E{,.*}` glob pnpm
-/// uses to find a workspace-root license to inject.
+/// Whether a root filename is a `LICENSE`, `LICENCE`, or `COPYING` file,
+/// with or without an extension.
 fn is_license_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    is_licence_or_license_filename(&lower) || lower == "copying" || lower.starts_with("copying.")
+}
+
+/// Whether a filename matches `LICEN{S,C}E{,.*}`, case-insensitively.
+fn is_licence_or_license_filename(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(lower.as_str(), "license" | "licence")
         || lower.starts_with("license.")

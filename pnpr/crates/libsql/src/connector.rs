@@ -6,11 +6,17 @@
 use http_0_2::Uri;
 use hyper_0_14::client::{
     HttpConnector,
-    connect::{Connected, Connection},
+    connect::{
+        Connected,
+        Connection,
+    },
 };
 use libsql::Error as LibsqlError;
 use pnpm_network::is_url_secure_for_credentials;
-use rustls::{ClientConfig, pki_types::ServerName};
+use rustls::{
+    ClientConfig,
+    pki_types::ServerName,
+};
 use rustls_platform_verifier::BuilderVerifierExt;
 use std::{
     error::Error as StdError,
@@ -19,17 +25,33 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
     },
-    task::{Context, Poll},
+    task::{
+        Context,
+        Poll,
+    },
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{
+        AsyncRead,
+        AsyncWrite,
+        ReadBuf,
+    },
     net::TcpStream,
 };
-use tokio_rustls::{TlsConnector, client::TlsStream};
-use tower_0_4::{Service, ServiceExt};
+use tokio_rustls::{
+    TlsConnector,
+    client::TlsStream,
+};
+use tower_0_4::{
+    Service,
+    ServiceExt,
+};
 
 /// How long one TCP dial may take. Without it a dropped SYN waits out the
 /// kernel's retransmissions, about two minutes on Linux.
@@ -82,7 +104,8 @@ impl LibsqlConnector {
         let config = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .and_then(BuilderVerifierExt::with_platform_verifier)
-            .map_err(|error| LibsqlError::InvalidTlsConfiguration(io::Error::other(error)))?
+            .map_err(io::Error::other)
+            .map_err(LibsqlError::InvalidTlsConfiguration)?
             .with_no_client_auth();
         Ok(Self::new(config))
     }
@@ -185,10 +208,18 @@ where
             Ok(stream) => return Ok(stream),
             Err(error) => error.into(),
         };
+        let target = pnpr_config::redact_connection_url(&uri.to_string());
+        let cause = std::iter::successors(Some(&*error as &(dyn StdError + 'static)), |&error| {
+            error.source()
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+        let cause = pnpr_error::redact_url_credentials(&cause);
         if !retries_timed_out_dials.load(Ordering::Relaxed) || !is_timeout(&*error) {
-            return Err(error);
+            return Err(cause.into());
         }
-        tracing::warn!(host = uri.host(), %error, ?delay, "libSQL database dial timed out, retrying");
+        tracing::warn!(%target, error = %cause, ?delay, "libSQL database dial timed out, retrying");
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(MAX_DIAL_RETRY_DELAY);
     }

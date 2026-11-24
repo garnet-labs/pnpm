@@ -1,16 +1,34 @@
+use command_extra::CommandExtra;
 use pnpr_fixtures::read_packument;
 
 use super::{
-    BenchId, HyperfineCommand, LINKED_WORKSPACE_DEPTH, LINKED_WORKSPACE_WIDTH, PEER_HEAVY_DEPTH,
-    PEER_HEAVY_PROVIDER, PEER_HEAVY_WIDTH, WorkEnv, collect_pnpr_direct_ratios,
-    create_generated_projects, create_install_script, create_package_json, create_pnpm_workspace,
+    BenchId,
+    HyperfineCommand,
+    LINKED_WORKSPACE_DEPTH,
+    LINKED_WORKSPACE_WIDTH,
+    PEER_HEAVY_DEPTH,
+    PEER_HEAVY_PROVIDER,
+    PEER_HEAVY_WIDTH,
+    WorkEnv,
+    collect_pnpr_direct_ratios,
+    create_generated_projects,
+    create_install_script,
+    create_package_json,
+    create_pnpm_workspace,
     fixtures::peer_heavy_package_name,
     may_create_lockfile,
     measurements::PhaseEvent,
-    non_trivial_cold_batch, read_phase_events, render_diagnostics_markdown,
-    requires_fresh_pnpr_cold_batch_metrics, seed_peer_heavy_registry,
+    non_trivial_cold_batch,
+    pnpr_restart::PnprRestartListener,
+    read_phase_events,
+    registries_home::RegistriesHome,
+    render_diagnostics_markdown,
+    requires_fresh_pnpr_cold_batch_metrics,
+    seed_peer_heavy_registry,
     server_config::{
-        cold_mock_config_yaml, pnpr_auth_config_key, pnpr_benchmark_config_yaml,
+        cold_mock_config_yaml,
+        pnpr_auth_config_key,
+        pnpr_benchmark_config_yaml,
         serves_npm_under_base_path,
     },
     summarize_phase_events,
@@ -20,10 +38,20 @@ use pnpm_lockfile::Lockfile;
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::{
+        Read,
+        Write,
+    },
     net::TcpListener,
+    panic::{
+        self,
+        AssertUnwindSafe,
+    },
     path::Path,
+    process::ExitStatus,
+    sync::Mutex,
     thread,
+    time::Duration,
 };
 
 #[test]
@@ -97,7 +125,7 @@ fn peer_heavy_scenario_generates_shared_subgraph_root() {
     create_pnpm_workspace(
         &dir,
         None,
-        "http://localhost:4873/",
+        "http://localhost:4873/".to_owned(),
         BenchmarkScenario::IsolatedPeerHeavyResolveHotCacheOffline,
     );
     create_install_script(
@@ -115,7 +143,7 @@ fn peer_heavy_scenario_generates_shared_subgraph_root() {
         fs::read_to_string(dir.join("pnpm-workspace.yaml")).expect("read generated workspace");
     let prewarm = fs::read_to_string(dir.join("prewarm.bash")).expect("read prewarm script");
     let registry = dir.join("registry");
-    seed_peer_heavy_registry(&pnpr_fixtures::metadata_path(&registry));
+    seed_peer_heavy_registry(pnpr_fixtures::database_path(&registry));
     let first_packument = read_packument(&registry, &peer_heavy_package_name(0, 0));
     let leaf_packument =
         read_packument(&registry, &peer_heavy_package_name(PEER_HEAVY_DEPTH - 1, 0));
@@ -164,7 +192,7 @@ fn linked_workspace_scenario_generates_a_shared_link_graph() {
 
     create_package_json(&dir, None, scenario);
     super::linked_workspace::create_projects(&dir);
-    create_pnpm_workspace(&dir, None, "http://localhost:4873/", scenario);
+    create_pnpm_workspace(&dir, None, "http://localhost:4873/".to_owned(), scenario);
 
     let root: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.join("package.json")).expect("read root manifest"))
@@ -295,10 +323,7 @@ fn phase_summary_reports_partition_and_means() {
     assert_eq!(partition.cold, 9);
     assert_eq!(summary.create_virtual_store_mean_ms, Some(150.0));
     assert_eq!(summary.link_slots[0].batch, "cold");
-    #[expect(clippy::float_cmp, reason = "deterministic mean of fixed fixture inputs is exact")]
-    {
-        assert_eq!(summary.link_slots[0].mean_ms, 30.0);
-    }
+    assert_eq!(summary.link_slots[0].mean_ms, 30.0);
 }
 
 fn peer_heavy_diagnostics(pacquet: (f64, f64), pnpm: (f64, f64)) -> super::BenchmarkDiagnostics {
@@ -381,10 +406,7 @@ fn pnpr_direct_ratios_pair_matching_revisions() {
 
     assert_eq!(ratios.len(), 1);
     assert_eq!(ratios[0].revision, "HEAD");
-    #[expect(clippy::float_cmp, reason = "deterministic ratio of fixed fixture inputs is exact")]
-    {
-        assert_eq!(ratios[0].ratio, 0.8);
-    }
+    assert_eq!(ratios[0].ratio, 0.8);
 }
 
 #[test]
@@ -415,20 +437,27 @@ fn pnpr_benchmark_config_declares_local_registry_public() {
     let yaml = pnpr_benchmark_config_yaml(
         &storage,
         &["http://localhost:4873/", "http://127.0.0.1:61824/"],
+        serde_json::json!({"users": {"file": "users.json", "maxUsers": -1}}),
+        RegistriesHome::ConfigFile,
     );
 
     assert!(yaml.contains("registry: http://localhost:4873/"));
     assert!(yaml.contains("registry: http://127.0.0.1:61824/"));
     assert!(yaml.contains("allowedPrivateNetworks:"));
     assert!(yaml.contains("maxUsers: -1"));
-    assert!(yaml.contains("htpasswd"));
+    assert!(yaml.contains("users.json"));
 }
 
 #[test]
 fn pnpr_benchmark_config_relies_on_the_builtin_npm_route() {
     let storage = std::env::temp_dir().join("pnpr-benchmark-config-test-storage");
 
-    let yaml = pnpr_benchmark_config_yaml(&storage, &[]);
+    let yaml = pnpr_benchmark_config_yaml(
+        &storage,
+        &[],
+        serde_json::json!({}),
+        RegistriesHome::ConfigFile,
+    );
 
     // No operator-declared public routes: npmjs resolution comes from the
     // built-in route, so the config never spells out an npmjs registry rule.
@@ -440,7 +469,7 @@ fn pnpr_benchmark_config_relies_on_the_builtin_npm_route() {
 fn cold_mock_config_declares_public_upstream_under_registries() {
     let storage = std::env::temp_dir().join("cold-mock-config-test-storage");
 
-    let yaml = cold_mock_config_yaml(&storage, "http://127.0.0.1:4873");
+    let yaml = cold_mock_config_yaml(&storage, "http://127.0.0.1:4873", RegistriesHome::ConfigFile);
 
     assert!(yaml.contains("registries:"));
     assert!(yaml.contains("type: upstream"));
@@ -600,7 +629,7 @@ fn store_only_scenario_unlocks_the_peered_direct_deps_and_links_nothing() {
     let dir = temp.path();
 
     create_package_json(dir, None, scenario);
-    create_pnpm_workspace(dir, None, "http://localhost:4873/", scenario);
+    create_pnpm_workspace(dir, None, "http://localhost:4873/".to_owned(), scenario);
     create_install_script(dir, scenario, "pnpm", BenchId::PnpmRevision("HEAD"));
     may_create_lockfile(dir, scenario, None);
     let manifest: serde_json::Value =
@@ -661,7 +690,7 @@ fn injected_repeat_install_creates_its_lockfile_before_the_frozen_runs() {
     let dir = std::env::temp_dir().join(format!("pnpm-benchmark-injected-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     create_package_json(&dir, None, scenario);
-    create_pnpm_workspace(&dir, None, "http://localhost:4873/", scenario);
+    create_pnpm_workspace(&dir, None, "http://localhost:4873/".to_owned(), scenario);
     create_install_script(&dir, scenario, "pnpm", BenchId::PnpmRevision("HEAD"));
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.join("package.json")).unwrap()).unwrap();
@@ -693,7 +722,7 @@ fn cargo_repeat_install_seeds_workspace_and_store_before_frozen_runs() {
 
     create_package_json(dir, None, scenario);
     create_generated_projects(dir, scenario);
-    create_pnpm_workspace(dir, None, "http://localhost:4873/", scenario);
+    create_pnpm_workspace(dir, None, "http://localhost:4873/".to_owned(), scenario);
     create_install_script(dir, scenario, "pnpm", BenchId::PnpmRevision("HEAD"));
     super::cargo_workspace::seed_store(dir);
 
@@ -763,4 +792,125 @@ fn registry_directory_reports_where_npm_is_served() {
 
     let without_directory = serve_registry_directory_once("HTTP/1.1 404 Not Found", "{}");
     assert!(!serves_npm_under_base_path(without_directory));
+}
+
+#[cfg(unix)]
+#[test]
+fn cold_mock_cleanup_preserves_server_metadata_and_empties_the_configured_cache() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let storage = temp.path().join("cold-mock-storage");
+    let yaml = cold_mock_config_yaml(&storage, "http://127.0.0.1:4873", RegistriesHome::ConfigFile);
+    let config: serde_json::Value = serde_saphyr::from_str(&yaml).unwrap();
+    let cache = Path::new(config["cache"].as_str().unwrap());
+    let server = super::server_config::cold_revision_mock_command(
+        &super::server_config::RevisionMockLaunch {
+            revision: "HEAD",
+            binary: Path::new("pnpr"),
+            bench_dir: temp.path(),
+            port: 4873,
+            public_url: "http://127.0.0.1:4873",
+            registries: RegistriesHome::ConfigFile,
+        },
+        "http://127.0.0.1:4874",
+    );
+    let args: Vec<_> = server.get_args().collect();
+    let selected_cache = args
+        .windows(2)
+        .find(|pair| pair[0] == "--cache")
+        .unwrap()[1];
+    assert_eq!(Path::new(selected_cache), cache);
+    let metadata = storage.join(".metadata/metadata.sqlite");
+    fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+    fs::create_dir_all(cache).unwrap();
+    fs::write(&metadata, b"server metadata").unwrap();
+    fs::write(cache.join("archive"), b"cached archive").unwrap();
+    fs::write(temp.path().join(".saved-pnpm-lock.yaml"), b"saved lockfile").unwrap();
+    let cleanup = BenchmarkScenario::IsolatedFreshRestoreColdCacheColdStoreColdPnpr.cleanup();
+    let command = super::scripts::build_cleanup_command(
+        &cleanup,
+        [BenchId::PnprRevision("HEAD")].into_iter(),
+        |_| temp.path().to_path_buf(),
+    );
+    let status = std::process::Command::new("sh")
+        .with_arg("-c")
+        .with_arg(command)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!cache.exists());
+    assert_eq!(fs::read(metadata).unwrap(), b"server metadata");
+    assert_eq!(fs::read(temp.path().join("pnpm-lock.yaml")).unwrap(), b"saved lockfile");
+}
+
+fn run_prepare_step(command: &str) -> ExitStatus {
+    std::process::Command::new("sh")
+        .with_args(["-c", command])
+        .status()
+        .expect("run the --prepare step")
+}
+
+#[test]
+fn pnpr_restart_prepare_step_returns_after_its_server_restarted() {
+    let restarted = Mutex::new(Vec::new());
+    let restart = |server| {
+        thread::sleep(Duration::from_millis(100));
+        restarted.lock().unwrap().push(server);
+        true
+    };
+    let listener = PnprRestartListener::bind();
+
+    listener.serve_during(restart, || {
+        assert!(run_prepare_step(&listener.prepare_command(1)).success());
+        assert_eq!(*restarted.lock().unwrap(), [1]);
+        assert!(run_prepare_step(&listener.prepare_command(0)).success());
+        assert_eq!(*restarted.lock().unwrap(), [1, 0]);
+    });
+}
+
+#[test]
+fn pnpr_restart_prepare_step_fails_when_the_restart_fails() {
+    let mut status = None;
+    let listener = PnprRestartListener::bind();
+
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        listener.serve_during(
+            |_| panic!("the pnpr server did not come back"),
+            || status = Some(run_prepare_step(&listener.prepare_command(0))),
+        );
+    }));
+
+    assert!(outcome.is_err());
+    let status = status.expect("the --prepare step ran");
+    assert!(!status.success());
+}
+
+#[test]
+fn pnpr_restart_listener_ignores_a_request_that_names_no_server() {
+    let restarted = Mutex::new(Vec::new());
+    let listener = PnprRestartListener::bind();
+    let send_stray = |request: &str| {
+        let mut stray = std::net::TcpStream::connect(("127.0.0.1", listener.port()))
+            .expect("connect to the restart listener");
+        writeln!(stray, "{request}").expect("send a stray request");
+        let mut reply = String::new();
+        stray.read_to_string(&mut reply).expect("read the stray reply");
+        reply
+    };
+
+    listener.serve_during(
+        |server| {
+            if server != 0 {
+                return false;
+            }
+            restarted.lock().unwrap().push(server);
+            true
+        },
+        || {
+            assert_eq!(send_stray("not a server"), "");
+            assert_eq!(send_stray("7"), "");
+            assert!(run_prepare_step(&listener.prepare_command(0)).success());
+        },
+    );
+
+    assert_eq!(*restarted.lock().unwrap(), [0]);
 }

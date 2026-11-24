@@ -1,7 +1,14 @@
 use super::{
-    TempDir, UpdateWorkspaceManifestOptions, WORKSPACE_MANIFEST_FILENAME, fs,
-    run_allow_builds_clearing_legacy, run_patched_deps, run_patched_deps_path,
-    run_remove_overrides, run_update_field, run_with,
+    TempDir,
+    UpdateWorkspaceManifestOptions,
+    WORKSPACE_MANIFEST_FILENAME,
+    fs,
+    run_allow_builds_clearing_legacy,
+    run_patched_deps,
+    run_patched_deps_path,
+    run_remove_overrides,
+    run_update_field,
+    run_with,
 };
 
 #[test]
@@ -81,6 +88,43 @@ fn comment_only_manifest_parses_as_empty() {
         .expect("comment-only manifest");
     assert!(manifest.catalogs.default.is_none());
     assert!(manifest.catalogs.named.is_none());
+}
+
+#[test]
+fn null_root_manifest_is_rejected_without_writing() {
+    for original in [
+        "null\n",
+        "~\n",
+        "Null\n",
+        "NULL\n",
+        "!!null\n",
+        "!<tag:yaml.org,2002:null>\n",
+        "&settings\n",
+        "---\n&settings !!null # keep\n...\n",
+        "# workspace settings\nnull # keep\n",
+        "---\n!!null null\n...\n",
+    ] {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+        fs::write(&path, original).expect("seed manifest");
+
+        let result = crate::set_skills_dirs(dir.path(), &["skills".to_string()]);
+        let error = result.expect_err("a null root must not be edited as a mapping");
+        assert!(
+            matches!(&error, crate::UpdateWorkspaceManifestError::Parse { path: error_path, .. } if error_path == &path),
+            "{original:?}: {error}",
+        );
+        assert!(error.to_string().contains("expected a mapping"), "{error}");
+        assert_eq!(fs::read_to_string(&path).expect("read manifest"), original);
+    }
+}
+
+#[test]
+fn comment_only_manifest_can_be_updated() {
+    let original = "# workspace settings\n";
+    let output = run_update_field(Some(original), "saveExact", &serde_json::json!(true))
+        .expect("file written");
+    assert_eq!(output, "saveExact: true\n# workspace settings\n");
 }
 
 #[test]

@@ -1,24 +1,29 @@
-use super::{CanonicalPackageName, Ecosystem, RegistryConfigError, fmt};
+use super::{
+    CanonicalPackageName,
+    Ecosystem,
+    RegistryConfigError,
+    fmt,
+};
 
 /// A package-name pattern: one member of a concrete registry's declared
 /// namespace.
 ///
 /// Deliberately a small, **decidable** language so [`Self::covers`] can decide
-/// statically whether one pattern matches a superset of another — the property
+/// statically whether one pattern matches a superset of another, the property
 /// [`crate::Registries::validate`] relies on to detect shadowed sources. A general glob
 /// (`wax`) would make coverage undecidable, so registry patterns are restricted
 /// to these four shapes; an unrecognized wildcard is a parse error rather than
 /// a silently-narrowing literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackagePattern {
-    /// `**` — every package name.
+    /// `**`: every package name.
     All,
-    /// `@*/*` — every scoped package, any scope.
+    /// `@*/*`: every scoped package, any scope.
     AnyScoped,
-    /// `@<scope>/*` — every package in one scope. Stores the scope without its
+    /// `@<scope>/*`: every package in one scope. Stores the scope without its
     /// leading `@`.
     Scope(String),
-    /// `<namespace>/*` — every image repository under one leading path
+    /// `<namespace>/*`: every image repository under one leading path
     /// component. One component only, so two namespace patterns are either
     /// equal or disjoint and the specificity chain stays strict.
     Namespace(String),
@@ -36,7 +41,7 @@ impl PackagePattern {
     /// matches and lets the scope land on a later router source.
     pub fn parse(pattern: &str, ecosystem: Ecosystem) -> Result<Self, RegistryConfigError> {
         if pattern.is_empty() {
-            return Err(invalid_pattern(pattern, ecosystem));
+            return Err(invalid_pattern(pattern.to_owned(), ecosystem));
         }
         if pattern == "**" {
             return Ok(PackagePattern::All);
@@ -63,10 +68,10 @@ impl PackagePattern {
             .and_then(|rest| rest.strip_suffix("/*"))
         {
             // A wildcard inside the scope is an unsupported glob; a scope
-            // that request parsing would reject — `@.acme`, `@..`, a
-            // separator — is a claim no valid package name can ever match.
+            // that request parsing would reject (`@.acme`, `@..`, a
+            // separator) is a claim no valid package name can ever match.
             if scope.contains('*') {
-                return Err(invalid_pattern(pattern, Ecosystem::Npm));
+                return Err(invalid_pattern(pattern.to_owned(), Ecosystem::Npm));
             }
             if !pnpr_package_name::is_safe_path_segment(scope) {
                 return Err(RegistryConfigError::ScopePatternNotAScope {
@@ -86,7 +91,7 @@ impl PackagePattern {
             return Self::parse_exact(pattern, Ecosystem::Oci);
         };
         if namespace.contains('*') || namespace.contains('/') {
-            return Err(invalid_pattern(pattern, Ecosystem::Oci));
+            return Err(invalid_pattern(pattern.to_owned(), Ecosystem::Oci));
         }
         pnpr_package_name::canonicalize_oci_name(namespace)
             .map(PackagePattern::Namespace)
@@ -101,17 +106,20 @@ impl PackagePattern {
         ecosystem: Ecosystem,
     ) -> Result<Self, RegistryConfigError> {
         if pattern.contains('*') {
-            return Err(invalid_pattern(pattern, ecosystem));
+            return Err(invalid_pattern(pattern.to_owned(), ecosystem));
         }
         CanonicalPackageName::parse(pattern, ecosystem)
             .map(|name| PackagePattern::Exact(name.as_str().to_string()))
-            .map_err(|_| RegistryConfigError::ExactPatternNotAName { pattern: pattern.to_string() })
+            .map_err(|_| RegistryConfigError::ExactPatternNotAName {
+                pattern: pattern.to_string(),
+                ecosystem,
+            })
     }
 
     /// How specific this pattern is: an exact name beats `@scope/*` beats
     /// `@*/*` beats `**`. For any one package name, the patterns that can
-    /// match it form a strict chain — at most one per tier can exist in a
-    /// duplicate-free set — so most-specific-match selection is total and
+    /// match it form a strict chain (at most one per tier can exist in a
+    /// duplicate-free set) so most-specific-match selection is total and
     /// order-free. That is what lets a registry's `packages:` map be a YAML
     /// mapping whose key order carries no meaning.
     #[must_use]
@@ -162,12 +170,18 @@ impl PackagePattern {
     /// (i.e. `self` ⊇ `other`). Decides source shadowing in [`crate::Registries::validate`].
     ///
     /// A union of earlier patterns can only shadow `other` through a single
-    /// member: the one unbounded case — many `@<scope>/*` covering `@*/*` —
+    /// member: the one unbounded case (many `@<scope>/*` covering `@*/*`)
     /// would need every scope enumerated, which is impossible, so per-pattern
     /// coverage is sufficient for union coverage in this language.
     #[must_use]
     pub fn covers(&self, other: &PackagePattern) -> bool {
-        use PackagePattern::{All, AnyScoped, Exact, Namespace, Scope};
+        use PackagePattern::{
+            All,
+            AnyScoped,
+            Exact,
+            Namespace,
+            Scope,
+        };
         match self {
             All => true,
             AnyScoped => match other {
@@ -222,14 +236,14 @@ pub(super) fn wildcard_shapes(ecosystem: Ecosystem) -> &'static str {
     }
 }
 
-pub(super) fn invalid_pattern(pattern: &str, ecosystem: Ecosystem) -> RegistryConfigError {
-    RegistryConfigError::InvalidPattern { pattern: pattern.to_string(), ecosystem }
+pub(super) fn invalid_pattern(pattern: String, ecosystem: Ecosystem) -> RegistryConfigError {
+    RegistryConfigError::InvalidPattern { pattern, ecosystem }
 }
 
 /// Reject a router source whose claims an earlier source already covers.
 ///
 /// A source is unreachable when every name it claims is already claimed by an
-/// earlier source — the misordered-catch-all hazard and its general form.
+/// earlier source, the misordered-catch-all hazard and its general form.
 /// Rejecting it makes a shadowed private source a startup error, not a silent
 /// public fall-through.
 ///

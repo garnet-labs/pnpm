@@ -1,8 +1,20 @@
 use super::UpdateError;
 use pnpm_matcher::create_matcher;
-use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
-use pnpm_resolving_deps_resolver::{UpdateTargets, VersionLine, real_package_name_of};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    PackageManifest,
+};
+use pnpm_reporter::{
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+};
+use pnpm_resolving_deps_resolver::{
+    UpdateTargets,
+    VersionLine,
+    real_package_name_of,
+};
 
 /// A CLI selector split into its name pattern and optional version part.
 pub struct ParsedSelector {
@@ -11,11 +23,9 @@ pub struct ParsedSelector {
 }
 #[must_use]
 pub fn parse_update_param(input: &str) -> ParsedSelector {
-    let search_start = if input.starts_with('!') { 2 } else { 1 };
-    let at_index = input
-        .get(search_start..)
-        .and_then(|rest| rest.find('@'))
-        .map(|offset| offset + search_start);
+    let body = input.strip_prefix('!').unwrap_or(input);
+    let prefix_len = input.len() - body.len();
+    let at_index = pnpm_deps_path::version_separator_index(body).map(|offset| prefix_len + offset);
     match at_index {
         Some(idx) => ParsedSelector {
             pattern: input[..idx].to_string(),
@@ -30,25 +40,37 @@ pub(super) fn parse_selectors(packages: &[String]) -> Vec<ParsedSelector> {
         .map(|input| parse_update_param(input))
         .collect()
 }
-/// `--latest` forbids versioned selectors.
-pub(super) fn reject_versioned_latest_selectors(
+/// `--latest` and `--tag` forbid versioned selectors: the flag's target and
+/// the selector's version would each name a different one.
+///
+/// # Errors
+///
+/// [`UpdateError::LatestWithSpec`] or [`UpdateError::TagWithSpec`] when a
+/// selector in `packages` carries a version under the matching flag.
+pub fn reject_versioned_selectors(
+    version: &super::UpdateVersionOptions<'_>,
     packages: &[String],
-    selectors: &[ParsedSelector],
 ) -> Result<(), UpdateError> {
     let with_spec = packages
         .iter()
-        .zip(selectors)
-        .filter(|(_, selector)| selector.version.is_some())
-        .map(|(raw, _)| raw.as_str())
+        .filter(|raw| parse_update_param(raw).version.is_some())
+        .map(String::as_str)
         .collect::<Vec<_>>();
     if with_spec.is_empty() {
         return Ok(());
     }
-    Err(UpdateError::LatestWithSpec(with_spec.join(", ")))
+    let specs = with_spec.join(", ");
+    if version.latest {
+        return Err(UpdateError::LatestWithSpec(specs));
+    }
+    if version.tag.is_some() {
+        return Err(UpdateError::TagWithSpec(specs));
+    }
+    Ok(())
 }
 /// The selectors an update selector stands for. An `npm:` selector
-/// contributes a second one for the aliased package, because that -- not
-/// the alias -- is the name the resolver resolves the edge under; it
+/// contributes a second one for the aliased package, because that (not
+/// the alias) is the name the resolver resolves the edge under; it
 /// carries the aliased spec's own version so the expansion scopes the same
 /// version line the user asked for.
 pub(super) fn expand_update_selectors(selectors: &[ParsedSelector]) -> Vec<ParsedSelector> {
@@ -74,14 +96,12 @@ pub(super) fn expand_update_selectors(selectors: &[ParsedSelector]) -> Vec<Parse
     }
     expanded
 }
-/// Record `name` as an update target once per selector that claims it: a
-/// selector pinning an exact version scopes the target to that version's
-/// line, while a bare or ranged one widens it to every version. Negated
-/// selectors exclude names, never versions, so they claim nothing here --
-/// the matcher that found `name` has already applied them.
+/// Record `name` for selectors matching `matched`, preserving their version
+/// lines. Negated selectors are handled by the caller's matcher.
 pub(super) fn insert_update_target(
     targets: &mut UpdateTargets,
     selectors: &[ParsedSelector],
+    matched: &str,
     name: &str,
 ) {
     let mut claimed = false;
@@ -89,16 +109,28 @@ pub(super) fn insert_update_target(
         .iter()
         .filter(|selector| !selector.pattern.starts_with('!'))
     {
-        if !matcher_one(&selector.pattern).matches(name) {
+        if !matcher_one(selector).matches(matched) {
             continue;
         }
         claimed = true;
-        targets.insert(name.to_string(), selector.version.as_deref().and_then(VersionLine::parse));
+        targets.insert(
+            name.to_string(),
+            selector.version.as_deref().and_then(selector_version_line),
+        );
     }
     if !claimed {
         targets.insert(name.to_string(), None);
     }
 }
+fn selector_version_line(version: &str) -> Option<VersionLine> {
+    match version.strip_prefix("npm:") {
+        Some(aliased) => {
+            parse_update_param(aliased).version.as_deref().and_then(VersionLine::parse)
+        }
+        None => VersionLine::parse(version),
+    }
+}
+
 /// Whether any of `manifests` declares a dependency `selector` names, so the
 /// update has a manifest entry to write the requested version into.
 pub(super) fn selector_matches_a_direct_dependency(
@@ -106,7 +138,7 @@ pub(super) fn selector_matches_a_direct_dependency(
     manifests: &[&PackageManifest],
     include_direct: &[DependencyGroup],
 ) -> bool {
-    let matcher = matcher_one(&selector.pattern);
+    let matcher = matcher_one(selector);
     manifests
         .iter()
         .any(|manifest| {
@@ -117,7 +149,7 @@ pub(super) fn selector_matches_a_direct_dependency(
 }
 /// `pacquet update <dep>@<version>` where `<dep>` matches no direct dependency
 /// has nowhere to record the version. An update resolves such a target the way
-/// a fresh install would -- which a command-line version cannot influence -- so
+/// a fresh install would (which a command-line version cannot influence) so
 /// honoring the request would mean writing a lockfile entry no manifest backs,
 /// and the next fresh resolve would undo it. Neither npm nor Yarn accepts a
 /// version here either. Fail rather than resolve to something else and leave
@@ -149,6 +181,10 @@ pub(super) fn reject_versions_of_indirect_update_specs<Reporter: self::Reporter>
         }
         let pattern = &selector.pattern;
         if node_semver::Version::parse(version).is_err() {
+            #[cfg_attr(
+                dylint_lib = "perfectionist",
+                expect(perfectionist::em_dash_prose, reason = "pnpm v11 prints the same warning")
+            )]
             Reporter::emit(&LogEvent::Pnpm(PnpmLog {
                 level: LogLevel::Warn,
                 message: format!(
@@ -194,24 +230,32 @@ pub(super) fn indirect_version_error(pinned: &[(String, String)]) -> UpdateError
     }
 }
 /// The name an update target for `matched` is keyed by. A manifest keys a
-/// dependency by its alias, but the resolver matches update targets — and
-/// [`UpdateSeedPolicy::DropOnly`](crate::UpdateSeedPolicy::DropOnly) keys them — by the package name the edge
+/// dependency by its alias, but the resolver matches update targets, and
+/// [`UpdateSeedPolicy::DropOnly`](crate::UpdateSeedPolicy::DropOnly) keys them, by the package name the edge
 /// resolves under, which an `npm:` or `jsr:` selector states separately from
-/// the alias. Falls back to the alias, which is the name for every other
-/// selector shape.
-pub(super) fn update_target_name(selectors: &[ParsedSelector], matched: &str) -> String {
+/// the alias. Other selectors keep the target of the existing declaration.
+pub(super) fn update_target_name(
+    selectors: &[ParsedSelector],
+    matched: &str,
+    previous: &str,
+) -> String {
     selectors
         .iter()
-        .filter(|selector| matcher_one(&selector.pattern).matches(matched))
+        .filter(|selector| matcher_one(selector).matches(matched))
         .filter_map(|selector| {
             real_package_name_of(Some(matched), Some(selector.version.as_deref()?))
         })
         .find(|name| name.as_ref() != matched)
-        .map_or_else(|| matched.to_string(), std::borrow::Cow::into_owned)
+        .or_else(|| real_package_name_of(Some(matched), Some(previous)))
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_else(|| matched.to_string())
 }
-/// Compile a single pattern into a matcher. Used to map a matched direct
+/// Compile a selector's pattern into a matcher. Used to map a matched direct
 /// dependency back to the selector that claimed it (so a versioned
 /// selector's version is applied to the right dep).
-pub(super) fn matcher_one(pattern: &str) -> pnpm_matcher::Matcher {
-    create_matcher(std::slice::from_ref(&pattern.to_string()))
+pub(super) fn matcher_one(selector: &ParsedSelector) -> pnpm_matcher::Matcher {
+    create_matcher(std::slice::from_ref(&selector.pattern))
 }
+
+#[cfg(test)]
+mod tests;

@@ -4,33 +4,65 @@
 //! suffix, and the [`DependenciesGraph`] built from the per-node records
 //! keyed by those depPaths.
 
-pub(crate) use final_paths::{FinalDepPaths, PeerIdRecording};
+pub(crate) use final_paths::{
+    FinalDepPaths,
+    PeerIdRecording,
+};
 pub(crate) use graph_edges::merge_additional_edges;
 
 mod peer_scc;
-use peer_scc::PeerSccPass;
 
 mod graph_edges;
-use graph_edges::{PeerNameTarjan, insert_graph_node, transitive_peer_names};
+use graph_edges::{
+    PeerNameTarjan,
+    insert_graph_node,
+    transitive_peer_names,
+};
 
 mod final_paths;
 
 use crate::{
-    dependencies_graph::{DependenciesGraph, DependenciesGraphNode},
+    dependencies_graph::{
+        DependenciesGraph,
+        DependenciesGraphNode,
+    },
     node_id::NodeId,
     resolve_peers::{
-        context::{SharedChain, link_node_id_as_dep_path, peer_id_pair, peer_segment_names},
-        walker::{MissingPeerInfo, Walker},
+        context::{
+            SharedChain,
+            link_node_id_as_dep_path,
+            peer_id_pair,
+            peer_segment_names,
+        },
+        walker::{
+            MissingPeerInfo,
+            Walker,
+        },
     },
-    resolved_tree::{ResolvedPackage, pkg_name_version},
+    resolved_tree::{
+        ResolvedPackage,
+        pkg_name_version,
+    },
 };
-use pnpm_deps_path::{DepPath, PeerId, link_path_to_peer_version};
+use pnpm_deps_path::{
+    DepPath,
+    PeerId,
+    link_path_to_peer_version,
+};
 use pnpm_resolving_resolver_base::ResolveResult;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{
+    FxHashMap as HashMap,
+    FxHashSet as HashSet,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     sync::Arc,
 };
+
+type FinalRecordPaths = (HashMap<NodeId, DepPath>, HashMap<DepPath, HashSet<String>>);
 
 /// Per-`NodeId` data captured during the walk so the post-walk
 /// [`Walker::build_final_dep_paths`] pass can recompute each node's
@@ -104,11 +136,21 @@ impl Walker<'_> {
         self.nodes.cache_owners.get(node_id).unwrap_or(node_id)
     }
 
+    pub(super) fn exceeds_final_snapshot_budget(&self, dep_path: &DepPath) -> bool {
+        self.traversal.snapshot_budget.max_snapshots.is_some_and(|max| {
+            self.output.graph.len() >= max && !self.output.graph.contains_key(dep_path)
+        })
+    }
+
     /// Record one walked node: its entry in the provisional
     /// depPath-keyed graph, and the [`NodeRecord`] the post-walk rebuild
     /// consumes. A discovery pass runs neither of the passes that read
     /// these, so it never calls this.
     pub(super) fn record_walked_node(&mut self, mut node: WalkedNode<'_>) {
+        if self.exceeds_final_snapshot_budget(node.dep_path) {
+            self.traversal.snapshot_budget.mark_exceeded();
+            return;
+        }
         // Seeds both the node's record edges and its graph children, so
         // it is computed once: a second call would rescan the ancestor
         // chain and re-realize every matching occurrence's children.
@@ -165,6 +207,7 @@ impl Walker<'_> {
                 }
             })
             .or_insert(DependenciesGraphNode {
+                recorded_peer_bindings: None,
                 dep_path: node.dep_path.clone(),
                 resolved_package_id: node.pkg.id.to_string(),
                 resolve_result: Arc::clone(node.pkg.result()),
@@ -186,7 +229,7 @@ impl Walker<'_> {
 
     /// Finish this node's NodeId-level edges for the post-walk
     /// [`Walker::build_final_dep_paths`] rebuild: its regular children
-    /// overlaid with its *own* resolved peers — this node's own peer
+    /// overlaid with its *own* resolved peers; this node's own peer
     /// resolution, not the descendants' peers bubbled up for the
     /// suffix. A peer a descendant resolved (e.g. `debug`'s optional
     /// `supports-color`) is symlinked at the descendant that declares
@@ -205,7 +248,7 @@ impl Walker<'_> {
 
     /// The children's depPath edges become this node's graph children.
     /// Resolved peers become extra edges, aliased by peer name. If a peer's
-    /// depPath isn't known yet — typically a later sibling direct dep — the
+    /// depPath isn't known yet (typically a later sibling direct dep) the
     /// edge is deferred to the post-walk patch pass; the install layer drives
     /// off `graph_children`, so skipping the edge entirely would leave the
     /// peer un-symlinked in the parent's slot.
@@ -240,7 +283,7 @@ impl Walker<'_> {
     }
 
     /// A back-edge child whose occurrence node the walk skipped would render
-    /// as its bare package id — a snapshot no variant of the target has.
+    /// as its bare package id, a snapshot no variant of the target has.
     /// These remap it to the target's shared canonical occurrence, which the
     /// drivers walk at importer context.
     fn remapped_backedge_children(
@@ -277,7 +320,7 @@ impl Walker<'_> {
     /// `walk()` drains this list, so every peer that was reachable
     /// from an ancestor's [`ParentRefs`](super::context::ParentRefs) has
     /// a `DepPath` now. Peers that still don't resolve here came from a
-    /// `parent_chain` outside the walked set — there's nothing to patch,
+    /// `parent_chain` outside the walked set; there's nothing to patch,
     /// and the absence already surfaced via
     /// [`crate::PeerDependencyIssues::missing`].
     pub(super) fn patch_pending_peer_edges(&mut self) {
@@ -304,23 +347,55 @@ impl Walker<'_> {
     /// resolve to the same final depPath merge (taking the smallest
     /// `depth`, like the inline build).
     ///
-    /// Every edge — a regular child or a resolved peer — points at the
+    /// Every edge (a regular child or a resolved peer) points at the
     /// depPath the edge's own node resolved to, matching upstream's
     /// `resolveChildren`, which maps each `childrenNodeIds` entry
     /// through `pathsByNodeId`. A peer provider therefore keeps its own
     /// peer suffix even where the consumer resolved none of those peers
     /// itself.
     pub(super) fn build_final_graph(
-        &self,
+        &mut self,
         final_dep_paths: &HashMap<NodeId, DepPath>,
     ) -> DependenciesGraph {
-        let min_depth = self.min_depth_by_final_dep_path(final_dep_paths);
-        let (record_dep_paths, transitive_peer_dependencies_by_dep_path) =
-            self.final_record_dep_paths(final_dep_paths);
+        if self.traversal.snapshot_budget.poll_cancelled()
+            || self.traversal.snapshot_budget.is_stopped()
+        {
+            return DependenciesGraph::default();
+        }
+        let Some(min_depth) = self.min_depth_by_final_dep_path(final_dep_paths) else {
+            self.traversal.snapshot_budget.abort = Some(crate::PeerWalkAbort::Cancelled);
+            return DependenciesGraph::default();
+        };
+        let Some((record_dep_paths, transitive_peer_dependencies_by_dep_path)) =
+            self.final_record_dep_paths(final_dep_paths)
+        else {
+            self.traversal.snapshot_budget.abort = Some(crate::PeerWalkAbort::Cancelled);
+            return DependenciesGraph::default();
+        };
+        self.assemble_final_graph_nodes(
+            final_dep_paths,
+            &min_depth,
+            &record_dep_paths,
+            &transitive_peer_dependencies_by_dep_path,
+        )
+    }
 
+    fn assemble_final_graph_nodes(
+        &mut self,
+        final_dep_paths: &HashMap<NodeId, DepPath>,
+        min_depth: &HashMap<DepPath, i32>,
+        record_dep_paths: &HashMap<NodeId, DepPath>,
+        transitive_by_dep_path: &HashMap<DepPath, HashSet<String>>,
+    ) -> DependenciesGraph {
         let mut graph = DependenciesGraph::default();
-        let mut graph_order: HashMap<DepPath, u64> = HashMap::default();
-        for (node_id, record) in &self.output.node_records {
+        let mut records: Vec<_> = self.output.node_records.iter().collect();
+        records.sort_unstable_by_key(|(_, record)| record.order);
+        let mut cancelled = false;
+        for (node_id, record) in records {
+            if self.traversal.snapshot_budget.cancel.poll_probe_amortized() {
+                cancelled = true;
+                break;
+            }
             let dep_path = record_dep_paths[node_id].clone();
             let depth = min_depth
                 .get(&dep_path)
@@ -328,13 +403,15 @@ impl Walker<'_> {
                 .unwrap_or(record.depth);
             let candidate =
                 self.graph_node_for_record(node_id, record, dep_path, depth, final_dep_paths);
-            insert_graph_node(
-                &mut graph,
-                &mut graph_order,
-                candidate,
-                record.order,
-                &transitive_peer_dependencies_by_dep_path,
-            );
+            insert_graph_node(&mut graph, candidate, transitive_by_dep_path);
+            if self.traversal.snapshot_budget.is_stopped()
+                || self.traversal.snapshot_budget.max_snapshots.is_some_and(|max| graph.len() > max)
+            {
+                break;
+            }
+        }
+        if cancelled {
+            self.traversal.snapshot_budget.abort = Some(crate::PeerWalkAbort::Cancelled);
         }
         graph
     }
@@ -344,14 +421,17 @@ impl Walker<'_> {
     /// a [`NodeRecord`] is created, so iterating `node_records` alone would
     /// restore the first (possibly deeper) walk's depth and miss a later
     /// shallower revisit. `node_dep_paths` carries every walked `NodeId`, so
-    /// the `Math.min` depth tie-break is recomputed here — the inline build
+    /// the `Math.min` depth tie-break is recomputed here, the inline build
     /// threaded it through `self.graph`, which this rebuild discards.
     fn min_depth_by_final_dep_path(
         &self,
         final_dep_paths: &HashMap<NodeId, DepPath>,
-    ) -> HashMap<DepPath, i32> {
+    ) -> Option<HashMap<DepPath, i32>> {
         let mut min_depth: HashMap<DepPath, i32> = HashMap::default();
         for node_id in self.caches.node_dep_paths.keys() {
+            if self.traversal.snapshot_budget.cancel.poll_probe_amortized() {
+                return None;
+            }
             let Some(tree_node) = self.tree.dependencies_tree.get(node_id) else { continue };
             let dep_path = self.final_dep_path_of(node_id, final_dep_paths);
             min_depth
@@ -359,7 +439,7 @@ impl Walker<'_> {
                 .and_modify(|depth| *depth = (*depth).min(tree_node.depth))
                 .or_insert(tree_node.depth);
         }
-        min_depth
+        Some(min_depth)
     }
 
     /// The final depPath each record resolves to, and the transitive peers
@@ -367,10 +447,13 @@ impl Walker<'_> {
     fn final_record_dep_paths(
         &self,
         final_dep_paths: &HashMap<NodeId, DepPath>,
-    ) -> (HashMap<NodeId, DepPath>, HashMap<DepPath, HashSet<String>>) {
+    ) -> Option<FinalRecordPaths> {
         let mut record_dep_paths: HashMap<NodeId, DepPath> = HashMap::default();
         let mut transitive_by_dep_path: HashMap<DepPath, HashSet<String>> = HashMap::default();
         for (node_id, record) in &self.output.node_records {
+            if self.traversal.snapshot_budget.cancel.poll_probe_amortized() {
+                return None;
+            }
             let dep_path = self.final_dep_path_of(node_id, final_dep_paths);
             transitive_by_dep_path
                 .entry(dep_path.clone())
@@ -378,7 +461,7 @@ impl Walker<'_> {
                 .extend(record.transitive_peer_dependencies.iter().cloned());
             record_dep_paths.insert(node_id.clone(), dep_path);
         }
-        (record_dep_paths, transitive_by_dep_path)
+        Some((record_dep_paths, transitive_by_dep_path))
     }
 
     fn graph_node_for_record(
@@ -400,6 +483,7 @@ impl Walker<'_> {
             .map(|peers| peers.keys().cloned().collect())
             .unwrap_or_default();
         DependenciesGraphNode {
+            recorded_peer_bindings: None,
             dep_path,
             resolved_package_id: pkg_id.to_string(),
             resolve_result: Arc::clone(pkg.result()),

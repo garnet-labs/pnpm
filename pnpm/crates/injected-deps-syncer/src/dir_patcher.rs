@@ -1,19 +1,36 @@
 //! Bring one directory tree in step with another by hardlinking, so an
 //! injected copy of a workspace package can be refreshed in place
-//! without re-running the installer. A target on another filesystem
-//! than its source gets copies instead.
+//! without re-running the installer. A file the target cannot link,
+//! because it is on another filesystem or the source has no names left,
+//! is copied instead.
 
 pub use inode_map::extend_files_map;
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use inode_map::load_inode_map;
 use miette::Diagnostic;
-use pnpm_directory_fetcher::{CopyFiles, DirectoryFetcherError};
-use pnpm_fs::{FsHardLink, Host, is_cross_device};
+use pnpm_directory_fetcher::{
+    CopyFiles,
+    DirectoryFetcherError,
+};
+use pnpm_fs::{
+    FsHardLink,
+    Host,
+    LinkFailure,
+    LinkFallback,
+    LinkFallbackPolicy,
+};
 use std::{
     collections::BTreeMap,
-    fs, io,
-    path::{Path, PathBuf},
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
     time::SystemTime,
 };
 
@@ -246,7 +263,10 @@ fn apply_change_with_link<Sys: FsHardLink>(
 /// a file is a file in the copy, and a hardlink of the link would be another
 /// link, one the copy cannot resolve.
 fn linked_file(path: &Path) -> PathBuf {
-    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type())
+        .is_ok_and(|file_type| file_type.is_symlink())
+    {
         fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     } else {
         path.to_path_buf()
@@ -389,16 +409,22 @@ fn publish_file(
     Ok(())
 }
 
+/// Hardlink `source_path` to `target_path`, copying under
+/// [`LinkFallbackPolicy::CopyOneFile`]: the sync shares inodes, as pnpm's
+/// `hardLinkDir` does, and copies only the file it cannot share.
 fn link_or_copy<Sys: FsHardLink>(source_path: &Path, target_path: &Path) -> io::Result<()> {
     match Sys::hard_link(source_path, target_path) {
-        Err(error) if is_cross_device(&error) => {
+        Err(error)
+            if LinkFailure::of(&error).fallback(LinkFallbackPolicy::CopyOneFile)
+                == LinkFallback::CopyFile =>
+        {
             pnpm_fs::copy_file_atomic(source_path, target_path)
         }
         result => result,
     }
 }
 
-/// The target may hold an inode that [`extend_files_map`] skips — a
+/// The target may hold an inode that [`extend_files_map`] skips, a
 /// FIFO, a socket, a device. No diff can see it, so it is never
 /// scheduled for removal, and creating over it fails with `EEXIST`.
 /// Clear that path and retry once instead of failing the sync.

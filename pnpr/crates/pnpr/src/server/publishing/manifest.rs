@@ -1,32 +1,43 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 
 use pnpr_error::RegistryError;
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_policy::Identity;
 use pnpr_storage::{
-    HostedDocumentForUpdate, HostedDocumentVersion, Storage,
-    publish::{extract_predicate_type, merge_manifest},
+    HostedDocumentForUpdate,
+    HostedDocumentVersion,
+    Storage,
+    publish::{
+        extract_predicate_type,
+        merge_manifest,
+    },
 };
 
 use super::{
-    attachments::{AttachmentKind, PreparedAttachment, PublishedTar},
+    attachments::{
+        AttachmentKind,
+        PreparedAttachment,
+        PublishedTar,
+    },
     restore_tgz_integrities,
-    variants::Declarations,
 };
 
 pub(super) fn record_publisher(incoming: &mut Value, identity: &Identity) {
-    if let Identity::User { username, .. } = identity {
-        record_publisher_in_maintainers(incoming, username);
+    if let Identity::User { id, username, .. } = identity {
+        record_publisher_in_maintainers(incoming, id, username);
     }
     let Some(versions) = incoming.get_mut("versions").and_then(Value::as_object_mut) else {
         return;
     };
     for manifest in versions.values_mut().filter_map(Value::as_object_mut) {
         match identity {
-            Identity::User { username, .. } => {
-                manifest.insert("_npmUser".to_string(), json!({ "name": username }));
+            Identity::User { id, username, .. } => {
+                manifest.insert("_npmUser".to_string(), json!({ "name": username, "userId": id }));
             }
             _ => {
                 manifest.remove("_npmUser");
@@ -35,26 +46,16 @@ pub(super) fn record_publisher(incoming: &mut Value, identity: &Identity) {
     }
 }
 
-fn record_publisher_in_maintainers(incoming: &mut Value, username: &str) {
+fn record_publisher_in_maintainers(incoming: &mut Value, user_id: &str, username: &str) {
     let Some(incoming_obj) = incoming.as_object_mut() else { return };
-    let maintainers = incoming_obj
-        .entry("maintainers")
-        .or_insert_with(|| json!([]));
-    let publisher = json!({ "name": username });
-    let Some(list) = maintainers.as_array_mut() else {
-        *maintainers = json!([publisher]);
-        return;
-    };
-    let already_present = list
-        .iter()
-        .any(|entry| entry.get("name").and_then(Value::as_str) == Some(username));
-    if !already_present {
-        list.insert(0, publisher);
-    }
+    incoming_obj.insert(
+        "maintainers".to_string(),
+        json!([{ "name": username, "userId": user_id }]),
+    );
 }
 
 /// The stored packument, parsed, with the version its update must be based
-/// on. `None` for a package the org has not published yet.
+/// on. `None` for a package the namespace has not published yet.
 pub(super) fn parse_hosted_packument(
     name: &CanonicalPackageName,
     hosted: Option<HostedDocumentForUpdate>,
@@ -78,16 +79,13 @@ pub(super) fn parse_hosted_packument(
 /// Validate each incoming version against the locally hosted packument. A
 /// hosted packument is served as-is, so anything not in it is genuinely new.
 /// Published content is immutable, so re-publishes with modified tarballs or
-/// integrity are rejected. New versions must provide a tarball, unless they
-/// reference variants and declare no `dist`: those are returned, as the
-/// versions published without an `any` archive.
+/// integrity are rejected. New versions must provide a tarball.
 pub(super) fn check_publishable_versions(
     name: &CanonicalPackageName,
     incoming: &Value,
     hosted: Option<&Value>,
-    (prepared, variants): (&[PreparedAttachment], &Declarations),
-) -> Result<BTreeSet<String>, RegistryError> {
-    let mut without_any = BTreeSet::new();
+    prepared: &[PreparedAttachment],
+) -> Result<(), RegistryError> {
     let attachment_versions: HashSet<&str> = prepared
         .iter()
         .filter(|attachment| attachment.kind == AttachmentKind::Tarball)
@@ -97,16 +95,20 @@ pub(super) fn check_publishable_versions(
         .and_then(|h| h.get("versions"))
         .and_then(Value::as_object);
     let Some(incoming_versions) = incoming.get("versions").and_then(Value::as_object) else {
-        return Ok(without_any);
+        return Ok(());
     };
     for (version, incoming_manifest) in incoming_versions {
         let has_attachment = attachment_versions.contains(version.as_str());
         let Some(hosted_manifest) = hosted_versions.and_then(|hosted| hosted.get(version)) else {
-            if !has_attachment {
-                check_new_version_without_any(name, (version, incoming_manifest), variants)?;
-                without_any.insert(version.clone());
+            if has_attachment {
+                continue;
             }
-            continue;
+            return Err(RegistryError::BadRequest {
+                reason: format!(
+                    "cannot publish version {version} of {:?} without a tarball",
+                    name.as_str(),
+                ),
+            });
         };
         if has_attachment || integrity_changed(incoming_manifest, hosted_manifest) {
             return Err(RegistryError::VersionAlreadyPublished {
@@ -115,26 +117,7 @@ pub(super) fn check_publishable_versions(
             });
         }
     }
-    Ok(without_any)
-}
-
-/// Refuse a new version with no archive attached unless it can be published
-/// without an `any` archive: it attaches variants and declares no `dist`.
-/// Any other new version needs its archive.
-fn check_new_version_without_any(
-    name: &CanonicalPackageName,
-    (version, incoming_manifest): (&str, &Value),
-    variants: &Declarations,
-) -> Result<(), RegistryError> {
-    if variants.contains_key(version) && incoming_manifest.get("dist").is_none() {
-        return Ok(());
-    }
-    Err(RegistryError::BadRequest {
-        reason: format!(
-            "cannot publish version {version} of {:?} without a tarball",
-            name.as_str(),
-        ),
-    })
+    Ok(())
 }
 
 /// Apply [`restore_tgz_integrities`] to a publish body. The tar-integrity
@@ -148,7 +131,7 @@ pub(super) async fn restore_submitted_tgz_integrities(
     if let Some(hosted) = hosted
         && submits_other_integrity(incoming, hosted)
     {
-        let tar_integrities = storage.read_tar_integrities(name).await?;
+        let tar_integrities = storage.refresh_tar_integrities(name).await?;
         restore_tgz_integrities(hosted, &tar_integrities, incoming);
     }
     Ok(())
@@ -176,6 +159,36 @@ pub(super) fn integrity_changed(incoming_manifest: &Value, hosted_manifest: &Val
     let incoming_integrity = incoming_manifest.pointer("/dist/integrity").and_then(Value::as_str);
     let hosted_integrity = hosted_manifest.pointer("/dist/integrity").and_then(Value::as_str);
     incoming_integrity.is_some_and(|integrity| Some(integrity) != hosted_integrity)
+}
+
+/// Keep a README submitted at package level with the version it describes.
+pub(super) fn keep_published_readme(incoming: &mut Value, prepared: &[PreparedAttachment]) {
+    let Some(latest) = incoming.pointer("/dist-tags/latest").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(target) = prepared
+        .iter()
+        .filter(|item| item.kind == AttachmentKind::Tarball)
+        .find(|item| item.version == latest)
+    else {
+        return;
+    };
+    for key in ["readme", "readmeFilename"] {
+        let Some(value) = incoming
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if let Some(manifest) = incoming
+            .get_mut("versions")
+            .and_then(|versions| versions.get_mut(&target.version))
+            && manifest[key].is_null()
+        {
+            manifest[key] = Value::String(value);
+        }
+    }
 }
 
 pub(super) fn prepare_staged_document(
@@ -240,17 +253,10 @@ fn attach_sigstore_attestations(
         .iter()
         .filter(|att| att.kind == AttachmentKind::Sigstore)
     {
-        // A version published without an `any` archive gets its `dist` from
-        // the archive pnpr generates, which keeps these attestations.
         if let Some(dist) = merged
             .get_mut("versions")
             .and_then(|v| v.get_mut(&attachment.version))
-            .and_then(Value::as_object_mut)
-            .map(|manifest| {
-                manifest
-                    .entry("dist")
-                    .or_insert_with(|| json!({}))
-            })
+            .and_then(|m| m.get_mut("dist"))
             .and_then(Value::as_object_mut)
         {
             let predicate_type =

@@ -6,10 +6,17 @@ use crate::_utils::pacquet_in;
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
-    bin::{AddMockedRegistry, CommandTempCwd},
+    bin::{
+        AddMockedRegistry,
+        CommandTempCwd,
+    },
+    diagnostics::assert_diagnostic_contains,
     fs::bump_mtime,
 };
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+};
 
 /// Empties the wanted lockfile once a `clear-lockfile` file exists next to
 /// the pnpmfile, so the pnpmfile and its checksum stay the same across runs.
@@ -175,7 +182,7 @@ fn a_throwing_hook_fails_the_install() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "STDERR:\n{stderr}");
     assert!(stderr.contains("ERR_PNPM_PNPMFILE_FAIL"), "STDERR:\n{stderr}");
-    assert!(stderr.contains("lockfile rejected"), "STDERR:\n{stderr}");
+    assert_diagnostic_contains(&stderr, "lockfile rejected");
 
     drop(root);
 }

@@ -1,8 +1,21 @@
 use super::{
-    CommandExtra, CommandTempCwd, Value, build_writes_marker, echoes_ok, fs, json, sorted_lines,
-    summary_statuses, write_marker_script, write_workspace,
+    CommandExtra,
+    CommandTempCwd,
+    Value,
+    build_writes_marker,
+    echoes_ok,
+    fs,
+    json,
+    sorted_lines,
+    summary_statuses,
+    write_marker_script,
+    write_workspace,
 };
-use crate::_utils::{has_pnpm_error_log, ndjson_records, without_colors};
+use crate::_utils::{
+    has_pnpm_error_log,
+    ndjson_records,
+    without_colors,
+};
 use assert_cmd::assert::OutputAssertExt;
 use std::process::Output;
 
@@ -69,8 +82,8 @@ fn test_pattern_from_workspace_yaml_is_respected_by_the_test_script() {
 
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&workspace)
+            .with_args(args)
+            .with_current_dir(&workspace)
             .output()
             .expect("spawn git");
         assert!(
@@ -92,11 +105,11 @@ fn test_pattern_from_workspace_yaml_is_respected_by_the_test_script() {
     git(&["push", "-u", "origin", "main"]);
 
     fs::write(workspace.join("project-2").join("file.js"), "").expect("write changed file");
-    fs::write(workspace.join("project-2").join("\u{d55c}\u{ae00}.js"), "")
+    fs::write(workspace.join("project-2").join("한글.js"), "")
         .expect("write changed Unicode test file");
     fs::write(workspace.join("project-4").join("different-pattern.js"), "")
         .expect("write changed file");
-    let workspace_yaml = "packages:\n  - project-1\n  - project-2\n  - project-3\n  - project-4\ntestPattern:\n  - '*/file.js'\n  - '*/\u{d55c}\u{ae00}.js'\n";
+    let workspace_yaml = "packages:\n  - project-1\n  - project-2\n  - project-3\n  - project-4\ntestPattern:\n  - '*/file.js'\n  - '*/한글.js'\n";
     fs::write(workspace.join("pnpm-workspace.yaml"), workspace_yaml)
         .expect("write pnpm-workspace.yaml");
     git(&["add", "."]);
@@ -211,7 +224,6 @@ fn stream_prefixes_recursive_script_output_with_the_project() {
     assert_eq!(
         sorted_lines(&output.stdout),
         [
-            "Scope: all 2 workspace projects",
             "project-1 test$ echo OK",
             "project-1 test: Done",
             "project-1 test: OK",
@@ -260,7 +272,8 @@ fn streamed_scripts_get_force_color_when_pnpm_output_is_colored() {
         assert!(output.status.success(), "streamed run failed: {output:?}");
         let printed: Vec<String> = sorted_lines(&output.stdout)
             .into_iter()
-            .filter(|line| !line.contains("project-") && !line.starts_with("Scope:"))
+            .filter(|line| !line.contains("project-"))
+            .filter(|line| !line.starts_with("Scope:"))
             .collect();
         assert_eq!(printed, [expected, expected], "with --color={color}");
 
@@ -347,7 +360,7 @@ fn ndjson_reporter_reports_recursive_lifecycle_failure_as_a_record() {
 
 /// Port of upstream's `run --reporter-hide-prefix should hide prefix`
 /// (`pnpm/test/monorepo/index.ts`): only the script's own output loses
-/// the prefix — the command echo and the `Done` line keep theirs.
+/// the prefix, the command echo and the `Done` line keep theirs.
 #[test]
 fn reporter_hide_prefix_drops_the_prefix_from_streamed_script_output() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -373,7 +386,6 @@ fn reporter_hide_prefix_drops_the_prefix_from_streamed_script_output() {
         [
             "OK",
             "OK",
-            "Scope: all 2 workspace projects",
             "project-1 test$ echo OK",
             "project-1 test: Done",
             "project-2 test$ echo OK",
@@ -385,7 +397,7 @@ fn reporter_hide_prefix_drops_the_prefix_from_streamed_script_output() {
 }
 
 /// `--parallel` expands to `--stream` in pnpm's `run` shorthand table,
-/// so a parallel run is prefixed even without the flag — otherwise the
+/// so a parallel run is prefixed even without the flag; otherwise the
 /// interleaved output of concurrent projects is unattributable.
 #[test]
 fn parallel_implies_stream() {
@@ -403,7 +415,6 @@ fn parallel_implies_stream() {
     assert_eq!(
         sorted_lines(&output.stdout),
         [
-            "Scope: all 2 workspace projects",
             "project-1 test$ echo OK",
             "project-1 test: Done",
             "project-1 test: OK",
@@ -433,13 +444,13 @@ fn recursive_run_inherits_stdio_without_stream() {
         .output()
         .expect("run test");
     assert!(output.status.success(), "recursive run failed: {output:?}");
-    assert_eq!(sorted_lines(&output.stdout), ["OK", "OK", "Scope: all 2 workspace projects"]);
+    assert_eq!(sorted_lines(&output.stdout), ["OK", "OK"]);
 
     drop(root);
 }
 
 /// Two independent projects can have their scripts in flight at once, so
-/// output is piped and prefixed even without `--stream` — inherited
+/// output is piped and prefixed even without `--stream`, inherited
 /// terminal output would interleave them mid-line.
 #[test]
 fn recursive_run_pipes_stdio_when_tasks_can_interleave() {
@@ -457,7 +468,6 @@ fn recursive_run_pipes_stdio_when_tasks_can_interleave() {
     assert_eq!(
         sorted_lines(&output.stdout),
         [
-            "Scope: all 2 workspace projects",
             "project-1 test$ echo OK",
             "project-1 test: Done",
             "project-1 test: OK",
@@ -559,7 +569,7 @@ fn aggregate_output_keeps_each_project_in_one_block() {
 }
 
 /// `--use-stderr` moves the reporter's own output to stderr, leaving
-/// stdout to the command — here, the scripts' streamed lines still reach
+/// stdout to the command; here, the scripts' streamed lines still reach
 /// stderr with it, since the reporter is what prints them.
 #[test]
 fn use_stderr_diverts_reporter_output() {
@@ -589,7 +599,11 @@ fn use_stderr_diverts_reporter_output() {
 
 #[test]
 fn github_actions_groups_serial_scripts_even_after_failure() {
-    for flags in [vec!["--sequential"], vec!["--workspace-concurrency=1"]] {
+    for flags in [
+        vec!["--sequential"],
+        vec!["--workspace-concurrency=1"],
+        vec!["--parallel", "--sequential"],
+    ] {
         let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
         write_workspace(
             &workspace,
@@ -628,10 +642,9 @@ fn github_actions_groups_serial_scripts_even_after_failure() {
             assert!(group.starts_with(&format!("{name}@1.0.0 : test {name}")), "{group}");
             let end = group.find("::endgroup::").expect("closed group");
             assert!(
-                group
-                    .find(&format!("\n{marker}"))
-                    .expect("script output")
-                    < end,
+                group[..end]
+                    .lines()
+                    .any(|line| line.ends_with(marker)),
                 "{group}",
             );
         }

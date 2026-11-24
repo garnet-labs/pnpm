@@ -7,28 +7,52 @@ use std::collections::BTreeMap;
 use pnpm_lockfile::Lockfile;
 use pnpm_resolving_deps_resolver::ResolveWorkspaceResult;
 use pnpm_resolving_resolver_base::{
-    LatestQuery, ResolveFuture, ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver,
+    LatestQuery,
+    ResolveFuture,
+    ResolveLatestFuture,
+    ResolveOptions,
+    ResolveResult,
+    Resolver,
     WantedDependency,
 };
-use proptest::{collection::vec, prelude::*};
+use proptest::{
+    collection::vec,
+    prelude::*,
+};
 use rustc_hash::FxHashMap as HashMap;
 
-use super::super::{make_resolve_result as fake_result, single_importer_opts};
+use super::super::{
+    make_resolve_result as fake_result,
+    single_importer_opts,
+};
 
 pub(super) struct StubResolver {
     table: HashMap<(String, String), ResolveResult>,
+    metadata: HashMap<String, pnpm_registry::Package>,
 }
 
 impl Resolver for StubResolver {
     fn resolve<'a>(
         &'a self,
         wanted: &'a WantedDependency,
-        _opts: &'a ResolveOptions,
+        opts: &'a ResolveOptions,
     ) -> ResolveFuture<'a> {
-        let key = (
-            wanted.alias.clone().unwrap_or_default(),
-            wanted.bare_specifier.clone().unwrap_or_default(),
-        );
+        let name = wanted.alias.clone().unwrap_or_default();
+        let specifier = wanted.bare_specifier.clone().unwrap_or_default();
+        let version = self.metadata
+            .get(&name)
+            .and_then(|meta| {
+                let selectors = pnpm_resolving_npm_resolver::preferred_selectors(opts, &name);
+                pnpm_resolving_npm_resolver::pick_version_by_version_range(
+                    &pnpm_resolving_npm_resolver::PickVersionByVersionRangeOptions {
+                        meta,
+                        version_range: &specifier,
+                        preferred_version_selectors: selectors.as_deref(),
+                        published_by: None,
+                    },
+                )
+            });
+        let key = (name, version.unwrap_or(specifier));
         Box::pin(async move { Ok(self.table.get(&key).cloned()) })
     }
 
@@ -125,21 +149,46 @@ fn package_version(package_count: usize) -> impl Strategy<Value = PackageVersion
 pub(super) struct Settings {
     pub(super) peers_suffix_max_length: usize,
     pub(super) auto_install_peers: bool,
+    pub(super) catalogs: bool,
+    pub(super) injected: bool,
+    pub(super) format: pnpm_lockfile::LockfileFormat,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { peers_suffix_max_length: 1000, auto_install_peers: true }
+        Self {
+            peers_suffix_max_length: 1000,
+            auto_install_peers: true,
+            catalogs: false,
+            injected: false,
+            format: pnpm_lockfile::LockfileFormat::V9,
+        }
     }
 }
 
 pub(super) fn settings() -> impl Strategy<Value = Settings> {
-    (prop::sample::select(vec![1000usize, 20usize]), any::<bool>()).prop_map(
-        |(peers_suffix_max_length, auto_install_peers)| Settings {
-            peers_suffix_max_length,
-            auto_install_peers,
-        },
+    (
+        prop::sample::select(vec![1000usize, 20usize]),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
     )
+        .prop_map(
+            |(peers_suffix_max_length, auto_install_peers, catalogs, injected, next_format)| {
+                Settings {
+                    peers_suffix_max_length,
+                    auto_install_peers,
+                    catalogs,
+                    injected,
+                    format: if next_format {
+                        pnpm_lockfile::LockfileFormat::V13
+                    } else {
+                        pnpm_lockfile::LockfileFormat::V9
+                    },
+                }
+            },
+        )
 }
 
 /// Two to five packages, each at both [`MAJORS`], depended on by one to
@@ -230,7 +279,11 @@ fn exact(major: u8) -> String {
 
 /// `dependencies` and `peerDependencies` (with `peerDependenciesMeta`)
 /// of `p{index}` at `version`.
-fn package_manifest(index: usize, major: u8, version: &PackageVersion) -> serde_json::Value {
+pub(super) fn package_manifest(
+    index: usize,
+    major: u8,
+    version: &PackageVersion,
+) -> serde_json::Value {
     let mut dependencies = serde_json::Map::new();
     let mut peers = serde_json::Map::new();
     let mut peers_meta = serde_json::Map::new();
@@ -267,29 +320,48 @@ fn package_manifest(index: usize, major: u8, version: &PackageVersion) -> serde_
     })
 }
 
-/// The form a caret range takes once auto-installed peers merge it with
-/// the other ranges that want the same peer.
-fn desugared_caret(major: u8) -> String {
-    format!(">={major}.0.0 <{}.0.0-0", major + 1)
-}
-
-/// Each package answers its caret range in both spellings, its exact
-/// version, and `*` (the highest version).
-pub(super) fn stub_resolver(workspace: &Workspace) -> StubResolver {
+/// Resolve generated registry packages with the production version picker.
+pub(super) fn stub_resolver(
+    workspace: &Workspace,
+    fixture: &super::fixture::Fixture,
+) -> StubResolver {
     let mut table = HashMap::default();
+    let mut metadata = HashMap::default();
     for (index, versions) in workspace.packages.iter().enumerate() {
         let name = package_name(index);
+        let published: BTreeMap<_, _> = MAJORS
+            .into_iter()
+            .zip(versions)
+            .map(|(major, version)| (exact(major), package_manifest(index, major, version)))
+            .collect();
+        metadata.insert(
+            name.clone(),
+            serde_json::from_value(serde_json::json!({
+                "name": name, "dist-tags": { "latest": "2.0.0" }, "versions": published,
+            }))
+            .unwrap(),
+        );
         for (major, version) in MAJORS.into_iter().zip(versions) {
             let result = fake_result(&name, &exact(major), package_manifest(index, major, version));
-            table.insert((name.clone(), caret(major)), result.clone());
-            table.insert((name.clone(), exact(major)), result.clone());
-            table.insert((name.clone(), desugared_caret(major)), result.clone());
-            if major == MAJORS[MAJORS.len() - 1] {
-                table.insert((name.clone(), "*".to_string()), result);
-            }
+            table.insert((name.clone(), exact(major)), result);
         }
     }
-    StubResolver { table }
+    if let Some((_, manifest)) = fixture.manifests
+        .iter()
+        .find(|(id, _)| id == "shared")
+    {
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest.path()).unwrap()).unwrap();
+        let mut result = fake_result("shared", "1.0.0", value);
+        result.id = "file:shared".to_string().into();
+        result.resolved_via = "workspace".to_string();
+        result.resolution =
+            pnpm_lockfile::LockfileResolution::Directory(pnpm_lockfile::DirectoryResolution {
+                directory: "shared".to_string(),
+            });
+        table.insert(("shared".to_string(), "workspace:*".to_string()), result);
+    }
+    StubResolver { table, metadata }
 }
 
 /// The `dependencies` of one importer, by alias.
@@ -310,7 +382,7 @@ pub(super) struct Outcome {
 }
 
 pub(super) fn outcome_of(result: &ResolveWorkspaceResult, workspace: &Workspace) -> Outcome {
-    let direct = IMPORTER_IDS
+    let mut direct: BTreeMap<_, _> = IMPORTER_IDS
         .iter()
         .zip(&workspace.importers)
         .map(|(id, edges)| {
@@ -318,11 +390,14 @@ pub(super) fn outcome_of(result: &ResolveWorkspaceResult, workspace: &Workspace)
             let declared = importer_dependencies(edges);
             let kept = resolved
                 .into_iter()
-                .filter(|(alias, _)| declared.contains_key(alias))
+                .filter(|(alias, _)| declared.contains_key(alias) || alias == "shared")
                 .collect();
             ((*id).to_string(), kept)
         })
         .collect();
+    if let Some(shared) = result.peers.direct_dependencies_by_importer.get("shared") {
+        direct.insert("shared".to_string(), stringify_edges(shared));
+    }
     let graph = result.peers.graph
         .values()
         .map(|node| (node.dep_path.to_string(), stringify_edges(&node.edges.children)))
@@ -349,9 +424,9 @@ pub(super) fn lockfile_with_settings(
     workspace: &Workspace,
     settings: Settings,
 ) -> Lockfile {
-    let manifests = super::manifests(workspace);
+    let fixture = super::fixture::Fixture::new(workspace, settings);
     let mut options = single_importer_opts(
-        &manifests[0].1,
+        &fixture.manifests[0].1,
         &result.peers.graph,
         BTreeMap::new(),
         settings.auto_install_peers,
@@ -361,21 +436,30 @@ pub(super) fn lockfile_with_settings(
     );
     options.settings.peers_suffix_max_length =
         Some(settings.peers_suffix_max_length.try_into().unwrap());
-    options.importers = IMPORTER_IDS
+    options.catalogs = &fixture.catalogs;
+    options.metadata_sources.lockfile_format = settings.format;
+    options.settings.resolution =
+        crate::fast_update_settings::resolution_settings_from_config(&fixture.config(settings));
+    options.importers = fixture.manifests
         .iter()
-        .zip(&manifests)
-        .map(|(id, (_, manifest))| {
+        .map(|(id, manifest)| {
             (
-                (*id).to_string(),
+                id.clone(),
                 crate::ImporterLockfileInput {
                     manifest,
-                    direct_dependencies_by_alias: result.peers.direct_dependencies_by_importer[*id]
+                    direct_dependencies_by_alias: result.peers.direct_dependencies_by_importer[id]
                         .clone(),
                 },
             )
         })
         .collect();
-    let lockfile = crate::dependencies_graph_to_lockfile(options).expect("write generated graph");
+    let mut lockfile =
+        crate::dependencies_graph_to_lockfile(options).expect("write generated graph");
+    lockfile.lockfile_version = settings.format.version();
+    round_trip(&lockfile)
+}
+
+pub(super) fn round_trip(lockfile: &Lockfile) -> Lockfile {
     let yaml = lockfile.to_yaml_string().expect("serialize generated lockfile");
     Lockfile::parse(&yaml, std::path::Path::new(Lockfile::FILE_NAME))
         .expect("parse generated lockfile")

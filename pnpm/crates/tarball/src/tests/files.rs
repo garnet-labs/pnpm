@@ -1,10 +1,32 @@
 use super::{
-    Arc, ArchiveStoreProjection, AuthHeaders, CafsFileInfo, HashMap, IngestTarballToStore,
-    PackageFilesIndex, PathBuf, PrefetchIntegrityCheck, PrefetchedCasPaths,
-    SharedReportedProgressKeys, SharedVerifiedFilesCache, SilentReporter, StoreIndex,
-    StoreIndexWriter, TarballError, UNREACHABLE_URL, assert_eq, fast_fail_client, gzipped_tar,
-    integrity, prefetch_cas_paths, store_index_cache_key, store_index_key, store_paths, tempdir,
-    tempdir_with_leaked_path, test_retry_opts,
+    Arc,
+    ArchiveStoreProjection,
+    AuthHeaders,
+    CafsFileInfo,
+    HashMap,
+    IngestTarballToStore,
+    PackageFilesIndex,
+    PathBuf,
+    PrefetchIntegrityCheck,
+    PrefetchedCasPaths,
+    SharedReportedProgressKeys,
+    SharedVerifiedFilesCache,
+    SilentReporter,
+    StoreIndex,
+    StoreIndexWriter,
+    TarballError,
+    UNREACHABLE_URL,
+    assert_eq,
+    fast_fail_client,
+    gzipped_tar,
+    integrity,
+    prefetch_cas_paths,
+    store_index_cache_key,
+    store_index_key,
+    store_paths,
+    tempdir,
+    tempdir_with_leaked_path,
+    test_retry_opts,
 };
 
 /// When the `SQLite` index already has an entry for this
@@ -82,7 +104,7 @@ async fn reuses_cached_cas_paths_when_index_entry_is_live() {
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: StoreIndex::shared_readonly_in(store_path),
             index_writer: None,
             verify_integrity: true,
@@ -137,7 +159,7 @@ async fn reuses_prefetched_cas_paths_when_provided() {
     let pkg_id = "fake@1.0.0";
     let cache_key = store_index_key(&pkg_integrity.to_string(), pkg_id);
 
-    // Synthetic cas-path map — its values just need to be returned
+    // Synthetic cas-path map; its values just need to be returned
     // verbatim by the prefetched short-circuit. They don't need to
     // resolve to anything on disk because no integrity check runs
     // on this path.
@@ -168,7 +190,7 @@ async fn reuses_prefetched_cas_paths_when_provided() {
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: None,
             index_writer: None,
             verify_integrity: true,
@@ -179,7 +201,7 @@ async fn reuses_prefetched_cas_paths_when_provided() {
 
         // No SQLite handle: any fall-through to the per-snapshot
         // SQLite lookup would just miss, so a network attempt
-        // would follow — and that would fail against the
+        // would follow, and that would fail against the
         // unreachable URL below, failing the test.
         requester: "",
 
@@ -259,6 +281,16 @@ async fn prefetch_cas_paths_returns_hits_for_live_index_rows() {
 
 #[tokio::test]
 async fn prefetch_cas_paths_recomputes_requires_build_for_legacy_rows() {
+    assert_eq!(legacy_row_requires_build(ManifestInIndex::Bundled).await, Some(true));
+    assert_eq!(legacy_row_requires_build(ManifestInIndex::NotBundled).await, Some(true));
+}
+
+enum ManifestInIndex {
+    Bundled,
+    NotBundled,
+}
+
+async fn legacy_row_requires_build(manifest_in_index: ManifestInIndex) -> Option<bool> {
     let (store_dir, store_path) = tempdir_with_leaked_path();
 
     let manifest_bytes = br#"{"name":"fake","scripts":{"postinstall":"node build.js"}}"#;
@@ -285,7 +317,10 @@ async fn prefetch_cas_paths_recomputes_requires_build_for_legacy_rows() {
         },
     );
     let entry = PackageFilesIndex {
-        manifest: Some(serde_json::from_slice(manifest_bytes).unwrap()),
+        manifest: match manifest_in_index {
+            ManifestInIndex::Bundled => Some(serde_json::from_slice(manifest_bytes).unwrap()),
+            ManifestInIndex::NotBundled => None,
+        },
         requires_build: None,
         requires_prepare: None,
         algo: "sha512".to_string(),
@@ -309,8 +344,8 @@ async fn prefetch_cas_paths_recomputes_requires_build_for_legacy_rows() {
 
     let map = prefetched.cas_paths.get(&index_key).expect("hit");
     assert_eq!(map.get("package.json").map(|file| &file.path), Some(&pkg_json_path.path));
-    assert_eq!(prefetched.requires_build.get(&index_key), Some(&true));
     drop(store_dir);
+    prefetched.requires_build.get(&index_key).copied()
 }
 
 /// Rows written before [pnpm/pnpm#17224](https://github.com/pnpm/pnpm/issues/17224)
@@ -416,7 +451,7 @@ async fn prefetch_cas_paths_rereads_gypfile_for_rows_that_predate_it() {
 
 /// With `verify_store_integrity = false`, `prefetch_cas_paths`
 /// goes through `build_file_maps_from_index` instead of
-/// `check_pkg_files_integrity` — the index row is trusted and
+/// `check_pkg_files_integrity`, the index row is trusted and
 /// no `fs::metadata` syscalls run per file. The result must
 /// still surface an entry for the requested key, even when no
 /// CAFS blob exists on disk; correctness is left to the caller's
@@ -664,7 +699,7 @@ async fn falls_through_when_cafs_file_missing() {
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: StoreIndex::shared_readonly_in(store_path),
             index_writer: None,
             verify_integrity: true,
@@ -746,7 +781,7 @@ async fn falls_through_when_cafs_path_is_a_directory() {
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: StoreIndex::shared_readonly_in(store_path),
             index_writer: None,
             verify_integrity: true,
@@ -860,7 +895,7 @@ async fn raw_archive_projection_ignores_legacy_package_rows() {
             id: package_id,
         },
         store: crate::ArchiveStoreContext {
-            dir: store_path,
+            dir: std::borrow::Cow::Borrowed(store_path),
             index: StoreIndex::shared_readonly_in(store_path),
             index_writer: Some(Arc::clone(&writer)),
             verify_integrity: true,

@@ -1,7 +1,19 @@
-use super::{BoundProviders, PeerBindings};
-use crate::{Lockfile, PkgNameVerPeer};
+use super::{
+    BoundProviders,
+    PeerBindings,
+};
+use crate::{
+    Lockfile,
+    PkgNameVerPeer,
+};
 use pretty_assertions::assert_eq;
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write,
+    path::{
+        Path,
+        PathBuf,
+    },
+};
 
 fn key(text: &str) -> PkgNameVerPeer {
     text.parse().expect("parse key")
@@ -59,6 +71,143 @@ snapshots:
     assert!(!providers.is_hashed());
     assert!(providers.binds(&key("bound@1.0.0")));
     assert!(!providers.binds(&key("own@2.0.0")));
+    let recorded = BoundProviders::from_recorded_snapshot((&lockfile).into(), &pkg_key);
+    assert!(recorded.is_hashed());
+    assert!(recorded.binds(&key("own@2.0.0")));
+}
+
+#[test]
+fn linked_peer_does_not_spend_the_snapshot_recovery_budget() {
+    let suffix = PeerBindings::Explicit(vec!["bound@1.0.0".to_string()]).to_suffix(3).unwrap();
+    let consumer = key(&format!("consumer@1.0.0{suffix}"));
+    let mut declarations = String::from("      linked: '*'\n");
+    let mut dependencies = String::from("      linked: link:packages/linked\n");
+    for name in
+        std::iter::once("bound".to_owned()).chain((0..11).map(|index| format!("provider-{index}")))
+    {
+        writeln!(declarations, "      {name}: '*'").unwrap();
+        writeln!(dependencies, "      {name}: 1.0.0").unwrap();
+    }
+    let lockfile: Lockfile = serde_saphyr::from_str(&format!(
+        "lockfileVersion: '9.0'
+packages:
+  consumer@1.0.0:
+    resolution: {{integrity: sha512-AAAA}}
+    peerDependencies:
+{declarations}snapshots:
+  {consumer}:
+    dependencies:
+{dependencies}",
+    ))
+    .unwrap();
+    let providers = BoundProviders::of_snapshot((&lockfile).into(), &consumer);
+    assert!(!providers.is_hashed());
+    assert!(providers.binds(&key("bound@1.0.0")));
+    assert!(!providers.binds(&key("linked@packages+linked")));
+    assert!(!providers.binds(&key("provider-0@1.0.0")));
+}
+
+#[test]
+fn bound_providers_recovers_mixed_cycle_cut_groups() {
+    let suffix = PeerBindings::Explicit(vec![
+        "bound@1.0.0(child@1.0.0)".to_string(),
+        "cut@1.0.0".to_string(),
+    ])
+    .to_suffix(3)
+    .unwrap();
+    let root = key(&format!("root@1.0.0{suffix}"));
+    let yaml = format!(
+        r"lockfileVersion: '9.0'
+packages:
+  root@1.0.0:
+    resolution: {{integrity: sha512-AAAA}}
+    peerDependencies:
+      bound: ^1.0.0
+      cut: ^1.0.0
+      own: ^2.0.0
+snapshots:
+  '{root}':
+    dependencies:
+      bound: 1.0.0(child@1.0.0)
+      cut: 1.0.0(root@1.0.0)
+      own: 2.0.0
+",
+    );
+    let lockfile: Lockfile = serde_saphyr::from_str(&yaml).unwrap();
+    let providers = BoundProviders::of_snapshot(
+        crate::LockfileEntries {
+            packages: lockfile.packages.as_ref(),
+            snapshots: lockfile.snapshots.as_ref(),
+        },
+        &root,
+    );
+    assert!(!providers.is_hashed());
+    assert!(providers.binds(&key("bound@1.0.0")));
+    assert!(providers.binds(&key("cut@1.0.0")));
+    assert!(!providers.binds(&key("own@2.0.0")));
+}
+
+#[test]
+fn bound_providers_recovers_a_cycle_cut_among_many_nested_providers_and_an_own_dependency() {
+    let bound: Vec<String> = (0..10)
+        .map(|index| format!("bound-{index}"))
+        .collect();
+    let mut groups: Vec<String> = bound
+        .iter()
+        .map(|name| format!("{name}@1.0.0(child@1.0.0)"))
+        .collect();
+    groups.push("cut@1.0.0".to_string());
+    let suffix = PeerBindings::Explicit(groups).to_suffix(3).unwrap();
+    let root = key(&format!("root@1.0.0{suffix}"));
+    let peer_ranges = bound
+        .iter()
+        .map(|name| format!("      {name}: ^1.0.0\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let bound_dependencies = bound
+        .iter()
+        .map(|name| format!("      {name}: 1.0.0(child@1.0.0)\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    let bound_snapshots = bound
+        .iter()
+        .map(|name| {
+            format!("  '{name}@1.0.0(child@1.0.0)':\n    dependencies:\n      child: 1.0.0\n")
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    let yaml = format!(
+        r"lockfileVersion: '9.0'
+packages:
+  root@1.0.0:
+    resolution: {{integrity: sha512-AAAA}}
+    peerDependencies:
+      a-own: ^1.0.0
+      cut: ^1.0.0
+{peer_ranges}snapshots:
+  '{root}':
+    dependencies:
+      a-own: 1.0.0(child@1.0.0)
+      cut: 1.0.0(child@1.0.0)
+{bound_dependencies}  'a-own@1.0.0(child@1.0.0)':
+    dependencies:
+      child: 1.0.0
+  'cut@1.0.0(child@1.0.0)':
+    dependencies:
+      child: 1.0.0
+      root: '{root_ref}'
+  child@1.0.0: {{}}
+{bound_snapshots}",
+        root_ref = root.suffix,
+    );
+    let lockfile: Lockfile = serde_saphyr::from_str(&yaml).unwrap();
+    let providers = BoundProviders::of_snapshot((&lockfile).into(), &root);
+    assert!(!providers.is_hashed());
+    for name in &bound {
+        assert!(providers.binds(&key(&format!("{name}@1.0.0"))));
+    }
+    assert!(providers.binds(&key("cut@1.0.0")));
+    assert!(!providers.binds(&key("a-own@1.0.0")));
 }
 
 #[test]
@@ -173,6 +322,58 @@ packages:
 }
 
 #[test]
+fn unmatched_hash_with_many_provider_candidates_stays_unknown() {
+    let suffix =
+        PeerBindings::Explicit(vec!["provider@9000.0.0".to_string()]).to_suffix(3).unwrap();
+    let root = key(&format!("root@1.0.0{suffix}"));
+    let mut snapshots = std::collections::HashMap::new();
+    let mut root_dependencies = std::collections::HashMap::new();
+    for index in 0..600 {
+        let name = format!("branch-{index}");
+        root_dependencies.insert(
+            name.parse().unwrap(),
+            crate::SnapshotDepRef::Plain("1.0.0".parse().unwrap()),
+        );
+        snapshots.insert(
+            key(&format!("{name}@1.0.0")),
+            crate::SnapshotEntry {
+                dependencies: Some(std::collections::HashMap::from([(
+                    "provider".parse().unwrap(),
+                    crate::SnapshotDepRef::Plain(
+                        format!("{}.0.0(child@1.0.0)", index + 1).parse().unwrap(),
+                    ),
+                )])),
+                ..Default::default()
+            },
+        );
+    }
+    snapshots.insert(
+        root.clone(),
+        crate::SnapshotEntry {
+            dependencies: Some(root_dependencies),
+            transitive_peer_dependencies: Some(vec!["provider".to_string()]),
+            ..Default::default()
+        },
+    );
+    let lockfile: Lockfile = serde_saphyr::from_str(
+        r"lockfileVersion: '9.0'
+packages:
+  root@1.0.0:
+    resolution: {integrity: sha512-AAAA}
+",
+    )
+    .unwrap();
+    let providers = BoundProviders::of_snapshot(
+        crate::LockfileEntries {
+            packages: lockfile.packages.as_ref(),
+            snapshots: Some(&snapshots),
+        },
+        &root,
+    );
+    assert!(providers.is_hashed());
+}
+
+#[test]
 fn an_explicit_suffix_names_its_providers_in_order() {
     let bindings = PeerBindings::from_key(&key("a@1.0.0(b@2.0.0(c@1.0.0))(c@1.0.0)")).unwrap();
     let providers: Vec<String> = bindings
@@ -276,4 +477,66 @@ fn bindings_round_trip_through_every_checked_in_lockfile() {
         }
     }
     assert!(checked > 0, "no snapshot with peers found under {}", repo_root.display());
+}
+
+#[test]
+fn snapshot_bindings_preserve_recorded_peer_contexts() {
+    let full = BoundProviders::from_key(&key("parent@1.0.0(provider@1.0.0(nested@1.0.0))"));
+    assert!(full.binds_snapshot(&key("provider@1.0.0(nested@1.0.0)")));
+    assert!(!full.binds_snapshot(&key("provider@1.0.0(nested@2.0.0)")));
+    assert!(!full.binds_snapshot(&key("provider@1.0.0")));
+    let bare = BoundProviders::from_key(&key("parent@1.0.0(provider@1.0.0)"));
+    assert!(bare.binds_snapshot(&key("provider@1.0.0(nested@2.0.0)")));
+    assert!(!bare.binds_snapshot(&key("provider@2.0.0(nested@2.0.0)")));
+}
+
+#[test]
+fn recorded_bindings_only_describe_the_key_that_created_them() {
+    let peers = [pnpm_deps_path::PeerId::DepPath("provider@1.0.0(nested@2.0.0)".into())];
+    let suffix = super::PeerBindings::suffix_of(&peers, 3);
+    for patch in ["", "(patch_hash=abc123)"] {
+        let original: crate::PkgNameVerPeer =
+            format!("consumer@1.0.0{patch}{suffix}").parse().unwrap();
+        let renamed: crate::PkgNameVerPeer =
+            format!("consumer@2.0.0{patch}{suffix}").parse().unwrap();
+        let entry = crate::SnapshotEntry {
+            recorded_peer_bindings: super::RecordedPeerBindings::for_dep_path(
+                &original.to_string().into(),
+                &peers,
+            ),
+            ..Default::default()
+        };
+        let snapshots = [(original.clone(), entry.clone()), (renamed.clone(), entry)].into();
+        let entries = crate::LockfileEntries { snapshots: Some(&snapshots), packages: None };
+        let providers = super::BoundProviders::from_recorded_snapshot(entries, &original);
+        assert_eq!(
+            providers
+                .provider_keys(&"provider@1.0.0".parse().unwrap())
+                .unwrap(),
+            &["provider@1.0.0(nested@2.0.0)".parse().unwrap()].into(),
+        );
+        assert!(super::BoundProviders::from_recorded_snapshot(entries, &renamed).is_hashed());
+    }
+}
+
+#[test]
+fn recorded_peer_keys_preserve_suffix_order_and_duplicate_groups() {
+    use pnpm_deps_path::PeerId;
+    let peers = [
+        PeerId::DepPath("second@2.0.0(nested@3.0.0)".into()),
+        PeerId::DepPath("first@1.0.0".into()),
+        PeerId::DepPath("first@1.0.0".into()),
+    ];
+    let suffix = super::PeerBindings::suffix_of(&peers, 3);
+    let key = format!("consumer@1.0.0{suffix}").parse().unwrap();
+    let bindings = super::RecordedPeerBindings::for_key(&key, &peers).unwrap();
+    let keys: Vec<_> = bindings
+        .peer_keys_for(&key)
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(keys, ["first@1.0.0", "first@1.0.0", "second@2.0.0(nested@3.0.0)"]);
+    let renamed = format!("consumer@2.0.0{suffix}").parse().unwrap();
+    assert!(bindings.peer_keys_for(&renamed).is_none());
 }

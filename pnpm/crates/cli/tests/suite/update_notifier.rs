@@ -5,16 +5,28 @@
 #[cfg(unix)]
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
 #[cfg(unix)]
 use pnpm_testing_utils::command_env::CommandTestExt;
 use serde_json::Value;
 use std::{
     fs,
     net::TcpListener,
-    path::{Path, PathBuf},
-    process::{Command, Output},
-    time::{Duration, Instant},
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::{
+        Command,
+        Output,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 /// A pnpm the mocked registry can serve as `latest`, far enough ahead that
@@ -39,7 +51,7 @@ fn fixture() -> Fixture {
         npmrc_info,
         ..
     } = CommandTempCwd::init().add_mocked_registry_with_pnpm_version(NEWER_PNPM);
-    pacquet.env("PNPM_CONFIG_UPDATE_NOTIFIER", "true");
+    pacquet = pacquet.with_env("PNPM_CONFIG_UPDATE_NOTIFIER", "true");
     let state_dir = root.path().join("pnpm-state");
     Fixture { pacquet, state_dir, workspace, root, npmrc_info }
 }
@@ -119,7 +131,7 @@ fn update_notifier_off_skips_the_check_entirely() {
         npmrc_info,
     } = fixture();
     // Drop the fixture's opt-in so the workspace manifest is what decides.
-    pacquet.env_remove("PNPM_CONFIG_UPDATE_NOTIFIER");
+    pacquet = pacquet.without_env("PNPM_CONFIG_UPDATE_NOTIFIER");
     append_to_workspace_yaml(&workspace, "updateNotifier: false\n");
 
     let output = install(pacquet, &state_dir);
@@ -193,7 +205,7 @@ fn a_check_recorded_today_silences_the_next_install() {
         ..
     } = fixture();
     fs::create_dir_all(&state_dir).expect("create the state dir");
-    let today = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let today = jiff::Timestamp::now().strftime("%a, %d %b %Y %H:%M:%S GMT").to_string();
     fs::write(state_file(&state_dir), serde_json::json!({ "lastUpdateCheck": today }).to_string())
         .expect("write pnpm-state.json");
 

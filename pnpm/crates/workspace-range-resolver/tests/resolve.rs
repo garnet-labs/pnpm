@@ -1,4 +1,7 @@
-use pnpm_workspace_range_resolver::resolve_workspace_range;
+use pnpm_workspace_range_resolver::{
+    matches_any_workspace_version,
+    resolve_workspace_range,
+};
 
 fn versions() -> Vec<String> {
     vec!["1.0.0".to_string(), "2.0.0".to_string(), "3.0.0-beta.1".to_string()]
@@ -22,6 +25,18 @@ fn resolves_tilde_to_max_version_including_prereleases() {
 #[test]
 fn resolves_empty_string_to_max_version_including_prereleases() {
     assert_eq!(resolve_workspace_range("", &versions()).as_deref(), Some("3.0.0-beta.1"));
+}
+
+#[test]
+fn a_union_with_a_sentinel_branch_matches_any_workspace_version() {
+    assert!(matches_any_workspace_version("^ || ^4.0.0"));
+    assert!(matches_any_workspace_version("^4.0.0 ||*"));
+    assert!(!matches_any_workspace_version("^4.0.0 || ^5.0.0"));
+}
+
+#[test]
+fn a_plain_range_union_with_star_excludes_prereleases() {
+    assert_eq!(resolve_workspace_range("* || ^1.0.0", &versions()).as_deref(), Some("2.0.0"));
 }
 
 #[test]
@@ -52,7 +67,7 @@ fn resolves_wildcards_to_a_non_semver_version_when_no_semver_version_is_present(
     assert_eq!(resolve_workspace_range("*", &owned(&["1", "2"])).as_deref(), Some("2"));
     assert_eq!(resolve_workspace_range("*", &owned(&["1", "1.0.0"])).as_deref(), Some("1.0.0"));
     assert_eq!(
-        resolve_workspace_range("*", &owned(&["\u{10000}", "\u{E000}"])).as_deref(),
+        resolve_workspace_range("*", &owned(&["𐀀", "\u{E000}"])).as_deref(),
         Some("\u{E000}"),
     );
 }

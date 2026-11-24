@@ -13,19 +13,39 @@
 //! publish runs before accepting bytes.
 
 pub use publishing::{
-    CrateArchiveError, PublishBodyError, PublishDependency, PublishMetadata, PublishMetadataError,
-    parse_publish_body, validate_crate_archive,
+    CrateArchiveError,
+    PublishBodyError,
+    PublishDependency,
+    PublishMetadata,
+    PublishMetadataError,
+    parse_publish_body,
+    validate_crate_archive,
 };
 
-pub use pnpr_package_name::{CrateNameError, MAX_CRATE_NAME_LEN};
+pub use pnpr_package_name::{
+    CrateNameError,
+    MAX_CRATE_NAME_LEN,
+};
 
 mod publishing;
 
-use derive_more::{Display, Error};
+use derive_more::{
+    Display,
+    Error,
+};
 use pnpr_package_name::canonicalize_crate_name;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::Read};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+};
 
 /// The URL segment under a registry endpoint where the sparse index lives:
 /// `/~<name>/index/config.json`, `/~<name>/index/se/rd/serde`.
@@ -203,16 +223,21 @@ pub struct CrateDocument {
     /// no description, so this is the only place a hosted crate has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The account IDs that may publish to this crate, recorded by its first
+    /// publish. When empty, `$owners` admits only admins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
 }
 
 impl CrateDocument {
     #[must_use]
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: String) -> Self {
         Self {
             format_version: CRATE_DOCUMENT_FORMAT_VERSION,
-            name: name.to_string(),
+            name,
             versions: Vec::new(),
             description: None,
+            owners: Vec::new(),
         }
     }
 

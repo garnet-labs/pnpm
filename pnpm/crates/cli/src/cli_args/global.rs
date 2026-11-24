@@ -10,84 +10,199 @@ pub mod rust;
 
 pub use builds::approve_global_builds;
 pub use legacy::migrate_legacy_global_packages;
-pub use remove::{handle_global_remove, remove_global_groups};
-pub use selectors::{has_pnpm_cli_dependency, selects_pnpm_cli};
+pub use remove::{
+    handle_global_remove,
+    remove_global_groups,
+};
+pub use selectors::{
+    has_pnpm_cli_dependency,
+    selects_pnpm_cli,
+};
 
 mod activation;
 
 use self::activation::{
-    ActivationBinSets, ArtifactCleanupError, FsRename,
-    activate_global_install_with_extra_bin_names, get_actual_bin_names, hash_linked_packages,
+    ActivationBinSets,
+    ArtifactCleanupError,
+    FsRename,
+    activate_global_install_with_extra_bin_names,
+    get_actual_bin_names,
+    hash_linked_packages,
     replace_global_bin_slots,
 };
 use crate::{
     State,
     cli_args::{
-        add::{AddGroups, AddRequest, add_packages, apply_allow_build},
+        add::{
+            AddGroups,
+            AddRequest,
+            add_packages,
+            apply_allow_build,
+        },
         approve_builds::{
-            ApproveBuildsArgs, clear_decided_ignored_builds, prompt_approve_install_builds,
-            write_approval_settings,
+            ApprovalStore,
+            ApproveBuildsArgs,
+            GlobalPackagesStore,
+            clear_decided_ignored_builds,
+            exclude_disallowed_builds,
+            load_global_packages_config,
+            load_legacy_global_settings,
+            prompt_approve_install_builds,
         },
         global_bin_lock::acquire_global_bin_lock,
-        ignored_builds::{IgnoredBuildsScan, get_automatically_ignored_builds},
+        ignored_builds::{
+            IgnoredBuildsScan,
+            get_automatically_ignored_builds,
+        },
         rebuild::run_rebuild,
         shim::{
-            record_package_manager_shims, virtual_shim_bins_to_restore, virtual_shim_owner,
+            record_package_manager_shims,
+            virtual_shim_bins_to_restore,
+            virtual_shim_owner,
             virtual_shim_restoration_owners,
         },
     },
-    engine_pm::selector::{rust_toolchain_request, tool_install_selector},
-    shim_dispatch::{ShimTarget, install_native_shim, migrate_legacy_shims, remove_native_shim},
+    engine_pm::selector::{
+        rust_toolchain_request,
+        tool_install_selector,
+    },
+    shim_dispatch::{
+        ShimTarget,
+        install_native_shim,
+        migrate_legacy_shims,
+        remove_native_shim,
+    },
 };
 
-use cleanup::discard_install_dir_on_error;
-use derive_more::{Display, Error};
-use install::{
-    GlobalInstallTarget, GroupActivation, GroupInstall, global_group_config, is_plain_version_spec,
-    pins_for_downgrades, run_group_install,
+use build_policy::{
+    apply_global_build_policy,
+    global_approval_store,
+    warn_about_legacy_global_settings,
 };
-use miette::{Context, Diagnostic, IntoDiagnostic};
+use cleanup::discard_install_dir_on_error;
+use derive_more::{
+    Display,
+    Error,
+};
+use install::{
+    GlobalInstallTarget,
+    GroupActivation,
+    GroupInstall,
+    global_group_config,
+    run_group_install,
+};
+use miette::{
+    Context,
+    Diagnostic,
+    IntoDiagnostic,
+};
 use node_semver::Version;
 use pnpm_cmd_shim::{
-    Host as CmdShimHost, LinkBinsOptions, PackageBinSource, choose_bins,
-    link_bins_of_packages_with_excludes, remove_bin as remove_cmd_shim,
+    Host as CmdShimHost,
+    LinkBinsOptions,
+    PackageBinSource,
+    choose_bins,
+    link_bins_of_packages_with_excludes,
+    remove_bin as remove_cmd_shim,
 };
-use pnpm_config::{CatalogMode, Config, GlobalShims, WorkspaceSettings, check_global_bin_dir};
-use pnpm_fs::{is_subdir, lexical_normalize, remove_symlink_dir, symlink_dir};
+use pnpm_config::{
+    CatalogMode,
+    Config,
+    GlobalShims,
+    WorkspaceSettings,
+    check_global_bin_dir,
+};
+use pnpm_fs::{
+    is_subdir,
+    remove_symlink_dir,
+    symlink_dir,
+};
 use pnpm_global::{
-    GlobalPackageInfo, check_global_bin_conflicts, clean_orphaned_install_dirs,
-    create_global_cache_key, create_install_dir, find_global_package, get_hash_link,
-    get_installed_bin_names, installed_versions, is_global_install_subdir,
-    read_direct_dependencies, read_installed_packages, scan_global_packages,
+    GlobalPackageInfo,
+    check_global_bin_conflicts,
+    clean_orphaned_install_dirs,
+    create_global_cache_key,
+    create_install_dir,
+    find_global_package,
+    get_hash_link,
+    get_installed_bin_names,
+    installed_versions,
+    is_global_install_subdir,
+    read_direct_dependencies,
+    read_installed_packages,
+    scan_global_packages,
 };
-use pnpm_lockfile::{ImporterDepVersion, Lockfile};
+use pnpm_lockfile::Lockfile;
 use pnpm_package_is_installable::SupportedArchitectures;
-use pnpm_package_manifest::{DependencyGroup, safe_read_package_json_from_dir};
+use pnpm_package_manifest::{
+    DependencyGroup,
+    safe_read_package_json_from_dir,
+};
 use pnpm_package_name::is_valid_old_npm_package_name;
 use pnpm_registry::RangeSpecStyle;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, PnpmLog, Reporter, SummaryLog};
+use pnpm_reporter::{
+    GlobalLog,
+    LogEvent,
+    LogLevel,
+    PnpmLog,
+    Reporter,
+    SummaryLog,
+};
 use pnpm_resolving_local_resolver::local_file_path;
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 
 use remove::{
-    FsGlobalRemoval, GlobalPackageBinSnapshot, cleanup_replaced_global_installs,
-    collect_existing_global_installs, snapshot_global_package,
+    FsGlobalRemoval,
+    GlobalPackageBinSnapshot,
+    cleanup_replaced_global_installs,
+    collect_existing_global_installs,
+    snapshot_global_package,
 };
 use selectors::{
-    SelectorGroup, groups_matching_params, infer_local_package_alias, missing_file_source_warning,
-    replacement_aliases, should_replace_existing_package, split_into_groups, take_rust_toolchains,
-    tool_install_selectors, update_selectors,
+    SelectorGroup,
+    groups_matching_params,
+    infer_local_package_alias,
+    parse_npm_spec_body,
+    replacement_aliases,
+    should_replace_existing_package,
+    split_into_groups,
+    take_rust_toolchains,
+    tool_install_selectors,
+};
+use tag_selectors::tag_checked_selectors;
+use update_selectors::{
+    apply_pins,
+    apply_runtime_range_bumps,
+    is_registry_version_spec,
+    missing_file_source_warning,
+    moves_past_declared_range,
+    needs_runtime_range_bump,
+    update_selectors,
 };
 
 use shims::{
-    ReplacedGlobalBinPlan, bin_names_of_other_groups, check_virtual_shim_conflicts,
-    link_global_bins, plan_replaced_global_bins, restore_virtual_shims, unprotected_bin_names,
+    ReplacedGlobalBinPlan,
+    bin_names_of_other_groups,
+    check_virtual_shim_conflicts,
+    link_global_bins,
+    plan_replaced_global_bins,
+    restore_virtual_shims,
+    unprotected_bin_names,
     virtual_shims_to_restore,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fs, io,
-    path::{Path, PathBuf},
+    collections::{
+        BTreeMap,
+        BTreeSet,
+        HashMap,
+        HashSet,
+    },
+    fs,
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 /// Errors specific to global package management, carrying the
@@ -177,6 +292,7 @@ pub async fn handle_global_add<Reporter: self::Reporter + 'static>(
 
     let (global_pkg_dir, global_bin_dir) = global_dirs(base_config)?;
     check_bin_dir(&global_bin_dir)?;
+    warn_about_legacy_global_settings::<Reporter>(base_config, &global_pkg_dir)?;
     for channel in rust_channels {
         rust::add_global_rust::<Reporter>(base_config, &global_bin_dir, channel).await?;
     }
@@ -193,30 +309,24 @@ pub async fn handle_global_add<Reporter: self::Reporter + 'static>(
         global_pkg_dir: &global_pkg_dir,
         global_bin_dir: &global_bin_dir,
     };
-    for group in groups {
-        target.add_group::<Reporter>(
-            &group,
-            range_spec_style,
-            supported_architectures.clone(),
-            allow_build,
-        )
-        .await?;
-    }
-    Ok(())
+    target.add_groups::<Reporter>(&groups, range_spec_style, supported_architectures, allow_build)
+        .await
 }
 
 /// `pnpm update -g`. Reinstalls each matching group (within its existing
-/// range, or to `--latest`), then swaps its hash symlink to the new dir.
+/// range, or to the version `--latest` / `--tag` names), then swaps its hash
+/// symlink to the new dir.
 pub async fn handle_global_update<Reporter: self::Reporter + 'static>(
     base_config: &'static Config,
     params: &[String],
     selected_hashes: Option<&HashSet<String>>,
-    latest: bool,
+    mode: GlobalUpdateMode<'_>,
     range_spec_style: RangeSpecStyle,
     supported_architectures: Option<SupportedArchitectures>,
 ) -> miette::Result<()> {
     let (global_pkg_dir, global_bin_dir) = global_dirs(base_config)?;
     check_bin_dir(&global_bin_dir)?;
+    warn_about_legacy_global_settings::<Reporter>(base_config, &global_pkg_dir)?;
     clean_orphaned_install_dirs(&global_pkg_dir);
 
     let (rust_updated, params) =
@@ -242,13 +352,45 @@ pub async fn handle_global_update<Reporter: self::Reporter + 'static>(
     };
     let up_to_date = target.update_groups::<Reporter>(
         &to_update,
-        latest,
+        mode,
         range_spec_style,
         supported_architectures,
     )
     .await?;
     emit_global_update_result::<Reporter>(&global_pkg_dir, up_to_date);
     Ok(())
+}
+
+/// What `update -g` moves each dependency of a group to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalUpdateMode<'a> {
+    /// The highest version inside the range the group records.
+    DeclaredRange,
+    /// The version behind the `latest` dist-tag (`--latest`).
+    Latest,
+    /// The version behind the given dist-tag (`--tag <tag>`).
+    Tag(&'a str),
+}
+
+impl<'a> GlobalUpdateMode<'a> {
+    /// clap rejects `--latest` together with `--tag`, so at most one is set.
+    pub(crate) const fn from_flags(latest: bool, tag: Option<&'a str>) -> Self {
+        match tag {
+            Some(tag) => Self::Tag(tag),
+            None if latest => Self::Latest,
+            None => Self::DeclaredRange,
+        }
+    }
+
+    /// The same target as the version an outdated query compares against.
+    pub(crate) const fn target_version(self) -> crate::cli_args::outdated::TargetVersion<'a> {
+        use crate::cli_args::outdated::TargetVersion;
+        match self {
+            Self::DeclaredRange => TargetVersion::WithinRange,
+            Self::Latest => TargetVersion::Latest,
+            Self::Tag(tag) => TargetVersion::Tag(tag),
+        }
+    }
 }
 
 /// The global groups `pnpm update -g` may reinstall, or `None` after saying
@@ -300,17 +442,24 @@ fn emit_global_update_result<Reporter: self::Reporter>(global_pkg_dir: &Path, up
             prefix: String::new(),
         }));
     }
+    emit_global_summary::<Reporter>(global_pkg_dir);
+}
+
+/// Close a global command that installs several groups with one summary.
+fn emit_global_summary<Reporter: self::Reporter>(global_pkg_dir: &Path) {
     let prefix = global_pkg_dir.to_string_lossy().into_owned();
-    Reporter::emit(&LogEvent::Summary(SummaryLog { level: LogLevel::Debug, prefix }));
+    Reporter::emit(&LogEvent::Summary(SummaryLog {
+        level: LogLevel::Debug,
+        prefix,
+        new_projects: None,
+        project_names: None,
+    }));
 }
 
 /// Surface a non-fatal problem on the `pnpm:global` channel, matching
 /// the TypeScript CLI's `globalWarn`.
-fn warn_global<Reporter: self::Reporter>(message: &str) {
-    Reporter::emit(&LogEvent::Global(GlobalLog {
-        level: LogLevel::Warn,
-        message: message.to_string(),
-    }));
+fn warn_global<Reporter: self::Reporter>(message: String) {
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }));
 }
 
 /// Build the registry map (`{ default, ...scoped }`) hashed into the
@@ -336,7 +485,13 @@ mod shims;
 
 mod selectors;
 
+mod update_selectors;
+
+mod tag_selectors;
+
 mod builds;
+
+mod build_policy;
 
 mod cleanup;
 

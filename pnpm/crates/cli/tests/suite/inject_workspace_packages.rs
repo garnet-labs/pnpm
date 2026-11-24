@@ -15,7 +15,10 @@ mod relative_peers;
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_testing_utils::bin::{
+    AddMockedRegistry,
+    CommandTempCwd,
+};
 use std::fs;
 
 /// Three-project workspace with `injectWorkspacePackages: true`.
@@ -30,7 +33,7 @@ use std::fs;
 /// - install succeeds.
 /// - `pnpm-lock.yaml` carries `settings.injectWorkspacePackages: true`.
 /// - The workspace resolutions are recorded as `file:` (not `link:`)
-///   inside the importer entries — that's the byte-level signal that
+///   inside the importer entries; that's the byte-level signal that
 ///   the global flag took effect.
 /// - The virtual-store directory layout matches the upstream count:
 ///   eight slots, accounting for `is-negative`, two `is-positive`
@@ -136,7 +139,7 @@ fn inject_workspace_packages_writes_file_resolutions_and_lockfile_setting() {
     // (the workspace dir), not relative to each consumer project. So
     // `project-2`'s recorded dep on project-1 reads
     // `file:project-1(...)` even though project-2 lives a directory
-    // away. The ref is the plain `file:` form — the `<name>@<ref>`
+    // away. The ref is the plain `file:` form, the `<name>@<ref>`
     // alias form is reserved for renamed deps, and here the alias
     // equals the package name.
     let parsed: pnpm_lockfile::Lockfile = serde_saphyr::from_str(&lockfile)
@@ -193,7 +196,7 @@ fn inject_workspace_packages_writes_file_resolutions_and_lockfile_setting() {
     // hoist target `node_modules/` (default `hoistPattern: ["*"]`
     // privately hoists every transitive to `<vs>/node_modules/`).
     // Empirically matches pnpm v11.4.0 with the same
-    // `enableGlobalVirtualStore: false` config — pnpm produces the
+    // `enableGlobalVirtualStore: false` config, pnpm produces the
     // same nine entries on the equivalent fixture.
     let dot_pnpm = workspace.join("node_modules/.pnpm");
     let entries: Vec<String> = fs::read_dir(&dot_pnpm)
@@ -229,7 +232,7 @@ fn inject_workspace_packages_writes_file_resolutions_and_lockfile_setting() {
         entries
             .iter()
             .all(|name| !name.contains("file:")),
-        "no virtual-store slot may contain an unescaped `:` — Windows refuses it; \
+        "no virtual-store slot may contain an unescaped `:`, Windows refuses it; \
          entries: {entries:?}",
     );
 
@@ -247,13 +250,13 @@ fn inject_workspace_packages_writes_file_resolutions_and_lockfile_setting() {
 
 /// `dependenciesMeta[<name>].injected = true` opts a single workspace
 /// dep into the `file:` resolution shape even when the global
-/// `injectWorkspacePackages` setting is off — the per-dep variant of
+/// `injectWorkspacePackages` setting is off, the per-dep variant of
 /// the same fixture, with the workspace-level flag unset.
 ///
 /// Two-project workspace: project-2 depends on project-1 via
 /// `workspace:1.0.0`, with `dependenciesMeta.project-1.injected =
 /// true`. The lockfile must record project-1 as a `file:` resolution
-/// inside project-2's importer block — proving the per-dep flag
+/// inside project-2's importer block, proving the per-dep flag
 /// flowed all the way from manifest read to resolver output, even
 /// with the workspace-level `injectWorkspacePackages` unset.
 #[test]
@@ -350,8 +353,8 @@ fn dependencies_meta_injected_per_dep_overrides_global_off() {
         "per-dep inject must NOT fall back to `link:`; got version={version:?}",
     );
 
-    // `lockfile.settings.injectWorkspacePackages` stays absent / false
-    // — this is the per-dep branch, not the global one.
+    // `lockfile.settings.injectWorkspacePackages` stays absent / false;
+    // this is the per-dep branch, not the global one.
     assert!(
         !lockfile.contains("injectWorkspacePackages: true"),
         "global `injectWorkspacePackages` must remain off in the lockfile settings; \
@@ -1543,6 +1546,99 @@ fn filtered_frozen_install_accepts_a_peer_a_read_package_hook_adds_to_an_injecte
         .with_args(["--filter=project-2", "install", "--frozen-lockfile"])
         .assert()
         .success();
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn frozen_install_checks_a_plain_range_workspace_child_of_a_directory_dependency() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\nlinkWorkspacePackages: deep\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "name": "root", "private": true }).to_string(),
+    )
+    .expect("write root package.json");
+    fs::create_dir_all(workspace.join("packages/app")).expect("mkdir packages/app");
+    fs::write(
+        workspace.join("packages/app/package.json"),
+        serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": { "lib": "file:../../vendor/lib" },
+        })
+        .to_string(),
+    )
+    .expect("write packages/app/package.json");
+    fs::create_dir_all(workspace.join("packages/workspace-child"))
+        .expect("mkdir packages/workspace-child");
+    fs::write(
+        workspace.join("packages/workspace-child/package.json"),
+        serde_json::json!({ "name": "workspace-child", "version": "1.0.0" }).to_string(),
+    )
+    .expect("write packages/workspace-child/package.json");
+    fs::create_dir_all(workspace.join("vendor/lib")).expect("mkdir vendor/lib");
+    let write_lib = |injected: &[&str]| {
+        let mut manifest = serde_json::json!({
+            "name": "lib",
+            "version": "1.0.0",
+            "dependencies": { "workspace-child": "^1.0.0" },
+        });
+        for child in injected {
+            manifest["dependenciesMeta"][child]["injected"] = serde_json::json!(true);
+        }
+        fs::write(workspace.join("vendor/lib/package.json"), manifest.to_string())
+            .expect("write vendor/lib/package.json");
+    };
+    let assert_frozen_outdated = || {
+        let output = pnpm_in(&workspace)
+            .with_args(["install", "--frozen-lockfile"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("STDERR:\n{stderr}\n");
+        assert!(stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE"), "stderr: {stderr}");
+    };
+
+    write_lib(&[]);
+    pnpm_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile =
+        fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read pnpm-lock.yaml");
+    eprintln!("LOCKFILE (linked):\n{lockfile}\n");
+    assert!(lockfile.contains("workspace-child: link:packages/workspace-child"));
+    pnpm_in(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+    write_lib(&["workspace-child"]);
+    assert_frozen_outdated();
+
+    pnpm_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let lockfile =
+        fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read pnpm-lock.yaml");
+    eprintln!("LOCKFILE (injected):\n{lockfile}\n");
+    assert!(lockfile.contains("workspace-child: file:packages/workspace-child"));
+    pnpm_in(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+    write_lib(&[]);
+    assert_frozen_outdated();
 
     drop((root, mock_instance));
 }

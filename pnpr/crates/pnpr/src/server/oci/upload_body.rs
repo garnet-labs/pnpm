@@ -1,6 +1,17 @@
 use super::{
-    BlobUpload, Body, Bytes, CanonicalPackageName, Digest, ErrorCode, HASH_CHUNK, Refusal,
-    RegistryError, Sha256, Storage, SystemTime, UNIX_EPOCH,
+    BlobUpload,
+    Body,
+    Bytes,
+    CanonicalPackageName,
+    Digest,
+    ErrorCode,
+    HASH_CHUNK,
+    Refusal,
+    RegistryError,
+    Sha256,
+    Storage,
+    SystemTime,
+    UNIX_EPOCH,
 };
 use futures_util::StreamExt as _;
 use sha2::Digest as _;
@@ -46,7 +57,7 @@ pub(super) async fn append_body(
 ) -> Result<(), Refusal> {
     let mut written = upload.offset().await?;
     if written > limit {
-        storage.abort_blob_upload(upload.id()).await?;
+        storage.abort_blob_upload(upload).await?;
         return Err(Refusal::new(
             ErrorCode::SizeInvalid,
             format!("a blob may not exceed {limit} bytes"),
@@ -60,7 +71,7 @@ pub(super) async fn append_body(
             return Err(Refusal::new(ErrorCode::BlobUploadInvalid, "upload stream ended early"));
         };
         let Some(next) = advance_within_ceiling(written, chunk.len(), limit) else {
-            let _ = storage.abort_blob_upload(upload.id()).await;
+            let _ = storage.abort_blob_upload(upload).await;
             return Err(Refusal::new(
                 ErrorCode::SizeInvalid,
                 format!("a blob may not exceed {limit} bytes"),
@@ -84,7 +95,9 @@ pub(super) fn advance_within_ceiling(written: u64, chunk: usize, limit: u64) -> 
 pub(super) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |since_epoch| u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX))
+        .map(|since_epoch| since_epoch.as_millis())
+        .map(u64::try_from)
+        .map_or(0, |converted| converted.unwrap_or(u64::MAX))
 }
 
 /// An upload's key in the shared lock table, kept out of the package keyspace

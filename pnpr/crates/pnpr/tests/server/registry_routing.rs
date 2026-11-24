@@ -1,8 +1,29 @@
 use super::{
-    AuthState, Body, Ecosystem, MaxUsers, PackagePattern, Registries, Registry, Request,
-    ServiceExt, StatusCode, TempDir, assert_grouped_ecosystem, body_bytes, body_json, config_for,
-    header, hosted_with_access, json, mock_package, mock_packument_for_tarball,
-    read_registry_directory, registry_groups, router, router_config, router_with_auth,
+    AuthState,
+    Body,
+    Ecosystem,
+    MaxUsers,
+    PackagePattern,
+    Registries,
+    Registry,
+    Request,
+    ServiceExt,
+    StatusCode,
+    TempDir,
+    assert_ecosystem_directory,
+    body_bytes,
+    body_json,
+    config_for,
+    header,
+    hosted_with_access,
+    json,
+    mock_package,
+    mock_packument_for_tarball,
+    multi_ecosystem,
+    read_registry_directory,
+    router,
+    router_config,
+    router_with_auth,
 };
 use crate::tokens::issue_token;
 
@@ -11,7 +32,7 @@ async fn scoped_packument_is_served() {
     let mut upstream = mockito::Server::new_async().await;
     let packument = json!({ "name": "@types/node", "versions": {} });
     let mock = upstream
-        .mock("GET", "/@types/node")
+        .mock("GET", "/@types%2Fnode")
         .with_status(200)
         .with_body(packument.to_string())
         .expect(1)
@@ -170,8 +191,8 @@ async fn router_routes_each_package_to_its_declared_source() {
 #[tokio::test]
 async fn router_not_found_does_not_fall_through_to_public() {
     // A router whose only source claims the private `@corp/*` scope. A public
-    // name no source claims must be a definitive 404 — never served from a
-    // public origin — which is the dependency-confusion vector closed by
+    // name no source claims must be a definitive 404 (never served from a
+    // public origin) which is the dependency-confusion vector closed by
     // construction. The same namespace bound holds on the registry's own URL:
     // `/~corp/lodash` is a 404 answered before the upstream (and its
     // server-owned credential) is consulted.
@@ -245,7 +266,7 @@ async fn router_not_found_does_not_fall_through_to_public() {
 #[tokio::test]
 async fn router_unavailable_source_errors_not_404() {
     // The matched source is down. The router must surface an *error*, never a
-    // 404 — reporting "not found" would let a downstream proxy or the client's
+    // 404, reporting "not found" would let a downstream proxy or the client's
     // next-configured registry fall through to a different origin.
     let tmp = TempDir::new().unwrap();
     // Point `corp` at a closed port so every fetch is a transport failure.
@@ -358,8 +379,8 @@ async fn building_the_server_rejects_a_name_shared_by_two_registry_kinds() {
     assert!(err.to_string().contains("collides"), "unexpected error: {err}");
 }
 
-/// The identity endpoints — adduser/login, whoami, profile, token list,
-/// logout, token revoke — are global, so they are served under *any*
+/// The identity endpoints (adduser/login, whoami, profile, token list,
+/// logout, token revoke) are global, so they are served under *any*
 /// `/~<prefix>/` without consulting the registry table: clients derive these
 /// URLs from their configured registry URL, so `pnpm login --registry
 /// .../~corp/` must work even when nothing named `corp` is mounted. Skipping
@@ -370,14 +391,14 @@ async fn building_the_server_rejects_a_name_shared_by_two_registry_kinds() {
 async fn identity_endpoints_are_served_under_any_registry_prefix() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     let app = router(config);
 
     // Login against a registry prefix that is NOT a defined registry.
     let registration = json!({
         "_id": "org.couchdb.user:alice",
         "name": "alice",
-        "password": "secret",
+        "password": "secret123",
         "email": "alice@example.test",
         "type": "user",
         "roles": [],
@@ -499,7 +520,7 @@ async fn identity_endpoints_are_served_under_any_registry_prefix() {
 async fn a_first_segment_that_is_not_a_tilde_prefix_does_not_reach_the_account_endpoints() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     let app = router(config);
 
     for path in ["/npm/~/-/whoami", "/npm/corp/-/npm/v1/tokens", "/npm/~/-/npm/v1/user"] {
@@ -515,8 +536,8 @@ async fn a_first_segment_that_is_not_a_tilde_prefix_does_not_reach_the_account_e
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
     }
 
-    // `/corp/-/whoami` is a well-formed tarball address — package `corp`,
-    // file `whoami` — so it reads through the registry graph instead of
+    // `/corp/-/whoami` is a well-formed tarball address (package `corp`,
+    // file `whoami`) so it reads through the registry graph instead of
     // answering as whoami. The configured upstream is unreachable, which is
     // what a package read of it reports.
     let tarball_shaped = app
@@ -538,7 +559,7 @@ async fn a_first_segment_that_is_not_a_tilde_prefix_does_not_reach_the_account_e
 async fn a_scoped_address_whose_first_segment_is_not_a_scope_is_not_found() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     let app = router(config);
 
     for (method, path) in [
@@ -574,7 +595,7 @@ async fn a_scoped_address_whose_first_segment_is_not_a_scope_is_not_found() {
 async fn a_method_the_address_does_not_serve_is_method_not_allowed() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     let app = router(config);
 
     for (method, path) in [
@@ -608,7 +629,7 @@ async fn a_method_the_address_does_not_serve_is_method_not_allowed() {
 async fn a_prefix_that_is_not_valid_utf8_is_not_found() {
     let tmp = TempDir::new().unwrap();
     let mut config = config_for("http://127.0.0.1:1", tmp.path().to_path_buf());
-    config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
+    config.identity.auth.users.max_users = MaxUsers::Unlimited;
     let app = router(config);
 
     let response = app
@@ -702,16 +723,19 @@ async fn a_single_npm_ecosystem_still_answers_under_its_prefix() {
 }
 
 #[tokio::test]
-async fn same_named_registries_keep_ecosystem_access_and_defaults_separate() {
+async fn registries_keep_ecosystem_access_and_defaults_separate() {
     let tmp = TempDir::new().unwrap();
-    let config = registry_groups::grouped_config(tmp.path(), "alice");
-    let auth = AuthState::in_memory();
+    let config = multi_ecosystem::multi_ecosystem_config(tmp.path(), "alice");
+    let auth = crate::tokens::seeded_auth(
+        &config,
+        &[("alice", "password"), ("bob", "password"), ("ci", "password")],
+    );
     let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(config, auth);
     for authenticated in [false, true] {
         let directory = read_registry_directory(&app, authenticated.then_some(&token)).await;
         for ecosystem in Ecosystem::all() {
-            assert_grouped_ecosystem(
+            assert_ecosystem_directory(
                 &directory,
                 ecosystem,
                 ecosystem != Ecosystem::Npm || authenticated,
@@ -719,14 +743,14 @@ async fn same_named_registries_keep_ecosystem_access_and_defaults_separate() {
         }
     }
     for path in [
-        "/cargo/~internal/index/config.json",
-        "/cargo/~main/index/config.json",
+        "/cargo/~cargo-internal/index/config.json",
+        "/cargo/~cargo-main/index/config.json",
         "/cargo/index/config.json",
-        "/pypi/~internal/simple/",
-        "/pypi/~main/simple/",
+        "/pypi/~pypi-internal/simple/",
+        "/pypi/~pypi-main/simple/",
         "/pypi/simple/",
-        "/oci/~internal/v2/",
-        "/oci/~main/v2/",
+        "/oci/~oci-internal/v2/",
+        "/oci/~oci-main/v2/",
         "/v2/",
     ] {
         let response = app
@@ -745,7 +769,7 @@ async fn same_named_registries_keep_ecosystem_access_and_defaults_separate() {
         );
     }
     for path in [
-        "/npm/~internal/demo",
+        "/npm/~npm-internal/demo",
         "/npm/~cargo%2Finternal/demo",
         "/cargo/~npm%2Finternal/index/config.json",
     ] {

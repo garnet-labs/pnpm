@@ -1,7 +1,16 @@
 use super::{
-    super::validate_importer_id, Config, DependencyGroup, HashMap, LinkBinsOptions, PathBuf,
-    ProjectSnapshot, SilentReporter, SkippedSnapshots, SymlinkDirectDependencies,
-    SymlinkDirectDependenciesError, tempdir,
+    super::validate_importer_id,
+    Config,
+    DependencyGroup,
+    HashMap,
+    LinkBinsOptions,
+    PathBuf,
+    ProjectSnapshot,
+    SilentReporter,
+    SkippedSnapshots,
+    SymlinkDirectDependencies,
+    SymlinkDirectDependenciesError,
+    tempdir,
 };
 
 #[test]
@@ -80,6 +89,7 @@ fn unsafe_importer_keys_error_before_filesystem_writes() {
                 importers: &importers,
                 packages: None,
                 skipped: &SkippedSnapshots::default(),
+                latest_versions: None,
             },
             policy: crate::DirectLinkPolicy {
                 public_hoist_targets: None,
@@ -120,7 +130,7 @@ fn unsafe_importer_keys_error_before_filesystem_writes() {
 }
 
 /// An importer id the caller declared as one of the install's own
-/// projects bypasses the unsafe-path rejection — Bit's nested capsule
+/// projects bypasses the unsafe-path rejection. Bit's nested capsule
 /// installs pass a project at `..`, whose `node_modules` lives outside
 /// the lockfile dir by design. Ids NOT in the trusted set must still
 /// be rejected.
@@ -155,6 +165,7 @@ fn trusted_importer_id_outside_workspace_root_is_linked() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: None,
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,
@@ -187,6 +198,7 @@ fn trusted_importer_id_outside_workspace_root_is_linked() {
             importers: &importers,
             packages: None,
             skipped: &SkippedSnapshots::default(),
+            latest_versions: None,
         },
         policy: crate::DirectLinkPolicy {
             public_hoist_targets: None,

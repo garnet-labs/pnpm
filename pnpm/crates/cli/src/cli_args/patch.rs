@@ -2,31 +2,66 @@
 use crate::dialoguer_wasm::Select;
 use crate::{
     State,
-    cli_args::patch_state::{EditDirState, StateFileError, write_edit_dir_state},
+    cli_args::patch_state::{
+        EditDirState,
+        StateFileError,
+        write_edit_dir_state,
+    },
 };
-use clap::Args;
-use derive_more::{Display, Error};
+use clap::{
+    Args,
+    ValueHint,
+};
+use derive_more::{
+    Display,
+    Error,
+};
 #[cfg(not(target_family = "wasm"))]
 use dialoguer::Select;
-use miette::{Diagnostic, IntoDiagnostic, miette};
+use miette::{
+    Diagnostic,
+    IntoDiagnostic,
+    miette,
+};
 use owo_colors::OwoColorize;
 use paths::{
-    apply_existing_patch_file, default_edit_dir, prepare_default_edit_dir,
-    reject_edit_dir_symlink_components_under, reject_non_empty_custom_edit_dir,
-    reject_non_empty_edit_dir, resolve_path,
+    apply_existing_patch_file,
+    default_edit_dir,
+    prepare_default_edit_dir,
+    reject_edit_dir_symlink_components_under,
+    reject_non_empty_custom_edit_dir,
+    reject_non_empty_edit_dir,
+    resolve_path,
 };
-use pnpm_fs::{is_subdir, lexical_normalize};
-use pnpm_lockfile::{LoadLockfileError, Lockfile};
+use pnpm_fs::{
+    is_subdir,
+    lexical_normalize,
+};
+use pnpm_lockfile::{
+    LoadLockfileError,
+    Lockfile,
+};
 use pnpm_package_manager::{
-    PatchCandidate, PatchCandidateSet, PatchTarget, PatchTargetError, WritePackageForPatch,
-    WritePackageForPatchError, default_patch_target, patch_candidates_from_lockfile,
+    PatchCandidate,
+    PatchCandidateSet,
+    PatchTarget,
+    PatchTargetError,
+    WritePackageForPatch,
+    WritePackageForPatchError,
+    default_patch_target,
+    patch_candidates_from_lockfile,
 };
 use pnpm_patching::PatchApplyError;
 use pnpm_reporter::Reporter;
 use std::{
-    fs, io,
+    fs,
+    io,
     io::IsTerminal,
-    path::{Component, Path, PathBuf},
+    path::{
+        Component,
+        Path,
+        PathBuf,
+    },
 };
 
 #[derive(Debug, Args)]
@@ -34,7 +69,7 @@ pub struct PatchArgs {
     /// Name of the package to patch.
     pub package_name: Option<String>,
     /// The package that needs to be modified will be extracted to this directory.
-    #[clap(short = 'd', long = "edit-dir", value_name = "dir")]
+    #[clap(short = 'd', long = "edit-dir", value_name = "dir", value_hint = ValueHint::DirPath)]
     pub edit_dir: Option<PathBuf>,
     /// Ignore existing patch files when patching.
     #[clap(long = "ignore-existing")]
@@ -182,7 +217,7 @@ impl PatchArgs {
         .await
         .map_err(PatchError::WritePackage)?;
 
-        record_edit_target(&state.config.modules_dir, &edit_dir, &package_name, &target)?;
+        record_edit_target(&state.config.modules_dir, &edit_dir, package_name, &target)?;
 
         if !ignore_existing {
             apply_existing_patch_file(state.config, &target, &edit_dir)?;
@@ -238,21 +273,13 @@ fn merge_workspace_current_lockfiles(
     mut merged: Option<Lockfile>,
 ) -> Result<Option<Lockfile>, pnpm_lockfile::LoadLockfileError> {
     for project in projects {
-        if let Some(project_lockfile) = load_project_current_lockfile(config, project)? {
+        if let Some(project_lockfile) =
+            super::recursive::load_project_current_lockfile(config, project)?
+        {
             merge_lockfile_packages_and_snapshots(&mut merged, project_lockfile);
         }
     }
     Ok(merged)
-}
-
-fn load_project_current_lockfile(
-    config: &pnpm_config::Config,
-    project: &pnpm_workspace::Project,
-) -> Result<Option<Lockfile>, pnpm_lockfile::LoadLockfileError> {
-    let mut project_config = config.clone();
-    let project_name = super::pipelines::project_manifest_name(project);
-    project_config.anchor_dedicated_project(&project.root_dir, project_name);
-    Lockfile::load_current_from_install_state_dir(&project_config.install_state_dir)
 }
 
 fn merge_lockfile_packages_and_snapshots(merged: &mut Option<Lockfile>, other: Lockfile) {
@@ -387,14 +414,14 @@ fn prepare_patch_edit_dir(
 fn record_edit_target(
     modules_dir: &Path,
     edit_dir: &Path,
-    package_name: &str,
+    package_name: String,
     target: &PatchTarget,
 ) -> Result<(), PatchError> {
     write_edit_dir_state(
         modules_dir,
         edit_dir,
         &EditDirState {
-            patched_pkg: package_name.to_owned(),
+            patched_pkg: package_name,
             apply_to_all: target.apply_to_all,
             package_key: Some(target.package_key.clone()),
         },

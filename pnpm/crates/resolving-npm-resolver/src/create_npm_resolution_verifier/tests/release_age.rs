@@ -1,7 +1,20 @@
 use super::{
-    FAKE_INTEGRITY, PkgName, ResolutionVerification, abbreviated_packument_json, assert_eq,
-    create_npm_resolution_verifier, create_package_version_policy, ctx, default_opts,
-    min_age_packument_json, now_at, registry_resolution,
+    ABBREVIATED_META_DIR,
+    FAKE_INTEGRITY,
+    Package,
+    PkgName,
+    ResolutionVerification,
+    TempDir,
+    abbreviated_packument_json,
+    assert_eq,
+    create_npm_resolution_verifier,
+    create_package_version_policy,
+    ctx,
+    default_opts,
+    min_age_packument_json,
+    now_at,
+    persist_meta_to_mirror,
+    registry_resolution,
 };
 use pnpm_resolving_resolver_base::ResolutionVerifier;
 
@@ -130,6 +143,38 @@ async fn min_age_fail_when_published_within_cutoff() {
     };
     assert_eq!(code, "MINIMUM_RELEASE_AGE_VIOLATION");
     assert!(reason.contains("within the minimumReleaseAge cutoff"), "got reason: {reason}");
+}
+
+#[tokio::test]
+async fn min_age_beyond_the_representable_range_rejects_every_version() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let _attestation_mock = server
+        .mock("GET", "/-/npm/v1/attestations/acme@1.0.0")
+        .with_status(404)
+        .create_async()
+        .await;
+    let _full_mock = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_body(min_age_packument_json("acme", "1.0.0", "2024-01-01T00:00:00.000Z").to_string())
+        .create_async()
+        .await;
+    for minimum_minutes in [10_000_000_000, u64::MAX] {
+        let mut opts = default_opts(&registry);
+        opts.release_age.minimum_minutes = Some(minimum_minutes);
+        opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+        let verifier = create_npm_resolution_verifier(opts);
+        let result = verifier.verify(
+            &registry_resolution(),
+            ctx(&"acme".parse::<PkgName>().expect("parse"), "1.0.0"),
+        )
+        .await;
+        let ResolutionVerification::Err { code, .. } = result else {
+            panic!("expected Err for {minimum_minutes} minutes, got {result:?}");
+        };
+        assert_eq!(code, "MINIMUM_RELEASE_AGE_VIOLATION");
+    }
 }
 
 #[tokio::test]
@@ -267,7 +312,7 @@ async fn min_age_unlisted_version_fails_when_missing_time_is_ignored() {
 }
 
 /// A previously-cached run with a stricter (larger) cutoff stays
-/// trustworthy under today's looser policy — the set of accepted
+/// trustworthy under today's looser policy, the set of accepted
 /// versions is a subset of today's.
 #[test]
 fn can_trust_past_check_accepts_looser_min_age() {
@@ -284,7 +329,7 @@ fn can_trust_past_check_accepts_looser_min_age() {
     assert!(verifier.can_trust_past_check(&cached));
 }
 
-/// Tightening the cutoff invalidates the cached run — versions
+/// Tightening the cutoff invalidates the cached run, versions
 /// that passed under a looser cutoff may now be in the new
 /// (narrower) window.
 #[test]
@@ -302,6 +347,33 @@ fn can_trust_past_check_rejects_tighter_min_age() {
     cached.insert("trustPolicyExclude".to_string(), serde_json::Value::Array(vec![]));
     cached.insert("trustPolicyIgnoreAfter".to_string(), serde_json::Value::Null);
     assert!(!verifier.can_trust_past_check(&cached));
+}
+
+#[test]
+fn can_trust_past_check_tracks_the_check_time() {
+    let at = |now: Option<&str>| {
+        let mut opts = default_opts("https://registry.example/");
+        opts.release_age.minimum_minutes = Some(60 * 24);
+        opts.now = now.map(now_at);
+        create_npm_resolution_verifier(opts)
+    };
+    let early = at(Some("2025-12-01T00:00:00Z"));
+    let late = at(Some("2025-12-02T00:00:00Z"));
+    let future = at(Some("2999-01-01T00:00:00Z"));
+    let wall_clock = at(None);
+    for (label, verifier) in
+        [("early", &early), ("late", &late), ("future", &future), ("wall clock", &wall_clock)]
+    {
+        eprintln!("{label} policy: {:?}", verifier.policy());
+    }
+
+    assert!(late.can_trust_past_check(early.policy()), "an earlier fixed time is reusable");
+    assert!(late.can_trust_past_check(late.policy()), "the same fixed time is reusable");
+    assert!(!early.can_trust_past_check(late.policy()), "a later fixed time is not reusable");
+    assert!(!early.can_trust_past_check(wall_clock.policy()), "a wall-clock run is not reusable");
+    assert!(wall_clock.can_trust_past_check(early.policy()), "a past fixed time is reusable");
+    assert!(!wall_clock.can_trust_past_check(future.policy()), "a future time is not reusable");
+    assert!(wall_clock.can_trust_past_check(wall_clock.policy()), "a wall-clock run is reusable");
 }
 
 /// Abbreviated-modified shortcut: when the package-level `modified`
@@ -393,7 +465,7 @@ async fn min_age_shortcut_falls_through_when_modified_within_cutoff() {
 /// The shortcut treats `modified` as an upper bound only for
 /// versions the registry currently lists. An unpublished or
 /// never-published pin must NOT slip through on a stale
-/// package-level timestamp — the verifier falls through to the
+/// package-level timestamp, the verifier falls through to the
 /// per-version layers, which surface the unchecked entry.
 #[tokio::test]
 async fn min_age_shortcut_falls_through_when_version_not_listed() {
@@ -407,7 +479,7 @@ async fn min_age_shortcut_falls_through_when_version_not_listed() {
         )
         .with_status(200)
         // `modified` is old enough, but the abbreviated packument
-        // only lists `1.0.0` — the verifier is checking `2.0.0`.
+        // only lists `1.0.0`, the verifier is checking `2.0.0`.
         .with_body(
             abbreviated_packument_json("acme", "1.0.0", "2024-01-01T00:00:00.000Z").to_string(),
         )
@@ -445,4 +517,30 @@ async fn min_age_shortcut_falls_through_when_version_not_listed() {
         panic!("expected Err, got {result:?}");
     };
     assert_eq!(code, "MINIMUM_RELEASE_AGE_VIOLATION");
+}
+
+/// The resolver's release-age upgrade stores the full document, `time`
+/// included, in the abbreviated mirror. An offline verification has no
+/// other source for the pin's publish time.
+#[tokio::test]
+async fn offline_reads_version_time_from_an_upgraded_abbreviated_mirror() {
+    let registry = "http://nonexistent.example.invalid/";
+    let cache_dir = TempDir::new().expect("tempdir");
+    let mut document = min_age_packument_json("acme", "1.0.0", "2024-01-01T00:00:00.000Z");
+    document["modified"] = "2025-11-30T23:30:00.000Z".into();
+    let packument: Package = serde_json::from_value(document).expect("package parses");
+    persist_meta_to_mirror(cache_dir.path(), ABBREVIATED_META_DIR, registry, &packument)
+        .expect("persist abbreviated mirror");
+
+    let mut opts = default_opts(registry);
+    opts.release_age.minimum_minutes = Some(60 * 24);
+    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+    opts.metadata.cache_dir = Some(cache_dir.path().to_path_buf());
+    opts.metadata.offline = true;
+    let verifier = create_npm_resolution_verifier(opts);
+    let name: PkgName = "acme".parse().expect("parse");
+
+    let result = verifier.verify(&registry_resolution(), ctx(&name, "1.0.0")).await;
+
+    assert_eq!(result, ResolutionVerification::Ok);
 }

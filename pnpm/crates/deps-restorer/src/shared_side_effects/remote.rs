@@ -1,21 +1,45 @@
 use super::{
-    BaseCasPaths, artifact_platform, decoded_trusted_keys, dependency_package,
-    insert_side_effects_map, non_empty, planning::CandidateGroup, quarantine_remote_side_effects,
+    BaseCasPaths,
+    artifact_platform,
+    artifact_store_options,
+    decoded_trusted_keys,
+    dependency_package,
+    insert_side_effects_map,
+    non_empty,
+    planning::CandidateGroup,
+    quarantine_remote_side_effects,
     store_holds,
 };
-use crate::{RemoteSideEffectsQuarantineBySnapshot, SideEffectsMapsBySnapshot};
+use crate::{
+    RemoteSideEffectsQuarantineBySnapshot,
+    SideEffectsMapsBySnapshot,
+};
 use pnpm_config::Config;
 use pnpm_lockfile::ProjectSnapshot;
 use pnpm_pnpr_client::{
-    ArtifactBlobRequest, ArtifactFile, ArtifactStore, OwnerScope, PnprClientError,
-    RejectedArtifact, ResolveArtifactsOptions, blob_id,
+    ArtifactBlobRequest,
+    ArtifactFile,
+    ArtifactStore,
+    OwnerScope,
+    PnprClientError,
+    RejectedArtifact,
+    ResolveArtifactsOptions,
+    blob_id,
 };
 use pnpm_store_dir::{
-    CafsFileInfo, RemoteSideEffectsOrigin, SideEffectsDiff, SideEffectsOverlay, StoreIndexWriter,
+    CafsFileInfo,
+    RemoteSideEffectsOrigin,
+    SideEffectsDiff,
+    SideEffectsOverlay,
+    StoreIndexWriter,
     side_effects_overlay,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{
+        BTreeMap,
+        HashMap,
+        HashSet,
+    },
     sync::Arc,
 };
 
@@ -78,7 +102,7 @@ pub(super) fn remote_cache_setup(
     }
     let eligible_packages = &config.remote_side_effects_cache.as_ref()?.packages;
     let settings = config.remote_cache_settings();
-    let store = match ArtifactStore::from_config(config, &settings) {
+    let store = match ArtifactStore::from_options(artifact_store_options(config, &settings)) {
         Ok(store) => store?,
         Err(error) => {
             tracing::warn!(target: "pacquet::install", %error, "remote side-effects cache is unusable");
@@ -257,7 +281,7 @@ pub(super) async fn stage_artifact(
     let mut downloaded = HashMap::<String, Vec<u8>>::new();
     let mut stored = HashMap::<(String, u32), pnpm_fs::StoreFile>::new();
     let mut added = HashMap::<String, CafsFileInfo>::new();
-    let mut staged_modes = HashMap::<String, u32>::new();
+    let mut staged_modes = HashMap::<String, pnpm_fs::FileMode>::new();
     for file in &artifact.payload.manifest.added {
         let (blob, info) =
             stage_artifact_blob(context, artifact, file, &mut stored, &mut downloaded).await?;
@@ -378,8 +402,9 @@ pub(super) async fn stage_artifact_blob(
         let bytes = download_artifact_file(context, artifact, file).await?;
         downloaded.insert(file.integrity.clone(), bytes);
     }
+    let executable = pnpm_fs::file_mode::is_executable(pnpm_fs::FileMode::from_mode(file.mode));
     let blob = context.config.store_dir
-        .write_cas_file(&downloaded[&file.integrity], pnpm_fs::file_mode::is_executable(file.mode))
+        .write_cas_file(&downloaded[&file.integrity], executable)
         .map_err(|error| (error.to_string(), false))?
         .file;
     stored.insert(storage_key, blob.clone());

@@ -1,18 +1,44 @@
-use super::{BlobUpload, BlobUploadWriter, generate_upload_id, is_upload_id};
+use super::{
+    BlobUpload,
+    BlobUploadWriter,
+    UploadPrincipal,
+    generate_upload_id,
+    is_upload_id,
+};
 use crate::s3::send_parts;
 use futures_util::StreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
-use pnpr_error::{RegistryError, Result};
+use object_store::{
+    ObjectStore,
+    ObjectStoreExt,
+    PutMode,
+    PutOptions,
+    UpdateVersion,
+    path::Path,
+};
+use pnpr_error::{
+    RegistryError,
+    Result,
+};
 use pnpr_package_name::CanonicalPackageName;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{
+        HashMap,
+        HashSet,
+    },
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 use tempfile::TempPath;
-use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    sync::Mutex,
+};
 
 const MAX_CHUNKS: usize = 10_000;
 
@@ -26,6 +52,7 @@ pub(crate) struct RemoteUploadStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadRecord {
     repository: String,
+    principal: UploadPrincipal,
     chunks: Vec<String>,
     size: u64,
     closed: bool,
@@ -122,10 +149,15 @@ impl RemoteUploadStore {
         })
     }
 
-    pub(super) async fn begin(&self, repository: &CanonicalPackageName) -> Result<BlobUpload> {
+    pub(super) async fn begin(
+        &self,
+        repository: &CanonicalPackageName,
+        principal: Option<&str>,
+    ) -> Result<BlobUpload> {
         let id = generate_upload_id();
         let record = UploadRecord {
             repository: repository.as_str().to_string(),
+            principal: UploadPrincipal::from_user_id(principal),
             chunks: Vec::new(),
             size: 0,
             closed: false,
@@ -138,10 +170,14 @@ impl RemoteUploadStore {
     pub(super) async fn open(
         &self,
         repository: &CanonicalPackageName,
+        principal: Option<&str>,
         id: &str,
     ) -> Result<Option<BlobUpload>> {
         let Some(state) = self.read(id).await? else { return Ok(None) };
-        if state.record.closed || state.record.repository != repository.as_str() {
+        if state.record.closed
+            || state.record.repository != repository.as_str()
+            || state.record.principal != UploadPrincipal::from_user_id(principal)
+        {
             return Ok(None);
         }
         self.handle(id, state).await.map(Some)
@@ -158,6 +194,7 @@ impl RemoteUploadStore {
         state.record.closed = true;
         self.write(id, &state.record, PutMode::Update(state.version)).await?;
         self.remove_chunks(id).await?;
+        self.remove(&self.key(id, "session.json")).await?;
         Ok(true)
     }
 
@@ -377,10 +414,8 @@ impl RemoteUpload {
         let version =
             self.backend.write(&self.id, &record, PutMode::Update(state.version.clone())).await?;
         *state = VersionedRecord { record, version };
-        if let Err(error) = self.backend.remove_chunks(&self.id).await {
-            tracing::warn!(%error, upload = self.id, "completed upload chunks await expiry cleanup");
-        }
-        Ok(())
+        self.backend.remove_chunks(&self.id).await?;
+        self.backend.remove(&self.backend.key(&self.id, "session.json")).await
     }
 }
 
