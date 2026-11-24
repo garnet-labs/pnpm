@@ -1,5 +1,7 @@
 name: Rust CI
 
+# Record the main baseline before opening the dependency replay PRs.
+
 # This workflow covers every Rust crate in the repo — pacquet and
 # pnpr alike. They share the same cargo workspace, so `just test`,
 # dylint, doc, etc. all see both stacks in one pass; running two
