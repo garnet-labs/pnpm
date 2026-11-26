@@ -80,3 +80,5 @@ savePrefix: ''
 virtualStoreType: global
 
 autoDedupe: true
+
+registry: https://registry.npmmirror.com/
